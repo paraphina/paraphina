@@ -18,6 +18,8 @@ pub struct Config {
     pub mm: MmConfig,
     /// Hedge engine (global LQ controller + band).
     pub hedge: HedgeConfig,
+    /// Toxicity / venue-health config.
+    pub toxicity: ToxicityConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +101,24 @@ pub struct HedgeConfig {
     /// LQ controller weights α, β.
     pub alpha_hedge: f64,
     pub beta_hedge: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToxicityConfig {
+    /// VOL_TOX_SCALE: how quickly relative vol turns into toxicity.
+    pub vol_tox_scale: f64,
+    /// FLOW_TOX_SCALE: scale for throughput normalisation (future use).
+    pub flow_tox_scale: f64,
+    /// Threshold between low and medium toxicity.
+    pub tox_med_threshold: f64,
+    /// Threshold for "high" toxicity → venue disabled.
+    pub tox_high_threshold: f64,
+    /// Weights for features f1..f5.
+    pub w1: f64,
+    pub w2: f64,
+    pub w3: f64,
+    pub w4: f64,
+    pub w5: f64,
 }
 
 impl Default for Config {
@@ -237,6 +257,19 @@ impl Default for Config {
             beta_hedge: 1.0,
         };
 
+        let toxicity = ToxicityConfig {
+            vol_tox_scale: 1.0,       // VOL_TOX_SCALE
+            flow_tox_scale: 1_000.0,  // FLOW_TOX_SCALE (placeholder)
+            tox_med_threshold: 0.4,
+            tox_high_threshold: 0.8,
+            // Feature weights; these sum to 1.0.
+            w1: 0.5,  // relative vol
+            w2: 0.2,  // neg markouts
+            w3: 0.1,  // imbalance
+            w4: 0.1,  // directional flow
+            w5: 0.1,  // throughput
+        };
+
         Config {
             version: "v0.1.0-whitepaper-structure",
             venues,
@@ -246,6 +279,7 @@ impl Default for Config {
             risk,
             mm,
             hedge,
+            toxicity,
         }
     }
 }

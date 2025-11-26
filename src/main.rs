@@ -6,6 +6,7 @@ mod types;
 mod engine;
 mod mm;
 mod hedge;
+mod toxicity;
 
 use crate::config::Config;
 use crate::engine::Engine;
@@ -51,7 +52,7 @@ fn main() {
         // ---- Synthetic market data for this tick (dummy mids) ----
         engine.seed_dummy_mids(&mut state, t_ms);
 
-        // ---- Core engine tick: fair value, vols, inventory, risk ----
+        // ---- Core engine tick: fair value, vols, inventory, risk, toxicity ----
         engine.main_tick(&mut state, t_ms);
 
         println!("\n================ Tick {} ================", tick);
@@ -76,6 +77,15 @@ fn main() {
             println!("Daily PnL total: {:.4}", state.daily_pnl_total);
             println!("Risk regime after tick: {:?}", state.risk_regime);
             println!("Kill switch: {}", state.kill_switch);
+
+            // ---- Per-venue toxicity & status ----
+            println!("\nPer-venue toxicity & status:");
+            for v in &state.venues {
+                println!(
+                    "  {:>10}: toxicity={:.3}, status={:?}",
+                    v.id, v.toxicity, v.status
+                );
+            }
 
             // ---- Market-making quotes ----
             let quotes = compute_mm_quotes(&cfg, &state);

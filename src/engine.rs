@@ -42,10 +42,14 @@ impl<'a> Engine<'a> {
     pub fn main_tick(&self, state: &mut GlobalState, now_ms: TimestampMs) {
         self.update_fair_value_and_vol(state, now_ms);
         self.update_volatility_scalars(state);
+
+        // NEW: toxicity + venue health (Section 7).
+        crate::toxicity::update_toxicity_and_health(self.cfg, state);
+
         self.recompute_inventory_and_basis(state);
         self.update_risk_regime(state);
         // Later we will add:
-        //  - toxicity updates,
+        //  - more detailed toxicity/venue gating,
         //  - quoting & order management,
         //  - hedging & exits.
     }
