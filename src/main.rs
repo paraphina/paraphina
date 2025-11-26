@@ -1,3 +1,5 @@
+// src/main.rs
+
 mod config;
 mod state;
 mod types;
@@ -7,9 +9,9 @@ mod hedge;
 
 use crate::config::Config;
 use crate::engine::Engine;
-use crate::state::GlobalState;
-use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
+use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
+use crate::state::GlobalState;
 use crate::types::OrderIntent;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +22,11 @@ fn now_ms() -> i64 {
         .expect("Time went backwards");
     dur.as_millis() as i64
 }
+
+/// Very small demo loop: how often the main loop ticks (fake time).
+const MAIN_LOOP_INTERVAL_MS: i64 = 1_000;
+/// How many ticks to run before exiting.
+const NUM_TICKS: usize = 3;
 
 fn main() {
     let cfg = Config::default();
@@ -32,100 +39,98 @@ fn main() {
     println!("Configured venues: {}", cfg.venues.len());
     println!("Initial risk regime: {:?}", state.risk_regime);
 
+    // TEMP: seed a starting long position so we can see risk + hedge logic.
+    if let Some(first_venue) = state.venues.get_mut(0) {
+        first_venue.position_tao = 40.0;
+    }
+
     let engine = Engine::new(&cfg);
+    let mut t_ms = now_ms();
 
-    // TEMP: seed synthetic mids so KF + vol logic can run before we have
-    // any real exchange connections wired up.
-    let t0 = now_ms();
-    engine.seed_dummy_mids(&mut state, t0);
+    for tick in 0..NUM_TICKS {
+        // ---- Synthetic market data for this tick (dummy mids) ----
+        engine.seed_dummy_mids(&mut state, t_ms);
 
-    // ==== TEMP: add some fake positions so the hedge engine has work to do ====
-    // extended: long +50 TAO
-    if let Some(v) = state.venues.get_mut(0) {
-        v.position_tao = 50.0;
-    }
-    // hyperliquid: short -10 TAO
-    if let Some(v) = state.venues.get_mut(1) {
-        v.position_tao = -10.0;
-    }
-    // (aster / lighter / paradex left at 0.0 for now)
-    // ==========================================================================
+        // ---- Core engine tick: fair value, vols, inventory, risk ----
+        engine.main_tick(&mut state, t_ms);
 
-    // Run one "main loop" tick (fair value, vols, inventory, risk).
-    engine.main_tick(&mut state, t0);
+        println!("\n================ Tick {} ================", tick);
 
-    if let Some(fv) = state.fair_value {
-        println!("--- Post-tick state ---");
-        println!("Fair value S_t: {:.4}", fv);
-        println!("Sigma_eff: {:.6}", state.sigma_eff);
-        println!("Vol ratio (clipped): {:.4}", state.vol_ratio_clipped);
-        println!("Spread_mult: {:.4}", state.spread_mult);
-        println!("Size_mult: {:.4}", state.size_mult);
-        println!("Band_mult: {:.4}", state.band_mult);
-        println!("Global q_t (TAO): {:.4}", state.q_global_tao);
-        println!("Dollar delta (USD): {:.4}", state.dollar_delta_usd);
-        println!("Basis exposure (USD): {:.4}", state.basis_usd);
-        println!(
-            "Basis gross (USD): {:.4}",
-            state.basis_gross_usd
-        );
-        println!(
-            "Delta limit (USD): {:.2}",
-            state.delta_limit_usd
-        );
-        println!(
-            "Basis warn / hard (USD): {:.2} / {:.2}",
-            state.basis_limit_warn_usd, state.basis_limit_hard_usd
-        );
-        println!("Daily PnL total: {:.4}", state.daily_pnl_total);
-        println!("Risk regime after tick: {:?}", state.risk_regime);
-        println!("Kill switch: {}", state.kill_switch);
-
-        // ----- MM quotes -----
-        let quotes = compute_mm_quotes(&cfg, &state);
-        println!("\nPer-venue quotes:");
-        for q in &quotes {
+        if let Some(fv) = state.fair_value {
+            // ---- State summary ----
+            println!("Fair value S_t: {:.4}", fv);
+            println!("Sigma_eff: {:.6}", state.sigma_eff);
+            println!("Vol ratio (clipped): {:.4}", state.vol_ratio_clipped);
+            println!("Spread_mult: {:.4}", state.spread_mult);
+            println!("Size_mult: {:.4}", state.size_mult);
+            println!("Band_mult: {:.4}", state.band_mult);
+            println!("Global q_t (TAO): {:.4}", state.q_global_tao);
+            println!("Dollar delta (USD): {:.4}", state.dollar_delta_usd);
+            println!("Basis exposure (USD): {:.4}", state.basis_usd);
+            println!("Basis gross (USD): {:.4}", state.basis_gross_usd);
+            println!("Delta limit (USD): {:.2}", state.delta_limit_usd);
             println!(
-                "  {:>10}: bid={:?}, ask={:?}",
-                q.venue_id,
-                q.bid.as_ref().map(|b| (b.price, b.size)),
-                q.ask.as_ref().map(|a| (a.price, a.size)),
+                "Basis warn / hard (USD): {:.2} / {:.2}",
+                state.basis_limit_warn_usd, state.basis_limit_hard_usd
             );
-        }
+            println!("Daily PnL total: {:.4}", state.daily_pnl_total);
+            println!("Risk regime after tick: {:?}", state.risk_regime);
+            println!("Kill switch: {}", state.kill_switch);
 
-        // ----- Hedge engine: compute one-step hedge plan -----
-        let hedge_plan = compute_hedge_plan(&cfg, &state);
-        println!("\nHedge plan:");
-        match &hedge_plan {
-            None => println!("  No hedge needed (inside dead band or no hedge venues)."),
-            Some(plan) => {
-                println!("  Desired ΔH (TAO): {:+.4}", plan.desired_delta);
-                for alloc in &plan.allocations {
+            // ---- Market-making quotes ----
+            let quotes = compute_mm_quotes(&cfg, &state);
+            println!("\nPer-venue quotes:");
+            for q in &quotes {
+                println!(
+                    "  {:>10}: bid={:?}, ask={:?}",
+                    q.venue_id,
+                    q.bid.as_ref().map(|b| (b.price, b.size)),
+                    q.ask.as_ref().map(|a| (a.price, a.size)),
+                );
+            }
+
+            // ---- Hedge plan for this tick ----
+            let hedge_plan = compute_hedge_plan(&cfg, &state);
+            println!("\nHedge plan:");
+            match &hedge_plan {
+                None => {
                     println!(
-                        "  -> venue {:>10}: {:?} {:.4} @ ~{:.4}",
-                        alloc.venue_id,
-                        alloc.side,
-                        alloc.size,
-                        alloc.est_price,
+                        "  No hedge needed (inside dead band or no hedge venues)."
                     );
                 }
+                Some(plan) => {
+                    println!("  Desired ΔH (TAO): {:+.4}", plan.desired_delta);
+                    for alloc in &plan.allocations {
+                        println!(
+                            "  -> venue {:>10}: {:?} {:.4} @ ~{:.4}",
+                            alloc.venue_id,
+                            alloc.side,
+                            alloc.size,
+                            alloc.est_price,
+                        );
+                    }
+                }
             }
+
+            // ---- Convert quotes + hedge plan into abstract order intents ----
+            let mut order_intents: Vec<OrderIntent> =
+                mm_quotes_to_order_intents(&quotes);
+            if let Some(plan) = &hedge_plan {
+                order_intents.extend(hedge_plan_to_order_intents(plan));
+            }
+
+            println!("\nOrder intents (abstract):");
+            for oi in &order_intents {
+                println!(
+                    "  {:>10} {:?} {:.4} @ {:.4} ({:?})",
+                    oi.venue_id, oi.side, oi.size, oi.price, oi.purpose
+                );
+            }
+        } else {
+            println!("Fair value not initialised yet (no mids).");
         }
 
-        // ----- Turn MM quotes + hedge plan into abstract order intents -----
-        let mut order_intents: Vec<OrderIntent> = mm_quotes_to_order_intents(&quotes);
-        if let Some(plan) = &hedge_plan {
-            order_intents.extend(hedge_plan_to_order_intents(plan));
-        }
-
-        println!("\nOrder intents (abstract):");
-        for oi in &order_intents {
-            println!(
-                "  {:>10} {:?} {:.4} @ {:.4} ({:?})",
-                oi.venue_id, oi.side, oi.size, oi.price, oi.purpose
-            );
-        }
-    } else {
-        println!("Fair value not initialised yet (no mids).");
+        // Advance our fake time for the next tick.
+        t_ms += MAIN_LOOP_INTERVAL_MS;
     }
 }
