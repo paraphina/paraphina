@@ -1,12 +1,10 @@
 // src/mm.rs
 //
-// Market-making model:
-// - Enhanced Avellaneda–Stoikov reservation price per venue
-// - Basis & funding adjustments
-// - Per-venue inventory targets
-// - Conversion to abstract order intents
-//
-// This corresponds to the quoting logic in Sections 9 & 10 of the whitepaper.
+// Simplified Avellaneda–Stoikov style quotes + conversion to order intents.
+// This version already respects:
+//   - global inventory q_t (skews all venues),
+//   - per-venue inventory q_v (skews each venue),
+//   - a simple basis term b_v = mid_v - S_t (if mid is known).
 
 use crate::config::Config;
 use crate::state::GlobalState;
@@ -26,19 +24,10 @@ pub struct VenueQuote {
     pub ask: Option<SideQuote>,
 }
 
-/// Compute model-based quotes per venue using the enhanced AS model.
-///
-/// This uses:
-/// - global inventory q_t from `GlobalState`
-/// - per-venue inventory q_v,
-/// - per-venue basis b_v = mid_v − S_t,
-/// - per-venue funding via a simple φ(funding) skew,
-/// - per-venue inventory targets q_v,target.
+/// Compute model-based quotes per venue (simplified AS + basis/inventory).
 pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<VenueQuote> {
-    // Fair value S_t; fall back to 250 if not initialised for some reason.
+    // Fair value and volatility with safe fallbacks.
     let s_t = state.fair_value.unwrap_or(250.0);
-
-    // Effective volatility with a small floor for demo.
     let sigma_eff = if state.sigma_eff > 0.0 {
         state.sigma_eff
     } else {
@@ -48,68 +37,52 @@ pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<VenueQuote> {
     let spread_mult = state.spread_mult;
     let size_mult = state.size_mult;
 
-    // Global inventory q_t.
-    let q_t = state.q_global_tao;
-
-    // Horizon for AS and funding, in seconds.
-    let tau = cfg.mm.quote_horizon_sec;
-    let eight_hours_sec = 8.0 * 60.0 * 60.0;
-
     let mut out = Vec::with_capacity(cfg.venues.len());
 
     for (idx, vcfg) in cfg.venues.iter().enumerate() {
         let vstate = &state.venues[idx];
 
-        // Per-venue position q_v.
+        // Global + per-venue inventory.
+        let q_t = state.q_global_tao;
         let q_v = vstate.position_tao;
 
-        // ----- Basis term: b_v = mid_v - S_t -----
-        let mid_v = vstate.mid.unwrap_or(s_t);
-        let b_v = mid_v - s_t;
-        let basis_term = cfg.mm.basis_weight * b_v;
+        let tau = cfg.mm.quote_horizon_sec;
 
-        // ----- Funding term: expected funding PnL per unit over horizon tau -----
-        //
-        // funding_8h is the 8h funding rate. Expected funding over horizon tau:
-        // f_v ≈ funding_8h * (tau / 8h) * S_t
-        let f_raw = vstate.funding_8h * (tau / eight_hours_sec) * s_t;
-        let funding_term = cfg.mm.funding_weight * f_raw;
+        // Basis term: mid_v - S_t, if we have a mid.
+        let basis_term = vstate.mid.map(|m| m - s_t).unwrap_or(0.0);
 
-        // ----- Per-venue inventory target q_v,target -----
-        //
-        // φ(funding) = clip(slope * funding_8h, -clip, +clip).
-        let phi = {
-            let x = cfg.mm.funding_skew_slope * vstate.funding_8h;
-            x.clamp(-cfg.mm.funding_skew_clip, cfg.mm.funding_skew_clip)
-        };
-        let q_target_v = vcfg.w_liq * q_t + vcfg.w_fund * phi;
+        // Funding term: left as 0 for now until we wire real funding.
+        let funding_term = 0.0;
 
+        // Per-venue target inventory q_v^target = w_liq * q_t + w_fund * φ(funding).
+        // For now, φ(funding) = 0.0, so target = w_liq * q_t.
+        let target_q_v = vcfg.w_liq * q_t;
         let lambda_inv = cfg.mm.lambda_inv;
 
-        // Enhanced reservation price from the whitepaper:
+        // Enhanced reservation price:
         //
-        // S_t
-        // + β_b * b_v
-        // + β_f * f_v
-        // - γ_v * σ_eff^2 * τ * ( q_t - λ_inv (q_v - q_v,target) )
+        // \tilde{S}_t^{(v)} =
+        //   S_t
+        //   + β_b * basis_term
+        //   + β_f * funding_term
+        //   - γ_v σ_eff^2 τ ( q_t - λ_inv (q_v - q_v^target) )
+        //
         let reservation = s_t
-            + basis_term
-            + funding_term
-            - vcfg.gamma * sigma_eff.powi(2) * tau * (q_t - lambda_inv * (q_v - q_target_v));
+            + cfg.mm.basis_weight * basis_term
+            + cfg.mm.funding_weight * funding_term
+            - vcfg.gamma * sigma_eff.powi(2) * tau * (q_t - lambda_inv * (q_v - target_q_v));
 
-        // ----- AS half-spread with vol scaling -----
+        // AS half-spread.
         let delta_as = (1.0 / vcfg.gamma) * ((1.0 + vcfg.gamma / vcfg.k).ln());
         let delta_vol = delta_as * spread_mult;
 
-        // ----- Economic edge requirement -----
+        // Economic edge requirement.
         let maker_cost =
             (vcfg.maker_fee_bps - vcfg.maker_rebate_bps) / 10_000.0 * s_t;
         let v_buf = cfg.mm.edge_vol_mult * sigma_eff * s_t;
+        let min_half = ((cfg.mm.edge_local_min + maker_cost + v_buf) / 2.0).max(delta_vol);
 
-        let min_half = ((cfg.mm.edge_local_min + maker_cost + v_buf) / 2.0)
-            .max(delta_vol);
-
-        // ----- Size choice (simple; later we can plug in full Section 10 logic) -----
+        // Vol-scaled size with per-venue caps.
         let size = (vcfg.base_order_size * size_mult)
             .min(vcfg.max_order_size)
             .max(0.0);
