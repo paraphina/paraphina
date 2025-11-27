@@ -54,7 +54,7 @@ fn main() {
         engine.main_tick(&mut state, t_ms);
 
         // ---- New: toxicity + venue health classification ----
-        update_toxicity_and_health(&cfg, &mut state, t_ms);
+        update_toxicity_and_health(&mut state);
 
         println!("\n================ Tick {} ================", tick);
 
