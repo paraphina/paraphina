@@ -1,12 +1,12 @@
 // src/main.rs
 
 mod config;
-mod engine;
-mod hedge;
-mod mm;
 mod state;
-mod toxicity;
 mod types;
+mod engine;
+mod mm;
+mod hedge;
+mod toxicity;
 
 use crate::config::Config;
 use crate::engine::Engine;
@@ -34,7 +34,10 @@ fn main() {
     let cfg = Config::default();
     let mut state = GlobalState::new(&cfg);
 
-    println!("Paraphina MM starting with config version: {}", cfg.version);
+    println!(
+        "Paraphina MM starting with config version: {}",
+        cfg.version
+    );
     println!("Configured venues: {}", cfg.venues.len());
     println!("Initial risk regime: {:?}", state.risk_regime);
 
@@ -50,11 +53,11 @@ fn main() {
         // ---- Synthetic market data for this tick (dummy mids) ----
         engine.seed_dummy_mids(&mut state, t_ms);
 
+        // ---- Toxicity scaffold (placeholder; later: real flow metrics) ----
+        update_toxicity_and_health(&mut state);
+
         // ---- Core engine tick: fair value, vols, inventory, risk ----
         engine.main_tick(&mut state, t_ms);
-
-        // ---- New: toxicity + venue health classification ----
-        update_toxicity_and_health(&mut state);
 
         println!("\n================ Tick {} ================", tick);
 
@@ -79,7 +82,7 @@ fn main() {
             println!("Risk regime after tick: {:?}", state.risk_regime);
             println!("Kill switch: {}", state.kill_switch);
 
-            // ---- Per-venue toxicity & status ----
+            // ---- Per-venue toxicity snapshot ----
             println!("\nPer-venue toxicity & status:");
             for v in &state.venues {
                 println!(
@@ -88,48 +91,59 @@ fn main() {
                 );
             }
 
-            // ---- Market-making quotes ----
-            let quotes = compute_mm_quotes(&cfg, &state);
-            println!("\nPer-venue quotes:");
-            for q in &quotes {
-                println!(
-                    "  {:>10}: bid={:?}, ask={:?}",
-                    q.venue_id,
-                    q.bid.as_ref().map(|b| (b.price, b.size)),
-                    q.ask.as_ref().map(|a| (a.price, a.size)),
-                );
-            }
-
-            // ---- Hedge plan for this tick ----
-            let hedge_plan = compute_hedge_plan(&cfg, &state);
-            println!("\nHedge plan:");
-            match &hedge_plan {
-                None => {
-                    println!("  No hedge needed (inside dead band or no hedge venues).");
+            // ---- Risk gating: kill switch disables MM + hedging ----
+            if state.kill_switch {
+                println!("\nKill switch ACTIVE: suppressing quotes and hedge intents.");
+            } else {
+                // ---- Market-making quotes ----
+                let quotes = compute_mm_quotes(&cfg, &state);
+                println!("\nPer-venue quotes:");
+                for q in &quotes {
+                    println!(
+                        "  {:>10}: bid={:?}, ask={:?}",
+                        q.venue_id,
+                        q.bid.as_ref().map(|b| (b.price, b.size)),
+                        q.ask.as_ref().map(|a| (a.price, a.size)),
+                    );
                 }
-                Some(plan) => {
-                    println!("  Desired ΔH (TAO): {:+.4}", plan.desired_delta);
-                    for alloc in &plan.allocations {
+
+                // ---- Hedge plan for this tick ----
+                let hedge_plan = compute_hedge_plan(&cfg, &state);
+                println!("\nHedge plan:");
+                match &hedge_plan {
+                    None => {
                         println!(
-                            "  -> venue {:>10}: {:?} {:.4} @ ~{:.4}",
-                            alloc.venue_id, alloc.side, alloc.size, alloc.est_price,
+                            "  No hedge needed (inside dead band or no hedge venues)."
                         );
                     }
+                    Some(plan) => {
+                        println!("  Desired ΔH (TAO): {:+.4}", plan.desired_delta);
+                        for alloc in &plan.allocations {
+                            println!(
+                                "  -> venue {:>10}: {:?} {:.4} @ ~{:.4}",
+                                alloc.venue_id,
+                                alloc.side,
+                                alloc.size,
+                                alloc.est_price,
+                            );
+                        }
+                    }
                 }
-            }
 
-            // ---- Convert quotes + hedge plan into abstract order intents ----
-            let mut order_intents: Vec<OrderIntent> = mm_quotes_to_order_intents(&quotes);
-            if let Some(plan) = &hedge_plan {
-                order_intents.extend(hedge_plan_to_order_intents(plan));
-            }
+                // ---- Convert quotes + hedge plan into abstract order intents ----
+                let mut order_intents: Vec<OrderIntent> =
+                    mm_quotes_to_order_intents(&quotes);
+                if let Some(plan) = &hedge_plan {
+                    order_intents.extend(hedge_plan_to_order_intents(plan));
+                }
 
-            println!("\nOrder intents (abstract):");
-            for oi in &order_intents {
-                println!(
-                    "  {:>10} {:?} {:.4} @ {:.4} ({:?})",
-                    oi.venue_id, oi.side, oi.size, oi.price, oi.purpose
-                );
+                println!("\nOrder intents (abstract):");
+                for oi in &order_intents {
+                    println!(
+                        "  {:>10} {:?} {:.4} @ {:.4} ({:?})",
+                        oi.venue_id, oi.side, oi.size, oi.price, oi.purpose
+                    );
+                }
             }
         } else {
             println!("Fair value not initialised yet (no mids).");
