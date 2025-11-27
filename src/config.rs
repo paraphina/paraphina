@@ -18,6 +18,8 @@ pub struct Config {
     pub mm: MmConfig,
     /// Hedge engine (global LQ controller + band).
     pub hedge: HedgeConfig,
+    /// Toxicity scoring + venue health config.
+    pub toxicity: ToxicityConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +164,16 @@ pub struct HedgeConfig {
     pub beta_hedge: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ToxicityConfig {
+    /// Scale for converting local vol ratio to toxicity feature.
+    pub vol_tox_scale: f64,
+    /// Toxicity threshold between low and medium.
+    pub tox_med_threshold: f64,
+    /// Toxicity threshold for disabling venue.
+    pub tox_high_threshold: f64,
+}
+
 impl Default for Config {
     fn default() -> Self {
         // ----- Venue configs -----
@@ -291,7 +303,7 @@ impl Default for Config {
             funding_weight: 0.3,
             edge_local_min: 0.5,
             edge_vol_mult: 0.2,
-            size_eta: 0.1,              // <--- NEW
+            size_eta: 0.1,
             lambda_inv: 0.5,
             quote_horizon_sec: 30.0,
             funding_skew_slope: 10_000.0,
@@ -305,6 +317,13 @@ impl Default for Config {
             beta_hedge: 1.0,
         };
 
+        let toxicity = ToxicityConfig {
+            // If local vol is ~50% higher than sigma_eff, toxicity ≈ 1.
+            vol_tox_scale: 0.5,
+            tox_med_threshold: 0.4,
+            tox_high_threshold: 0.8,
+        };
+
         Config {
             version: "v0.1.0-whitepaper-structure",
             venues,
@@ -314,6 +333,7 @@ impl Default for Config {
             risk,
             mm,
             hedge,
+            toxicity,
         }
     }
 }

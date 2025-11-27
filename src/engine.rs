@@ -2,8 +2,8 @@
 //
 // Core strategy engine scaffolding: main loop tick, Kalman fair value,
 // volatility EWMAs, volatility-driven control scalars, inventory/basis
-// recomputation, and risk-regime classification. All mapped to
-// Sections 5, 6, 8 and 14 of the whitepaper.
+// recomputation, simplified PnL, and risk-regime classification.
+// Mapped to Sections 5, 6, 8, 9 and 14 of the whitepaper.
 
 use crate::config::Config;
 use crate::state::{GlobalState, RiskRegime};
@@ -55,22 +55,27 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// One "main loop" tick as per Section 16.1, currently restricted to:
+    /// One "main loop" tick:
     ///  - fair value & volatility updates (Sections 5 & 6),
     ///  - volatility scalars,
     ///  - inventory & basis recomputation (Section 8),
+    ///  - mark-to-market PnL scaffold (Section 9),
     ///  - risk regime & kill switch (Section 14).
     pub fn main_tick(&self, state: &mut GlobalState, now_ms: TimestampMs) {
         self.update_fair_value_and_vol(state, now_ms);
         self.update_volatility_scalars(state);
         self.recompute_inventory_and_basis(state);
-    
-        // ✅ correct call – only pass state
-        update_toxicity(state);
-    
+
+        // Toxicity + venue health, using cfg.toxicity
+        update_toxicity(state, self.cfg);
+
+        // Simplified mark-to-market PnL based on global inventory.
+        self.update_pnl_mark_to_market(state);
+
+        // Finally, risk regime & kill switch based on limits and PnL.
         self.update_risk_regime(state);
     }
-      
+
     // ----------------- Section 5 & 6: Kalman + vol -----------------
 
     fn update_fair_value_and_vol(&self, state: &mut GlobalState, now_ms: TimestampMs) {
@@ -107,6 +112,11 @@ impl<'a> Engine<'a> {
                 state.kf_p = kalman_cfg.p_init;
                 state.fair_value_prev = state.fair_value;
                 state.fair_value = Some(median);
+
+                // Initialise PnL reference fair value on the first fair-value estimate.
+                if state.pnl_ref_fair_value.is_none() {
+                    state.pnl_ref_fair_value = Some(median);
+                }
             } else {
                 // No mids anywhere; cannot update KF yet.
                 return;
@@ -193,6 +203,11 @@ impl<'a> Engine<'a> {
         state.fair_value_prev = prev_fv;
         state.fair_value = Some(s_t);
 
+        // If we still don't have a PnL reference for some reason, set it now.
+        if state.pnl_ref_fair_value.is_none() {
+            state.pnl_ref_fair_value = Some(s_t);
+        }
+
         // ----- Volatility EWMA updates on log returns -----
         if let Some(prev) = prev_fv {
             if prev > 0.0 {
@@ -249,68 +264,54 @@ impl<'a> Engine<'a> {
 
     // ----------------- Section 8: inventory & basis -----------------
 
-        // ----------------- Section 8 & 14.2: inventory, basis & PnL -----------------
+    fn recompute_inventory_and_basis(&self, state: &mut GlobalState) {
+        // Global inventory q_t = sum_v q_v.
+        let mut q_t = 0.0;
+        for v in &state.venues {
+            q_t += v.position_tao;
+        }
+        state.q_global_tao = q_t;
 
-        fn recompute_inventory_and_basis(&self, state: &mut GlobalState) {
-            // ---- Global inventory q_t = sum_v q_v ----
-            let mut q_t = 0.0;
-            for v in &state.venues {
-                q_t += v.position_tao;
+        // If we don't have a fair value yet, zero the derived metrics.
+        let Some(s_t) = state.fair_value else {
+            state.dollar_delta_usd = 0.0;
+            state.basis_usd = 0.0;
+            state.basis_gross_usd = 0.0;
+            return;
+        };
+
+        state.dollar_delta_usd = q_t * s_t;
+
+        let mut basis = 0.0;
+        let mut basis_gross = 0.0;
+
+        for v in &state.venues {
+            let q_v = v.position_tao;
+            if let Some(mid) = v.mid {
+                let b_v = mid - s_t;
+                basis += q_v * b_v;
+                basis_gross += q_v.abs() * b_v.abs();
             }
-            state.q_global_tao = q_t;
-    
-            // If we don't have a fair value yet, we can only compute partial metrics.
-            let Some(s_t) = state.fair_value else {
-                state.dollar_delta_usd = 0.0;
-                state.basis_usd = 0.0;
-                state.basis_gross_usd = 0.0;
-    
-                // Realised PnL is still meaningful even without S_t.
-                let mut daily_realised = 0.0;
-                for v in &state.venues {
-                    daily_realised += v.pnl_realised + v.pnl_funding + v.pnl_fees;
-                }
-                state.daily_realised_pnl = daily_realised;
-                state.daily_unrealised_pnl = 0.0;
-                state.daily_pnl_total = daily_realised;
-    
-                return;
-            };
-    
-            state.dollar_delta_usd = q_t * s_t;
-    
-            let mut basis = 0.0;
-            let mut basis_gross = 0.0;
-            let mut daily_realised = 0.0;
-            let mut daily_unrealised = 0.0;
-    
-            for v in &mut state.venues {
-                let q_v = v.position_tao;
-    
-                // Basis exposure using local mid vs global fair value.
-                if let Some(mid) = v.mid {
-                    let b_v = mid - s_t;
-                    basis += q_v * b_v;
-                    basis_gross += q_v.abs() * b_v.abs();
-                }
-    
-                // Unrealised PnL only if we have a sensible entry price.
-                if q_v != 0.0 && v.vwap > 0.0 {
-                    v.pnl_unrealised = q_v * (s_t - v.vwap);
-                } else {
-                    v.pnl_unrealised = 0.0;
-                }
-    
-                daily_realised += v.pnl_realised + v.pnl_funding + v.pnl_fees;
-                daily_unrealised += v.pnl_unrealised;
-            }
-    
-            state.basis_usd = basis;
-            state.basis_gross_usd = basis_gross;
-            state.daily_realised_pnl = daily_realised;
-            state.daily_unrealised_pnl = daily_unrealised;
-            state.daily_pnl_total = daily_realised + daily_unrealised;
-        }    
+        }
+
+        state.basis_usd = basis;
+        state.basis_gross_usd = basis_gross;
+    }
+
+    // ----------------- Section 9: simplified PnL scaffold -----------------
+
+    fn update_pnl_mark_to_market(&self, state: &mut GlobalState) {
+        let (Some(s_t), Some(s_ref)) = (state.fair_value, state.pnl_ref_fair_value) else {
+            state.daily_unrealised_pnl = 0.0;
+            return;
+        };
+
+        // Simple global unrealised PnL since reference:
+        //   PnL_unrealised ≈ q_t * (S_t - S_ref).
+        let q_t = state.q_global_tao;
+        state.daily_unrealised_pnl = q_t * (s_t - s_ref);
+        // realised PnL stays as-is (we'll wire real fills later).
+    }
 
     // ----------------- Section 14: risk regime & kill switch -----------------
 
@@ -367,4 +368,14 @@ impl<'a> Engine<'a> {
         state.basis_limit_warn_usd = basis_warn;
         state.basis_limit_hard_usd = risk_cfg.basis_hard_limit_usd;
     }
+
+    /// Recompute inventory, basis and risk after hedge / MM fills have been
+    /// applied to the state. This does **not** touch fair value, volatility,
+    /// or toxicity; it just refreshes Section 8 + 14 from the new positions.
+    pub fn recompute_after_fills(&self, state: &mut GlobalState) {
+        self.recompute_inventory_and_basis(state);
+        self.update_risk_regime(state);
+    }
 }
+
+

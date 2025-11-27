@@ -3,9 +3,11 @@
 // Avellaneda–Stoikov style quoting with the whitepaper's additions:
 //  - global + per-venue inventory,
 //  - per-venue basis and funding terms in the reservation price,
-//  - per-venue inventory targets from liquidity + funding preferences,
+//  - (placeholder) per-venue inventory targets,
 //  - volatility scaling of spreads,
-//  - edge-proportional size choice (Section 10),
+//  - quadratic size objective J(Q) = e Q - 0.5 η Q^2,
+//  - toxicity + liquidation-distance gating,
+//  - simple Warning regime hooks,
 //  - conversion to abstract OrderIntent structs.
 
 use crate::config::Config;
@@ -28,44 +30,51 @@ pub struct VenueQuote {
 
 /// Compute model-based quotes per venue.
 ///
-/// Reservation price matches whitepaper 9.1, spread matches 9.2,
-/// and size follows Section 10:
+/// Still “toy” on funding / inventory targets:
+///  - basis term = mid_v - S_t,
+///  - funding term just passes through v.funding_8h,
+///  - per-venue target inventory is 0 for now.
 ///
-///   J(Q) = e Q - 0.5 η Q^2  ->  Q_raw = max(0, e / η)
-///
-/// then scaled and capped.
+/// But the structural pieces match the whitepaper:
+///  - enhanced AS reservation price,
+///  - volatility-scaled spreads,
+///  - quadratic size choice with η,
+///  - Warning regime widening + size cap,
+///  - toxicity & liquidation-distance gating.
 pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<VenueQuote> {
-    // Global kill-switch disables all quoting.
+    // Global kill-switch: no quoting at all.
     if state.kill_switch {
         return Vec::new();
     }
 
-    let risk_cfg = &cfg.risk;
-
     // Fair value and effective volatility.
     let s_t = state.fair_value.unwrap_or(250.0);
-
     let sigma_eff = if state.sigma_eff > 0.0 {
         state.sigma_eff
     } else {
-        cfg.volatility.sigma_min.max(1e-6)
+        0.02
     };
 
-    // Volatility-driven control scalars from the engine.
-    let spread_mult = state.spread_mult;
-    let size_mult = state.size_mult;
-
+    let risk_cfg = &cfg.risk;
+    let tox_cfg = &cfg.toxicity;
     let mm_cfg = &cfg.mm;
-    let eta = mm_cfg.size_eta.max(1e-9);
-    let regime = state.risk_regime;
+
+    // ----- Global volatility-driven scalars, then Warning regime tweaks -----
+    let mut base_spread_mult = state.spread_mult;
+    let base_size_mult = state.size_mult;
+
+    // Warning regime: widen spreads as per SPREAD_WARN_MULT.
+    if matches!(state.risk_regime, RiskRegime::Warning) {
+        base_spread_mult *= risk_cfg.spread_warn_mult.max(1.0);
+    }
 
     let mut out = Vec::with_capacity(cfg.venues.len());
 
     for (idx, vcfg) in cfg.venues.iter().enumerate() {
         let v_state = &state.venues[idx];
 
-        // Skip non-healthy venues entirely.
-        if v_state.status != VenueStatus::Healthy {
+        // Skip venues that are fully disabled.
+        if v_state.status == VenueStatus::Disabled {
             out.push(VenueQuote {
                 venue_index: idx,
                 venue_id: vcfg.id.clone(),
@@ -75,164 +84,180 @@ pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<VenueQuote> {
             continue;
         }
 
+        // Toxicity-based behaviour:
+        //  - tox < tox_med_threshold  => "healthy"
+        //  - tox in [med, high)       => medium toxic: shrink sizes
+        //  - tox >= tox_high_threshold=> status would already be Disabled above
+        let tox = v_state.toxicity;
+        let medium_toxic = tox >= tox_cfg.tox_med_threshold;
+
+        // ----- Start from global scalars, then apply per-venue liq gating -----
+        let mut spread_mult = base_spread_mult;
+        let mut size_mult = base_size_mult;
+
+        // Liquidation-distance gating in sigma units.
+        let mut dist_liq = v_state.dist_liq_sigma;
+        if !dist_liq.is_finite() || dist_liq <= 0.0 {
+            // Treat non-finite / non-positive as "far away" for now.
+            dist_liq = f64::INFINITY;
+        }
+
+        let liq_warn = risk_cfg.liq_warn_sigma;
+        let liq_crit = risk_cfg.liq_crit_sigma;
+
+        // Inside critical zone: do not quote at all.
+        if dist_liq <= liq_crit {
+            out.push(VenueQuote {
+                venue_index: idx,
+                venue_id: vcfg.id.clone(),
+                bid: None,
+                ask: None,
+            });
+            continue;
+        }
+
+        // Warning zone between liq_crit and liq_warn:
+        //  - linearly shrink sizes to 0 as dist→liq_crit,
+        //  - widen spreads up to ~2x as we approach liq_crit.
+        if dist_liq <= liq_warn && liq_warn > liq_crit {
+            let t = ((dist_liq - liq_crit) / (liq_warn - liq_crit))
+                .max(0.0)
+                .min(1.0); // t=1 at warn edge, t→0 near critical
+
+            size_mult *= t;
+            spread_mult *= 1.0 + (1.0 - t); // between 1x and 2x
+        }
+
         // -------- Inventory inputs --------
-        let q_t = state.q_global_tao;     // global inventory
-        let q_v = v_state.position_tao;   // per-venue inventory
+        let q_t = state.q_global_tao;   // global inventory
+        let q_v = v_state.position_tao; // per-venue inventory
 
         // -------- Basis & funding terms --------
-
-        // Basis b_v = m_v - S_t.
         let mid_v = v_state.mid.unwrap_or(s_t);
-        let b_v = mid_v - s_t;
+        let basis_term = mid_v - s_t;
 
-        // Funding per unit over horizon τ:
-        //   f_v ≈ funding_8h * (τ / 8h) * S_t.
-        let funding_8h = v_state.funding_8h;
+        // funding_8h is dimensionless (rate per 8h); we treat it as a signal for now.
+        let funding_term = v_state.funding_8h;
+
+        // Placeholder per-venue inventory target.
+        let target_q_v = 0.0;
+
+        // λ_inv from the whitepaper (inventory coupling between global and per-venue).
+        let lambda_inv = mm_cfg.lambda_inv;
+
+        // Time horizon for the AS optimisation.
         let tau = mm_cfg.quote_horizon_sec;
-        let eight_hours_sec = 8.0 * 60.0 * 60.0;
-        let funding_factor = if eight_hours_sec > 0.0 {
-            tau / eight_hours_sec
-        } else {
-            0.0
-        };
-        let f_v = funding_8h * funding_factor * s_t;
 
-        // Funding→inventory skew map φ(funding_8h).
-        let phi_raw = mm_cfg.funding_skew_slope * funding_8h;
-        let phi = phi_raw
-            .max(-mm_cfg.funding_skew_clip)
-            .min(mm_cfg.funding_skew_clip);
-
-        // Per-venue target inventory:
-        //   q_v_target = w_liq * q_t + w_fund * φ.
-        let q_v_target = vcfg.w_liq * q_t + vcfg.w_fund * phi;
-
-        // λ_inv ∈ [0,1] controls how strongly we anchor to per-venue targets.
-        let lambda_inv = mm_cfg.lambda_inv.clamp(0.0, 1.0);
-
-        // Inventory tilt term inside the AS reservation price.
-        let inventory_term = q_t - lambda_inv * (q_v - q_v_target);
-
-        // -------- Enhanced reservation price (whitepaper 9.1) --------
+        // -------- Reservation price S̃_v(t) --------
+        //
+        // S̃_v = S_t
+        //      + β_b * basis_term
+        //      + β_f * funding_term
+        //      - γ_v * σ_eff^2 * τ * [ q_t - λ_inv (q_v - q_v^{target}) ].
         let reservation = s_t
-            + mm_cfg.basis_weight * b_v
-            + mm_cfg.funding_weight * f_v
-            - vcfg.gamma * sigma_eff.powi(2) * tau * inventory_term;
+            + mm_cfg.basis_weight * basis_term
+            + mm_cfg.funding_weight * funding_term
+            - vcfg.gamma * sigma_eff.powi(2) * tau * (q_t - lambda_inv * (q_v - target_q_v));
 
-        // -------- Avellaneda–Stoikov half-spread (whitepaper 9.2) --------
-        // δ_AS = (1/γ_v) * ln(1 + γ_v / k_v).
-        let delta_as = if vcfg.gamma > 0.0 && vcfg.k > 0.0 {
-            (1.0 / vcfg.gamma) * ((1.0 + vcfg.gamma / vcfg.k).ln())
-        } else {
-            0.0
-        };
+        // -------- Avellaneda–Stoikov half-spread --------
+        //
+        // δ_AS = (1 / γ_v) * ln(1 + γ_v / k_v).
+        let delta_as = (1.0 / vcfg.gamma) * ((1.0 + vcfg.gamma / vcfg.k).ln());
 
-        // Volatility scaling.
+        // Volatility + risk driven spreads.
         let delta_vol = delta_as * spread_mult;
 
         // -------- Economic edge requirement --------
         //
-        // Maker cost near mid:
+        // Maker cost near mid, plus volatility protection buffer.
         let maker_cost =
             (vcfg.maker_fee_bps - vcfg.maker_rebate_bps) / 10_000.0 * s_t;
-
-        // Volatility buffer.
         let v_buf = mm_cfg.edge_vol_mult * sigma_eff * s_t;
 
-        // Minimum half-spread we're willing to quote:
-        let min_half = ((mm_cfg.edge_local_min + maker_cost + v_buf) / 2.0)
-            .max(delta_vol);
+        // Minimum half-spread we’re willing to quote.
+        let min_half =
+            ((mm_cfg.edge_local_min + maker_cost + v_buf) / 2.0).max(delta_vol);
 
-        // -------- Raw quotes, then tick snapping --------
-        let tick = vcfg.tick_size.max(1e-9);
+        // -------- Candidate prices (pre-tick) --------
+        let mut bid_price = reservation - min_half;
+        let mut ask_price = reservation + min_half;
 
-        let bid_raw = reservation - min_half;
-        let ask_raw = reservation + min_half;
+        // Snap to tick grid.
+        let tick = vcfg.tick_size.max(1e-6);
+        bid_price = (bid_price / tick).floor() * tick;
+        ask_price = (ask_price / tick).ceil() * tick;
 
-        let bid = (bid_raw / tick).floor() * tick;
-        let ask = (ask_raw / tick).ceil() * tick;
+        // -------- Per-unit edges for bid / ask --------
+        //
+        // e_bid = (S_t - bid) - maker_cost - v_buf
+        // e_ask = (ask - S_t) - maker_cost - v_buf
+        let e_bid = (s_t - bid_price) - maker_cost - v_buf;
+        let e_ask = (ask_price - s_t) - maker_cost - v_buf;
 
-        // -------- Helper for edge-based size choice (Section 10) --------
-        let make_side = |price: f64, e: f64| -> Option<SideQuote> {
-            if price <= 0.0 {
-                return None;
+        // -------- Size choice from quadratic objective --------
+        //
+        // J(Q) = e Q - 0.5 η Q^2  ⇒  Q_raw = e / η  for e > 0, else 0.
+        let eta = mm_cfg.size_eta.max(1e-9);
+        let size_mult_local = size_mult; // capture by value for the closure
+
+        let size_from_edge = |e: f64| -> f64 {
+            if e <= 0.0 {
+                return 0.0;
             }
 
-            // Require minimum per-unit edge.
-            if e < mm_cfg.edge_local_min {
-                return None;
-            }
+            // Unconstrained optimum.
+            let mut q = e / eta;
 
-            // Unconstrained optimum from J(Q) = e Q - 0.5 η Q^2:
-            //   Q_raw = e / η.
-            let mut q_raw = e / eta;
-            if q_raw <= 0.0 {
-                return None;
-            }
+            // Volatility & liquidation scaling.
+            q *= size_mult_local;
 
-            // Volatility scaling.
-            q_raw *= size_mult;
-
-            // Per-venue hard max.
-            let mut q = q_raw.min(vcfg.max_order_size);
-
-            // ---------- Margin-based cap (Section 10, step 3) ----------
-            //
-            // notional_quote = |Q| * price_side
-            // Q_margin_max   = margin_available * MM_MAX_LEVERAGE * MM_MARGIN_SAFETY / price_side
-            let margin_avail = v_state.margin_available.max(0.0);
-            if margin_avail > 0.0 {
-                let q_margin_max = margin_avail
-                    * risk_cfg.mm_max_leverage
-                    * risk_cfg.mm_margin_safety
-                    / (price + 1e-9);
-
-                if q_margin_max > 0.0 {
-                    q = q.min(q_margin_max);
-                }
-            }
-
-            // ---------- Liquidation-distance shrink (Section 10, step 4) ----------
-            let dist = v_state.dist_liq_sigma;
-            let liq_warn = risk_cfg.liq_warn_sigma;
-            let liq_crit = risk_cfg.liq_crit_sigma;
-
-            if dist.is_finite() && dist < liq_warn {
-                // Linear shrink from 1 at liq_warn to 0 at liq_crit.
-                let num = (dist - liq_crit).max(0.0);
-                let den = (liq_warn - liq_crit).max(1e-9);
-                let k_liq = (num / den).min(1.0);
-                q *= k_liq;
-
-                // If we're inside Critical distance, k_liq will be 0.
-            }
-
-            // ---------- Risk-regime cap (Warning) ----------
-            if let RiskRegime::Warning = regime {
+            // Warning risk regime: cap per-order size.
+            if matches!(state.risk_regime, RiskRegime::Warning) {
                 q = q.min(risk_cfg.q_warn_cap);
             }
 
-            // Simple minimum: don't bother with dust.
-            let min_size = (vcfg.base_order_size * 0.25).max(1e-6);
-            if q < min_size {
-                return None;
+            // Medium toxicity: shrink sizes.
+            if medium_toxic {
+                q *= 0.5;
             }
 
-            Some(SideQuote { price, size: q })
+            // Per-venue max.
+            q = q.min(vcfg.max_order_size);
+
+            // No negatives.
+            if q < 0.0 {
+                q = 0.0;
+            }
+
+            q
         };
 
-        // -------- Per-side local edges and gating --------
-        let e_bid = s_t - bid - maker_cost - v_buf;
-        let e_ask = ask - s_t - maker_cost - v_buf;
+        let bid_size = size_from_edge(e_bid);
+        let ask_size = size_from_edge(e_ask);
 
-        let bid_side = make_side(bid, e_bid);
-        let ask_side = make_side(ask, e_ask);
+        let bid = if bid_size > 0.0 {
+            Some(SideQuote {
+                price: bid_price,
+                size: bid_size,
+            })
+        } else {
+            None
+        };
+
+        let ask = if ask_size > 0.0 {
+            Some(SideQuote {
+                price: ask_price,
+                size: ask_size,
+            })
+        } else {
+            None
+        };
 
         out.push(VenueQuote {
             venue_index: idx,
             venue_id: vcfg.id.clone(),
-            bid: bid_side,
-            ask: ask_side,
+            bid,
+            ask,
         });
     }
 
