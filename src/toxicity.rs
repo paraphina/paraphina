@@ -1,68 +1,77 @@
 // src/toxicity.rs
 //
-// Venue toxicity + health scoring (Section 7 of the whitepaper).
-// Right now we fully implement feature f1 (relative venue vol) and
-// leave the flow/markout-based features as 0.0 until we wire real data.
+// Very small toxicity scoring module.
+//
+// It mirrors the structure of Section 7 of the whitepaper but, for now,
+// only uses feature f1 (relative local vol vs global sigma_eff).
+// The other features (markouts, imbalance, flow, throughput) are
+// placeholders and stay at 0 until we wire real data.
 
-use crate::config::Config;
 use crate::state::GlobalState;
 use crate::types::VenueStatus;
 
-/// Update per-venue toxicity score in [0,1] and VenueStatus.
+// How aggressive we treat "extra volatility" as toxic.
+// Larger VOL_TOX_SCALE means we need a bigger vol jump to hit f1 = 1.
+const VOL_TOX_SCALE: f64 = 1.0;
+
+// Regime thresholds.
+const TOX_MED_THRESHOLD: f64 = 0.4;
+const TOX_HIGH_THRESHOLD: f64 = 0.8;
+
+// Feature weights w1..w5. For now w1 dominates because we only
+// implement f1; the others stay 0.0 until we add real data.
+const W1: f64 = 0.8;
+const W2: f64 = 0.05;
+const W3: f64 = 0.05;
+const W4: f64 = 0.05;
+const W5: f64 = 0.05;
+
+// Clamp to [0,1].
+fn clip01(x: f64) -> f64 {
+    if x < 0.0 {
+        0.0
+    } else if x > 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+/// Update per-venue toxicity score and status.
 ///
-/// For now:
-///   - f1: relative venue vol vs global sigma_eff
-///   - f2..f5: stubs (0.0) until we add flows / markouts / imbalance
-pub fn update_toxicity_and_health(cfg: &Config, state: &mut GlobalState) {
-    let tox_cfg = &cfg.toxicity;
+/// - toxicity_v ∈ [0,1]
+/// - status_v ∈ {Healthy, Degraded, Disabled}
+pub fn update_toxicity(state: &mut GlobalState) {
+    let sigma_eff = state.sigma_eff;
 
-    // Use sigma_eff as the reference volatility.
-    let sigma_eff = state.sigma_eff.max(1e-9);
+    for v in state.venues.iter_mut() {
+        let mut tox = 0.0;
 
-    for v in &mut state.venues {
-        // -------- f1: relative venue vol --------
-        let ratio = if sigma_eff > 0.0 {
-            v.local_vol_short / sigma_eff
-        } else {
-            0.0
-        };
+        if sigma_eff > 0.0 {
+            // f1: relative venue vol vs global vol.
+            //
+            // ratio_v = local_vol_short_v / sigma_eff
+            // f1 = clip((ratio_v - 1) / VOL_TOX_SCALE, 0, 1)
+            let ratio = (v.local_vol_short / sigma_eff).max(0.0);
+            let f1 = clip01((ratio - 1.0) / VOL_TOX_SCALE);
 
-        // Map (ratio - 1) / VOL_TOX_SCALE into [0,1], clipped.
-        let f1 = ((ratio - 1.0) / tox_cfg.vol_tox_scale)
-            .max(0.0)
-            .min(1.0);
+            // Placeholders for now (we will wire these later from real data):
+            let f2 = 0.0; // negative markouts fraction
+            let f3 = 0.0; // order book imbalance
+            let f4 = 0.0; // directional aggressive flow
+            let f5 = 0.0; // total throughput
 
-        // -------- Placeholders for f2..f5 --------
-        // Until we wire negative markouts, order-book imbalance and flow,
-        // we leave these as 0.0.
-        let f2 = 0.0; // neg markouts fraction
-        let f3 = 0.0; // order book imbalance
-        let f4 = 0.0; // directional aggressive flow
-        let f5 = 0.0; // throughput
-
-        // Weighted sum -> toxicity in [0,1].
-        let tox = (tox_cfg.w1 * f1
-            + tox_cfg.w2 * f2
-            + tox_cfg.w3 * f3
-            + tox_cfg.w4 * f4
-            + tox_cfg.w5 * f5)
-            .max(0.0)
-            .min(1.0);
+            tox = clip01(W1 * f1 + W2 * f2 + W3 * f3 + W4 * f4 + W5 * f5);
+        }
 
         v.toxicity = tox;
 
-        // -------- VenueStatus classification --------
-        v.status = if tox >= tox_cfg.tox_high_threshold {
-            // High toxicity → disable venue (no quoting / hedging).
-            VenueStatus::Disabled
-        } else if tox >= tox_cfg.tox_med_threshold {
-            // Medium toxicity → in a more complete implementation we might
-            // mark Degraded and shrink quotes. For now, keep Healthy so that
-            // quoting logic can still run, but you can see toxicity values
-            // on the console.
+        v.status = if tox < TOX_MED_THRESHOLD {
             VenueStatus::Healthy
+        } else if tox < TOX_HIGH_THRESHOLD {
+            VenueStatus::Degraded
         } else {
-            VenueStatus::Healthy
+            VenueStatus::Disabled
         };
     }
 }

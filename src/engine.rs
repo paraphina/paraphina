@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 use crate::state::{GlobalState, RiskRegime};
+use crate::toxicity;
 use crate::types::{TimestampMs, VenueStatus};
 
 pub struct Engine<'a> {
@@ -25,12 +26,32 @@ impl<'a> Engine<'a> {
         let spread = 1.0;
         let depth = 1_000.0;
 
+        // Use a tiny deterministic "jitter" based on time so mids move a bit and
+        // we see non-zero local vol & toxicity.
+        let t_step = (now_ms / 1_000) % 10; // 0..9, wraps every 10 seconds
+        let t_jitter = t_step as f64 * 0.01; // up to ~0.09 USD
+
         for (i, v) in state.venues.iter_mut().enumerate() {
-            let mid = base_price + i as f64 * 0.5;
+            let old_mid = v.mid;
+
+            // Base mid differs slightly per venue plus the shared jitter.
+            let mid = base_price + i as f64 * 0.5 + t_jitter;
+
             v.mid = Some(mid);
             v.spread = Some(spread);
             v.depth_near_mid = depth;
             v.last_mid_update_ms = Some(now_ms);
+
+            // Simple short-horizon EWMA vol on log mid returns.
+            if let Some(prev_mid) = old_mid {
+                if prev_mid > 0.0 {
+                    let r = (mid / prev_mid).ln();
+                    let alpha = 0.3_f64; // EWMA weight
+                    let var_old = v.local_vol_short * v.local_vol_short;
+                    let var_new = (1.0 - alpha) * var_old + alpha * r * r;
+                    v.local_vol_short = var_new.max(0.0).sqrt();
+                }
+            }
         }
     }
 
@@ -43,13 +64,12 @@ impl<'a> Engine<'a> {
         self.update_fair_value_and_vol(state, now_ms);
         self.update_volatility_scalars(state);
 
-        // NEW: toxicity + venue health (Section 7).
-        crate::toxicity::update_toxicity_and_health(self.cfg, state);
+        // New: per-venue toxicity scoring (Section 7).
+        toxicity::update_toxicity(state);
 
         self.recompute_inventory_and_basis(state);
         self.update_risk_regime(state);
         // Later we will add:
-        //  - more detailed toxicity/venue gating,
         //  - quoting & order management,
         //  - hedging & exits.
     }
@@ -151,8 +171,7 @@ impl<'a> Engine<'a> {
             // ----- Sequential scalar KF updates for each observation -----
             for ob in obs {
                 let mut r =
-                    kalman_cfg.r_a * ob.spread * ob.spread +
-                    kalman_cfg.r_b / (ob.depth + 1e-9);
+                    kalman_cfg.r_a * ob.spread * ob.spread + kalman_cfg.r_b / (ob.depth + 1e-9);
 
                 if r < kalman_cfg.r_min {
                     r = kalman_cfg.r_min;
@@ -188,10 +207,8 @@ impl<'a> Engine<'a> {
                 let alpha_s = vol_cfg.fv_vol_alpha_short;
                 let alpha_l = vol_cfg.fv_vol_alpha_long;
 
-                let var_short_new =
-                    (1.0 - alpha_s) * var_short + alpha_s * r_t * r_t;
-                let var_long_new =
-                    (1.0 - alpha_l) * var_long + alpha_l * r_t * r_t;
+                let var_short_new = (1.0 - alpha_s) * var_short + alpha_s * r_t * r_t;
+                let var_long_new = (1.0 - alpha_l) * var_long + alpha_l * r_t * r_t;
 
                 state.fv_short_vol = var_short_new.max(0.0).sqrt();
                 state.fv_long_vol = var_long_new.max(0.0).sqrt();
@@ -280,16 +297,13 @@ impl<'a> Engine<'a> {
         } else {
             1.0
         };
-        let delta_limit =
-            risk_cfg.delta_hard_limit_usd_base / vol_ratio.max(1e-9);
+        let delta_limit = risk_cfg.delta_hard_limit_usd_base / vol_ratio.max(1e-9);
 
         // Basis Warning threshold.
-        let basis_warn =
-            risk_cfg.basis_warn_frac * risk_cfg.basis_hard_limit_usd;
+        let basis_warn = risk_cfg.basis_warn_frac * risk_cfg.basis_hard_limit_usd;
 
         // Total daily PnL = realised + unrealised.
-        let pnl_total =
-            state.daily_realised_pnl + state.daily_unrealised_pnl;
+        let pnl_total = state.daily_realised_pnl + state.daily_unrealised_pnl;
         state.daily_pnl_total = pnl_total;
 
         let abs_delta = state.dollar_delta_usd.abs();
@@ -308,11 +322,9 @@ impl<'a> Engine<'a> {
             kill = true;
         } else {
             // Warning conditions.
-            let delta_warn_level =
-                risk_cfg.delta_warn_frac * delta_limit;
+            let delta_warn_level = risk_cfg.delta_warn_frac * delta_limit;
             let basis_warn_level = basis_warn;
-            let pnl_warn_level =
-                risk_cfg.pnl_warn_frac * risk_cfg.daily_loss_limit;
+            let pnl_warn_level = risk_cfg.pnl_warn_frac * risk_cfg.daily_loss_limit;
 
             if abs_delta > delta_warn_level
                 || abs_basis > basis_warn_level

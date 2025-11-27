@@ -1,12 +1,12 @@
 // src/main.rs
 
 mod config;
-mod state;
-mod types;
 mod engine;
-mod mm;
 mod hedge;
+mod mm;
+mod state;
 mod toxicity;
+mod types;
 
 use crate::config::Config;
 use crate::engine::Engine;
@@ -33,10 +33,7 @@ fn main() {
     let cfg = Config::default();
     let mut state = GlobalState::new(&cfg);
 
-    println!(
-        "Paraphina MM starting with config version: {}",
-        cfg.version
-    );
+    println!("Paraphina MM starting with config version: {}", cfg.version);
     println!("Configured venues: {}", cfg.venues.len());
     println!("Initial risk regime: {:?}", state.risk_regime);
 
@@ -104,27 +101,21 @@ fn main() {
             println!("\nHedge plan:");
             match &hedge_plan {
                 None => {
-                    println!(
-                        "  No hedge needed (inside dead band or no hedge venues)."
-                    );
+                    println!("  No hedge needed (inside dead band or no hedge venues).");
                 }
                 Some(plan) => {
                     println!("  Desired ΔH (TAO): {:+.4}", plan.desired_delta);
                     for alloc in &plan.allocations {
                         println!(
                             "  -> venue {:>10}: {:?} {:.4} @ ~{:.4}",
-                            alloc.venue_id,
-                            alloc.side,
-                            alloc.size,
-                            alloc.est_price,
+                            alloc.venue_id, alloc.side, alloc.size, alloc.est_price,
                         );
                     }
                 }
             }
 
             // ---- Convert quotes + hedge plan into abstract order intents ----
-            let mut order_intents: Vec<OrderIntent> =
-                mm_quotes_to_order_intents(&quotes);
+            let mut order_intents: Vec<OrderIntent> = mm_quotes_to_order_intents(&quotes);
             if let Some(plan) = &hedge_plan {
                 order_intents.extend(hedge_plan_to_order_intents(plan));
             }

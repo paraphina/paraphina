@@ -251,23 +251,23 @@ impl Default for Config {
         };
 
         let hedge = HedgeConfig {
-            hedge_band_base: 5.0,  // TAO band
-            hedge_max_step: 20.0,  // TAO per hedge step
+            hedge_band_base: 5.0, // TAO band
+            hedge_max_step: 20.0, // TAO per hedge step
             alpha_hedge: 1.0,
             beta_hedge: 1.0,
         };
 
         let toxicity = ToxicityConfig {
-            vol_tox_scale: 1.0,       // VOL_TOX_SCALE
-            flow_tox_scale: 1_000.0,  // FLOW_TOX_SCALE (placeholder)
+            vol_tox_scale: 1.0,      // VOL_TOX_SCALE
+            flow_tox_scale: 1_000.0, // FLOW_TOX_SCALE (placeholder)
             tox_med_threshold: 0.4,
             tox_high_threshold: 0.8,
             // Feature weights; these sum to 1.0.
-            w1: 0.5,  // relative vol
-            w2: 0.2,  // neg markouts
-            w3: 0.1,  // imbalance
-            w4: 0.1,  // directional flow
-            w5: 0.1,  // throughput
+            w1: 0.5, // relative vol
+            w2: 0.2, // neg markouts
+            w3: 0.1, // imbalance
+            w4: 0.1, // directional flow
+            w5: 0.1, // throughput
         };
 
         Config {
