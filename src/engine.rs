@@ -7,7 +7,6 @@
 
 use crate::config::Config;
 use crate::state::{GlobalState, RiskRegime};
-use crate::toxicity;
 use crate::types::{TimestampMs, VenueStatus};
 
 pub struct Engine<'a> {
@@ -63,10 +62,6 @@ impl<'a> Engine<'a> {
     pub fn main_tick(&self, state: &mut GlobalState, now_ms: TimestampMs) {
         self.update_fair_value_and_vol(state, now_ms);
         self.update_volatility_scalars(state);
-
-        // New: per-venue toxicity scoring (Section 7).
-        toxicity::update_toxicity(state);
-
         self.recompute_inventory_and_basis(state);
         self.update_risk_regime(state);
         // Later we will add:

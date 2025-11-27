@@ -18,7 +18,7 @@ pub struct Config {
     pub mm: MmConfig,
     /// Hedge engine (global LQ controller + band).
     pub hedge: HedgeConfig,
-    /// Toxicity / venue-health config.
+    /// Toxicity and venue health thresholds.
     pub toxicity: ToxicityConfig,
 }
 
@@ -105,20 +105,16 @@ pub struct HedgeConfig {
 
 #[derive(Debug, Clone)]
 pub struct ToxicityConfig {
-    /// VOL_TOX_SCALE: how quickly relative vol turns into toxicity.
-    pub vol_tox_scale: f64,
-    /// FLOW_TOX_SCALE: scale for throughput normalisation (future use).
-    pub flow_tox_scale: f64,
-    /// Threshold between low and medium toxicity.
-    pub tox_med_threshold: f64,
-    /// Threshold for "high" toxicity → venue disabled.
-    pub tox_high_threshold: f64,
-    /// Weights for features f1..f5.
-    pub w1: f64,
-    pub w2: f64,
-    pub w3: f64,
-    pub w4: f64,
-    pub w5: f64,
+    /// Max toxicity to still treat venue as Healthy.
+    pub max_toxicity_healthy: f64,
+    /// Above this, venue is definitely Disabled.
+    pub max_toxicity_degraded: f64,
+    /// If last mid is older than this, mark Degraded.
+    pub stale_ms_degraded: i64,
+    /// If last mid is older than this, mark Disabled.
+    pub stale_ms_disabled: i64,
+    /// Minimum depth near mid to consider venue structurally healthy.
+    pub min_depth_healthy: f64,
 }
 
 impl Default for Config {
@@ -251,23 +247,18 @@ impl Default for Config {
         };
 
         let hedge = HedgeConfig {
-            hedge_band_base: 5.0, // TAO band
-            hedge_max_step: 20.0, // TAO per hedge step
+            hedge_band_base: 5.0,  // TAO band
+            hedge_max_step: 20.0,  // TAO per hedge step
             alpha_hedge: 1.0,
             beta_hedge: 1.0,
         };
 
         let toxicity = ToxicityConfig {
-            vol_tox_scale: 1.0,      // VOL_TOX_SCALE
-            flow_tox_scale: 1_000.0, // FLOW_TOX_SCALE (placeholder)
-            tox_med_threshold: 0.4,
-            tox_high_threshold: 0.8,
-            // Feature weights; these sum to 1.0.
-            w1: 0.5, // relative vol
-            w2: 0.2, // neg markouts
-            w3: 0.1, // imbalance
-            w4: 0.1, // directional flow
-            w5: 0.1, // throughput
+            max_toxicity_healthy: 0.3,
+            max_toxicity_degraded: 0.7,
+            stale_ms_degraded: 5_000,
+            stale_ms_disabled: 30_000,
+            min_depth_healthy: 10.0,
         };
 
         Config {

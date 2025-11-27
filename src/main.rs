@@ -13,6 +13,7 @@ use crate::engine::Engine;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
 use crate::state::GlobalState;
+use crate::toxicity::update_toxicity_and_health;
 use crate::types::OrderIntent;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,8 +50,11 @@ fn main() {
         // ---- Synthetic market data for this tick (dummy mids) ----
         engine.seed_dummy_mids(&mut state, t_ms);
 
-        // ---- Core engine tick: fair value, vols, inventory, risk, toxicity ----
+        // ---- Core engine tick: fair value, vols, inventory, risk ----
         engine.main_tick(&mut state, t_ms);
+
+        // ---- New: toxicity + venue health classification ----
+        update_toxicity_and_health(&cfg, &mut state, t_ms);
 
         println!("\n================ Tick {} ================", tick);
 
