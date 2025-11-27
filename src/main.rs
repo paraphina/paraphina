@@ -13,8 +13,7 @@ use crate::engine::Engine;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
 use crate::state::GlobalState;
-use crate::toxicity::update_toxicity_and_health;
-use crate::types::OrderIntent;
+use crate::types::{OrderIntent, Side};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,9 +40,32 @@ fn main() {
     println!("Configured venues: {}", cfg.venues.len());
     println!("Initial risk regime: {:?}", state.risk_regime);
 
-    // TEMP: seed a starting long position so we can see risk + hedge logic.
-    if let Some(first_venue) = state.venues.get_mut(0) {
-        first_venue.position_tao = 40.0;
+    // -----------------------------------------------
+    // SIMULATED INITIAL TRADE (perp fill semantics)
+    // -----------------------------------------------
+    //
+    // Instead of manually poking position_tao, we apply a single
+    // synthetic perp fill on Extended (venue 0):
+    //
+    //   Buy 40 TAO @ 250 USDT, paying taker fees.
+    //
+    // This exercises GlobalState::apply_perp_fill, which updates:
+    //   - position_tao
+    //   - VWAP
+    //   - realised trade PnL (0 here; it's an opening trade)
+    //   - fee PnL (negative)
+    {
+        let venue_index = 0;
+        let size_tao = 40.0;
+        let price = 250.0;
+        let fee_bps = cfg.venues[venue_index].taker_fee_bps;
+
+        state.apply_perp_fill(venue_index, Side::Buy, size_tao, price, fee_bps);
+
+        println!(
+            "\n[SIM] Applied synthetic fill on {}: Buy {:.4} TAO @ {:.4} (taker fee_bps = {:.2})",
+            cfg.venues[venue_index].id, size_tao, price, fee_bps
+        );
     }
 
     let engine = Engine::new(&cfg);
@@ -53,10 +75,7 @@ fn main() {
         // ---- Synthetic market data for this tick (dummy mids) ----
         engine.seed_dummy_mids(&mut state, t_ms);
 
-        // ---- Toxicity scaffold (placeholder; later: real flow metrics) ----
-        update_toxicity_and_health(&mut state);
-
-        // ---- Core engine tick: fair value, vols, inventory, risk ----
+        // ---- Core engine tick: fair value, vols, inventory, PnL, risk ----
         engine.main_tick(&mut state, t_ms);
 
         println!("\n================ Tick {} ================", tick);
@@ -78,6 +97,8 @@ fn main() {
                 "Basis warn / hard (USD): {:.2} / {:.2}",
                 state.basis_limit_warn_usd, state.basis_limit_hard_usd
             );
+            println!("Daily realised PnL: {:.4}", state.daily_realised_pnl);
+            println!("Daily unrealised PnL: {:.4}", state.daily_unrealised_pnl);
             println!("Daily PnL total: {:.4}", state.daily_pnl_total);
             println!("Risk regime after tick: {:?}", state.risk_regime);
             println!("Kill switch: {}", state.kill_switch);

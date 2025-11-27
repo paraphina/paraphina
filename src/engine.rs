@@ -249,39 +249,68 @@ impl<'a> Engine<'a> {
 
     // ----------------- Section 8: inventory & basis -----------------
 
-    fn recompute_inventory_and_basis(&self, state: &mut GlobalState) {
-        // Global inventory q_t = sum_v q_v.
-        let mut q_t = 0.0;
-        for v in &state.venues {
-            q_t += v.position_tao;
-        }
-        state.q_global_tao = q_t;
+        // ----------------- Section 8 & 14.2: inventory, basis & PnL -----------------
 
-        // If we don't have a fair value yet, zero the derived metrics.
-        let Some(s_t) = state.fair_value else {
-            state.dollar_delta_usd = 0.0;
-            state.basis_usd = 0.0;
-            state.basis_gross_usd = 0.0;
-            return;
-        };
-
-        state.dollar_delta_usd = q_t * s_t;
-
-        let mut basis = 0.0;
-        let mut basis_gross = 0.0;
-
-        for v in &state.venues {
-            let q_v = v.position_tao;
-            if let Some(mid) = v.mid {
-                let b_v = mid - s_t;
-                basis += q_v * b_v;
-                basis_gross += q_v.abs() * b_v.abs();
+        fn recompute_inventory_and_basis(&self, state: &mut GlobalState) {
+            // ---- Global inventory q_t = sum_v q_v ----
+            let mut q_t = 0.0;
+            for v in &state.venues {
+                q_t += v.position_tao;
             }
-        }
-
-        state.basis_usd = basis;
-        state.basis_gross_usd = basis_gross;
-    }
+            state.q_global_tao = q_t;
+    
+            // If we don't have a fair value yet, we can only compute partial metrics.
+            let Some(s_t) = state.fair_value else {
+                state.dollar_delta_usd = 0.0;
+                state.basis_usd = 0.0;
+                state.basis_gross_usd = 0.0;
+    
+                // Realised PnL is still meaningful even without S_t.
+                let mut daily_realised = 0.0;
+                for v in &state.venues {
+                    daily_realised += v.pnl_realised + v.pnl_funding + v.pnl_fees;
+                }
+                state.daily_realised_pnl = daily_realised;
+                state.daily_unrealised_pnl = 0.0;
+                state.daily_pnl_total = daily_realised;
+    
+                return;
+            };
+    
+            state.dollar_delta_usd = q_t * s_t;
+    
+            let mut basis = 0.0;
+            let mut basis_gross = 0.0;
+            let mut daily_realised = 0.0;
+            let mut daily_unrealised = 0.0;
+    
+            for v in &mut state.venues {
+                let q_v = v.position_tao;
+    
+                // Basis exposure using local mid vs global fair value.
+                if let Some(mid) = v.mid {
+                    let b_v = mid - s_t;
+                    basis += q_v * b_v;
+                    basis_gross += q_v.abs() * b_v.abs();
+                }
+    
+                // Unrealised PnL only if we have a sensible entry price.
+                if q_v != 0.0 && v.vwap > 0.0 {
+                    v.pnl_unrealised = q_v * (s_t - v.vwap);
+                } else {
+                    v.pnl_unrealised = 0.0;
+                }
+    
+                daily_realised += v.pnl_realised + v.pnl_funding + v.pnl_fees;
+                daily_unrealised += v.pnl_unrealised;
+            }
+    
+            state.basis_usd = basis;
+            state.basis_gross_usd = basis_gross;
+            state.daily_realised_pnl = daily_realised;
+            state.daily_unrealised_pnl = daily_unrealised;
+            state.daily_pnl_total = daily_realised + daily_unrealised;
+        }    
 
     // ----------------- Section 14: risk regime & kill switch -----------------
 

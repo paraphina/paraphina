@@ -118,6 +118,14 @@ pub struct RiskConfig {
     pub spread_warn_mult: f64,
     /// Max per-order size (TAO) in Warning regime.
     pub q_warn_cap: f64,
+    /// Safety factor for MM margin sizing (MM_MARGIN_SAFETY).
+    pub mm_margin_safety: f64,
+    /// Max leverage assumption for MM sizing (MM_MAX_LEVERAGE).
+    pub mm_max_leverage: f64,
+    /// Sigma distance where liq Warning starts (LIQ_WARN_SIGMA).
+    pub liq_warn_sigma: f64,
+    /// Sigma distance where liq Critical starts (LIQ_CRIT_SIGMA).
+    pub liq_crit_sigma: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +138,8 @@ pub struct MmConfig {
     pub edge_local_min: f64,
     /// Multiplier for volatility-based edge buffer.
     pub edge_vol_mult: f64,
+    /// Risk parameter η in size objective J(Q)=eQ - 0.5 η Q^2.
+    pub size_eta: f64,
     /// λ_inv ∈ [0,1] controlling anchoring to per-venue targets.
     pub lambda_inv: f64,
     /// Quote horizon T (seconds) in the AS model.
@@ -270,6 +280,10 @@ impl Default for Config {
             pnl_warn_frac: 0.5,
             spread_warn_mult: 1.5,
             q_warn_cap: 5.0,
+            mm_margin_safety: 0.5,  // use only half of available margin
+            mm_max_leverage: 10.0,  // allow up to 10x notionally for MM sizing
+            liq_warn_sigma: 5.0,    // start shrinking sizes inside 5σ to liq
+            liq_crit_sigma: 2.0,    // 0 sizes inside 2σ
         };
 
         let mm = MmConfig {
@@ -277,6 +291,7 @@ impl Default for Config {
             funding_weight: 0.3,
             edge_local_min: 0.5,
             edge_vol_mult: 0.2,
+            size_eta: 0.1,              // <--- NEW
             lambda_inv: 0.5,
             quote_horizon_sec: 30.0,
             funding_skew_slope: 10_000.0,
