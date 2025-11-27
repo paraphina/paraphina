@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 use crate::state::{GlobalState, RiskRegime};
+use crate::toxicity::update_toxicity;
 use crate::types::{TimestampMs, VenueStatus};
 
 pub struct Engine<'a> {
@@ -63,12 +64,13 @@ impl<'a> Engine<'a> {
         self.update_fair_value_and_vol(state, now_ms);
         self.update_volatility_scalars(state);
         self.recompute_inventory_and_basis(state);
+    
+        // ✅ correct call – only pass state
+        update_toxicity(state);
+    
         self.update_risk_regime(state);
-        // Later we will add:
-        //  - quoting & order management,
-        //  - hedging & exits.
     }
-
+      
     // ----------------- Section 5 & 6: Kalman + vol -----------------
 
     fn update_fair_value_and_vol(&self, state: &mut GlobalState, now_ms: TimestampMs) {

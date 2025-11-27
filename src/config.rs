@@ -18,77 +18,125 @@ pub struct Config {
     pub mm: MmConfig,
     /// Hedge engine (global LQ controller + band).
     pub hedge: HedgeConfig,
-    /// Toxicity and venue health thresholds.
-    pub toxicity: ToxicityConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct VenueConfig {
+    /// Stable identifier used in logs / routing (e.g. "extended").
     pub id: String,
+    /// Human-readable venue name.
     pub name: String,
+    /// Smallest price tick size for this venue.
     pub tick_size: f64,
+    /// Base per-order size in TAO.
     pub base_order_size: f64,
+    /// Hard max per-order size in TAO.
     pub max_order_size: f64,
+    /// Maker fee in basis points (positive = fee).
     pub maker_fee_bps: f64,
+    /// Taker fee in basis points (positive = fee).
     pub taker_fee_bps: f64,
+    /// Maker rebate in basis points (positive = rebate).
     pub maker_rebate_bps: f64,
+    /// Avellaneda–Stoikov risk aversion γ_v.
     pub gamma: f64,
+    /// Avellaneda–Stoikov intensity decay k_v.
     pub k: f64,
+    /// Liquidity weight w_v^{liq} for venue inventory targeting.
     pub w_liq: f64,
+    /// Funding weight w_v^{fund} for venue inventory targeting.
     pub w_fund: f64,
+    /// Whether this venue is allowed to be used for hedging.
     pub is_hedge_allowed: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct BookConfig {
+    /// Number of levels to track per side in each order book.
     pub depth_levels: usize,
+    /// Max age (ms) before a book is considered stale.
     pub stale_ms: i64,
+    /// Minimum healthy venues required for KF observation update.
     pub min_healthy_for_kf: u32,
+    /// Max allowed relative mid move vs last fair before treating as outlier.
     pub max_mid_jump_pct: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct KalmanConfig {
+    /// State noise q per second for log price.
     pub q_base: f64,
+    /// Coefficient a for observation noise vs spread.
     pub r_a: f64,
+    /// Coefficient b for observation noise vs depth.
     pub r_b: f64,
+    /// Min observation noise variance.
     pub r_min: f64,
+    /// Max observation noise variance.
     pub r_max: f64,
+    /// Initial variance P_0 for the Kalman filter.
     pub p_init: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct VolatilityConfig {
+    /// EWMA alpha for short-horizon fair value volatility.
     pub fv_vol_alpha_short: f64,
+    /// EWMA alpha for long-horizon fair value volatility.
     pub fv_vol_alpha_long: f64,
+    /// Minimum effective volatility σ_min.
     pub sigma_min: f64,
+    /// Reference volatility σ_ref for vol_ratio.
     pub vol_ref: f64,
+    /// Min vol_ratio used when clipping.
     pub vol_ratio_min: f64,
+    /// Max vol_ratio used when clipping.
     pub vol_ratio_max: f64,
+    /// Coefficient c_s in spread_mult(t).
     pub spread_vol_mult_coeff: f64,
+    /// Coefficient c_q in size_mult(t).
     pub size_vol_mult_coeff: f64,
+    /// Coefficient c_band in band_mult(t).
     pub band_vol_mult_coeff: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct RiskConfig {
+    /// Base dollar-delta limit before vol scaling.
     pub delta_hard_limit_usd_base: f64,
+    /// Fraction of delta limit where Warning regime begins.
     pub delta_warn_frac: f64,
+    /// Hard limit on basis exposure |B_t| in USD.
     pub basis_hard_limit_usd: f64,
+    /// Fraction of basis limit where Warning begins.
     pub basis_warn_frac: f64,
+    /// Max allowed daily PnL drawdown (negative).
     pub daily_loss_limit: f64,
+    /// Fraction of loss limit where Warning regime begins.
     pub pnl_warn_frac: f64,
+    /// Extra spread multiplier applied in Warning regime.
+    pub spread_warn_mult: f64,
+    /// Max per-order size (TAO) in Warning regime.
+    pub q_warn_cap: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct MmConfig {
+    /// Weight of basis in reservation price.
     pub basis_weight: f64,
+    /// Weight of funding in reservation price.
     pub funding_weight: f64,
+    /// Minimum per-unit edge for local MM quotes.
     pub edge_local_min: f64,
+    /// Multiplier for volatility-based edge buffer.
     pub edge_vol_mult: f64,
+    /// λ_inv ∈ [0,1] controlling anchoring to per-venue targets.
     pub lambda_inv: f64,
+    /// Quote horizon T (seconds) in the AS model.
     pub quote_horizon_sec: f64,
+    /// Slope of funding→inventory skew map.
     pub funding_skew_slope: f64,
+    /// Clip for funding-driven skew magnitude.
     pub funding_skew_clip: f64,
 }
 
@@ -98,23 +146,10 @@ pub struct HedgeConfig {
     pub hedge_band_base: f64,
     /// HEDGE_MAX_STEP in TAO per hedge action.
     pub hedge_max_step: f64,
-    /// LQ controller weights α, β.
+    /// LQ controller weight α_hedge.
     pub alpha_hedge: f64,
+    /// LQ controller weight β_hedge.
     pub beta_hedge: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToxicityConfig {
-    /// Max toxicity to still treat venue as Healthy.
-    pub max_toxicity_healthy: f64,
-    /// Above this, venue is definitely Disabled.
-    pub max_toxicity_degraded: f64,
-    /// If last mid is older than this, mark Degraded.
-    pub stale_ms_degraded: i64,
-    /// If last mid is older than this, mark Disabled.
-    pub stale_ms_disabled: i64,
-    /// Minimum depth near mid to consider venue structurally healthy.
-    pub min_depth_healthy: f64,
 }
 
 impl Default for Config {
@@ -233,6 +268,8 @@ impl Default for Config {
             basis_warn_frac: 0.7,
             daily_loss_limit: -5_000.0,
             pnl_warn_frac: 0.5,
+            spread_warn_mult: 1.5,
+            q_warn_cap: 5.0,
         };
 
         let mm = MmConfig {
@@ -253,14 +290,6 @@ impl Default for Config {
             beta_hedge: 1.0,
         };
 
-        let toxicity = ToxicityConfig {
-            max_toxicity_healthy: 0.3,
-            max_toxicity_degraded: 0.7,
-            stale_ms_degraded: 5_000,
-            stale_ms_disabled: 30_000,
-            min_depth_healthy: 10.0,
-        };
-
         Config {
             version: "v0.1.0-whitepaper-structure",
             venues,
@@ -270,7 +299,6 @@ impl Default for Config {
             risk,
             mm,
             hedge,
-            toxicity,
         }
     }
 }
