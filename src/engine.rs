@@ -2,8 +2,8 @@
 //
 // Core strategy engine scaffolding: main loop tick, Kalman fair value,
 // volatility EWMAs, volatility-driven control scalars, inventory/basis
-// recomputation, simplified PnL, and risk-regime classification.
-// Mapped to Sections 5, 6, 8, 9 and 14 of the whitepaper.
+// recomputation, toxicity/venue health, and risk-regime classification.
+// All mapped to Sections 5, 6, 7, 8 and 14 of the whitepaper.
 
 use crate::config::Config;
 use crate::state::{GlobalState, RiskRegime};
@@ -55,24 +55,31 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// One "main loop" tick:
+    /// One "main loop" tick as per Section 16.1:
     ///  - fair value & volatility updates (Sections 5 & 6),
     ///  - volatility scalars,
-    ///  - inventory & basis recomputation (Section 8),
-    ///  - mark-to-market PnL scaffold (Section 9),
+    ///  - inventory, basis & PnL recomputation (Section 8),
+    ///  - toxicity + venue health (Section 7),
     ///  - risk regime & kill switch (Section 14).
     pub fn main_tick(&self, state: &mut GlobalState, now_ms: TimestampMs) {
         self.update_fair_value_and_vol(state, now_ms);
         self.update_volatility_scalars(state);
-        self.recompute_inventory_and_basis(state);
+        self.recompute_inventory_basis_and_pnl(state);
 
         // Toxicity + venue health, using cfg.toxicity
         update_toxicity(state, self.cfg);
 
-        // Simplified mark-to-market PnL based on global inventory.
-        self.update_pnl_mark_to_market(state);
+        self.update_risk_regime(state);
+    }
 
-        // Finally, risk regime & kill switch based on limits and PnL.
+        /// Recompute inventory, basis, PnL and risk regime after we apply fills.
+    ///
+    /// Called from `main.rs` after we simulate hedge/MM fills so that
+    /// `GlobalState` reflects the new positions before the next tick.
+    pub fn recompute_after_fills(&self, state: &mut GlobalState) {
+        // We do NOT touch fair value or volatility here – only
+        // inventory/basis/PnL and the resulting risk regime.
+        self.recompute_inventory_basis_and_pnl(state);
         self.update_risk_regime(state);
     }
 
@@ -112,11 +119,6 @@ impl<'a> Engine<'a> {
                 state.kf_p = kalman_cfg.p_init;
                 state.fair_value_prev = state.fair_value;
                 state.fair_value = Some(median);
-
-                // Initialise PnL reference fair value on the first fair-value estimate.
-                if state.pnl_ref_fair_value.is_none() {
-                    state.pnl_ref_fair_value = Some(median);
-                }
             } else {
                 // No mids anywhere; cannot update KF yet.
                 return;
@@ -203,11 +205,6 @@ impl<'a> Engine<'a> {
         state.fair_value_prev = prev_fv;
         state.fair_value = Some(s_t);
 
-        // If we still don't have a PnL reference for some reason, set it now.
-        if state.pnl_ref_fair_value.is_none() {
-            state.pnl_ref_fair_value = Some(s_t);
-        }
-
         // ----- Volatility EWMA updates on log returns -----
         if let Some(prev) = prev_fv {
             if prev > 0.0 {
@@ -230,6 +227,12 @@ impl<'a> Engine<'a> {
         // Effective sigma: sigma_eff = max(short_vol, SIGMA_MIN).
         let sigma_eff = state.fv_short_vol.max(vol_cfg.sigma_min);
         state.sigma_eff = sigma_eff;
+
+        // Initialise the PnL reference fair value (S_ref) the first time we
+        // have a valid fair value. This anchors daily PnL marking.
+        if state.pnl_ref_fair_value.is_none() {
+            state.pnl_ref_fair_value = Some(s_t);
+        }
     }
 
     // ----------------- Section 6: vol scalars -----------------
@@ -262,9 +265,9 @@ impl<'a> Engine<'a> {
         state.band_mult = band_mult;
     }
 
-    // ----------------- Section 8: inventory & basis -----------------
+    // -------- Section 8: inventory, basis & PnL (mark-to-market) --------
 
-    fn recompute_inventory_and_basis(&self, state: &mut GlobalState) {
+    fn recompute_inventory_basis_and_pnl(&self, state: &mut GlobalState) {
         // Global inventory q_t = sum_v q_v.
         let mut q_t = 0.0;
         for v in &state.venues {
@@ -277,6 +280,7 @@ impl<'a> Engine<'a> {
             state.dollar_delta_usd = 0.0;
             state.basis_usd = 0.0;
             state.basis_gross_usd = 0.0;
+            state.daily_unrealised_pnl = 0.0;
             return;
         };
 
@@ -296,21 +300,21 @@ impl<'a> Engine<'a> {
 
         state.basis_usd = basis;
         state.basis_gross_usd = basis_gross;
-    }
 
-    // ----------------- Section 9: simplified PnL scaffold -----------------
+        // ----- Mark-to-market unrealised PnL vs reference fair value -----
+        let s_ref = state.pnl_ref_fair_value.unwrap_or(s_t);
 
-    fn update_pnl_mark_to_market(&self, state: &mut GlobalState) {
-        let (Some(s_t), Some(s_ref)) = (state.fair_value, state.pnl_ref_fair_value) else {
-            state.daily_unrealised_pnl = 0.0;
-            return;
-        };
+        let mut unreal = 0.0;
+        for v in &state.venues {
+            let q_v = v.position_tao;
+            if q_v != 0.0 {
+                unreal += q_v * (s_t - s_ref);
+            }
+        }
 
-        // Simple global unrealised PnL since reference:
-        //   PnL_unrealised ≈ q_t * (S_t - S_ref).
-        let q_t = state.q_global_tao;
-        state.daily_unrealised_pnl = q_t * (s_t - s_ref);
-        // realised PnL stays as-is (we'll wire real fills later).
+        state.daily_unrealised_pnl = unreal;
+        // daily_realised_pnl is only changed by fills; total PnL is updated
+        // in update_risk_regime.
     }
 
     // ----------------- Section 14: risk regime & kill switch -----------------
@@ -368,14 +372,4 @@ impl<'a> Engine<'a> {
         state.basis_limit_warn_usd = basis_warn;
         state.basis_limit_hard_usd = risk_cfg.basis_hard_limit_usd;
     }
-
-    /// Recompute inventory, basis and risk after hedge / MM fills have been
-    /// applied to the state. This does **not** touch fair value, volatility,
-    /// or toxicity; it just refreshes Section 8 + 14 from the new positions.
-    pub fn recompute_after_fills(&self, state: &mut GlobalState) {
-        self.recompute_inventory_and_basis(state);
-        self.update_risk_regime(state);
-    }
 }
-
-

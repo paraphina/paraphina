@@ -3,7 +3,7 @@
 // Global engine state + per-venue state for Paraphina.
 
 use crate::config::Config;
-use crate::types::{TimestampMs, VenueStatus};
+use crate::types::{TimestampMs, VenueStatus, Side};
 
 /// Per-venue state (one per perp venue / subaccount).
 #[derive(Debug, Clone)]
@@ -35,6 +35,9 @@ pub struct VenueState {
     pub position_tao: f64,
     /// Current 8h funding rate (dimensionless).
     pub funding_8h: f64,
+    /// Volume-weighted average entry price of the current position (USD per TAO).
+    /// Defined only when `position_tao != 0.0`, otherwise 0.0.
+    pub avg_entry_price: f64,
 
     // ----- Margin & liquidation (synthetic for now) -----
     /// Total margin balance in USD (if known).
@@ -96,7 +99,7 @@ pub struct GlobalState {
     pub daily_realised_pnl: f64,
     pub daily_unrealised_pnl: f64,
     pub daily_pnl_total: f64,
-    /// Reference fair value for daily PnL marking (e.g. S_ref at start of day).
+    /// Reference fair value used as PnL anchor for drawdown / risk regime.
     pub pnl_ref_fair_value: Option<f64>,
 
     // ----- Risk regime & limits -----
@@ -129,6 +132,7 @@ impl GlobalState {
 
                 position_tao: 0.0,
                 funding_8h: 0.0,
+                avg_entry_price: 0.0,
 
                 // For now we just give each venue a synthetic chunk of
                 // available margin and set liquidation far away.
@@ -177,34 +181,112 @@ impl GlobalState {
     }
 }
 
-// --- TEMP: simple perp-fill application stub ---
+// --- Perp-fill application + realised PnL accounting ---
 //
-// Add this at the very bottom of src/state.rs,
-// after the existing `impl GlobalState` block(s).
+// This is still simplified (no funding cashflows yet, unrealised PnL stays 0),
+// but matches the structural idea in the whitepaper:
+//  - maintain per-venue position q_v and VWAP entry price,
+//  - on each fill, compute realised PnL for the portion that *closes*
+//    existing inventory,
+//  - subtract trading fees,
+//  - accumulate into daily_realised_pnl and daily_pnl_total.
+//
 
 impl GlobalState {
     /// Apply a single perp fill into the state.
     ///
-    /// For now this only updates the venue position in TAO.
-    /// Detailed realised/unrealised PnL accounting will be added later.
+    /// - `venue_index`: index into `self.venues`.
+    /// - `side`: Buy or Sell.
+    /// - `size_tao`: filled size in TAO (non-negative).
+    /// - `price`: fill price in USD per TAO.
+    /// - `fee_bps`: net fee in basis points (positive = cost, negative = rebate).
     pub fn apply_perp_fill(
         &mut self,
         venue_index: usize,
-        side: crate::types::Side,
+        side: Side,
         size_tao: f64,
-        _price: f64,
-        _fee_bps: f64,
+        price: f64,
+        fee_bps: f64,
     ) {
-        if let Some(v) = self.venues.get_mut(venue_index) {
-            let signed = match side {
-                crate::types::Side::Buy => size_tao,
-                crate::types::Side::Sell => -size_tao,
-            };
-            v.position_tao += signed;
+        if size_tao <= 0.0 {
+            return;
         }
 
-        // PnL fields (daily_realised_pnl, daily_unrealised_pnl) are left
-        // unchanged for now so the risk engine still sees 0 PnL unless
-        // we set something manually.
+        if let Some(v) = self.venues.get_mut(venue_index) {
+            // Signed trade size: + for buy, - for sell.
+            let trade = match side {
+                Side::Buy => size_tao,
+                Side::Sell => -size_tao,
+            };
+
+            let q_old = v.position_tao;
+            let p_old = v.avg_entry_price;
+            let p_trade = price;
+
+            // Total fee in USD (always reduces realised PnL if fee_bps > 0).
+            let fee = (fee_bps / 10_000.0) * p_trade * size_tao.abs();
+
+            let mut realised = 0.0_f64;
+
+            if q_old == 0.0 {
+                // Opening a fresh position.
+                v.position_tao = trade;
+                v.avg_entry_price = p_trade;
+            } else {
+                let same_dir = q_old.signum() == trade.signum();
+
+                if same_dir {
+                    // Add to existing position, update VWAP entry price.
+                    let q_new = q_old + trade;
+                    if q_new != 0.0 {
+                        let w_old = q_old.abs();
+                        let w_trade = trade.abs();
+                        let p_new = (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
+                        v.position_tao = q_new;
+                        v.avg_entry_price = p_new;
+                    } else {
+                        // Pathological cancellation.
+                        v.position_tao = 0.0;
+                        v.avg_entry_price = 0.0;
+                    }
+                } else {
+                    // Closing or flipping some or all of the existing position.
+                    let close_qty = trade.abs().min(q_old.abs());
+
+                    if close_qty > 0.0 {
+                        if q_old > 0.0 {
+                            // Closing a long: PnL = (sell_price - entry_price) * qty.
+                            realised += (p_trade - p_old) * close_qty;
+                        } else {
+                            // Closing a short: PnL = (entry_price - buy_price) * qty.
+                            realised += (p_old - p_trade) * close_qty;
+                        }
+                    }
+
+                    let q_new = q_old + trade;
+
+                    if q_old.abs() > trade.abs() {
+                        // Partial close; keep original entry price.
+                        v.position_tao = q_new;
+                        v.avg_entry_price = p_old;
+                    } else if q_old.abs() < trade.abs() {
+                        // Closed and flipped into a new position.
+                        v.position_tao = q_new;
+                        v.avg_entry_price = p_trade;
+                    } else {
+                        // Exactly flat.
+                        v.position_tao = 0.0;
+                        v.avg_entry_price = 0.0;
+                    }
+                }
+            }
+
+            // Subtract fees from realised PnL.
+            realised -= fee;
+
+            // Accumulate into global PnL.
+            self.daily_realised_pnl += realised;
+            self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
+        }
     }
 }

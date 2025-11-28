@@ -104,7 +104,7 @@ pub struct VolatilityConfig {
 
 #[derive(Debug, Clone)]
 pub struct RiskConfig {
-    /// Base dollar-delta limit before vol scaling.
+    /// Base dollar-delta limit before vol scaling (at vol_ratio ≈ 1).
     pub delta_hard_limit_usd_base: f64,
     /// Fraction of delta limit where Warning regime begins.
     pub delta_warn_frac: f64,
@@ -112,7 +112,7 @@ pub struct RiskConfig {
     pub basis_hard_limit_usd: f64,
     /// Fraction of basis limit where Warning begins.
     pub basis_warn_frac: f64,
-    /// Max allowed daily PnL drawdown (negative).
+    /// Max allowed daily PnL drawdown (realised + unrealised), negative.
     pub daily_loss_limit: f64,
     /// Fraction of loss limit where Warning regime begins.
     pub pnl_warn_frac: f64,
@@ -292,8 +292,10 @@ impl Default for Config {
             pnl_warn_frac: 0.5,
             spread_warn_mult: 1.5,
             q_warn_cap: 5.0,
+            // Use ~50% of available margin, assuming up to 10x leverage for sizing.
             mm_margin_safety: 0.5,  // use only half of available margin
             mm_max_leverage: 10.0,  // allow up to 10x notionally for MM sizing
+            // Start shrinking sizes as we get within 5σ of liq; 0 sizes inside 2σ.
             liq_warn_sigma: 5.0,    // start shrinking sizes inside 5σ to liq
             liq_crit_sigma: 2.0,    // 0 sizes inside 2σ
         };

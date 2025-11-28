@@ -2,10 +2,10 @@
 //
 // Simple driver for the Paraphina MM engine:
 //  - builds Config + GlobalState,
-//  - runs a few synthetic ticks with dummy orderbooks,
+//  - runs synthetic ticks with dummy orderbooks,
 //  - computes fair value, vols, quotes, hedge plan,
-//  - applies hedge fills into the state,
-//  - recomputes inventory / basis / risk as per the whitepaper.
+//  - applies synthetic MM + hedge fills into the state,
+//  - updates inventory / basis / risk as per the whitepaper.
 
 mod config;
 mod engine;
@@ -20,6 +20,7 @@ use crate::engine::Engine;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
 use crate::state::GlobalState;
+use crate::toxicity::update_toxicity_and_health;
 
 fn main() {
     // ---------- Bootstrap config + state ----------
@@ -36,8 +37,8 @@ fn main() {
 
     let engine = Engine::new(&cfg);
 
-    // For now, run a small fixed number of synthetic ticks.
-    let num_ticks = 3;
+    // For now, run a fixed number of synthetic ticks.
+    let num_ticks = 50;
 
     for tick in 0..num_ticks {
         let now_ms: i64 = (tick as i64) * 1_000; // 1 second per tick
@@ -51,11 +52,13 @@ fn main() {
         //    - fair value + Kalman (Section 5),
         //    - volatility EWMAs + control scalars (Section 6),
         //    - inventory & basis (Section 8),
-        //    - toxicity + venue status (Section 7),
         //    - risk regime & kill switch (Section 14).
         engine.main_tick(&mut state, now_ms);
 
-        // ---------- Global snapshot BEFORE hedges ----------
+        // 3) Toxicity + venue health (Section 7).
+        update_toxicity_and_health(&mut state, &cfg);
+
+        // ---------- Global snapshot BEFORE synthetic fills ----------
         let s_t = state.fair_value.unwrap_or(0.0);
 
         println!("Fair value S_t: {:.4}", s_t);
@@ -72,6 +75,14 @@ fn main() {
         println!(
             "Basis warn / hard (USD): {:.2} / {:.2}",
             state.basis_limit_warn_usd, state.basis_limit_hard_usd
+        );
+        println!(
+            "Daily PnL (realised): {:.4}",
+            state.daily_realised_pnl
+        );
+        println!(
+            "Daily PnL (unrealised): {:.4}",
+            state.daily_unrealised_pnl
         );
         println!("Daily PnL total: {:.4}", state.daily_pnl_total);
         println!("Risk regime after tick: {:?}", state.risk_regime);
@@ -132,12 +143,24 @@ fn main() {
             );
         }
 
-        // ---------- Apply hedge fills into state ----------
+        // ---------- Apply synthetic fills into state ----------
         //
         // Toy fill model:
-        //   - assume all **hedge** intents are fully filled at their est. price
-        //   - use venue taker fee bps
-        //   - MM intents are not filled yet (later we can add a Poisson fill model).
+        //   - MM intents treated as maker fills (maker fee - rebate),
+        //   - hedge intents treated as taker fills (taker fee).
+        for intent in &mm_intents {
+            let vcfg = &cfg.venues[intent.venue_index];
+            let fee_bps = vcfg.maker_fee_bps - vcfg.maker_rebate_bps;
+
+            state.apply_perp_fill(
+                intent.venue_index,
+                intent.side,
+                intent.size,
+                intent.price,
+                fee_bps,
+            );
+        }
+
         for intent in &hedge_intents {
             let vcfg = &cfg.venues[intent.venue_index];
             let fee_bps = vcfg.taker_fee_bps;
@@ -151,14 +174,21 @@ fn main() {
             );
         }
 
-        // Recompute inventory, basis and risk *after* those hedge fills
-        // so q_t, delta, basis and risk regime reflect the new positions.
-        engine.recompute_after_fills(&mut state);
+        // NOTE:
+        // apply_perp_fill is responsible for updating inventory, delta,
+        // basis, and PnL aggregates, so we don't call a separate
+        // recompute_after_fills() helper here.
 
-        println!("\nAfter hedge fills:");
+        println!("\nAfter synthetic fills:");
         println!("  Global q_t (TAO): {:.4}", state.q_global_tao);
         println!("  Dollar delta (USD): {:.4}", state.dollar_delta_usd);
         println!("  Basis exposure (USD): {:.4}", state.basis_usd);
+        println!(
+            "  Daily PnL (realised / unrealised / total): {:.4} / {:.4} / {:.4}",
+            state.daily_realised_pnl,
+            state.daily_unrealised_pnl,
+            state.daily_pnl_total,
+        );
         println!("  Risk regime: {:?}", state.risk_regime);
     }
 }
