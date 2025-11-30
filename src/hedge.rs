@@ -2,246 +2,195 @@
 //
 // Global hedge engine for Paraphina.
 //
-// Responsibilities (whitepaper Sections 9–10):
-//   - Look at current global inventory q_t (in TAO) and decide a *desired*
-//     hedge change ΔH* using a simple LQ objective with a dead-band.
-//   - Check kill-switch / risk regime / venue health and only hedge when allowed.
-//   - Allocate ΔH* across a subset of venues based on expected cost
-//     (fees + spread + a toxicity penalty).
-//   - Convert that plan into abstract OrderIntents which main.rs will
-//     synthetically “fill” as taker orders.
+// Responsibilities (whitepaper Sections 9–11):
+//   - Look at global inventory q_t and dollar delta.
+//   - Apply a volatility / band based LQ-style controller to decide
+//     a desired change in TAO exposure ΔH.
+//   - Allocate ΔH across a subset of venues based on expected
+//     execution cost (spread + fees + toxicity penalty).
+//   - Convert the resulting allocations into abstract hedge
+//     OrderIntents consumed by main.rs.
 
 use crate::config::{Config, VenueConfig};
-use crate::state::GlobalState;
+use crate::state::{GlobalState, RiskRegime};
 use crate::types::{OrderIntent, OrderPurpose, Side, VenueStatus};
 
-/// Per-venue hedge allocation (abstract).
+/// One venue-level hedge slice in TAO.
 #[derive(Debug, Clone)]
 pub struct HedgeAllocation {
     pub venue_index: usize,
     pub venue_id: String,
     pub side: Side,
-    pub size: f64,      // TAO
-    pub est_price: f64, // USD / TAO
+    pub size: f64,
+    pub est_price: f64,
 }
 
-/// Global hedge plan (single step).
+/// Global hedge decision for this tick.
 #[derive(Debug, Clone)]
 pub struct HedgePlan {
-    /// Desired global hedge change ΔH* in TAO (sign: + = buy, - = sell).
+    /// Desired change in global inventory q_t in TAO
+    /// (positive = buy TAO, negative = sell TAO).
     pub desired_delta: f64,
-    /// Per-venue allocations that sum (approximately) to desired_delta.
     pub allocations: Vec<HedgeAllocation>,
 }
 
-/// Main entry point: decide whether to hedge, and if so how.
+/// Main hedge planner.
+///
+/// Returns `None` when no hedge action is required for this tick.
 pub fn compute_hedge_plan(cfg: &Config, state: &GlobalState) -> Option<HedgePlan> {
-    // ---------- Hard gates ----------
+    // 0) Global guards: no hedging without a fair value or when kill switch is active.
     if state.kill_switch {
         return None;
     }
 
-    let s_t = state.fair_value?;
-    if s_t <= 0.0 {
-        return None;
-    }
+    let _s_t = match state.fair_value {
+        Some(v) if v > 0.0 => v,
+        _ => return None,
+    };
 
-    // Current global inventory in TAO (already maintained by GlobalState).
-    let q_t = state.q_global_tao;
-
-    // Dynamic hedge band in TAO:
-    //
-    //   band_t ≈ hedge_band_base * band_mult(t)
-    //
-    // band_mult(t) already comes from volatility controls in the engine
-    // (Section 6): higher vol => smaller band => more aggressive hedging.
     let hedge_cfg = &cfg.hedge;
-    let mut band_tao = hedge_cfg.hedge_band_base * state.band_mult.max(0.25);
-    if band_tao <= 0.0 {
-        band_tao = hedge_cfg.hedge_band_base.max(1.0);
-    }
 
+    // 1) Compute dynamic hedge band around 0 inventory.
+    //
+    //    band_t = hedge_band_base * band_mult(t)
+    //
+    // band_mult(t) is already computed in the engine as a function
+    // of volatility (Section 6).
+    let band_mult = state.band_mult.max(0.1);
+    let band = (hedge_cfg.hedge_band_base.max(0.0) * band_mult).max(0.0);
+
+    let q_t = state.q_global_tao;
     let q_abs = q_t.abs();
 
-    // If we are inside the band, do nothing.
-    if q_abs <= band_tao {
+    // Inside the band => do nothing.
+    if band <= 0.0 || q_abs <= band {
         return None;
     }
 
-    // ---------- LQ objective for ΔH* ----------
+    // 2) LQ-style controller for desired ΔH in TAO.
     //
-    // We use a simple quadratic cost:
+    // We hedge only the excess over the band, smoothed by alpha_hedge:
     //
-    //   J(ΔH) = α (q_t + ΔH)^2 + β (ΔH)^2
+    //   excess  = |q_t| - band
+    //   ΔH_raw  = -sign(q_t) * excess * alpha_hedge
     //
-    // Minimising gives the closed form:
-    //
-    //   ΔH* = - (α / (α + β)) q_t
-    //
-    // which smoothly pulls us toward 0 inventory. α controls how much we
-    // care about ending close to 0; β controls how much we penalise trading.
-    let alpha = hedge_cfg.alpha_hedge.max(1e-8);
-    let beta = hedge_cfg.beta_hedge.max(1e-8);
-    let gain = alpha / (alpha + beta);
-    let mut desired_delta = -gain * q_t; // TAO
+    // Risk regime shrinks the step in Warning.
+    let excess = q_abs - band;
+    let direction = -q_t.signum(); // reduce inventory towards 0
 
-    // We *already* know |q_t| > band_tao here, so desired_delta ≠ 0
-    // unless α is pathological.
+    let alpha = hedge_cfg.alpha_hedge.clamp(0.0, 1.0);
+    let mut desired_delta = direction * excess * alpha;
 
-    // Limit the size of a single hedge step:
-    let max_step = hedge_cfg.hedge_max_step.max(band_tao);
-    if desired_delta > max_step {
-        desired_delta = max_step;
-    } else if desired_delta < -max_step {
-        desired_delta = -max_step;
+    let regime_scale = match state.risk_regime {
+        RiskRegime::Normal => 1.0,
+        RiskRegime::Warning => 0.5,
+        // In HardLimit we keep full-strength hedging (we want to reduce risk,
+        // not slow it down). Kill switch still disables hedging entirely.
+        RiskRegime::HardLimit => 1.0,
+    };
+    
+    desired_delta *= regime_scale;
+
+    // Clip to per-tick max step.
+    let max_step = hedge_cfg.hedge_max_step.max(0.0);
+    if max_step > 0.0 && desired_delta.abs() > max_step {
+        desired_delta = desired_delta.signum() * max_step;
     }
 
-    // If after all that the step is tiny, skip it.
+    // If the result is tiny, skip hedging.
     if desired_delta.abs() < 1e-6 {
         return None;
     }
 
-    // ---------- Candidate venues & cost model ----------
+    // 3) Build list of candidate venues with an expected per-unit
+    //    execution cost (spread + fees, scaled by toxicity).
     //
-    // We choose venues that:
-    //   - are marked is_hedge_allowed in config,
-    //   - are not Disabled,
-    //   - have at least some notion of a mid.
+    //    cost_v ≈ (half_spread_v + taker_fee_abs_v) * (1 + β * tox_v)
     //
-    // For each candidate we compute a simple per-TAO cost proxy:
-    //
-    //   cost_i ≈ taker_fee + half_spread + toxicity_penalty
-    //
-    // Then we allocate ΔH across venues with weights ∝ 1 / cost_i.
-
-    let sign_side = if desired_delta > 0.0 {
-        Side::Buy
-    } else {
-        Side::Sell
-    };
-    let total_abs = desired_delta.abs();
-
-    #[derive(Debug)]
-    struct Candidate {
-        venue_index: usize,
-        vcfg: &'static VenueConfig,
-        cost: f64,
-        side: Side,
-        mid: f64,
-        half_spread: f64,
-        tox: f64,
-    }
-
-    let mut candidates: Vec<Candidate> = Vec::new();
+    // We will allocate ΔH in proportion to 1 / cost_v.
+    let mut candidates: Vec<(usize, &VenueConfig, f64, f64, f64)> = Vec::new();
+    let beta_tox = hedge_cfg.beta_hedge.max(0.0);
 
     for (i, vcfg) in cfg.venues.iter().enumerate() {
+        let vstate = &state.venues[i];
+
         if !vcfg.is_hedge_allowed {
             continue;
         }
-
-        let vstate = &state.venues[i];
-
-        // Disabled venues are never used for hedging.
-        if matches!(vstate.status, VenueStatus::Disabled) {
+        if vstate.status != VenueStatus::Healthy {
             continue;
         }
 
-        // If we have no usable mid, skip: we can't price a hedge.
-        let mid = vstate.mid.unwrap_or(s_t);
-        if mid <= 0.0 {
-            continue;
-        }
+        let mid = match vstate.mid {
+            Some(m) if m > 0.0 => m,
+            _ => continue,
+        };
 
-        // Approximate half-spread: if we don't have a live spread, assume
-        // something modest so we still hedge.
-        let half_spread = vstate
+        // Local spread: prefer venue spread, otherwise fall back to a small synthetic.
+        let spread = vstate
             .spread
-            .map(|sp| (sp / 2.0).max(0.01))
-            .unwrap_or(0.05);
+            .unwrap_or(2.0 * vcfg.tick_size.max(1e-6).max(0.01));
+        let half_spread = (spread / 2.0).max(vcfg.tick_size.max(1e-6));
 
-        // Fees expressed as USD/TAO:
-        let taker_fee_usd = (vcfg.taker_fee_bps / 10_000.0) * mid;
+        // Per-unit taker fee in USD.
+        let fee_abs = (vcfg.taker_fee_bps / 10_000.0).abs() * mid;
 
-        // Tox penalty (Section 7): higher toxicity => higher effective cost.
-        let tox = vstate.toxicity;
-        let tox_penalty = 0.25 * tox * mid; // 25% weight of 1σ move scaled by toxicity
+        // Toxicity penalty (>= 1.0).
+        let tox_penalty = 1.0 + beta_tox * vstate.toxicity.max(0.0);
 
-        let base_cost = taker_fee_usd + half_spread + tox_penalty;
+        let cost = (half_spread + fee_abs) * tox_penalty;
+        if cost <= 0.0 {
+            continue;
+        }
 
-        // Ensure positive cost to avoid singular weights.
-        let cost = base_cost.max(1e-6);
-
-        candidates.push(Candidate {
-            venue_index: i,
-            vcfg: unsafe { &*(vcfg as *const VenueConfig) }, // keep lifetime simple for this small utility
-            cost,
-            side: sign_side,
-            mid,
-            half_spread,
-            tox,
-        });
+        let weight = 1.0 / cost;
+        candidates.push((i, vcfg, mid, half_spread, weight));
     }
 
     if candidates.is_empty() {
         return None;
     }
 
-    // ---------- Allocate ΔH across venues ----------
-    //
-    // Weight_i = 1 / cost_i
-    // size_i   = |ΔH*| * Weight_i / Σ_j Weight_j
-    let mut inv_cost_sum = 0.0;
-    for c in &candidates {
-        inv_cost_sum += 1.0 / c.cost;
-    }
-
-    if inv_cost_sum <= 0.0 {
+    let weight_sum: f64 = candidates.iter().map(|(_, _, _, _, w)| w).sum();
+    if weight_sum <= 0.0 {
         return None;
     }
 
+    // 4) Turn desired_delta into per-venue hedge orders.
     let mut allocations: Vec<HedgeAllocation> = Vec::new();
-    let mut remaining = total_abs;
+    let side = if desired_delta > 0.0 {
+        Side::Buy
+    } else {
+        Side::Sell
+    };
+    let total_size = desired_delta.abs();
 
-    for (idx, c) in candidates.iter().enumerate() {
-        let weight = (1.0 / c.cost) / inv_cost_sum;
-        let mut size = total_abs * weight;
+    for (idx, vcfg, mid, half_spread, weight) in candidates {
+        let frac = weight / weight_sum;
+        let mut size = total_size * frac;
 
-        // Respect venue-level max_order_size.
-        if size > c.vcfg.max_order_size {
-            size = c.vcfg.max_order_size;
-        }
-
-        // Last venue gets whatever is left so rounding error doesn't leak.
-        if idx == candidates.len() - 1 {
-            size = remaining;
-        }
-
-        if size <= 0.0 {
+        // Clip to per-venue max order size.
+        size = size.min(vcfg.max_order_size.max(0.0));
+        if size < 1e-4 {
             continue;
         }
 
-        remaining -= size;
-        if remaining < 0.0 {
-            remaining = 0.0;
-        }
+        // Round size to a sensible precision to avoid silly decimals.
+        size = (size * 1_000_000.0).round() / 1_000_000.0;
 
-        // Price: best guess taker level around the mid.
-        let est_price = match c.side {
-            Side::Buy => c.mid + c.half_spread,
-            Side::Sell => c.mid - c.half_spread,
+        // Execution price: mid ± half_spread (we assume taker).
+        let price = match side {
+            Side::Buy => mid + half_spread,
+            Side::Sell => mid - half_spread,
         };
 
         allocations.push(HedgeAllocation {
-            venue_index: c.venue_index,
-            venue_id: c.vcfg.id.clone(),
-            side: c.side,
+            venue_index: idx,
+            venue_id: vcfg.id.clone(),
+            side,
             size,
-            est_price,
+            est_price: price,
         });
-
-        if remaining <= 1e-6 {
-            break;
-        }
     }
 
     if allocations.is_empty() {
@@ -255,13 +204,11 @@ pub fn compute_hedge_plan(cfg: &Config, state: &GlobalState) -> Option<HedgePlan
 }
 
 /// Convert a hedge plan into abstract OrderIntents.
-///
-/// These are interpreted by main.rs as *taker* orders (taker fees applied).
 pub fn hedge_plan_to_order_intents(plan: &HedgePlan) -> Vec<OrderIntent> {
-    let mut intents = Vec::new();
+    let mut out = Vec::new();
 
     for alloc in &plan.allocations {
-        intents.push(OrderIntent {
+        out.push(OrderIntent {
             venue_index: alloc.venue_index,
             venue_id: alloc.venue_id.clone(),
             side: alloc.side,
@@ -271,5 +218,5 @@ pub fn hedge_plan_to_order_intents(plan: &HedgePlan) -> Vec<OrderIntent> {
         });
     }
 
-    intents
+    out
 }
