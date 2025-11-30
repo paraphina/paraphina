@@ -1,61 +1,62 @@
 // src/toxicity.rs
 //
-// Per-venue toxicity + venue health, aligned with Section 7:
-//
-//  - tox_v is driven (for now) only by relative local volatility vs σ_eff.
-//  - Later we can add markouts / order-book imbalance / flow features.
-//  - VenueStatus is set from toxicity via low/medium/high thresholds.
+// Per-venue toxicity + health classification.
+// Approximation of the whitepaper logic:
+//  - measure how "noisy" / off-market each venue looks vs fair value,
+//  - map that to a toxicity score in [0, ~2],
+//  - threshold into {Healthy, Warning, Disabled}.
 
 use crate::config::Config;
 use crate::state::GlobalState;
 use crate::types::VenueStatus;
 
-/// Core toxicity updater.
+/// Update per-venue toxicity score and health status.
 ///
-/// Uses:
-///   - venue.local_vol_short
-///   - global state.sigma_eff
-///   - cfg.toxicity.{vol_tox_scale, tox_med_threshold, tox_high_threshold}
-pub fn update_toxicity(state: &mut GlobalState, cfg: &Config) {
+/// In production this would use per-venue realised volatility.
+/// Here we approximate it from the deviation of each venue mid
+/// from the current global fair value.
+pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config) {
     let tox_cfg = &cfg.toxicity;
 
-    // Avoid divide-by-zero if sigma_eff is tiny.
-    let sigma_eff = if state.sigma_eff > 0.0 {
-        state.sigma_eff
-    } else {
-        1e-6
+    let fair = match state.fair_value {
+        Some(v) if v > 0.0 => v,
+        _ => {
+            // If we have no fair value yet, mark everything healthy.
+            for v in &mut state.venues {
+                v.toxicity = 0.0;
+                v.status = VenueStatus::Healthy;
+            }
+            return;
+        }
     };
 
-    for venue in &mut state.venues {
-        // ---- f1: relative venue vol vs global σ_eff ----
-        let local_vol = venue.local_vol_short.max(0.0);
-        let ratio = local_vol / sigma_eff.max(1e-9);
+    let sigma_eff = state.sigma_eff.max(1e-8);
 
-        // Map ratio>1 into [0,1] using vol_tox_scale.
-        // If ratio == 1      → feature = 0
-        // If ratio >= 1+scale→ feature ≈ 1
-        let vol_feature = ((ratio - 1.0) / tox_cfg.vol_tox_scale)
-            .max(0.0)
-            .min(1.0);
+    for v in &mut state.venues {
+        let mid = match v.mid {
+            Some(m) if m > 0.0 => m,
+            _ => {
+                // No usable mid: treat venue as toxic / disabled.
+                v.toxicity = 1.0;
+                v.status = VenueStatus::Disabled;
+                continue;
+            }
+        };
 
-        // TODO: f2..f5 (markouts, imbalance, flow, throughput).
-        // For now they are 0, so toxicity is just vol_feature.
-        let tox = vol_feature;
+        // Simple proxy for local volatility: instantaneous deviation vs fair.
+        let rel_move = ((mid - fair) / fair).abs();
 
-        venue.toxicity = tox;
+        let vol_ratio_local = (rel_move / sigma_eff).min(10.0);
+        let tox = (vol_ratio_local * tox_cfg.vol_tox_scale).min(2.0);
 
-        // ---- Health classification from toxicity ----
-        venue.status = if tox < tox_cfg.tox_med_threshold {
-            VenueStatus::Healthy
-        } else if tox < tox_cfg.tox_high_threshold {
-            VenueStatus::Degraded
-        } else {
+        v.toxicity = tox;
+
+        v.status = if tox >= tox_cfg.tox_high_threshold {
             VenueStatus::Disabled
+        } else if tox >= tox_cfg.tox_med_threshold {
+            VenueStatus::Warning
+        } else {
+            VenueStatus::Healthy
         };
     }
-}
-
-/// Convenience wrapper if you ever want the same signature as before.
-pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config) {
-    update_toxicity(state, cfg);
 }

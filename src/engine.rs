@@ -1,375 +1,252 @@
 // src/engine.rs
 //
-// Core strategy engine scaffolding: main loop tick, Kalman fair value,
-// volatility EWMAs, volatility-driven control scalars, inventory/basis
-// recomputation, toxicity/venue health, and risk-regime classification.
-// All mapped to Sections 5, 6, 7, 8 and 14 of the whitepaper.
+// Paraphina MM engine:
+//  - seeds synthetic per-venue mids/spreads/depth,
+//  - aggregates a cross-venue fair value observation,
+//  - runs a simple EWMA “Kalman-lite” filter on price,
+//  - updates effective volatility + control scalars,
+//  - runs toxicity + venue health,
+//  - updates risk limits + risk regime,
+//  - delegates post-fill recomputations to GlobalState.
 
 use crate::config::Config;
 use crate::state::{GlobalState, RiskRegime};
-use crate::toxicity::update_toxicity;
-use crate::types::{TimestampMs, VenueStatus};
+use crate::toxicity::update_toxicity_and_health;
 
-pub struct Engine<'a> {
-    cfg: &'a Config,
+pub struct Engine {
+    cfg: Config,
 }
 
-impl<'a> Engine<'a> {
-    pub fn new(cfg: &'a Config) -> Self {
-        Self { cfg }
+impl Engine {
+    pub fn new(cfg: &Config) -> Self {
+        Self { cfg: cfg.clone() }
     }
 
-    /// TEMP helper: seed synthetic mids/spreads/depth into all venues so that
-    /// the Kalman filter can initialise before we have real exchange data.
-    pub fn seed_dummy_mids(&self, state: &mut GlobalState, now_ms: TimestampMs) {
-        let base_price = 250.0;
-        let spread = 1.0;
-        let depth = 1_000.0;
+    /// Seed synthetic mids / spreads / depth for all venues.
+    /// This is just a deterministic function of `now_ms` and venue index.
+    pub fn seed_dummy_mids(&self, state: &mut GlobalState, now_ms: i64) {
+        let base = 250.0 + (now_ms as f64) * 0.001;
 
-        // Use a tiny deterministic "jitter" based on time so mids move a bit and
-        // we see non-zero local vol & toxicity.
-        let t_step = (now_ms / 1_000) % 10; // 0..9, wraps every 10 seconds
-        let t_jitter = t_step as f64 * 0.01; // up to ~0.09 USD
+        for (idx, v) in state.venues.iter_mut().enumerate() {
+            let offset = idx as f64 * 0.4;
+            let mid = base + offset;
+            let spread = 0.4 + idx as f64 * 0.02;
+            let depth = 10_000.0;
 
-        for (i, v) in state.venues.iter_mut().enumerate() {
-            let old_mid = v.mid;
-
-            // Base mid differs slightly per venue plus the shared jitter.
-            let mid = base_price + i as f64 * 0.5 + t_jitter;
-
+            // These fields are Option<> in VenueState.
             v.mid = Some(mid);
             v.spread = Some(spread);
-            v.depth_near_mid = depth;
             v.last_mid_update_ms = Some(now_ms);
 
-            // Simple short-horizon EWMA vol on log mid returns.
-            if let Some(prev_mid) = old_mid {
-                if prev_mid > 0.0 {
-                    let r = (mid / prev_mid).ln();
-                    let alpha = 0.3_f64; // EWMA weight
-                    let var_old = v.local_vol_short * v.local_vol_short;
-                    let var_new = (1.0 - alpha) * var_old + alpha * r * r;
-                    v.local_vol_short = var_new.max(0.0).sqrt();
-                }
-            }
+            // Depth is stored as a plain f64.
+            v.depth_near_mid = depth;
         }
     }
 
-    /// One "main loop" tick as per Section 16.1:
-    ///  - fair value & volatility updates (Sections 5 & 6),
-    ///  - volatility scalars,
-    ///  - inventory, basis & PnL recomputation (Section 8),
-    ///  - toxicity + venue health (Section 7),
-    ///  - risk regime & kill switch (Section 14).
-    pub fn main_tick(&self, state: &mut GlobalState, now_ms: TimestampMs) {
-        self.update_fair_value_and_vol(state, now_ms);
-        self.update_volatility_scalars(state);
-        self.recompute_inventory_basis_and_pnl(state);
-
-        // Toxicity + venue health, using cfg.toxicity
-        update_toxicity(state, self.cfg);
-
-        self.update_risk_regime(state);
-    }
-
-        /// Recompute inventory, basis, PnL and risk regime after we apply fills.
+    /// Main per-tick engine step.
     ///
-    /// Called from `main.rs` after we simulate hedge/MM fills so that
-    /// `GlobalState` reflects the new positions before the next tick.
-    pub fn recompute_after_fills(&self, state: &mut GlobalState) {
-        // We do NOT touch fair value or volatility here – only
-        // inventory/basis/PnL and the resulting risk regime.
-        self.recompute_inventory_basis_and_pnl(state);
-        self.update_risk_regime(state);
+    /// Sections (roughly matching the whitepaper):
+    ///   5) fair value / filtering
+    ///   6) volatility + control scalars
+    ///   7) toxicity / venue health
+    ///   8, 14) risk limits + risk regime / kill switch
+    pub fn main_tick(&self, state: &mut GlobalState, now_ms: i64) {
+        // 1) Fair value + volatility + control scalars ------------------------
+        self.update_fair_value_and_vol(state, now_ms);
+
+        // 2) Toxicity + venue health -----------------------------------------
+        update_toxicity_and_health(state, &self.cfg);
+
+        // 3) Risk limits + risk regime / kill switch -------------------------
+        self.update_risk_limits_and_regime(state);
     }
 
-    // ----------------- Section 5 & 6: Kalman + vol -----------------
-
-    fn update_fair_value_and_vol(&self, state: &mut GlobalState, now_ms: TimestampMs) {
-        let book_cfg = &self.cfg.book;
-        let kalman_cfg = &self.cfg.kalman;
-        let vol_cfg = &self.cfg.volatility;
-
-        // ----- Time update -----
-        if let Some(last_ms) = state.kf_last_update_ms {
-            let dt_ms = (now_ms - last_ms).max(0);
-            let dt_sec = dt_ms as f64 / 1000.0;
-            state.kf_p += kalman_cfg.q_base * dt_sec;
-        }
-        state.kf_last_update_ms = Some(now_ms);
-
-        // ----- Initialisation: seed x_hat from venue mids if needed -----
-        if state.kf_x_hat.is_none() {
-            let mut mids: Vec<f64> = state
-                .venues
-                .iter()
-                .filter(|v| v.status == VenueStatus::Healthy)
-                .filter_map(|v| v.mid)
-                .collect();
-
-            if !mids.is_empty() {
-                mids.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let median = if mids.len() % 2 == 1 {
-                    mids[mids.len() / 2]
-                } else {
-                    (mids[mids.len() / 2 - 1] + mids[mids.len() / 2]) * 0.5
-                };
-
-                state.kf_x_hat = Some(median.ln());
-                state.kf_p = kalman_cfg.p_init;
-                state.fair_value_prev = state.fair_value;
-                state.fair_value = Some(median);
-            } else {
-                // No mids anywhere; cannot update KF yet.
+    /// Aggregate fair value observation, run a “Kalman-lite” EWMA filter,
+    /// and update sigma_eff + spread/size/band multipliers.
+    fn update_fair_value_and_vol(&self, state: &mut GlobalState, now_ms: i64) {
+        let (s_obs, avg_spread, avg_depth) = match self.compute_agg_mid_spread(state) {
+            Some(t) => t,
+            None => {
+                // No usable books this tick – keep previous fair value / sigma.
+                let _ = now_ms;
                 return;
             }
-        }
+        };
 
-        let mut x_hat = state.kf_x_hat.unwrap();
-        let mut p = state.kf_p;
+        // ----- Price filter (very simple EWMA over the aggregated mid) -----
+        let prev_fair = state.fair_value.unwrap_or(s_obs);
+        // Small smoothing factor – “Kalman-lite”.
+        let alpha_price = 0.2_f64;
+        let s_t = alpha_price * s_obs + (1.0 - alpha_price) * prev_fair;
 
-        // ----- Build eligible observations -----
-        struct Obs {
-            mid: f64,
-            spread: f64,
-            depth: f64,
-        }
-
-        let mut obs: Vec<Obs> = Vec::new();
-
-        for v in state.venues.iter() {
-            let mid = match v.mid {
-                Some(m) => m,
-                None => continue,
-            };
-            let spread = match v.spread {
-                Some(s) if s > 0.0 => s,
-                _ => continue,
-            };
-            if v.depth_near_mid <= 0.0 {
-                continue;
-            }
-            if v.status != VenueStatus::Healthy {
-                continue;
-            }
-            if let Some(last_mid_ms) = v.last_mid_update_ms {
-                if now_ms - last_mid_ms > book_cfg.stale_ms as i64 {
-                    continue;
-                }
-            }
-
-            // Outlier vs previous fair value.
-            if let Some(prev_fv) = state.fair_value {
-                let dev = ((mid - prev_fv).abs()) / prev_fv.max(1e-9);
-                if dev > book_cfg.max_mid_jump_pct {
-                    continue;
-                }
-            }
-
-            obs.push(Obs {
-                mid,
-                spread,
-                depth: v.depth_near_mid,
-            });
-        }
-
-        // If not enough healthy venues, skip observation updates.
-        if obs.len() < book_cfg.min_healthy_for_kf as usize {
-            // Keep the time-updated x_hat / P only.
-        } else {
-            // ----- Sequential scalar KF updates for each observation -----
-            for ob in obs {
-                let mut r =
-                    kalman_cfg.r_a * ob.spread * ob.spread + kalman_cfg.r_b / (ob.depth + 1e-9);
-
-                if r < kalman_cfg.r_min {
-                    r = kalman_cfg.r_min;
-                } else if r > kalman_cfg.r_max {
-                    r = kalman_cfg.r_max;
-                }
-
-                let s = p + r;
-                let k = p / s;
-                let y = ob.mid.ln();
-                x_hat = x_hat + k * (y - x_hat);
-                p = (1.0 - k) * p;
-            }
-        }
-
-        state.kf_x_hat = Some(x_hat);
-        state.kf_p = p;
-
-        // ----- Map Kalman state to fair value -----
-        let s_t = x_hat.exp();
-        let prev_fv = state.fair_value;
-        state.fair_value_prev = prev_fv;
+        state.fair_value_prev = prev_fair;
         state.fair_value = Some(s_t);
 
-        // ----- Volatility EWMA updates on log returns -----
-        if let Some(prev) = prev_fv {
-            if prev > 0.0 {
-                let r_t = (s_t / prev).ln();
+        // We keep KF fields populated even though we’re not running a full KF yet.
+        state.kf_x_hat = s_t.ln();
+        state.kf_p = 1.0;
+        state.kf_last_update_ms = now_ms;
 
-                let var_short = state.fv_short_vol * state.fv_short_vol;
-                let var_long = state.fv_long_vol * state.fv_long_vol;
+        // ----- Volatility EWMAs -> sigma_eff --------------------------------
+        let vol_cfg = &self.cfg.volatility;
 
-                let alpha_s = vol_cfg.fv_vol_alpha_short;
-                let alpha_l = vol_cfg.fv_vol_alpha_long;
+        let ret = if prev_fair > 0.0 && s_t > 0.0 {
+            (s_t / prev_fair).ln()
+        } else {
+            0.0
+        };
+        let r2 = ret * ret;
 
-                let var_short_new = (1.0 - alpha_s) * var_short + alpha_s * r_t * r_t;
-                let var_long_new = (1.0 - alpha_l) * var_long + alpha_l * r_t * r_t;
+        // Interpret sigma_eff^2 as the current variance estimate,
+        // and run a single-scale EWMA on variance.
+        let var_prev = if state.sigma_eff > 0.0 {
+            state.sigma_eff * state.sigma_eff
+        } else {
+            vol_cfg.sigma_min * vol_cfg.sigma_min
+        };
 
-                state.fv_short_vol = var_short_new.max(0.0).sqrt();
-                state.fv_long_vol = var_long_new.max(0.0).sqrt();
-            }
+        let alpha_var = vol_cfg.fv_vol_alpha_short; // use short-horizon alpha
+        let var_new = (1.0 - alpha_var) * var_prev + alpha_var * r2;
+
+        let mut sigma_eff = var_new.max(0.0).sqrt();
+        if !sigma_eff.is_finite() || sigma_eff < vol_cfg.sigma_min {
+            sigma_eff = vol_cfg.sigma_min;
         }
 
-        // Effective sigma: sigma_eff = max(short_vol, SIGMA_MIN).
-        let sigma_eff = state.fv_short_vol.max(vol_cfg.sigma_min);
         state.sigma_eff = sigma_eff;
 
-        // Initialise the PnL reference fair value (S_ref) the first time we
-        // have a valid fair value. This anchors daily PnL marking.
-        if state.pnl_ref_fair_value.is_none() {
-            state.pnl_ref_fair_value = Some(s_t);
-        }
-    }
-
-    // ----------------- Section 6: vol scalars -----------------
-
-    fn update_volatility_scalars(&self, state: &mut GlobalState) {
-        let vol_cfg = &self.cfg.volatility;
-        let sigma_eff = state.sigma_eff;
-
-        if vol_cfg.vol_ref <= 0.0 {
-            state.vol_ratio_clipped = 1.0;
-            state.spread_mult = 1.0;
-            state.size_mult = 1.0;
-            state.band_mult = 1.0;
-            return;
+        // ----- Map sigma_eff -> vol_ratio_clipped + control scalars ---------
+        let mut vol_ratio = if vol_cfg.vol_ref > 0.0 {
+            sigma_eff / vol_cfg.vol_ref
+        } else {
+            1.0
+        };
+        if !vol_ratio.is_finite() {
+            vol_ratio = 1.0;
         }
 
-        let vol_ratio = sigma_eff / vol_cfg.vol_ref;
         let vol_ratio_clipped = vol_ratio
             .max(vol_cfg.vol_ratio_min)
             .min(vol_cfg.vol_ratio_max);
 
-        let x = (vol_ratio_clipped - 1.0).max(0.0);
-        let spread_mult = 1.0 + vol_cfg.spread_vol_mult_coeff * x;
-        let size_mult = 1.0 / (1.0 + vol_cfg.size_vol_mult_coeff * x);
-        let band_mult = 1.0 / (1.0 + vol_cfg.band_vol_mult_coeff * x);
-
         state.vol_ratio_clipped = vol_ratio_clipped;
-        state.spread_mult = spread_mult;
-        state.size_mult = size_mult;
-        state.band_mult = band_mult;
+
+        let bump = (vol_ratio_clipped - 1.0).max(0.0);
+        state.spread_mult =
+            1.0 + vol_cfg.spread_vol_mult_coeff * bump;
+        state.size_mult =
+            1.0 + vol_cfg.size_vol_mult_coeff * bump;
+        state.band_mult =
+            1.0 + vol_cfg.band_vol_mult_coeff * bump;
+
+        // avg_spread / avg_depth are currently just diagnostics, but keep
+        // them wired to avoid “unused” warnings when we start logging them.
+        let _ = (avg_spread, avg_depth);
     }
 
-    // -------- Section 8: inventory, basis & PnL (mark-to-market) --------
-
-    fn recompute_inventory_basis_and_pnl(&self, state: &mut GlobalState) {
-        // Global inventory q_t = sum_v q_v.
-        let mut q_t = 0.0;
-        for v in &state.venues {
-            q_t += v.position_tao;
-        }
-        state.q_global_tao = q_t;
-
-        // If we don't have a fair value yet, zero the derived metrics.
-        let Some(s_t) = state.fair_value else {
-            state.dollar_delta_usd = 0.0;
-            state.basis_usd = 0.0;
-            state.basis_gross_usd = 0.0;
-            state.daily_unrealised_pnl = 0.0;
-            return;
-        };
-
-        state.dollar_delta_usd = q_t * s_t;
-
-        let mut basis = 0.0;
-        let mut basis_gross = 0.0;
+    /// Cross-venue liquidity-weighted mid + average spread + depth.
+    fn compute_agg_mid_spread(
+        &self,
+        state: &GlobalState,
+    ) -> Option<(f64, f64, f64)> {
+        let mut weight_sum: f64 = 0.0;
+        let mut mid_num: f64 = 0.0;
+        let mut spread_sum: f64 = 0.0;
+        let mut depth_sum: f64 = 0.0;
+        let mut count: f64 = 0.0;
 
         for v in &state.venues {
-            let q_v = v.position_tao;
-            if let Some(mid) = v.mid {
-                let b_v = mid - s_t;
-                basis += q_v * b_v;
-                basis_gross += q_v.abs() * b_v.abs();
+            // Only use venues that currently have a usable mid + spread.
+            if let (Some(mid), Some(spread)) = (v.mid, v.spread) {
+                if v.depth_near_mid <= 0.0 {
+                    continue;
+                }
+
+                let depth = v.depth_near_mid;
+                let weight = depth; // simple depth-proportional weighting
+
+                weight_sum += weight;
+                mid_num += weight * mid;
+                spread_sum += spread;
+                depth_sum += depth;
+                count += 1.0;
             }
         }
 
-        state.basis_usd = basis;
-        state.basis_gross_usd = basis_gross;
-
-        // ----- Mark-to-market unrealised PnL vs reference fair value -----
-        let s_ref = state.pnl_ref_fair_value.unwrap_or(s_t);
-
-        let mut unreal = 0.0;
-        for v in &state.venues {
-            let q_v = v.position_tao;
-            if q_v != 0.0 {
-                unreal += q_v * (s_t - s_ref);
-            }
+        if weight_sum <= 0.0 || count < 1.0 {
+            return None;
         }
 
-        state.daily_unrealised_pnl = unreal;
-        // daily_realised_pnl is only changed by fills; total PnL is updated
-        // in update_risk_regime.
+        let mid = mid_num / weight_sum;
+        let avg_spread = spread_sum / count.max(1.0);
+        let avg_depth = depth_sum / count.max(1.0);
+
+        Some((mid, avg_spread, avg_depth))
     }
 
-    // ----------------- Section 14: risk regime & kill switch -----------------
-
-    fn update_risk_regime(&self, state: &mut GlobalState) {
+    /// Vol-scaled risk limits + discrete risk regime + kill switch.
+    fn update_risk_limits_and_regime(&self, state: &mut GlobalState) {
         let risk_cfg = &self.cfg.risk;
 
-        // Delta limit scaled by current volatility ratio.
-        let vol_ratio = if state.vol_ratio_clipped > 0.0 {
-            state.vol_ratio_clipped
-        } else {
-            1.0
-        };
-        let delta_limit = risk_cfg.delta_hard_limit_usd_base / vol_ratio.max(1e-9);
+        // ---- 1) Vol-scaled delta limit + static basis limits ---------------
+        let vol_ratio = state.vol_ratio_clipped.max(0.25);
+        state.delta_limit_usd = risk_cfg.delta_hard_limit_usd_base / vol_ratio;
 
-        // Basis Warning threshold.
-        let basis_warn = risk_cfg.basis_warn_frac * risk_cfg.basis_hard_limit_usd;
+        state.basis_limit_hard_usd = risk_cfg.basis_hard_limit_usd;
+        state.basis_limit_warn_usd =
+            risk_cfg.basis_hard_limit_usd * risk_cfg.basis_warn_frac;
 
-        // Total daily PnL = realised + unrealised.
-        let pnl_total = state.daily_realised_pnl + state.daily_unrealised_pnl;
-        state.daily_pnl_total = pnl_total;
+        // ---- 2) Aggregate daily PnL fields --------------------------------
+        // NOTE: field names in GlobalState today are `daily_realised_pnl`
+        // and `daily_unrealised_pnl`.
+        state.daily_pnl_total =
+            state.daily_realised_pnl + state.daily_unrealised_pnl;
 
-        let abs_delta = state.dollar_delta_usd.abs();
-        let abs_basis = state.basis_usd.abs();
+        // ---- 3) Choose risk regime based on delta / basis / PnL -----------
+        let delta_abs = state.dollar_delta_usd.abs();
+        let basis_abs = state.basis_usd.abs();
+        let pnl = state.daily_pnl_total;
 
-        // Decide regime.
+        let delta_warn = risk_cfg.delta_warn_frac * state.delta_limit_usd;
+        let basis_warn =
+            risk_cfg.basis_warn_frac * risk_cfg.basis_hard_limit_usd;
+        // All of these are negative numbers; pnl_warn is a “less negative”
+        // early-warning threshold.
+        let pnl_warn = risk_cfg.pnl_warn_frac * risk_cfg.daily_loss_limit;
+
         let mut regime = RiskRegime::Normal;
-        let mut kill = false;
 
-        // Critical conditions.
-        if abs_delta > delta_limit
-            || abs_basis > risk_cfg.basis_hard_limit_usd
-            || pnl_total <= risk_cfg.daily_loss_limit
+        // Hard-limit regime if *any* hard constraint breached.
+        if delta_abs >= state.delta_limit_usd
+            || basis_abs >= risk_cfg.basis_hard_limit_usd
+            || pnl <= risk_cfg.daily_loss_limit
         {
-            regime = RiskRegime::Critical;
-            kill = true;
-        } else {
-            // Warning conditions.
-            let delta_warn_level = risk_cfg.delta_warn_frac * delta_limit;
-            let basis_warn_level = basis_warn;
-            let pnl_warn_level = risk_cfg.pnl_warn_frac * risk_cfg.daily_loss_limit;
-
-            if abs_delta > delta_warn_level
-                || abs_basis > basis_warn_level
-                || pnl_total < pnl_warn_level
-            {
-                regime = RiskRegime::Warning;
-            }
+            regime = RiskRegime::HardLimit;
+        }
+        // Warning regime if *any* warning threshold breached
+        // (and hard limit not already hit).
+        else if delta_abs >= delta_warn
+            || basis_abs >= basis_warn
+            || pnl <= pnl_warn
+        {
+            regime = RiskRegime::Warning;
         }
 
-        state.risk_regime = regime;
-        state.kill_switch = kill;
+        // Kill-switch if we are in HardLimit and PnL has breached the hard
+        // daily loss limit. This can be made stricter later if desired.
+        let kill_switch =
+            matches!(regime, RiskRegime::HardLimit) && pnl <= risk_cfg.daily_loss_limit;
 
-        state.delta_limit_usd = delta_limit;
-        state.basis_limit_warn_usd = basis_warn;
-        state.basis_limit_hard_usd = risk_cfg.basis_hard_limit_usd;
+        state.risk_regime = regime;
+        state.kill_switch = kill_switch;
+    }
+
+    /// Delegate post-fill recomputations (inventory, basis, PnL, etc.)
+    /// to GlobalState. This assumes you have:
+    ///   impl GlobalState {
+    ///       pub fn recompute_after_fills(&mut self, cfg: &Config) { ... }
+    ///   }
+    pub fn recompute_after_fills(&self, state: &mut GlobalState) {
+        state.recompute_after_fills(&self.cfg);
     }
 }

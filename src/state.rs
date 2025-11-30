@@ -3,7 +3,7 @@
 // Global engine state + per-venue state for Paraphina.
 
 use crate::config::Config;
-use crate::types::{TimestampMs, VenueStatus, Side};
+use crate::types::{Side, TimestampMs, VenueStatus};
 
 /// Per-venue state (one per perp venue / subaccount).
 #[derive(Debug, Clone)]
@@ -57,7 +57,8 @@ pub struct VenueState {
 pub enum RiskRegime {
     Normal,
     Warning,
-    Critical,
+    /// Hard limit / circuit-breaker regime.
+    HardLimit,
 }
 
 /// Global engine state shared across strategy components.
@@ -66,20 +67,26 @@ pub struct GlobalState {
     // ----- Per-venue -----
     pub venues: Vec<VenueState>,
 
-    // ----- Fair value / Kalman -----
-    pub kf_last_update_ms: Option<TimestampMs>,
+    // ----- Fair value / “Kalman-lite” filter -----
+    /// Last time the fair-value filter was updated.
+    pub kf_last_update_ms: TimestampMs,
+    /// Dummy variance term kept for future KF upgrades.
     pub kf_p: f64,
-    pub kf_x_hat: Option<f64>,
-    pub fair_value_prev: Option<f64>,
+    /// Filtered log-price x_t = log(S_t).
+    pub kf_x_hat: f64,
+    /// Previous fair value S_{t-1}.
+    pub fair_value_prev: f64,
+    /// Current fair value S_t (if we have one).
     pub fair_value: Option<f64>,
-    /// Short-horizon fair value vol (σ_short).
+    /// Short-horizon fair value vol (σ_short) – kept for future use.
     pub fv_short_vol: f64,
-    /// Long-horizon fair value vol (σ_long).
+    /// Long-horizon fair value vol (σ_long) – kept for future use.
     pub fv_long_vol: f64,
-    /// Effective volatility σ_eff = max(σ_short, σ_min).
+    /// Effective volatility σ_eff (used by quoting / risk).
     pub sigma_eff: f64,
 
     // ----- Volatility-driven control scalars (Section 6) -----
+    /// Vol ratio clipped into [vol_ratio_min, vol_ratio_max].
     pub vol_ratio_clipped: f64,
     pub spread_mult: f64,
     pub size_mult: f64,
@@ -90,16 +97,16 @@ pub struct GlobalState {
     pub q_global_tao: f64,
     /// Dollar delta q_t * S_t.
     pub dollar_delta_usd: f64,
-    /// Net basis exposure in USD.
+    /// Net basis exposure in USD (signed).
     pub basis_usd: f64,
-    /// Gross basis exposure in USD.
+    /// Gross basis exposure in USD (sum of absolute venue bases).
     pub basis_gross_usd: f64,
 
     // ----- PnL -----
     pub daily_realised_pnl: f64,
     pub daily_unrealised_pnl: f64,
     pub daily_pnl_total: f64,
-    /// Reference fair value used as PnL anchor for drawdown / risk regime.
+    /// Optional PnL anchor fair value (not used yet but kept for spec).
     pub pnl_ref_fair_value: Option<f64>,
 
     // ----- Risk regime & limits -----
@@ -107,7 +114,9 @@ pub struct GlobalState {
     pub kill_switch: bool,
     /// Volatility-scaled delta limit (updated in engine).
     pub delta_limit_usd: f64,
+    /// Basis warning limit in USD (soft).
     pub basis_limit_warn_usd: f64,
+    /// Basis hard limit in USD.
     pub basis_limit_hard_usd: f64,
 }
 
@@ -147,33 +156,37 @@ impl GlobalState {
         GlobalState {
             venues,
 
-            kf_last_update_ms: None,
+            // Fair value filter
+            kf_last_update_ms: 0,
             kf_p: cfg.kalman.p_init,
-            kf_x_hat: None,
-            fair_value_prev: None,
+            kf_x_hat: 0.0,
+            fair_value_prev: 0.0,
             fair_value: None,
             fv_short_vol: 0.0,
             fv_long_vol: 0.0,
             sigma_eff: cfg.volatility.sigma_min,
 
+            // Vol control scalars
             vol_ratio_clipped: 1.0,
             spread_mult: 1.0,
             size_mult: 1.0,
             band_mult: 1.0,
 
+            // Inventory & basis
             q_global_tao: 0.0,
             dollar_delta_usd: 0.0,
             basis_usd: 0.0,
             basis_gross_usd: 0.0,
 
+            // PnL
             daily_realised_pnl: 0.0,
             daily_unrealised_pnl: 0.0,
             daily_pnl_total: 0.0,
             pnl_ref_fair_value: None,
 
+            // Risk
             risk_regime: RiskRegime::Normal,
             kill_switch: false,
-
             delta_limit_usd: cfg.risk.delta_hard_limit_usd_base,
             basis_limit_warn_usd: cfg.risk.basis_warn_frac * cfg.risk.basis_hard_limit_usd,
             basis_limit_hard_usd: cfg.risk.basis_hard_limit_usd,
@@ -181,16 +194,14 @@ impl GlobalState {
     }
 }
 
-// --- Perp-fill application + realised PnL accounting ---
+// --- Perp-fill application + realised PnL accounting ------------------------
 //
-// This is still simplified (no funding cashflows yet, unrealised PnL stays 0),
-// but matches the structural idea in the whitepaper:
 //  - maintain per-venue position q_v and VWAP entry price,
 //  - on each fill, compute realised PnL for the portion that *closes*
 //    existing inventory,
 //  - subtract trading fees,
-//  - accumulate into daily_realised_pnl and daily_pnl_total.
-//
+//  - accumulate into daily_realised_pnl; total PnL will be updated when
+//    we recompute after fills.
 
 impl GlobalState {
     /// Apply a single perp fill into the state.
@@ -241,7 +252,8 @@ impl GlobalState {
                     if q_new != 0.0 {
                         let w_old = q_old.abs();
                         let w_trade = trade.abs();
-                        let p_new = (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
+                        let p_new =
+                            (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
                         v.position_tao = q_new;
                         v.avg_entry_price = p_new;
                     } else {
@@ -284,9 +296,42 @@ impl GlobalState {
             // Subtract fees from realised PnL.
             realised -= fee;
 
-            // Accumulate into global PnL.
+            // Accumulate into global realised PnL.
             self.daily_realised_pnl += realised;
-            self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
+            // `daily_unrealised_pnl` will be updated in `recompute_after_fills`.
+            self.daily_pnl_total =
+                self.daily_realised_pnl + self.daily_unrealised_pnl;
         }
+    }
+
+    /// Recompute inventory, basis and mark-to-market PnL after a batch of fills.
+    /// Called by the Engine after synthetic / hedge fills.
+    pub fn recompute_after_fills(&mut self, _cfg: &Config) {
+        let s_t = self.fair_value.unwrap_or(self.fair_value_prev);
+
+        self.q_global_tao = 0.0;
+        self.dollar_delta_usd = 0.0;
+        self.basis_usd = 0.0;
+        self.basis_gross_usd = 0.0;
+
+        let mut unrealised = 0.0_f64;
+
+        for v in &self.venues {
+            self.q_global_tao += v.position_tao;
+            self.dollar_delta_usd += v.position_tao * s_t;
+
+            let mark = v.mid.unwrap_or(s_t);
+            let basis_v = v.position_tao * (mark - s_t);
+            self.basis_usd += basis_v;
+            self.basis_gross_usd += basis_v.abs();
+
+            if v.position_tao != 0.0 {
+                unrealised += v.position_tao * (s_t - v.avg_entry_price);
+            }
+        }
+
+        self.daily_unrealised_pnl = unrealised;
+        self.daily_pnl_total =
+            self.daily_realised_pnl + self.daily_unrealised_pnl;
     }
 }

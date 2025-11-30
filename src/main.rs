@@ -21,6 +21,7 @@ use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
 use crate::state::GlobalState;
 use crate::toxicity::update_toxicity_and_health;
+use crate::types::Side;
 
 fn main() {
     // ---------- Bootstrap config + state ----------
@@ -38,7 +39,7 @@ fn main() {
     let engine = Engine::new(&cfg);
 
     // For now, run a fixed number of synthetic ticks.
-    let num_ticks = 50;
+    let num_ticks: usize = 50;
 
     for tick in 0..num_ticks {
         let now_ms: i64 = (tick as i64) * 1_000; // 1 second per tick
@@ -55,10 +56,39 @@ fn main() {
         //    - risk regime & kill switch (Section 14).
         engine.main_tick(&mut state, now_ms);
 
+        // --- TEMP: inject synthetic inventory on tick 0 so hedge engine has work to do ---
+        if tick == 0 {
+            if let Some(s_t) = state.fair_value {
+                // Use the first venue ("extended") for the synthetic position.
+                let vcfg0 = &cfg.venues[0];
+
+                // Open a +25 TAO long on extended at ~fair value with taker fees.
+                state.apply_perp_fill(
+                    0,                  // venue_index for "extended"
+                    Side::Buy,          // open a long
+                    25.0,               // size in TAO
+                    s_t,                // price ≈ fair value
+                    vcfg0.taker_fee_bps,
+                );
+
+                // Recompute global inventory, delta, basis, risk, etc.
+                engine.recompute_after_fills(&mut state);
+
+                println!(
+                    "\n[debug] Injected synthetic +25 TAO long on {} -> q_t = {:.4}, delta = {:.2} USD",
+                    vcfg0.id, state.q_global_tao, state.dollar_delta_usd
+                );
+            } else {
+                println!(
+                    "\n[debug] Skipped synthetic position injection – fair value not available on tick 0"
+                );
+            }
+        }
+
         // 3) Toxicity + venue health (Section 7).
         update_toxicity_and_health(&mut state, &cfg);
 
-        // ---------- Global snapshot BEFORE synthetic fills ----------
+        // ---------- Global snapshot (post-engine, pre-MM/hedge) ----------
         let s_t = state.fair_value.unwrap_or(0.0);
 
         println!("Fair value S_t: {:.4}", s_t);
@@ -134,6 +164,18 @@ fn main() {
             .map(hedge_plan_to_order_intents)
             .unwrap_or_default();
 
+        // ---------- Snapshot BEFORE MM + hedge fills ----------
+        println!("\nBefore MM + hedge fills:");
+        println!("  Global q_t (TAO): {:.4}", state.q_global_tao);
+        println!("  Dollar delta (USD): {:.4}", state.dollar_delta_usd);
+        println!("  Basis exposure (USD): {:.4}", state.basis_usd);
+        println!(
+            "  Daily PnL (realised / unrealised / total): {:.4} / {:.4} / {:.4}",
+            state.daily_realised_pnl,
+            state.daily_unrealised_pnl,
+            state.daily_pnl_total,
+        );
+
         // ---------- Combined order intents ----------
         println!("\nOrder intents (abstract):");
         for intent in mm_intents.iter().chain(hedge_intents.iter()) {
@@ -174,12 +216,12 @@ fn main() {
             );
         }
 
-        // NOTE:
-        // apply_perp_fill is responsible for updating inventory, delta,
-        // basis, and PnL aggregates, so we don't call a separate
-        // recompute_after_fills() helper here.
+        // Recompute global inventory / delta / basis / risk from the
+        // updated per-venue positions after all synthetic fills.
+        engine.recompute_after_fills(&mut state);
 
-        println!("\nAfter synthetic fills:");
+        // ---------- Snapshot AFTER MM + hedge fills ----------
+        println!("\nAfter MM + hedge fills:");
         println!("  Global q_t (TAO): {:.4}", state.q_global_tao);
         println!("  Dollar delta (USD): {:.4}", state.dollar_delta_usd);
         println!("  Basis exposure (USD): {:.4}", state.basis_usd);

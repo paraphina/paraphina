@@ -1,4 +1,9 @@
 // src/config.rs
+//
+// Central configuration for the Paraphina engine.
+// This is the single source of truth that maps directly onto the
+// whitepaper parameters (venues, Kalman fair value, vols, risk,
+// MM quoting, hedging, toxicity / venue health).
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -30,7 +35,7 @@ pub struct VenueConfig {
     pub name: String,
     /// Smallest price tick size for this venue.
     pub tick_size: f64,
-    /// Base per-order size in TAO.
+    /// Base per-order size in TAO (before vol / risk scaling).
     pub base_order_size: f64,
     /// Hard max per-order size in TAO.
     pub max_order_size: f64,
@@ -126,7 +131,7 @@ pub struct RiskConfig {
     pub mm_max_leverage: f64,
     /// Sigma distance where liq Warning starts (LIQ_WARN_SIGMA).
     pub liq_warn_sigma: f64,
-    /// Sigma distance where liq Critical starts (LIQ_CRIT_SIGMA).
+    /// Sigma distance where liq is considered “too close” (LIQ_CRIT_SIGMA).
     pub liq_crit_sigma: f64,
 }
 
@@ -136,7 +141,7 @@ pub struct MmConfig {
     pub basis_weight: f64,
     /// Weight of funding in reservation price.
     pub funding_weight: f64,
-    /// Minimum per-unit edge for local MM quotes.
+    /// Minimum per-unit edge for local MM quotes (in USD).
     pub edge_local_min: f64,
     /// Multiplier for volatility-based edge buffer.
     pub edge_vol_mult: f64,
@@ -154,9 +159,9 @@ pub struct MmConfig {
 
 #[derive(Debug, Clone)]
 pub struct HedgeConfig {
-    /// HEDGE_BAND_BASE in TAO.
+    /// Base half-band in TAO (before vol scaling).
     pub hedge_band_base: f64,
-    /// HEDGE_MAX_STEP in TAO per hedge action.
+    /// Max TAO we are allowed to move in one hedge action.
     pub hedge_max_step: f64,
     /// LQ controller weight α_hedge.
     pub alpha_hedge: f64,
@@ -168,15 +173,20 @@ pub struct HedgeConfig {
 pub struct ToxicityConfig {
     /// Scale for converting local vol ratio to toxicity feature.
     pub vol_tox_scale: f64,
-    /// Toxicity threshold between low and medium.
+    /// Toxicity threshold between Healthy and Warning.
     pub tox_med_threshold: f64,
-    /// Toxicity threshold for disabling venue.
+    /// Toxicity threshold above which the venue is Disabled.
     pub tox_high_threshold: f64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         // ----- Venue configs -----
+        //
+        // These are deliberately conservative, assuming ~300 USD / TAO:
+        //  - base_order_size = 1 TAO  → ~300 USD notional,
+        //  - max_order_size  = 20 TAO → ~6k  USD notional.
+        // The risk engine and MM sizing logic will further scale these.
         let venues = vec![
             VenueConfig {
                 id: "extended".to_string(),
@@ -187,7 +197,7 @@ impl Default for Config {
                 maker_fee_bps: 2.0,
                 taker_fee_bps: 5.0,
                 maker_rebate_bps: 0.0,
-                gamma: 0.1,
+                gamma: 0.10,
                 k: 1.5,
                 w_liq: 0.25,
                 w_fund: 0.25,
@@ -219,8 +229,8 @@ impl Default for Config {
                 maker_rebate_bps: 0.0,
                 gamma: 0.11,
                 k: 1.4,
-                w_liq: 0.2,
-                w_fund: 0.2,
+                w_liq: 0.20,
+                w_fund: 0.20,
                 is_hedge_allowed: true,
             },
             VenueConfig {
@@ -232,7 +242,7 @@ impl Default for Config {
                 maker_fee_bps: 2.0,
                 taker_fee_bps: 5.0,
                 maker_rebate_bps: 0.0,
-                gamma: 0.1,
+                gamma: 0.10,
                 k: 1.5,
                 w_liq: 0.15,
                 w_fund: 0.15,
@@ -247,7 +257,7 @@ impl Default for Config {
                 maker_fee_bps: 2.0,
                 taker_fee_bps: 5.0,
                 maker_rebate_bps: 0.0,
-                gamma: 0.1,
+                gamma: 0.10,
                 k: 1.5,
                 w_liq: 0.15,
                 w_fund: 0.15,
@@ -255,6 +265,7 @@ impl Default for Config {
             },
         ];
 
+        // ----- Order book / observation config -----
         let book = BookConfig {
             depth_levels: 10,
             stale_ms: 1_000,
@@ -262,6 +273,7 @@ impl Default for Config {
             max_mid_jump_pct: 0.02,
         };
 
+        // ----- Kalman fair-value config -----
         let kalman = KalmanConfig {
             q_base: 1e-6,
             r_a: 1e-6,
@@ -271,6 +283,7 @@ impl Default for Config {
             p_init: 1.0,
         };
 
+        // ----- Volatility & control scalars -----
         let volatility = VolatilityConfig {
             fv_vol_alpha_short: 0.2,
             fv_vol_alpha_long: 0.05,
@@ -283,51 +296,77 @@ impl Default for Config {
             band_vol_mult_coeff: 1.0,
         };
 
+        // ----- Global risk config (Section 14) -----
         let risk = RiskConfig {
+            // This is the *base* hard delta limit at vol_ratio ≈ 1.
+            // The engine scales this by vol_ratio: high vol ⇒ smaller limit.
             delta_hard_limit_usd_base: 100_000.0,
+            // Warning regime kicks in once |Δ| exceeds this fraction of limit.
             delta_warn_frac: 0.7,
+            // Basis limit is intentionally smaller: we don’t want to run a big
+            // basis book while market is volatile.
             basis_hard_limit_usd: 10_000.0,
             basis_warn_frac: 0.7,
+            // Daily loss limit (realised + unrealised). Negative by convention.
             daily_loss_limit: -5_000.0,
             pnl_warn_frac: 0.5,
+            // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
             q_warn_cap: 5.0,
             // Use ~50% of available margin, assuming up to 10x leverage for sizing.
-            mm_margin_safety: 0.5,  // use only half of available margin
-            mm_max_leverage: 10.0,  // allow up to 10x notionally for MM sizing
+            mm_margin_safety: 0.5, // use only half of available margin
+            mm_max_leverage: 10.0, // allow up to 10x notionally for MM sizing
             // Start shrinking sizes as we get within 5σ of liq; 0 sizes inside 2σ.
-            liq_warn_sigma: 5.0,    // start shrinking sizes inside 5σ to liq
-            liq_crit_sigma: 2.0,    // 0 sizes inside 2σ
+            liq_warn_sigma: 5.0, // start shrinking sizes inside 5σ to liq
+            liq_crit_sigma: 2.0, // treat as “too close” inside 2σ
         };
 
+        // ----- MM (Avellaneda–Stoikov + basis/funding) -----
         let mm = MmConfig {
+            // Reservation price adjustment weights. These are deliberately
+            // modest so we only lightly lean inventory based on basis/funding.
             basis_weight: 0.3,
             funding_weight: 0.3,
+            // Local minimum edge in USD, plus a vol-dependent buffer.
             edge_local_min: 0.5,
             edge_vol_mult: 0.2,
+            // Inventory-risk parameter in J(Q) = eQ - 0.5 η Q².
             size_eta: 0.1,
+            // 0 = pure global, 1 = pure per-venue target; we sit in the middle.
             lambda_inv: 0.5,
+            // Quoting horizon in seconds used in the AS formulas.
             quote_horizon_sec: 30.0,
+            // Funding-driven inventory skew: slope and clip.
             funding_skew_slope: 10_000.0,
             funding_skew_clip: 100.0,
         };
 
+        // ----- Hedge engine (global LQ controller) -----
         let hedge = HedgeConfig {
+            // With ~300 USD / TAO and our default limits, this band corresponds
+            // to ~6–9k USD of unhedged delta before the LQ controller kicks in.
             hedge_band_base: 5.0,  // TAO band
             hedge_max_step: 20.0,  // TAO per hedge step
             alpha_hedge: 1.0,
             beta_hedge: 1.0,
         };
 
+        // ----- Toxicity / venue health -----
+        //
+        // Toxicity is a dimensionless score; typical markets will end up
+        // around 0.3–0.7. We classify:
+        //   tox <  tox_med_threshold  → Healthy
+        //   tox ∈ [tox_med_threshold, tox_high_threshold) → Warning
+        //   tox ≥  tox_high_threshold → Disabled
         let toxicity = ToxicityConfig {
-            // If local vol is ~50% higher than sigma_eff, toxicity ≈ 1.
-            vol_tox_scale: 0.5,
-            tox_med_threshold: 0.4,
-            tox_high_threshold: 0.8,
+            // Gentler mapping: typical vol regimes → toxicity < 0.5 ⇒ Healthy.
+            vol_tox_scale: 0.15,
+            tox_med_threshold: 0.8,  // Warning only when toxicity is elevated
+            tox_high_threshold: 1.5, // Disabled only in extreme conditions
         };
 
         Config {
-            version: "v0.1.0-whitepaper-structure",
+            version: "v0.1.1-whitepaper-spec",
             venues,
             book,
             kalman,
