@@ -172,6 +172,12 @@ pub struct HedgeConfig {
 #[derive(Debug, Clone)]
 pub struct ToxicityConfig {
     /// Scale for converting local vol ratio to toxicity feature.
+    ///
+    /// f1 = clip((local_vol / sigma_eff - 1) / vol_tox_scale, 0, 1)
+    ///
+    /// With the default values below a venue has to run roughly 25–30% hotter
+    /// than the global volatility before entering Warning, and ~45–50% hotter
+    /// before being Disabled.
     pub vol_tox_scale: f64,
     /// Toxicity threshold between Healthy and Warning.
     pub tox_med_threshold: f64,
@@ -345,24 +351,23 @@ impl Default for Config {
         let hedge = HedgeConfig {
             // With ~300 USD / TAO and our default limits, this band corresponds
             // to ~6–9k USD of unhedged delta before the LQ controller kicks in.
-            hedge_band_base: 5.0,  // TAO band
-            hedge_max_step: 20.0,  // TAO per hedge step
+            hedge_band_base: 5.0, // TAO band
+            hedge_max_step: 20.0, // TAO per hedge step
             alpha_hedge: 1.0,
             beta_hedge: 1.0,
         };
 
         // ----- Toxicity / venue health -----
         //
-        // Toxicity is a dimensionless score; typical markets will end up
-        // around 0.3–0.7. We classify:
-        //   tox <  tox_med_threshold  → Healthy
-        //   tox ∈ [tox_med_threshold, tox_high_threshold) → Warning
-        //   tox ≥  tox_high_threshold → Disabled
+        // f1 = clip((local_vol / sigma_eff - 1) / vol_tox_scale, 0, 1)
+        //
+        // With these defaults we need a venue to run roughly 25–30% hotter
+        // than the global volatility before entering Warning, and ~45–50%
+        // hotter before being Disabled.
         let toxicity = ToxicityConfig {
-            // Gentler mapping: typical vol regimes → toxicity < 0.5 ⇒ Healthy.
-            vol_tox_scale: 0.15,
-            tox_med_threshold: 0.8,  // Warning only when toxicity is elevated
-            tox_high_threshold: 1.5, // Disabled only in extreme conditions
+            vol_tox_scale: 0.5,
+            tox_med_threshold: 0.6, // Warning only when volatility is clearly elevated
+            tox_high_threshold: 0.9, // Disabled only when it is much higher still
         };
 
         Config {

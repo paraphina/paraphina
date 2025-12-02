@@ -12,7 +12,7 @@
 //     abstract OrderIntents.
 
 use crate::config::{Config, VenueConfig};
-use crate::state::{GlobalState, VenueState, RiskRegime};
+use crate::state::{GlobalState, RiskRegime, VenueState};
 use crate::types::{OrderIntent, OrderPurpose, Side, VenueStatus};
 
 /// Internal MM quote level (one side of the book).
@@ -59,10 +59,7 @@ pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
     };
 
     // Global scalars.
-    let sigma_eff = state
-        .sigma_eff
-        .max(cfg.volatility.sigma_min)
-        .max(1e-8); // avoid degenerate 0-vol modes
+    let sigma_eff = state.sigma_eff.max(cfg.volatility.sigma_min).max(1e-8); // avoid degenerate 0-vol modes
 
     let vol_ratio = state.vol_ratio_clipped;
     let spread_mult = state.spread_mult.max(0.0);
@@ -231,8 +228,7 @@ fn compute_single_venue_quotes(
     let dist_liq = vstate.dist_liq_sigma;
     if dist_liq > 0.0 && dist_liq < risk_cfg.liq_warn_sigma {
         // Linear ramp: at liq_warn_sigma → 1x, near 0 → up to 3x spread.
-        let t = ((risk_cfg.liq_warn_sigma - dist_liq) / risk_cfg.liq_warn_sigma)
-            .clamp(0.0, 1.0);
+        let t = ((risk_cfg.liq_warn_sigma - dist_liq) / risk_cfg.liq_warn_sigma).clamp(0.0, 1.0);
         half_spread *= 1.0 + 2.0 * t;
     }
 

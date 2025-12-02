@@ -252,8 +252,7 @@ impl GlobalState {
                     if q_new != 0.0 {
                         let w_old = q_old.abs();
                         let w_trade = trade.abs();
-                        let p_new =
-                            (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
+                        let p_new = (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
                         v.position_tao = q_new;
                         v.avg_entry_price = p_new;
                     } else {
@@ -299,8 +298,7 @@ impl GlobalState {
             // Accumulate into global realised PnL.
             self.daily_realised_pnl += realised;
             // `daily_unrealised_pnl` will be updated in `recompute_after_fills`.
-            self.daily_pnl_total =
-                self.daily_realised_pnl + self.daily_unrealised_pnl;
+            self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
         }
     }
 
@@ -331,7 +329,6 @@ impl GlobalState {
         }
 
         self.daily_unrealised_pnl = unrealised;
-        self.daily_pnl_total =
-            self.daily_realised_pnl + self.daily_unrealised_pnl;
+        self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
     }
 }

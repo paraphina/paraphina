@@ -88,7 +88,7 @@ pub fn compute_hedge_plan(cfg: &Config, state: &GlobalState) -> Option<HedgePlan
         // not slow it down). Kill switch still disables hedging entirely.
         RiskRegime::HardLimit => 1.0,
     };
-    
+
     desired_delta *= regime_scale;
 
     // Clip to per-tick max step.

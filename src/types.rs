@@ -9,8 +9,8 @@ pub type TimestampMs = i64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VenueStatus {
     Healthy,
-    Warning,   // used for "medium" toxicity / soft risk clamp
-    Disabled,  // venue is turned off
+    Warning,  // used for "medium" toxicity / soft risk clamp
+    Disabled, // venue is turned off
 }
 
 /// Buy or sell side for an order.

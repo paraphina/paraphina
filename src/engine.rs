@@ -1,7 +1,7 @@
 // src/engine.rs
 //
 // Paraphina MM engine:
-//  - seeds synthetic per-venue mids/spreads/depth,
+//  - seeds synthetic per-venue mids/spreads/depth and local vols,
 //  - aggregates a cross-venue fair value observation,
 //  - runs a simple EWMA “Kalman-lite” filter on price,
 //  - updates effective volatility + control scalars,
@@ -22,24 +22,49 @@ impl Engine {
         Self { cfg: cfg.clone() }
     }
 
-    /// Seed synthetic mids / spreads / depth for all venues.
-    /// This is just a deterministic function of `now_ms` and venue index.
+    /// Seed synthetic mids / spreads / depth for all venues and update
+    /// per-venue local volatility estimates.
+    ///
+    /// This is a deterministic function of `now_ms` and venue index. The goal
+    /// is not to be realistic, but to give the strategy a smooth price path
+    /// with non-zero returns so that the volatility machinery is exercised.
     pub fn seed_dummy_mids(&self, state: &mut GlobalState, now_ms: i64) {
         let base = 250.0 + (now_ms as f64) * 0.001;
+        let vol_cfg = &self.cfg.volatility;
 
         for (idx, v) in state.venues.iter_mut().enumerate() {
             let offset = idx as f64 * 0.4;
+            let mid_prev = v.mid;
+
             let mid = base + offset;
             let spread = 0.4 + idx as f64 * 0.02;
             let depth = 10_000.0;
 
-            // These fields are Option<> in VenueState.
+            // Update order-book snapshot.
             v.mid = Some(mid);
             v.spread = Some(spread);
             v.last_mid_update_ms = Some(now_ms);
-
-            // Depth is stored as a plain f64.
             v.depth_near_mid = depth;
+
+            // --- Local per-venue volatility (short / long EWMA of log returns) ---
+            if let Some(prev) = mid_prev {
+                if prev > 0.0 && mid > 0.0 {
+                    let r = (mid / prev).ln();
+                    let r2 = r * r;
+
+                    let alpha_short = vol_cfg.fv_vol_alpha_short;
+                    let alpha_long = vol_cfg.fv_vol_alpha_long;
+
+                    let var_short_prev = v.local_vol_short * v.local_vol_short;
+                    let var_long_prev = v.local_vol_long * v.local_vol_long;
+
+                    let var_short_new = (1.0 - alpha_short) * var_short_prev + alpha_short * r2;
+                    let var_long_new = (1.0 - alpha_long) * var_long_prev + alpha_long * r2;
+
+                    v.local_vol_short = var_short_new.max(0.0).sqrt();
+                    v.local_vol_long = var_long_new.max(0.0).sqrt();
+                }
+            }
         }
     }
 
@@ -132,12 +157,11 @@ impl Engine {
         state.vol_ratio_clipped = vol_ratio_clipped;
 
         let bump = (vol_ratio_clipped - 1.0).max(0.0);
-        state.spread_mult =
-            1.0 + vol_cfg.spread_vol_mult_coeff * bump;
-        state.size_mult =
-            1.0 + vol_cfg.size_vol_mult_coeff * bump;
-        state.band_mult =
-            1.0 + vol_cfg.band_vol_mult_coeff * bump;
+
+        // spread_mult grows with volatility; size_mult and band_mult shrink.
+        state.spread_mult = 1.0 + vol_cfg.spread_vol_mult_coeff * bump;
+        state.size_mult = 1.0 / (1.0 + vol_cfg.size_vol_mult_coeff * bump);
+        state.band_mult = 1.0 / (1.0 + vol_cfg.band_vol_mult_coeff * bump);
 
         // avg_spread / avg_depth are currently just diagnostics, but keep
         // them wired to avoid “unused” warnings when we start logging them.
@@ -145,10 +169,7 @@ impl Engine {
     }
 
     /// Cross-venue liquidity-weighted mid + average spread + depth.
-    fn compute_agg_mid_spread(
-        &self,
-        state: &GlobalState,
-    ) -> Option<(f64, f64, f64)> {
+    fn compute_agg_mid_spread(&self, state: &GlobalState) -> Option<(f64, f64, f64)> {
         let mut weight_sum: f64 = 0.0;
         let mut mid_num: f64 = 0.0;
         let mut spread_sum: f64 = 0.0;
@@ -193,14 +214,12 @@ impl Engine {
         state.delta_limit_usd = risk_cfg.delta_hard_limit_usd_base / vol_ratio;
 
         state.basis_limit_hard_usd = risk_cfg.basis_hard_limit_usd;
-        state.basis_limit_warn_usd =
-            risk_cfg.basis_hard_limit_usd * risk_cfg.basis_warn_frac;
+        state.basis_limit_warn_usd = risk_cfg.basis_hard_limit_usd * risk_cfg.basis_warn_frac;
 
         // ---- 2) Aggregate daily PnL fields --------------------------------
         // NOTE: field names in GlobalState today are `daily_realised_pnl`
         // and `daily_unrealised_pnl`.
-        state.daily_pnl_total =
-            state.daily_realised_pnl + state.daily_unrealised_pnl;
+        state.daily_pnl_total = state.daily_realised_pnl + state.daily_unrealised_pnl;
 
         // ---- 3) Choose risk regime based on delta / basis / PnL -----------
         let delta_abs = state.dollar_delta_usd.abs();
@@ -208,8 +227,7 @@ impl Engine {
         let pnl = state.daily_pnl_total;
 
         let delta_warn = risk_cfg.delta_warn_frac * state.delta_limit_usd;
-        let basis_warn =
-            risk_cfg.basis_warn_frac * risk_cfg.basis_hard_limit_usd;
+        let basis_warn = risk_cfg.basis_warn_frac * risk_cfg.basis_hard_limit_usd;
         // All of these are negative numbers; pnl_warn is a “less negative”
         // early-warning threshold.
         let pnl_warn = risk_cfg.pnl_warn_frac * risk_cfg.daily_loss_limit;
@@ -225,10 +243,7 @@ impl Engine {
         }
         // Warning regime if *any* warning threshold breached
         // (and hard limit not already hit).
-        else if delta_abs >= delta_warn
-            || basis_abs >= basis_warn
-            || pnl <= pnl_warn
-        {
+        else if delta_abs >= delta_warn || basis_abs >= basis_warn || pnl <= pnl_warn {
             regime = RiskRegime::Warning;
         }
 

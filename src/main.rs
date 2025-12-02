@@ -3,24 +3,26 @@
 // Simple driver for the Paraphina MM engine:
 //  - builds Config + GlobalState,
 //  - runs synthetic ticks with dummy orderbooks,
-//  - computes fair value, vols, quotes, hedge plan,
-//  - applies synthetic MM + hedge fills into the state,
-//  - updates inventory / basis / risk as per the whitepaper.
+//  - computes fair value, vols, risk regime, toxicity,
+//  - runs the pure strategy policy (MM + hedge),
+//  - passes abstract intents to SimGateway for synthetic fills,
+//  - recomputes inventory / basis / PnL / risk after fills.
 
 mod config;
 mod engine;
+mod gateway;
 mod hedge;
 mod mm;
 mod state;
+mod strategy;
 mod toxicity;
 mod types;
 
 use crate::config::Config;
 use crate::engine::Engine;
-use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
-use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
+use crate::gateway::SimGateway;
 use crate::state::GlobalState;
-use crate::toxicity::update_toxicity_and_health;
+use crate::strategy::compute_strategy_step;
 use crate::types::Side;
 
 fn main() {
@@ -37,6 +39,7 @@ fn main() {
     println!("Initial risk regime: {:?}\n", state.risk_regime);
 
     let engine = Engine::new(&cfg);
+    let gateway = SimGateway::new();
 
     // For now, run a fixed number of synthetic ticks.
     let num_ticks: usize = 50;
@@ -50,9 +53,9 @@ fn main() {
         engine.seed_dummy_mids(&mut state, now_ms);
 
         // 2) Main engine tick:
-        //    - fair value + Kalman (Section 5),
+        //    - fair value + "Kalman-lite" (Section 5),
         //    - volatility EWMAs + control scalars (Section 6),
-        //    - inventory & basis (Section 8),
+        //    - toxicity / venue health (Section 7),
         //    - risk regime & kill switch (Section 14).
         engine.main_tick(&mut state, now_ms);
 
@@ -85,10 +88,7 @@ fn main() {
             }
         }
 
-        // 3) Toxicity + venue health (Section 7).
-        update_toxicity_and_health(&mut state, &cfg);
-
-        // ---------- Global snapshot (post-engine, pre-MM/hedge) ----------
+        // ---------- Global snapshot (post-engine, pre-strategy) ----------
         let s_t = state.fair_value.unwrap_or(0.0);
 
         println!("Fair value S_t: {:.4}", s_t);
@@ -128,11 +128,11 @@ fn main() {
             );
         }
 
-        // ---------- MM quotes ----------
-        let mm_quotes = compute_mm_quotes(&cfg, &state);
+        // ---------- Strategy decision (MM + hedge) ----------
+        let step = compute_strategy_step(&cfg, &state);
 
         println!("\nPer-venue quotes:");
-        for q in &mm_quotes {
+        for q in &step.mm_quotes {
             let bid_pair = q.bid.as_ref().map(|b| (b.price, b.size));
             let ask_pair = q.ask.as_ref().map(|a| (a.price, a.size));
             println!(
@@ -141,12 +141,7 @@ fn main() {
             );
         }
 
-        let mm_intents = mm_quotes_to_order_intents(&mm_quotes);
-
-        // ---------- Hedge plan ----------
-        let hedge_plan_opt = compute_hedge_plan(&cfg, &state);
-
-        if let Some(plan) = &hedge_plan_opt {
+        if let Some(plan) = &step.hedge_plan {
             println!("\nHedge plan:");
             println!("  Desired ΔH (TAO): {:.4}", plan.desired_delta);
             for alloc in &plan.allocations {
@@ -158,11 +153,6 @@ fn main() {
         } else {
             println!("\nHedge plan: none");
         }
-
-        let hedge_intents = hedge_plan_opt
-            .as_ref()
-            .map(hedge_plan_to_order_intents)
-            .unwrap_or_default();
 
         // ---------- Snapshot BEFORE MM + hedge fills ----------
         println!("\nBefore MM + hedge fills:");
@@ -178,45 +168,26 @@ fn main() {
 
         // ---------- Combined order intents ----------
         println!("\nOrder intents (abstract):");
-        for intent in mm_intents.iter().chain(hedge_intents.iter()) {
+        for intent in step
+            .mm_intents
+            .iter()
+            .chain(step.hedge_intents.iter())
+        {
             println!(
                 "  {:>9} {:?} {:.4} @ {:.4} ({:?})",
                 intent.venue_id, intent.side, intent.size, intent.price, intent.purpose
             );
         }
 
-        // ---------- Apply synthetic fills into state ----------
-        //
-        // Toy fill model:
-        //   - MM intents treated as maker fills (maker fee - rebate),
-        //   - hedge intents treated as taker fills (taker fee).
-        for intent in &mm_intents {
-            let vcfg = &cfg.venues[intent.venue_index];
-            let fee_bps = vcfg.maker_fee_bps - vcfg.maker_rebate_bps;
+        // Build a single batch for the gateway.
+        let mut all_intents = Vec::new();
+        all_intents.extend(step.mm_intents.iter().cloned());
+        all_intents.extend(step.hedge_intents.iter().cloned());
 
-            state.apply_perp_fill(
-                intent.venue_index,
-                intent.side,
-                intent.size,
-                intent.price,
-                fee_bps,
-            );
-        }
+        // ---------- Apply synthetic fills via SimGateway ----------
+        gateway.apply_fills(&cfg, &mut state, &all_intents);
 
-        for intent in &hedge_intents {
-            let vcfg = &cfg.venues[intent.venue_index];
-            let fee_bps = vcfg.taker_fee_bps;
-
-            state.apply_perp_fill(
-                intent.venue_index,
-                intent.side,
-                intent.size,
-                intent.price,
-                fee_bps,
-            );
-        }
-
-        // Recompute global inventory / delta / basis / risk from the
+        // Recompute global inventory / delta / basis / PnL / risk from the
         // updated per-venue positions after all synthetic fills.
         engine.recompute_after_fills(&mut state);
 
