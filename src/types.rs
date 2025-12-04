@@ -9,8 +9,8 @@ pub type TimestampMs = i64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VenueStatus {
     Healthy,
-    Warning,  // used for "medium" toxicity / soft risk clamp
-    Disabled, // venue is turned off
+    Warning,   // used for "medium" toxicity / soft risk clamp
+    Disabled,  // venue is turned off
 }
 
 /// Buy or sell side for an order.
@@ -21,8 +21,8 @@ pub enum Side {
 }
 
 /// High-level reason for an order.
-/// - Mm   = passive market-making quote
-/// - Exit = cross-venue exit / arb
+/// - Mm    = passive market-making quote
+/// - Exit  = cross-venue exit / arb
 /// - Hedge = global hedge adjustment
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderPurpose {
@@ -41,4 +41,17 @@ pub struct OrderIntent {
     pub price: f64,
     pub size: f64,
     pub purpose: OrderPurpose,
+}
+
+/// A realised perp fill used for logging and PnL attribution.
+#[derive(Debug, Clone)]
+pub struct FillEvent {
+    pub venue_index: usize,
+    pub venue_id: String,
+    pub side: Side,
+    pub price: f64,
+    pub size: f64,
+    pub purpose: OrderPurpose,
+    /// Net fee in basis points (positive = cost, negative = rebate).
+    pub fee_bps: f64,
 }
