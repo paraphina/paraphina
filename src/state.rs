@@ -252,7 +252,8 @@ impl GlobalState {
                     if q_new != 0.0 {
                         let w_old = q_old.abs();
                         let w_trade = trade.abs();
-                        let p_new = (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
+                        let p_new =
+                            (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
                         v.position_tao = q_new;
                         v.avg_entry_price = p_new;
                     } else {
@@ -298,7 +299,8 @@ impl GlobalState {
             // Accumulate into global realised PnL.
             self.daily_realised_pnl += realised;
             // `daily_unrealised_pnl` will be updated in `recompute_after_fills`.
-            self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
+            self.daily_pnl_total =
+                self.daily_realised_pnl + self.daily_unrealised_pnl;
         }
     }
 
@@ -329,6 +331,133 @@ impl GlobalState {
         }
 
         self.daily_unrealised_pnl = unrealised;
-        self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
+        self.daily_pnl_total =
+            self.daily_realised_pnl + self.daily_unrealised_pnl;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::types::Side;
+
+    fn approx(label: &str, expected: f64, actual: f64) {
+        let diff = (expected - actual).abs();
+        assert!(
+            diff < 1e-6,
+            "{}: left={} right={} diff={}",
+            label,
+            expected,
+            actual,
+            diff
+        );
+    }
+
+    #[test]
+    fn basis_and_unrealised_pnl_two_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        // Set fair value.
+        state.fair_value = Some(100.0);
+        state.fair_value_prev = 100.0;
+
+        // Venue 0: long 5 @ 95, mid 102.
+        {
+            let v0 = &mut state.venues[0];
+            v0.position_tao = 5.0;
+            v0.avg_entry_price = 95.0;
+            v0.mid = Some(102.0);
+        }
+
+        // Venue 1: short 3 @ 110, mid 98.
+        {
+            let v1 = &mut state.venues[1];
+            v1.position_tao = -3.0;
+            v1.avg_entry_price = 110.0;
+            v1.mid = Some(98.0);
+        }
+
+        state.recompute_after_fills(&cfg);
+
+        approx("q_global_tao", 2.0, state.q_global_tao);
+        approx("dollar_delta_usd", 200.0, state.dollar_delta_usd);
+
+        // Basis contributions:
+        // v0: 5 * (102 - 100) = 10
+        // v1: -3 * (98 - 100) =  6
+        approx("basis_usd", 16.0, state.basis_usd);
+        approx("basis_gross_usd", 16.0, state.basis_gross_usd);
+
+        // Unrealised PnL is marked vs fair value:
+        // v0: 5 * (100 - 95) = 25
+        // v1: -3 * (100 - 110) = 30
+        approx("daily_unrealised_pnl", 55.0, state.daily_unrealised_pnl);
+        approx("daily_pnl_total", 55.0, state.daily_pnl_total);
+    }
+
+    #[test]
+    fn long_open_and_close_no_fees() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        let venue_index = 0;
+        let size = 10.0;
+        let entry_price = 100.0;
+        let exit_price = 110.0;
+
+        // Open long.
+        state.apply_perp_fill(venue_index, Side::Buy, size, entry_price, 0.0);
+        // Close long.
+        state.apply_perp_fill(venue_index, Side::Sell, size, exit_price, 0.0);
+
+        // Mark at exit price.
+        state.fair_value = Some(exit_price);
+        state.fair_value_prev = exit_price;
+        state.recompute_after_fills(&cfg);
+
+        approx(
+            "realised PnL long round-trip no fees",
+            (exit_price - entry_price) * size,
+            state.daily_realised_pnl,
+        );
+        approx("unrealised PnL flat book", 0.0, state.daily_unrealised_pnl);
+        approx("q_global_tao flat book", 0.0, state.q_global_tao);
+    }
+
+    #[test]
+    fn short_open_and_close_with_fees() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        let venue_index = 0;
+        let size = 10.0;
+        let entry_price = 110.0;
+        let exit_price = 100.0;
+        let fee_bps = 5.0;
+
+        // Open short: sell first.
+        state.apply_perp_fill(venue_index, Side::Sell, size, entry_price, fee_bps);
+        // Close short: buy back.
+        state.apply_perp_fill(venue_index, Side::Buy, size, exit_price, fee_bps);
+
+        // Mark at exit price (flat book).
+        state.fair_value = Some(exit_price);
+        state.fair_value_prev = exit_price;
+        state.recompute_after_fills(&cfg);
+
+        let fee_entry = (fee_bps / 10_000.0) * entry_price * size;
+        let fee_exit = (fee_bps / 10_000.0) * exit_price * size;
+        let expected_realised =
+            (entry_price - exit_price) * size - fee_entry - fee_exit;
+
+        approx(
+            "realised PnL short round-trip with fees",
+            expected_realised,
+            state.daily_realised_pnl,
+        );
+        approx("unrealised PnL flat book", 0.0, state.daily_unrealised_pnl);
+        approx("q_global_tao flat book", 0.0, state.q_global_tao);
     }
 }
