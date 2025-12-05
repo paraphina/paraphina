@@ -9,6 +9,11 @@
 pub struct Config {
     /// Human-readable config / release version.
     pub version: &'static str,
+    /// Initial global TAO inventory q_global(0) for research runs.
+    ///
+    /// This lets us start from non-flat inventory (e.g. 5 TAO) to
+    /// reproduce particular PnL / risk paths in experiments.
+    pub initial_q_tao: f64,
     /// Static config per venue (Extended, Hyperliquid, Aster, Lighter, Paradex).
     pub venues: Vec<VenueConfig>,
     /// Orderbook / fair-value observation config.
@@ -25,11 +30,6 @@ pub struct Config {
     pub hedge: HedgeConfig,
     /// Toxicity scoring + venue health config.
     pub toxicity: ToxicityConfig,
-    /// Initial global TAO position q₀ used at the start of a run.
-    ///
-    /// This is a *research knob* only – production should usually keep this at 0
-    /// and let the strategy discover inventory organically.
-    pub initial_q_tao: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +50,7 @@ pub struct VenueConfig {
     pub taker_fee_bps: f64,
     /// Maker rebate in basis points (positive = rebate).
     pub maker_rebate_bps: f64,
-    /// Avellaneda–Stoikov risk aversion γ_v.
+    /// Avellaneda–Stoikov risk aversion gamma_v.
     pub gamma: f64,
     /// Avellaneda–Stoikov intensity decay k_v.
     pub k: f64,
@@ -96,9 +96,9 @@ pub struct VolatilityConfig {
     pub fv_vol_alpha_short: f64,
     /// EWMA alpha for long-horizon fair value volatility.
     pub fv_vol_alpha_long: f64,
-    /// Minimum effective volatility σ_min.
+    /// Minimum effective volatility sigma_min.
     pub sigma_min: f64,
-    /// Reference volatility σ_ref for vol_ratio.
+    /// Reference volatility sigma_ref for vol_ratio.
     pub vol_ref: f64,
     /// Min vol_ratio used when clipping.
     pub vol_ratio_min: f64,
@@ -114,7 +114,7 @@ pub struct VolatilityConfig {
 
 #[derive(Debug, Clone)]
 pub struct RiskConfig {
-    /// Base dollar-delta limit before vol scaling (at vol_ratio ≈ 1).
+    /// Base dollar-delta limit before vol scaling (at vol_ratio ~= 1).
     pub delta_hard_limit_usd_base: f64,
     /// Fraction of delta limit where Warning regime begins.
     pub delta_warn_frac: f64,
@@ -136,7 +136,7 @@ pub struct RiskConfig {
     pub mm_max_leverage: f64,
     /// Sigma distance where liq Warning starts (LIQ_WARN_SIGMA).
     pub liq_warn_sigma: f64,
-    /// Sigma distance where liq is considered “too close” (LIQ_CRIT_SIGMA).
+    /// Sigma distance where liq is considered "too close" (LIQ_CRIT_SIGMA).
     pub liq_crit_sigma: f64,
 }
 
@@ -150,13 +150,13 @@ pub struct MmConfig {
     pub edge_local_min: f64,
     /// Multiplier for volatility-based edge buffer.
     pub edge_vol_mult: f64,
-    /// Risk parameter η in size objective J(Q)=eQ - 0.5 η Q^2.
+    /// Risk parameter eta in size objective J(Q)=eQ - 0.5 * eta * Q^2.
     pub size_eta: f64,
-    /// λ_inv ∈ [0,1] controlling anchoring to per-venue targets.
+    /// lambda_inv in [0,1] controlling anchoring to per-venue targets.
     pub lambda_inv: f64,
     /// Quote horizon T (seconds) in the AS model.
     pub quote_horizon_sec: f64,
-    /// Slope of funding→inventory skew map.
+    /// Slope of funding->inventory skew map.
     pub funding_skew_slope: f64,
     /// Clip for funding-driven skew magnitude.
     pub funding_skew_clip: f64,
@@ -168,9 +168,9 @@ pub struct HedgeConfig {
     pub hedge_band_base: f64,
     /// Max TAO we are allowed to move in one hedge action.
     pub hedge_max_step: f64,
-    /// LQ controller weight α_hedge.
+    /// LQ controller weight alpha_hedge.
     pub alpha_hedge: f64,
-    /// LQ controller weight β_hedge.
+    /// LQ controller weight beta_hedge.
     pub beta_hedge: f64,
 }
 
@@ -195,8 +195,8 @@ impl Default for Config {
         // ----- Venue configs -----
         //
         // These are deliberately conservative, assuming ~300 USD / TAO:
-        //  - base_order_size = 1 TAO  → ~300 USD notional,
-        //  - max_order_size  = 20 TAO → ~6k  USD notional.
+        //  - base_order_size = 1 TAO  -> ~300 USD notional,
+        //  - max_order_size  = 20 TAO -> ~6k  USD notional.
         // The risk engine and MM sizing logic will further scale these.
         let venues = vec![
             VenueConfig {
@@ -307,15 +307,13 @@ impl Default for Config {
             band_vol_mult_coeff: 1.0,
         };
 
-        // ----- Global risk config (Section 14) -----
+        // ----- Global risk config -----
         let risk = RiskConfig {
-            // This is the *base* hard delta limit at vol_ratio ≈ 1.
-            // The engine scales this by vol_ratio: high vol ⇒ smaller limit.
+            // Base hard delta limit at vol_ratio ~= 1.
             delta_hard_limit_usd_base: 100_000.0,
             // Warning regime kicks in once |Δ| exceeds this fraction of limit.
             delta_warn_frac: 0.7,
-            // Basis limit is intentionally smaller: we don’t want to run a big
-            // basis book while market is volatile.
+            // Basis limit: we do not want a large basis book in high vol.
             basis_hard_limit_usd: 10_000.0,
             basis_warn_frac: 0.7,
             // Daily loss limit (realised + unrealised). Negative by convention.
@@ -324,26 +322,25 @@ impl Default for Config {
             // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
             q_warn_cap: 5.0,
-            // Use ~50% of available margin, assuming up to 10x leverage for sizing.
-            mm_margin_safety: 0.5, // use only half of available margin
-            mm_max_leverage: 10.0, // allow up to 10x notionally for MM sizing
-            // Start shrinking sizes as we get within 5σ of liq; 0 sizes inside 2σ.
-            liq_warn_sigma: 5.0, // start shrinking sizes inside 5σ to liq
-            liq_crit_sigma: 2.0, // treat as “too close” inside 2σ
+            // Use ~50% of available margin, assuming up to 10x leverage.
+            mm_margin_safety: 0.5,
+            mm_max_leverage: 10.0,
+            // Start shrinking sizes as we get within 5 sigma of liq; 0 inside 2.
+            liq_warn_sigma: 5.0,
+            liq_crit_sigma: 2.0,
         };
 
         // ----- MM (Avellaneda–Stoikov + basis/funding) -----
         let mm = MmConfig {
-            // Reservation price adjustment weights. These are deliberately
-            // modest so we only lightly lean inventory based on basis/funding.
+            // Reservation price adjustment weights.
             basis_weight: 0.3,
             funding_weight: 0.3,
             // Local minimum edge in USD, plus a vol-dependent buffer.
             edge_local_min: 0.5,
             edge_vol_mult: 0.2,
-            // Inventory-risk parameter in J(Q) = eQ - 0.5 η Q².
+            // Inventory-risk parameter in J(Q) = eQ - 0.5 * eta * Q^2.
             size_eta: 0.1,
-            // 0 = pure global, 1 = pure per-venue target; we sit in the middle.
+            // 0 = pure global, 1 = pure per-venue target.
             lambda_inv: 0.5,
             // Quoting horizon in seconds used in the AS formulas.
             quote_horizon_sec: 30.0,
@@ -355,7 +352,7 @@ impl Default for Config {
         // ----- Hedge engine (global LQ controller) -----
         let hedge = HedgeConfig {
             // With ~300 USD / TAO and our default limits, this band corresponds
-            // to ~6–9k USD of unhedged delta before the LQ controller kicks in.
+            // to ~6–9k USD of unhedged delta before the controller kicks in.
             hedge_band_base: 5.0, // TAO band
             hedge_max_step: 20.0, // TAO per hedge step
             alpha_hedge: 1.0,
@@ -363,20 +360,18 @@ impl Default for Config {
         };
 
         // ----- Toxicity / venue health -----
-        //
-        // f1 = clip((local_vol / sigma_eff - 1) / vol_tox_scale, 0, 1)
-        //
-        // With these defaults we need a venue to run roughly 25–30% hotter
-        // than the global volatility before entering Warning, and ~45–50%
-        // hotter before being Disabled.
         let toxicity = ToxicityConfig {
             vol_tox_scale: 0.5,
-            tox_med_threshold: 0.6, // Warning only when volatility is clearly elevated
-            tox_high_threshold: 0.9, // Disabled only when it is much higher still
+            // Warning only when volatility is clearly elevated.
+            tox_med_threshold: 0.6,
+            // Disabled only when it is much higher still.
+            tox_high_threshold: 0.9,
         };
 
         Config {
             version: "v0.1.1-whitepaper-spec",
+            // Start from 5 TAO global position by default (matches earlier sims).
+            initial_q_tao: 5.0,
             venues,
             book,
             kalman,
@@ -385,9 +380,6 @@ impl Default for Config {
             mm,
             hedge,
             toxicity,
-            // Start research runs with a small long inventory by default.
-            // You can change this per run in code or via a future CLI flag.
-            initial_q_tao: 5.0,
         }
     }
 }
