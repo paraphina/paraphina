@@ -44,7 +44,7 @@ fn main() {
     //    - FileSink  -> JSONL file with 1 record per tick for backtesting / RL.
     //
     // Flip this flag when you want real logs.
-    let use_file_sink = true;
+    let use_file_sink = false;
     let sink = build_sink(use_file_sink);
 
     // 4) Run the high-level strategy for N ticks.
