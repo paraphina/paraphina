@@ -2,101 +2,141 @@
 """
 tools/research_ticks.py
 
-Basic research/analysis helper for Paraphina tick logs.
+Lightweight research helper for Paraphina JSONL tick logs.
 
 Usage:
     python3 tools/research_ticks.py paraphina_ticks.jsonl
+    python3 tools/research_ticks.py research_run_002.jsonl
+
+It will:
+  - load the JSONL into a pandas DataFrame,
+  - print basic summary statistics, and
+  - save a few PNG charts next to the JSONL file:
+        <stem>_pnl_curve.png
+        <stem>_delta_curve.png
+        <stem>_basis_curve.png
 """
 
-import json
 import sys
 from pathlib import Path
 
-try:
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    HAS_PANDAS = True
-except ImportError:
-    HAS_PANDAS = False
+import pandas as pd
+import matplotlib.pyplot as plt
 
 
-def load_ticks(path: Path):
-    rows = []
-    with path.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    return rows
+def load_ticks(path: Path) -> pd.DataFrame:
+    df = pd.read_json(path, lines=True)
+    if "tick" not in df.columns:
+        raise ValueError("Expected a 'tick' column in the JSONL log")
+    return df
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 tools/research_ticks.py paraphina_ticks.jsonl")
-        sys.exit(1)
-
-    path = Path(sys.argv[1])
-    if not path.exists():
-        print(f"File not found: {path}")
-        sys.exit(1)
-
-    ticks = load_ticks(path)
-    if not ticks:
-        print("No ticks found in file.")
-        sys.exit(0)
-
-    print(f"Loaded {len(ticks)} ticks from {path}")
+def print_summary(df: pd.DataFrame, path: Path) -> None:
+    print(f"Loaded {len(df)} ticks from {path.name}")
     print("-" * 72)
 
-    # Simple manual stats (no dependencies)
-    def col(name):
-        return [t[name] for t in ticks if name in t]
+    # Fair value
+    fv = df["fair_value"]
+    print(
+        "Fair value: "
+        f"min={fv.min():.4f}, max={fv.max():.4f}, "
+        f"last={fv.iloc[-1]:.4f}, mean={fv.mean():.4f}"
+    )
 
-    pnl = col("daily_pnl_total")
-    delta = col("dollar_delta_usd")
-    basis = col("basis_usd")
-    fv = col("fair_value")
+    # Total PnL
+    pnl = df["daily_pnl_total"]
+    print(
+        "Daily PnL total: "
+        f"min={pnl.min():.4f}, max={pnl.max():.4f}, "
+        f"last={pnl.iloc[-1]:.4f}, mean={pnl.mean():.4f}"
+    )
 
-    def basic_stats(xs, label):
-        if not xs:
-            print(f"{label}: <no data>")
-            return
-        mn = min(xs)
-        mx = max(xs)
-        last = xs[-1]
-        avg = sum(xs) / len(xs)
-        print(f"{label}: min={mn:.4f}, max={mx:.4f}, last={last:.4f}, mean={avg:.4f}")
+    # Dollar delta
+    delta = df["dollar_delta_usd"]
+    print(
+        "Dollar delta USD: "
+        f"min={delta.min():.4f}, max={delta.max():.4f}, "
+        f"last={delta.iloc[-1]:.4f}, mean={delta.mean():.4f}"
+    )
 
-    basic_stats(fv,    "Fair value")
-    basic_stats(pnl,   "Daily PnL total")
-    basic_stats(delta, "Dollar delta USD")
-    basic_stats(basis, "Basis exposure USD")
+    # Basis exposure
+    basis = df["basis_usd"]
+    print(
+        "Basis exposure USD: "
+        f"min={basis.min():.4f}, max={basis.max():.4f}, "
+        f"last={basis.iloc[-1]:.4f}, mean={basis.mean():.4f}"
+    )
 
-    # Optional pandas + chart
-    if HAS_PANDAS:
-        df = pd.DataFrame(ticks)
-        df["tick"] = range(len(df))
+    print("\nHead of dataframe:")
+    # Show a compact head so your terminal doesn’t explode
+    print(df.head()[["tick", "fair_value", "dollar_delta_usd", "basis_usd", "daily_pnl_total"]])
 
-        print("\nHead of dataframe:")
-        print(df.head())
 
-        # Simple PnL plot
-        plt.figure()
-        plt.plot(df["tick"], df["daily_pnl_total"])
-        plt.xlabel("Tick")
-        plt.ylabel("Daily PnL total (USD)")
-        plt.title("Paraphina PnL path")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
-    else:
-        print(
-            "\n(pandas/matplotlib not installed; "
-            "install with `python3 -m pip install --user pandas matplotlib` "
-            "to get plots and richer analysis.)"
-        )
+def plot_series(df: pd.DataFrame, x_col: str, y_col: str, out_path: Path,
+                ylabel: str, title: str) -> None:
+    plt.figure()
+    plt.plot(df[x_col], df[y_col])
+    plt.xlabel("tick")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    print(f"Saved {out_path}")
+
+
+def make_plots(df: pd.DataFrame, path: Path) -> None:
+    stem = path.with_suffix("").name
+    base_dir = path.parent
+
+    pnl_png = base_dir / f"{stem}_pnl_curve.png"
+    delta_png = base_dir / f"{stem}_delta_curve.png"
+    basis_png = base_dir / f"{stem}_basis_curve.png"
+
+    plot_series(
+        df,
+        x_col="tick",
+        y_col="daily_pnl_total",
+        out_path=pnl_png,
+        ylabel="daily_pnl_total",
+        title="Total PnL vs tick",
+    )
+
+    plot_series(
+        df,
+        x_col="tick",
+        y_col="dollar_delta_usd",
+        out_path=delta_png,
+        ylabel="dollar_delta_usd",
+        title="Dollar delta vs tick",
+    )
+
+    plot_series(
+        df,
+        x_col="tick",
+        y_col="basis_usd",
+        out_path=basis_png,
+        ylabel="basis_usd",
+        title="Basis exposure vs tick",
+    )
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print("Usage: python3 tools/research_ticks.py <ticks.jsonl>", file=sys.stderr)
+        return 1
+
+    path = Path(argv[1])
+    if not path.is_file():
+        print(f"File not found: {path}", file=sys.stderr)
+        return 1
+
+    df = load_ticks(path)
+    print_summary(df, path)
+    make_plots(df, path)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv))

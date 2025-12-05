@@ -3,3 +3,5 @@ paraphina_ticks.jsonl
 paraphina_ticks.log
 research_run_*.jsonl
 research_run_*.jsonl
+research_run_*_curve.png
+research_run_*jsonl
