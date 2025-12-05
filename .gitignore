@@ -5,3 +5,4 @@ research_run_*.jsonl
 research_run_*.jsonl
 research_run_*_curve.png
 research_run_*jsonl
+.venv/
