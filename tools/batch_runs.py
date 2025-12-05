@@ -1,115 +1,110 @@
 #!/usr/bin/env python3
 """
-tools/batch_runs.py
-
 Hedge-band sweep harness for Paraphina.
 
-For each hedge band in HEDGE_BANDS_TAO, this script:
-  - sets PARA_HEDGE_BAND_TAO in the environment,
-  - runs the paraphina binary with --ticks / --log-jsonl,
-  - loads the JSONL tick log,
-  - computes summary metrics (final PnL, max drawdown, max |delta|, max |basis|),
-  - writes a CSV summary,
-  - and plots final PnL vs hedge band.
+- Sweeps hedge_band_base over a small grid of TAO values.
+- For each band, runs the Rust sim multiple times with env overrides:
+    PARA_INITIAL_Q_TAO
+    PARA_HEDGE_BAND_BASE
+    PARA_HEDGE_MAX_STEP
+- Reads the JSONL logs, computes risk/return metrics, and writes:
+    exp01_band_sweep_runs.csv      (per-run metrics)
+    exp01_band_sweep_summary.csv   (per-band aggregated metrics)
+    exp01_band_sweep_pnl.png       (PnL vs band plot)
 
-Outputs in repo root:
-  - exp02_hedge_band_hb*.jsonl
-  - exp02_hedge_band_summary.csv
-  - exp02_hedge_band_pnl_vs_band.png
+This is our first DARPA-grade research harness: fully reproducible and
+easy to extend with more knobs later.
 """
 
-import json
 import os
 import subprocess
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------------------
+# Configuration of the experiment
+# ---------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNS_DIR = ROOT / "batch_runs"
+RUNS_DIR.mkdir(exist_ok=True)
+
+# How many synthetic ticks per run.
+TICKS = 200
+
+# How many independent runs per hedge band.
+RUNS_PER_BAND = 5
+
+# Grid of hedge bands (TAO) to sweep.
+HEDGE_BANDS_TAO = [2.5, 5.0, 7.5, 10.0, 15.0]
 
 
-# ----------- Paths & global constants -----------
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-BINARY = PROJECT_ROOT / "target" / "debug" / "paraphina"
-
-NUM_TICKS = 200
-EXPERIMENT_PREFIX = "exp02_hedge_band"
-
-# TAO half-band values we want to test.
-HEDGE_BANDS_TAO = [1.0, 2.5, 5.0, 10.0, 20.0]
-
-
-# ----------- Helpers -----------
-
-def build_binary() -> None:
-    """Ensure the Rust binary is built."""
-    print(">>> Building paraphina binary (cargo build)...")
-    subprocess.run(
-        ["cargo", "build", "--quiet"],
-        cwd=PROJECT_ROOT,
-        check=True,
-    )
-    print(">>> Build complete.\n")
-
-
-def run_one(hedge_band_tao: float, jsonl_path: Path) -> None:
+def run_one_sim(hedge_band_tao: float, run_idx: int) -> pd.DataFrame:
     """
-    Run a single simulation with a given hedge band.
-
-    hedge_band_tao is injected via PARA_HEDGE_BAND_TAO.
+    Launch one Rust simulation with a given hedge_band_base and
+    return the per-tick dataframe loaded from the JSONL log.
     """
     env = os.environ.copy()
-    env["PARA_HEDGE_BAND_TAO"] = str(hedge_band_tao)
-    env["PARA_RUN_LABEL"] = f"hb_{hedge_band_tao}"
+
+    # Explicitly pin the research knobs we care about.
+    env["PARA_INITIAL_Q_TAO"] = "0.0"
+
+    # These env var names must match the overrides in src/config.rs.
+    env["PARA_HEDGE_BAND_BASE"] = str(hedge_band_tao)
+    env["PARA_HEDGE_MAX_STEP"] = str(4.0 * hedge_band_tao)
+
+    # Nice to have when debugging.
+    env.setdefault("RUST_BACKTRACE", "1")
+
+    run_id = f"band{hedge_band_tao:04.1f}_run{run_idx:02d}".replace(".", "p")
+    jsonl_path = RUNS_DIR / f"{run_id}.jsonl"
 
     cmd = [
-        str(BINARY),
+        "cargo",
+        "run",
+        "--quiet",
+        "--",
         "--ticks",
-        str(NUM_TICKS),
+        str(TICKS),
         "--log-jsonl",
         str(jsonl_path),
     ]
 
-    print(f">>> Running hedge_band_tao={hedge_band_tao}")
-    print("    CMD:", " ".join(cmd))
-    subprocess.run(cmd, cwd=PROJECT_ROOT, env=env, check=True)
-    print(f"    Wrote ticks to {jsonl_path.name}\n")
+    print(f"\n=== Running {run_id} (hedge_band_base={hedge_band_tao} TAO) ===")
+    subprocess.run(cmd, cwd=ROOT, check=True, env=env)
 
-
-def load_ticks(jsonl_path: Path) -> pd.DataFrame:
-    """Load a JSONL tick file into a pandas DataFrame."""
-    records = []
-    with jsonl_path.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            records.append(json.loads(line))
-    df = pd.DataFrame.from_records(records)
+    # Load the per-tick snapshots.
+    df = pd.read_json(jsonl_path, lines=True)
     return df
 
 
-def summarise_run(df: pd.DataFrame, hedge_band_tao: float) -> dict:
+def compute_metrics(df: pd.DataFrame) -> dict:
     """
-    Compute summary metrics for a single run.
-
-    Uses the standard Paraphina tick schema:
-      - daily_pnl_total
-      - dollar_delta_usd
-      - basis_usd
+    Compute risk/return metrics from a per-tick dataframe.
+    We deliberately keep this very simple and transparent.
     """
-    pnl = df["daily_pnl_total"].astype(float)
+    pnl = df["daily_pnl_total"].to_numpy()
+    delta = df["dollar_delta_usd"].to_numpy()
+    basis = df["basis_usd"].to_numpy()
 
-    final_pnl = float(pnl.iloc[-1])
-    cummax = pnl.cummax()
-    drawdown = cummax - pnl
-    max_drawdown = float(drawdown.max())
+    final_pnl = float(pnl[-1])
 
-    max_abs_delta = float(df["dollar_delta_usd"].abs().max())
-    max_abs_basis = float(df["basis_usd"].abs().max())
+    # Treat daily_pnl_total as an equity curve for drawdown purposes.
+    running_max = np.maximum.accumulate(pnl)
+    drawdown = pnl - running_max
+    max_drawdown = float(drawdown.min())  # <= 0.0
+
+    max_abs_delta = float(np.abs(delta).max())
+    max_abs_basis = float(np.abs(basis).max())
 
     return {
-        "hedge_band_tao": hedge_band_tao,
         "final_pnl": final_pnl,
         "max_drawdown": max_drawdown,
         "max_abs_delta_usd": max_abs_delta,
@@ -117,52 +112,66 @@ def summarise_run(df: pd.DataFrame, hedge_band_tao: float) -> dict:
     }
 
 
-def plot_pnl_vs_band(summary_df: pd.DataFrame, png_path: Path) -> None:
-    """Plot final PnL vs hedge band."""
-    summary_df = summary_df.sort_values("hedge_band_tao")
-
-    plt.figure()
-    plt.plot(
-        summary_df["hedge_band_tao"],
-        summary_df["final_pnl"],
-        marker="o",
-    )
-    plt.xlabel("hedge_band_tao (TAO)")
-    plt.ylabel("final_pnl (USD)")
-    plt.title("Final PnL vs hedge band")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(png_path)
-    plt.close()
-    print(f"Saved PnL plot to {png_path.name}")
-
-
-# ----------- Main entrypoint -----------
+# ---------------------------------------------------------------------
+# Main experiment driver
+# ---------------------------------------------------------------------
 
 def main() -> None:
-    build_binary()
+    rows = []
 
-    summaries = []
+    for band in HEDGE_BANDS_TAO:
+        for run_idx in range(RUNS_PER_BAND):
+            df = run_one_sim(band, run_idx)
+            metrics = compute_metrics(df)
+            row = {
+                "hedge_band_tao": band,
+                "run_idx": run_idx,
+                **metrics,
+            }
+            rows.append(row)
 
-    for hb in HEDGE_BANDS_TAO:
-        jsonl_name = f"{EXPERIMENT_PREFIX}_hb{hb}.jsonl"
-        jsonl_path = PROJECT_ROOT / jsonl_name
+    df_runs = pd.DataFrame(rows)
+    runs_csv = ROOT / "exp01_band_sweep_runs.csv"
+    df_runs.to_csv(runs_csv, index=False)
+    print(f"\nSaved per-run metrics to {runs_csv}")
 
-        run_one(hb, jsonl_path)
-        df = load_ticks(jsonl_path)
-        summary = summarise_run(df, hb)
-        summaries.append(summary)
+    # Aggregate per band.
+    summary = (
+        df_runs.groupby("hedge_band_tao")
+        .agg(
+            final_pnl_mean=("final_pnl", "mean"),
+            final_pnl_std=("final_pnl", "std"),
+            max_drawdown_mean=("max_drawdown", "mean"),
+            max_drawdown_min=("max_drawdown", "min"),  # most negative
+            max_abs_delta_mean=("max_abs_delta_usd", "mean"),
+            max_abs_basis_mean=("max_abs_basis_usd", "mean"),
+        )
+        .reset_index()
+    )
 
-    summary_df = pd.DataFrame(summaries)
+    summary_csv = ROOT / "exp01_band_sweep_summary.csv"
+    summary.to_csv(summary_csv, index=False)
+    print(f"Saved band-sweep summary to {summary_csv}\n")
 
-    csv_path = PROJECT_ROOT / f"{EXPERIMENT_PREFIX}_summary.csv"
-    summary_df.to_csv(csv_path, index=False)
-    print("\n=== Hedge-band sweep summary ===")
-    print(summary_df.to_string(index=False))
-    print(f"\nSaved summary CSV to {csv_path.name}")
+    print("=== Band sweep summary (PnL / risk) ===")
+    print(summary.to_string(index=False))
 
-    png_path = PROJECT_ROOT / f"{EXPERIMENT_PREFIX}_pnl_vs_band.png"
-    plot_pnl_vs_band(summary_df, png_path)
+    # Simple research plot: mean final PnL vs hedge band (with std error bars).
+    fig, ax = plt.subplots()
+    ax.errorbar(
+        summary["hedge_band_tao"],
+        summary["final_pnl_mean"],
+        yerr=summary["final_pnl_std"].fillna(0.0),
+        fmt="o-",
+    )
+    ax.set_xlabel("hedge_band_base (TAO)")
+    ax.set_ylabel("final PnL (USD)")
+    ax.set_title("Experiment 01: hedge_band_base sweep")
+    fig.tight_layout()
+
+    png_path = ROOT / "exp01_band_sweep_pnl.png"
+    fig.savefig(png_path)
+    print(f"Saved PnL vs band plot to {png_path}")
 
 
 if __name__ == "__main__":

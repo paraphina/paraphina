@@ -11,3 +11,10 @@ exp*_pnl_hist.png
 exp02_hedge_band_hb*.jsonl
 exp02_hedge_band_summary.csv
 exp02_hedge_band_pnl_vs_band.png
+# Python venv
+.venv/
+
+# Research / experiment artefacts
+exp01_*.csv
+exp01_*.png
+batch_runs/
