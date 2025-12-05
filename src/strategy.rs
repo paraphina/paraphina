@@ -71,9 +71,9 @@ where
             self.engine.main_tick(&mut self.state, now_ms);
 
             // Inject the initial synthetic position (demo only).
-            if tick == 0 && self.state.q_global_tao.abs() < 1e-9 {
-                self.inject_initial_position();
-            }
+            // if tick == 0 && self.state.q_global_tao.abs() < 1e-9 {
+            //    self.inject_initial_position();
+            // }
 
             // 2) Update toxicity / venue health.
             update_toxicity_and_health(&mut self.state, self.cfg);
@@ -144,27 +144,42 @@ where
         }
     }
 
-    /// Inject an initial synthetic long position on venue 0.
-    /// This mirrors the previous demo behaviour where you start with
-    /// a small inventory that the hedge engine can work against.
+    /// Inject an initial synthetic position on venue 0.
+    /// Sign of `cfg.initial_q_tao` controls direction:
+    ///   > 0  => long
+    ///   < 0  => short
+    ///   ~= 0 => no position
     fn inject_initial_position(&mut self) {
         if self.cfg.venues.is_empty() {
             return;
         }
 
+        let q0 = self.cfg.initial_q_tao;
+
+        // If configured initial position is effectively zero, do nothing.
+        if q0.abs() < 1e-9 {
+            println!("No synthetic initial position (initial_q_tao ~= 0).");
+            return;
+        }
+
         let venue_index = 0usize;
-        let size_tao = 5.0_f64;
+        let size_tao = q0.abs();
+        let side = if q0 > 0.0 { Side::Buy } else { Side::Sell };
+
         let s_t = self.state.fair_value.unwrap_or(self.state.fair_value_prev);
         let entry_price = if s_t > 0.0 { s_t } else { 250.0 };
 
         println!(
-            "Injecting synthetic initial position: venue={} side=Buy size={} @ {:.4}",
-            self.cfg.venues[venue_index].id, size_tao, entry_price
+            "Injecting synthetic initial position: venue={} side={:?} size={} @ {:.4}",
+            self.cfg.venues[venue_index].id,
+            side,
+            size_tao,
+            entry_price
         );
 
         self.state.apply_perp_fill(
             venue_index,
-            Side::Buy,
+            side,
             size_tao,
             entry_price,
             0.0,

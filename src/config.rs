@@ -25,6 +25,11 @@ pub struct Config {
     pub hedge: HedgeConfig,
     /// Toxicity scoring + venue health config.
     pub toxicity: ToxicityConfig,
+    /// Initial global TAO position q₀ used at the start of a run.
+    ///
+    /// This is a *research knob* only – production should usually keep this at 0
+    /// and let the strategy discover inventory organically.
+    pub initial_q_tao: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +385,9 @@ impl Default for Config {
             mm,
             hedge,
             toxicity,
+            // Start research runs with a small long inventory by default.
+            // You can change this per run in code or via a future CLI flag.
+            initial_q_tao: 5.0,
         }
     }
 }

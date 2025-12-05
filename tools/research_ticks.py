@@ -1,142 +1,147 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-tools/research_ticks.py
-
-Lightweight research helper for Paraphina JSONL tick logs.
+Research helper for Paraphina tick logs.
 
 Usage:
-    python3 tools/research_ticks.py paraphina_ticks.jsonl
-    python3 tools/research_ticks.py research_run_002.jsonl
+    python tools/research_ticks.py paraphina_ticks.jsonl --prefix research_run_005
 
-It will:
-  - load the JSONL into a pandas DataFrame,
-  - print basic summary statistics, and
-  - save a few PNG charts next to the JSONL file:
-        <stem>_pnl_curve.png
-        <stem>_delta_curve.png
-        <stem>_basis_curve.png
+This will:
+  - Copy the input JSONL to:  research_run_005.jsonl
+  - Print some summary stats to stdout
+  - Save three PNG charts in the current directory:
+        research_run_005_pnl_curve.png
+        research_run_005_delta_curve.png
+        research_run_005_basis_curve.png
 """
 
-import sys
+import argparse
+import shutil
 from pathlib import Path
 
-import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend for SSH/headless use
+
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
-def load_ticks(path: Path) -> pd.DataFrame:
-    df = pd.read_json(path, lines=True)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Inspect Paraphina JSONL tick logs and plot basic curves."
+    )
+    parser.add_argument(
+        "ticks_path",
+        help="Path to the JSONL tick log (produced by --log-jsonl).",
+    )
+    parser.add_argument(
+        "--prefix",
+        default="research_run",
+        help="Prefix for output files (e.g. research_run_005).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    ticks_path = Path(args.ticks_path)
+    if not ticks_path.is_file():
+        raise SystemExit(f"Input file not found: {ticks_path}")
+
+    # Normalise the prefix (strip any extension if the user typed .jsonl)
+    prefix = Path(args.prefix).stem
+
+    # Copy the raw tick log to a research archive file in the CWD
+    archived_jsonl = Path(f"{prefix}.jsonl")
+    if ticks_path.resolve() != archived_jsonl.resolve():
+        shutil.copy2(ticks_path, archived_jsonl)
+        print(f"Copied tick log to {archived_jsonl}")
+    else:
+        print(f"Using existing tick log {archived_jsonl}")
+
+    # Load JSONL into a DataFrame
+    print(f"Loading {archived_jsonl} ...")
+    df = pd.read_json(archived_jsonl, lines=True)
+
     if "tick" not in df.columns:
-        raise ValueError("Expected a 'tick' column in the JSONL log")
-    return df
+        raise SystemExit("Expected a 'tick' column in the JSONL file.")
 
+    # --- Basic summary -------------------------------------------------------
+    n_ticks = len(df)
+    last = df.iloc[-1]
 
-def print_summary(df: pd.DataFrame, path: Path) -> None:
-    print(f"Loaded {len(df)} ticks from {path.name}")
+    print()
+    print(f"Loaded {n_ticks} ticks from {archived_jsonl}")
     print("-" * 72)
 
-    # Fair value
-    fv = df["fair_value"]
+    fv_min = df["fair_value"].min()
+    fv_max = df["fair_value"].max()
+    fv_last = last["fair_value"]
+    fv_mean = df["fair_value"].mean()
+
     print(
-        "Fair value: "
-        f"min={fv.min():.4f}, max={fv.max():.4f}, "
-        f"last={fv.iloc[-1]:.4f}, mean={fv.mean():.4f}"
+        f"Fair value: min={fv_min:.4f}, max={fv_max:.4f}, "
+        f"last={fv_last:.4f}, mean={fv_mean:.4f}"
     )
 
-    # Total PnL
-    pnl = df["daily_pnl_total"]
+    pnl_last = last["daily_pnl_total"]
+    print(f"Total PnL (last tick): {pnl_last:.4f}")
+
+    dd_min = df["dollar_delta_usd"].min()
+    dd_max = df["dollar_delta_usd"].max()
+    dd_last = last["dollar_delta_usd"]
+    dd_mean = df["dollar_delta_usd"].mean()
+
     print(
-        "Daily PnL total: "
-        f"min={pnl.min():.4f}, max={pnl.max():.4f}, "
-        f"last={pnl.iloc[-1]:.4f}, mean={pnl.mean():.4f}"
+        f"Dollar delta USD: min={dd_min:.4f}, max={dd_max:.4f}, "
+        f"last={dd_last:.4f}, mean={dd_mean:.4f}"
     )
 
-    # Dollar delta
-    delta = df["dollar_delta_usd"]
+    basis_min = df["basis_usd"].min()
+    basis_max = df["basis_usd"].max()
+    basis_last = last["basis_usd"]
+    basis_mean = df["basis_usd"].mean()
+
     print(
-        "Dollar delta USD: "
-        f"min={delta.min():.4f}, max={delta.max():.4f}, "
-        f"last={delta.iloc[-1]:.4f}, mean={delta.mean():.4f}"
+        f"Basis exposure USD: min={basis_min:.4f}, max={basis_max:.4f}, "
+        f"last={basis_last:.4f}, mean={basis_mean:.4f}"
     )
 
-    # Basis exposure
-    basis = df["basis_usd"]
-    print(
-        "Basis exposure USD: "
-        f"min={basis.min():.4f}, max={basis.max():.4f}, "
-        f"last={basis.iloc[-1]:.4f}, mean={basis.mean():.4f}"
-    )
+    # --- Plot helpers --------------------------------------------------------
+    def save_curve(y_col: str, ylabel: str, title: str, suffix: str) -> None:
+        out_path = Path(f"{prefix}_{suffix}.png")
+        plt.figure()
+        plt.plot(df["tick"], df[y_col])
+        plt.xlabel("tick")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+        print(f"Saved {out_path}")
 
-    print("\nHead of dataframe:")
-    # Show a compact head so your terminal doesn’t explode
-    print(df.head()[["tick", "fair_value", "dollar_delta_usd", "basis_usd", "daily_pnl_total"]])
-
-
-def plot_series(df: pd.DataFrame, x_col: str, y_col: str, out_path: Path,
-                ylabel: str, title: str) -> None:
-    plt.figure()
-    plt.plot(df[x_col], df[y_col])
-    plt.xlabel("tick")
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(out_path)
-    plt.close()
-    print(f"Saved {out_path}")
-
-
-def make_plots(df: pd.DataFrame, path: Path) -> None:
-    stem = path.with_suffix("").name
-    base_dir = path.parent
-
-    pnl_png = base_dir / f"{stem}_pnl_curve.png"
-    delta_png = base_dir / f"{stem}_delta_curve.png"
-    basis_png = base_dir / f"{stem}_basis_curve.png"
-
-    plot_series(
-        df,
-        x_col="tick",
+    # --- Individual curves ---------------------------------------------------
+    save_curve(
         y_col="daily_pnl_total",
-        out_path=pnl_png,
         ylabel="daily_pnl_total",
         title="Total PnL vs tick",
+        suffix="pnl_curve",
     )
 
-    plot_series(
-        df,
-        x_col="tick",
+    save_curve(
         y_col="dollar_delta_usd",
-        out_path=delta_png,
         ylabel="dollar_delta_usd",
         title="Dollar delta vs tick",
+        suffix="delta_curve",
     )
 
-    plot_series(
-        df,
-        x_col="tick",
+    save_curve(
         y_col="basis_usd",
-        out_path=basis_png,
         ylabel="basis_usd",
         title="Basis exposure vs tick",
+        suffix="basis_curve",
     )
-
-
-def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("Usage: python3 tools/research_ticks.py <ticks.jsonl>", file=sys.stderr)
-        return 1
-
-    path = Path(argv[1])
-    if not path.is_file():
-        print(f"File not found: {path}", file=sys.stderr)
-        return 1
-
-    df = load_ticks(path)
-    print_summary(df, path)
-    make_plots(df, path)
-
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    main()
