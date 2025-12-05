@@ -1,8 +1,8 @@
 //! Paraphina core library.
 //!
-//! This crate exposes the core market-making engine, state, strategy
-//! runner, execution gateway, and telemetry sinks. The binary
-//! (`src/main.rs`) is just a thin harness around these components.
+//! This crate exposes the core market-making engine, state, and strategy
+//! runner. The binary (`src/main.rs`) is just a thin simulation / research
+//! harness around these components.
 
 pub mod config;
 pub mod engine;
@@ -19,18 +19,26 @@ pub mod types;
 
 pub use config::Config;
 pub use engine::Engine;
+
 pub use gateway::{ExecutionGateway, SimGateway};
+
 pub use hedge::{
     compute_hedge_plan,
     hedge_plan_to_order_intents,
     HedgeAllocation,
     HedgePlan,
 };
+
 pub use logging::{EventSink, FileSink, NoopSink};
+
 pub use mm::{compute_mm_quotes, mm_quotes_to_order_intents, MmLevel, MmQuote};
+
 pub use state::{GlobalState, RiskRegime, VenueState};
+
 pub use strategy::StrategyRunner;
+
 pub use toxicity::update_toxicity_and_health;
+
 pub use types::{
     FillEvent,
     OrderIntent,

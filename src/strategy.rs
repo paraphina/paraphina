@@ -25,25 +25,25 @@ use crate::types::{OrderIntent, Side, TimestampMs};
 /// High-level strategy runner.
 ///
 /// `'a` is the lifetime of the shared `Config` reference.
-/// The sink is a boxed trait object so we can choose FileSink / NoopSink
-/// at runtime.
-pub struct StrategyRunner<'a, G>
+pub struct StrategyRunner<'a, G, S>
 where
     G: ExecutionGateway,
+    S: EventSink,
 {
     pub cfg: &'a Config,
     pub engine: Engine,
     pub state: GlobalState,
     pub gateway: G,
-    pub sink: Box<dyn EventSink>,
+    pub sink: S,
 }
 
-impl<'a, G> StrategyRunner<'a, G>
+impl<'a, G, S> StrategyRunner<'a, G, S>
 where
     G: ExecutionGateway,
+    S: EventSink,
 {
     /// Construct a new strategy runner with a given gateway and event sink.
-    pub fn new(cfg: &'a Config, gateway: G, sink: Box<dyn EventSink>) -> Self {
+    pub fn new(cfg: &'a Config, gateway: G, sink: S) -> Self {
         let engine = Engine::new(cfg);
         let state = GlobalState::new(cfg);
         Self {

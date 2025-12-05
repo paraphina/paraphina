@@ -7,10 +7,29 @@ use paraphina::{
     Config,
     SimGateway,
     StrategyRunner,
+    EventSink,
     FileSink,
     NoopSink,
-    EventSink,
 };
+
+/// Build the telemetry sink as a trait object so we can choose between
+/// FileSink and NoopSink at runtime.
+fn build_sink(use_file_sink: bool) -> Box<dyn EventSink> {
+    if use_file_sink {
+        match FileSink::create("paraphina_ticks.jsonl") {
+            Ok(s) => Box::new(s),
+            Err(err) => {
+                eprintln!(
+                    "Failed to create log file (paraphina_ticks.jsonl), \
+                     falling back to NoopSink: {err}"
+                );
+                Box::new(NoopSink)
+            }
+        }
+    } else {
+        Box::new(NoopSink)
+    }
+}
 
 fn main() {
     // 1) Load / build config.
@@ -26,21 +45,7 @@ fn main() {
     //
     // Flip this flag when you want real logs.
     let use_file_sink = true;
-
-    let sink: Box<dyn EventSink> = if use_file_sink {
-        match FileSink::create("paraphina_ticks.jsonl") {
-            Ok(s) => Box::new(s) as Box<dyn EventSink>,
-            Err(err) => {
-                eprintln!(
-                    "Failed to create log file (paraphina_ticks.jsonl), \
-                     falling back to NoopSink: {err}"
-                );
-                Box::new(NoopSink) as Box<dyn EventSink>
-            }
-        }
-    } else {
-        Box::new(NoopSink) as Box<dyn EventSink>
-    };
+    let sink = build_sink(use_file_sink);
 
     // 4) Run the high-level strategy for N ticks.
     let num_ticks: u64 = 50;
