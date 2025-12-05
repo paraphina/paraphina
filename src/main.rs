@@ -4,7 +4,6 @@
 // All of the real logic lives in the lib crate (engine, strategy, etc).
 
 use clap::Parser;
-
 use paraphina::{
     Config,
     SimGateway,
@@ -14,50 +13,51 @@ use paraphina::{
     NoopSink,
 };
 
-/// Command-line arguments for the Paraphina simulator.
+/// CLI configuration for the simulation / research harness.
+///
+/// Examples:
+///   cargo run -- --ticks 50
+///   cargo run -- --ticks 200 --log-jsonl research_run_002.jsonl
 #[derive(Parser, Debug)]
 #[command(
     name = "paraphina",
     version,
-    about = "Paraphina perp MM / hedge simulator",
-    long_about = None
+    about = "TAO perp market-making research / simulation harness"
 )]
-struct Args {
-    /// Number of ticks to simulate.
+struct Cli {
+    /// Number of ticks to simulate
     #[arg(long, default_value_t = 50)]
-    num_ticks: u64,
+    ticks: u64,
 
-    /// Whether to log ticks to a JSONL file.
-    #[arg(long, default_value_t = false)]
-    use_file_sink: bool,
-
-    /// Output JSONL filename (used only if --use-file-sink is true).
-    #[arg(long, default_value = "paraphina_ticks.jsonl")]
-    out: String,
+    /// Optional JSONL file path to log per-tick state.
+    ///
+    /// If omitted, no JSONL log is written (stdout only).
+    #[arg(long, value_name = "PATH")]
+    log_jsonl: Option<String>,
 }
 
 /// Build the telemetry sink as a trait object so we can choose between
-/// FileSink and NoopSink at runtime.
-fn build_sink(use_file_sink: bool, path: &str) -> Box<dyn EventSink> {
-    if use_file_sink {
+/// FileSink and NoopSink at runtime, based on the CLI options.
+fn build_sink(log_jsonl: &Option<String>) -> Box<dyn EventSink> {
+    if let Some(path) = log_jsonl {
         match FileSink::create(path) {
-            Ok(s) => Box::new(s),
+            Ok(sink) => Box::new(sink),
             Err(err) => {
                 eprintln!(
-                    "Failed to create log file ({path}), \
-                     falling back to NoopSink: {err}"
+                    "Failed to create log file ({path}), falling back to NoopSink: {err}"
                 );
                 Box::new(NoopSink)
             }
         }
     } else {
+        // No log file requested → just print to stdout.
         Box::new(NoopSink)
     }
 }
 
 fn main() {
-    // 0) Parse CLI args.
-    let args = Args::parse();
+    // 0) Parse CLI flags.
+    let cli = Cli::parse();
 
     // 1) Load / build config.
     let cfg = Config::default();
@@ -65,10 +65,10 @@ fn main() {
     // 2) Choose execution gateway (here: synthetic sim).
     let gateway = SimGateway::new();
 
-    // 3) Choose telemetry sink from CLI flags.
-    let sink = build_sink(args.use_file_sink, &args.out);
+    // 3) Build telemetry sink from CLI options.
+    let sink = build_sink(&cli.log_jsonl);
 
     // 4) Run the high-level strategy for N ticks.
     let mut runner = StrategyRunner::new(&cfg, gateway, sink);
-    runner.run_simulation(args.num_ticks);
+    runner.run_simulation(cli.ticks);
 }
