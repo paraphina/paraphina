@@ -3,20 +3,18 @@
 // Thin harness around the Paraphina library.
 // All of the real logic lives in the lib crate (engine, strategy, etc).
 
-use std::env;
-
 use clap::Parser;
 
 use paraphina::{
     Config,
+    SimGateway,
+    StrategyRunner,
     EventSink,
     FileSink,
     NoopSink,
-    SimGateway,
-    StrategyRunner,
 };
 
-/// Command-line arguments for the Paraphina simulation binary.
+/// Command-line arguments for the Paraphina binary.
 #[derive(Parser, Debug)]
 #[command(
     name = "paraphina",
@@ -28,33 +26,21 @@ struct Args {
     #[arg(long, default_value_t = 200)]
     ticks: u64,
 
+    /// Initial synthetic global position q0 in TAO.
+    ///
+    /// This is applied once at t = 0 via StrategyRunner::inject_initial_position.
+    #[arg(long, allow_hyphen_values = true)]
+    initial_q_tao: Option<f64>,
+
+    /// Base hedge band (TAO) before volatility scaling.
+    #[arg(long)]
+    hedge_band_base: Option<f64>,
+
     /// JSONL file to log per-tick snapshots.
     ///
     /// If omitted, no JSONL log is written (NoopSink).
     #[arg(long)]
     log_jsonl: Option<String>,
-
-    /// Optional override for the initial global position q0 (TAO).
-    ///
-    /// If omitted, uses cfg.initial_q_tao from Config::default().
-    #[arg(long)]
-    initial_q_tao: Option<f64>,
-
-    /// Optional override for the base hedge half-band (TAO).
-    #[arg(long)]
-    hedge_band_base: Option<f64>,
-
-    /// Optional override for the MM size-risk parameter η.
-    ///
-    /// Smaller η ⇒ more aggressive sizing; larger η ⇒ more conservative.
-    #[arg(long)]
-    mm_size_eta: Option<f64>,
-
-    /// Optional override for the reference volatility σ_ref (= vol_ref).
-    ///
-    /// Smaller vol_ref ⇒ larger effective vol_ratio for a given σ_eff.
-    #[arg(long)]
-    vol_ref: Option<f64>,
 }
 
 /// Build the telemetry sink as a trait object so we can choose between
@@ -76,96 +62,62 @@ fn build_sink(log_jsonl: Option<&str>) -> Box<dyn EventSink> {
     }
 }
 
-/// Apply CLI + environment overrides to the base Config.
+/// Build Config from defaults, then apply CLI + env research overrides.
 ///
-/// This keeps Config::default() as the single source of truth, while
-/// allowing research harnesses to move individual knobs.
-fn apply_overrides(cfg: &mut Config, args: &Args) {
-    // ---- CLI overrides first ----
+/// This keeps src/config.rs as the single source of truth, while letting
+/// Python harnesses sweep parameters via environment variables.
+fn build_config_from_env_and_args(args: &Args) -> Config {
+    let mut cfg = Config::default();
+
+    // ---------- CLI overrides ----------
 
     if let Some(q0) = args.initial_q_tao {
         cfg.initial_q_tao = q0;
-        println!("[config] CLI --initial-q-tao = {q0} (overrode env/default)");
     }
 
     if let Some(band) = args.hedge_band_base {
-        cfg.hedge.hedge_band_base = band.max(0.0);
-        println!(
-            "[config] CLI --hedge-band-base = {} (overrode env/default)",
-            cfg.hedge.hedge_band_base
-        );
+        cfg.hedge.hedge_band_base = band;
     }
 
-    if let Some(eta) = args.mm_size_eta {
-        let eta_clamped = eta.max(1e-6);
-        cfg.mm.size_eta = eta_clamped;
-        println!(
-            "[config] CLI --mm-size-eta = {} (overrode env/default)",
-            cfg.mm.size_eta
-        );
-    }
+    // ---------- Env overrides (research knobs) ----------
 
-    if let Some(vref) = args.vol_ref {
-        let vref_clamped = vref.max(cfg.volatility.sigma_min);
-        cfg.volatility.vol_ref = vref_clamped;
-        println!(
-            "[config] CLI --vol-ref = {} (overrode env/default)",
-            cfg.volatility.vol_ref
-        );
-    }
-
-    // ---- Environment overrides (used heavily by Python harnesses) ----
-
-    if let Ok(q_env) = env::var("PARAPHINA_INITIAL_Q_TAO") {
-        if let Ok(q0) = q_env.parse::<f64>() {
-            cfg.initial_q_tao = q0;
-            println!(
-                "[config] ENV PARAPHINA_INITIAL_Q_TAO = {} (overrode default/CLI)",
-                q0
-            );
+    // Volatility reference σ_ref (used in vol_ratio).
+    if let Ok(raw) = std::env::var("PARAPHINA_VOL_REF") {
+        if let Ok(v) = raw.parse::<f64>() {
+            cfg.volatility.vol_ref = v;
         }
     }
 
-    if let Ok(band_env) = env::var("PARAPHINA_HEDGE_BAND_BASE") {
-        if let Ok(band) = band_env.parse::<f64>() {
-            cfg.hedge.hedge_band_base = band.max(0.0);
-            println!(
-                "[config] ENV PARAPHINA_HEDGE_BAND_BASE = {} (overrode default/CLI)",
-                cfg.hedge.hedge_band_base
-            );
+    // Size risk parameter η in J(Q) = eQ - 0.5 η Q².
+    if let Ok(raw) = std::env::var("PARAPHINA_SIZE_ETA") {
+        if let Ok(v) = raw.parse::<f64>() {
+            cfg.mm.size_eta = v;
         }
     }
 
-    if let Ok(eta_env) = env::var("PARAPHINA_MM_SIZE_ETA") {
-        if let Ok(eta) = eta_env.parse::<f64>() {
-            cfg.mm.size_eta = eta.max(1e-6);
-            println!(
-                "[config] ENV PARAPHINA_MM_SIZE_ETA = {} (overrode default/CLI)",
-                cfg.mm.size_eta
-            );
+    // Base dollar delta hard limit before vol scaling.
+    if let Ok(raw) = std::env::var("PARAPHINA_DELTA_LIMIT_USD_BASE") {
+        if let Ok(v) = raw.parse::<f64>() {
+            cfg.risk.delta_hard_limit_usd_base = v;
         }
     }
 
-    if let Ok(vref_env) = env::var("PARAPHINA_VOL_REF") {
-        if let Ok(vref) = vref_env.parse::<f64>() {
-            cfg.volatility.vol_ref = vref.max(cfg.volatility.sigma_min);
-            println!(
-                "[config] ENV PARAPHINA_VOL_REF = {} (overrode default/CLI)",
-                cfg.volatility.vol_ref
-            );
+    // Daily loss limit (realised + unrealised), negative by convention.
+    if let Ok(raw) = std::env::var("PARAPHINA_DAILY_LOSS_LIMIT_USD") {
+        if let Ok(v) = raw.parse::<f64>() {
+            cfg.risk.daily_loss_limit = v;
         }
     }
+
+    cfg
 }
 
 fn main() {
     // 0) Parse CLI args.
     let args = Args::parse();
 
-    // 1) Load / build config.
-    let mut cfg = Config::default();
-
-    // 1b) Apply CLI + env overrides (research knobs).
-    apply_overrides(&mut cfg, &args);
+    // 1) Load / build config with CLI + env overrides.
+    let cfg = build_config_from_env_and_args(&args);
 
     // 2) Choose execution gateway (here: synthetic sim).
     let gateway = SimGateway::new();

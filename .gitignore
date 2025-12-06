@@ -1,35 +1,39 @@
+# Rust / Cargo build artefacts
 /target
-paraphina_ticks.jsonl
-paraphina_ticks.log
-research_run_*.jsonl
-research_run_*.jsonl
-research_run_*_curve.png
-research_run_*jsonl
-.venv/
-exp*_summary.csv
-exp*_pnl_hist.png
-exp02_hedge_band_hb*.jsonl
-exp02_hedge_band_summary.csv
-exp02_hedge_band_pnl_vs_band.png
-# Python venv
+
+# Python virtual environment
 .venv/
 
-# Research / experiment artefacts
-exp01_*.csv
-exp01_*.png
+# Core tick logs
+paraphina_ticks.jsonl
+paraphina_ticks.log
+
+# Old one-off research harness outputs
+research_run_*.jsonl
+research_run_*_curve.png
+
+# Batch-run helper outputs
 batch_runs/
 
 # Paraphina research artefacts
+# (all .jsonl here are tick logs / experiment logs, not configs)
 runs/
 *.jsonl
 
-# Per-run plots
+# Generic experiment CSV / PNG outputs (exp01, exp02, exp03, exp04, ...)
+# e.g. exp01_band_sweep_summary.csv, exp02_hedge_band_heatmap_pnl.png, ...
+exp[0-9][0-9]_*.csv
+exp[0-9][0-9]_*.png
+
+# Per-run plots from research_ticks.py etc.
 *_pnl_curve.png
 *_delta_curve.png
 *_basis_curve.png
 *_heatmap_pnl.png
 
-# Raw grid outputs (we can regenerate)
+# Raw grid outputs that can always be regenerated
 exp0*_runs.csv
+
+# Baseline study artefacts
 baseline_q0_band5*.png
 baseline_q0_band5*.jsonl
