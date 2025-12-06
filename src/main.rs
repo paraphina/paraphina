@@ -7,38 +7,38 @@ use clap::Parser;
 
 use paraphina::{
     Config,
-    SimGateway,
-    StrategyRunner,
     EventSink,
     FileSink,
     NoopSink,
+    SimGateway,
+    StrategyRunner,
 };
 
 /// Command-line arguments for the Paraphina binary.
 #[derive(Parser, Debug)]
-#[command(
-    name = "paraphina",
-    version,
-    about = "TAO perp MM + hedge research driver"
-)]
-struct Args {
-    /// Number of synthetic ticks to simulate.
-    #[arg(long, default_value_t = 200)]
+#[command(name = "paraphina")]
+struct Cli {
+    /// Number of synthetic ticks to run.
+    #[arg(long)]
     ticks: u64,
 
-    /// Initial synthetic global position q0 in TAO.
-    ///
-    /// This is applied once at t = 0 via StrategyRunner::inject_initial_position.
-    #[arg(long, allow_hyphen_values = true)]
-    initial_q_tao: Option<f64>,
-
-    /// Base hedge band (TAO) before volatility scaling.
+    /// Initial global position q0 in TAO.
+    /// (exposed so research harnesses can sweep q0).
     #[arg(long)]
-    hedge_band_base: Option<f64>,
+    initial_q_tao: f64,
 
-    /// JSONL file to log per-tick snapshots.
+    /// Base hedge band (TAO).
+    #[arg(long)]
+    hedge_band_base: f64,
+
+    /// Optional per-day loss limit in USD (positive number).
     ///
-    /// If omitted, no JSONL log is written (NoopSink).
+    /// NOTE: The risk engine stores this as a NEGATIVE quantity, so we
+    /// convert `+4000.0` on the CLI into `-4000.0` in Config.
+    #[arg(long)]
+    loss_limit_usd: Option<f64>,
+
+    /// Optional JSONL path for tick log.
     #[arg(long)]
     log_jsonl: Option<String>,
 }
@@ -66,17 +66,22 @@ fn build_sink(log_jsonl: Option<&str>) -> Box<dyn EventSink> {
 ///
 /// This keeps src/config.rs as the single source of truth, while letting
 /// Python harnesses sweep parameters via environment variables.
-fn build_config_from_env_and_args(args: &Args) -> Config {
+fn build_config_from_env_and_args(cli: &Cli) -> Config {
     let mut cfg = Config::default();
 
     // ---------- CLI overrides ----------
 
-    if let Some(q0) = args.initial_q_tao {
-        cfg.initial_q_tao = q0;
-    }
+    // Initial inventory.
+    cfg.initial_q_tao = cli.initial_q_tao;
 
-    if let Some(band) = args.hedge_band_base {
-        cfg.hedge.hedge_band_base = band;
+    // Base hedge band (TAO).
+    cfg.hedge.hedge_band_base = cli.hedge_band_base;
+
+    // Daily loss limit (realised + unrealised).
+    // CLI provides this as a POSITIVE USD number (e.g. 4000.0),
+    // but the risk engine expects a NEGATIVE threshold.
+    if let Some(loss) = cli.loss_limit_usd {
+        cfg.risk.daily_loss_limit = -loss;
     }
 
     // ---------- Env overrides (research knobs) ----------
@@ -102,7 +107,7 @@ fn build_config_from_env_and_args(args: &Args) -> Config {
         }
     }
 
-    // Daily loss limit (realised + unrealised), negative by convention.
+    // Daily loss limit override from env (already negative by convention).
     if let Ok(raw) = std::env::var("PARAPHINA_DAILY_LOSS_LIMIT_USD") {
         if let Ok(v) = raw.parse::<f64>() {
             cfg.risk.daily_loss_limit = v;
@@ -114,10 +119,10 @@ fn build_config_from_env_and_args(args: &Args) -> Config {
 
 fn main() {
     // 0) Parse CLI args.
-    let args = Args::parse();
+    let cli = Cli::parse();
 
     // 1) Load / build config with CLI + env overrides.
-    let cfg = build_config_from_env_and_args(&args);
+    let cfg = build_config_from_env_and_args(&cli);
 
     // 2) Choose execution gateway (here: synthetic sim).
     let gateway = SimGateway::new();
@@ -126,9 +131,9 @@ fn main() {
     //
     //    - NoopSink   -> no on-disk logs, just prints to stdout.
     //    - FileSink   -> JSONL file with 1 record per tick for backtesting / RL.
-    let sink = build_sink(args.log_jsonl.as_deref());
+    let sink = build_sink(cli.log_jsonl.as_deref());
 
     // 4) Run the high-level strategy for N ticks.
     let mut runner = StrategyRunner::new(&cfg, gateway, sink);
-    runner.run_simulation(args.ticks);
+    runner.run_simulation(cli.ticks);
 }
