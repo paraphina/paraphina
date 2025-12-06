@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Hedge-band sweep harness for Paraphina.
+Hedge-band sweep harness for Paraphina (Exp01).
 
 - Sweeps hedge_band_base over a small grid of TAO values.
-- For each band, runs the Rust sim multiple times with env overrides:
-    PARA_INITIAL_Q_TAO
-    PARA_HEDGE_BAND_BASE
-    PARA_HEDGE_MAX_STEP
+- For each band, runs the Rust sim multiple times using the new CLI:
+    --ticks
+    --initial-q-tao
+    --hedge-band-base
+    --log-jsonl
 - Reads the JSONL logs, computes risk/return metrics, and writes:
     exp01_band_sweep_runs.csv      (per-run metrics)
     exp01_band_sweep_summary.csv   (per-band aggregated metrics)
     exp01_band_sweep_pnl.png       (PnL vs band plot)
-
-This is our first DARPA-grade research harness: fully reproducible and
-easy to extend with more knobs later.
 """
 
 import os
@@ -38,6 +36,9 @@ TICKS = 200
 # How many independent runs per hedge band.
 RUNS_PER_BAND = 5
 
+# Per-run loss budget (USD, positive for CLI; Rust flips sign internally).
+LOSS_LIMIT_USD = 4000.0
+
 # Grid of hedge bands (TAO) to sweep.
 HEDGE_BANDS_TAO = [2.5, 5.0, 7.5, 10.0, 15.0]
 
@@ -52,20 +53,12 @@ def run_one_sim(hedge_band_tao: float, run_idx: int) -> pd.DataFrame:
     return the per-tick dataframe loaded from the JSONL log.
     """
     env = os.environ.copy()
-
-    # Explicitly pin the research knobs we care about.
-    env["PARA_INITIAL_Q_TAO"] = "0.0"
-
-    # These env var names must match the overrides in src/config.rs.
-    env["PARA_HEDGE_BAND_BASE"] = str(hedge_band_tao)
-    env["PARA_HEDGE_MAX_STEP"] = str(4.0 * hedge_band_tao)
-
-    # Nice to have when debugging.
     env.setdefault("RUST_BACKTRACE", "1")
 
     run_id = f"band{hedge_band_tao:04.1f}_run{run_idx:02d}".replace(".", "p")
     jsonl_path = RUNS_DIR / f"{run_id}.jsonl"
 
+    # IMPORTANT: use the new CLI parameters instead of old PARA_* env vars.
     cmd = [
         "cargo",
         "run",
@@ -73,6 +66,12 @@ def run_one_sim(hedge_band_tao: float, run_idx: int) -> pd.DataFrame:
         "--",
         "--ticks",
         str(TICKS),
+        "--initial-q-tao",
+        "0.0",  # q0 = 0 for Exp01
+        "--hedge-band-base",
+        str(hedge_band_tao),
+        "--loss-limit-usd",
+        str(LOSS_LIMIT_USD),
         "--log-jsonl",
         str(jsonl_path),
     ]
