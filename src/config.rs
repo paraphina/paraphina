@@ -305,7 +305,7 @@ impl Default for Config {
             fv_vol_alpha_short: 0.2,
             fv_vol_alpha_long: 0.05,
             sigma_min: 0.001,
-            vol_ref: 0.02,
+            vol_ref: 0.04,
             vol_ratio_min: 0.25,
             vol_ratio_max: 4.0,
             spread_vol_mult_coeff: 1.0,
@@ -325,7 +325,7 @@ impl Default for Config {
             basis_hard_limit_usd: 10_000.0,
             basis_warn_frac: 0.7,
             // Daily loss limit (realised + unrealised). Negative by convention.
-            daily_loss_limit: -5_000.0,
+            daily_loss_limit: 6000.0,
             pnl_warn_frac: 0.5,
             // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
@@ -348,7 +348,7 @@ impl Default for Config {
             edge_local_min: 0.5,
             edge_vol_mult: 0.2,
             // Inventory-risk parameter in J(Q) = eQ - 0.5 η Q².
-            size_eta: 0.1,
+            size_eta: 0.20,
             // 0 = pure global, 1 = pure per-venue target; we sit in the middle.
             lambda_inv: 0.5,
             // Quoting horizon in seconds used in the AS formulas.
@@ -383,7 +383,7 @@ impl Default for Config {
 
         Config {
             version: "v0.1.2-whitepaper-spec",
-            initial_q_tao: 5.0,
+            initial_q_tao: 0.0,
             venues,
             book,
             kalman,
