@@ -18,3 +18,18 @@ exp02_hedge_band_pnl_vs_band.png
 exp01_*.csv
 exp01_*.png
 batch_runs/
+
+# Paraphina research artefacts
+runs/
+*.jsonl
+
+# Per-run plots
+*_pnl_curve.png
+*_delta_curve.png
+*_basis_curve.png
+*_heatmap_pnl.png
+
+# Raw grid outputs (we can regenerate)
+exp0*_runs.csv
+baseline_q0_band5*.png
+baseline_q0_band5*.jsonl

@@ -63,17 +63,17 @@ where
         let mut now_ms: TimestampMs = 0;
         let dt_ms: TimestampMs = 1_000;
 
+        // Apply the configured initial position q0 (in TAO) once at t = 0.
+        // This uses `cfg.initial_q_tao` and ensures the hedge engine + risk
+        // logic start from the correct inventory state.
+        self.inject_initial_position();
+
         for tick in 0..num_ticks {
             println!("\n================ Tick {} =================", tick);
 
             // 1) Seed synthetic mids / books and run the core engine tick.
             self.engine.seed_dummy_mids(&mut self.state, now_ms);
             self.engine.main_tick(&mut self.state, now_ms);
-
-            // Inject the initial synthetic position (demo only).
-            // if tick == 0 && self.state.q_global_tao.abs() < 1e-9 {
-            //    self.inject_initial_position();
-            // }
 
             // 2) Update toxicity / venue health.
             update_toxicity_and_health(&mut self.state, self.cfg);
@@ -138,6 +138,14 @@ where
             // 8) Log everything via the telemetry sink.
             self.sink
                 .log_tick(tick, self.cfg, &self.state, &all_intents, &fills);
+            // 9) Honour the global kill switch: stop the run early if tripped.
+            if self.state.kill_switch {
+                println!(
+                    "\nKill switch active at tick {} – stopping simulation early.",
+                    tick
+                );
+                break;
+            }
 
             // Advance synthetic clock.
             now_ms += dt_ms;
