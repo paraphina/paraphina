@@ -27,6 +27,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS_DIR = ROOT / "runs"
+EXP_DIR = RUNS_DIR / "exp04_risk_regime"
 
 
 def load_ticks(jsonl_path: Path) -> pd.DataFrame:
@@ -96,9 +97,10 @@ def run_single_sim(q0: float, loss_limit_usd: float, run_idx: int) -> dict:
     Run one Paraphina simulation for given (q0, loss_limit) and return metrics.
     """
     RUNS_DIR.mkdir(exist_ok=True)
+    EXP_DIR.mkdir(parents=True, exist_ok=True)
 
     log_name = f"exp04_q{q0:+.0f}_loss{loss_limit_usd:.0f}_r{run_idx}.jsonl"
-    log_path = RUNS_DIR / log_name
+    log_path = EXP_DIR / log_name
 
     cmd = [
         "cargo",
@@ -115,9 +117,11 @@ def run_single_sim(q0: float, loss_limit_usd: float, run_idx: int) -> dict:
         str(log_path),
     ]
 
-    # Pass the loss limit via env, so Config can pick it up.
+    # Pass the loss limit via env so Config can pick it up.
+    # Risk engine expects a NEGATIVE daily_loss_limit, and
+    # PARAPHINA_DAILY_LOSS_LIMIT_USD is "already negative by convention".
     env = os.environ.copy()
-    env["PARA_LOSS_LIMIT_USD"] = str(loss_limit_usd)
+    env["PARAPHINA_DAILY_LOSS_LIMIT_USD"] = str(-abs(loss_limit_usd))
 
     print(f"[run] q0={q0:+.0f} TAO, loss_limit={loss_limit_usd:.0f} -> {log_name}")
     subprocess.run(cmd, check=True, cwd=str(ROOT), env=env)
@@ -146,10 +150,12 @@ def main() -> None:
                 row = run_single_sim(q0, loss_limit, run_idx)
                 all_rows.append(row)
 
+    # Per-run results
     runs_df = pd.DataFrame(all_rows)
-    runs_csv = ROOT / "exp04_risk_regime_runs.csv"
+    EXP_DIR.mkdir(parents=True, exist_ok=True)
+    runs_csv = EXP_DIR / "exp04_risk_regime_runs.csv"
     runs_df.to_csv(runs_csv, index=False)
-    print(f"\nSaved per-run metrics to {runs_csv}")
+    print(f"\n[exp04] Saved per-run metrics to {runs_csv}")
 
     # Aggregate across seeds to get mean/std and kill-switch probability.
     summary = (
@@ -164,9 +170,9 @@ def main() -> None:
         .sort_values(["initial_q_tao", "loss_limit_usd"])
     )
 
-    summary_csv = ROOT / "exp04_risk_regime_summary.csv"
+    summary_csv = EXP_DIR / "exp04_risk_regime_summary.csv"
     summary.to_csv(summary_csv, index=False)
-    print(f"Saved risk-regime summary to {summary_csv}\n")
+    print(f"[exp04] Saved risk-regime summary to {summary_csv}\n")
 
     print("=== Exp04 summary table (final_pnl_mean, kill_prob, etc.) ===")
     print(summary.to_string(index=False))

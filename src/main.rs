@@ -14,33 +14,107 @@ use paraphina::{
     StrategyRunner,
 };
 
+/// High-level risk / behaviour profiles, distilled from Exp07.
+#[derive(Clone, Copy, Debug)]
+enum Profile {
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+impl Profile {
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "conservative" | "cons" | "c" => Ok(Profile::Conservative),
+            "balanced" | "bal" | "b" => Ok(Profile::Balanced),
+            "aggressive" | "agg" | "a" => Ok(Profile::Aggressive),
+            other => Err(format!(
+                "Unknown profile '{other}'. Expected one of: \
+                 conservative, balanced, aggressive."
+            )),
+        }
+    }
+}
+
+/// Base configs for each profile, generated from Exp07 presets.
+///
+/// NOTE:
+///   - These are *starting points*; CLI + env overrides still apply on top.
+///   - The numbers here came from your current Exp07 run; if you re-run
+///     Exp07 later, you can update them from its printed snippet.
+fn config_for_profile(profile: Profile) -> Config {
+    let mut cfg = Config::default();
+
+    match profile {
+        Profile::Conservative => {
+            cfg.initial_q_tao = 0.0;
+            cfg.risk.daily_loss_limit = -2000.0; // -loss_limit_usd
+            cfg
+        }
+        Profile::Balanced => {
+            cfg.initial_q_tao = 0.0;
+            cfg.risk.daily_loss_limit = -2000.0; // -loss_limit_usd
+            cfg
+        }
+        Profile::Aggressive => {
+            cfg.initial_q_tao = 0.0;
+            cfg.risk.daily_loss_limit = -2000.0; // -loss_limit_usd
+            cfg
+        }
+    }
+}
+
 /// Command-line arguments for the Paraphina binary.
 #[derive(Parser, Debug)]
 #[command(name = "paraphina")]
 struct Cli {
     /// Number of synthetic ticks to run.
-    #[arg(long)]
+    #[arg(long, value_name = "TICKS")]
     ticks: u64,
 
-    /// Initial global position q0 in TAO.
-    /// (exposed so research harnesses can sweep q0).
-    #[arg(long)]
-    initial_q_tao: f64,
+    /// Optional initial global position q0 in TAO.
+    ///
+    /// - Can be NEGATIVE (short inventory).
+    /// - If omitted, we use either the profile's q0 (if --profile is set)
+    ///   or the default from Config::default().
+    #[arg(
+        long,
+        value_name = "INITIAL_Q_TAO",
+        allow_hyphen_values = true
+    )]
+    initial_q_tao: Option<f64>,
 
     /// Base hedge band (TAO).
-    #[arg(long)]
-    hedge_band_base: f64,
+    /// Exposed so research harnesses can sweep hedge_band_base.
+    /// If omitted, we keep the value from the profile or Config::default().
+    #[arg(long, value_name = "HEDGE_BAND_BASE")]
+    hedge_band_base: Option<f64>,
 
     /// Optional per-day loss limit in USD (positive number).
     ///
     /// NOTE: The risk engine stores this as a NEGATIVE quantity, so we
     /// convert `+4000.0` on the CLI into `-4000.0` in Config.
-    #[arg(long)]
+    #[arg(long, value_name = "LOSS_LIMIT_USD")]
     loss_limit_usd: Option<f64>,
 
     /// Optional JSONL path for tick log.
-    #[arg(long)]
+    ///
+    /// When provided, we stream one JSON record per tick into this file
+    /// for offline analysis / research.
+    #[arg(long, value_name = "PATH")]
     log_jsonl: Option<String>,
+
+    /// Optional named risk/profile preset:
+    ///   - conservative
+    ///   - balanced
+    ///   - aggressive
+    ///
+    /// Example:
+    ///   paraphina --profile balanced --ticks 2000 --hedge-band-base 5.0
+    ///
+    /// CLI and env overrides still apply on top of the profile config.
+    #[arg(long, value_name = "PROFILE")]
+    profile: Option<String>,
 }
 
 /// Build the telemetry sink as a trait object so we can choose between
@@ -62,20 +136,43 @@ fn build_sink(log_jsonl: Option<&str>) -> Box<dyn EventSink> {
     }
 }
 
-/// Build Config from defaults, then apply CLI + env research overrides.
+/// Build Config from defaults and profile, then apply CLI + env overrides.
 ///
-/// This keeps src/config.rs as the single source of truth, while letting
-/// Python harnesses sweep parameters via environment variables.
+/// Precedence:
+///   1) Start from profile config if --profile is set, else Config::default().
+///   2) Apply CLI overrides (initial_q_tao, hedge_band_base, loss_limit_usd).
+///   3) Apply env overrides (PARAPHINA_*, PARA_* research knobs).
 fn build_config_from_env_and_args(cli: &Cli) -> Config {
-    let mut cfg = Config::default();
+    // ---------- Base config: profile or default ----------
+
+    let profile = match &cli.profile {
+        None => None,
+        Some(name) => match Profile::from_str(name) {
+            Ok(p) => Some(p),
+            Err(msg) => {
+                eprintln!("WARNING: {msg}. Falling back to default config.");
+                None
+            }
+        },
+    };
+
+    let mut cfg = match profile {
+        Some(p) => config_for_profile(p),
+        None => Config::default(),
+    };
 
     // ---------- CLI overrides ----------
 
-    // Initial inventory.
-    cfg.initial_q_tao = cli.initial_q_tao;
+    // Initial inventory: only override if CLI provided a value.
+    if let Some(q) = cli.initial_q_tao {
+        cfg.initial_q_tao = q;
+    }
 
     // Base hedge band (TAO).
-    cfg.hedge.hedge_band_base = cli.hedge_band_base;
+    // Only override if CLI provided a value; otherwise use profile/default.
+    if let Some(band) = cli.hedge_band_base {
+        cfg.hedge.hedge_band_base = band;
+    }
 
     // Daily loss limit (realised + unrealised).
     // CLI provides this as a POSITIVE USD number (e.g. 4000.0),
@@ -121,7 +218,7 @@ fn main() {
     // 0) Parse CLI args.
     let cli = Cli::parse();
 
-    // 1) Load / build config with CLI + env overrides.
+    // 1) Load / build config with profile + CLI + env overrides.
     let cfg = build_config_from_env_and_args(&cli);
 
     // 2) Choose execution gateway (here: synthetic sim).
