@@ -42,53 +42,34 @@ impl Profile {
     }
 }
 
-/// Base configs for each profile, generated from the calibration suite.
+/// Base configs for each profile, generated from Exp07/Exp09 presets.
 ///
-/// These numbers are chosen to respect the grids used in:
-///   - Exp03 (size_eta vs vol_ref)
-///   - Exp04 (loss_limit vs initial_q_tao)
-///   - Exp07/08/09 (profile presets + validation + hypersearch)
-///
-/// When you re-run calibration:
-///   1) Inspect runs/exp09_hypersearch/exp09_summary.csv
-///      for each profile tier.
-///   2) Pick the top row by score that has acceptable kill_prob + drawdown.
-///   3) Mirror those numbers into the match arms below.
+/// These are *starting points*; CLI + env overrides still apply on top.
+/// Tuned from:
+///   - Exp07 (risk regime sweep)
+///   - Exp09 (hyperparam search: band / size_eta / vol_ref / loss_limit)
 fn config_for_profile(profile: Profile) -> Config {
     let mut cfg = Config::default();
 
-    // Shared defaults that all profiles inherit
-    cfg.initial_q_tao = 0.0; // we prefer to start flat unless overridden
+    // Shared tuned parameters from Exp09 hyperparam search.
+    cfg.hedge.hedge_band_base = 2.5;
+    cfg.mm.size_eta = 0.05;
+    cfg.volatility.vol_ref = 0.01;
 
     match profile {
         Profile::Conservative => {
-            // Very tight risk + narrow bands.
-            cfg.hedge.hedge_band_base = 2.5;      // TAO
-            cfg.mm.size_eta = 0.05;               // gentle size curve
-            cfg.volatility.vol_ref = 0.01;        // low vol reference
-            cfg.risk.delta_hard_limit_usd_base = 5_000.0;
-            cfg.risk.daily_loss_limit = -2_000.0; // USD, negative in config
-
+            cfg.initial_q_tao = 0.0;
+            cfg.risk.daily_loss_limit = -2_000.0;
             cfg
         }
         Profile::Balanced => {
-            // Middle-of-the-road: more band width and size risk.
-            cfg.hedge.hedge_band_base = 5.0;      // TAO
-            cfg.mm.size_eta = 0.10;
-            cfg.volatility.vol_ref = 0.02;
-            cfg.risk.delta_hard_limit_usd_base = 10_000.0;
-            cfg.risk.daily_loss_limit = -4_000.0;
-
+            cfg.initial_q_tao = 0.0;
+            cfg.risk.daily_loss_limit = -2_000.0;
             cfg
         }
         Profile::Aggressive => {
-            // Wider bands, larger sizes, higher risk budgets.
-            cfg.hedge.hedge_band_base = 7.5;      // TAO
-            cfg.mm.size_eta = 0.20;
-            cfg.volatility.vol_ref = 0.03;
-            cfg.risk.delta_hard_limit_usd_base = 15_000.0;
-            cfg.risk.daily_loss_limit = -6_000.0;
-
+            cfg.initial_q_tao = 0.0;
+            cfg.risk.daily_loss_limit = -2_000.0;
             cfg
         }
     }
