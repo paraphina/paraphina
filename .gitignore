@@ -37,3 +37,7 @@ exp0*_runs.csv
 # Baseline study artefacts
 baseline_q0_band5*.png
 baseline_q0_band5*.jsonl
+
+# Python caches
+__pycache__/
+*.pyc
