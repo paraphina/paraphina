@@ -14,16 +14,13 @@ use paraphina::{
     StrategyRunner,
 };
 
-/// High-level risk / behaviour profiles, distilled from Exp07/Exp08.
+/// High-level risk / behaviour profiles, distilled from Exp07/Exp08/Exp09.
 ///
-/// NOTE:
-///   - Right now all three profiles share the same calibrated core:
-///       * initial_q_tao = 0 (delta-neutral)
-///       * daily_loss_limit = -2000 USD
-///     This matches the current Exp07 presets and Exp08 validation,
-///     where all three tiers had zero kill probability.
-///   - We still keep the enum + plumbing so it is trivial to
-///     differentiate profiles later (e.g. via size_eta, vol_ref, etc.).
+/// IMPORTANT:
+/// - These are *calibrated starting points*, not hard-coded truths.
+/// - CLI flags and env-vars still override them.
+/// - When you re-run Exp06/07/08/09 in the future, update these numbers
+///   from the new summary tables.
 #[derive(Clone, Copy, Debug)]
 enum Profile {
     Conservative,
@@ -45,32 +42,53 @@ impl Profile {
     }
 }
 
-/// Base configs for each profile, generated from Exp07 presets and
-/// validated by Exp08.
+/// Base configs for each profile, generated from the calibration suite.
 ///
-/// Default calibrated core (all tiers for now):
-///   - cfg.initial_q_tao         = 0.0   (delta-neutral)
-///   - cfg.risk.daily_loss_limit = -2000 (i.e. -LOSS_LIMIT_USD)
+/// These numbers are chosen to respect the grids used in:
+///   - Exp03 (size_eta vs vol_ref)
+///   - Exp04 (loss_limit vs initial_q_tao)
+///   - Exp07/08/09 (profile presets + validation + hypersearch)
 ///
-/// CLI + env overrides are applied *on top* of this in
-/// `build_config_from_env_and_args`.
+/// When you re-run calibration:
+///   1) Inspect runs/exp09_hypersearch/exp09_summary.csv
+///      for each profile tier.
+///   2) Pick the top row by score that has acceptable kill_prob + drawdown.
+///   3) Mirror those numbers into the match arms below.
 fn config_for_profile(profile: Profile) -> Config {
     let mut cfg = Config::default();
 
+    // Shared defaults that all profiles inherit
+    cfg.initial_q_tao = 0.0; // we prefer to start flat unless overridden
+
     match profile {
         Profile::Conservative => {
-            cfg.initial_q_tao = 0.0;
-            cfg.risk.daily_loss_limit = -2_000.0; // -loss_limit_usd
+            // Very tight risk + narrow bands.
+            cfg.hedge.hedge_band_base = 2.5;      // TAO
+            cfg.mm.size_eta = 0.05;               // gentle size curve
+            cfg.volatility.vol_ref = 0.01;        // low vol reference
+            cfg.risk.delta_hard_limit_usd_base = 5_000.0;
+            cfg.risk.daily_loss_limit = -2_000.0; // USD, negative in config
+
             cfg
         }
         Profile::Balanced => {
-            cfg.initial_q_tao = 0.0;
-            cfg.risk.daily_loss_limit = -2_000.0; // -loss_limit_usd
+            // Middle-of-the-road: more band width and size risk.
+            cfg.hedge.hedge_band_base = 5.0;      // TAO
+            cfg.mm.size_eta = 0.10;
+            cfg.volatility.vol_ref = 0.02;
+            cfg.risk.delta_hard_limit_usd_base = 10_000.0;
+            cfg.risk.daily_loss_limit = -4_000.0;
+
             cfg
         }
         Profile::Aggressive => {
-            cfg.initial_q_tao = 0.0;
-            cfg.risk.daily_loss_limit = -2_000.0; // -loss_limit_usd
+            // Wider bands, larger sizes, higher risk budgets.
+            cfg.hedge.hedge_band_base = 7.5;      // TAO
+            cfg.mm.size_eta = 0.20;
+            cfg.volatility.vol_ref = 0.03;
+            cfg.risk.delta_hard_limit_usd_base = 15_000.0;
+            cfg.risk.daily_loss_limit = -6_000.0;
+
             cfg
         }
     }
