@@ -14,13 +14,7 @@ use paraphina::{
     StrategyRunner,
 };
 
-/// High-level risk / behaviour profiles, distilled from Exp07/Exp08/Exp09.
-///
-/// IMPORTANT:
-/// - These are *calibrated starting points*, not hard-coded truths.
-/// - CLI flags and env-vars still override them.
-/// - When you re-run Exp06/07/08/09 in the future, update these numbers
-///   from the new summary tables.
+/// High-level risk / behaviour profiles, distilled from Exp07/Exp09.
 #[derive(Clone, Copy, Debug)]
 enum Profile {
     Conservative,
@@ -126,6 +120,16 @@ struct Cli {
     /// CLI and env overrides still apply on top of the profile config.
     #[arg(long, value_name = "PROFILE")]
     profile: Option<String>,
+
+    /// If set, dump the fully-resolved Config (after profile + CLI + env)
+    /// to a text file for reproducibility.
+    #[arg(long, value_name = "PATH")]
+    dump_config: Option<String>,
+
+    /// If set, build config, optionally dump it, then exit without running
+    /// the simulation. Useful for quick sanity checks and CI.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Build the telemetry sink as a trait object so we can choose between
@@ -232,16 +236,34 @@ fn main() {
     // 1) Load / build config with profile + CLI + env overrides.
     let cfg = build_config_from_env_and_args(&cli);
 
-    // 2) Choose execution gateway (here: synthetic sim).
+    // 2) Optionally dump resolved config for reproducibility.
+    if let Some(path) = &cli.dump_config {
+        match std::fs::write(path, format!("{:#?}", cfg)) {
+            Ok(()) => {
+                eprintln!("Wrote resolved config to {path}");
+            }
+            Err(err) => {
+                eprintln!("Failed to write resolved config to {path}: {err}");
+            }
+        }
+    }
+
+    // 3) Optional dry-run: show config and exit.
+    if cli.dry_run {
+        println!("Dry-run only. Resolved config:\n{:#?}", cfg);
+        return;
+    }
+
+    // 4) Choose execution gateway (here: synthetic sim).
     let gateway = SimGateway::new();
 
-    // 3) Build telemetry sink from CLI.
+    // 5) Build telemetry sink from CLI.
     //
     //    - NoopSink   -> no on-disk logs, just prints to stdout.
     //    - FileSink   -> JSONL file with 1 record per tick for backtesting / RL.
     let sink = build_sink(cli.log_jsonl.as_deref());
 
-    // 4) Run the high-level strategy for N ticks.
+    // 6) Run the high-level strategy for N ticks.
     let mut runner = StrategyRunner::new(&cfg, gateway, sink);
     runner.run_simulation(cli.ticks);
 }
