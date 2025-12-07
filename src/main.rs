@@ -14,7 +14,16 @@ use paraphina::{
     StrategyRunner,
 };
 
-/// High-level risk / behaviour profiles, distilled from Exp07.
+/// High-level risk / behaviour profiles, distilled from Exp07/Exp08.
+///
+/// NOTE:
+///   - Right now all three profiles share the same calibrated core:
+///       * initial_q_tao = 0 (delta-neutral)
+///       * daily_loss_limit = -2000 USD
+///     This matches the current Exp07 presets and Exp08 validation,
+///     where all three tiers had zero kill probability.
+///   - We still keep the enum + plumbing so it is trivial to
+///     differentiate profiles later (e.g. via size_eta, vol_ref, etc.).
 #[derive(Clone, Copy, Debug)]
 enum Profile {
     Conservative,
@@ -36,29 +45,32 @@ impl Profile {
     }
 }
 
-/// Base configs for each profile, generated from Exp07 presets.
+/// Base configs for each profile, generated from Exp07 presets and
+/// validated by Exp08.
 ///
-/// NOTE:
-///   - These are *starting points*; CLI + env overrides still apply on top.
-///   - The numbers here came from your current Exp07 run; if you re-run
-///     Exp07 later, you can update them from its printed snippet.
+/// Default calibrated core (all tiers for now):
+///   - cfg.initial_q_tao         = 0.0   (delta-neutral)
+///   - cfg.risk.daily_loss_limit = -2000 (i.e. -LOSS_LIMIT_USD)
+///
+/// CLI + env overrides are applied *on top* of this in
+/// `build_config_from_env_and_args`.
 fn config_for_profile(profile: Profile) -> Config {
     let mut cfg = Config::default();
 
     match profile {
         Profile::Conservative => {
             cfg.initial_q_tao = 0.0;
-            cfg.risk.daily_loss_limit = -2000.0; // -loss_limit_usd
+            cfg.risk.daily_loss_limit = -2_000.0; // -loss_limit_usd
             cfg
         }
         Profile::Balanced => {
             cfg.initial_q_tao = 0.0;
-            cfg.risk.daily_loss_limit = -2000.0; // -loss_limit_usd
+            cfg.risk.daily_loss_limit = -2_000.0; // -loss_limit_usd
             cfg
         }
         Profile::Aggressive => {
             cfg.initial_q_tao = 0.0;
-            cfg.risk.daily_loss_limit = -2000.0; // -loss_limit_usd
+            cfg.risk.daily_loss_limit = -2_000.0; // -loss_limit_usd
             cfg
         }
     }
