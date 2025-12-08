@@ -427,7 +427,7 @@ impl Config {
                 cfg.risk.daily_loss_limit = 1_500.0;
             }
             RiskProfile::Aggressive => {
-                // Exp02 grid-tuned aggressive point around:
+                // Exp02 grid-tuned aggressive point:
                 // band_base ≈ 5.625, eta ≈ 0.025, vol_ref ≈ 0.01875, loss ≈ 4k.
                 cfg.hedge.hedge_band_base = 5.625;
                 cfg.mm.size_eta = 0.025;
@@ -504,11 +504,11 @@ impl Config {
                     );
                 }
                 Err(_) => {
-                    eprintln![
+                    eprintln!(
                         "[config] WARN: could not parse PARAPHINA_HEDGE_MAX_STEP = {:?} as f64; using default {}",
                         raw,
                         cfg.hedge.hedge_max_step
-                    ];
+                    );
                 }
             }
         }
@@ -577,8 +577,36 @@ impl Config {
         cfg
     }
 
-    /// Backwards-compatible helper: use the Balanced profile by default.
+    /// Backwards-compatible helper:
+    /// pick risk profile from PARAPHINA_RISK_PROFILE (default Balanced),
+    /// then apply all other env overrides.
+    ///
+    /// Allowed values (case-insensitive):
+    ///   conservative | cons | c
+    ///   balanced     | bal  | b   | "" (empty)
+    ///   aggressive   | agg  | a
     pub fn from_env_or_default() -> Self {
-        Self::from_env_or_profile(RiskProfile::Balanced)
+        use std::env;
+
+        let profile = match env::var("PARAPHINA_RISK_PROFILE") {
+            Ok(s) => {
+                let s_l = s.to_lowercase();
+                match s_l.as_str() {
+                    "conservative" | "cons" | "c" => RiskProfile::Conservative,
+                    "aggressive" | "agg" | "a" => RiskProfile::Aggressive,
+                    "balanced" | "bal" | "b" | "" => RiskProfile::Balanced,
+                    other => {
+                        eprintln!(
+                            "[config] WARN: unknown PARAPHINA_RISK_PROFILE = {:?}; using Balanced",
+                            other
+                        );
+                        RiskProfile::Balanced
+                    }
+                }
+            }
+            Err(_) => RiskProfile::Balanced,
+        };
+
+        Self::from_env_or_profile(profile)
     }
 }
