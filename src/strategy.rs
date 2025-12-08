@@ -86,10 +86,7 @@ where
 
             println!("\nPer-venue quotes:");
             for q in &mm_quotes {
-                println!(
-                    "  {:<10}: bid={:?}, ask={:?}",
-                    q.venue_id, q.bid, q.ask
-                );
+                println!("  {:<10}: bid={:?}, ask={:?}", q.venue_id, q.bid, q.ask);
             }
 
             let hedge_plan = compute_hedge_plan(self.cfg, &self.state);
@@ -105,8 +102,7 @@ where
             }
 
             // 5) Convert to abstract order intents.
-            let mut all_intents: Vec<OrderIntent> =
-                mm_quotes_to_order_intents(&mm_quotes);
+            let mut all_intents: Vec<OrderIntent> = mm_quotes_to_order_intents(&mm_quotes);
             if let Some(plan) = hedge_plan {
                 let mut hedge_intents = hedge_plan_to_order_intents(&plan);
                 all_intents.append(&mut hedge_intents);
@@ -118,16 +114,17 @@ where
             println!("\nOrder intents (abstract):");
             for it in &all_intents {
                 println!(
-                    "  {:<10} {:?} {:>6.4} @ {:>8.4} ({:?})",
+                    "\
+  {:<10} {:?} {:>6.4} @ {:>8.4} ({:?})",
                     it.venue_id, it.side, it.size, it.price, it.purpose
                 );
             }
 
             // 6) Send intents to the execution gateway and get realised fills.
             println!("\nSynthetic fills (SimGateway):");
-            let fills =
-                self.gateway
-                    .process_intents(self.cfg, &mut self.state, &all_intents);
+            let fills = self
+                .gateway
+                .process_intents(self.cfg, &mut self.state, &all_intents);
 
             // 7) Recompute inventory / basis / unrealised PnL after fills.
             self.state.recompute_after_fills(self.cfg);
@@ -138,6 +135,7 @@ where
             // 8) Log everything via the telemetry sink.
             self.sink
                 .log_tick(tick, self.cfg, &self.state, &all_intents, &fills);
+
             // 9) Honour the global kill switch: stop the run early if tripped.
             if self.state.kill_switch {
                 println!(
@@ -153,10 +151,11 @@ where
     }
 
     /// Inject an initial synthetic position on venue 0.
-    /// Sign of `cfg.initial_q_tao` controls direction:
-    ///   > 0  => long
-    ///   < 0  => short
-    ///   ~= 0 => no position
+    ///
+    /// Sign convention for `cfg.initial_q_tao`:
+    /// - `initial_q_tao > 0`  → start **long** `initial_q_tao` TAO
+    /// - `initial_q_tao < 0`  → start **short** `|initial_q_tao|` TAO
+    /// - `|initial_q_tao| ≈ 0` → start approximately **flat**
     fn inject_initial_position(&mut self) {
         if self.cfg.venues.is_empty() {
             return;
@@ -179,19 +178,11 @@ where
 
         println!(
             "Injecting synthetic initial position: venue={} side={:?} size={} @ {:.4}",
-            self.cfg.venues[venue_index].id,
-            side,
-            size_tao,
-            entry_price
+            self.cfg.venues[venue_index].id, side, size_tao, entry_price
         );
 
-        self.state.apply_perp_fill(
-            venue_index,
-            side,
-            size_tao,
-            entry_price,
-            0.0,
-        );
+        self.state
+            .apply_perp_fill(venue_index, side, size_tao, entry_price, 0.0);
         self.state.recompute_after_fills(self.cfg);
     }
 
@@ -200,44 +191,26 @@ where
 
         println!("Fair value S_t: {:.4}", s_t);
         println!("Sigma_eff: {:.6}", self.state.sigma_eff);
-        println!(
-            "Vol ratio (clipped): {:.4}",
-            self.state.vol_ratio_clipped
-        );
+        println!("Vol ratio (clipped): {:.4}", self.state.vol_ratio_clipped);
         println!("Spread_mult: {:.4}", self.state.spread_mult);
         println!("Size_mult: {:.4}", self.state.size_mult);
         println!("Band_mult: {:.4}", self.state.band_mult);
         println!("Global q_t (TAO): {:.4}", self.state.q_global_tao);
-        println!(
-            "Dollar delta (USD): {:.4}",
-            self.state.dollar_delta_usd
-        );
+        println!("Dollar delta (USD): {:.4}", self.state.dollar_delta_usd);
         println!("Basis exposure (USD): {:.4}", self.state.basis_usd);
-        println!(
-            "Basis gross (USD): {:.4}",
-            self.state.basis_gross_usd
-        );
+        println!("Basis gross (USD): {:.4}", self.state.basis_gross_usd);
         println!("Delta limit (USD): {:.4}", self.state.delta_limit_usd);
         println!(
             "Basis warn / hard (USD): {:.4} / {:.4}",
             self.state.basis_limit_warn_usd, self.state.basis_limit_hard_usd
         );
-        println!(
-            "Daily PnL (realised): {:.4}",
-            self.state.daily_realised_pnl
-        );
+        println!("Daily PnL (realised): {:.4}", self.state.daily_realised_pnl);
         println!(
             "Daily PnL (unrealised): {:.4}",
             self.state.daily_unrealised_pnl
         );
-        println!(
-            "Daily PnL total: {:.4}",
-            self.state.daily_pnl_total
-        );
-        println!(
-            "Risk regime after tick: {:?}",
-            self.state.risk_regime
-        );
+        println!("Daily PnL total: {:.4}", self.state.daily_pnl_total);
+        println!("Risk regime after tick: {:?}", self.state.risk_regime);
         println!("Kill switch: {}", self.state.kill_switch);
 
         println!("\nPer-venue toxicity & status:");
@@ -251,10 +224,7 @@ where
 
     fn print_inventory_and_pnl(&self) {
         println!("  Global q_t (TAO): {:.4}", self.state.q_global_tao);
-        println!(
-            "  Dollar delta (USD): {:.4}",
-            self.state.dollar_delta_usd
-        );
+        println!("  Dollar delta (USD): {:.4}", self.state.dollar_delta_usd);
         println!("  Basis exposure (USD): {:.4}", self.state.basis_usd);
         println!(
             "  Daily PnL (realised / unrealised / total): {:.4} / {:.4} / {:.4}",

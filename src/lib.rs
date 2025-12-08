@@ -22,12 +22,7 @@ pub use engine::Engine;
 
 pub use gateway::{ExecutionGateway, SimGateway};
 
-pub use hedge::{
-    compute_hedge_plan,
-    hedge_plan_to_order_intents,
-    HedgeAllocation,
-    HedgePlan,
-};
+pub use hedge::{compute_hedge_plan, hedge_plan_to_order_intents, HedgeAllocation, HedgePlan};
 
 pub use logging::{EventSink, FileSink, NoopSink};
 
@@ -39,14 +34,7 @@ pub use strategy::StrategyRunner;
 
 pub use toxicity::update_toxicity_and_health;
 
-pub use types::{
-    FillEvent,
-    OrderIntent,
-    OrderPurpose,
-    Side,
-    TimestampMs,
-    VenueStatus,
-};
+pub use types::{FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
 
 // --- PnL / basis unit tests -------------------------------------------------
 
@@ -123,7 +111,7 @@ mod tests {
         let size = 3.0;
         let entry = 110.0;
         let exit = 100.0;
-        let fee_open_bps = 5.0;  // 5 bps on entry
+        let fee_open_bps = 5.0; // 5 bps on entry
         let fee_close_bps = 5.0; // 5 bps on exit
 
         // Open short, then close.

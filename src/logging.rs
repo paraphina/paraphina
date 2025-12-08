@@ -75,7 +75,7 @@ impl EventSink for FileSink {
     fn log_tick(
         &mut self,
         tick: u64,
-        _cfg: & Config,
+        _cfg: &Config,
         state: &GlobalState,
         _intents: &[OrderIntent],
         _fills: &[FillEvent],

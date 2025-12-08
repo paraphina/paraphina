@@ -6,7 +6,7 @@
 
 use paraphina::{Config, NoopSink, SimGateway, StrategyRunner};
 
-fn run_smoke(mut cfg: Config, ticks: u64) {
+fn run_smoke(cfg: Config, ticks: u64) {
     // Use the same wiring as src/main.rs, but with a NoopSink so tests are fast.
     let gateway = SimGateway::new();
     let sink = Box::new(NoopSink);

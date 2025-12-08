@@ -75,22 +75,11 @@ impl ExecutionGateway for SimGateway {
 
             println!(
                 "Synthetic fill: {:<10} {:?} {:>6.4} @ {:>8.4} fee_bps={:.2} ({:?})",
-                intent.venue_id,
-                intent.side,
-                size_tao,
-                price,
-                fee_bps,
-                intent.purpose
+                intent.venue_id, intent.side, size_tao, price, fee_bps, intent.purpose
             );
 
             // Apply fill into global state (positions + realised PnL).
-            state.apply_perp_fill(
-                venue_index,
-                intent.side,
-                size_tao,
-                price,
-                fee_bps,
-            );
+            state.apply_perp_fill(venue_index, intent.side, size_tao, price, fee_bps);
 
             fills.push(FillEvent {
                 venue_index,

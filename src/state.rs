@@ -93,7 +93,12 @@ pub struct GlobalState {
     pub band_mult: f64,
 
     // ----- Inventory & basis (Section 8) -----
-    /// Global trading inventory q_t in TAO.
+    /// Global net trading inventory \(q_t\) in TAO.
+    ///
+    /// Sign convention:
+    /// - `q_t > 0`  → net long `q_t` TAO
+    /// - `q_t < 0`  → net short `|q_t|` TAO
+    /// - `|q_t| ≈ 0` → approximately flat
     pub q_global_tao: f64,
     /// Dollar delta q_t * S_t.
     pub dollar_delta_usd: f64,
@@ -252,8 +257,7 @@ impl GlobalState {
                     if q_new != 0.0 {
                         let w_old = q_old.abs();
                         let w_trade = trade.abs();
-                        let p_new =
-                            (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
+                        let p_new = (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
                         v.position_tao = q_new;
                         v.avg_entry_price = p_new;
                     } else {
@@ -299,8 +303,7 @@ impl GlobalState {
             // Accumulate into global realised PnL.
             self.daily_realised_pnl += realised;
             // `daily_unrealised_pnl` will be updated in `recompute_after_fills`.
-            self.daily_pnl_total =
-                self.daily_realised_pnl + self.daily_unrealised_pnl;
+            self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
         }
     }
 
@@ -331,8 +334,7 @@ impl GlobalState {
         }
 
         self.daily_unrealised_pnl = unrealised;
-        self.daily_pnl_total =
-            self.daily_realised_pnl + self.daily_unrealised_pnl;
+        self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
     }
 }
 
@@ -449,8 +451,7 @@ mod tests {
 
         let fee_entry = (fee_bps / 10_000.0) * entry_price * size;
         let fee_exit = (fee_bps / 10_000.0) * exit_price * size;
-        let expected_realised =
-            (entry_price - exit_price) * size - fee_entry - fee_exit;
+        let expected_realised = (entry_price - exit_price) * size - fee_entry - fee_exit;
 
         approx(
             "realised PnL short round-trip with fees",

@@ -173,6 +173,7 @@ pub fn mm_quotes_to_order_intents(quotes: &[MmQuote]) -> Vec<OrderIntent> {
 ///   - basis + funding adjustments,
 ///   - vol-driven spread & size multipliers,
 ///   - risk-regime / liq / delta-limit aware size scaling.
+#[allow(clippy::too_many_arguments)]
 fn compute_single_venue_quotes(
     cfg: &Config,
     vcfg: &VenueConfig,

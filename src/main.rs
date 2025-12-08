@@ -5,14 +5,7 @@
 
 use clap::Parser;
 
-use paraphina::{
-    Config,
-    EventSink,
-    FileSink,
-    NoopSink,
-    SimGateway,
-    StrategyRunner,
-};
+use paraphina::{Config, EventSink, FileSink, NoopSink, SimGateway, StrategyRunner};
 
 /// High-level risk / behaviour profiles, distilled from Exp07/Exp09.
 #[derive(Clone, Copy, Debug)]
@@ -82,11 +75,7 @@ struct Cli {
     /// - Can be NEGATIVE (short inventory).
     /// - If omitted, we use either the profile's q0 (if --profile is set)
     ///   or the default from Config::default().
-    #[arg(
-        long,
-        value_name = "INITIAL_Q_TAO",
-        allow_hyphen_values = true
-    )]
+    #[arg(long, value_name = "INITIAL_Q_TAO", allow_hyphen_values = true)]
     initial_q_tao: Option<f64>,
 
     /// Base hedge band (TAO).

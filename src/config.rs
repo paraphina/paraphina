@@ -12,13 +12,12 @@
 pub struct Config {
     /// Human-readable config / release version.
     pub version: &'static str,
-    /// Initial global inventory q0 in TAO (sim / research only).
+    /// Signed initial global position in TAO.
     ///
-    /// This is applied once at t = 0 on venue 0 by StrategyRunner::inject_initial_position.
     /// Sign convention:
-    ///   > 0  => start long q0 TAO
-    ///   < 0  => start short |q0| TAO
-    ///   ~= 0 => start flat
+    /// - `q0 > 0`  → start long `q0` TAO
+    /// - `q0 < 0`  → start short `|q0|` TAO
+    /// - `|q0| ≈ 0` → start flat
     pub initial_q_tao: f64,
     /// Static config per venue (Extended, Hyperliquid, Aster, Lighter, Paradex).
     pub venues: Vec<VenueConfig>,
@@ -128,7 +127,8 @@ pub struct RiskConfig {
     pub basis_hard_limit_usd: f64,
     /// Fraction of basis limit where Warning begins.
     pub basis_warn_frac: f64,
-    /// Max allowed daily PnL drawdown (realised + unrealised), negative.
+    /// Max allowed daily PnL loss in absolute USD (realised + unrealised).
+    /// Positive value; the engine interprets this as a loss threshold.
     pub daily_loss_limit: f64,
     /// Fraction of loss limit where Warning regime begins.
     pub pnl_warn_frac: f64,
@@ -305,7 +305,8 @@ impl Default for Config {
             fv_vol_alpha_short: 0.2,
             fv_vol_alpha_long: 0.05,
             sigma_min: 0.001,
-            vol_ref: 0.02,
+            // Hyper-search-optimal reference vol for current synthetic regime.
+            vol_ref: 0.01,
             vol_ratio_min: 0.25,
             vol_ratio_max: 4.0,
             spread_vol_mult_coeff: 1.0,
@@ -324,8 +325,9 @@ impl Default for Config {
             // basis book while market is volatile.
             basis_hard_limit_usd: 10_000.0,
             basis_warn_frac: 0.7,
-            // Daily loss limit (realised + unrealised). Negative by convention.
-            daily_loss_limit: 4000.0,
+            // Daily loss limit (realised + unrealised), in absolute USD.
+            // Interpreted as a positive loss threshold by the engine.
+            daily_loss_limit: 2_000.0,
             pnl_warn_frac: 0.5,
             // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
@@ -362,8 +364,8 @@ impl Default for Config {
         let hedge = HedgeConfig {
             // With ~300 USD / TAO and our default limits, this band corresponds
             // to ~6–9k USD of unhedged delta before the LQ controller kicks in.
-            hedge_band_base: 5.0,  // TAO band
-            hedge_max_step: 20.0,  // TAO per hedge step
+            hedge_band_base: 5.0, // TAO band
+            hedge_max_step: 20.0, // TAO per hedge step
             alpha_hedge: 1.0,
             beta_hedge: 1.0,
         };
@@ -382,7 +384,7 @@ impl Default for Config {
         };
 
         Config {
-            version: "v0.1.2-whitepaper-spec",
+            version: "v0.1.3-hyper-optimised",
             initial_q_tao: 0.0,
             venues,
             book,
@@ -418,9 +420,7 @@ impl Config {
             match raw.parse::<f64>() {
                 Ok(v) => {
                     cfg.initial_q_tao = v;
-                    eprintln!(
-                        "[config] PARAPHINA_INIT_Q_TAO = {v} (overrode default)"
-                    );
+                    eprintln!("[config] PARAPHINA_INIT_Q_TAO = {v} (overrode default)");
                 }
                 Err(_) => {
                     eprintln!(
