@@ -336,7 +336,7 @@ impl Default for Config {
             basis_hard_limit_usd: 10_000.0,
             basis_warn_frac: 0.7,
             // Daily loss limit (realised + unrealised), as a positive threshold.
-            daily_loss_limit: 3_000.0,
+            daily_loss_limit: 10_000.0,
             pnl_warn_frac: 0.5,
             // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
@@ -393,7 +393,7 @@ impl Default for Config {
         };
 
         Config {
-            version: "v0.1.4-whitepaper-spec+profiles",
+            version: "v0.1.5-whitepaper-spec+profiles+exp02-aggressive-v1",
             initial_q_tao: 0.0,
             venues,
             book,
@@ -420,17 +420,18 @@ impl Config {
                 // Already matches Config::default().
             }
             RiskProfile::Conservative => {
-                // Tighter hedge band, stronger inventory penalty, tighter loss limit.
+                // Tighter hedge band, stronger inventory penalty, lower loss limit.
                 cfg.hedge.hedge_band_base = 2.5;
                 cfg.mm.size_eta = 0.20;
                 cfg.volatility.vol_ref = 0.015;
                 cfg.risk.daily_loss_limit = 1_500.0;
             }
             RiskProfile::Aggressive => {
-                // Wider hedge band, weaker inventory penalty, looser loss limit.
-                cfg.hedge.hedge_band_base = 7.5;
-                cfg.mm.size_eta = 0.05;
-                cfg.volatility.vol_ref = 0.025;
+                // Exp02 grid-tuned aggressive point around:
+                // band_base ≈ 5.625, eta ≈ 0.025, vol_ref ≈ 0.01875, loss ≈ 4k.
+                cfg.hedge.hedge_band_base = 5.625;
+                cfg.mm.size_eta = 0.025;
+                cfg.volatility.vol_ref = 0.01875;
                 cfg.risk.daily_loss_limit = 4_000.0;
             }
         }
@@ -447,7 +448,7 @@ impl Config {
     ///   - PARAPHINA_HEDGE_MAX_STEP    (f64, TAO)
     ///   - PARAPHINA_MM_SIZE_ETA       (f64)
     ///   - PARAPHINA_VOL_REF           (f64)
-    ///   - PARAPHINA_DAILY_LOSS_LIMIT  (f64, USD, absolute)
+    ///   - PARAPHINA_DAILY_LOSS_LIMIT  (f64, USD; positive threshold)
     ///
     /// Any variable that fails to parse is ignored with a warning.
     pub fn from_env_or_profile(profile: RiskProfile) -> Self {
@@ -503,11 +504,11 @@ impl Config {
                     );
                 }
                 Err(_) => {
-                    eprintln!(
+                    eprintln![
                         "[config] WARN: could not parse PARAPHINA_HEDGE_MAX_STEP = {:?} as f64; using default {}",
                         raw,
                         cfg.hedge.hedge_max_step
-                    );
+                    ];
                 }
             }
         }
