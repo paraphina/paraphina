@@ -206,6 +206,12 @@ impl Engine {
     }
 
     /// Vol-scaled risk limits + discrete risk regime + kill switch.
+    ///
+    /// Semantics:
+    /// - `daily_loss_limit` in `RiskConfig` is a *positive* USD number, meaning
+    ///   "maximum allowed daily loss (realised + unrealised)".
+    /// - We trigger Warning / HardLimit when PnL falls below negative
+    ///   thresholds:  -pnl_warn_level, -daily_loss_limit.
     fn update_risk_limits_and_regime(&self, state: &mut GlobalState) {
         let risk_cfg = &self.cfg.risk;
 
@@ -217,40 +223,48 @@ impl Engine {
         state.basis_limit_warn_usd = risk_cfg.basis_hard_limit_usd * risk_cfg.basis_warn_frac;
 
         // ---- 2) Aggregate daily PnL fields --------------------------------
-        // NOTE: field names in GlobalState today are `daily_realised_pnl`
-        // and `daily_unrealised_pnl`.
         state.daily_pnl_total = state.daily_realised_pnl + state.daily_unrealised_pnl;
+        let pnl = state.daily_pnl_total;
 
         // ---- 3) Choose risk regime based on delta / basis / PnL -----------
+
         let delta_abs = state.dollar_delta_usd.abs();
         let basis_abs = state.basis_usd.abs();
-        let pnl = state.daily_pnl_total;
 
         let delta_warn = risk_cfg.delta_warn_frac * state.delta_limit_usd;
         let basis_warn = risk_cfg.basis_warn_frac * risk_cfg.basis_hard_limit_usd;
-        // All of these are negative numbers; pnl_warn is a “less negative”
-        // early-warning threshold.
-        let pnl_warn = risk_cfg.pnl_warn_frac * risk_cfg.daily_loss_limit;
+
+        // `daily_loss_limit` is a positive loss magnitude.
+        let loss_hard = risk_cfg.daily_loss_limit.max(0.0);
+        // If it is zero, effectively disable PnL-based gating.
+        let loss_warn = loss_hard * risk_cfg.pnl_warn_frac;
+
+        // PnL thresholds (these are negative numbers: e.g. -1000, -2000).
+        let pnl_hard_level = -loss_hard;
+        let pnl_warn_level = -loss_warn;
 
         let mut regime = RiskRegime::Normal;
 
         // Hard-limit regime if *any* hard constraint breached.
         if delta_abs >= state.delta_limit_usd
             || basis_abs >= risk_cfg.basis_hard_limit_usd
-            || pnl <= risk_cfg.daily_loss_limit
+            || (loss_hard > 0.0 && pnl <= pnl_hard_level)
         {
             regime = RiskRegime::HardLimit;
         }
         // Warning regime if *any* warning threshold breached
         // (and hard limit not already hit).
-        else if delta_abs >= delta_warn || basis_abs >= basis_warn || pnl <= pnl_warn {
+        else if delta_abs >= delta_warn
+            || basis_abs >= basis_warn
+            || (loss_warn > 0.0 && pnl <= pnl_warn_level)
+        {
             regime = RiskRegime::Warning;
         }
 
-        // Kill-switch if we are in HardLimit and PnL has breached the hard
-        // daily loss limit. This can be made stricter later if desired.
+        // Kill-switch if we are in HardLimit *and* PnL has breached the hard
+        // daily loss threshold.
         let kill_switch =
-            matches!(regime, RiskRegime::HardLimit) && pnl <= risk_cfg.daily_loss_limit;
+            matches!(regime, RiskRegime::HardLimit) && (loss_hard > 0.0 && pnl <= pnl_hard_level);
 
         state.risk_regime = regime;
         state.kill_switch = kill_switch;

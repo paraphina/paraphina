@@ -37,6 +37,17 @@ pub struct Config {
     pub toxicity: ToxicityConfig,
 }
 
+/// Coarse risk profile preset used by the CLI / research harness.
+///
+/// These presets only tweak a small set of hyperparameters on top of the
+/// whitepaper-spec default (which we treat as "Balanced").
+#[derive(Debug, Clone, Copy)]
+pub enum RiskProfile {
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
 #[derive(Debug, Clone)]
 pub struct VenueConfig {
     /// Stable identifier used in logs / routing (e.g. "extended").
@@ -127,8 +138,8 @@ pub struct RiskConfig {
     pub basis_hard_limit_usd: f64,
     /// Fraction of basis limit where Warning begins.
     pub basis_warn_frac: f64,
-    /// Max allowed daily PnL loss in absolute USD (realised + unrealised).
-    /// Positive value; the engine interprets this as a loss threshold.
+    /// Daily loss limit (realised + unrealised), in absolute USD.
+    /// The engine interprets this as a positive loss threshold.
     pub daily_loss_limit: f64,
     /// Fraction of loss limit where Warning regime begins.
     pub pnl_warn_frac: f64,
@@ -305,8 +316,7 @@ impl Default for Config {
             fv_vol_alpha_short: 0.2,
             fv_vol_alpha_long: 0.05,
             sigma_min: 0.001,
-            // Hyper-search-optimal reference vol for current synthetic regime.
-            vol_ref: 0.01,
+            vol_ref: 0.02, // "balanced" reference vol
             vol_ratio_min: 0.25,
             vol_ratio_max: 4.0,
             spread_vol_mult_coeff: 1.0,
@@ -325,9 +335,8 @@ impl Default for Config {
             // basis book while market is volatile.
             basis_hard_limit_usd: 10_000.0,
             basis_warn_frac: 0.7,
-            // Daily loss limit (realised + unrealised), in absolute USD.
-            // Interpreted as a positive loss threshold by the engine.
-            daily_loss_limit: -2_000.0,
+            // Daily loss limit (realised + unrealised), as a positive threshold.
+            daily_loss_limit: 10_000.0,
             pnl_warn_frac: 0.5,
             // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
@@ -364,7 +373,7 @@ impl Default for Config {
         let hedge = HedgeConfig {
             // With ~300 USD / TAO and our default limits, this band corresponds
             // to ~6–9k USD of unhedged delta before the LQ controller kicks in.
-            hedge_band_base: 5.0, // TAO band
+            hedge_band_base: 5.0, // TAO band (balanced)
             hedge_max_step: 20.0, // TAO per hedge step
             alpha_hedge: 1.0,
             beta_hedge: 1.0,
@@ -384,7 +393,7 @@ impl Default for Config {
         };
 
         Config {
-            version: "v0.1.3-hyper-optimised",
+            version: "v0.1.3-whitepaper-spec",
             initial_q_tao: 0.0,
             venues,
             book,
@@ -401,7 +410,35 @@ impl Default for Config {
 // --- Runtime config loader: env overrides on top of defaults -----------------
 
 impl Config {
-    /// Build a Config from defaults, then apply environment overrides.
+    /// Build a Config using a given risk profile on top of the
+    /// whitepaper-spec defaults.
+    pub fn for_profile(profile: RiskProfile) -> Self {
+        let mut cfg = Config::default();
+
+        match profile {
+            RiskProfile::Balanced => {
+                // Already matches Config::default().
+            }
+            RiskProfile::Conservative => {
+                // Tighter hedge band, stronger inventory penalty, tighter loss limit.
+                cfg.hedge.hedge_band_base = 2.5;
+                cfg.mm.size_eta = 0.20;
+                cfg.volatility.vol_ref = 0.015;
+                cfg.risk.daily_loss_limit = 1_500.0;
+            }
+            RiskProfile::Aggressive => {
+                // Wider hedge band, weaker inventory penalty, looser loss limit.
+                cfg.hedge.hedge_band_base = 7.5;
+                cfg.mm.size_eta = 0.05;
+                cfg.volatility.vol_ref = 0.025;
+                cfg.risk.daily_loss_limit = 4_000.0;
+            }
+        }
+
+        cfg
+    }
+
+    /// Build a Config from a profile, then apply environment overrides.
     ///
     /// This is designed for research / batch runs and future RL:
     ///
@@ -410,10 +447,10 @@ impl Config {
     ///   - PARAPHINA_HEDGE_MAX_STEP   (f64, TAO)
     ///
     /// Any variable that fails to parse is ignored with a warning.
-    pub fn from_env_or_default() -> Self {
+    pub fn from_env_or_profile(profile: RiskProfile) -> Self {
         use std::env;
 
-        let mut cfg = Config::default();
+        let mut cfg = Config::for_profile(profile);
 
         // Initial global inventory q0 in TAO.
         if let Ok(raw) = env::var("PARAPHINA_INIT_Q_TAO") {
@@ -473,5 +510,10 @@ impl Config {
         }
 
         cfg
+    }
+
+    /// Backwards-compatible helper: use the Balanced profile by default.
+    pub fn from_env_or_default() -> Self {
+        Self::from_env_or_profile(RiskProfile::Balanced)
     }
 }
