@@ -327,7 +327,7 @@ impl Default for Config {
             basis_warn_frac: 0.7,
             // Daily loss limit (realised + unrealised), in absolute USD.
             // Interpreted as a positive loss threshold by the engine.
-            daily_loss_limit: 2_000.0,
+            daily_loss_limit: -2_000.0,
             pnl_warn_frac: 0.5,
             // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
