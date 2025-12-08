@@ -1,91 +1,58 @@
 // src/toxicity.rs
 //
-// Per-venue toxicity + health classification.
-// Approximation of the whitepaper logic:
-//  - use local per-venue volatility vs global σ_eff as the primary signal,
-//  - map that to a toxicity score in [0, 1],
-//  - threshold into {Healthy, Warning, Disabled}.
+// Per-venue volatility-based toxicity scoring.
+//
+// We currently use a single feature:
+//
+//   f_vol = clip((local_vol_short / sigma_eff - 1) / vol_tox_scale, 0, 1)
+//
+// and write the final score into `venue.toxicity ∈ [0, 1]`.
+//
+// Other parts of the engine can interpret this as:
+//
+//   - tox <  tox_med_threshold   → effectively "Healthy"
+//   - tox ∈ [tox_med, tox_high)  → "Warning"
+//   - tox ≥  tox_high_threshold  → "Disabled"
+//
+// We *don't* store a separate health enum/flag here to keep it compatible
+// with the existing VenueState struct.
 
 use crate::config::Config;
 use crate::state::GlobalState;
-use crate::types::VenueStatus;
 
-/// Update per-venue toxicity score and health status.
+/// Update per-venue toxicity scores.
 ///
-/// In production this would also use realised markouts and flow imbalance.
-/// Here we approximate the whitepaper's f₁ feature:
-///
-///   ratio_v = local_vol_short_v / σ_eff
-///   f₁     = clip((ratio_v - 1) / VOL_TOX_SCALE, 0, 1)
-///
-/// and treat f₁ itself as the toxicity score.
-///
-/// `VOL_TOX_SCALE` controls how far above global volatility a venue has to run
-/// before it is considered suspect. With the default config:
-///
-///   - ratio_v ≲ 1.25  → tox < 0.6  → Healthy
-///   - ratio_v ≈ 1.3   → tox ≈ 0.6  → Warning
-///   - ratio_v ≳ 1.45  → tox ≳ 0.9  → Disabled
+/// Assumes:
+///   - `state.sigma_eff` has been updated by the engine,
+///   - each venue has `local_vol_short` populated.
 pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config) {
     let tox_cfg = &cfg.toxicity;
+    let vol_cfg = &cfg.volatility;
 
-    let fair = match state.fair_value {
-        Some(v) if v > 0.0 => v,
-        _ => {
-            // If we have no fair value yet, mark everything healthy.
-            for v in &mut state.venues {
-                v.toxicity = 0.0;
-                v.status = VenueStatus::Healthy;
-            }
-            return;
-        }
-    };
+    // Keep sigma_eff away from zero so ratios are well-defined.
+    let sigma_eff: f64 = state.sigma_eff.max(vol_cfg.sigma_min);
 
-    let sigma_eff = state.sigma_eff.max(1e-8);
-
-    for v in &mut state.venues {
-        let mid = match v.mid {
-            Some(m) if m > 0.0 => m,
-            _ => {
-                // No usable mid: treat venue as disabled and maximally toxic.
-                v.toxicity = tox_cfg.tox_high_threshold.max(1.0);
-                v.status = VenueStatus::Disabled;
-                continue;
-            }
-        };
-
-        // Primary signal: local vol vs global σ_eff.
-        let local_sigma = v.local_vol_short.max(1e-8);
-        let ratio_v = local_sigma / sigma_eff;
-
-        // Excess volatility above 1, scaled by vol_tox_scale and clipped to [0,1].
-        let mut tox = ((ratio_v - 1.0) / tox_cfg.vol_tox_scale).max(0.0);
-        if tox > 1.0 {
-            tox = 1.0;
-        }
-
-        // Very large persistent price deviations vs fair value are also suspect.
-        // This is a light additional guard so that wildly off-market books
-        // are not treated as perfectly healthy.
-        let rel_dev = ((mid - fair) / fair).abs();
-        let dev_floor = 0.01; // 1% baseline deviation tolerance.
-        let dev_thresh = 3.0 * sigma_eff.max(dev_floor);
-
-        if rel_dev > dev_thresh {
-            let overshoot = rel_dev - dev_thresh;
-            let dev_scale = dev_thresh.max(1e-4);
-            let extra = (overshoot / dev_scale).min(1.0); // up to +1
-            tox = (tox + extra).min(1.0);
-        }
-
-        v.toxicity = tox;
-
-        v.status = if tox >= tox_cfg.tox_high_threshold {
-            VenueStatus::Disabled
-        } else if tox >= tox_cfg.tox_med_threshold {
-            VenueStatus::Warning
+    for venue in &mut state.venues {
+        // Base toxicity: if we have no mid or no depth, treat as highly toxic.
+        let mut tox: f64 = if venue.mid.is_some() && venue.depth_near_mid > 0.0_f64 {
+            0.0_f64
         } else {
-            VenueStatus::Healthy
+            1.0_f64
         };
+
+        // Volatility-based feature.
+        if sigma_eff > 0.0_f64 && tox_cfg.vol_tox_scale > 0.0_f64 {
+            let local: f64 = venue.local_vol_short.max(vol_cfg.sigma_min);
+            let ratio: f64 = local / sigma_eff;
+
+            let raw: f64 = (ratio - 1.0_f64) / tox_cfg.vol_tox_scale;
+            // Clamp to [0, 1] using the intrinsic clamp() to satisfy clippy.
+            let f_vol: f64 = raw.clamp(0.0_f64, 1.0_f64);
+
+            tox = tox.max(f_vol);
+        }
+
+        // Store final score in [0, 1] (again via clamp() for clippy).
+        venue.toxicity = tox.clamp(0.0_f64, 1.0_f64);
     }
 }

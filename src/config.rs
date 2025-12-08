@@ -336,7 +336,7 @@ impl Default for Config {
             basis_hard_limit_usd: 10_000.0,
             basis_warn_frac: 0.7,
             // Daily loss limit (realised + unrealised), as a positive threshold.
-            daily_loss_limit: 10_000.0,
+            daily_loss_limit: 3_000.0,
             pnl_warn_frac: 0.5,
             // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
@@ -393,7 +393,7 @@ impl Default for Config {
         };
 
         Config {
-            version: "v0.1.3-whitepaper-spec",
+            version: "v0.1.4-whitepaper-spec+profiles",
             initial_q_tao: 0.0,
             venues,
             book,
@@ -407,7 +407,7 @@ impl Default for Config {
     }
 }
 
-// --- Runtime config loader: env overrides on top of defaults -----------------
+// --- Runtime config loader: profiles + env overrides -------------------------
 
 impl Config {
     /// Build a Config using a given risk profile on top of the
@@ -442,9 +442,12 @@ impl Config {
     ///
     /// This is designed for research / batch runs and future RL:
     ///
-    ///   - PARAPHINA_INIT_Q_TAO       (f64, TAO)
-    ///   - PARAPHINA_HEDGE_BAND_BASE  (f64, TAO)
-    ///   - PARAPHINA_HEDGE_MAX_STEP   (f64, TAO)
+    ///   - PARAPHINA_INIT_Q_TAO        (f64, TAO)
+    ///   - PARAPHINA_HEDGE_BAND_BASE   (f64, TAO)
+    ///   - PARAPHINA_HEDGE_MAX_STEP    (f64, TAO)
+    ///   - PARAPHINA_MM_SIZE_ETA       (f64)
+    ///   - PARAPHINA_VOL_REF           (f64)
+    ///   - PARAPHINA_DAILY_LOSS_LIMIT  (f64, USD, absolute)
     ///
     /// Any variable that fails to parse is ignored with a warning.
     pub fn from_env_or_profile(profile: RiskProfile) -> Self {
@@ -504,6 +507,67 @@ impl Config {
                         "[config] WARN: could not parse PARAPHINA_HEDGE_MAX_STEP = {:?} as f64; using default {}",
                         raw,
                         cfg.hedge.hedge_max_step
+                    );
+                }
+            }
+        }
+
+        // MM size_eta (risk parameter in J(Q) = eQ - 0.5 η Q²).
+        if let Ok(raw) = env::var("PARAPHINA_MM_SIZE_ETA") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    // Keep it strictly positive to avoid degeneracy.
+                    cfg.mm.size_eta = v.max(1e-6);
+                    eprintln!(
+                        "[config] PARAPHINA_MM_SIZE_ETA = {} (overrode default)",
+                        cfg.mm.size_eta
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_MM_SIZE_ETA = {:?} as f64; using default {}",
+                        raw,
+                        cfg.mm.size_eta
+                    );
+                }
+            }
+        }
+
+        // Volatility reference σ_ref used for vol_ratio = sigma_eff / σ_ref.
+        if let Ok(raw) = env::var("PARAPHINA_VOL_REF") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.volatility.vol_ref = v.max(1e-6);
+                    eprintln!(
+                        "[config] PARAPHINA_VOL_REF = {} (overrode default)",
+                        cfg.volatility.vol_ref
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_VOL_REF = {:?} as f64; using default {}",
+                        raw,
+                        cfg.volatility.vol_ref
+                    );
+                }
+            }
+        }
+
+        // Daily loss limit in absolute USD; engine treats this as |max drawdown|.
+        if let Ok(raw) = env::var("PARAPHINA_DAILY_LOSS_LIMIT") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.risk.daily_loss_limit = v.abs();
+                    eprintln!(
+                        "[config] PARAPHINA_DAILY_LOSS_LIMIT = {} (overrode default)",
+                        cfg.risk.daily_loss_limit
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_DAILY_LOSS_LIMIT = {:?} as f64; using default {}",
+                        raw,
+                        cfg.risk.daily_loss_limit
                     );
                 }
             }
