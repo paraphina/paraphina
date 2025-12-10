@@ -4,6 +4,7 @@
 //
 // Example usage:
 //
+//   cargo run --release
 //   cargo run --release -- --ticks 500
 //   cargo run --release -- --ticks 500 --profile aggressive
 //
@@ -33,7 +34,8 @@ enum ProfileArg {
 )]
 struct Cli {
     /// Number of synthetic ticks to run.
-    #[arg(long)]
+    /// Defaults to 2000 if not provided.
+    #[arg(long, default_value_t = 2000)]
     ticks: u64,
 
     /// Risk profile preset: conservative | balanced | aggressive.
@@ -42,8 +44,10 @@ struct Cli {
 }
 
 fn main() {
+    // Parse CLI args.
     let cli = Cli::parse();
 
+    // Map CLI profile to internal RiskProfile enum.
     let profile = match cli.profile {
         ProfileArg::Conservative => RiskProfile::Conservative,
         ProfileArg::Balanced => RiskProfile::Balanced,
@@ -53,10 +57,11 @@ fn main() {
     // Build config from profile + env overrides.
     let cfg = Config::from_env_or_profile(profile);
 
-    // Pure synthetic gateway + no-op sink (tests / manual sims).
+    // Pure synthetic gateway + no-op event sink (tests / manual sims).
     let gateway = SimGateway; // unit struct – no ::default()
     let sink = NoopSink;
 
+    // Strategy runner owns engine, state, telemetry, and logging.
     let mut runner = StrategyRunner::new(&cfg, gateway, sink);
     runner.run_simulation(cli.ticks);
 }

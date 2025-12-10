@@ -12,6 +12,7 @@ pub mod logging;
 pub mod mm;
 pub mod state;
 pub mod strategy;
+pub mod telemetry;
 pub mod toxicity;
 pub mod types;
 

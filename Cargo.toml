@@ -14,7 +14,7 @@ name = "paraphina"
 path = "src/main.rs"
 
 [dependencies]
-# For JSON logging of per-tick snapshots (FileSink).
+# For JSON logging of per-tick snapshots (TelemetrySink, etc.).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -209,6 +209,22 @@ pub struct ToxicityConfig {
 
 impl Default for Config {
     fn default() -> Self {
+        // ------------------------------------------------------------------
+        // World-model tuned "balanced" centre (exp07/exp08):
+        //
+        //   band_base      = 5.625     TAO
+        //   mm_size_eta    = 0.10
+        //   vol_ref        = 0.028125
+        //   daily_loss_lim = 5000 USD
+        //
+        // Aggressive / Conservative profiles only change daily_loss_limit
+        // on top of this centre; see Config::for_profile.
+        // ------------------------------------------------------------------
+        const BAND_BASE: f64 = 5.625;
+        const MM_SIZE_ETA: f64 = 0.10;
+        const VOL_REF: f64 = 0.028_125;
+        const DAILY_LOSS_LIMIT_BAL: f64 = 5_000.0;
+
         // ----- Venue configs -----
         //
         // These are deliberately conservative, assuming ~300 USD / TAO:
@@ -316,7 +332,8 @@ impl Default for Config {
             fv_vol_alpha_short: 0.2,
             fv_vol_alpha_long: 0.05,
             sigma_min: 0.001,
-            vol_ref: 0.02, // "balanced" reference vol
+            // World-model tuned reference vol for vol_ratio.
+            vol_ref: VOL_REF,
             vol_ratio_min: 0.25,
             vol_ratio_max: 4.0,
             spread_vol_mult_coeff: 1.0,
@@ -336,7 +353,8 @@ impl Default for Config {
             basis_hard_limit_usd: 10_000.0,
             basis_warn_frac: 0.7,
             // Daily loss limit (realised + unrealised), as a positive threshold.
-            daily_loss_limit: 10_000.0,
+            // For Balanced profile we use the world-model tuned centre.
+            daily_loss_limit: DAILY_LOSS_LIMIT_BAL,
             pnl_warn_frac: 0.5,
             // In Warning regime we widen spreads and cap sizes.
             spread_warn_mult: 1.5,
@@ -359,7 +377,8 @@ impl Default for Config {
             edge_local_min: 0.5,
             edge_vol_mult: 0.2,
             // Inventory-risk parameter in J(Q) = eQ - 0.5 η Q².
-            size_eta: 0.10,
+            // World-model tuned η at the profile centre.
+            size_eta: MM_SIZE_ETA,
             // 0 = pure global, 1 = pure per-venue target; we sit in the middle.
             lambda_inv: 0.5,
             // Quoting horizon in seconds used in the AS formulas.
@@ -373,8 +392,8 @@ impl Default for Config {
         let hedge = HedgeConfig {
             // With ~300 USD / TAO and our default limits, this band corresponds
             // to ~6–9k USD of unhedged delta before the LQ controller kicks in.
-            hedge_band_base: 5.0, // TAO band (balanced)
-            hedge_max_step: 20.0, // TAO per hedge step
+            hedge_band_base: BAND_BASE, // TAO band (balanced centre)
+            hedge_max_step: 20.0,       // TAO per hedge step
             alpha_hedge: 1.0,
             beta_hedge: 1.0,
         };
@@ -393,7 +412,7 @@ impl Default for Config {
         };
 
         Config {
-            version: "v0.1.5-whitepaper-spec+profiles+exp02-aggressive-v1",
+            version: "v0.1.6-worldmodel-exp08-presets",
             initial_q_tao: 0.0,
             venues,
             book,
@@ -412,27 +431,24 @@ impl Default for Config {
 impl Config {
     /// Build a Config using a given risk profile on top of the
     /// whitepaper-spec defaults.
+    ///
+    /// We treat `Config::default()` as the *Balanced* world-model centre.
+    /// Other profiles only adjust a small set of knobs on top.
     pub fn for_profile(profile: RiskProfile) -> Self {
         let mut cfg = Config::default();
 
         match profile {
             RiskProfile::Balanced => {
-                // Already matches Config::default().
-            }
-            RiskProfile::Conservative => {
-                // Tighter hedge band, stronger inventory penalty, lower loss limit.
-                cfg.hedge.hedge_band_base = 2.5;
-                cfg.mm.size_eta = 0.20;
-                cfg.volatility.vol_ref = 0.015;
-                cfg.risk.daily_loss_limit = 1_500.0;
+                // Already matches world-model "balanced" centre
+                // (band_base = 5.625, eta = 0.10, vol_ref = 0.028125, loss = 5000).
             }
             RiskProfile::Aggressive => {
-                // Exp02 grid-tuned aggressive point:
-                // band_base ≈ 5.625, eta ≈ 0.025, vol_ref ≈ 0.01875, loss ≈ 4k.
-                cfg.hedge.hedge_band_base = 5.625;
-                cfg.mm.size_eta = 0.025;
-                cfg.volatility.vol_ref = 0.01875;
-                cfg.risk.daily_loss_limit = 4_000.0;
+                // Same world-model centre, but tighter daily loss limit.
+                cfg.risk.daily_loss_limit = 2_000.0;
+            }
+            RiskProfile::Conservative => {
+                // Same centre, but very tight daily loss limit.
+                cfg.risk.daily_loss_limit = 750.0;
             }
         }
 
@@ -545,8 +561,7 @@ impl Config {
                     );
                 }
                 Err(_) => {
-                    eprintln!(
-                        "[config] WARN: could not parse PARAPHINA_VOL_REF = {:?} as f64; using default {}",
+                    eprintln!("[config] WARN: could not parse PARAPHINA_VOL_REF = {:?} as f64; using default {}",
                         raw,
                         cfg.volatility.vol_ref
                     );

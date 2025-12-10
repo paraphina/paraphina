@@ -7,7 +7,8 @@
 //   - MM quote engine,
 //   - Hedge engine,
 //   - Execution gateway (real or synthetic),
-//   - Telemetry sink (file / noop).
+//   - Telemetry sink (JSONL / noop via env),
+//   - Logging sink (EventSink for human-readable logs).
 //
 // `main.rs` simply constructs a `StrategyRunner` and calls
 // `run_simulation(num_ticks)`.
@@ -19,8 +20,10 @@ use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::logging::EventSink;
 use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
 use crate::state::GlobalState;
+use crate::telemetry::TelemetrySink;
 use crate::toxicity::update_toxicity_and_health;
 use crate::types::{OrderIntent, Side, TimestampMs};
+use serde_json::json;
 
 /// High-level strategy runner.
 ///
@@ -35,6 +38,13 @@ where
     pub state: GlobalState,
     pub gateway: G,
     pub sink: S,
+    /// JSONL telemetry sink, controlled entirely via environment:
+    ///
+    ///   PARAPHINA_TELEMETRY_MODE = "off" | "jsonl"
+    ///   PARAPHINA_TELEMETRY_PATH = /path/to/file.jsonl  (when mode = jsonl)
+    ///
+    /// When mode = off or misconfigured, all calls are no-ops.
+    pub telemetry: TelemetrySink,
 }
 
 impl<'a, G, S> StrategyRunner<'a, G, S>
@@ -46,19 +56,22 @@ where
     pub fn new(cfg: &'a Config, gateway: G, sink: S) -> Self {
         let engine = Engine::new(cfg);
         let state = GlobalState::new(cfg);
+        let telemetry = TelemetrySink::from_env();
+
         Self {
             cfg,
             engine,
             state,
             gateway,
             sink,
+            telemetry,
         }
     }
 
     /// Run a simple synthetic simulation for `num_ticks` ticks.
     ///
     /// This is the same logic you were previously running in `main.rs`,
-    /// now encapsulated here and wired to the logging sink.
+    /// now encapsulated here and wired to the logging + telemetry sinks.
     pub fn run_simulation(&mut self, num_ticks: u64) {
         let mut now_ms: TimestampMs = 0;
         let dt_ms: TimestampMs = 1_000;
@@ -132,11 +145,32 @@ where
             println!("\nAfter MM + hedge fills:");
             self.print_inventory_and_pnl();
 
-            // 8) Log everything via the telemetry sink.
+            // 8) Emit per-tick JSONL telemetry snapshot.
+            //
+            // This is what exp05_telemetry_validation.py + ts_metrics.py read.
+            // Keys:
+            //   - t            : tick index
+            //   - pnl_total   : cumulative total PnL
+            //   - risk_regime : "Normal" | "Warning" | "HardLimit"
+            //   - kill_switch : bool
+            // plus a few extra helpful fields.
+            self.telemetry.log_json(&json!({
+                "t": tick,
+                "pnl_realised": self.state.daily_realised_pnl,
+                "pnl_unrealised": self.state.daily_unrealised_pnl,
+                "pnl_total": self.state.daily_pnl_total,
+                "risk_regime": format!("{:?}", self.state.risk_regime),
+                "kill_switch": self.state.kill_switch,
+                "q_global_tao": self.state.q_global_tao,
+                "dollar_delta_usd": self.state.dollar_delta_usd,
+                "basis_usd": self.state.basis_usd,
+            }));
+
+            // 9) Log everything via the event sink (human-readable / structured).
             self.sink
                 .log_tick(tick, self.cfg, &self.state, &all_intents, &fills);
 
-            // 9) Honour the global kill switch: stop the run early if tripped.
+            // 10) Honour the global kill switch: stop the run early if tripped.
             if self.state.kill_switch {
                 println!(
                     "\nKill switch active at tick {} – stopping simulation early.",
@@ -148,6 +182,9 @@ where
             // Advance synthetic clock.
             now_ms += dt_ms;
         }
+
+        // Ensure telemetry is flushed when the simulation finishes.
+        self.telemetry.flush();
     }
 
     /// Inject an initial synthetic position on venue 0.
