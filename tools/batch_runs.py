@@ -1,176 +1,194 @@
 #!/usr/bin/env python3
 """
-Hedge-band sweep harness for Paraphina (Exp01).
+research_ticks.py
 
-- Sweeps hedge_band_base over a small grid of TAO values.
-- For each band, runs the Rust sim multiple times using the new CLI:
-    --ticks
-    --initial-q-tao
-    --hedge-band-base
-    --log-jsonl
-- Reads the JSONL logs, computes risk/return metrics, and writes:
-    exp01_band_sweep_runs.csv      (per-run metrics)
-    exp01_band_sweep_summary.csv   (per-band aggregated metrics)
-    exp01_band_sweep_pnl.png       (PnL vs band plot)
+Log a single telemetry JSONL file as a run-level record into a research
+dataset (JSONL).
+
+Usage examples
+--------------
+
+# Log the manual test run you just did, tagged as aggressive:
+python tools/research_ticks.py \
+    --telemetry runs/manual_telemetry/test_run.jsonl \
+    --profile aggressive \
+    --label manual_test_001 \
+    --out research_run_001.jsonl
+
+The script will:
+  - load the ticks via batch_runs.ts_metrics.load_telemetry_jsonl
+  - compute PnL / drawdown / regime fractions / kill-switch
+  - look up the profile centre from batch_runs.profile_centres
+  - append a JSON line to the output file
+  - print a human-readable summary
 """
 
-import os
-import subprocess
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import asdict  # kept for possible future use
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------
-# Configuration of the experiment
+# Make repo root importable so we can do `from batch_runs ...`
 # ---------------------------------------------------------------------
-
 ROOT = Path(__file__).resolve().parents[1]
-RUNS_DIR = ROOT / "batch_runs"
-RUNS_DIR.mkdir(exist_ok=True)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-# How many synthetic ticks per run.
-TICKS = 200
-
-# How many independent runs per hedge band.
-RUNS_PER_BAND = 5
-
-# Per-run loss budget (USD, positive for CLI; Rust flips sign internally).
-LOSS_LIMIT_USD = 4000.0
-
-# Grid of hedge bands (TAO) to sweep.
-HEDGE_BANDS_TAO = [2.5, 5.0, 7.5, 10.0, 15.0]
+from batch_runs.ts_metrics import load_telemetry_jsonl
+from batch_runs.profile_centres import get_profile_centre
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+def compute_run_metrics(df: pd.DataFrame) -> dict:
+    """Compute basic run-level metrics from a telemetry dataframe."""
+    if df.empty:
+        raise SystemExit("No rows in telemetry – did the engine actually run?")
 
-def run_one_sim(hedge_band_tao: float, run_idx: int) -> pd.DataFrame:
-    """
-    Launch one Rust simulation with a given hedge_band_base and
-    return the per-tick dataframe loaded from the JSONL log.
-    """
-    env = os.environ.copy()
-    env.setdefault("RUST_BACKTRACE", "1")
+    # --- PnL series ---------------------------------------------------------
+    pnl = df["pnl_total"].astype(float)
 
-    run_id = f"band{hedge_band_tao:04.1f}_run{run_idx:02d}".replace(".", "p")
-    jsonl_path = RUNS_DIR / f"{run_id}.jsonl"
+    final_pnl = float(pnl.iloc[-1])
+    max_pnl = float(pnl.max())
+    min_pnl = float(pnl.min())
 
-    # IMPORTANT: use the new CLI parameters instead of old PARA_* env vars.
-    cmd = [
-        "cargo",
-        "run",
-        "--quiet",
-        "--",
-        "--ticks",
-        str(TICKS),
-        "--initial-q-tao",
-        "0.0",  # q0 = 0 for Exp01
-        "--hedge-band-base",
-        str(hedge_band_tao),
-        "--loss-limit-usd",
-        str(LOSS_LIMIT_USD),
-        "--log-jsonl",
-        str(jsonl_path),
-    ]
+    # --- Max drawdown on total PnL -----------------------------------------
+    cummx = np.maximum.accumulate(pnl.values)
+    dd = cummx - pnl.values
+    max_dd = float(dd.max()) if len(dd) else 0.0
 
-    print(f"\n=== Running {run_id} (hedge_band_base={hedge_band_tao} TAO) ===")
-    subprocess.run(cmd, cwd=ROOT, check=True, env=env)
+    # --- Risk regime fractions ---------------------------------------------
+    regime_counts = df["risk_regime"].value_counts(normalize=True)
+    frac_normal = float(regime_counts.get("Normal", 0.0))
+    frac_warning = float(regime_counts.get("Warning", 0.0))
+    frac_hard = float(regime_counts.get("HardLimit", 0.0))
 
-    # Load the per-tick snapshots.
-    df = pd.read_json(jsonl_path, lines=True)
-    return df
-
-
-def compute_metrics(df: pd.DataFrame) -> dict:
-    """
-    Compute risk/return metrics from a per-tick dataframe.
-    We deliberately keep this very simple and transparent.
-    """
-    pnl = df["daily_pnl_total"].to_numpy()
-    delta = df["dollar_delta_usd"].to_numpy()
-    basis = df["basis_usd"].to_numpy()
-
-    final_pnl = float(pnl[-1])
-
-    # Treat daily_pnl_total as an equity curve for drawdown purposes.
-    running_max = np.maximum.accumulate(pnl)
-    drawdown = pnl - running_max
-    max_drawdown = float(drawdown.min())  # <= 0.0
-
-    max_abs_delta = float(np.abs(delta).max())
-    max_abs_basis = float(np.abs(basis).max())
+    # --- Kill-switch -------------------------------------------------------
+    if "kill_switch" in df.columns:
+        kill_fired = bool(df["kill_switch"].any())
+    else:
+        kill_fired = False
 
     return {
+        "num_ticks": int(len(df)),
         "final_pnl": final_pnl,
-        "max_drawdown": max_drawdown,
-        "max_abs_delta_usd": max_abs_delta,
-        "max_abs_basis_usd": max_abs_basis,
+        "max_pnl": max_pnl,
+        "min_pnl": min_pnl,
+        "max_drawdown": max_dd,
+        "frac_normal": frac_normal,
+        "frac_warning": frac_warning,
+        "frac_hard": frac_hard,
+        "kill_switch": kill_fired,
     }
 
 
-# ---------------------------------------------------------------------
-# Main experiment driver
-# ---------------------------------------------------------------------
-
 def main() -> None:
-    rows = []
-
-    for band in HEDGE_BANDS_TAO:
-        for run_idx in range(RUNS_PER_BAND):
-            df = run_one_sim(band, run_idx)
-            metrics = compute_metrics(df)
-            row = {
-                "hedge_band_tao": band,
-                "run_idx": run_idx,
-                **metrics,
-            }
-            rows.append(row)
-
-    df_runs = pd.DataFrame(rows)
-    runs_csv = ROOT / "exp01_band_sweep_runs.csv"
-    df_runs.to_csv(runs_csv, index=False)
-    print(f"\nSaved per-run metrics to {runs_csv}")
-
-    # Aggregate per band.
-    summary = (
-        df_runs.groupby("hedge_band_tao")
-        .agg(
-            final_pnl_mean=("final_pnl", "mean"),
-            final_pnl_std=("final_pnl", "std"),
-            max_drawdown_mean=("max_drawdown", "mean"),
-            max_drawdown_min=("max_drawdown", "min"),  # most negative
-            max_abs_delta_mean=("max_abs_delta_usd", "mean"),
-            max_abs_basis_mean=("max_abs_basis_usd", "mean"),
-        )
-        .reset_index()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Summarise a telemetry JSONL file and append it to a "
+            "research JSONL dataset."
+        ),
+    )
+    parser.add_argument(
+        "--telemetry",
+        "-t",
+        type=Path,
+        required=True,
+        help="Path to telemetry JSONL file (e.g. runs/manual_telemetry/test_run.jsonl)",
+    )
+    parser.add_argument(
+        "--profile",
+        "-p",
+        type=str,
+        choices=["aggressive", "balanced", "conservative"],
+        required=True,
+        help="Risk profile used for the run.",
+    )
+    parser.add_argument(
+        "--label",
+        "-l",
+        type=str,
+        required=True,
+        help="Short label for this run (e.g. 'manual_test_001').",
+    )
+    parser.add_argument(
+        "--out",
+        "-o",
+        type=Path,
+        default=Path("research_run_001.jsonl"),
+        help=(
+            "Output JSONL dataset to append to "
+            "(default: research_run_001.jsonl)."
+        ),
+    )
+    parser.add_argument(
+        "--notes",
+        type=str,
+        default="",
+        help="Optional free-form notes to store with the run.",
     )
 
-    summary_csv = ROOT / "exp01_band_sweep_summary.csv"
-    summary.to_csv(summary_csv, index=False)
-    print(f"Saved band-sweep summary to {summary_csv}\n")
+    args = parser.parse_args()
 
-    print("=== Band sweep summary (PnL / risk) ===")
-    print(summary.to_string(index=False))
+    # Load telemetry
+    df = load_telemetry_jsonl(args.telemetry)
 
-    # Simple research plot: mean final PnL vs hedge band (with std error bars).
-    fig, ax = plt.subplots()
-    ax.errorbar(
-        summary["hedge_band_tao"],
-        summary["final_pnl_mean"],
-        yerr=summary["final_pnl_std"].fillna(0.0),
-        fmt="o-",
+    # Compute core metrics
+    metrics = compute_run_metrics(df)
+
+    # Look up profile centre knobs
+    centre = get_profile_centre(args.profile)
+
+    # Build record
+    record = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "label": args.label,
+        "profile": args.profile,
+        "telemetry_path": str(args.telemetry),
+        "notes": args.notes,
+        # Profile-centre structural knobs
+        "band_base": centre.band_base,
+        "mm_size_eta": centre.mm_size_eta,
+        "vol_ref": centre.vol_ref,
+        "daily_loss_limit": centre.daily_loss_limit,
+        "init_q_tao": centre.init_q_tao,
+        "vol_scale": centre.vol_scale,
+        # Run-level metrics
+        **metrics,
+    }
+
+    # Ensure output directory exists
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Append JSON line
+    with args.out.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+    # Pretty-print summary
+    print("=== Research run summary ===")
+    print(f"Label:         {args.label}")
+    print(f"Profile:       {args.profile}")
+    print(f"Telemetry:     {args.telemetry}")
+    print(f"Saved to:      {args.out}")
+    print()
+    print(f"Ticks:         {metrics['num_ticks']}")
+    print(f"Final PnL:     {metrics['final_pnl']:.2f} USD")
+    print(f"Max PnL:       {metrics['max_pnl']:.2f} USD")
+    print(f"Max drawdown:  {metrics['max_drawdown']:.2f} USD")
+    print()
+    print(
+        "Risk regime:   "
+        f"Normal={metrics['frac_normal']:.3f}, "
+        f"Warning={metrics['frac_warning']:.3f}, "
+        f"HardLimit={metrics['frac_hard']:.3f}",
     )
-    ax.set_xlabel("hedge_band_base (TAO)")
-    ax.set_ylabel("final PnL (USD)")
-    ax.set_title("Experiment 01: hedge_band_base sweep")
-    fig.tight_layout()
-
-    png_path = ROOT / "exp01_band_sweep_pnl.png"
-    fig.savefig(png_path)
-    print(f"Saved PnL vs band plot to {png_path}")
+    print(f"Kill switch:   {metrics['kill_switch']}")
 
 
 if __name__ == "__main__":

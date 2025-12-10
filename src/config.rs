@@ -439,16 +439,28 @@ impl Config {
 
         match profile {
             RiskProfile::Balanced => {
-                // Already matches world-model "balanced" centre
-                // (band_base = 5.625, eta = 0.10, vol_ref = 0.028125, loss = 5000).
-            }
-            RiskProfile::Aggressive => {
-                // Same world-model centre, but tighter daily loss limit.
-                cfg.risk.daily_loss_limit = 2_000.0;
+                // World-model tuned "balanced" centre (exp08).
+                cfg.initial_q_tao         = 0.0;
+                cfg.hedge.hedge_band_base = 5.625;
+                cfg.mm.size_eta           = 0.10;
+                cfg.volatility.vol_ref    = 0.028_125;
+                cfg.risk.daily_loss_limit = 5_000.0;
             }
             RiskProfile::Conservative => {
-                // Same centre, but very tight daily loss limit.
+                // World-model tuned "conservative" centre.
+                cfg.initial_q_tao         = 0.0;
+                cfg.hedge.hedge_band_base = 5.625;
+                cfg.mm.size_eta           = 0.10;
+                cfg.volatility.vol_ref    = 0.028_125;
                 cfg.risk.daily_loss_limit = 750.0;
+            }
+            RiskProfile::Aggressive => {
+                // World-model tuned "aggressive" centre.
+                cfg.initial_q_tao         = 0.0;
+                cfg.hedge.hedge_band_base = 5.625;
+                cfg.mm.size_eta           = 0.10;
+                cfg.volatility.vol_ref    = 0.028_125;
+                cfg.risk.daily_loss_limit = 2_000.0;
             }
         }
 
