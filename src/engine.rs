@@ -15,13 +15,13 @@ use crate::state::{GlobalState, RiskRegime};
 use crate::toxicity::update_toxicity_and_health;
 use crate::types::VenueStatus;
 
-pub struct Engine {
-    cfg: Config,
+pub struct Engine<'a> {
+    cfg: &'a Config,
 }
 
-impl Engine {
-    pub fn new(cfg: &Config) -> Self {
-        Self { cfg: cfg.clone() }
+impl<'a> Engine<'a> {
+    pub fn new(cfg: &'a Config) -> Self {
+        Self { cfg }
     }
 
     /// Seed synthetic mids / spreads / depth for all venues and update

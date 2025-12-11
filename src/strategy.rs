@@ -3,12 +3,12 @@
 // High-level strategy runner around the Paraphina core engine.
 // This wires together:
 //
-//   - Engine (fair value, vols, risk, inventory),
-//   - MM quote engine,
-//   - Hedge engine,
-//   - Execution gateway (real or synthetic),
-//   - Telemetry sink (JSONL / noop via env),
-//   - Logging sink (EventSink for human-readable logs).
+// - Engine (fair value, vols, risk, inventory),
+// - MM quote engine,
+// - Hedge engine,
+// - Execution gateway (real or synthetic),
+// - Telemetry sink (JSONL / noop via env),
+// - Logging sink (EventSink for human-readable logs).
 //
 // `main.rs` simply constructs a `StrategyRunner` and calls
 // `run_simulation(num_ticks)`.
@@ -21,8 +21,8 @@ use crate::logging::EventSink;
 use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
 use crate::state::GlobalState;
 use crate::telemetry::TelemetrySink;
-use crate::toxicity::update_toxicity_and_health;
 use crate::types::{OrderIntent, Side, TimestampMs};
+
 use serde_json::json;
 
 /// High-level strategy runner.
@@ -34,14 +34,15 @@ where
     S: EventSink,
 {
     pub cfg: &'a Config,
-    pub engine: Engine,
+    pub engine: Engine<'a>,
     pub state: GlobalState,
     pub gateway: G,
     pub sink: S,
+
     /// JSONL telemetry sink, controlled entirely via environment:
     ///
     ///   PARAPHINA_TELEMETRY_MODE = "off" | "jsonl"
-    ///   PARAPHINA_TELEMETRY_PATH = /path/to/file.jsonl  (when mode = jsonl)
+    ///   PARAPHINA_TELEMETRY_PATH = /path/to/file.jsonl (when mode = jsonl)
     ///
     /// When mode = off or misconfigured, all calls are no-ops.
     pub telemetry: TelemetrySink,
@@ -85,11 +86,11 @@ where
             println!("\n================ Tick {} =================", tick);
 
             // 1) Seed synthetic mids / books and run the core engine tick.
-            self.engine.seed_dummy_mids(&mut self.state, now_ms);
-            self.engine.main_tick(&mut self.state, now_ms);
+            self.engine
+                .seed_dummy_mids(&mut self.state, now_ms);
+            self.engine
+                .main_tick(&mut self.state, now_ms);
 
-            // 2) Update toxicity / venue health.
-            update_toxicity_and_health(&mut self.state, self.cfg);
 
             // 3) Print global snapshot.
             self.print_state_snapshot();
@@ -99,7 +100,10 @@ where
 
             println!("\nPer-venue quotes:");
             for q in &mm_quotes {
-                println!("  {:<10}: bid={:?}, ask={:?}", q.venue_id, q.bid, q.ask);
+                println!(
+                    " {:<10}: bid={:?}, ask={:?}",
+                    q.venue_id, q.bid, q.ask
+                );
             }
 
             let hedge_plan = compute_hedge_plan(self.cfg, &self.state);
@@ -115,9 +119,12 @@ where
             }
 
             // 5) Convert to abstract order intents.
-            let mut all_intents: Vec<OrderIntent> = mm_quotes_to_order_intents(&mm_quotes);
+            let mut all_intents: Vec<OrderIntent> =
+                mm_quotes_to_order_intents(&mm_quotes);
+
             if let Some(plan) = hedge_plan {
-                let mut hedge_intents = hedge_plan_to_order_intents(&plan);
+                let mut hedge_intents =
+                    hedge_plan_to_order_intents(&plan);
                 all_intents.append(&mut hedge_intents);
             }
 
@@ -127,8 +134,7 @@ where
             println!("\nOrder intents (abstract):");
             for it in &all_intents {
                 println!(
-                    "\
-  {:<10} {:?} {:>6.4} @ {:>8.4} ({:?})",
+                    " {:<10} {:?} {:>6.4} @ {:>8.4} ({:?})",
                     it.venue_id, it.side, it.size, it.price, it.purpose
                 );
             }
@@ -148,8 +154,9 @@ where
             // 8) Emit per-tick JSONL telemetry snapshot.
             //
             // This is what exp05_telemetry_validation.py + ts_metrics.py read.
+            //
             // Keys:
-            //   - t            : tick index
+            //   - t           : tick index
             //   - pnl_total   : cumulative total PnL
             //   - risk_regime : "Normal" | "Warning" | "HardLimit"
             //   - kill_switch : bool
@@ -190,9 +197,9 @@ where
     /// Inject an initial synthetic position on venue 0.
     ///
     /// Sign convention for `cfg.initial_q_tao`:
-    /// - `initial_q_tao > 0`  → start **long** `initial_q_tao` TAO
-    /// - `initial_q_tao < 0`  → start **short** `|initial_q_tao|` TAO
-    /// - `|initial_q_tao| ≈ 0` → start approximately **flat**
+    ///   - `initial_q_tao > 0` → start **long**  `initial_q_tao` TAO
+    ///   - `initial_q_tao < 0` → start **short** `|initial_q_tao|` TAO
+    ///   - `|initial_q_tao| ≈ 0` → start approximately **flat**
     fn inject_initial_position(&mut self) {
         if self.cfg.venues.is_empty() {
             return;
@@ -210,21 +217,31 @@ where
         let size_tao = q0.abs();
         let side = if q0 > 0.0 { Side::Buy } else { Side::Sell };
 
-        let s_t = self.state.fair_value.unwrap_or(self.state.fair_value_prev);
+        let s_t = self
+            .state
+            .fair_value
+            .unwrap_or(self.state.fair_value_prev);
         let entry_price = if s_t > 0.0 { s_t } else { 250.0 };
 
         println!(
             "Injecting synthetic initial position: venue={} side={:?} size={} @ {:.4}",
-            self.cfg.venues[venue_index].id, side, size_tao, entry_price
+            self.cfg.venues[venue_index].id,
+            side,
+            size_tao,
+            entry_price,
         );
 
         self.state
             .apply_perp_fill(venue_index, side, size_tao, entry_price, 0.0);
+
         self.state.recompute_after_fills(self.cfg);
     }
 
     fn print_state_snapshot(&self) {
-        let s_t = self.state.fair_value.unwrap_or(self.state.fair_value_prev);
+        let s_t = self
+            .state
+            .fair_value
+            .unwrap_or(self.state.fair_value_prev);
 
         println!("Fair value S_t: {:.4}", s_t);
         println!("Sigma_eff: {:.6}", self.state.sigma_eff);
@@ -239,36 +256,49 @@ where
         println!("Delta limit (USD): {:.4}", self.state.delta_limit_usd);
         println!(
             "Basis warn / hard (USD): {:.4} / {:.4}",
-            self.state.basis_limit_warn_usd, self.state.basis_limit_hard_usd
+            self.state.basis_limit_warn_usd,
+            self.state.basis_limit_hard_usd,
         );
         println!("Daily PnL (realised): {:.4}", self.state.daily_realised_pnl);
         println!(
             "Daily PnL (unrealised): {:.4}",
             self.state.daily_unrealised_pnl
         );
-        println!("Daily PnL total: {:.4}", self.state.daily_pnl_total);
+        println!(
+            "Daily PnL total: {:.4}",
+            self.state.daily_pnl_total
+        );
         println!("Risk regime after tick: {:?}", self.state.risk_regime);
         println!("Kill switch: {}", self.state.kill_switch);
 
         println!("\nPer-venue toxicity & status:");
         for v in &self.state.venues {
             println!(
-                "  {:<10}: toxicity={:.3}, status={:?}",
+                " {:<10}: toxicity={:.3}, status={:?}",
                 v.id, v.toxicity, v.status
             );
         }
     }
 
     fn print_inventory_and_pnl(&self) {
-        println!("  Global q_t (TAO): {:.4}", self.state.q_global_tao);
-        println!("  Dollar delta (USD): {:.4}", self.state.dollar_delta_usd);
-        println!("  Basis exposure (USD): {:.4}", self.state.basis_usd);
         println!(
-            "  Daily PnL (realised / unrealised / total): {:.4} / {:.4} / {:.4}",
+            " Global q_t (TAO): {:.4}",
+            self.state.q_global_tao
+        );
+        println!(
+            " Dollar delta (USD): {:.4}",
+            self.state.dollar_delta_usd
+        );
+        println!(
+            " Basis exposure (USD): {:.4}",
+            self.state.basis_usd
+        );
+        println!(
+            " Daily PnL (realised / unrealised / total): {:.4} / {:.4} / {:.4}",
             self.state.daily_realised_pnl,
             self.state.daily_unrealised_pnl,
             self.state.daily_pnl_total
         );
-        println!("  Risk regime: {:?}", self.state.risk_regime);
+        println!(" Risk regime: {:?}", self.state.risk_regime);
     }
 }
