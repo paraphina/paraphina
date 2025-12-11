@@ -22,10 +22,12 @@
 //! ------------------
 //! In your main / engine loop, once per tick:
 //!
-//!     use crate::telemetry::TelemetrySink;
-//!     use serde_json::json;
+//! ```ignore
+//! use crate::telemetry::TelemetrySink;
+//! use serde_json::json;
 //!
-//!     let mut telemetry = TelemetrySink::from_env()?;
+//! fn main_loop() -> anyhow::Result<()> {
+//!     let mut telemetry = TelemetrySink::from_env();
 //!
 //!     // inside tick loop:
 //!     telemetry.log_json(&json!({
@@ -39,7 +41,11 @@
 //!         "pnl_total": global_state.pnl_total(),
 //!         "risk_regime": format!("{:?}", global_state.risk_regime),
 //!         "kill_switch": global_state.kill_switch,
-//!     })?);
+//!     }));
+//!
+//!     Ok(())
+//! }
+//! ```
 //!
 //! You decide exactly what fields to log; this module just handles
 //! opening the file and appending JSON lines.

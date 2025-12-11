@@ -309,7 +309,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Vol-scaled risk limits + discrete risk regime + kill switch.
-    fn update_risk_limits_and_regime(&self, state: &mut GlobalState) {
+    pub fn update_risk_limits_and_regime(&self, state: &mut GlobalState) {
         let risk_cfg = &self.cfg.risk;
 
         // ---- 1) Vol-scaled delta limit + static basis limits ---------------
