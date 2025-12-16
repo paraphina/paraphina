@@ -1,5 +1,5 @@
 # Rust / Cargo build artefacts
-/target
+/target/
 
 # Python virtual environment
 .venv/
@@ -13,7 +13,13 @@ research_run_*.jsonl
 research_run_*_curve.png
 
 # Batch-run helper outputs
-batch_runs/
+# Keep batch_runs for generated artifacts, but TRACK Python code under batch_runs/.
+# (Git requires parent directories to be unignored for file exceptions to work.)
+batch_runs/**
+!batch_runs/
+!batch_runs/**/
+!batch_runs/**/*.py
+!batch_runs/**/*.md
 
 # Paraphina research artefacts
 # (all .jsonl here are tick logs / experiment logs, not configs)
@@ -40,4 +46,4 @@ baseline_q0_band5*.jsonl
 
 # Python caches
 __pycache__/
-*.pyc
+*.py[cod]
