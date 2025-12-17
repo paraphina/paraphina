@@ -25,17 +25,42 @@ fn make_harness(profile: RiskProfile) -> Harness {
     Harness { cfg, engine, state }
 }
 
+/// Helper: seed deterministic books then run a tick so FV/vol/limits are initialised.
+fn init_tick(h: &mut Harness, now_ms: i64) {
+    h.engine.seed_dummy_mids(&mut h.state, now_ms);
+    h.engine.main_tick(&mut h.state, now_ms);
+}
+
 #[test]
 fn regime_stays_normal_with_small_exposures() {
-    // Use conservative profile – tightest limits.
     let mut h = make_harness(RiskProfile::Conservative);
 
-    // Run one tick to initialise vol + risk limits.
-    h.engine.main_tick(&mut h.state, 0);
+    init_tick(&mut h, 0);
 
-    // With zero delta / basis / PnL, we should be firmly in Normal regime
-    // and the kill switch should be off.
+    // With ~0 delta / basis / PnL, we should be Normal and not killed.
     assert_eq!(h.state.risk_regime, RiskRegime::Normal);
+    assert!(!h.state.kill_switch);
+}
+
+#[test]
+fn warning_when_delta_above_warn_but_below_hard() {
+    let mut h = make_harness(RiskProfile::Conservative);
+
+    init_tick(&mut h, 0);
+
+    // Place delta between warn and hard thresholds.
+    let delta_warn = h.cfg.risk.delta_warn_frac * h.state.delta_limit_usd;
+    let delta_hard = h.state.delta_limit_usd;
+    let delta_mid = 0.5 * (delta_warn + delta_hard);
+
+    h.state.daily_realised_pnl = 0.0;
+    h.state.daily_unrealised_pnl = 0.0;
+    h.state.basis_usd = 0.0;
+    h.state.dollar_delta_usd = delta_mid;
+
+    h.engine.update_risk_limits_and_regime(&mut h.state);
+
+    assert_eq!(h.state.risk_regime, RiskRegime::Warning);
     assert!(!h.state.kill_switch);
 }
 
@@ -43,39 +68,55 @@ fn regime_stays_normal_with_small_exposures() {
 fn hardlimit_and_kill_switch_when_loss_limit_breached() {
     let mut h = make_harness(RiskProfile::Conservative);
 
-    // First tick to make sure limits are initialised.
-    h.engine.main_tick(&mut h.state, 0);
+    init_tick(&mut h, 0);
 
-    // Config stores a *positive* daily_loss_limit in USD.
-    // Risk engine interprets this as a negative PnL threshold.
     let loss_limit = -h.cfg.risk.daily_loss_limit.abs();
 
-    // Drive PnL slightly past the hard loss limit with clean delta/basis.
+    // Breach daily loss hard limit, keep delta/basis clean.
     h.state.daily_realised_pnl = loss_limit - 1.0;
     h.state.daily_unrealised_pnl = 0.0;
     h.state.dollar_delta_usd = 0.0;
     h.state.basis_usd = 0.0;
 
-    // Second tick so the risk-regime logic runs on this PnL snapshot.
-    h.engine.main_tick(&mut h.state, 1);
+    h.engine.update_risk_limits_and_regime(&mut h.state);
 
-    // Once the hard loss limit is breached, we expect:
-    // - regime = HardLimit
-    // - kill_switch = true
     assert_eq!(h.state.risk_regime, RiskRegime::HardLimit);
     assert!(h.state.kill_switch);
 }
 
 #[test]
-fn hardlimit_disables_mm_quotes_even_if_kill_switch_is_false() {
-    // Conservative profile – tightest limits.
+fn kill_switch_latches_once_true() {
     let mut h = make_harness(RiskProfile::Conservative);
 
-    // First tick to initialise fair value + delta limits.
-    h.engine.main_tick(&mut h.state, 0);
+    init_tick(&mut h, 0);
+
+    let loss_limit = -h.cfg.risk.daily_loss_limit.abs();
+
+    // Trip kill.
+    h.state.daily_realised_pnl = loss_limit - 1.0;
+    h.state.daily_unrealised_pnl = 0.0;
+    h.engine.update_risk_limits_and_regime(&mut h.state);
+
+    assert!(h.state.kill_switch);
+    assert_eq!(h.state.risk_regime, RiskRegime::HardLimit);
+
+    // Now "recover" PnL; killzn = safe again.
+    h.state.daily_realised_pnl = 0.0;
+    h.state.daily_unrealised_pnl = 0.0;
+    h.engine.update_risk_limits_and_regime(&mut h.state);
+
+    // Kill stays latched until manual reset.
+    assert!(h.state.kill_switch);
+    assert_eq!(h.state.risk_regime, RiskRegime::HardLimit);
+}
+
+#[test]
+fn hardlimit_disables_mm_quotes_even_if_kill_switch_is_false() {
+    let mut h = make_harness(RiskProfile::Conservative);
+
+    init_tick(&mut h, 0);
 
     // Force a delta hard-limit breach WITHOUT breaching the loss limit.
-    // We do this by setting dollar_delta_usd above the computed delta_limit_usd.
     h.state.daily_realised_pnl = 0.0;
     h.state.daily_unrealised_pnl = 0.0;
     h.state.basis_usd = 0.0;
@@ -86,11 +127,11 @@ fn hardlimit_disables_mm_quotes_even_if_kill_switch_is_false() {
     // Re-run the risk logic.
     h.engine.update_risk_limits_and_regime(&mut h.state);
 
-    // We should be in HardLimit, but kill switch should still be false (no loss breach).
+    // HardLimit, but kill switch should still be false (no loss breach).
     assert_eq!(h.state.risk_regime, RiskRegime::HardLimit);
     assert!(!h.state.kill_switch);
 
-    // MM should produce no quotes in HardLimit.
+    // MM should produce no quotes in HardLimit (even if kill is false).
     let quotes = paraphina::mm::compute_mm_quotes(h.cfg, &h.state);
     assert_eq!(quotes.len(), h.cfg.venues.len());
     for q in quotes {
