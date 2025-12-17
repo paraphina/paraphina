@@ -12,7 +12,7 @@
 //  - updates risk limits + risk regime + latching kill switch.
 
 use crate::config::Config;
-use crate::state::{GlobalState, RiskRegime};
+use crate::state::{GlobalState, KillReason, RiskRegime};
 use crate::toxicity::update_toxicity_and_health;
 use crate::types::VenueStatus;
 
@@ -390,6 +390,12 @@ impl<'a> Engine<'a> {
     // ---------------------------------------------------------------------
 
     /// Vol-scaled risk limits + discrete risk regime + *latched* kill switch.
+    ///
+    /// Milestone C implementation:
+    /// - Centralizes all risk regime determination in one place.
+    /// - Critical/HardLimit regime implies kill_switch = true (latching).
+    /// - Kill switch triggers on ANY hard breach: PnL, delta, basis, or liquidation distance.
+    /// - Once kill_switch is true, it stays true until manual reset.
     pub fn update_risk_limits_and_regime(&self, state: &mut GlobalState) {
         let risk_cfg = &self.cfg.risk;
 
@@ -403,7 +409,15 @@ impl<'a> Engine<'a> {
         // ---- 2) Aggregate daily PnL fields --------------------------------
         state.daily_pnl_total = state.daily_realised_pnl + state.daily_unrealised_pnl;
 
-        // ---- 3) Choose risk regime based on delta / basis / PnL ------------
+        // ---- 3) Compute minimum liquidation distance across all venues -----
+        let mut min_liq_dist_sigma = f64::INFINITY;
+        for v in &state.venues {
+            if v.dist_liq_sigma.is_finite() && v.dist_liq_sigma >= 0.0 {
+                min_liq_dist_sigma = min_liq_dist_sigma.min(v.dist_liq_sigma);
+            }
+        }
+
+        // ---- 4) Determine hard breach conditions ---------------------------
         let delta_abs = state.dollar_delta_usd.abs();
         let basis_abs = state.basis_usd.abs();
         let pnl = state.daily_pnl_total;
@@ -415,32 +429,58 @@ impl<'a> Engine<'a> {
         // - Config stores a *positive* USD number (e.g. 2000.0).
         // - Losses are negative PnL, so the actual hard limit is -daily_loss_limit.
         let loss_limit = -risk_cfg.daily_loss_limit.abs();
-        let pnl_warn = loss_limit * risk_cfg.pnl_warn_frac; // e.g. -2000 * 0.8 = -1600
+        let pnl_warn = loss_limit * risk_cfg.pnl_warn_frac; // e.g. -2000 * 0.5 = -1000
 
+        // Hard breach conditions (any triggers HardLimit/Critical regime)
+        let pnl_hard_breach = pnl <= loss_limit;
+        let delta_hard_breach = delta_abs >= state.delta_limit_usd;
+        let basis_hard_breach = basis_abs >= state.basis_limit_hard_usd;
+        let liq_hard_breach =
+            min_liq_dist_sigma.is_finite() && min_liq_dist_sigma <= risk_cfg.liq_crit_sigma;
+
+        // ---- 5) Choose risk regime based on breach conditions --------------
         let mut regime = RiskRegime::Normal;
 
-        // Hard-limit regime if *any* hard constraint is breached.
-        if delta_abs >= state.delta_limit_usd
-            || basis_abs >= state.basis_limit_hard_usd
-            || pnl <= loss_limit
-        {
+        // Hard-limit (Critical) regime if *any* hard constraint is breached.
+        if pnl_hard_breach || delta_hard_breach || basis_hard_breach || liq_hard_breach {
             regime = RiskRegime::HardLimit;
         }
         // Warning regime if *any* warning threshold breached.
-        else if delta_abs >= delta_warn || basis_abs >= basis_warn || pnl <= pnl_warn {
+        else if delta_abs >= delta_warn
+            || basis_abs >= basis_warn
+            || pnl <= pnl_warn
+            || (min_liq_dist_sigma.is_finite() && min_liq_dist_sigma <= risk_cfg.liq_warn_sigma)
+        {
             regime = RiskRegime::Warning;
         }
 
-        // ---- 4) Kill switch trigger + latch -------------------------------
+        // ---- 6) Kill switch trigger + latch -------------------------------
         //
-        // In this codebase: kill switch is reserved for the "we are done trading"
-        // condition (hard daily loss breach). This is intentionally latched.
-        let trigger_kill = pnl <= loss_limit;
+        // Milestone C: kill switch triggers on ANY hard breach, not just PnL.
+        // This is the canonical "Critical implies kill_switch" behavior.
+        //
+        // Once triggered, kill_switch is LATCHED (stays true until manual reset).
+        // We also preserve the first reason for kill activation.
 
-        // Latch: once true, never auto-clears.
-        state.kill_switch = state.kill_switch || trigger_kill;
+        // Determine new kill trigger and reason (only if not already killed)
+        if !state.kill_switch {
+            // Check in priority order: PnL > Delta > Basis > Liquidation
+            if pnl_hard_breach {
+                state.kill_switch = true;
+                state.kill_reason = KillReason::PnlHardBreach;
+            } else if delta_hard_breach {
+                state.kill_switch = true;
+                state.kill_reason = KillReason::DeltaHardBreach;
+            } else if basis_hard_breach {
+                state.kill_switch = true;
+                state.kill_reason = KillReason::BasisHardBreach;
+            } else if liq_hard_breach {
+                state.kill_switch = true;
+                state.kill_reason = KillReason::LiquidationDistanceBreach;
+            }
+        }
 
-        // If kill is latched, force HardLimit regime for clarity.
+        // If kill is latched, force HardLimit regime for clarity/telemetry.
         state.risk_regime = if state.kill_switch {
             RiskRegime::HardLimit
         } else {

@@ -188,6 +188,7 @@ where
             }
 
             // Telemetry snapshot (must keep schema stable for research tooling)
+            // Required fields: t, pnl_total, risk_regime, kill_switch (per research contract)
             self.telemetry.log_json(&json!({
                 "t": tick,
                 "pnl_realised": self.state.daily_realised_pnl,
@@ -195,6 +196,7 @@ where
                 "pnl_total": self.state.daily_pnl_total,
                 "risk_regime": format!("{:?}", self.state.risk_regime),
                 "kill_switch": self.state.kill_switch,
+                "kill_reason": format!("{:?}", self.state.kill_reason),
                 "q_global_tao": self.state.q_global_tao,
                 "dollar_delta_usd": self.state.dollar_delta_usd,
                 "basis_usd": self.state.basis_usd,
@@ -219,14 +221,58 @@ where
 
             if self.state.kill_switch {
                 println!(
-                    "Kill switch active at tick {} - stopping simulation early.",
-                    tick
+                    "Kill switch active at tick {} - stopping simulation early (reason: {:?}).",
+                    tick, self.state.kill_reason
                 );
                 break;
             }
         }
 
+        // End-of-run summary (format required by batch_runs/metrics.py parse_daily_summary)
+        self.print_daily_summary();
+
         self.telemetry.flush();
+    }
+
+    /// Print end-of-run summary in the format expected by batch_runs/metrics.py.
+    ///
+    /// This is the research contract - do not change the format without versioning.
+    fn print_daily_summary(&self) {
+        let r = self.state.daily_realised_pnl;
+        let u = self.state.daily_unrealised_pnl;
+        let t = self.state.daily_pnl_total;
+
+        // Format with sign prefix for clarity
+        let r_str = if r >= 0.0 {
+            format!("+{:.2}", r)
+        } else {
+            format!("{:.2}", r)
+        };
+        let u_str = if u >= 0.0 {
+            format!("+{:.2}", u)
+        } else {
+            format!("{:.2}", u)
+        };
+        let t_str = if t >= 0.0 {
+            format!("+{:.2}", t)
+        } else {
+            format!("{:.2}", t)
+        };
+
+        println!();
+        println!("=== Daily Summary ===");
+        println!(
+            "Daily PnL (realised / unrealised / total): {} / {} / {}",
+            r_str, u_str, t_str
+        );
+        println!(
+            "Kill switch: {}",
+            if self.state.kill_switch { "true" } else { "false" }
+        );
+        if self.state.kill_switch {
+            println!("Kill reason: {:?}", self.state.kill_reason);
+        }
+        println!("Risk regime: {:?}", self.state.risk_regime);
     }
 
     fn inject_initial_position(&mut self) {
