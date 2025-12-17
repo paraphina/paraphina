@@ -10,6 +10,7 @@ pub mod exit;
 pub mod gateway;
 pub mod hedge;
 pub mod logging;
+pub mod metrics;
 pub mod mm;
 pub mod state;
 pub mod strategy;
