@@ -47,3 +47,13 @@ baseline_q0_band5*.jsonl
 # Python caches
 __pycache__/
 *.py[cod]
+
+paraphina_bundle.txt
+paraphina_context.tar.gz
+paraphina_context.tar.gz.part_*
+
+
+# Local context bundles
+paraphina_bundle.txt
+paraphina_context.tar.gz
+paraphina_context.tar.gz.part_*
