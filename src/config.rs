@@ -33,6 +33,8 @@ pub struct Config {
     pub mm: MmConfig,
     /// Hedge engine (global LQ controller + band).
     pub hedge: HedgeConfig,
+    /// Exit engine (cross-venue profit-only exits).
+    pub exit: ExitConfig,
     /// Toxicity scoring + venue health config.
     pub toxicity: ToxicityConfig,
 }
@@ -192,6 +194,51 @@ pub struct HedgeConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExitConfig {
+    /// Master enable for the exit engine.
+    pub enabled: bool,
+
+    /// Max total TAO we are allowed to exit per tick.
+    pub max_total_tao_per_tick: f64,
+
+    /// Max TAO per single venue per tick.
+    pub max_venue_tao_per_tick: f64,
+
+    /// Do nothing if |q_global| is smaller than this.
+    pub min_global_abs_tao: f64,
+
+    /// Do not emit intents smaller than this (dust guard).
+    pub min_intent_size_tao: f64,
+
+    /// Minimum profit-only edge per TAO in USD (after fees & buffers).
+    pub edge_min_usd: f64,
+
+    /// Volatility buffer term (USD/TAO) scaled by vol_ratio_clipped.
+    pub edge_vol_mult: f64,
+
+    /// Scoring weight on basis term (USD/TAO).
+    pub basis_weight: f64,
+
+    /// Scoring weight on funding benefit term (USD/TAO).
+    pub funding_weight: f64,
+
+    /// Funding horizon (seconds) used for approximating funding benefit.
+    pub funding_horizon_sec: f64,
+
+    /// Fragmentation penalty proxy (USD/TAO) applied when an exit opens/increases a new leg.
+    pub fragmentation_penalty_per_tao: f64,
+
+    /// Fraction of depth_near_mid we allow consuming for exits.
+    pub depth_fraction: f64,
+
+    /// Slippage model multiplier against (notional/depth)*spread.
+    pub slippage_spread_mult: f64,
+
+    /// Minimum depth_near_mid (USD) required to consider a venue for exits.
+    pub min_depth_usd: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ToxicityConfig {
     /// Scale for converting local vol ratio to toxicity feature.
     ///
@@ -205,6 +252,23 @@ pub struct ToxicityConfig {
     pub tox_med_threshold: f64,
     /// Toxicity threshold above which the venue is Disabled.
     pub tox_high_threshold: f64,
+
+    // ----- Markout-based toxicity (v2) -----
+    /// Time horizon (ms) after fill when we evaluate the markout.
+    /// E.g. 5000 means we check fair/mid 5 seconds after each fill.
+    pub markout_horizon_ms: i64,
+
+    /// EWMA alpha for blending instantaneous markout toxicity into the running score.
+    /// tox_new = (1 - alpha) * tox_old + alpha * tox_instant
+    pub markout_alpha: f64,
+
+    /// Scale for converting adverse markout (USD/TAO) to instantaneous toxicity [0,1].
+    /// tox_instant = clamp((-markout) / markout_scale_usd_per_tao, 0, 1)
+    pub markout_scale_usd_per_tao: f64,
+
+    /// Maximum number of pending markout evaluations per venue.
+    /// Older entries are dropped when this limit is exceeded.
+    pub max_pending_per_venue: usize,
 }
 
 impl Default for Config {
@@ -398,6 +462,24 @@ impl Default for Config {
             beta_hedge: 1.0,
         };
 
+        // ----- Exit engine (cross-venue profit-only exits) -----
+        let exit = ExitConfig {
+            enabled: true,
+            max_total_tao_per_tick: 10.0,
+            max_venue_tao_per_tick: 6.0,
+            min_global_abs_tao: 0.25,
+            min_intent_size_tao: 0.01,
+            edge_min_usd: 0.25,
+            edge_vol_mult: 0.10,
+            basis_weight: 0.20,
+            funding_weight: 0.20,
+            funding_horizon_sec: 30.0,
+            fragmentation_penalty_per_tao: 0.05,
+            depth_fraction: 0.10,
+            slippage_spread_mult: 1.00,
+            min_depth_usd: 500.0,
+        };
+
         // ----- Toxicity / venue health -----
         //
         // f1 = clip((local_vol / sigma_eff - 1) / vol_tox_scale, 0, 1)
@@ -405,10 +487,22 @@ impl Default for Config {
         // With these defaults we need a venue to run roughly 25–30% hotter
         // than the global volatility before entering Warning, and ~45–50%
         // hotter before being Disabled.
+        //
+        // Markout-based toxicity (v2):
+        // - After each fill, we schedule an evaluation at t + markout_horizon_ms.
+        // - At evaluation time, markout = (mid_now - fill_price) for buys,
+        //   or (fill_price - mid_now) for sells.
+        // - Adverse markout (negative) increases toxicity via EWMA.
         let toxicity = ToxicityConfig {
             vol_tox_scale: 0.5,
             tox_med_threshold: 0.6, // Warning only when volatility is clearly elevated
             tox_high_threshold: 0.9, // Disabled only when it is much higher still
+
+            // Markout-based toxicity v2 defaults
+            markout_horizon_ms: 5_000,      // evaluate 5s after fill
+            markout_alpha: 0.1,             // EWMA blend factor
+            markout_scale_usd_per_tao: 2.0, // $2 adverse markout → tox_instant = 1.0
+            max_pending_per_venue: 100,     // bounded queue size
         };
 
         Config {
@@ -421,6 +515,7 @@ impl Default for Config {
             risk,
             mm,
             hedge,
+            exit,
             toxicity,
         }
     }

@@ -1,31 +1,43 @@
 // src/toxicity.rs
 //
-// Per-venue volatility-based toxicity scoring.
+// Per-venue markout-based toxicity scoring (v2 - whitepaper advancement).
 //
-// We currently use a single feature:
+// Toxicity is now driven by realized markouts from fills:
 //
-//   f_vol = clip((local_vol_short / sigma_eff - 1) / vol_tox_scale, 0, 1)
+// 1. When a fill occurs, we record a pending markout evaluation scheduled
+//    at t_fill + markout_horizon_ms.
 //
-// and write the final score into `venue.toxicity ∈ [0, 1]`.
+// 2. At evaluation time, we compute:
+//    - Buy:  markout = mid_now - fill_price
+//    - Sell: markout = fill_price - mid_now
 //
-// Other parts of the engine can interpret this as:
+// 3. Convert markout to instantaneous toxicity:
+//    - if markout >= 0 => tox_instant = 0 (favorable fill)
+//    - else tox_instant = clamp((-markout) / markout_scale_usd_per_tao, 0, 1)
 //
-//   - tox <  tox_med_threshold   → effectively "Healthy"
-//   - tox ∈ [tox_med, tox_high)  → "Warning"
-//   - tox ≥  tox_high_threshold  → "Disabled"
+// 4. Update EWMA toxicity:
+//    tox = (1 - alpha) * tox + alpha * tox_instant
 //
-// We *don't* store a separate health enum/flag here to keep it compatible
-// with the existing VenueState struct.
+// 5. Health gating based on toxicity thresholds:
+//    - tox >= tox_high_threshold => Disabled
+//    - tox >= tox_med_threshold  => Warning
+//    - else                      => Healthy
+//
+// The legacy volatility-based toxicity feature is retained as a fallback
+// when no mid/depth data is available.
 
 use crate::config::Config;
 use crate::state::GlobalState;
+use crate::types::{Side, TimestampMs, VenueStatus};
 
-/// Update per-venue toxicity scores.
+/// Update per-venue toxicity scores and health status.
 ///
-/// Assumes:
-///   - `state.sigma_eff` has been updated by the engine,
-///   - each venue has `local_vol_short` populated.
-pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config) {
+/// This function:
+/// 1. Processes pending markouts whose evaluation time has arrived.
+/// 2. Updates toxicity EWMA based on markout results.
+/// 3. Falls back to volatility-based toxicity when no book data exists.
+/// 4. Sets venue health status based on toxicity thresholds.
+pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config, now_ms: TimestampMs) {
     let tox_cfg = &cfg.toxicity;
     let vol_cfg = &cfg.volatility;
 
@@ -33,26 +45,289 @@ pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config) {
     let sigma_eff: f64 = state.sigma_eff.max(vol_cfg.sigma_min);
 
     for venue in &mut state.venues {
-        // Base toxicity: if we have no mid or no depth, treat as highly toxic.
-        let mut tox: f64 = if venue.mid.is_some() && venue.depth_near_mid > 0.0_f64 {
-            0.0_f64
-        } else {
-            1.0_f64
-        };
+        // --- 1) Process pending markouts that have reached evaluation time ---
+        let mut markouts_to_process: Vec<(f64, f64)> = Vec::new(); // (markout_usd_per_tao, size)
 
-        // Volatility-based feature.
-        if sigma_eff > 0.0_f64 && tox_cfg.vol_tox_scale > 0.0_f64 {
+        // Drain all markouts where t_eval_ms <= now_ms
+        while let Some(front) = venue.pending_markouts.front() {
+            if front.t_eval_ms > now_ms {
+                break; // Not yet ready
+            }
+
+            let pm = venue.pending_markouts.pop_front().unwrap();
+
+            // Get current mid for markout calculation
+            let mid_now = match venue.mid {
+                Some(m) if m.is_finite() && m > 0.0 => m,
+                _ => continue, // Skip if no valid mid
+            };
+
+            // Compute markout in USD/TAO
+            // Buy: we want price to go UP after buying, so markout = mid_now - fill_price
+            // Sell: we want price to go DOWN after selling, so markout = fill_price - mid_now
+            let markout = match pm.side {
+                Side::Buy => mid_now - pm.price,
+                Side::Sell => pm.price - mid_now,
+            };
+
+            markouts_to_process.push((markout, pm.size_tao));
+        }
+
+        // --- 2) Update toxicity EWMA from markout results ---
+        for (markout, _size) in markouts_to_process {
+            // Compute instantaneous toxicity from markout:
+            // - markout >= 0: favorable fill, tox_instant = 0
+            // - markout < 0: adverse fill, tox_instant = clamp(-markout / scale, 0, 1)
+            let tox_instant: f64 = if markout >= 0.0 {
+                0.0
+            } else {
+                let scale = tox_cfg.markout_scale_usd_per_tao.max(1e-9);
+                ((-markout) / scale).clamp(0.0, 1.0)
+            };
+
+            // EWMA update: tox = (1 - alpha) * tox + alpha * tox_instant
+            let alpha = tox_cfg.markout_alpha.clamp(0.0, 1.0);
+            venue.toxicity = (1.0 - alpha) * venue.toxicity + alpha * tox_instant;
+
+            // Also update markout EWMA for telemetry
+            venue.markout_ewma_usd_per_tao =
+                (1.0 - alpha) * venue.markout_ewma_usd_per_tao + alpha * markout;
+        }
+
+        // --- 3) Fallback: if no mid or no depth, apply legacy vol-based toxicity ---
+        // This ensures venues with missing book data are still penalized.
+        if venue.mid.is_none() || venue.depth_near_mid <= 0.0 {
+            // No valid book data -> treat as highly toxic
+            venue.toxicity = 1.0;
+        } else if tox_cfg.vol_tox_scale > 0.0 && sigma_eff > 0.0 {
+            // Optionally blend in volatility-based feature for extra signal
+            // (only if local vol is significantly elevated)
             let local: f64 = venue.local_vol_short.max(vol_cfg.sigma_min);
             let ratio: f64 = local / sigma_eff;
 
-            let raw: f64 = (ratio - 1.0_f64) / tox_cfg.vol_tox_scale;
-            // Clamp to [0, 1] using the intrinsic clamp() to satisfy clippy.
-            let f_vol: f64 = raw.clamp(0.0_f64, 1.0_f64);
+            let raw: f64 = (ratio - 1.0) / tox_cfg.vol_tox_scale;
+            let f_vol: f64 = raw.clamp(0.0, 1.0);
 
-            tox = tox.max(f_vol);
+            // Take max of current toxicity and vol-based feature
+            // This provides a floor when markout data is sparse
+            venue.toxicity = venue.toxicity.max(f_vol);
         }
 
-        // Store final score in [0, 1] (again via clamp() for clippy).
-        venue.toxicity = tox.clamp(0.0_f64, 1.0_f64);
+        // --- 4) Clamp final toxicity to [0, 1] ---
+        venue.toxicity = venue.toxicity.clamp(0.0, 1.0);
+
+        // --- 5) Set venue health status based on toxicity thresholds ---
+        venue.status = if venue.toxicity >= tox_cfg.tox_high_threshold {
+            VenueStatus::Disabled
+        } else if venue.toxicity >= tox_cfg.tox_med_threshold {
+            VenueStatus::Warning
+        } else {
+            VenueStatus::Healthy
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::PendingMarkout;
+    use crate::types::Side;
+
+    fn make_test_config() -> Config {
+        let mut cfg = Config::default();
+        // Set predictable toxicity thresholds for testing
+        cfg.toxicity.tox_med_threshold = 0.5;
+        cfg.toxicity.tox_high_threshold = 0.8;
+        cfg.toxicity.markout_alpha = 0.5; // 50% blend for easier testing
+        cfg.toxicity.markout_scale_usd_per_tao = 1.0; // $1 adverse = tox=1
+        cfg.toxicity.markout_horizon_ms = 1000; // 1 second
+        cfg
+    }
+
+    #[test]
+    fn test_favorable_markout_does_not_increase_toxicity() {
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+
+        // Setup venue with valid mid
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.2; // Start with some toxicity
+
+        // Add a pending markout for a BUY at 99, now mid is 100 (favorable!)
+        venue.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 99.0, // Bought at 99
+            fair_at_fill: 99.0,
+            mid_at_fill: 99.0,
+        });
+
+        // Run toxicity update at t=1000ms (markout should evaluate)
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        // Favorable markout = mid_now - price = 100 - 99 = +1
+        // tox_instant = 0 (favorable)
+        // tox = 0.5 * 0.2 + 0.5 * 0 = 0.1
+        assert!(
+            state.venues[0].toxicity < 0.2,
+            "Favorable markout should decrease toxicity, got {}",
+            state.venues[0].toxicity
+        );
+    }
+
+    #[test]
+    fn test_adverse_markout_increases_toxicity() {
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+
+        // Setup venue with valid mid
+        let venue = &mut state.venues[0];
+        venue.mid = Some(98.0); // Price dropped!
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.0; // Start clean
+
+        // Add a pending markout for a BUY at 100, now mid is 98 (adverse!)
+        venue.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 100.0, // Bought at 100
+            fair_at_fill: 100.0,
+            mid_at_fill: 100.0,
+        });
+
+        // Run toxicity update at t=1000ms
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        // Adverse markout = mid_now - price = 98 - 100 = -2
+        // tox_instant = clamp(2 / 1, 0, 1) = 1.0
+        // tox = 0.5 * 0.0 + 0.5 * 1.0 = 0.5
+        assert!(
+            state.venues[0].toxicity >= 0.4,
+            "Adverse markout should increase toxicity, got {}",
+            state.venues[0].toxicity
+        );
+    }
+
+    #[test]
+    fn test_markout_only_applies_after_horizon() {
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+
+        // Setup venue
+        let venue = &mut state.venues[0];
+        venue.mid = Some(98.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.0;
+
+        // Add pending markout that evaluates at t=1000
+        venue.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 100.0,
+            fair_at_fill: 100.0,
+            mid_at_fill: 100.0,
+        });
+
+        // Run at t=500 (before horizon)
+        update_toxicity_and_health(&mut state, &cfg, 500);
+
+        // Toxicity should remain low (no markout processed yet)
+        assert!(
+            state.venues[0].toxicity < 0.1,
+            "Markout should not apply before horizon, got {}",
+            state.venues[0].toxicity
+        );
+
+        // Markout should still be pending
+        assert_eq!(state.venues[0].pending_markouts.len(), 1);
+
+        // Now run at t=1000 (at horizon)
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        // Now toxicity should have increased
+        assert!(
+            state.venues[0].toxicity >= 0.4,
+            "Markout should apply at horizon, got {}",
+            state.venues[0].toxicity
+        );
+
+        // Markout should be consumed
+        assert_eq!(state.venues[0].pending_markouts.len(), 0);
+    }
+
+    #[test]
+    fn test_high_toxicity_disables_venue() {
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+
+        // Setup venue
+        let venue = &mut state.venues[0];
+        venue.mid = Some(90.0); // Price crashed!
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.7; // Already elevated
+
+        // Add very adverse markout
+        venue.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 100.0,
+            fair_at_fill: 100.0,
+            mid_at_fill: 100.0,
+        });
+
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        // With alpha=0.5: tox = 0.5 * 0.7 + 0.5 * 1.0 = 0.85
+        // Should be >= tox_high_threshold (0.8) => Disabled
+        assert_eq!(state.venues[0].status, VenueStatus::Disabled);
+    }
+
+    #[test]
+    fn test_sell_adverse_markout() {
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+
+        // Setup venue
+        let venue = &mut state.venues[0];
+        venue.mid = Some(102.0); // Price went UP after we sold (adverse)
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.0;
+
+        // Add pending markout for a SELL at 100
+        venue.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Sell,
+            size_tao: 1.0,
+            price: 100.0, // Sold at 100
+            fair_at_fill: 100.0,
+            mid_at_fill: 100.0,
+        });
+
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        // Adverse markout for sell = price - mid_now = 100 - 102 = -2
+        // tox_instant = clamp(2 / 1, 0, 1) = 1.0
+        assert!(
+            state.venues[0].toxicity >= 0.4,
+            "Adverse sell markout should increase toxicity, got {}",
+            state.venues[0].toxicity
+        );
     }
 }
