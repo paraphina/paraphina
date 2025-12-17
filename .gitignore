@@ -57,3 +57,8 @@ paraphina_context.tar.gz.part_*
 paraphina_bundle.txt
 paraphina_context.tar.gz
 paraphina_context.tar.gz.part_*
+
+# Local context bundles
+paraphina_bundle.txt
+paraphina_context.tar.gz
+paraphina_context.tar.gz.part_*
