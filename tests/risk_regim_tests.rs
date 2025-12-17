@@ -246,8 +246,14 @@ fn hardlimit_from_delta_breach_triggers_kill_and_disables_mm() {
     let quotes = paraphina::mm::compute_mm_quotes(h.cfg, &h.state);
     assert_eq!(quotes.len(), h.cfg.venues.len());
     for q in quotes {
-        assert!(q.bid.is_none(), "bid should be None when kill_switch is active");
-        assert!(q.ask.is_none(), "ask should be None when kill_switch is active");
+        assert!(
+            q.bid.is_none(),
+            "bid should be None when kill_switch is active"
+        );
+        assert!(
+            q.ask.is_none(),
+            "ask should be None when kill_switch is active"
+        );
     }
 }
 
@@ -274,7 +280,10 @@ fn hedge_disabled_when_kill_switch_active() {
 
     // Hedge should produce no orders when kill switch is active
     let hedge_after = paraphina::hedge::compute_hedge_orders(h.cfg, &h.state);
-    assert!(hedge_after.is_empty(), "hedge should produce no orders when kill_switch is active");
+    assert!(
+        hedge_after.is_empty(),
+        "hedge should produce no orders when kill_switch is active"
+    );
 }
 
 #[test]
@@ -297,5 +306,8 @@ fn exit_disabled_when_kill_switch_active() {
 
     // Exit should produce no orders when kill switch is active
     let exit_intents = paraphina::exit::compute_exit_intents(h.cfg, &h.state, 1000);
-    assert!(exit_intents.is_empty(), "exit should produce no orders when kill_switch is active");
+    assert!(
+        exit_intents.is_empty(),
+        "exit should produce no orders when kill_switch is active"
+    );
 }

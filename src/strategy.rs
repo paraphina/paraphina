@@ -267,7 +267,11 @@ where
         );
         println!(
             "Kill switch: {}",
-            if self.state.kill_switch { "true" } else { "false" }
+            if self.state.kill_switch {
+                "true"
+            } else {
+                "false"
+            }
         );
         if self.state.kill_switch {
             println!("Kill reason: {:?}", self.state.kill_reason);
