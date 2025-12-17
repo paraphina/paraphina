@@ -1,0 +1,13 @@
+# Paraphina research harness dependencies.
+# Keep this conservative and stable across servers.
+# Note: We intentionally pin NumPy < 2 to avoid ABI issues with native extensions
+# that may be installed system-wide (apt) on research boxes.
+
+numpy<2
+pandas<3
+
+# Optional but commonly used by experiment scripts / plots:
+matplotlib<4
+
+# Utilities (safe pure-Python):
+tqdm>=4.0
