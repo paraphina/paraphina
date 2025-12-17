@@ -1,15 +1,17 @@
 // src/main.rs
 //
-// CLI entrypoint for the Paraphina research harness.
+// Research-harness friendly CLI entrypoint for Paraphina.
 //
-// IMPORTANT precedence rule:
-// - If --profile is provided, it wins.
-// - If --profile is NOT provided, we fall back to PARAPHINA_RISK_PROFILE,
-//   via Config::from_env_or_default().
-//
-// This makes batch_runs/* experiments (which set env vars) behave as intended.
+// Constraints:
+// - CLI profile precedence:
+//     --profile overrides env;
+//     if missing use PARAPHINA_RISK_PROFILE (default Balanced).
+// - Deterministic runs via --seed (offset synthetic timebase).
+// - Tick count, optional verbosity.
+// - Print concise run header (profile, ticks, cfg version/hash).
+// - Exit engine is wired in StrategyRunner BEFORE hedge.
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 
 use paraphina::config::{Config, RiskProfile};
 use paraphina::gateway::SimGateway;
@@ -23,47 +25,92 @@ enum ProfileArg {
     Aggressive,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Debug, Parser)]
 #[command(
     name = "paraphina",
-    version,
-    about = "Paraphina TAO perp MM + hedge simulator",
-    long_about = None
+    about = "Paraphina TAO perp MM + hedge simulator (research harness)",
+    version
 )]
-struct Cli {
+struct Args {
     /// Number of synthetic ticks to run.
-    /// Defaults to 2000 if not provided.
     #[arg(long, default_value_t = 2000)]
     ticks: u64,
 
-    /// Risk profile preset: conservative | balanced | aggressive.
-    ///
-    /// If omitted, we use PARAPHINA_RISK_PROFILE (default Balanced).
+    /// Risk profile preset (optional).
+    /// If omitted, uses PARAPHINA_RISK_PROFILE (default Balanced).
     #[arg(long, value_enum)]
     profile: Option<ProfileArg>,
+
+    /// Deterministic seed (used to offset synthetic timebase).
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Verbosity: -v, -vv
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+}
+
+fn parse_env_profile() -> RiskProfile {
+    match std::env::var("PARAPHINA_RISK_PROFILE") {
+        Ok(s) => {
+            let s = s.to_lowercase();
+            match s.as_str() {
+                "conservative" | "cons" | "c" => RiskProfile::Conservative,
+                "aggressive" | "agg" | "a" => RiskProfile::Aggressive,
+                "balanced" | "bal" | "b" | "" => RiskProfile::Balanced,
+                _ => RiskProfile::Balanced,
+            }
+        }
+        Err(_) => RiskProfile::Balanced,
+    }
+}
+
+fn fnv1a64(s: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFFSET;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let args = Args::parse();
 
-    // Build config:
-    // - If CLI profile is provided, use it (with env overrides).
-    // - Otherwise use env-selected profile (with env overrides).
-    let cfg = match cli.profile {
-        Some(p) => {
-            let profile = match p {
-                ProfileArg::Conservative => RiskProfile::Conservative,
-                ProfileArg::Balanced => RiskProfile::Balanced,
-                ProfileArg::Aggressive => RiskProfile::Aggressive,
-            };
-            Config::from_env_or_profile(profile)
-        }
-        None => Config::from_env_or_default(),
+    // Profile precedence: CLI > env > Balanced
+    let profile = match args.profile {
+        Some(p) => match p {
+            ProfileArg::Conservative => RiskProfile::Conservative,
+            ProfileArg::Balanced => RiskProfile::Balanced,
+            ProfileArg::Aggressive => RiskProfile::Aggressive,
+        },
+        None => parse_env_profile(),
     };
 
+    // Profile presets + env overrides already handled in Config.
+    let cfg = Config::from_env_or_profile(profile);
+    let cfg_hash = fnv1a64(&format!("{cfg:?}"));
+
+    println!(
+        "paraphina | cfg={} | cfg_hash=0x{:016x} | profile={:?} | ticks={} | seed={}",
+        cfg.version,
+        cfg_hash,
+        profile,
+        args.ticks,
+        args.seed
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+
+    // Gateway + sink
     let gateway = SimGateway;
     let sink = NoopSink;
 
+    // Strategy runner owns engine/state/telemetry and runs the loop.
     let mut runner = StrategyRunner::new(&cfg, gateway, sink);
-    runner.run_simulation(cli.ticks);
+    runner.set_seed(args.seed);
+    runner.set_verbosity(args.verbose);
+    runner.run_simulation(args.ticks);
 }

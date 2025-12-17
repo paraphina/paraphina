@@ -1,33 +1,29 @@
 // src/strategy.rs
 //
 // High-level strategy runner around the Paraphina core engine.
-// This wires together:
 //
-// - Engine (fair value, vols, risk, inventory),
-// - MM quote engine,
-// - Hedge engine,
-// - Execution gateway (real or synthetic),
-// - Telemetry sink (JSONL / noop via env),
-// - Logging sink (EventSink for human-readable logs).
+// Ordering (spec):
+//   1) Engine tick (FV/vol scalars/toxicity/risk)
+//   2) MM intents -> fills -> recompute
+//   3) Exit intents -> fills -> recompute
+//   4) Hedge intents -> fills -> recompute
 //
-// `main.rs` simply constructs a `StrategyRunner` and calls
-// `run_simulation(num_ticks)`.
+// main.rs constructs StrategyRunner and calls run_simulation(num_ticks).
 
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::exit;
 use crate::gateway::ExecutionGateway;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::logging::EventSink;
 use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
 use crate::state::GlobalState;
 use crate::telemetry::TelemetrySink;
-use crate::types::{OrderIntent, Side, TimestampMs};
+use crate::types::{FillEvent, OrderIntent, Side, TimestampMs};
 
 use serde_json::json;
 
 /// High-level strategy runner.
-///
-/// `'a` is the lifetime of the shared `Config` reference.
 pub struct StrategyRunner<'a, G, S>
 where
     G: ExecutionGateway,
@@ -38,14 +34,11 @@ where
     pub state: GlobalState,
     pub gateway: G,
     pub sink: S,
-
-    /// JSONL telemetry sink, controlled entirely via environment:
-    ///
-    ///   PARAPHINA_TELEMETRY_MODE = "off" | "jsonl"
-    ///   PARAPHINA_TELEMETRY_PATH = /path/to/file.jsonl (when mode = jsonl)
-    ///
-    /// When mode = off or misconfigured, all calls are no-ops.
     pub telemetry: TelemetrySink,
+
+    // research-harness helpers
+    seed: Option<u64>,
+    verbosity: u8,
 }
 
 impl<'a, G, S> StrategyRunner<'a, G, S>
@@ -66,93 +59,135 @@ where
             gateway,
             sink,
             telemetry,
+            seed: None,
+            verbosity: 0,
         }
     }
 
-    /// Run a simple synthetic simulation for `num_ticks` ticks.
+    /// Optional deterministic seed. Currently used to offset the synthetic timebase.
+    pub fn set_seed(&mut self, seed: Option<u64>) {
+        self.seed = seed;
+    }
+
+    /// Verbosity: 0 (quiet) / 1 (summary) / 2 (debug).
+    pub fn set_verbosity(&mut self, v: u8) {
+        self.verbosity = v;
+    }
+
+    /// Record pending markouts for a batch of fills.
     ///
-    /// This is the same logic you were previously running in `main.rs`,
-    /// now encapsulated here and wired to the logging + telemetry sinks.
+    /// Called immediately after fills are produced to schedule markout evaluations.
+    fn record_markouts_for_fills(&mut self, fills: &[FillEvent], now_ms: TimestampMs) {
+        let tox_cfg = &self.cfg.toxicity;
+        let horizon_ms = tox_cfg.markout_horizon_ms;
+        let max_pending = tox_cfg.max_pending_per_venue;
+
+        // Get fair value for recording
+        let fair = self
+            .state
+            .fair_value
+            .unwrap_or(self.state.fair_value_prev)
+            .max(1.0);
+
+        for fill in fills {
+            // Get venue mid at fill time
+            let mid = self
+                .state
+                .venues
+                .get(fill.venue_index)
+                .and_then(|v| v.mid)
+                .unwrap_or(fair);
+
+            self.state.record_pending_markout(
+                fill.venue_index,
+                fill.side,
+                fill.size,
+                fill.price,
+                now_ms,
+                fair,
+                mid,
+                horizon_ms,
+                max_pending,
+            );
+        }
+    }
+
+    /// Run synthetic simulation for `num_ticks`.
     pub fn run_simulation(&mut self, num_ticks: u64) {
-        let mut now_ms: TimestampMs = 0;
+        // Deterministic timebase offset (keeps runs stable given same seed).
+        let base_ms: TimestampMs = self.seed.map(|s| (s % 10_000) as i64).unwrap_or(0);
+
         let dt_ms: TimestampMs = 1_000;
 
-        // Apply the configured initial position q0 (in TAO) once at t = 0.
-        // This uses `cfg.initial_q_tao` and ensures the hedge engine + risk
-        // logic start from the correct inventory state.
+        // Apply initial position once (if configured).
         self.inject_initial_position();
 
         for tick in 0..num_ticks {
-            println!("\n================ Tick {} =================", tick);
+            let now_ms: TimestampMs = base_ms + (tick as i64) * dt_ms;
 
-            // 1) Seed synthetic mids / books and run the core engine tick.
+            // 1) Seed synthetic books + engine tick.
             self.engine.seed_dummy_mids(&mut self.state, now_ms);
             self.engine.main_tick(&mut self.state, now_ms);
 
-            // 3) Print global snapshot.
-            self.print_state_snapshot();
-
-            // 4) Compute MM quotes & hedge plan.
+            // 2) Market-making
             let mm_quotes = compute_mm_quotes(self.cfg, &self.state);
-
-            println!("\nPer-venue quotes:");
-            for q in &mm_quotes {
-                println!(" {:<10}: bid={:?}, ask={:?}", q.venue_id, q.bid, q.ask);
-            }
-
-            let hedge_plan = compute_hedge_plan(self.cfg, &self.state);
-            match &hedge_plan {
-                Some(plan) => {
-                    println!(
-                        "\nHedge plan: desired_delta={:.4}, allocations={}",
-                        plan.desired_delta,
-                        plan.allocations.len()
-                    );
-                }
-                None => println!("\nHedge plan: none"),
-            }
-
-            // 5) Convert to abstract order intents.
             let mut all_intents: Vec<OrderIntent> = mm_quotes_to_order_intents(&mm_quotes);
 
-            if let Some(plan) = hedge_plan {
-                let mut hedge_intents = hedge_plan_to_order_intents(&plan);
-                all_intents.append(&mut hedge_intents);
-            }
+            let mut all_fills = Vec::new();
 
-            println!("\nBefore MM + hedge fills:");
-            self.print_inventory_and_pnl();
-
-            println!("\nOrder intents (abstract):");
-            for it in &all_intents {
-                println!(
-                    " {:<10} {:?} {:>6.4} @ {:>8.4} ({:?})",
-                    it.venue_id, it.side, it.size, it.price, it.purpose
-                );
-            }
-
-            // 6) Send intents to the execution gateway and get realised fills.
-            println!("\nSynthetic fills (SimGateway):");
-            let fills = self
+            let mm_fills = self
                 .gateway
                 .process_intents(self.cfg, &mut self.state, &all_intents);
 
-            // 7) Recompute inventory / basis / unrealised PnL after fills.
+            // Record pending markouts for MM fills (before extending all_fills)
+            self.record_markouts_for_fills(&mm_fills, now_ms);
+            all_fills.extend(mm_fills);
+
+            // Recompute after MM fills
             self.state.recompute_after_fills(self.cfg);
 
-            println!("\nAfter MM + hedge fills:");
-            self.print_inventory_and_pnl();
+            // 3) Exit engine BEFORE hedge (spec)
+            let exit_intents = if self.cfg.exit.enabled {
+                exit::compute_exit_intents(self.cfg, &self.state, now_ms)
+            } else {
+                Vec::new()
+            };
+            if !exit_intents.is_empty() {
+                // include in overall intents log
+                all_intents.extend(exit_intents.iter().cloned());
 
-            // 8) Emit per-tick JSONL telemetry snapshot.
-            //
-            // This is what exp05_telemetry_validation.py + ts_metrics.py read.
-            //
-            // Keys:
-            //   - t           : tick index
-            //   - pnl_total   : cumulative total PnL
-            //   - risk_regime : "Normal" | "Warning" | "HardLimit"
-            //   - kill_switch : bool
-            // plus a few extra helpful fields.
+                let exit_fills =
+                    self.gateway
+                        .process_intents(self.cfg, &mut self.state, &exit_intents);
+
+                // Record pending markouts for exit fills
+                self.record_markouts_for_fills(&exit_fills, now_ms);
+                all_fills.extend(exit_fills);
+
+                self.state.recompute_after_fills(self.cfg);
+            }
+
+            // 4) Hedge engine (after exits)
+            let mut hedge_intents: Vec<OrderIntent> = Vec::new();
+            if let Some(plan) = compute_hedge_plan(self.cfg, &self.state) {
+                hedge_intents = hedge_plan_to_order_intents(&plan);
+            }
+
+            if !hedge_intents.is_empty() {
+                all_intents.extend(hedge_intents.iter().cloned());
+
+                let hedge_fills =
+                    self.gateway
+                        .process_intents(self.cfg, &mut self.state, &hedge_intents);
+
+                // Record pending markouts for hedge fills
+                self.record_markouts_for_fills(&hedge_fills, now_ms);
+                all_fills.extend(hedge_fills);
+
+                self.state.recompute_after_fills(self.cfg);
+            }
+
+            // Telemetry snapshot (must keep schema stable for research tooling)
             self.telemetry.log_json(&json!({
                 "t": tick,
                 "pnl_realised": self.state.daily_realised_pnl,
@@ -165,33 +200,35 @@ where
                 "basis_usd": self.state.basis_usd,
             }));
 
-            // 9) Log everything via the event sink (human-readable / structured).
+            // Human-readable / structured logs via sink
             self.sink
-                .log_tick(tick, self.cfg, &self.state, &all_intents, &fills);
+                .log_tick(tick, self.cfg, &self.state, &all_intents, &all_fills);
 
-            // 10) Honour the global kill switch: stop the run early if tripped.
+            if self.verbosity >= 1 {
+                println!(
+                    "tick {}: q={:.4} Δ={:.2} basis={:.2} pnl={:.2} regime={:?} kill={}",
+                    tick,
+                    self.state.q_global_tao,
+                    self.state.dollar_delta_usd,
+                    self.state.basis_usd,
+                    self.state.daily_pnl_total,
+                    self.state.risk_regime,
+                    self.state.kill_switch
+                );
+            }
+
             if self.state.kill_switch {
                 println!(
-                    "\nKill switch active at tick {} – stopping simulation early.",
+                    "Kill switch active at tick {} - stopping simulation early.",
                     tick
                 );
                 break;
             }
-
-            // Advance synthetic clock.
-            now_ms += dt_ms;
         }
 
-        // Ensure telemetry is flushed when the simulation finishes.
         self.telemetry.flush();
     }
 
-    /// Inject an initial synthetic position on venue 0.
-    ///
-    /// Sign convention for `cfg.initial_q_tao`:
-    ///   - `initial_q_tao > 0` → start **long**  `initial_q_tao` TAO
-    ///   - `initial_q_tao < 0` → start **short** `|initial_q_tao|` TAO
-    ///   - `|initial_q_tao| ≈ 0` → start approximately **flat**
     fn inject_initial_position(&mut self) {
         if self.cfg.venues.is_empty() {
             return;
@@ -199,9 +236,7 @@ where
 
         let q0 = self.cfg.initial_q_tao;
 
-        // If configured initial position is effectively zero, do nothing.
         if q0.abs() < 1e-9 {
-            println!("No synthetic initial position (initial_q_tao ~= 0).");
             return;
         }
 
@@ -209,66 +244,17 @@ where
         let size_tao = q0.abs();
         let side = if q0 > 0.0 { Side::Buy } else { Side::Sell };
 
+        // Use fair value if present, else fallback.
         let s_t = self.state.fair_value.unwrap_or(self.state.fair_value_prev);
-        let entry_price = if s_t > 0.0 { s_t } else { 250.0 };
-
-        println!(
-            "Injecting synthetic initial position: venue={} side={:?} size={} @ {:.4}",
-            self.cfg.venues[venue_index].id, side, size_tao, entry_price,
-        );
+        let entry_price = if s_t.is_finite() && s_t > 0.0 {
+            s_t
+        } else {
+            250.0
+        };
 
         self.state
             .apply_perp_fill(venue_index, side, size_tao, entry_price, 0.0);
 
         self.state.recompute_after_fills(self.cfg);
-    }
-
-    fn print_state_snapshot(&self) {
-        let s_t = self.state.fair_value.unwrap_or(self.state.fair_value_prev);
-
-        println!("Fair value S_t: {:.4}", s_t);
-        println!("Sigma_eff: {:.6}", self.state.sigma_eff);
-        println!("Vol ratio (clipped): {:.4}", self.state.vol_ratio_clipped);
-        println!("Spread_mult: {:.4}", self.state.spread_mult);
-        println!("Size_mult: {:.4}", self.state.size_mult);
-        println!("Band_mult: {:.4}", self.state.band_mult);
-        println!("Global q_t (TAO): {:.4}", self.state.q_global_tao);
-        println!("Dollar delta (USD): {:.4}", self.state.dollar_delta_usd);
-        println!("Basis exposure (USD): {:.4}", self.state.basis_usd);
-        println!("Basis gross (USD): {:.4}", self.state.basis_gross_usd);
-        println!("Delta limit (USD): {:.4}", self.state.delta_limit_usd);
-        println!(
-            "Basis warn / hard (USD): {:.4} / {:.4}",
-            self.state.basis_limit_warn_usd, self.state.basis_limit_hard_usd,
-        );
-        println!("Daily PnL (realised): {:.4}", self.state.daily_realised_pnl);
-        println!(
-            "Daily PnL (unrealised): {:.4}",
-            self.state.daily_unrealised_pnl
-        );
-        println!("Daily PnL total: {:.4}", self.state.daily_pnl_total);
-        println!("Risk regime after tick: {:?}", self.state.risk_regime);
-        println!("Kill switch: {}", self.state.kill_switch);
-
-        println!("\nPer-venue toxicity & status:");
-        for v in &self.state.venues {
-            println!(
-                " {:<10}: toxicity={:.3}, status={:?}",
-                v.id, v.toxicity, v.status
-            );
-        }
-    }
-
-    fn print_inventory_and_pnl(&self) {
-        println!(" Global q_t (TAO): {:.4}", self.state.q_global_tao);
-        println!(" Dollar delta (USD): {:.4}", self.state.dollar_delta_usd);
-        println!(" Basis exposure (USD): {:.4}", self.state.basis_usd);
-        println!(
-            " Daily PnL (realised / unrealised / total): {:.4} / {:.4} / {:.4}",
-            self.state.daily_realised_pnl,
-            self.state.daily_unrealised_pnl,
-            self.state.daily_pnl_total
-        );
-        println!(" Risk regime: {:?}", self.state.risk_regime);
     }
 }

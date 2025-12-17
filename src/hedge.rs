@@ -220,3 +220,10 @@ pub fn hedge_plan_to_order_intents(plan: &HedgePlan) -> Vec<OrderIntent> {
 
     out
 }
+
+pub fn compute_hedge_orders(cfg: &Config, state: &GlobalState) -> Vec<OrderIntent> {
+    match compute_hedge_plan(cfg, state) {
+        Some(plan) => hedge_plan_to_order_intents(&plan),
+        None => Vec::new(),
+    }
+}

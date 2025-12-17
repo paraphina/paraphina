@@ -15,8 +15,31 @@
 //  - Kill-switch is a separate boolean and is intended to be *latched*
 //    by the Engine (once set, it stays set until manual reset).
 
+use std::collections::VecDeque;
+
 use crate::config::Config;
 use crate::types::{Side, TimestampMs, VenueStatus};
+
+/// A pending markout evaluation entry.
+///
+/// Created at fill time; evaluated at `t_eval_ms` to compute realized markout.
+#[derive(Debug, Clone)]
+pub struct PendingMarkout {
+    /// Timestamp when the fill occurred.
+    pub t_fill_ms: TimestampMs,
+    /// Timestamp when we should evaluate the markout (t_fill_ms + horizon).
+    pub t_eval_ms: TimestampMs,
+    /// Side of the fill (Buy or Sell).
+    pub side: Side,
+    /// Size of the fill in TAO.
+    pub size_tao: f64,
+    /// Fill price in USD/TAO.
+    pub price: f64,
+    /// Fair value at fill time (for optional analysis).
+    pub fair_at_fill: f64,
+    /// Venue mid price at fill time (used for markout calculation).
+    pub mid_at_fill: f64,
+}
 
 /// Per-venue state (one per perp venue / subaccount).
 #[derive(Debug, Clone)]
@@ -40,8 +63,12 @@ pub struct VenueState {
 
     // ----- Health / toxicity -----
     pub status: VenueStatus,
-    /// Toxicity score ∈ [0,1].
+    /// Toxicity score ∈ [0,1] (EWMA of markout-based instantaneous toxicity).
     pub toxicity: f64,
+    /// Pending markout evaluations (ring buffer, bounded by config).
+    pub pending_markouts: VecDeque<PendingMarkout>,
+    /// Running EWMA of markout in USD/TAO for telemetry/debugging.
+    pub markout_ewma_usd_per_tao: f64,
 
     // ----- Position & funding -----
     /// Net TAO-equivalent perp position.
@@ -151,6 +178,8 @@ impl GlobalState {
 
                 status: VenueStatus::Healthy,
                 toxicity: 0.0,
+                pending_markouts: VecDeque::new(),
+                markout_ewma_usd_per_tao: 0.0,
 
                 position_tao: 0.0,
                 funding_8h: 0.0,
@@ -364,6 +393,58 @@ impl GlobalState {
 
         self.daily_unrealised_pnl = unrealised;
         self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
+    }
+
+    /// Record a pending markout evaluation for a fill.
+    ///
+    /// Called immediately after a fill is applied. The markout will be
+    /// evaluated at `now_ms + horizon_ms` in `update_toxicity_and_health`.
+    ///
+    /// - `venue_index`: index into `self.venues`.
+    /// - `side`: Buy or Sell.
+    /// - `size_tao`: filled size in TAO.
+    /// - `price`: fill price in USD/TAO.
+    /// - `now_ms`: current timestamp.
+    /// - `fair`: current fair value (for optional analysis).
+    /// - `mid`: current venue mid price.
+    /// - `horizon_ms`: time until markout evaluation.
+    /// - `max_pending`: maximum queue size (older entries dropped).
+    pub fn record_pending_markout(
+        &mut self,
+        venue_index: usize,
+        side: Side,
+        size_tao: f64,
+        price: f64,
+        now_ms: TimestampMs,
+        fair: f64,
+        mid: f64,
+        horizon_ms: i64,
+        max_pending: usize,
+    ) {
+        if size_tao <= 0.0 || !price.is_finite() || price <= 0.0 {
+            return;
+        }
+
+        let Some(v) = self.venues.get_mut(venue_index) else {
+            return;
+        };
+
+        let entry = PendingMarkout {
+            t_fill_ms: now_ms,
+            t_eval_ms: now_ms + horizon_ms,
+            side,
+            size_tao,
+            price,
+            fair_at_fill: fair,
+            mid_at_fill: mid,
+        };
+
+        v.pending_markouts.push_back(entry);
+
+        // Enforce bounded queue: drop oldest entries if over limit.
+        while v.pending_markouts.len() > max_pending {
+            v.pending_markouts.pop_front();
+        }
     }
 }
 

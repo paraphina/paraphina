@@ -85,8 +85,8 @@ impl<'a> Engine<'a> {
         // 2) Mark-to-fair inventory / basis / unrealised PnL (spec-consistent)
         state.recompute_after_fills(self.cfg);
 
-        // 3) Toxicity + venue health
-        update_toxicity_and_health(state, &self.cfg);
+        // 3) Toxicity + venue health (now processes pending markouts)
+        update_toxicity_and_health(state, self.cfg, now_ms);
 
         // 4) Risk limits + regime / kill switch (latched)
         self.update_risk_limits_and_regime(state);

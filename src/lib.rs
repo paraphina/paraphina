@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod exit;
 pub mod gateway;
 pub mod hedge;
 pub mod logging;
@@ -29,7 +30,7 @@ pub use logging::{EventSink, FileSink, NoopSink};
 
 pub use mm::{compute_mm_quotes, mm_quotes_to_order_intents, MmLevel, MmQuote};
 
-pub use state::{GlobalState, RiskRegime, VenueState};
+pub use state::{GlobalState, PendingMarkout, RiskRegime, VenueState};
 
 pub use strategy::StrategyRunner;
 
