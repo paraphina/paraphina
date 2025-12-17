@@ -120,18 +120,31 @@ There are state-level unit tests validating key PnL identities.
 
 ### Fair value (Kalman filter)
 - The engine uses a 1D Kalman filter over **log price** to estimate fair value `S_t`.
-- Observation quality is gated by:
-  - venue health
-  - staleness
-  - spread/depth (in observation variance)
-  - outlier filtering vs previous fair value
+- Observation quality is gated by (Milestone D gating policy):
+  - **Venue health**: only Healthy venues (not Warning or Disabled) contribute observations
+  - **Staleness gating**: venues with book data older than `stale_ms` are excluded
+  - **Outlier gating**: venues whose mid deviates > `max_mid_jump_pct` from prior FV are excluded
+  - **Min-healthy gating**: if fewer than `min_healthy_for_kf` venues pass all gates, measurement update is skipped (time-update only)
+  - spread/depth affect observation variance R
+
+### FV gating telemetry (Milestone D)
+The engine tracks and exposes in telemetry:
+- `fv_available`: bool — true if >= min_healthy_for_kf observations passed gating
+- `fair_value`: the current fair value estimate (Option<f64>)
+- `healthy_venues_used`: list of venue indices that contributed to the last FV update
+- `healthy_venues_used_count`: count of healthy venues used
+
+When `fv_available = false`, the engine performs a time update only (prediction step) and fair value degrades gracefully without jumping.
 
 ### Volatility + scalars
 - EWMA volatility is computed on fair value log returns.
+- **Volatility floor** (Milestone D): `sigma_eff = max(sigma_short, sigma_min)`
+  - Ensures effective volatility never falls below the configured floor
+  - `sigma_eff` is used by all downstream scalars
 - A clipped vol ratio drives dynamic scalars:
-  - spreads widen with vol
-  - sizes shrink with vol
-  - hedge deadband shrinks with vol
+  - spreads widen with vol (`spread_mult`)
+  - sizes shrink with vol (`size_mult`)
+  - hedge deadband shrinks with vol (`band_mult`)
 
 ---
 
@@ -237,8 +250,9 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | Subsystem | Status | Notes |
 |---|---|---|
 | Config + risk profiles | Implemented | Presets + env overrides exist; CLI/env precedence needs tightening |
-| Fair value KF | Implemented | KF on log price with gating |
-| Volatility scalars | Implemented | EWMA vol + spread/size/band scalars |
+| Fair value KF | Implemented | KF on log price with staleness/outlier/min-healthy gating (Milestone D) |
+| FV gating telemetry | Implemented | Milestone D: fv_available, healthy_venues_used, healthy_venues_used_count |
+| Volatility scalars | Implemented | EWMA vol + spread/size/band scalars; sigma_eff floor enforced (Milestone D) |
 | PnL accounting | Implemented | Realised + unrealised + fees; tests exist |
 | Risk regimes | Implemented | Normal/Warning/HardLimit (Critical) |
 | Kill switch | Implemented (latching) | Milestone C: triggers on any hard breach, latches until reset |

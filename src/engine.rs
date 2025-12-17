@@ -148,22 +148,34 @@ impl<'a> Engine<'a> {
 
         let obs = self.collect_kf_observations(state, now_ms, gate_ref);
 
-        if obs.len() >= (book_cfg.min_healthy_for_kf as usize) {
-            for (y, r) in obs {
+        // Milestone D: min-healthy gating - require >= min_healthy_for_kf observations
+        // to apply a measurement update; otherwise skip measurement update (time update only).
+        let min_healthy = book_cfg.min_healthy_for_kf as usize;
+        let fv_available = obs.len() >= min_healthy;
+
+        // Track which venues were used for telemetry
+        let healthy_venues_used: Vec<usize> = if fv_available {
+            obs.iter().map(|(idx, _, _)| *idx).collect()
+        } else {
+            Vec::new()
+        };
+
+        if fv_available {
+            for (_, y, r) in &obs {
                 // Standard scalar KF update:
                 //   S = P + R
                 //   K = P / S
                 //   x = x + K (y - x)
                 //   P = (1 - K) P
-                let s = p + r;
+                let s = p + *r;
                 if s.is_finite() && s > 0.0 {
                     let k_gain = p / s;
-                    x_hat += k_gain * (y - x_hat);
+                    x_hat += k_gain * (*y - x_hat);
                     p *= 1.0 - k_gain;
                 }
             }
         }
-        // else: time update only
+        // else: time update only - FV unchanged, fv_available = false
 
         // Keep KF variance sane.
         if !p.is_finite() || p <= 0.0 {
@@ -203,6 +215,11 @@ impl<'a> Engine<'a> {
         state.kf_x_hat = x_hat;
         state.kf_p = p;
         state.kf_last_update_ms = now_ms;
+
+        // Milestone D: FV gating telemetry fields.
+        state.fv_available = fv_available;
+        state.healthy_venues_used_count = healthy_venues_used.len();
+        state.healthy_venues_used = healthy_venues_used;
     }
 
     /// Compute median mid across venues with fresh books (no outlier gating).
@@ -246,26 +263,29 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Collect eligible KF observations as (y=log(mid), r=variance).
+    /// Collect eligible KF observations as (venue_index, y=log(mid), r=variance).
     ///
-    /// Eligibility follows the spec:
+    /// Eligibility follows the spec (Milestone D gating policy):
     ///  - venue not disabled,
     ///  - status is Healthy (not Warning) for KF contributions,
-    ///  - non-stale book,
+    ///  - non-stale book (staleness gating),
     ///  - valid mid/spread/depth,
-    ///  - optional outlier gating vs gate_ref.
+    ///  - optional outlier gating vs gate_ref (outlier gating).
+    ///
+    /// Returns venue indices along with observations for telemetry tracking.
     fn collect_kf_observations(
         &self,
         state: &GlobalState,
         now_ms: i64,
         gate_ref: Option<f64>,
-    ) -> Vec<(f64, f64)> {
+    ) -> Vec<(usize, f64, f64)> {
         let book_cfg = &self.cfg.book;
         let k_cfg = &self.cfg.kalman;
 
-        let mut out: Vec<(f64, f64)> = Vec::new();
+        let mut out: Vec<(usize, f64, f64)> = Vec::new();
 
-        for v in &state.venues {
+        for (venue_idx, v) in state.venues.iter().enumerate() {
+            // --- Disabled venue gating ---
             if matches!(v.status, VenueStatus::Disabled) {
                 continue;
             }
@@ -274,6 +294,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
+            // --- Staleness gating (Milestone D) ---
             let Some(ts) = v.last_mid_update_ms else {
                 continue;
             };
@@ -297,7 +318,8 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
-            // Outlier gating vs previous fair.
+            // --- Outlier gating (Milestone D) ---
+            // Reject venues whose mid deviates too far from the reference fair value.
             if let Some(ref_price) = gate_ref {
                 if ref_price.is_finite() && ref_price > 0.0 {
                     let dev = ((mid - ref_price) / ref_price).abs();
@@ -319,7 +341,7 @@ impl<'a> Engine<'a> {
             r = r.clamp(k_cfg.r_min, k_cfg.r_max);
 
             let y = mid.max(1e-6).ln();
-            out.push((y, r));
+            out.push((venue_idx, y, r));
         }
 
         out
