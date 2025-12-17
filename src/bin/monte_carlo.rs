@@ -31,7 +31,7 @@ use paraphina::exit;
 use paraphina::hedge;
 use paraphina::metrics::{DrawdownTracker, OnlineStats};
 use paraphina::mm;
-use paraphina::state::GlobalState;
+use paraphina::state::{GlobalState, KillReason};
 use paraphina::types::{OrderIntent, TimestampMs};
 
 const DEFAULT_RUNS: usize = 50;
@@ -379,6 +379,8 @@ struct RunResult {
     max_abs_q: f64,
     max_venue_toxicity: f64,
     kill_tick: Option<usize>,
+    kill_reason: KillReason,
+    kill_switch: bool,
     ticks_executed: usize,
 }
 
@@ -478,6 +480,8 @@ fn run_once(cfg: &Config, seed: u64, ticks: usize, tick_ms: i64, jitter_ms: i64)
         max_abs_q,
         max_venue_toxicity,
         kill_tick,
+        kill_reason: state.kill_reason,
+        kill_switch: state.kill_switch,
         ticks_executed,
     }
 }
@@ -522,7 +526,7 @@ fn main() {
             });
             writeln!(
                 f,
-                "run,seed,ticks_executed,kill_tick,final_pnl,max_drawdown,max_abs_delta_usd,max_abs_basis_usd,max_abs_q_tao,max_venue_toxicity"
+                "run,seed,ticks_executed,kill_tick,kill_switch,kill_reason,final_pnl,max_drawdown,max_abs_delta_usd,max_abs_basis_usd,max_abs_q_tao,max_venue_toxicity"
             )
             .unwrap();
             Some(f)
@@ -584,13 +588,16 @@ fn main() {
                 .kill_tick
                 .map(|x| x.to_string())
                 .unwrap_or_else(|| "".to_string());
+            let kill_reason_str = format!("{:?}", r.kill_reason);
             writeln!(
                 f,
-                "{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+                "{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
                 i + 1,
                 run_seed,
                 r.ticks_executed,
                 kt,
+                r.kill_switch,
+                kill_reason_str,
                 r.final_pnl,
                 r.max_drawdown,
                 r.max_abs_delta,
@@ -605,12 +612,17 @@ fn main() {
             && (args.print_every == 1 || ((i + 1) % args.print_every == 0) || (i + 1 == args.runs));
 
         if should_print {
-            let kt = r
+            let kill_tick_str = r
                 .kill_tick
                 .map(|x| x.to_string())
                 .unwrap_or_else(|| "-".to_string());
+            let kill_reason_str = if r.kill_switch {
+                format!("{:?}", r.kill_reason)
+            } else {
+                "-".to_string()
+            };
             println!(
-                "run {:>4}/{:<4} seed={:<10} pnl={:>10.4} maxDD={:>10.4} |maxΔ|={:>10.4} |basis|={:>10.4} |q|={:>9.4} tox={:>6.3} kill_tick={} ticks={}",
+                "run {:>4}/{:<4} seed={:<10} pnl={:>10.4} maxDD={:>10.4} |maxΔ|={:>10.4} |basis|={:>10.4} |q|={:>9.4} tox={:>6.3} kill={} kt={} reason={} ticks={}",
                 i + 1,
                 args.runs,
                 run_seed,
@@ -620,7 +632,9 @@ fn main() {
                 r.max_abs_basis,
                 r.max_abs_q,
                 r.max_venue_toxicity,
-                kt,
+                r.kill_switch,
+                kill_tick_str,
+                kill_reason_str,
                 r.ticks_executed
             );
         }

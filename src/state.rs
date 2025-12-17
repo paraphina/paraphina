@@ -98,7 +98,27 @@ pub enum RiskRegime {
     Normal,
     Warning,
     /// Hard limit / circuit-breaker regime (whitepaper "Critical").
+    /// When this regime is active, kill_switch MUST be latched true.
     HardLimit,
+}
+
+/// Reason code for kill switch activation.
+///
+/// The kill switch can be triggered by multiple conditions. This enum
+/// captures the primary reason for activation. Once latched, the reason
+/// is preserved until manual reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillReason {
+    /// No kill triggered (default state).
+    None,
+    /// Daily PnL loss limit breached.
+    PnlHardBreach,
+    /// Volatility-scaled delta limit breached.
+    DeltaHardBreach,
+    /// Basis exposure hard limit breached.
+    BasisHardBreach,
+    /// Liquidation distance too close (below critical sigma threshold).
+    LiquidationDistanceBreach,
 }
 
 /// Global engine state shared across strategy components.
@@ -151,7 +171,12 @@ pub struct GlobalState {
 
     // ----- Risk regime & limits -----
     pub risk_regime: RiskRegime,
+    /// Kill switch: once true, stays true until manual reset (latching).
+    /// When kill_switch is true, risk_regime MUST be HardLimit.
     pub kill_switch: bool,
+    /// Primary reason for kill switch activation (if any).
+    /// Preserved once set until manual reset.
+    pub kill_reason: KillReason,
     /// Volatility-scaled delta limit (updated in engine).
     pub delta_limit_usd: f64,
     /// Basis warning limit in USD (soft).
@@ -228,6 +253,7 @@ impl GlobalState {
             // Risk
             risk_regime: RiskRegime::Normal,
             kill_switch: false,
+            kill_reason: KillReason::None,
             delta_limit_usd: cfg.risk.delta_hard_limit_usd_base,
             basis_limit_warn_usd: cfg.risk.basis_warn_frac * cfg.risk.basis_hard_limit_usd,
             basis_limit_hard_usd: cfg.risk.basis_hard_limit_usd,

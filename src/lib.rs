@@ -31,7 +31,7 @@ pub use logging::{EventSink, FileSink, NoopSink};
 
 pub use mm::{compute_mm_quotes, mm_quotes_to_order_intents, MmLevel, MmQuote};
 
-pub use state::{GlobalState, PendingMarkout, RiskRegime, VenueState};
+pub use state::{GlobalState, KillReason, PendingMarkout, RiskRegime, VenueState};
 
 pub use strategy::StrategyRunner;
 

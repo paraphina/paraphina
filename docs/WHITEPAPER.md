@@ -54,9 +54,9 @@ Where the canonical spec differs from current code, that difference must be trea
   - Current gating behavior:
     - no FV → no quotes
     - kill switch → no quotes
+    - HardLimit (Critical) regime → no quotes (Milestone C)
     - disabled venue → no quotes
   - Warning regime widens spreads and caps sizes.
-  - **Known gap**: HardLimit regime still allows quoting unless kill switch also triggers (see drift section).
 
 **Hedging**
 - `src/hedge.rs`
@@ -148,9 +148,11 @@ The regime is determined using combinations of:
 - basis exposure limits
 - daily PnL loss limits
 
-### Kill switch
-- Current code triggers a kill switch on a daily PnL hard breach (and/or regime logic).
-- **Known gap vs canonical**: kill switch is currently recomputed each tick (non-latching). Canonical spec requires human reset.
+### Kill switch (Milestone C complete)
+- Kill switch triggers on ANY hard breach: PnL, delta, basis, or liquidation distance.
+- Kill switch is **latching**: once true, stays true until manual reset.
+- Kill reason tracked via `KillReason` enum (`PnlHardBreach`, `DeltaHardBreach`, `BasisHardBreach`, `LiquidationDistanceBreach`).
+- When kill switch is active, HardLimit (Critical) regime is forced for telemetry consistency.
 
 ---
 
@@ -163,10 +165,8 @@ MM quotes are computed per venue based on:
 - venue health / toxicity / liquidation-distance constraints (sim)
 
 **Non-negotiable today**:
-- If kill switch is active, MM does not emit new quotes.
-
-**Known gap**:
-- In HardLimit regime, MM quoting can still occur unless kill switch is also active.
+- If kill switch is active OR risk regime is HardLimit, MM does not emit new quotes.
+- HardLimit (Critical) regime implies kill_switch=true (Milestone C).
 
 ---
 
@@ -179,9 +179,9 @@ The hedge controller:
 - caps per-step size
 
 **Non-negotiable today**:
-- If kill switch is active, hedging is disabled.
+- If kill switch is active, hedging is disabled (Milestone C).
 
-**Known gaps vs canonical**:
+**Known gaps vs canonical** (future work):
 - allocation does not yet incorporate basis/funding/margin/liquidation constraints at canonical depth.
 
 ---
@@ -206,13 +206,16 @@ These are the highest-impact mismatches currently observed in the repo wiring an
    - Current main wiring defaults to a CLI profile and can ignore `PARAPHINA_RISK_PROFILE`.
    - This can silently invalidate runs that rely on env overlays.
 
-2) **HardLimit still allows MM quotes**
-   - Canonical spec expects “Critical” to stop new quoting.
-   - Current MM gating is kill-switch-based.
+2) ~~**HardLimit still allows MM quotes**~~ **FIXED (Milestone C)**
+   - HardLimit (Critical) regime now implies `kill_switch=true`.
+   - MM, hedge, and exit engines all gate on `kill_switch`, stopping all new orders.
+   - See `engine.rs::update_risk_limits_and_regime()`.
 
-3) **Kill switch not latching**
-   - Canonical spec requires human reset after kill.
-   - Current kill switch is recomputed each tick.
+3) ~~**Kill switch not latching**~~ **FIXED (Milestone C)**
+   - Kill switch is now latching: once triggered, stays true until manual reset.
+   - Kill switch triggers on ANY hard breach: PnL, delta, basis, or liquidation distance.
+   - Kill reason is tracked via `KillReason` enum for diagnostics.
+   - Tests in `tests/risk_regim_tests.rs` cover all breach scenarios.
 
 4) **Tooling/doc footguns**
    - Exp12 filename spelling mismatch exists in docs (fix in tools/RESEARCH.md or provide shim).
@@ -237,11 +240,11 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | Fair value KF | Implemented | KF on log price with gating |
 | Volatility scalars | Implemented | EWMA vol + spread/size/band scalars |
 | PnL accounting | Implemented | Realised + unrealised + fees; tests exist |
-| Risk regimes | Implemented | Normal/Warning/HardLimit |
-| Kill switch | Implemented (non-latching) | Canonical requires latching |
-| MM quoting | Implemented | Needs HardLimit gating for canonical behavior |
-| Hedging | Partial | Cost model is simplified vs canonical |
-| Cross-venue exits | Planned | Canonical has detailed exit optimiser not yet surfaced in current loop |
+| Risk regimes | Implemented | Normal/Warning/HardLimit (Critical) |
+| Kill switch | Implemented (latching) | Milestone C: triggers on any hard breach, latches until reset |
+| MM quoting | Implemented | Stops on kill_switch OR HardLimit (Milestone C) |
+| Hedging | Partial | Cost model is simplified vs canonical; stops on kill_switch |
+| Cross-venue exits | Implemented | Profit-only exits; stops on kill_switch OR HardLimit |
 | Production I/O | Planned | Current focus is deterministic sim + telemetry |
 
 ---
