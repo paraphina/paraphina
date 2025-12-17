@@ -2,14 +2,12 @@
 //
 // CLI entrypoint for the Paraphina research harness.
 //
-// Example usage:
+// IMPORTANT precedence rule:
+// - If --profile is provided, it wins.
+// - If --profile is NOT provided, we fall back to PARAPHINA_RISK_PROFILE,
+//   via Config::from_env_or_default().
 //
-//   cargo run --release
-//   cargo run --release -- --ticks 500
-//   cargo run --release -- --ticks 500 --profile aggressive
-//
-// The `ticks` argument controls the synthetic simulation length.
-// The `profile` argument selects a coarse risk preset.
+// This makes batch_runs/* experiments (which set env vars) behave as intended.
 
 use clap::{Parser, ValueEnum};
 
@@ -39,29 +37,33 @@ struct Cli {
     ticks: u64,
 
     /// Risk profile preset: conservative | balanced | aggressive.
-    #[arg(long, value_enum, default_value_t = ProfileArg::Balanced)]
-    profile: ProfileArg,
+    ///
+    /// If omitted, we use PARAPHINA_RISK_PROFILE (default Balanced).
+    #[arg(long, value_enum)]
+    profile: Option<ProfileArg>,
 }
 
 fn main() {
-    // Parse CLI args.
     let cli = Cli::parse();
 
-    // Map CLI profile to internal RiskProfile enum.
-    let profile = match cli.profile {
-        ProfileArg::Conservative => RiskProfile::Conservative,
-        ProfileArg::Balanced => RiskProfile::Balanced,
-        ProfileArg::Aggressive => RiskProfile::Aggressive,
+    // Build config:
+    // - If CLI profile is provided, use it (with env overrides).
+    // - Otherwise use env-selected profile (with env overrides).
+    let cfg = match cli.profile {
+        Some(p) => {
+            let profile = match p {
+                ProfileArg::Conservative => RiskProfile::Conservative,
+                ProfileArg::Balanced => RiskProfile::Balanced,
+                ProfileArg::Aggressive => RiskProfile::Aggressive,
+            };
+            Config::from_env_or_profile(profile)
+        }
+        None => Config::from_env_or_default(),
     };
 
-    // Build config from profile + env overrides.
-    let cfg = Config::from_env_or_profile(profile);
-
-    // Pure synthetic gateway + no-op event sink (tests / manual sims).
-    let gateway = SimGateway; // unit struct – no ::default()
+    let gateway = SimGateway;
     let sink = NoopSink;
 
-    // Strategy runner owns engine, state, telemetry, and logging.
     let mut runner = StrategyRunner::new(&cfg, gateway, sink);
     runner.run_simulation(cli.ticks);
 }

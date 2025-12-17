@@ -1,6 +1,19 @@
 // src/state.rs
 //
 // Global engine state + per-venue state for Paraphina.
+//
+// This file is intentionally "spec-shaped":
+//  - Per-venue: book-derived mid/spread/depth + local vols + toxicity/health,
+//    position + funding + (synthetic) margin/liquidation.
+//  - Global: fair value + vol scalars, inventories + basis exposures, PnL,
+//    risk regime + kill switch.
+//
+// Notes:
+//  - We keep the current 3-state regime enum {Normal, Warning, HardLimit}.
+//    In the whitepaper this maps to {Normal, Warning, Critical}, but in this
+//    codebase HardLimit is the "circuit-breaker" state.
+//  - Kill-switch is a separate boolean and is intended to be *latched*
+//    by the Engine (once set, it stays set until manual reset).
 
 use crate::config::Config;
 use crate::types::{Side, TimestampMs, VenueStatus};
@@ -52,12 +65,12 @@ pub struct VenueState {
     pub dist_liq_sigma: f64,
 }
 
-/// High-level risk regime (Section 14 of the whitepaper).
+/// High-level risk regime (whitepaper Section 14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskRegime {
     Normal,
     Warning,
-    /// Hard limit / circuit-breaker regime.
+    /// Hard limit / circuit-breaker regime (whitepaper "Critical").
     HardLimit,
 }
 
@@ -67,10 +80,10 @@ pub struct GlobalState {
     // ----- Per-venue -----
     pub venues: Vec<VenueState>,
 
-    // ----- Fair value / “Kalman-lite” filter -----
+    // ----- Fair value / Kalman filter backbone -----
     /// Last time the fair-value filter was updated.
     pub kf_last_update_ms: TimestampMs,
-    /// Dummy variance term kept for future KF upgrades.
+    /// 1D KF variance term P.
     pub kf_p: f64,
     /// Filtered log-price x_t = log(S_t).
     pub kf_x_hat: f64,
@@ -78,40 +91,35 @@ pub struct GlobalState {
     pub fair_value_prev: f64,
     /// Current fair value S_t (if we have one).
     pub fair_value: Option<f64>,
-    /// Short-horizon fair value vol (σ_short) – kept for future use.
+    /// Short-horizon fair value vol (σ_short).
     pub fv_short_vol: f64,
-    /// Long-horizon fair value vol (σ_long) – kept for future use.
+    /// Long-horizon fair value vol (σ_long).
     pub fv_long_vol: f64,
-    /// Effective volatility σ_eff (used by quoting / risk).
+    /// Effective volatility σ_eff = max(σ_short, σ_min).
     pub sigma_eff: f64,
 
-    // ----- Volatility-driven control scalars (Section 6) -----
+    // ----- Volatility-driven control scalars (whitepaper Section 6) -----
     /// Vol ratio clipped into [vol_ratio_min, vol_ratio_max].
     pub vol_ratio_clipped: f64,
     pub spread_mult: f64,
     pub size_mult: f64,
     pub band_mult: f64,
 
-    // ----- Inventory & basis (Section 8) -----
-    /// Global net trading inventory \(q_t\) in TAO.
-    ///
-    /// Sign convention:
-    /// - `q_t > 0`  → net long `q_t` TAO
-    /// - `q_t < 0`  → net short `|q_t|` TAO
-    /// - `|q_t| ≈ 0` → approximately flat
+    // ----- Inventory & basis (whitepaper Section 8) -----
+    /// Global net trading inventory q_t in TAO.
     pub q_global_tao: f64,
     /// Dollar delta q_t * S_t.
     pub dollar_delta_usd: f64,
-    /// Net basis exposure in USD (signed).
+    /// Net basis exposure B_t in USD (signed): sum_v q_v * (m_v - S_t).
     pub basis_usd: f64,
-    /// Gross basis exposure in USD (sum of absolute venue bases).
+    /// Gross basis exposure in USD: sum_v |q_v| * |m_v - S_t|.
     pub basis_gross_usd: f64,
 
     // ----- PnL -----
     pub daily_realised_pnl: f64,
     pub daily_unrealised_pnl: f64,
     pub daily_pnl_total: f64,
-    /// Optional PnL anchor fair value (not used yet but kept for spec).
+    /// Optional PnL anchor fair value (kept for spec / future).
     pub pnl_ref_fair_value: Option<f64>,
 
     // ----- Risk regime & limits -----
@@ -148,8 +156,7 @@ impl GlobalState {
                 funding_8h: 0.0,
                 avg_entry_price: 0.0,
 
-                // For now we just give each venue a synthetic chunk of
-                // available margin and set liquidation far away.
+                // Synthetic defaults; real implementations poll these.
                 margin_balance_usd: 0.0,
                 margin_used_usd: 0.0,
                 margin_available_usd: 10_000.0,
@@ -206,7 +213,7 @@ impl GlobalState {
 //    existing inventory,
 //  - subtract trading fees,
 //  - accumulate into daily_realised_pnl; total PnL will be updated when
-//    we recompute after fills.
+//    we recompute marks/unrealised.
 
 impl GlobalState {
     /// Apply a single perp fill into the state.
@@ -224,93 +231,108 @@ impl GlobalState {
         price: f64,
         fee_bps: f64,
     ) {
-        if size_tao <= 0.0 {
+        if size_tao <= 0.0 || !price.is_finite() || price <= 0.0 {
             return;
         }
 
-        if let Some(v) = self.venues.get_mut(venue_index) {
-            // Signed trade size: + for buy, - for sell.
-            let trade = match side {
-                Side::Buy => size_tao,
-                Side::Sell => -size_tao,
-            };
+        let Some(v) = self.venues.get_mut(venue_index) else {
+            return;
+        };
 
-            let q_old = v.position_tao;
-            let p_old = v.avg_entry_price;
-            let p_trade = price;
+        // Signed trade size: + for buy, - for sell.
+        let trade = match side {
+            Side::Buy => size_tao,
+            Side::Sell => -size_tao,
+        };
 
-            // Total fee in USD (always reduces realised PnL if fee_bps > 0).
-            let fee = (fee_bps / 10_000.0) * p_trade * size_tao.abs();
+        let q_old = v.position_tao;
+        let p_old = v.avg_entry_price;
+        let p_trade = price;
 
-            let mut realised = 0.0_f64;
+        // Total fee in USD (positive reduces PnL; negative is a rebate).
+        let fee = (fee_bps / 10_000.0) * p_trade * size_tao;
 
-            if q_old == 0.0 {
-                // Opening a fresh position.
-                v.position_tao = trade;
-                v.avg_entry_price = p_trade;
-            } else {
-                let same_dir = q_old.signum() == trade.signum();
+        let mut realised = 0.0_f64;
 
-                if same_dir {
-                    // Add to existing position, update VWAP entry price.
-                    let q_new = q_old + trade;
-                    if q_new != 0.0 {
-                        let w_old = q_old.abs();
-                        let w_trade = trade.abs();
-                        let p_new = (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
-                        v.position_tao = q_new;
-                        v.avg_entry_price = p_new;
-                    } else {
-                        // Pathological cancellation.
-                        v.position_tao = 0.0;
-                        v.avg_entry_price = 0.0;
-                    }
+        if q_old == 0.0 {
+            // Opening a fresh position.
+            v.position_tao = trade;
+            v.avg_entry_price = p_trade;
+        } else {
+            let same_dir = q_old.signum() == trade.signum();
+
+            if same_dir {
+                // Add to existing position, update VWAP entry price.
+                let q_new = q_old + trade;
+                if q_new != 0.0 {
+                    let w_old = q_old.abs();
+                    let w_trade = trade.abs();
+                    v.avg_entry_price = (p_old * w_old + p_trade * w_trade) / (w_old + w_trade);
+                    v.position_tao = q_new;
                 } else {
-                    // Closing or flipping some or all of the existing position.
-                    let close_qty = trade.abs().min(q_old.abs());
+                    // Exactly flat (rare).
+                    v.position_tao = 0.0;
+                    v.avg_entry_price = 0.0;
+                }
+            } else {
+                // Closing or flipping some/all of the existing position.
+                let close_qty = trade.abs().min(q_old.abs());
 
-                    if close_qty > 0.0 {
-                        if q_old > 0.0 {
-                            // Closing a long: PnL = (sell_price - entry_price) * qty.
-                            realised += (p_trade - p_old) * close_qty;
-                        } else {
-                            // Closing a short: PnL = (entry_price - buy_price) * qty.
-                            realised += (p_old - p_trade) * close_qty;
-                        }
-                    }
-
-                    let q_new = q_old + trade;
-
-                    if q_old.abs() > trade.abs() {
-                        // Partial close; keep original entry price.
-                        v.position_tao = q_new;
-                        v.avg_entry_price = p_old;
-                    } else if q_old.abs() < trade.abs() {
-                        // Closed and flipped into a new position.
-                        v.position_tao = q_new;
-                        v.avg_entry_price = p_trade;
+                if close_qty > 0.0 {
+                    if q_old > 0.0 {
+                        // Closing a long: sell closes.
+                        realised += (p_trade - p_old) * close_qty;
                     } else {
-                        // Exactly flat.
-                        v.position_tao = 0.0;
-                        v.avg_entry_price = 0.0;
+                        // Closing a short: buy closes.
+                        realised += (p_old - p_trade) * close_qty;
                     }
                 }
+
+                let q_new = q_old + trade;
+
+                if q_old.abs() > trade.abs() {
+                    // Partial close; keep original entry price.
+                    v.position_tao = q_new;
+                    v.avg_entry_price = p_old;
+                } else if q_old.abs() < trade.abs() {
+                    // Closed and flipped into a new position.
+                    v.position_tao = q_new;
+                    v.avg_entry_price = p_trade;
+                } else {
+                    // Exactly flat.
+                    v.position_tao = 0.0;
+                    v.avg_entry_price = 0.0;
+                }
             }
-
-            // Subtract fees from realised PnL.
-            realised -= fee;
-
-            // Accumulate into global realised PnL.
-            self.daily_realised_pnl += realised;
-            // `daily_unrealised_pnl` will be updated in `recompute_after_fills`.
-            self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
         }
+
+        // Fees always apply to the executed trade.
+        realised -= fee;
+
+        self.daily_realised_pnl += realised;
+        // Unrealised is marked in `recompute_after_fills`.
+        self.daily_pnl_total = self.daily_realised_pnl + self.daily_unrealised_pnl;
     }
 
-    /// Recompute inventory, basis and mark-to-market PnL after a batch of fills.
-    /// Called by the Engine after synthetic / hedge fills.
+    /// Recompute inventory, basis and mark-to-market PnL.
+    ///
+    /// Despite the historical name, this is safe and intended to be called:
+    ///  - after a batch of fills, and
+    ///  - on every main tick after fair value updates (whitepaper: mark-to-S_t).
     pub fn recompute_after_fills(&mut self, _cfg: &Config) {
+        // Prefer current fair; else fall back to previous fair.
         let s_t = self.fair_value.unwrap_or(self.fair_value_prev);
+
+        // If we still don't have a sane fair value, keep everything at 0.
+        if !s_t.is_finite() || s_t <= 0.0 {
+            self.q_global_tao = 0.0;
+            self.dollar_delta_usd = 0.0;
+            self.basis_usd = 0.0;
+            self.basis_gross_usd = 0.0;
+            self.daily_unrealised_pnl = 0.0;
+            self.daily_pnl_total = self.daily_realised_pnl;
+            return;
+        }
 
         self.q_global_tao = 0.0;
         self.dollar_delta_usd = 0.0;
@@ -320,16 +342,23 @@ impl GlobalState {
         let mut unrealised = 0.0_f64;
 
         for v in &self.venues {
-            self.q_global_tao += v.position_tao;
-            self.dollar_delta_usd += v.position_tao * s_t;
+            let q = v.position_tao;
 
-            let mark = v.mid.unwrap_or(s_t);
-            let basis_v = v.position_tao * (mark - s_t);
-            self.basis_usd += basis_v;
-            self.basis_gross_usd += basis_v.abs();
+            self.q_global_tao += q;
+            self.dollar_delta_usd += q * s_t;
 
-            if v.position_tao != 0.0 {
-                unrealised += v.position_tao * (s_t - v.avg_entry_price);
+            // Per-venue basis b_v = m_v - S_t (if no mid, assume m_v == S_t => b_v=0).
+            let b_v = v.mid.unwrap_or(s_t) - s_t;
+
+            // Net basis exposure: sum q_v * b_v
+            self.basis_usd += q * b_v;
+
+            // Gross basis exposure: sum |q_v| * |b_v|
+            self.basis_gross_usd += q.abs() * b_v.abs();
+
+            // Mark-to-fair unrealised PnL.
+            if q != 0.0 {
+                unrealised += q * (s_t - v.avg_entry_price);
             }
         }
 

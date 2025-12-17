@@ -436,10 +436,10 @@ impl Config {
     /// Other profiles only adjust a small set of knobs on top.
     pub fn for_profile(profile: RiskProfile) -> Self {
         let mut cfg = Config::default();
-    
+
         // We treat Config::default() as the world-model "balanced" centre.
         // Profiles below are tuned using the Exp07/10/11/12 research pipeline.
-    
+
         match profile {
             RiskProfile::Balanced => {
                 // World-model tuned "balanced" centre (exp08).
@@ -450,44 +450,44 @@ impl Config {
                 // Keep existing loss limit for now; empirical drawdown is safe.
                 cfg.risk.daily_loss_limit = 5_000.0;
             }
-    
+
             RiskProfile::Conservative => {
                 // Conservative profile:
                 // - Same world-model as Balanced
                 // - Risk-scaled down using Exp12 (risk_scale ≈ 0.466)
                 cfg.initial_q_tao = 0.0;
-    
+
                 // Tighten hedge band and MM risk parameter.
                 cfg.hedge.hedge_band_base = 2.621_25; // ≈ 5.625 * 0.466
-                cfg.mm.size_eta = 0.046_6;           // ≈ 0.10  * 0.466
+                cfg.mm.size_eta = 0.046_6; // ≈ 0.10  * 0.466
                 cfg.volatility.vol_ref = 0.028_125;
-    
+
                 // Shrink delta & PnL limits proportionally.
                 cfg.risk.delta_hard_limit_usd_base = 46_600.0; // ≈ 100k * 0.466
-                cfg.risk.daily_loss_limit = 2_000.0;           // matches Exp12 tuned preset
+                cfg.risk.daily_loss_limit = 2_000.0; // matches Exp12 tuned preset
             }
-    
+
             RiskProfile::Aggressive => {
                 // Aggressive profile:
                 // - Same world-model centre as Balanced
                 // - Risk-scaled down using Exp12 (risk_scale ≈ 0.864)
                 cfg.initial_q_tao = 0.0;
-    
+
                 // Slightly tighter than centre to bring empirical dd back under 8k.
-                cfg.hedge.hedge_band_base = 4.86;   // ≈ 5.625 * 0.864
-                cfg.mm.size_eta = 0.086_4;          // ≈ 0.10  * 0.864
+                cfg.hedge.hedge_band_base = 4.86; // ≈ 5.625 * 0.864
+                cfg.mm.size_eta = 0.086_4; // ≈ 0.10  * 0.864
                 cfg.volatility.vol_ref = 0.028_125;
-    
+
                 // Scale delta limit proportionally.
                 cfg.risk.delta_hard_limit_usd_base = 86_400.0; // ≈ 100k * 0.864
-    
+
                 // Keep loss limit as-is for now; world-model dd budget is 8k.
                 cfg.risk.daily_loss_limit = 2_000.0;
-            }    
+            }
         }
-    
+
         cfg
-    }      
+    }
 
     /// Build a Config from a profile, then apply environment overrides.
     ///

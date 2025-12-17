@@ -86,11 +86,8 @@ where
             println!("\n================ Tick {} =================", tick);
 
             // 1) Seed synthetic mids / books and run the core engine tick.
-            self.engine
-                .seed_dummy_mids(&mut self.state, now_ms);
-            self.engine
-                .main_tick(&mut self.state, now_ms);
-
+            self.engine.seed_dummy_mids(&mut self.state, now_ms);
+            self.engine.main_tick(&mut self.state, now_ms);
 
             // 3) Print global snapshot.
             self.print_state_snapshot();
@@ -100,10 +97,7 @@ where
 
             println!("\nPer-venue quotes:");
             for q in &mm_quotes {
-                println!(
-                    " {:<10}: bid={:?}, ask={:?}",
-                    q.venue_id, q.bid, q.ask
-                );
+                println!(" {:<10}: bid={:?}, ask={:?}", q.venue_id, q.bid, q.ask);
             }
 
             let hedge_plan = compute_hedge_plan(self.cfg, &self.state);
@@ -119,12 +113,10 @@ where
             }
 
             // 5) Convert to abstract order intents.
-            let mut all_intents: Vec<OrderIntent> =
-                mm_quotes_to_order_intents(&mm_quotes);
+            let mut all_intents: Vec<OrderIntent> = mm_quotes_to_order_intents(&mm_quotes);
 
             if let Some(plan) = hedge_plan {
-                let mut hedge_intents =
-                    hedge_plan_to_order_intents(&plan);
+                let mut hedge_intents = hedge_plan_to_order_intents(&plan);
                 all_intents.append(&mut hedge_intents);
             }
 
@@ -217,18 +209,12 @@ where
         let size_tao = q0.abs();
         let side = if q0 > 0.0 { Side::Buy } else { Side::Sell };
 
-        let s_t = self
-            .state
-            .fair_value
-            .unwrap_or(self.state.fair_value_prev);
+        let s_t = self.state.fair_value.unwrap_or(self.state.fair_value_prev);
         let entry_price = if s_t > 0.0 { s_t } else { 250.0 };
 
         println!(
             "Injecting synthetic initial position: venue={} side={:?} size={} @ {:.4}",
-            self.cfg.venues[venue_index].id,
-            side,
-            size_tao,
-            entry_price,
+            self.cfg.venues[venue_index].id, side, size_tao, entry_price,
         );
 
         self.state
@@ -238,10 +224,7 @@ where
     }
 
     fn print_state_snapshot(&self) {
-        let s_t = self
-            .state
-            .fair_value
-            .unwrap_or(self.state.fair_value_prev);
+        let s_t = self.state.fair_value.unwrap_or(self.state.fair_value_prev);
 
         println!("Fair value S_t: {:.4}", s_t);
         println!("Sigma_eff: {:.6}", self.state.sigma_eff);
@@ -256,18 +239,14 @@ where
         println!("Delta limit (USD): {:.4}", self.state.delta_limit_usd);
         println!(
             "Basis warn / hard (USD): {:.4} / {:.4}",
-            self.state.basis_limit_warn_usd,
-            self.state.basis_limit_hard_usd,
+            self.state.basis_limit_warn_usd, self.state.basis_limit_hard_usd,
         );
         println!("Daily PnL (realised): {:.4}", self.state.daily_realised_pnl);
         println!(
             "Daily PnL (unrealised): {:.4}",
             self.state.daily_unrealised_pnl
         );
-        println!(
-            "Daily PnL total: {:.4}",
-            self.state.daily_pnl_total
-        );
+        println!("Daily PnL total: {:.4}", self.state.daily_pnl_total);
         println!("Risk regime after tick: {:?}", self.state.risk_regime);
         println!("Kill switch: {}", self.state.kill_switch);
 
@@ -281,18 +260,9 @@ where
     }
 
     fn print_inventory_and_pnl(&self) {
-        println!(
-            " Global q_t (TAO): {:.4}",
-            self.state.q_global_tao
-        );
-        println!(
-            " Dollar delta (USD): {:.4}",
-            self.state.dollar_delta_usd
-        );
-        println!(
-            " Basis exposure (USD): {:.4}",
-            self.state.basis_usd
-        );
+        println!(" Global q_t (TAO): {:.4}", self.state.q_global_tao);
+        println!(" Dollar delta (USD): {:.4}", self.state.dollar_delta_usd);
+        println!(" Basis exposure (USD): {:.4}", self.state.basis_usd);
         println!(
             " Daily PnL (realised / unrealised / total): {:.4} / {:.4} / {:.4}",
             self.state.daily_realised_pnl,
