@@ -258,8 +258,57 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | Kill switch | Implemented (latching) | Milestone C: triggers on any hard breach, latches until reset |
 | MM quoting | Implemented | Stops on kill_switch OR HardLimit (Milestone C) |
 | Hedging | Partial | Cost model is simplified vs canonical; stops on kill_switch |
-| Cross-venue exits | Implemented | Profit-only exits; stops on kill_switch OR HardLimit |
+| Cross-venue exits | Implemented (Milestone E) | Full allocator with net edge, basis/funding, fragmentation; lot size + min notional enforcement |
 | Production I/O | Planned | Current focus is deterministic sim + telemetry |
+
+### Milestone E: Cross-venue Exit Allocator (Section 12)
+
+**Status: Implemented**
+
+The exit allocator runs after MM fill batches and before hedge, implementing the canonical
+Section 12 cross-venue exit optimization with the following features:
+
+**Edge calculation:**
+- Net edge = base_profit - fees - slippage_buffer - vol_buffer + basis_adj + funding_adj - penalties + bonuses
+- Slippage model: linear + quadratic (`slippage = linear_coeff * size + quadratic_coeff * size²`)
+- Volatility buffer: `vol_buffer = vol_buffer_mult * sigma_eff * fair_value`
+- Basis/funding adjustments weight venue selection by carry advantage
+
+**Fragmentation and basis-risk handling:**
+- Fragmentation penalty for opening new legs or increasing venue exposure
+- Fragmentation reduction bonus for closing positions entirely (consolidation)
+- Basis-risk penalty for trades that increase |B_t| (signed basis exposure)
+- Deterministic tie-breaking: when edges are similar, prefers actions that reduce fragmentation/basis-risk
+
+**Per-venue constraints:**
+- `lot_size_tao`: minimum order size per venue
+- `size_step_tao`: size increment (orders rounded to multiples)
+- `min_notional_usd`: minimum notional value per order
+- If rounding makes size too small or below min-notional, venue is skipped
+
+**Gating (unchanged from prior implementation):**
+- Skip disabled, toxic (≥tox_high), stale venues
+- Skip venues without fair value / valid book data
+- Liquidation distance safety caps (reduce-only mode near LIQ_WARN/LIQ_CRIT)
+
+**Approximations and known limitations:**
+- **Depth model**: Uses `depth_near_mid` as a proxy for top-of-book depth; no full L2 orderbook
+- **Slippage model**: Linear + quadratic approximation; real market impact may differ
+- **Entry reference**: Uses weighted average entry price across venues (no full fill ledger)
+- **Basis-risk**: Linear approximation of Δ|B| change; actual impact is non-linear for large trades
+
+**Test coverage:**
+- `exit_respects_lot_size_and_min_notional`: verifies lot size rounding and min notional enforcement
+- `exit_prefers_less_fragmentation_when_edges_similar`: verifies deterministic fragmentation preference
+- `exit_prefers_less_basis_risk_when_edges_similar`: verifies basis-risk penalty behavior
+- `exit_deterministic_ordering_with_identical_edges`: proves deterministic tie-breaking
+- Existing tests: profit-only, skip disabled/toxic/stale, splits across best venues with per-venue caps
+
+**Wiring (strategy loop order):**
+```
+MM quotes → MM fills → recompute → EXIT → recompute → hedge → recompute
+```
+This ordering is enforced in both `src/strategy.rs` and `src/bin/monte_carlo.rs`.
 
 ---
 

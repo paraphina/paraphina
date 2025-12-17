@@ -1,9 +1,21 @@
 // tests/config_profile_tests.rs
+//
+// Note: These tests manipulate environment variables and must run serially.
+// Use `cargo test --test config_profile_tests -- --test-threads=1` if flaky.
 
 use paraphina::config::Config;
+use std::sync::Mutex;
+
+// Global mutex to serialize tests that touch environment variables.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
 fn env_risk_profile_is_honored_by_from_env_or_default() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
+    // Clean up any stale env var first
+    std::env::remove_var("PARAPHINA_RISK_PROFILE");
+
     // Set env var for this test process.
     std::env::set_var("PARAPHINA_RISK_PROFILE", "conservative");
 
@@ -20,6 +32,11 @@ fn env_risk_profile_is_honored_by_from_env_or_default() {
 
 #[test]
 fn unknown_env_risk_profile_falls_back_to_balanced() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
+    // Clean up any stale env var first
+    std::env::remove_var("PARAPHINA_RISK_PROFILE");
+
     std::env::set_var("PARAPHINA_RISK_PROFILE", "definitely_not_a_real_profile");
 
     let cfg = Config::from_env_or_default();

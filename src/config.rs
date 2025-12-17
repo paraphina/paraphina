@@ -78,6 +78,12 @@ pub struct VenueConfig {
     pub w_fund: f64,
     /// Whether this venue is allowed to be used for hedging.
     pub is_hedge_allowed: bool,
+    /// Minimum lot size in TAO (orders smaller than this are rejected).
+    pub lot_size_tao: f64,
+    /// Size step/increment in TAO (orders must be multiples of this).
+    pub size_step_tao: f64,
+    /// Minimum notional value in USD (orders below this are skipped).
+    pub min_notional_usd: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -231,11 +237,32 @@ pub struct ExitConfig {
     /// Fraction of depth_near_mid we allow consuming for exits.
     pub depth_fraction: f64,
 
-    /// Slippage model multiplier against (notional/depth)*spread.
+    /// Slippage model linear coefficient (USD per TAO).
+    /// slippage = linear_coeff * size + quadratic_coeff * size^2
+    pub slippage_linear_coeff: f64,
+
+    /// Slippage model quadratic coefficient (USD per TAO^2).
+    /// slippage = linear_coeff * size + quadratic_coeff * size^2
+    pub slippage_quadratic_coeff: f64,
+
+    /// Legacy slippage model multiplier against (notional/depth)*spread.
+    /// Used when depth-based slippage model is desired.
     pub slippage_spread_mult: f64,
 
     /// Minimum depth_near_mid (USD) required to consider a venue for exits.
     pub min_depth_usd: f64,
+
+    /// Volatility buffer multiplier applied to sigma_eff * fair_value.
+    /// vol_buffer = vol_buffer_mult * sigma_eff * fair
+    pub vol_buffer_mult: f64,
+
+    /// Basis-risk penalty weight (USD/TAO per unit basis increase).
+    /// Applied when an exit would increase |B_t|.
+    pub basis_risk_penalty_weight: f64,
+
+    /// Fragmentation reduction bonus (USD/TAO) when exit reduces venue count.
+    /// Provides deterministic preference for consolidation when edges are similar.
+    pub fragmentation_reduction_bonus: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +337,9 @@ impl Default for Config {
                 w_liq: 0.25,
                 w_fund: 0.25,
                 is_hedge_allowed: true,
+                lot_size_tao: 0.01,
+                size_step_tao: 0.01,
+                min_notional_usd: 10.0,
             },
             VenueConfig {
                 id: "hyperliquid".to_string(),
@@ -325,6 +355,9 @@ impl Default for Config {
                 w_liq: 0.25,
                 w_fund: 0.25,
                 is_hedge_allowed: true,
+                lot_size_tao: 0.01,
+                size_step_tao: 0.01,
+                min_notional_usd: 10.0,
             },
             VenueConfig {
                 id: "aster".to_string(),
@@ -340,6 +373,9 @@ impl Default for Config {
                 w_liq: 0.20,
                 w_fund: 0.20,
                 is_hedge_allowed: true,
+                lot_size_tao: 0.01,
+                size_step_tao: 0.01,
+                min_notional_usd: 10.0,
             },
             VenueConfig {
                 id: "lighter".to_string(),
@@ -355,6 +391,9 @@ impl Default for Config {
                 w_liq: 0.15,
                 w_fund: 0.15,
                 is_hedge_allowed: true,
+                lot_size_tao: 0.01,
+                size_step_tao: 0.01,
+                min_notional_usd: 10.0,
             },
             VenueConfig {
                 id: "paradex".to_string(),
@@ -370,6 +409,9 @@ impl Default for Config {
                 w_liq: 0.15,
                 w_fund: 0.15,
                 is_hedge_allowed: true,
+                lot_size_tao: 0.01,
+                size_step_tao: 0.01,
+                min_notional_usd: 10.0,
             },
         ];
 
@@ -476,8 +518,17 @@ impl Default for Config {
             funding_horizon_sec: 30.0,
             fragmentation_penalty_per_tao: 0.05,
             depth_fraction: 0.10,
-            slippage_spread_mult: 1.00,
+            // Linear + quadratic slippage model coefficients
+            slippage_linear_coeff: 0.01,     // USD per TAO
+            slippage_quadratic_coeff: 0.001, // USD per TAO^2
+            slippage_spread_mult: 1.00,      // legacy spread-based model
             min_depth_usd: 500.0,
+            // Volatility buffer: vol_buffer = vol_buffer_mult * sigma_eff * fair
+            vol_buffer_mult: 0.5,
+            // Basis-risk penalty weight
+            basis_risk_penalty_weight: 0.10,
+            // Fragmentation reduction bonus (deterministic tie-break preference)
+            fragmentation_reduction_bonus: 0.02,
         };
 
         // ----- Toxicity / venue health -----
