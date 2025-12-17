@@ -189,6 +189,8 @@ where
 
             // Telemetry snapshot (must keep schema stable for research tooling)
             // Required fields: t, pnl_total, risk_regime, kill_switch (per research contract)
+            // Milestone D additions: fv_available, fair_value, sigma_eff,
+            //                        healthy_venues_used_count, healthy_venues_used
             self.telemetry.log_json(&json!({
                 "t": tick,
                 "pnl_realised": self.state.daily_realised_pnl,
@@ -200,6 +202,12 @@ where
                 "q_global_tao": self.state.q_global_tao,
                 "dollar_delta_usd": self.state.dollar_delta_usd,
                 "basis_usd": self.state.basis_usd,
+                // Milestone D: FV gating & volatility telemetry
+                "fv_available": self.state.fv_available,
+                "fair_value": self.state.fair_value,
+                "sigma_eff": self.state.sigma_eff,
+                "healthy_venues_used_count": self.state.healthy_venues_used_count,
+                "healthy_venues_used": self.state.healthy_venues_used,
             }));
 
             // Human-readable / structured logs via sink

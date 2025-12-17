@@ -145,6 +145,20 @@ pub struct GlobalState {
     /// Effective volatility σ_eff = max(σ_short, σ_min).
     pub sigma_eff: f64,
 
+    // ----- Milestone D: FV gating telemetry -----
+    /// Whether fair value was successfully updated this tick.
+    ///
+    /// True if >= min_healthy_for_kf observations passed gating and the
+    /// measurement update was applied. False if we only did a time update
+    /// (prediction step) due to insufficient healthy venue data.
+    pub fv_available: bool,
+    /// Indices of venues whose observations were used in the last KF update.
+    ///
+    /// Empty if fv_available is false (time update only).
+    pub healthy_venues_used: Vec<usize>,
+    /// Count of healthy venues used in the last KF update (convenience field).
+    pub healthy_venues_used_count: usize,
+
     // ----- Volatility-driven control scalars (whitepaper Section 6) -----
     /// Vol ratio clipped into [vol_ratio_min, vol_ratio_max].
     pub vol_ratio_clipped: f64,
@@ -231,6 +245,11 @@ impl GlobalState {
             fv_short_vol: 0.0,
             fv_long_vol: 0.0,
             sigma_eff: cfg.volatility.sigma_min,
+
+            // Milestone D: FV gating telemetry
+            fv_available: false,
+            healthy_venues_used: Vec::new(),
+            healthy_venues_used_count: 0,
 
             // Vol control scalars
             vol_ratio_clipped: 1.0,
