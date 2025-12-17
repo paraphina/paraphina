@@ -189,13 +189,74 @@ pub struct MmConfig {
 
 #[derive(Debug, Clone)]
 pub struct HedgeConfig {
+    // ----- Deadband + LQ control (Section 13.1) -----
     /// Base half-band in TAO (before vol scaling).
+    /// `band_vol = band_base_tao * (1 + band_vol_mult * vol_ratio_clipped)`
+    pub band_base_tao: f64,
+
+    /// Volatility multiplier for the deadband.
+    pub band_vol_mult: f64,
+
+    /// LQ controller gain k_hedge = alpha / (alpha + beta).
+    /// The global hedge step is ΔH_raw = k_hedge * X.
+    pub k_hedge: f64,
+
+    /// Max TAO we are allowed to move in one hedge action (global cap).
+    pub max_step_tao: f64,
+
+    // ----- Per-venue allocation (Section 13.2) -----
+    /// Max TAO per single venue per tick.
+    pub max_venue_tao_per_tick: f64,
+
+    /// Fraction of venue depth_near_mid (converted to TAO) we consume per hedge.
+    pub depth_fraction: f64,
+
+    /// Minimum depth_near_mid (USD) required to consider a venue for hedging.
+    pub min_depth_usd: f64,
+
+    /// Weight for funding benefit in the per-venue cost model.
+    /// Positive => prefer venues with favorable funding.
+    pub funding_weight: f64,
+
+    /// Weight for basis edge in the per-venue cost model.
+    /// Positive => prefer venues where we can capture basis spread.
+    pub basis_weight: f64,
+
+    /// Funding horizon (seconds) used for approximating funding benefit.
+    pub funding_horizon_sec: f64,
+
+    /// Slippage buffer constant (USD/TAO) added to execution cost.
+    pub slippage_buffer: f64,
+
+    /// Guard price multiplier for IOC orders.
+    /// Guard price = ask + guard_mult * spread (buy) or bid - guard_mult * spread (sell).
+    pub guard_mult: f64,
+
+    /// Fragmentation penalty (USD/TAO) applied when opening a new position on a venue.
+    pub frag_penalty: f64,
+
+    /// Liquidation warning sigma threshold (copied from risk config for gating).
+    /// Penalize venues as dist_liq_sigma approaches this.
+    pub liq_warn_sigma: f64,
+
+    /// Liquidation critical sigma threshold.
+    /// Hard-skip venues at or below this.
+    pub liq_crit_sigma: f64,
+
+    /// Penalty scale for liquidation proximity (USD/TAO per sigma below warn).
+    pub liq_penalty_scale: f64,
+
+    // ----- Legacy compat (for migration) -----
+    /// Legacy: Base half-band in TAO. Alias for band_base_tao.
     pub hedge_band_base: f64,
-    /// Max TAO we are allowed to move in one hedge action.
+
+    /// Legacy: Max step. Alias for max_step_tao.
     pub hedge_max_step: f64,
-    /// LQ controller weight α_hedge.
+
+    /// Legacy: alpha_hedge (unused in new model).
     pub alpha_hedge: f64,
-    /// LQ controller weight β_hedge.
+
+    /// Legacy: beta_hedge (unused in new model).
     pub beta_hedge: f64,
 }
 
@@ -494,12 +555,38 @@ impl Default for Config {
             funding_skew_clip: 100.0,
         };
 
-        // ----- Hedge engine (global LQ controller) -----
+        // ----- Hedge engine (global LQ controller + allocation, Section 13) -----
         let hedge = HedgeConfig {
+            // Deadband + LQ control (Section 13.1)
             // With ~300 USD / TAO and our default limits, this band corresponds
             // to ~6–9k USD of unhedged delta before the LQ controller kicks in.
-            hedge_band_base: BAND_BASE, // TAO band (balanced centre)
-            hedge_max_step: 20.0,       // TAO per hedge step
+            band_base_tao: BAND_BASE, // TAO band (balanced centre)
+            band_vol_mult: 1.0,       // volatility scaling for the band
+
+            // k_hedge = alpha / (alpha + beta); with alpha=beta=1 => k=0.5
+            // Using k=0.5 as default for smoother hedging
+            k_hedge: 0.5,
+            max_step_tao: 20.0, // TAO per hedge step (global cap)
+
+            // Per-venue allocation (Section 13.2)
+            max_venue_tao_per_tick: 10.0,
+            depth_fraction: 0.10,
+            min_depth_usd: 500.0,
+            funding_weight: 0.20,
+            basis_weight: 0.20,
+            funding_horizon_sec: 30.0,
+            slippage_buffer: 0.05, // USD/TAO
+            guard_mult: 0.5,       // half-spread for guard price
+            frag_penalty: 0.02,    // USD/TAO penalty for opening new leg
+
+            // Liquidation-aware gating
+            liq_warn_sigma: 5.0,     // start penalizing inside 5σ
+            liq_crit_sigma: 2.0,     // hard-skip inside 2σ
+            liq_penalty_scale: 0.10, // USD/TAO per sigma below warn
+
+            // Legacy aliases (for backwards compat)
+            hedge_band_base: BAND_BASE,
+            hedge_max_step: 20.0,
             alpha_hedge: 1.0,
             beta_hedge: 1.0,
         };
@@ -590,7 +677,8 @@ impl Config {
             RiskProfile::Balanced => {
                 // World-model tuned "balanced" centre (exp08).
                 cfg.initial_q_tao = 0.0;
-                cfg.hedge.hedge_band_base = 5.625;
+                cfg.hedge.band_base_tao = 5.625;
+                cfg.hedge.hedge_band_base = 5.625; // legacy alias
                 cfg.mm.size_eta = 0.10;
                 cfg.volatility.vol_ref = 0.028_125;
                 // Keep existing loss limit for now; empirical drawdown is safe.
@@ -604,7 +692,8 @@ impl Config {
                 cfg.initial_q_tao = 0.0;
 
                 // Tighten hedge band and MM risk parameter.
-                cfg.hedge.hedge_band_base = 2.621_25; // ≈ 5.625 * 0.466
+                cfg.hedge.band_base_tao = 2.621_25; // ≈ 5.625 * 0.466
+                cfg.hedge.hedge_band_base = 2.621_25; // legacy alias
                 cfg.mm.size_eta = 0.046_6; // ≈ 0.10  * 0.466
                 cfg.volatility.vol_ref = 0.028_125;
 
@@ -620,7 +709,8 @@ impl Config {
                 cfg.initial_q_tao = 0.0;
 
                 // Slightly tighter than centre to bring empirical dd back under 8k.
-                cfg.hedge.hedge_band_base = 4.86; // ≈ 5.625 * 0.864
+                cfg.hedge.band_base_tao = 4.86; // ≈ 5.625 * 0.864
+                cfg.hedge.hedge_band_base = 4.86; // legacy alias
                 cfg.mm.size_eta = 0.086_4; // ≈ 0.10  * 0.864
                 cfg.volatility.vol_ref = 0.028_125;
 
@@ -673,17 +763,18 @@ impl Config {
         if let Ok(raw) = env::var("PARAPHINA_HEDGE_BAND_BASE") {
             match raw.parse::<f64>() {
                 Ok(v) => {
-                    cfg.hedge.hedge_band_base = v.max(0.0);
+                    cfg.hedge.band_base_tao = v.max(0.0);
+                    cfg.hedge.hedge_band_base = v.max(0.0); // legacy alias
                     eprintln!(
                         "[config] PARAPHINA_HEDGE_BAND_BASE = {} (overrode default)",
-                        cfg.hedge.hedge_band_base
+                        cfg.hedge.band_base_tao
                     );
                 }
                 Err(_) => {
                     eprintln!(
                         "[config] WARN: could not parse PARAPHINA_HEDGE_BAND_BASE = {:?} as f64; using default {}",
                         raw,
-                        cfg.hedge.hedge_band_base
+                        cfg.hedge.band_base_tao
                     );
                 }
             }
@@ -693,17 +784,78 @@ impl Config {
         if let Ok(raw) = env::var("PARAPHINA_HEDGE_MAX_STEP") {
             match raw.parse::<f64>() {
                 Ok(v) => {
-                    cfg.hedge.hedge_max_step = v.max(0.0);
+                    cfg.hedge.max_step_tao = v.max(0.0);
+                    cfg.hedge.hedge_max_step = v.max(0.0); // legacy alias
                     eprintln!(
                         "[config] PARAPHINA_HEDGE_MAX_STEP = {} (overrode default)",
-                        cfg.hedge.hedge_max_step
+                        cfg.hedge.max_step_tao
                     );
                 }
                 Err(_) => {
                     eprintln!(
                         "[config] WARN: could not parse PARAPHINA_HEDGE_MAX_STEP = {:?} as f64; using default {}",
                         raw,
-                        cfg.hedge.hedge_max_step
+                        cfg.hedge.max_step_tao
+                    );
+                }
+            }
+        }
+
+        // Hedge k_hedge (LQ controller gain).
+        if let Ok(raw) = env::var("PARAPHINA_HEDGE_K_HEDGE") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.hedge.k_hedge = v.clamp(0.0, 1.0);
+                    eprintln!(
+                        "[config] PARAPHINA_HEDGE_K_HEDGE = {} (overrode default)",
+                        cfg.hedge.k_hedge
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_HEDGE_K_HEDGE = {:?} as f64; using default {}",
+                        raw,
+                        cfg.hedge.k_hedge
+                    );
+                }
+            }
+        }
+
+        // Hedge funding weight.
+        if let Ok(raw) = env::var("PARAPHINA_HEDGE_FUNDING_WEIGHT") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.hedge.funding_weight = v;
+                    eprintln!(
+                        "[config] PARAPHINA_HEDGE_FUNDING_WEIGHT = {} (overrode default)",
+                        cfg.hedge.funding_weight
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_HEDGE_FUNDING_WEIGHT = {:?} as f64; using default {}",
+                        raw,
+                        cfg.hedge.funding_weight
+                    );
+                }
+            }
+        }
+
+        // Hedge basis weight.
+        if let Ok(raw) = env::var("PARAPHINA_HEDGE_BASIS_WEIGHT") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.hedge.basis_weight = v;
+                    eprintln!(
+                        "[config] PARAPHINA_HEDGE_BASIS_WEIGHT = {} (overrode default)",
+                        cfg.hedge.basis_weight
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_HEDGE_BASIS_WEIGHT = {:?} as f64; using default {}",
+                        raw,
+                        cfg.hedge.basis_weight
                     );
                 }
             }

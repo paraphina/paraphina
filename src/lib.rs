@@ -25,7 +25,10 @@ pub use engine::Engine;
 
 pub use gateway::{ExecutionGateway, SimGateway};
 
-pub use hedge::{compute_hedge_plan, hedge_plan_to_order_intents, HedgeAllocation, HedgePlan};
+pub use hedge::{
+    compute_hedge_orders, compute_hedge_plan, hedge_plan_to_order_intents, HedgeAllocation,
+    HedgePlan,
+};
 
 pub use logging::{EventSink, FileSink, NoopSink};
 

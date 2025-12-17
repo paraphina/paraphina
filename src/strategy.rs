@@ -169,7 +169,7 @@ where
 
             // 4) Hedge engine (after exits)
             let mut hedge_intents: Vec<OrderIntent> = Vec::new();
-            if let Some(plan) = compute_hedge_plan(self.cfg, &self.state) {
+            if let Some(plan) = compute_hedge_plan(self.cfg, &self.state, now_ms) {
                 hedge_intents = hedge_plan_to_order_intents(&plan);
             }
 
