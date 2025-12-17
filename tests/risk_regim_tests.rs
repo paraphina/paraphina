@@ -268,7 +268,7 @@ fn hedge_disabled_when_kill_switch_active() {
     h.state.dollar_delta_usd = 100.0 * h.state.fair_value.unwrap_or(250.0);
 
     // Verify hedge would normally produce intents
-    let _hedge_before = paraphina::hedge::compute_hedge_orders(h.cfg, &h.state);
+    let _hedge_before = paraphina::hedge::compute_hedge_orders(h.cfg, &h.state, 0);
     // (We don't assert non-empty here since hedge logic has other conditions)
 
     // Now trigger kill switch via PnL breach
@@ -279,7 +279,7 @@ fn hedge_disabled_when_kill_switch_active() {
     assert!(h.state.kill_switch);
 
     // Hedge should produce no orders when kill switch is active
-    let hedge_after = paraphina::hedge::compute_hedge_orders(h.cfg, &h.state);
+    let hedge_after = paraphina::hedge::compute_hedge_orders(h.cfg, &h.state, 0);
     assert!(
         hedge_after.is_empty(),
         "hedge should produce no orders when kill_switch is active"

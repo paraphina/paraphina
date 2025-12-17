@@ -456,7 +456,7 @@ fn run_once(cfg: &Config, seed: u64, ticks: usize, tick_ms: i64, jitter_ms: i64)
         );
 
         // Hedge -> fills -> recompute
-        let hedge_intents = hedge::compute_hedge_orders(cfg, &state);
+        let hedge_intents = hedge::compute_hedge_orders(cfg, &state, now_ms);
         apply_intents_as_fills(cfg, &mut state, &hedge_intents);
         state.recompute_after_fills(cfg);
         update_peaks(
