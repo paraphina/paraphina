@@ -14,7 +14,7 @@ use paraphina::config::{Config, RiskProfile};
 use paraphina::engine::Engine;
 use paraphina::mm::{
     compute_mm_quotes, compute_order_actions, compute_venue_targets, should_replace_order,
-    ActiveMmOrder, MmOrderAction,
+    ActiveMmOrder, MmOrderAction, ShouldReplaceOrderCtx,
 };
 use paraphina::state::{GlobalState, KillReason, RiskRegime};
 use paraphina::types::{Side, VenueStatus};
@@ -660,11 +660,17 @@ fn young_passive_order_not_replaced() {
     };
 
     // 200ms since order placed; min_quote_lifetime_ms is 500.
-    let should_replace = should_replace_order(
-        &cfg, vcfg, &current, 299.91, // Slightly different price
-        1.0, 200, // Order is 100ms old (200 - 100)
-        300.0, 300.10,
-    );
+    let ctx = ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        current: &current,
+        desired_price: 299.91, // Slightly different price
+        desired_size: 1.0,
+        now_ms: 200, // Order is 100ms old (200 - 100)
+        best_bid: 300.0,
+        best_ask: 300.10,
+    };
+    let should_replace = should_replace_order(ctx);
 
     assert!(
         !should_replace,
@@ -686,10 +692,17 @@ fn old_order_with_price_change_replaced() {
     };
 
     // 1 second since order; price changed by 10 ticks.
-    let should_replace = should_replace_order(
-        &cfg, vcfg, &current, 299.80, // 10 cents different (10 ticks at 0.01)
-        1.0, 1000, 300.0, 300.10,
-    );
+    let ctx = ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        current: &current,
+        desired_price: 299.80, // 10 cents different (10 ticks at 0.01)
+        desired_size: 1.0,
+        now_ms: 1000,
+        best_bid: 300.0,
+        best_ask: 300.10,
+    };
+    let should_replace = should_replace_order(ctx);
 
     assert!(
         should_replace,
@@ -711,10 +724,17 @@ fn old_order_with_size_change_replaced() {
     };
 
     // 1 second since order; size changed by 20%.
-    let should_replace = should_replace_order(
-        &cfg, vcfg, &current, 299.90, 1.2, // 20% size increase
-        1000, 300.0, 300.10,
-    );
+    let ctx = ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        current: &current,
+        desired_price: 299.90,
+        desired_size: 1.2, // 20% size increase
+        now_ms: 1000,
+        best_bid: 300.0,
+        best_ask: 300.10,
+    };
+    let should_replace = should_replace_order(ctx);
 
     assert!(
         should_replace,
@@ -737,11 +757,17 @@ fn non_passive_order_replaced_even_if_young() {
     };
 
     // Young order but not passive.
-    let should_replace = should_replace_order(
-        &cfg, vcfg, &current, 299.90, 1.0, 500,    // Only 100ms old
-        300.00, // best_bid
-        300.10,
-    );
+    let ctx = ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        current: &current,
+        desired_price: 299.90,
+        desired_size: 1.0,
+        now_ms: 500, // Only 100ms old
+        best_bid: 300.00,
+        best_ask: 300.10,
+    };
+    let should_replace = should_replace_order(ctx);
 
     // Order is at best_bid, not passive (should be < best_bid - tick).
     // With price tolerance of 1 tick, 10 ticks difference should trigger replace.

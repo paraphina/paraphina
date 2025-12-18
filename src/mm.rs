@@ -650,6 +650,21 @@ fn compute_single_venue_quotes(
 // Order lifetime + tolerance logic (Section 11)
 // ---------------------------------------------------------------------
 
+/// Context for evaluating whether an existing MM order should be replaced.
+///
+/// Bundles all parameters needed by `should_replace_order` to avoid
+/// clippy::too_many_arguments.
+pub struct ShouldReplaceOrderCtx<'a> {
+    pub cfg: &'a Config,
+    pub vcfg: &'a VenueConfig,
+    pub current: &'a ActiveMmOrder,
+    pub desired_price: f64,
+    pub desired_size: f64,
+    pub now_ms: TimestampMs,
+    pub best_bid: f64,
+    pub best_ask: f64,
+}
+
 /// Determines whether an existing MM order should be replaced.
 ///
 /// Returns `true` if the order should be cancelled and replaced.
@@ -657,25 +672,16 @@ fn compute_single_venue_quotes(
 /// Section 11:
 /// - If age_ms < MIN_QUOTE_LIFETIME_MS and order is still passive, keep it.
 /// - Else: replace only if price_diff > PRICE_TOL_TICKS or size_diff > SIZE_TOL_REL.
-pub fn should_replace_order(
-    cfg: &Config,
-    vcfg: &VenueConfig,
-    current: &ActiveMmOrder,
-    desired_price: f64,
-    desired_size: f64,
-    now_ms: TimestampMs,
-    best_bid: f64,
-    best_ask: f64,
-) -> bool {
-    let mm_cfg = &cfg.mm;
-    let tick = vcfg.tick_size.max(1e-6);
+pub fn should_replace_order(ctx: ShouldReplaceOrderCtx<'_>) -> bool {
+    let mm_cfg = &ctx.cfg.mm;
+    let tick = ctx.vcfg.tick_size.max(1e-6);
 
-    let age_ms = now_ms - current.timestamp_ms;
+    let age_ms = ctx.now_ms - ctx.current.timestamp_ms;
 
     // Check if current order is still passive.
-    let is_passive = match current.side {
-        Side::Buy => current.price <= best_bid - tick,
-        Side::Sell => current.price >= best_ask + tick,
+    let is_passive = match ctx.current.side {
+        Side::Buy => ctx.current.price <= ctx.best_bid - tick,
+        Side::Sell => ctx.current.price >= ctx.best_ask + tick,
     };
 
     // If young and still passive, keep it.
@@ -684,8 +690,9 @@ pub fn should_replace_order(
     }
 
     // Compute differences.
-    let price_diff_ticks = (current.price - desired_price).abs() / tick;
-    let size_diff_rel = (current.size - desired_size).abs() / desired_size.max(vcfg.lot_size_tao);
+    let price_diff_ticks = (ctx.current.price - ctx.desired_price).abs() / tick;
+    let size_diff_rel =
+        (ctx.current.size - ctx.desired_size).abs() / ctx.desired_size.max(ctx.vcfg.lot_size_tao);
 
     // Replace if price or size changed beyond tolerance.
     price_diff_ticks > mm_cfg.price_tol_ticks || size_diff_rel > mm_cfg.size_tol_rel
@@ -738,16 +745,17 @@ pub fn compute_order_actions(
     // Handle bid side.
     match (&desired_quote.bid, current_bid) {
         (Some(desired), Some(current)) => {
-            if should_replace_order(
+            let ctx = ShouldReplaceOrderCtx {
                 cfg,
                 vcfg,
                 current,
-                desired.price,
-                desired.size,
+                desired_price: desired.price,
+                desired_size: desired.size,
                 now_ms,
                 best_bid,
                 best_ask,
-            ) {
+            };
+            if should_replace_order(ctx) {
                 actions.push(MmOrderAction::Replace {
                     venue_index: desired_quote.venue_index,
                     old_level: MmLevel {
@@ -779,16 +787,17 @@ pub fn compute_order_actions(
     // Handle ask side.
     match (&desired_quote.ask, current_ask) {
         (Some(desired), Some(current)) => {
-            if should_replace_order(
+            let ctx = ShouldReplaceOrderCtx {
                 cfg,
                 vcfg,
                 current,
-                desired.price,
-                desired.size,
+                desired_price: desired.price,
+                desired_size: desired.size,
                 now_ms,
                 best_bid,
                 best_ask,
-            ) {
+            };
+            if should_replace_order(ctx) {
                 actions.push(MmOrderAction::Replace {
                     venue_index: desired_quote.venue_index,
                     old_level: MmLevel {
@@ -1075,12 +1084,17 @@ mod tests {
         };
 
         // Within lifetime (500ms), passive order should not be replaced.
-        let should_replace = should_replace_order(
-            &cfg, vcfg, &current, 299.91, // Slightly different price
-            1.0, 200,    // Only 100ms old
-            300.0,  // best_bid
-            300.10, // best_ask
-        );
+        let ctx = ShouldReplaceOrderCtx {
+            cfg: &cfg,
+            vcfg,
+            current: &current,
+            desired_price: 299.91, // Slightly different price
+            desired_size: 1.0,
+            now_ms: 200, // Only 100ms old
+            best_bid: 300.0,
+            best_ask: 300.10,
+        };
+        let should_replace = should_replace_order(ctx);
 
         assert!(
             !should_replace,
@@ -1102,11 +1116,17 @@ mod tests {
         };
 
         // Beyond lifetime, large price change should trigger replacement.
-        let should_replace = should_replace_order(
-            &cfg, vcfg, &current, 299.80, // 10 cents different (10 ticks with 0.01 tick size)
-            1.0, 1000, // 1 second old
-            300.0, 300.10,
-        );
+        let ctx = ShouldReplaceOrderCtx {
+            cfg: &cfg,
+            vcfg,
+            current: &current,
+            desired_price: 299.80, // 10 cents different (10 ticks with 0.01 tick size)
+            desired_size: 1.0,
+            now_ms: 1000, // 1 second old
+            best_bid: 300.0,
+            best_ask: 300.10,
+        };
+        let should_replace = should_replace_order(ctx);
 
         assert!(
             should_replace,

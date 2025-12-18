@@ -12,7 +12,7 @@
 // 7. Multiple markouts accumulate correctly via EWMA.
 
 use paraphina::config::Config;
-use paraphina::state::{GlobalState, PendingMarkout};
+use paraphina::state::{GlobalState, PendingMarkout, PendingMarkoutRecord};
 use paraphina::toxicity::update_toxicity_and_health;
 use paraphina::types::{Side, VenueStatus};
 
@@ -289,17 +289,17 @@ fn test_max_pending_cap_enforced() {
 
     // Add more markouts than max_pending (5)
     for i in 0..10 {
-        state.record_pending_markout(
-            0,
-            Side::Buy,
-            1.0,
-            100.0,
-            i * 100,
-            100.0,
-            100.0,
-            cfg.toxicity.markout_horizon_ms,
-            cfg.toxicity.max_pending_per_venue,
-        );
+        state.record_pending_markout(PendingMarkoutRecord {
+            venue_index: 0,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 100.0,
+            now_ms: i * 100,
+            fair: 100.0,
+            mid: 100.0,
+            horizon_ms: cfg.toxicity.markout_horizon_ms,
+            max_pending: cfg.toxicity.max_pending_per_venue,
+        });
     }
 
     // Should be capped at max_pending
@@ -327,17 +327,17 @@ fn test_bounded_deque_fifo_order() {
 
     // Add entries with different timestamps
     for i in 0..3 {
-        state.record_pending_markout(
-            0,
-            Side::Buy,
-            1.0,
-            100.0 + (i as f64),
-            i * 1000,
-            100.0,
-            100.0,
-            cfg.toxicity.markout_horizon_ms,
-            cfg.toxicity.max_pending_per_venue,
-        );
+        state.record_pending_markout(PendingMarkoutRecord {
+            venue_index: 0,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 100.0 + (i as f64),
+            now_ms: i * 1000,
+            fair: 100.0,
+            mid: 100.0,
+            horizon_ms: cfg.toxicity.markout_horizon_ms,
+            max_pending: cfg.toxicity.max_pending_per_venue,
+        });
     }
 
     // Verify FIFO order
@@ -619,41 +619,41 @@ fn test_invalid_fill_not_recorded() {
     let mut state = GlobalState::new(&cfg);
 
     // Try to record invalid fills
-    state.record_pending_markout(
-        0,
-        Side::Buy,
-        0.0, // Zero size
-        100.0,
-        0,
-        100.0,
-        100.0,
-        cfg.toxicity.markout_horizon_ms,
-        cfg.toxicity.max_pending_per_venue,
-    );
+    state.record_pending_markout(PendingMarkoutRecord {
+        venue_index: 0,
+        side: Side::Buy,
+        size_tao: 0.0, // Zero size
+        price: 100.0,
+        now_ms: 0,
+        fair: 100.0,
+        mid: 100.0,
+        horizon_ms: cfg.toxicity.markout_horizon_ms,
+        max_pending: cfg.toxicity.max_pending_per_venue,
+    });
 
-    state.record_pending_markout(
-        0,
-        Side::Buy,
-        1.0,
-        -100.0, // Negative price
-        0,
-        100.0,
-        100.0,
-        cfg.toxicity.markout_horizon_ms,
-        cfg.toxicity.max_pending_per_venue,
-    );
+    state.record_pending_markout(PendingMarkoutRecord {
+        venue_index: 0,
+        side: Side::Buy,
+        size_tao: 1.0,
+        price: -100.0, // Negative price
+        now_ms: 0,
+        fair: 100.0,
+        mid: 100.0,
+        horizon_ms: cfg.toxicity.markout_horizon_ms,
+        max_pending: cfg.toxicity.max_pending_per_venue,
+    });
 
-    state.record_pending_markout(
-        999, // Invalid venue index
-        Side::Buy,
-        1.0,
-        100.0,
-        0,
-        100.0,
-        100.0,
-        cfg.toxicity.markout_horizon_ms,
-        cfg.toxicity.max_pending_per_venue,
-    );
+    state.record_pending_markout(PendingMarkoutRecord {
+        venue_index: 999, // Invalid venue index
+        side: Side::Buy,
+        size_tao: 1.0,
+        price: 100.0,
+        now_ms: 0,
+        fair: 100.0,
+        mid: 100.0,
+        horizon_ms: cfg.toxicity.markout_horizon_ms,
+        max_pending: cfg.toxicity.max_pending_per_venue,
+    });
 
     // No markouts should have been recorded
     assert_eq!(
@@ -672,17 +672,17 @@ fn test_record_pending_markout_basic() {
     let cfg = make_test_config();
     let mut state = GlobalState::new(&cfg);
 
-    state.record_pending_markout(
-        0,
-        Side::Buy,
-        5.0,
-        100.0,
-        1000,  // now_ms
-        99.0,  // fair
-        100.0, // mid
-        cfg.toxicity.markout_horizon_ms,
-        cfg.toxicity.max_pending_per_venue,
-    );
+    state.record_pending_markout(PendingMarkoutRecord {
+        venue_index: 0,
+        side: Side::Buy,
+        size_tao: 5.0,
+        price: 100.0,
+        now_ms: 1000,
+        fair: 99.0,
+        mid: 100.0,
+        horizon_ms: cfg.toxicity.markout_horizon_ms,
+        max_pending: cfg.toxicity.max_pending_per_venue,
+    });
 
     assert_eq!(state.venues[0].pending_markouts.len(), 1);
 
