@@ -32,7 +32,10 @@ pub use hedge::{
 
 pub use logging::{EventSink, FileSink, NoopSink};
 
-pub use mm::{compute_mm_quotes, mm_quotes_to_order_intents, MmLevel, MmQuote};
+pub use mm::{
+    compute_mm_quotes, compute_order_actions, compute_venue_targets, mm_quotes_to_order_intents,
+    should_replace_order, ActiveMmOrder, MmLevel, MmOrderAction, MmQuote, VenueTargetInventory,
+};
 
 pub use state::{GlobalState, KillReason, PendingMarkout, RiskRegime, VenueState};
 
