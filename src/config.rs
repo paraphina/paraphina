@@ -167,9 +167,9 @@ pub struct RiskConfig {
 
 #[derive(Debug, Clone)]
 pub struct MmConfig {
-    /// Weight of basis in reservation price.
+    /// Weight of basis in reservation price (β_b in spec).
     pub basis_weight: f64,
-    /// Weight of funding in reservation price.
+    /// Weight of funding in reservation price (β_f in spec).
     pub funding_weight: f64,
     /// Minimum per-unit edge for local MM quotes (in USD).
     pub edge_local_min: f64,
@@ -185,6 +185,21 @@ pub struct MmConfig {
     pub funding_skew_slope: f64,
     /// Clip for funding-driven skew magnitude.
     pub funding_skew_clip: f64,
+
+    // ----- Order management (Section 11) -----
+    /// Minimum quote lifetime before replacement (milliseconds).
+    pub min_quote_lifetime_ms: i64,
+    /// Price tolerance in ticks before triggering order replacement.
+    pub price_tol_ticks: f64,
+    /// Size tolerance (relative) before triggering order replacement.
+    pub size_tol_rel: f64,
+
+    // ----- Funding target inventory (Section 9) -----
+    /// Scale for funding rate in target inventory calculation.
+    /// phi(funding_8h) = clip(funding_8h / this, -1, 1) * FUNDING_TARGET_MAX_TAO
+    pub funding_target_rate_scale: f64,
+    /// Maximum TAO shift from funding preference per venue.
+    pub funding_target_max_tao: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -547,12 +562,21 @@ impl Default for Config {
             // World-model tuned η at the profile centre.
             size_eta: MM_SIZE_ETA,
             // 0 = pure global, 1 = pure per-venue target; we sit in the middle.
-            lambda_inv: 0.5,
+            lambda_inv: 0.3,
             // Quoting horizon in seconds used in the AS formulas.
             quote_horizon_sec: 30.0,
             // Funding-driven inventory skew: slope and clip.
             funding_skew_slope: 10_000.0,
             funding_skew_clip: 100.0,
+
+            // Order management (Section 11)
+            min_quote_lifetime_ms: 500,
+            price_tol_ticks: 1.0,
+            size_tol_rel: 0.10,
+
+            // Funding target inventory (Section 9)
+            funding_target_rate_scale: 0.001, // 0.1% funding rate = full shift
+            funding_target_max_tao: 5.0,      // max TAO shift from funding preference
         };
 
         // ----- Hedge engine (global LQ controller + allocation, Section 13) -----
