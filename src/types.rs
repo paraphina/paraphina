@@ -2,11 +2,13 @@
 //
 // Common shared types for the Paraphina MM engine.
 
+use serde::{Deserialize, Serialize};
+
 /// Millisecond timestamp since Unix epoch.
 pub type TimestampMs = i64;
 
 /// Health status of a venue used by the strategy & risk engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VenueStatus {
     Healthy,
     Warning,  // used for "medium" toxicity / soft risk clamp
@@ -14,7 +16,7 @@ pub enum VenueStatus {
 }
 
 /// Buy or sell side for an order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
     Buy,
     Sell,
@@ -24,7 +26,7 @@ pub enum Side {
 /// - Mm    = passive market-making quote
 /// - Exit  = cross-venue exit / arb
 /// - Hedge = global hedge adjustment
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderPurpose {
     Mm,
     Exit,

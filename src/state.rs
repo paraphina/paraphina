@@ -17,6 +17,8 @@
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::Config;
 use crate::types::{Side, TimestampMs, VenueStatus};
 
@@ -107,7 +109,7 @@ pub enum RiskRegime {
 /// The kill switch can be triggered by multiple conditions. This enum
 /// captures the primary reason for activation. Once latched, the reason
 /// is preserved until manual reset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KillReason {
     /// No kill triggered (default state).
     None,
