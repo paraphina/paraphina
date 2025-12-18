@@ -584,10 +584,7 @@ fn main() {
         }
 
         if let Some(f) = csv.as_mut() {
-            let kt = r
-                .kill_tick
-                .map(|x| x.to_string())
-                .unwrap_or_else(|| "".to_string());
+            let kt = r.kill_tick.map(|x| x.to_string()).unwrap_or_default();
             let kill_reason_str = format!("{:?}", r.kill_reason);
             writeln!(
                 f,

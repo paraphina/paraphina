@@ -98,17 +98,18 @@ where
                 .and_then(|v| v.mid)
                 .unwrap_or(fair);
 
-            self.state.record_pending_markout(
-                fill.venue_index,
-                fill.side,
-                fill.size,
-                fill.price,
-                now_ms,
-                fair,
-                mid,
-                horizon_ms,
-                max_pending,
-            );
+            self.state
+                .record_pending_markout(crate::state::PendingMarkoutRecord {
+                    venue_index: fill.venue_index,
+                    side: fill.side,
+                    size_tao: fill.size,
+                    price: fill.price,
+                    now_ms,
+                    fair,
+                    mid,
+                    horizon_ms,
+                    max_pending,
+                });
         }
     }
 

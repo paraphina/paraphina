@@ -513,6 +513,6 @@ impl<'a> Engine<'a> {
     /// Delegate post-fill recomputations (inventory, basis, PnL, etc.)
     /// to GlobalState.
     pub fn recompute_after_fills(&self, state: &mut GlobalState) {
-        state.recompute_after_fills(&self.cfg);
+        state.recompute_after_fills(self.cfg);
     }
 }
