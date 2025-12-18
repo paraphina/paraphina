@@ -152,11 +152,7 @@ pub fn compute_hedge_plan(
     let delta_raw = hedge_cfg.k_hedge * x;
     let max_step = hedge_cfg.max_step_tao.max(0.0);
 
-    let delta_clamped = if max_step > 0.0 {
-        delta_raw.clamp(-max_step, max_step)
-    } else {
-        delta_raw
-    };
+    let delta_clamped = delta_raw.clamp(-max_step, max_step);
 
     // 4) Determine side and target.
     //    If ΔH > 0 (we have positive inventory, want to reduce) => Sell.

@@ -2,24 +2,22 @@
 //!
 //! Lightweight JSONL telemetry sink for Paraphina.
 //!
-//! Goals
-//! =====
+//! # Goals
+//!
 //! - Provide a simple, low-overhead way to write one JSON object per tick
 //!   (or per event) to a file.
 //! - Controlled entirely via environment variables so experiments can
 //!   turn telemetry on/off without code changes.
 //!
-//! Environment variables
-//! ---------------------
-//! - PARAPHINA_TELEMETRY_MODE
-//!     "off"   (default) -> no telemetry
-//!     "jsonl"          -> write JSONL to PARAPHINA_TELEMETRY_PATH
+//! # Environment variables
 //!
-//! - PARAPHINA_TELEMETRY_PATH
-//!     Path to the JSONL file to write. Required when mode = "jsonl".
+//! - `PARAPHINA_TELEMETRY_MODE`: `"off"` (default) disables telemetry,
+//!   `"jsonl"` writes JSONL to `PARAPHINA_TELEMETRY_PATH`.
+//! - `PARAPHINA_TELEMETRY_PATH`: Path to the JSONL file. Required when
+//!   mode is `"jsonl"`.
 //!
-//! Usage (conceptual)
-//! ------------------
+//! # Usage (conceptual)
+//!
 //! In your main / engine loop, once per tick:
 //!
 //! ```ignore
@@ -198,7 +196,7 @@ impl TelemetrySink {
             Err(_) => return,
         };
 
-        if let Err(_) = writeln!(writer, "{}", line) {
+        if writeln!(writer, "{}", line).is_err() {
             // Disable telemetry on write error.
             self.mode = TelemetryMode::Off;
             self.writer = None;

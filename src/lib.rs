@@ -3,17 +3,36 @@
 //! This crate exposes the core market-making engine, state, and strategy
 //! runner. The binary (`src/main.rs`) is just a thin simulation / research
 //! harness around these components.
+//!
+//! # Architecture (Milestone H)
+//!
+//! The codebase follows a clean separation between strategy logic and I/O:
+//!
+//! - **Strategy Core** (`strategy_core`): Pure, deterministic functions that
+//!   compute what actions to take given state and config. No I/O.
+//!
+//! - **Actions** (`actions`): Data types representing strategy decisions
+//!   (PlaceOrder, CancelOrder, etc.) with deterministic IDs.
+//!
+//! - **I/O Layer** (`io`): VenueAdapter trait and implementations that
+//!   execute actions. Swappable for sim/live/replay modes.
+//!
+//! - **Gateway** (`gateway`): Legacy execution gateway (preserved for
+//!   backwards compatibility with existing code).
 
+pub mod actions;
 pub mod config;
 pub mod engine;
 pub mod exit;
 pub mod gateway;
 pub mod hedge;
+pub mod io;
 pub mod logging;
 pub mod metrics;
 pub mod mm;
 pub mod state;
 pub mod strategy;
+pub mod strategy_core;
 pub mod telemetry;
 pub mod toxicity;
 pub mod types;
@@ -23,7 +42,24 @@ pub mod types;
 pub use config::Config;
 pub use engine::Engine;
 
+// Legacy gateway (preserved for backwards compatibility)
 pub use gateway::{ExecutionGateway, SimGateway};
+
+// New I/O layer (Milestone H)
+pub use io::{
+    noop::{compare_batches, create_noop_adapters, ActionRecorder, NoopAdapter},
+    sim::{create_sim_adapters, SimAdapter},
+    ActionResult, Gateway, GatewayPolicy, RateLimitPolicy, RetryPolicy, VenueAdapter,
+};
+
+// Actions (Milestone H)
+pub use actions::{
+    Action, ActionBatch, ActionBuilder, ActionId, ActionIdGenerator, CancelAllAction,
+    CancelOrderAction, LogAction, LogLevel, PlaceOrderAction, SetKillSwitchAction,
+};
+
+// Strategy core (Milestone H)
+pub use strategy_core::{compute_actions, StrategyInput, StrategyOutput};
 
 pub use hedge::{
     compute_hedge_orders, compute_hedge_plan, hedge_plan_to_order_intents, HedgeAllocation,
@@ -32,7 +68,10 @@ pub use hedge::{
 
 pub use logging::{EventSink, FileSink, NoopSink};
 
-pub use mm::{compute_mm_quotes, mm_quotes_to_order_intents, MmLevel, MmQuote};
+pub use mm::{
+    compute_mm_quotes, compute_order_actions, compute_venue_targets, mm_quotes_to_order_intents,
+    should_replace_order, ActiveMmOrder, MmLevel, MmOrderAction, MmQuote, VenueTargetInventory,
+};
 
 pub use state::{GlobalState, KillReason, PendingMarkout, RiskRegime, VenueState};
 

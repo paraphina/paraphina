@@ -17,6 +17,8 @@
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::Config;
 use crate::types::{Side, TimestampMs, VenueStatus};
 
@@ -107,7 +109,7 @@ pub enum RiskRegime {
 /// The kill switch can be triggered by multiple conditions. This enum
 /// captures the primary reason for activation. Once latched, the reason
 /// is preserved until manual reset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KillReason {
     /// No kill triggered (default state).
     None,
@@ -444,53 +446,57 @@ impl GlobalState {
     ///
     /// Called immediately after a fill is applied. The markout will be
     /// evaluated at `now_ms + horizon_ms` in `update_toxicity_and_health`.
-    ///
-    /// - `venue_index`: index into `self.venues`.
-    /// - `side`: Buy or Sell.
-    /// - `size_tao`: filled size in TAO.
-    /// - `price`: fill price in USD/TAO.
-    /// - `now_ms`: current timestamp.
-    /// - `fair`: current fair value (for optional analysis).
-    /// - `mid`: current venue mid price.
-    /// - `horizon_ms`: time until markout evaluation.
-    /// - `max_pending`: maximum queue size (older entries dropped).
-    pub fn record_pending_markout(
-        &mut self,
-        venue_index: usize,
-        side: Side,
-        size_tao: f64,
-        price: f64,
-        now_ms: TimestampMs,
-        fair: f64,
-        mid: f64,
-        horizon_ms: i64,
-        max_pending: usize,
-    ) {
-        if size_tao <= 0.0 || !price.is_finite() || price <= 0.0 {
+    pub fn record_pending_markout(&mut self, record: PendingMarkoutRecord) {
+        if record.size_tao <= 0.0 || !record.price.is_finite() || record.price <= 0.0 {
             return;
         }
 
-        let Some(v) = self.venues.get_mut(venue_index) else {
+        let Some(v) = self.venues.get_mut(record.venue_index) else {
             return;
         };
 
         let entry = PendingMarkout {
-            t_fill_ms: now_ms,
-            t_eval_ms: now_ms + horizon_ms,
-            side,
-            size_tao,
-            price,
-            fair_at_fill: fair,
-            mid_at_fill: mid,
+            t_fill_ms: record.now_ms,
+            t_eval_ms: record.now_ms + record.horizon_ms,
+            side: record.side,
+            size_tao: record.size_tao,
+            price: record.price,
+            fair_at_fill: record.fair,
+            mid_at_fill: record.mid,
         };
 
         v.pending_markouts.push_back(entry);
 
         // Enforce bounded queue: drop oldest entries if over limit.
-        while v.pending_markouts.len() > max_pending {
+        while v.pending_markouts.len() > record.max_pending {
             v.pending_markouts.pop_front();
         }
     }
+}
+
+/// Parameters for recording a pending markout evaluation.
+///
+/// Bundles all parameters needed by `record_pending_markout` to avoid
+/// clippy::too_many_arguments.
+pub struct PendingMarkoutRecord {
+    /// Index into `GlobalState.venues`.
+    pub venue_index: usize,
+    /// Buy or Sell.
+    pub side: Side,
+    /// Filled size in TAO.
+    pub size_tao: f64,
+    /// Fill price in USD/TAO.
+    pub price: f64,
+    /// Current timestamp.
+    pub now_ms: TimestampMs,
+    /// Current fair value (for optional analysis).
+    pub fair: f64,
+    /// Current venue mid price.
+    pub mid: f64,
+    /// Time until markout evaluation.
+    pub horizon_ms: i64,
+    /// Maximum queue size (older entries dropped).
+    pub max_pending: usize,
 }
 
 #[cfg(test)]
