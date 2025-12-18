@@ -213,16 +213,10 @@ fn check_risk_transitions(
     // emit a SetKillSwitch action (this handles the case where
     // the engine hasn't processed the risk transition yet)
     if matches!(state.risk_regime, RiskRegime::HardLimit) && !state.kill_switch {
-        // Determine reason from state
-        let reason = if state.daily_pnl_total <= -state.delta_limit_usd {
-            KillReason::PnlHardBreach
-        } else if state.dollar_delta_usd.abs() >= state.delta_limit_usd {
-            KillReason::DeltaHardBreach
-        } else if state.basis_usd.abs() >= state.basis_limit_hard_usd {
-            KillReason::BasisHardBreach
-        } else {
-            KillReason::None
-        };
+        // Use the existing kill_reason from state - it was set when the regime
+        // transitioned to HardLimit and should be preserved even if conditions
+        // have since improved.
+        let reason = state.kill_reason;
 
         if reason != KillReason::None {
             batch.push(builder.set_kill_switch(true, reason));

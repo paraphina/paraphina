@@ -111,11 +111,6 @@ impl NoopAdapter {
         }
     }
 
-    /// Set the current timestamp for recording.
-    pub fn set_timestamp(&mut self, ms: i64) {
-        self.current_ms = ms;
-    }
-
     /// Get the shared recorder.
     pub fn recorder(&self) -> &ActionRecorder {
         &self.recorder
@@ -123,6 +118,10 @@ impl NoopAdapter {
 }
 
 impl VenueAdapter for NoopAdapter {
+    fn set_timestamp(&mut self, now_ms: i64) {
+        self.current_ms = now_ms;
+    }
+
     fn place_order(
         &mut self,
         _cfg: &Config,

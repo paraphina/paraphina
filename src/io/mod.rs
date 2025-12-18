@@ -76,6 +76,15 @@ pub trait VenueAdapter: Send + Sync {
 
     /// Get the adapter name for logging.
     fn name(&self) -> &str;
+
+    /// Set the current timestamp for action recording/execution.
+    ///
+    /// Called by Gateway before executing actions to ensure adapters
+    /// that record timestamps (like NoopAdapter) have the correct time.
+    /// Default implementation is a no-op for adapters that don't need it.
+    fn set_timestamp(&mut self, _now_ms: TimestampMs) {
+        // Default: no-op
+    }
 }
 
 /// Rate limiting policy configuration.
@@ -300,6 +309,13 @@ impl Gateway {
         batch: &ActionBatch,
         now_ms: TimestampMs,
     ) -> BatchExecutionResult {
+        // Propagate timestamp to all adapters before executing actions
+        // This ensures adapters that record timestamps (like NoopAdapter)
+        // have the correct execution time.
+        for adapter in &mut self.adapters {
+            adapter.set_timestamp(now_ms);
+        }
+
         let mut results = Vec::new();
         let mut fills = Vec::new();
         let mut success_count = 0;
