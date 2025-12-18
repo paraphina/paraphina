@@ -19,6 +19,15 @@
 //!
 //! - **Gateway** (`gateway`): Legacy execution gateway (preserved for
 //!   backwards compatibility with existing code).
+//!
+//! # RL-0 Foundations (per ROADMAP.md)
+//!
+//! The `rl` module provides interfaces and instrumentation for RL evolution:
+//!
+//! - **Observation**: Versioned, serializable state snapshot for policy input
+//! - **Policy**: Trait for strategy decision-making (heuristic or learned)
+//! - **ShadowRunner**: Parallel execution of baseline + shadow policies
+//! - **RLTelemetry**: Logging of policy inputs/outputs and reward components
 
 pub mod actions;
 pub mod config;
@@ -30,6 +39,7 @@ pub mod io;
 pub mod logging;
 pub mod metrics;
 pub mod mm;
+pub mod rl;
 pub mod state;
 pub mod strategy;
 pub mod strategy_core;
@@ -80,6 +90,13 @@ pub use strategy::StrategyRunner;
 pub use toxicity::update_toxicity_and_health;
 
 pub use types::{FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
+
+// RL-0 Foundations (per ROADMAP.md)
+pub use rl::{
+    EpisodeConfig, EpisodeSummary, HeuristicPolicy, NoopPolicy, Observation, Policy, PolicyAction,
+    RLTelemetry, RewardComponents, ShadowRunner, TerminationReason, TickRecord, VenueObservation,
+    HEURISTIC_POLICY_VERSION, OBS_VERSION,
+};
 
 // --- PnL / basis unit tests -------------------------------------------------
 
