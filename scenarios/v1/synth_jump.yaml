@@ -1,0 +1,35 @@
+scenario_id: synth_jump
+scenario_version: 1
+
+engine: rl_sim_env
+
+horizon:
+  steps: 2000
+  dt_seconds: 0.25
+
+rng:
+  base_seed: 7
+  num_seeds: 5
+
+initial_state:
+  risk_profile: conservative
+  init_q_tao: 5.0
+
+market_model:
+  type: synthetic
+  synthetic:
+    process: jump_diffusion_stub
+    params:
+      vol: 0.02
+      drift: 0.0
+      jump_intensity: 0.0005
+      jump_sigma: 0.03
+
+microstructure_model:
+  fees_bps_maker: 0.0
+  fees_bps_taker: 1.0
+  latency_ms: 5.0
+
+invariants:
+  expect_kill_switch: allowed
+  pnl_linearity_check: disabled

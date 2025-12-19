@@ -48,6 +48,7 @@ pub mod logging;
 pub mod metrics;
 pub mod mm;
 pub mod rl;
+pub mod sim_eval;
 pub mod state;
 pub mod strategy;
 pub mod strategy_core;
@@ -114,6 +115,16 @@ pub use rl::{DomainRandConfig, DomainRandSample, DomainRandSampler, SimEnv, Step
 pub use rl::{
     decode_action, encode_action, ActionEncodingSpec, TrajectoryCollector, TrajectoryMetadata,
     TrajectoryRecord, TrajectoryWriter, ACTION_VERSION, TRAJECTORY_VERSION,
+};
+
+// Simulation & Evaluation (Option B per ROADMAP.md)
+pub use sim_eval::{
+    create_output_dir, write_build_info, write_config_resolved, BuildInfo, ConfigResolved,
+    DeterminismInfo, Engine as SimEngine, ExpectKillSwitch, HistoricalStubConfig, Horizon,
+    InitialState, Invariants, KillSwitchInfo, MarketModel, MarketModelType, MetricRecord,
+    MetricsWriter, MicrostructureModel, PnlLinearityCheck, ResultsInfo, Rng as SimRng, RunSummary,
+    ScenarioError, ScenarioSpec, SyntheticConfig, SyntheticParams, SyntheticProcess,
+    SCENARIO_SCHEMA_VERSION,
 };
 
 // --- PnL / basis unit tests -------------------------------------------------
