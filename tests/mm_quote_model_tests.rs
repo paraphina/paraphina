@@ -370,8 +370,8 @@ fn warning_regime_caps_size() {
     let cap = h.cfg.risk.q_warn_cap;
 
     // Warning should have sizes <= cap.
-    for i in 0..h.cfg.venues.len() {
-        if let Some(bid_w) = &quotes_warning[i].bid {
+    for (i, quote_warning) in quotes_warning.iter().enumerate() {
+        if let Some(bid_w) = &quote_warning.bid {
             assert!(
                 bid_w.size <= cap + 0.001,
                 "Venue {}: warning bid size {} should be <= cap {}",
@@ -380,7 +380,7 @@ fn warning_regime_caps_size() {
                 cap
             );
         }
-        if let Some(ask_w) = &quotes_warning[i].ask {
+        if let Some(ask_w) = &quote_warning.ask {
             assert!(
                 ask_w.size <= cap + 0.001,
                 "Venue {}: warning ask size {} should be <= cap {}",
