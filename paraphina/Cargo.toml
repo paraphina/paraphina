@@ -13,10 +13,16 @@ path = "src/lib.rs"
 name = "paraphina"
 path = "src/main.rs"
 
+[[bin]]
+# Simulation & Evaluation runner (Option B per ROADMAP.md).
+name = "sim_eval"
+path = "src/bin/sim_eval.rs"
+
 [dependencies]
 # For JSON logging of per-tick snapshots (TelemetrySink, etc.).
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 
 # For command-line argument parsing.
 clap = { workspace = true }
@@ -24,4 +30,7 @@ clap = { workspace = true }
 # For deterministic random number generation.
 rand = { workspace = true }
 rand_chacha = { workspace = true }
+
+# For checksum computation.
+sha2 = { workspace = true }
 
