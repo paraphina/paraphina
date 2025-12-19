@@ -3,7 +3,19 @@
 This document has two parts:
 
 1) **Code-derived whitepaper (implementation truth)** — describes what the current repository implements today (Rust sim + research toolchain), including invariants and known drift.
-2) **Appendix: Canonical v1 target specification (VERBATIM)** — included exactly as provided, unedited.
+2) **Appendix: Canonical v1 target specification (VERBATIM)** — included exactly as provided, unedited, but annotated with implementation status markers.
+
+---
+
+## Implementation Status Legend
+
+Throughout this document, algorithmic claims are annotated with one of:
+
+- **Implemented: `path/to/file.rs::function_name`** — code exists and is tested
+- **Planned (not yet implemented; milestone X)** — in roadmap but no code yet
+- **Partial (milestone X)** — scaffolding exists but incomplete
+
+All implementation evidence is documented in detail in `docs/EVIDENCE_PACK.md`.
 
 ---
 
@@ -21,17 +33,21 @@ Where the canonical spec differs from current code, that difference must be trea
 
 ## Repo architecture at a glance
 
+> **Implementation References:** See EVIDENCE_PACK.md §1 (Core loop order), §8 (Research harness)
+
 ### Rust core (`src/`)
 
 **Entrypoint**
 - `src/main.rs`
   - CLI flags include `--ticks` and `--profile` (defaults to Balanced in the current wiring).
   - Builds config via `Config::from_env_or_profile(profile)` and runs `StrategyRunner::run_simulation()`.
+  - **Implemented: `paraphina/src/main.rs`**
 
 **Configuration**
 - `src/config.rs`
   - Defines `Config` and `RiskProfile` presets.
   - Provides profile builders (`Config::for_profile`) and environment override logic (`Config::from_env_or_profile`, `Config::from_env_or_default`).
+  - **Implemented: `paraphina/src/config.rs::Config`, `RiskProfile`**
 
 **State + accounting**
 - `src/state.rs`
@@ -40,6 +56,7 @@ Where the canonical spec differs from current code, that difference must be trea
   - PnL accounting is implemented via:
     - `GlobalState::apply_perp_fill(...)` (realised PnL + fees)
     - `GlobalState::recompute_after_fills(...)` (inventory/basis + unrealised PnL marked to fair value)
+  - **Implemented: `paraphina/src/state.rs::GlobalState`, `VenueState`**
 
 **Engine tick**
 - `src/engine.rs`
@@ -47,6 +64,7 @@ Where the canonical spec differs from current code, that difference must be trea
     1) fair value + vol update (KF + EWMA)
     2) toxicity/health update
     3) risk regime + limits update (warning/hardlimit + kill switch)
+  - **Implemented: `paraphina/src/engine.rs::main_tick`, `update_fair_value_and_vol`, `update_risk_limits_and_regime`**
 
 **Market making**
 - `src/mm.rs`
@@ -57,6 +75,7 @@ Where the canonical spec differs from current code, that difference must be trea
     - HardLimit (Critical) regime → no quotes (Milestone C)
     - disabled venue → no quotes
   - Warning regime widens spreads and caps sizes.
+  - **Implemented: `paraphina/src/mm.rs::compute_mm_quotes`, `compute_single_venue_quotes`** (see EVIDENCE_PACK.md §2)
 
 **Hedging**
 - `src/hedge.rs`
@@ -64,13 +83,16 @@ Where the canonical spec differs from current code, that difference must be trea
   - Current gating behavior:
     - kill switch → no hedge
     - may still hedge in HardLimit (risk-reducing behavior)
+  - **Implemented: `paraphina/src/hedge.rs::compute_hedge_plan`, `build_candidates`, `greedy_allocate`** (see EVIDENCE_PACK.md §4)
 
 **Wiring + telemetry**
 - `src/strategy.rs`
   - Runs the full loop: tick → MM quotes → hedge plan → intents → sim execution → recompute state.
   - Emits per-tick JSONL telemetry used by research tooling.
+  - **Implemented: `paraphina/src/strategy.rs::StrategyRunner::run_simulation`** (see EVIDENCE_PACK.md §1)
 - `src/telemetry.rs`
   - JSONL sink controlled by env vars (mode/path).
+  - **Implemented: `paraphina/src/telemetry.rs`**
 
 ---
 
@@ -98,14 +120,18 @@ Where the canonical spec differs from current code, that difference must be trea
 
 ## State and accounting model (current implementation)
 
+> **Implementation References:** See EVIDENCE_PACK.md §1 (Core loop), §7 (Risk regime)
+
 ### Inventories
 - Per venue, the engine tracks net TAO position `q_v` (TAO-equivalent perp delta).
 - Global inventory is aggregated across venues: `q_global = Σ q_v`.
+- **Implemented: `paraphina/src/state.rs::VenueState::position_tao`, `GlobalState::inventory`**
 
 ### Basis exposure
 - The engine computes basis exposure relative to a synthetic fair value `S_t`:
   - net basis: `B = Σ q_v * (m_v - S_t)`
   - gross basis: `B_gross = Σ |q_v * (m_v - S_t)|`
+- **Implemented: `paraphina/src/state.rs::GlobalState::recompute_after_fills`** (computes `basis_usd` and `basis_gross_usd`)
 
 ### PnL
 - **Realised PnL** is updated on position reductions/flips (VWAP-style) and fees are applied in USD.
@@ -113,10 +139,13 @@ Where the canonical spec differs from current code, that difference must be trea
 - **Daily total PnL** is realised + unrealised.
 
 There are state-level unit tests validating key PnL identities.
+- **Implemented: `paraphina/src/state.rs::GlobalState::apply_perp_fill`, `recompute_after_fills`**
 
 ---
 
 ## Fair value and volatility (current implementation)
+
+> **Implementation References:** See EVIDENCE_PACK.md §5 (Fair value + volatility gating)
 
 ### Fair value (Kalman filter)
 - The engine uses a 1D Kalman filter over **log price** to estimate fair value `S_t`.
@@ -126,6 +155,7 @@ There are state-level unit tests validating key PnL identities.
   - **Outlier gating**: venues whose mid deviates > `max_mid_jump_pct` from prior FV are excluded
   - **Min-healthy gating**: if fewer than `min_healthy_for_kf` venues pass all gates, measurement update is skipped (time-update only)
   - spread/depth affect observation variance R
+- **Implemented: `paraphina/src/engine.rs::update_fair_value_and_vol`, `collect_kf_observations`**
 
 ### FV gating telemetry (Milestone D)
 The engine tracks and exposes in telemetry:
@@ -145,16 +175,20 @@ When `fv_available = false`, the engine performs a time update only (prediction 
   - spreads widen with vol (`spread_mult`)
   - sizes shrink with vol (`size_mult`)
   - hedge deadband shrinks with vol (`band_mult`)
+- **Implemented: `paraphina/src/engine.rs::update_vol_and_scalars`**
 
 ---
 
 ## Risk management (current implementation)
 
+> **Implementation References:** See EVIDENCE_PACK.md §7 (Risk regime + kill switch semantics)
+
 ### Risk regimes
 - The engine maintains a risk regime:
   - `Normal`
   - `Warning`
-  - `HardLimit` (current code’s name; canonical spec calls this `Critical`)
+  - `HardLimit` (current code's name; canonical spec calls this `Critical`)
+- **Implemented: `paraphina/src/state.rs::RiskRegime`, `paraphina/src/engine.rs::update_risk_limits_and_regime`**
 
 The regime is determined using combinations of:
 - volatility-scaled delta limits
@@ -166,10 +200,13 @@ The regime is determined using combinations of:
 - Kill switch is **latching**: once true, stays true until manual reset.
 - Kill reason tracked via `KillReason` enum (`PnlHardBreach`, `DeltaHardBreach`, `BasisHardBreach`, `LiquidationDistanceBreach`).
 - When kill switch is active, HardLimit (Critical) regime is forced for telemetry consistency.
+- **Implemented: `paraphina/src/state.rs::KillReason`, `paraphina/src/engine.rs::update_risk_limits_and_regime` (L488-L510)**
 
 ---
 
 ## Market making (current implementation)
+
+> **Implementation References:** See EVIDENCE_PACK.md §2 (Market making / quote model)
 
 MM quotes are computed per venue based on:
 - fair value
@@ -181,9 +218,17 @@ MM quotes are computed per venue based on:
 - If kill switch is active OR risk regime is HardLimit, MM does not emit new quotes.
 - HardLimit (Critical) regime implies kill_switch=true (Milestone C).
 
+**Implemented:**
+- Reservation price: `paraphina/src/mm.rs::compute_single_venue_quotes` (L419-L441)
+- AS spread model: `paraphina/src/mm.rs` (L378-L415)
+- Size model with quadratic objective: `paraphina/src/mm.rs` (L499-L624)
+- Risk gating: `paraphina/src/mm.rs` (L182-L196, L346-L375)
+
 ---
 
 ## Hedging (current implementation)
+
+> **Implementation References:** See EVIDENCE_PACK.md §4 (Hedge allocator)
 
 The hedge controller:
 - uses a volatility-adjusted deadband
@@ -196,10 +241,18 @@ The hedge controller:
 
 **Known gaps vs canonical** (future work):
 - allocation does not yet incorporate basis/funding/margin/liquidation constraints at canonical depth.
+- **Partial (Milestone F):** Current implementation has simplified cost model vs canonical Section 13
+
+**Implemented:**
+- Deadband: `paraphina/src/hedge.rs::compute_hedge_plan` (L135-L148)
+- Cost model: `paraphina/src/hedge.rs::build_candidates` (L298-L361)
+- Greedy allocation: `paraphina/src/hedge.rs::greedy_allocate` (L380-L427)
 
 ---
 
 ## Telemetry contract (research-critical)
+
+> **Implementation References:** See EVIDENCE_PACK.md §8 (Research harness + metrics)
 
 The research pipeline assumes the tick telemetry JSONL contains (at minimum):
 - `t` (tick index or time)
@@ -208,6 +261,11 @@ The research pipeline assumes the tick telemetry JSONL contains (at minimum):
 - `kill_switch`
 
 Breaking this contract breaks `batch_runs/ts_metrics.py` and `tools/research_ticks.py`.
+
+**Implemented:**
+- Stdout parser: `batch_runs/metrics.py::parse_daily_summary` (L50-L88)
+- Telemetry sink: `paraphina/src/telemetry.rs`
+- Research harness: `batch_runs/orchestrator.py`
 
 ---
 
@@ -267,6 +325,8 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 
 **Status: Implemented**
 
+> **Implementation References:** See EVIDENCE_PACK.md §3 (Exit engine)
+
 The exit allocator runs after MM fill batches and before hedge, implementing the canonical
 Section 12 cross-venue exit optimization with the following features:
 
@@ -317,6 +377,8 @@ This ordering is enforced in both `src/strategy.rs` and `src/bin/monte_carlo.rs`
 ### RL-1: Gym-style Environment and Vectorised Simulation (Implemented)
 
 **Status: Implemented**
+
+> **Implementation References:** See EVIDENCE_PACK.md §9 (RL / training scaffolding)
 
 Per ROADMAP.md RL-1, this milestone provides a Gym-style RL environment for training policies without modifying baseline trading behaviour.
 
@@ -379,6 +441,8 @@ observations, rewards, dones, infos = vec_env.step(actions)
 ### RL-2: Imitation Learning Baseline (Behaviour Cloning) (Implemented)
 
 **Status: Implemented**
+
+> **Implementation References:** See EVIDENCE_PACK.md §9 (RL / training scaffolding)
 
 Per ROADMAP.md RL-2, this milestone provides a behaviour cloning baseline that trains a neural network policy to imitate the HeuristicPolicy.
 
@@ -481,7 +545,31 @@ python python/rl2_bc/eval_bc.py \
 
 # Part II — Appendix: Canonical v1 target specification (VERBATIM)
 
-Everything below this heading is included exactly as provided (unedited).
+Everything below this heading is included exactly as provided (unedited), but **annotated with implementation status markers** in `[STATUS]` blocks at the start of each major section. The original spec text is preserved.
+
+---
+
+## Implementation Status Overview (Part II Sections)
+
+| Section | Status | Evidence |
+|---------|--------|----------|
+| §1 Market & System Overview | Implemented | EVIDENCE_PACK.md §1 |
+| §2 Notation and Configuration | Implemented | `config.rs` |
+| §3 State Representation | Implemented | `state.rs` |
+| §4 Data Ingestion | Partial (sim only) | `engine.rs` |
+| §5 Fair Value (KF) | Implemented | EVIDENCE_PACK.md §5 |
+| §6 Volatility Scalars | Implemented | EVIDENCE_PACK.md §5 |
+| §7 Toxicity Scoring | Implemented | EVIDENCE_PACK.md §6 |
+| §8 Inventory & Basis | Implemented | `state.rs` |
+| §9 Quoting Model | Implemented | EVIDENCE_PACK.md §2 |
+| §10 Quote Size | Implemented | EVIDENCE_PACK.md §2 |
+| §11 Order Management | Partial (sim fills) | Milestone H |
+| §12 Cross-Perp Exit | Implemented | EVIDENCE_PACK.md §3 |
+| §13 Hedge Engine | Partial | EVIDENCE_PACK.md §4, Milestone F |
+| §14 Risk Management | Implemented | EVIDENCE_PACK.md §7 |
+| §15 Logging/Metrics | Partial | EVIDENCE_PACK.md §8 |
+| §16 Control Flow | Implemented | EVIDENCE_PACK.md §1 |
+| §17 Architecture | Partial (sim only) | Milestone H |
 
 ---
 
@@ -595,6 +683,8 @@ concurrent Rust implementation.
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Implemented]** Core loop order and multi-venue structure implemented in `strategy.rs::run_simulation`. See EVIDENCE_PACK.md §1.
+
   
 
 Markets: 
@@ -682,6 +772,8 @@ conditions between cross-venue exits and hedging.
 2. NOTATION AND CONFIGURATION   
 
 ------------------------------------------------------------------ 
+
+> **[STATUS: Implemented]** Config struct with all major parameters in `config.rs`. Risk profiles and env overrides supported. See `Config::from_env_or_profile`.
 
   
 
@@ -1111,6 +1203,8 @@ Per-venue order semantics (conceptual config):
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Implemented]** `GlobalState` and `VenueState` in `state.rs`. All fields listed below are modeled. Margin/liquidation fields use synthetic defaults in sim mode.
+
   
 
 Per-venue state (perp venues): 
@@ -1252,6 +1346,8 @@ Global engine state:
 4. DATA INGESTION   
 
 ------------------------------------------------------------------ 
+
+> **[STATUS: Partial (sim only; Milestone H)]** Order book/fill ingestion abstracted via `Gateway` trait. Real exchange I/O not yet implemented. Synthetic mids/spreads seeded via `engine.seed_dummy_mids()`. Markout computation in `state.rs::record_pending_markout`.
 
   
 
@@ -1483,6 +1579,8 @@ Periodically, for each venue \(v\):
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Implemented]** Kalman filter over log-price in `engine.rs::update_fair_value_and_vol`. Venue gating (staleness, outlier, min-healthy) in `collect_kf_observations`. See EVIDENCE_PACK.md §5.
+
   
 
 We model log fair value \(x_t = \log S_t\) as a random walk: 
@@ -1701,6 +1799,8 @@ On process start:
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Implemented]** `spread_mult`, `size_mult`, `band_mult` computed in `engine.rs::update_vol_and_scalars`. Vol floor via `sigma_eff = max(sigma_short, sigma_min)`. See EVIDENCE_PACK.md §5.
+
   
 
 Define volatility ratio: 
@@ -1778,6 +1878,8 @@ additional Warning multipliers (SPREAD_WARN_MULT, Q_WARN_CAP).
 7. TOXICITY SCORING   
 
 ------------------------------------------------------------------ 
+
+> **[STATUS: Implemented]** `toxicity.rs::update_toxicity_and_health`. EWMA markout-based toxicity, venue disable thresholds. See EVIDENCE_PACK.md §6.
 
   
 
@@ -1905,6 +2007,8 @@ In Warning regime, medium/high toxicity venues can be further de-prioritised.
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Implemented]** Global inventory `q_t`, dollar delta, basis exposure `B_t` and `B_gross` computed in `state.rs::recompute_after_fills`.
+
   
 
 At each main loop tick: 
@@ -1954,6 +2058,8 @@ optimisation cost.
 9. QUOTING MODEL PER VENUE (AS + FUNDING + BASIS + TARGETS)   
 
 ------------------------------------------------------------------ 
+
+> **[STATUS: Implemented]** Full Avellaneda-Stoikov model with basis/funding/inventory terms in `mm.rs::compute_single_venue_quotes`. Per-venue targets via `compute_venue_targets`. See EVIDENCE_PACK.md §2.
 
   
 
@@ -2265,6 +2371,8 @@ We only quote a side if:
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Implemented]** Quadratic edge objective, margin cap, liquidation-distance shrink, delta-limit throttling all in `mm.rs` (L499-L624). See EVIDENCE_PACK.md §2.
+
   
 
 For each venue \(v\) and side (bid/ask), we model size choice: 
@@ -2455,6 +2563,8 @@ The final size is this constrained \(Q\).
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Partial (Milestone H)]** Order intent generation implemented via `OrderIntent` struct. Sim gateway applies fills immediately. Real exchange order management (cancel/replace logic, MIN_QUOTE_LIFETIME, TIF enforcement) not yet implemented.
+
   
 
 For each venue \(v\) and side, we maintain at most one active MM quote. 
@@ -2536,6 +2646,8 @@ EXIT and HEDGE orders are typically IOC and are not constrained by
 12. FILL HANDLING AND CROSS-PERP EXIT OPTIMISATION   
 
 ------------------------------------------------------------------ 
+
+> **[STATUS: Implemented (Milestone E)]** Full exit allocator in `exit.rs::compute_exit_intents`. Includes net edge calculation, basis/funding adjustments, fragmentation/basis-risk penalties, lot size and min notional enforcement. See EVIDENCE_PACK.md §3.
 
   
 
@@ -2899,6 +3011,8 @@ hedge engine.
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Partial (Milestone F)]** Deadband and greedy allocation implemented in `hedge.rs`. Cost model includes exec cost, funding, basis, liq penalty, fragmentation. Full canonical depth (per-venue margin constraints, multi-chunk allocation) not yet complete. See EVIDENCE_PACK.md §4.
+
   
 
 We define global exposure: 
@@ -3212,6 +3326,8 @@ hard limits, risk regime escalates.
 14. RISK MANAGEMENT, REGIMES AND KILL SWITCH   
 
 ------------------------------------------------------------------ 
+
+> **[STATUS: Implemented (Milestone C)]** Full risk regime (Normal/Warning/HardLimit) and latching kill switch in `engine.rs::update_risk_limits_and_regime`. Kill reasons tracked via `KillReason` enum. See EVIDENCE_PACK.md §7.
 
   
 
@@ -3547,6 +3663,8 @@ Per venue v:
 
 ------------------------------------------------------------------ 
 
+> **[STATUS: Partial]** Per-tick JSONL telemetry implemented (`telemetry.rs`). Stdout summary parsed by `batch_runs/metrics.py`. Treasury guidance is **Planned (not yet implemented)**.
+
   
 
 Logging: 
@@ -3790,6 +3908,8 @@ decisions externally.
 16. ENGINE CONTROL FLOW (MAIN, HEDGE, RISK LOOPS)   
 
 ------------------------------------------------------------------ 
+
+> **[STATUS: Implemented]** Single main loop in `strategy.rs::run_simulation` executes tick → MM → exit → hedge sequence. Separate hedge/risk loops not yet separated (all in main loop). See EVIDENCE_PACK.md §1.
 
   
 
@@ -4054,6 +4174,8 @@ At each tick:
 17. ARCHITECTURE, DETERMINISM AND RUST IMPLEMENTATION NOTES   
 
 ------------------------------------------------------------------ 
+
+> **[STATUS: Partial (Milestone H)]** Strategy core is deterministic and pure. Gateway trait abstraction exists but real I/O layer (WebSocket/REST) is **Planned (not yet implemented; Milestone H)**. Replay via seed + config is supported in simulation.
 
   
 
@@ -4373,6 +4495,8 @@ APPENDIX A — RL EVOLUTION PLAN (GPU-TRAINED POLICY, SAFETY-SHIELDED)
 
 ------------------------------------------------------------------------------
 
+> **[STATUS: Partial]** RL-0 (interfaces), RL-1 (Gym env), RL-2 (BC baseline) are **Implemented** (see EVIDENCE_PACK.md §9, `paraphina/src/rl/`, `python/rl2_bc/`). RL-3 through RL-6 are **Planned (not yet implemented; see ROADMAP.md)**.
+
 This appendix defines a concrete, implementation-ready plan to evolve Paraphina
 from a deterministic, model-based strategy into a GPU-trained reinforcement
 learning policy, while preserving strict safety invariants (risk limits,
@@ -4558,10 +4682,12 @@ END APPENDIX A
 ------------------------------------------------------------------------------
 
 ------------------------------------------------------------------
-APPENDIX A — WHAT “FULLY OPTIMISED” MEANS IN PRACTICE
+APPENDIX A — WHAT "FULLY OPTIMISED" MEANS IN PRACTICE
 ------------------------------------------------------------------
 
-This strategy is “fully optimised” only if it is not just mathematically specified,
+> **[STATUS: Partial]** Deterministic baseline is **Implemented**. Automated quant optimization (layer 2) is **Partial** (batch harness exists, advanced search methods not yet implemented). GPU RL (layer 3) is **Planned** (RL-3 through RL-6 in ROADMAP.md).
+
+This strategy is "fully optimised" only if it is not just mathematically specified,
 but also continuously tuned, stress-tested, and promoted through an explicit research → deployment loop.
 
 The optimisation loop has three layers:
@@ -4599,6 +4725,8 @@ The optimisation loop has three layers:
 ------------------------------------------------------------------
 APPENDIX B — ADVANCED QUANT OPTIMISATION METHODS (PRE-RL)
 ------------------------------------------------------------------
+
+> **[STATUS: Planned]** All methods in this appendix are **Planned (not yet implemented; Phase A in ROADMAP.md)**. The batch harness (`batch_runs/`) provides foundational infrastructure.
 
 Before moving to RL, we maximise strategy performance and robustness using a suite of
 quant methods that directly integrate with the existing telemetry-first research harness.
@@ -4646,9 +4774,11 @@ A candidate configuration/policy is promoted only if it:
 APPENDIX C — RL EVOLUTION PLAN (GPU) AND WHERE IT INTEGRATES
 ------------------------------------------------------------------
 
+> **[STATUS: Partial]** Policy surfaces (C1) are **Implemented** (`rl/action_encoding.rs`). Reward function (C2) components available via telemetry. Safe RL / constrained RL (C3) is **Planned**. Training stack (C4) has BC baseline implemented; model-based RL is **Planned (Phase B-C in ROADMAP.md)**.
+
 C1) The policy surfaces (what RL is allowed to control)
 To keep integration safe and incremental, RL should NOT replace everything at once.
-Instead, expose a small number of “policy surfaces”:
+Instead, expose a small number of "policy surfaces":
 
 1) Quote control (per venue)
 - inputs: (fair value, vol, basis, funding, inventory, toxicity, margin, book state)

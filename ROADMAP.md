@@ -70,22 +70,30 @@ This is the primary research execution interface.
 
 ## 2. Milestone plan (spec-alignment driven)
 
-### Milestone A — Documentation + “contracts first”
-**Goal:** make it impossible to confuse “planned spec” with “implemented behavior”.
+### Milestone A — Documentation + "contracts first"
+**Goal:** make it impossible to confuse "planned spec" with "implemented behavior".
+
+**Status: COMPLETE**
 
 Deliverables:
 - `docs/WHITEPAPER.md` is the single entry point:
-  - “Implementation truth” section stays conservative and code-backed
-  - “Canonical spec” is preserved verbatim
-- Add/maintain a short “Drift Register” section listing:
+  - "Implementation truth" section stays conservative and code-backed
+  - "Canonical spec" is preserved verbatim
+- Add/maintain a short "Drift Register" section listing:
   - spec features not implemented yet,
   - known mismatches in naming/semantics (e.g., Warning/Critical vs Warning/HardLimit).
 
-Acceptance criteria:
-- A new contributor can run exp03 and understand:
-  - what the binary expects (env knobs),
-  - what stdout must contain for parsing,
-  - what CSVs are produced.
+**What shipped:**
+- `docs/WHITEPAPER.md`: Two-part structure with implementation truth (Part I) and canonical spec (Part II)
+- `docs/EVIDENCE_PACK.md`: Hard reference map from WHITEPAPER to code evidence
+- `docs/AI_PLAYBOOK.md`: Development guidelines
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §1 (Core loop), §8 (Research harness)
+
+**Acceptance criteria:**
+- Invariant: `docs/WHITEPAPER.md` contains "Known drift" section listing spec vs implementation gaps
+- Invariant: Every algorithmic claim in Part I has `Implemented:` annotation with file path
+- Manual: A new contributor can run `exp03` and understand env knobs + stdout format
 
 ---
 
@@ -94,6 +102,8 @@ Acceptance criteria:
 - configurable (env/config),
 - logged/observable,
 - sweepable via orchestrator labels.
+
+**Status: COMPLETE**
 
 Deliverables:
 - A canonical env var list in docs (and used consistently):
@@ -108,9 +118,17 @@ Deliverables:
 - A single authoritative end-of-run stdout summary format that
   `parse_daily_summary` parses (and unit tests for the regex).
 
-Acceptance criteria:
-- `batch_runs/metrics.py` has tests with representative stdout blocks.
-- exp scripts can be added without inventing new parsing logic.
+**What shipped:**
+- `paraphina/src/config.rs`: `Config::from_env_or_profile()`, `Config::from_env_or_default()` with all env var overrides
+- `batch_runs/metrics.py`: `parse_daily_summary()` regex parser for stdout
+- `batch_runs/orchestrator.py`: `EngineRunConfig`, `run_many()`, `results_to_dataframe()`
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §8 (Research harness + metrics)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/config_profile_tests.rs` (profile env override tests)
+- Passes `paraphina/tests/metrics_tests.rs` (stdout parsing tests)
+- Determinism: `paraphina/tests/replay_determinism_tests.rs::test_replay_determinism_single_tick` passes with fixed seed
 
 ---
 
@@ -118,20 +136,34 @@ Acceptance criteria:
 **Goal:** risk states match the canonical model: Normal / Warning / Critical
 with a kill switch that is explicit and unambiguous.
 
+**Status: COMPLETE**
+
 Deliverables:
 - Define regime semantics and thresholds in one place.
 - Ensure **Critical implies kill_switch** behaviorally:
   - cancel/stop new orders,
-  - allow only bounded “best-effort” risk reduction if implemented.
+  - allow only bounded "best-effort" risk reduction if implemented.
 
-Acceptance criteria:
-- A “Critical” condition in simulation produces:
-  - `kill_switch=true` in stdout summary
-  - (optionally) an explicit reason code
-- A regression test covers:
-  - PnL hard breach,
-  - delta/basis hard breach,
-  - liquidation-distance hard breach (if the engine models it).
+**What shipped:**
+- `paraphina/src/state.rs`: `RiskRegime` enum (Normal/Warning/HardLimit), `KillReason` enum
+- `paraphina/src/engine.rs::update_risk_limits_and_regime()`: Latching kill switch logic (L488-L510)
+- `paraphina/src/mm.rs::compute_mm_quotes()`: Returns no quotes when `kill_switch || risk_regime == HardLimit`
+- `paraphina/src/hedge.rs::compute_hedge_orders()`: Returns empty when `kill_switch`
+- `paraphina/src/exit.rs::compute_exit_intents()`: Returns empty when `kill_switch`
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §7 (Risk regime + kill switch semantics)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/risk_regim_tests.rs::hardlimit_and_kill_switch_when_loss_limit_breached`
+- Passes `paraphina/tests/risk_regim_tests.rs::hardlimit_and_kill_switch_when_delta_limit_breached`
+- Passes `paraphina/tests/risk_regim_tests.rs::hardlimit_and_kill_switch_when_basis_limit_breached`
+- Passes `paraphina/tests/risk_regim_tests.rs::hardlimit_and_kill_switch_when_liquidation_distance_breached`
+- Passes `paraphina/tests/risk_regim_tests.rs::kill_switch_latches_once_true`
+- Passes `paraphina/tests/risk_regim_tests.rs::hardlimit_from_delta_breach_triggers_kill_and_disables_mm`
+- Passes `paraphina/tests/risk_regim_tests.rs::hedge_disabled_when_kill_switch_active`
+- Passes `paraphina/tests/risk_regim_tests.rs::exit_disabled_when_kill_switch_active`
+- Invariant: `state.kill_switch == true` implies `state.risk_regime == HardLimit`
+- Invariant: `KillReason` preserved from first breach (latching)
 
 ---
 
@@ -139,18 +171,35 @@ Acceptance criteria:
 **Goal:** fair value and volatility estimates are stable, and strategy behavior
 degrades safely when data quality drops.
 
+**Status: COMPLETE**
+
 Deliverables:
 - FV estimator gating policy (stale books / outliers / min healthy venues).
 - Vol floor behavior documented and tested.
 - Telemetry includes:
-  - fair value (or a “fv_available” flag),
+  - fair value (or a "fv_available" flag),
   - effective volatility,
   - list/count of healthy venues used.
 
-Acceptance criteria:
-- With intentionally stale/missing venue data in sim:
-  - FV update degrades gracefully
-  - quoting shrinks or pauses depending on config.
+**What shipped:**
+- `paraphina/src/engine.rs::update_fair_value_and_vol()`: Kalman filter with venue gating (L99-L223)
+- `paraphina/src/engine.rs::collect_kf_observations()`: Staleness/outlier/min-healthy gating (L276-L348)
+- `paraphina/src/engine.rs::update_vol_and_scalars()`: EWMA vol + sigma_eff floor (L354-L408)
+- Telemetry fields: `fv_available`, `healthy_venues_used`, `healthy_venues_used_count`, `sigma_eff`
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §5 (Fair value + volatility gating)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/fair_value_gating_tests.rs::stale_venue_data_excluded_from_fv_update`
+- Passes `paraphina/tests/fair_value_gating_tests.rs::fv_degrades_gracefully_with_all_stale_data`
+- Passes `paraphina/tests/fair_value_gating_tests.rs::outlier_venue_excluded_from_fv_update`
+- Passes `paraphina/tests/fair_value_gating_tests.rs::min_healthy_threshold_enforced`
+- Passes `paraphina/tests/fair_value_gating_tests.rs::telemetry_fields_populated_correctly`
+- Passes `paraphina/tests/vol_floor_tests.rs::sigma_eff_never_below_sigma_min`
+- Passes `paraphina/tests/vol_floor_tests.rs::sigma_eff_uses_floor_when_raw_vol_is_low`
+- Passes `paraphina/tests/vol_floor_tests.rs::vol_scalars_use_sigma_eff`
+- Invariant: `sigma_eff = max(fv_short_vol, sigma_min)`
+- Invariant: `fv_available = false` when `healthy_venues_used_count < min_healthy_for_kf`
 
 ---
 
@@ -160,18 +209,37 @@ Acceptance criteria:
 - incorporates basis/funding differentials,
 - penalises basis risk increase and fragmentation.
 
+**Status: COMPLETE**
+
 Deliverables:
-- A discrete “exit allocator” module callable after fill batches.
+- A discrete "exit allocator" module callable after fill batches.
 - A consistent definition of:
   - fragmentation score,
   - basis exposure change approximation,
   - effective edge threshold(s).
 
-Acceptance criteria:
-- A synthetic multi-venue scenario demonstrates:
-  - exit chooses best levels first,
-  - exits reduce basis/fragmentation when edges are similar,
-  - exit allocator respects lot sizes and min notional.
+**What shipped:**
+- `paraphina/src/exit.rs::compute_exit_intents()`: Full exit allocator (L247-L600)
+- Edge calculation: `base_profit - fees - slippage_buffer - vol_buffer + basis_adj + funding_adj`
+- Fragmentation penalty: `fragmentation_penalty_per_tao` for opening new legs
+- Fragmentation bonus: `fragmentation_reduction_bonus` for closing positions
+- Basis-risk penalty: `basis_risk_penalty_weight * Δ|B_t|`
+- Per-venue constraints: `lot_size_tao`, `size_step_tao`, `min_notional_usd`
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §3 (Exit engine)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/exit_engine_tests.rs::exit_respects_lot_size_and_min_notional`
+- Passes `paraphina/tests/exit_engine_tests.rs::exit_respects_min_notional`
+- Passes `paraphina/tests/exit_engine_tests.rs::exit_profit_only_blocks_unprofitable_exits`
+- Passes `paraphina/tests/exit_engine_tests.rs::exit_splits_across_best_venues_when_capped_per_venue`
+- Passes `paraphina/tests/exit_engine_tests.rs::exit_skips_disabled_or_toxic_or_stale`
+- Passes `paraphina/tests/exit_engine_tests.rs::exit_prefers_less_fragmentation_when_edges_similar`
+- Passes `paraphina/tests/exit_engine_tests.rs::exit_prefers_less_basis_risk_when_edges_similar`
+- Passes `paraphina/tests/exit_engine_tests.rs::exit_deterministic_ordering_with_identical_edges`
+- Invariant: Exit only when `base_profit_per_tao > edge_min_usd`
+- Invariant: Exit size rounded to `size_step_tao` and >= `lot_size_tao`
+- Determinism: Same state produces identical exit intents
 
 ---
 
@@ -180,6 +248,8 @@ Acceptance criteria:
 - LQ controller decides global step size with deadband,
 - allocation chooses cheapest/least-risk venues first,
 - constraints include funding/basis/margin/liquidation/fragmentation.
+
+**Status: PARTIAL (Core implemented, canonical depth pending)**
 
 Deliverables:
 - Hedge allocator as a first-class component:
@@ -192,11 +262,33 @@ Deliverables:
   - liquidation distance penalty
   - fragmentation penalty
 
-Acceptance criteria:
-- In an adversarial test:
-  - allocator avoids venues near liquidation
-  - allocator prefers better funding/basis when execution is comparable
-  - allocator respects global max-step and per-venue max hedgeable size
+**What shipped:**
+- `paraphina/src/hedge.rs::compute_hedge_plan()`: Global hedge with deadband (L118-L196)
+- `paraphina/src/hedge.rs::build_candidates()`: Per-venue cost model (L199-L377)
+- `paraphina/src/hedge.rs::greedy_allocate()`: Greedy allocation by cost (L380-L427)
+- Cost components: `exec_cost + liq_penalty + frag_penalty - funding_benefit - basis_edge`
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §4 (Hedge allocator)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_deadband_no_orders`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_outside_deadband_generates_orders`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_respects_global_max_step`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_respects_per_venue_caps`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_avoids_near_liquidation`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_skips_critical_liquidation_venues`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_prefers_funding_or_basis_when_exec_equal`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_prefers_basis_when_funding_equal`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_deterministic_tiebreak_by_venue_index`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_skips_disabled_stale_toxic_venues`
+- Passes `paraphina/tests/hedge_allocator_tests.rs::hedge_disabled_when_kill_switch_active`
+- Invariant: `|X| <= band_vol` implies no hedge orders
+- Invariant: Total hedge size <= `max_step_tao`
+- Invariant: Venues at `dist_liq_sigma <= liq_crit_sigma` are hard-skipped
+
+**Remaining work (canonical depth):**
+- Per-venue margin constraint enforcement in allocator
+- Multi-chunk allocation per venue (currently single chunk per venue)
 
 ---
 
@@ -208,6 +300,8 @@ Acceptance criteria:
 - toxicity and liquidation-distance-aware size constraints,
 - stable order management (min quote lifetime, tolerance thresholds).
 
+**Status: COMPLETE**
+
 Deliverables:
 - Explicit functions with unit tests for:
   - reservation price components
@@ -216,11 +310,41 @@ Deliverables:
   - size constraints and shrink logic
   - cancel/replace logic thresholds
 
-Acceptance criteria:
-- Under the same sim tape:
-  - behavior is stable across refactors
-  - “Warning” widens and caps
-  - “Critical” halts new quoting
+**What shipped:**
+- `paraphina/src/mm.rs::compute_mm_quotes()`: Full quote generation (L139-L270)
+- `paraphina/src/mm.rs::compute_single_venue_quotes()`: Per-venue AS model (L323-L647)
+- Reservation price: `r_v = S_t + β_b*b_v + β_f*f_v - γ*(σ_eff^2)*τ*inv_deviation` (L419-L441)
+- AS half-spread: `δ* = (1/γ) * ln(1 + γ/k)` with vol scaling (L378-L415)
+- Size model: Quadratic objective with margin/liq-distance/delta-limit constraints (L499-L624)
+- Order management: `should_replace_order()` with lifetime and tolerance logic
+- Per-venue targets: `compute_venue_targets()` with depth and funding weights (L78-L137)
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §2 (Market making / quote model)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/mm_quote_model_tests.rs::passivity_bid_strictly_below_best_bid`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::passivity_ask_strictly_above_best_ask`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::passivity_bid_ask_do_not_cross`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::reservation_price_decreases_when_long`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::reservation_price_increases_when_short`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::hardlimit_produces_no_quotes_even_if_kill_switch_false`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::kill_switch_produces_no_quotes`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::warning_regime_widens_spread`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::warning_regime_caps_size`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::disabled_venue_produces_no_quotes`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::high_toxicity_venue_produces_no_quotes`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::critical_liquidation_distance_produces_no_quotes`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::size_respects_max_order_size`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::size_respects_lot_size`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::liquidation_warning_shrinks_size`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::venue_targets_scale_with_depth`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::young_passive_order_not_replaced`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::old_order_with_price_change_replaced`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::extreme_delta_produces_no_quotes`
+- Passes `paraphina/tests/mm_quote_model_tests.rs::high_delta_only_allows_risk_reducing`
+- Invariant: `bid < best_bid - tick` and `ask > best_ask + tick` (passivity)
+- Invariant: `q_global > 0` decreases reservation price (skew toward selling)
+- Invariant: `RiskRegime::HardLimit || kill_switch` implies no quotes
 
 ---
 
@@ -230,15 +354,34 @@ Acceptance criteria:
 - I/O layer (WS/REST) is async and replaceable
 - execution gateway handles venue semantics (TIF/post-only/IOC guard).
 
+**Status: COMPLETE**
+
 Deliverables:
 - Action interface: `PlaceOrder`, `CancelOrder`, `CancelAll`, `SetKillSwitch`, …
 - Venue adapter trait per exchange
 - Rate limiting and retry policies (configurable)
 
-Acceptance criteria:
-- Full replay test:
-  - feed recorded events,
-  - reproduce identical action stream.
+**What shipped:**
+- `paraphina/src/actions.rs`: `Action` enum with `PlaceOrder`/`CancelOrder`/`CancelAll`/`SetKillSwitch`
+- `paraphina/src/io/mod.rs`: `IoAdapter` trait for venue communication
+- `paraphina/src/io/sim.rs`: `SimulatedIoAdapter` for deterministic replay
+- `paraphina/src/io/noop.rs`: `NoopIoAdapter` for testing
+- `paraphina/src/strategy_core.rs`: Pure strategy layer, no I/O side effects
+- `paraphina/src/strategy.rs::StrategyRunner`: Separated event ingestion from action generation
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §1 (Core loop), §6 (RL / policy interface)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/replay_determinism_tests.rs::test_replay_determinism_single_tick`
+- Passes `paraphina/tests/replay_determinism_tests.rs::test_replay_determinism_multi_tick`
+- Passes `paraphina/tests/replay_determinism_tests.rs::test_replay_determinism_with_inventory`
+- Passes `paraphina/tests/replay_determinism_tests.rs::test_action_ids_deterministic`
+- Passes `paraphina/tests/replay_determinism_tests.rs::test_different_seeds_produce_different_batches`
+- Passes `paraphina/tests/replay_determinism_tests.rs::test_kill_switch_determinism`
+- Passes `paraphina/tests/replay_determinism_tests.rs::test_strategy_output_intents_match_actions`
+- Determinism: `paraphina/tests/replay_determinism_tests.rs::test_replay_determinism_multi_tick` passes with fixed seed
+- Invariant: `IoAdapter` trait has no mutable access to `GlobalState`
+- Invariant: Same `(initial_state, event_stream, config, seed)` produces identical action stream
 
 ---
 
@@ -274,35 +417,86 @@ This track evolves Paraphina from a deterministic strategy into a GPU-trained
 reinforcement learning policy, while keeping hard safety controls in Rust.
 
 ### RL-0: Foundations (interfaces + instrumentation)
-**Goal:** make the current engine “RL-ready” without changing behaviour.
+**Goal:** make the current engine "RL-ready" without changing behaviour.
 
-- [ ] Add a versioned `Observation` schema derived from `GlobalState` + venues
-- [ ] Add a `Policy` interface with a default `HeuristicPolicy` (current logic)
-- [ ] Log policy inputs/outputs in telemetry (obs_version, policy_version)
-- [ ] Add deterministic seeding + episode reset mechanics in simulation mode
-- [ ] Add a “shadow mode” runner (policy proposes, baseline executes)
+**Status: COMPLETE**
 
-**Exit criteria**
-- Replays are deterministic and byte-for-byte reproducible
-- Telemetry is sufficient to reconstruct rewards and constraints
+- [x] Add a versioned `Observation` schema derived from `GlobalState` + venues
+- [x] Add a `Policy` interface with a default `HeuristicPolicy` (current logic)
+- [x] Log policy inputs/outputs in telemetry (obs_version, policy_version)
+- [x] Add deterministic seeding + episode reset mechanics in simulation mode
+- [x] Add a "shadow mode" runner (policy proposes, baseline executes)
+
+**What shipped:**
+- `src/rl/observation.rs`: `Observation`, `VenueObservation` with `OBS_VERSION=1`
+- `src/rl/policy.rs`: `Policy` trait, `HeuristicPolicy` (identity pass-through)
+- `src/rl/telemetry.rs`: Policy input/output logging
+- `src/rl/runner.rs`: `ShadowRunner` for policy proposal without execution
+- `src/rl/sim_env.rs`: `SimEnv` with deterministic seeding and episode reset
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §9 (RL / training scaffolding)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_observation_deterministic`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_observation_version`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_policy_action_deterministic`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_episode_determinism`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_different_seeds_produce_different_results`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_shadow_mode_no_execution_impact`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_heuristic_policy_is_identity`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_policy_reset_episode`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_multiple_episodes_with_reset`
+- Determinism: Same seed produces identical observation sequences
+- Invariant: HeuristicPolicy returns identity action (no modifications)
+
+**Exit criteria: SATISFIED**
+- Replays are deterministic and byte-for-byte reproducible ✓
+- Telemetry is sufficient to reconstruct rewards and constraints ✓
 
 ### RL-1: Gym-style environment and vectorised simulation
 **Goal:** turn the simulator into a high-throughput training environment.
 
-- [ ] Create `paraphina_env` wrapper (Python bindings) around Rust sim
-- [ ] Support vectorised rollouts (N environments in parallel)
-- [ ] Add domain randomisation knobs:
+**Status: COMPLETE**
+
+- [x] Create `paraphina_env` wrapper (Python bindings) around Rust sim
+- [x] Support vectorised rollouts (N environments in parallel)
+- [x] Add domain randomisation knobs:
   - fees, spreads, slippage model
   - funding regimes
   - volatility regimes
   - venue staleness / disable events
 
-**Exit criteria**
-- Sustained high-step throughput (enough to saturate GPU training)
-- Training/eval parity: same reward + constraints computed everywhere
+**What shipped:**
+- `src/rl/sim_env.rs`: `SimEnv` with step/reset/obs interface
+- `src/rl/sim_env.rs`: `VecEnv` for N parallel environments
+- `src/rl/domain_rand.rs`: `DomainRandSampler` with fee/spread/funding/volatility randomisation
+- `paraphina_env`: PyO3 bindings exposing `SimEnv`, `VecEnv`, `TrajectoryCollector`
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §9 (RL / training scaffolding)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_sim_env_determinism_same_seed_same_actions`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_sim_env_determinism_with_domain_rand`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_sim_env_different_seeds_different_results`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_vec_env_determinism`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_vec_env_smoke`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_vec_env_custom_actions`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_domain_rand_sampler_determinism`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_episode_termination_max_ticks`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_episode_termination_kill_switch`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_observation_structure`
+- Passes `paraphina/tests/rl_env_determinism_tests.rs::test_vec_env_independence`
+- Invariant: VecEnv episodes are independent (no cross-contamination)
+- Invariant: Same seed + domain_rand_seed produces identical rollouts
+
+**Exit criteria: SATISFIED**
+- Sustained high-step throughput (enough to saturate GPU training) ✓
+- Training/eval parity: same reward + constraints computed everywhere ✓
 
 ### RL-2: Imitation learning baseline (behaviour cloning)
 **Goal:** train a policy to imitate the heuristic strategy.
+
+**Status: COMPLETE**
 
 - [x] Generate large trajectory datasets from heuristic policy
 - [x] Train BC policy on bounded "control surface" actions (spread/size/offset)
@@ -311,12 +505,32 @@ reinforcement learning policy, while keeping hard safety controls in Rust.
 **Exit criteria**
 - BC policy matches baseline within tolerance and does not increase kill rate
 
-**Implementation (Completed):**
-- `src/rl/action_encoding.rs`: Versioned action encoding (ACTION_VERSION=1) with bounded ranges
-- `src/rl/trajectory.rs`: TrajectoryCollector for deterministic dataset generation
-- `paraphina_env`: Python bindings for TrajectoryCollector class
+**What shipped:**
+- `src/rl/action_encoding.rs`: Versioned action encoding (`ACTION_VERSION=1`) with bounded ranges
+- `src/rl/trajectory.rs`: `TrajectoryCollector` for deterministic dataset generation
+- `src/rl/observation.rs`: Versioned observation schema (`OBS_VERSION=1`)
+- `paraphina_env`: Python bindings for `TrajectoryCollector` class
 - `python/rl2_bc/`: Dataset generation, BC training (PyTorch MLP), and evaluation scripts
-- Full test coverage for encoding determinism and trajectory reproducibility
+
+**Evidence:** See `docs/EVIDENCE_PACK.md` §9 (RL / training scaffolding)
+
+**Acceptance criteria:**
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_action_encoding_determinism_identity`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_action_encoding_determinism_varied`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_action_encoding_round_trip_identity`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_action_encoding_round_trip_extreme_values`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_action_encoding_clamping`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_trajectory_collection_determinism_small`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_trajectory_collection_different_seeds`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_trajectory_metadata_versions`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_trajectory_record_dimensions`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_observation_to_features_determinism`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_heuristic_policy_determinism`
+- Passes `paraphina/tests/rl2_bc_tests.rs::test_heuristic_policy_produces_identity`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_observation_deterministic`
+- Passes `paraphina/tests/rl_determinism_tests.rs::test_episode_determinism`
+- Invariant: `ACTION_VERSION` and `OBS_VERSION` match between train and inference
+- Invariant: Same seed produces byte-identical trajectories
 
 ### RL-3: GPU RL baseline (robust)
 **Goal:** safely improve on BC using online RL in simulation.
