@@ -304,12 +304,19 @@ reinforcement learning policy, while keeping hard safety controls in Rust.
 ### RL-2: Imitation learning baseline (behaviour cloning)
 **Goal:** train a policy to imitate the heuristic strategy.
 
-- [ ] Generate large trajectory datasets from heuristic policy
-- [ ] Train BC policy on bounded “control surface” actions (spread/size/offset)
-- [ ] Evaluate: action error, PnL parity, risk parity under randomisation
+- [x] Generate large trajectory datasets from heuristic policy
+- [x] Train BC policy on bounded "control surface" actions (spread/size/offset)
+- [x] Evaluate: action error, PnL parity, risk parity under randomisation
 
 **Exit criteria**
 - BC policy matches baseline within tolerance and does not increase kill rate
+
+**Implementation (Completed):**
+- `src/rl/action_encoding.rs`: Versioned action encoding (ACTION_VERSION=1) with bounded ranges
+- `src/rl/trajectory.rs`: TrajectoryCollector for deterministic dataset generation
+- `paraphina_env`: Python bindings for TrajectoryCollector class
+- `python/rl2_bc/`: Dataset generation, BC training (PyTorch MLP), and evaluation scripts
+- Full test coverage for encoding determinism and trajectory reproducibility
 
 ### RL-3: GPU RL baseline (robust)
 **Goal:** safely improve on BC using online RL in simulation.

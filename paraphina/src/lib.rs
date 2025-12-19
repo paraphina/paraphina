@@ -110,6 +110,12 @@ pub use rl::{
 pub use rl::sim_env::{SimEnvConfig, StepInfo};
 pub use rl::{DomainRandConfig, DomainRandSample, DomainRandSampler, SimEnv, StepResult, VecEnv};
 
+// RL-2 Behaviour Cloning (per ROADMAP.md)
+pub use rl::{
+    decode_action, encode_action, ActionEncodingSpec, TrajectoryCollector, TrajectoryMetadata,
+    TrajectoryRecord, TrajectoryWriter, ACTION_VERSION, TRAJECTORY_VERSION,
+};
+
 // --- PnL / basis unit tests -------------------------------------------------
 
 #[cfg(test)]

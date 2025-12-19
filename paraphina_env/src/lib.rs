@@ -14,7 +14,8 @@ use pyo3::types::{PyDict, PyList};
 
 use paraphina::{
     Config, DomainRandConfig, Observation, PolicyAction, SimEnv as RustSimEnv, SimEnvConfig,
-    StepInfo, VecEnv as RustVecEnv, VenueObservation,
+    StepInfo, TrajectoryCollector as RustTrajectoryCollector, TrajectoryMetadata, TrajectoryRecord,
+    VecEnv as RustVecEnv, VenueObservation, ACTION_VERSION, OBS_VERSION, TRAJECTORY_VERSION,
 };
 
 /// Convert a Rust Observation to a Python dictionary.
@@ -497,7 +498,19 @@ impl VecEnv {
 /// Get the observation version.
 #[pyfunction]
 fn obs_version() -> u32 {
-    paraphina::OBS_VERSION
+    OBS_VERSION
+}
+
+/// Get the action encoding version.
+#[pyfunction]
+fn action_version() -> u32 {
+    ACTION_VERSION
+}
+
+/// Get the trajectory format version.
+#[pyfunction]
+fn trajectory_version() -> u32 {
+    TRAJECTORY_VERSION
 }
 
 /// Get the default number of venues.
@@ -506,12 +519,180 @@ fn default_num_venues() -> usize {
     Config::default().venues.len()
 }
 
+/// Convert TrajectoryRecord to Python dict.
+fn trajectory_record_to_dict(py: Python<'_>, record: &TrajectoryRecord) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new_bound(py);
+
+    dict.set_item("obs_features", record.obs_features.clone())?;
+    dict.set_item("action_target", record.action_target.clone())?;
+    dict.set_item("reward", record.reward)?;
+    dict.set_item("terminal", record.terminal)?;
+    dict.set_item("kill_reason", record.kill_reason.clone())?;
+    dict.set_item("episode_idx", record.episode_idx)?;
+    dict.set_item("step_idx", record.step_idx)?;
+    dict.set_item("seed", record.seed)?;
+
+    Ok(dict.into())
+}
+
+/// Convert TrajectoryMetadata to Python dict.
+fn trajectory_metadata_to_dict(
+    py: Python<'_>,
+    metadata: &TrajectoryMetadata,
+) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new_bound(py);
+
+    dict.set_item("trajectory_version", metadata.trajectory_version)?;
+    dict.set_item("obs_version", metadata.obs_version)?;
+    dict.set_item("action_version", metadata.action_version)?;
+    dict.set_item("policy_version", &metadata.policy_version)?;
+    dict.set_item("base_seed", metadata.base_seed)?;
+    dict.set_item("num_episodes", metadata.num_episodes)?;
+    dict.set_item("num_transitions", metadata.num_transitions)?;
+    dict.set_item("num_venues", metadata.num_venues)?;
+    dict.set_item("obs_dim", metadata.obs_dim)?;
+    dict.set_item("action_dim", metadata.action_dim)?;
+    dict.set_item("domain_rand_preset", &metadata.domain_rand_preset)?;
+    dict.set_item("apply_domain_rand", metadata.apply_domain_rand)?;
+    dict.set_item("max_ticks", metadata.max_ticks)?;
+    dict.set_item("collected_at", &metadata.collected_at)?;
+    dict.set_item("kill_rate", metadata.kill_rate)?;
+    dict.set_item("mean_episode_length", metadata.mean_episode_length)?;
+    dict.set_item("mean_pnl", metadata.mean_pnl)?;
+
+    Ok(dict.into())
+}
+
+/// Trajectory collector for generating BC training data.
+///
+/// Collects trajectories from the HeuristicPolicy running in the simulation
+/// environment. Supports vectorised rollouts and domain randomisation.
+#[pyclass]
+pub struct TrajectoryCollector {
+    inner: RustTrajectoryCollector,
+}
+
+#[pymethods]
+impl TrajectoryCollector {
+    /// Create a new trajectory collector.
+    ///
+    /// Args:
+    ///     num_envs: Number of parallel environments (default: 4)
+    ///     max_ticks: Maximum ticks per episode (default: 1000)
+    ///     apply_domain_rand: Whether to apply domain randomisation (default: True)
+    ///     domain_rand_preset: "default", "mild", or "deterministic" (default: "default")
+    ///     base_seed: Base seed for reproducibility (default: 42)
+    #[new]
+    #[pyo3(signature = (num_envs=4, max_ticks=1000, apply_domain_rand=true, domain_rand_preset="default", base_seed=42))]
+    fn new(
+        num_envs: usize,
+        max_ticks: u64,
+        apply_domain_rand: bool,
+        domain_rand_preset: &str,
+        base_seed: u64,
+    ) -> PyResult<Self> {
+        if num_envs == 0 {
+            return Err(PyValueError::new_err("num_envs must be > 0"));
+        }
+
+        let inner = RustTrajectoryCollector::new(
+            num_envs,
+            max_ticks,
+            apply_domain_rand,
+            domain_rand_preset,
+            base_seed,
+        );
+
+        Ok(Self { inner })
+    }
+
+    /// Collect trajectories for the specified number of episodes.
+    ///
+    /// Args:
+    ///     num_episodes: Number of episodes to collect
+    ///
+    /// Returns:
+    ///     Tuple of (records, metadata) where:
+    ///       - records is a list of dicts with obs_features, action_target, reward, etc.
+    ///       - metadata is a dict with version info, stats, etc.
+    fn collect(
+        &self,
+        py: Python<'_>,
+        num_episodes: u32,
+    ) -> PyResult<(Vec<Py<PyDict>>, Py<PyDict>)> {
+        let (records, metadata) = self.inner.collect(num_episodes);
+
+        let py_records: PyResult<Vec<_>> = records
+            .iter()
+            .map(|r| trajectory_record_to_dict(py, r))
+            .collect();
+
+        let py_metadata = trajectory_metadata_to_dict(py, &metadata)?;
+
+        Ok((py_records?, py_metadata))
+    }
+
+    /// Collect trajectories and return as numpy-compatible arrays.
+    ///
+    /// Args:
+    ///     num_episodes: Number of episodes to collect
+    ///
+    /// Returns:
+    ///     Dict with arrays:
+    ///       - observations: [N, obs_dim] float32
+    ///       - actions: [N, action_dim] float32
+    ///       - rewards: [N] float32
+    ///       - terminals: [N] bool
+    ///       - episode_indices: [N] uint32
+    ///       - metadata: dict
+    fn collect_arrays(&self, py: Python<'_>, num_episodes: u32) -> PyResult<Py<PyDict>> {
+        let (records, metadata) = self.inner.collect(num_episodes);
+
+        let n = records.len();
+        let obs_dim = metadata.obs_dim;
+        let action_dim = metadata.action_dim;
+
+        // Flatten arrays
+        let mut observations: Vec<f32> = Vec::with_capacity(n * obs_dim);
+        let mut actions: Vec<f32> = Vec::with_capacity(n * action_dim);
+        let mut rewards: Vec<f32> = Vec::with_capacity(n);
+        let mut terminals: Vec<bool> = Vec::with_capacity(n);
+        let mut episode_indices: Vec<u32> = Vec::with_capacity(n);
+
+        for record in &records {
+            observations.extend(&record.obs_features);
+            actions.extend(&record.action_target);
+            rewards.push(record.reward);
+            terminals.push(record.terminal);
+            episode_indices.push(record.episode_idx);
+        }
+
+        let dict = PyDict::new_bound(py);
+        dict.set_item("observations", observations)?;
+        dict.set_item("actions", actions)?;
+        dict.set_item("rewards", rewards)?;
+        dict.set_item("terminals", terminals)?;
+        dict.set_item("episode_indices", episode_indices)?;
+        dict.set_item("obs_dim", obs_dim)?;
+        dict.set_item("action_dim", action_dim)?;
+        dict.set_item("num_samples", n)?;
+
+        let py_metadata = trajectory_metadata_to_dict(py, &metadata)?;
+        dict.set_item("metadata", py_metadata)?;
+
+        Ok(dict.into())
+    }
+}
+
 /// Python module definition.
 #[pymodule]
 fn paraphina_env(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Env>()?;
     m.add_class::<VecEnv>()?;
+    m.add_class::<TrajectoryCollector>()?;
     m.add_function(wrap_pyfunction!(obs_version, m)?)?;
+    m.add_function(wrap_pyfunction!(action_version, m)?)?;
+    m.add_function(wrap_pyfunction!(trajectory_version, m)?)?;
     m.add_function(wrap_pyfunction!(default_num_venues, m)?)?;
     Ok(())
 }
