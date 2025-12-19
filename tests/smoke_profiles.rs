@@ -20,10 +20,12 @@ fn run_smoke(cfg: Config, ticks: u64) {
 /// for a modest number of ticks without panicking.
 #[test]
 fn smoke_profile_like_default() {
-    let mut cfg = Config::default();
+    let mut cfg = Config {
+        initial_q_tao: 0.0,
+        ..Config::default()
+    };
 
     // Mirror the profile presets you just validated:
-    cfg.initial_q_tao = 0.0;
     cfg.risk.daily_loss_limit = -2_000.0;
 
     run_smoke(cfg, 1_000);
@@ -32,9 +34,11 @@ fn smoke_profile_like_default() {
 /// Sanity check: a looser daily loss limit should also run cleanly.
 #[test]
 fn smoke_loose_loss_limit() {
-    let mut cfg = Config::default();
+    let mut cfg = Config {
+        initial_q_tao: 0.0,
+        ..Config::default()
+    };
 
-    cfg.initial_q_tao = 0.0;
     cfg.risk.daily_loss_limit = -10_000.0;
 
     run_smoke(cfg, 1_000);
