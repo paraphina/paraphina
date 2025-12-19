@@ -260,6 +260,7 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | Hedging | Partial | Cost model is simplified vs canonical; stops on kill_switch |
 | Cross-venue exits | Implemented (Milestone E) | Full allocator with net edge, basis/funding, fragmentation; lot size + min notional enforcement |
 | RL-1: Gym-style env | Implemented | SimEnv/VecEnv with Python bindings via paraphina_env crate |
+| RL-2: BC baseline | Implemented | Action encoding, trajectory collection, Python BC training scripts |
 | Production I/O | Planned | Current focus is deterministic sim + telemetry |
 
 ### Milestone E: Cross-venue Exit Allocator (Section 12)
@@ -372,6 +373,109 @@ observations, rewards, dones, infos = vec_env.step(actions)
 - Actions map to existing RL-0 `PolicyAction` control surface (spread_scale, size_scale, hedge_scale, etc.)
 - Errors converted to Python exceptions via PyO3
 - APIs designed small and stable for forward compatibility
+
+---
+
+### RL-2: Imitation Learning Baseline (Behaviour Cloning) (Implemented)
+
+**Status: Implemented**
+
+Per ROADMAP.md RL-2, this milestone provides a behaviour cloning baseline that trains a neural network policy to imitate the HeuristicPolicy.
+
+**Components:**
+
+1. **Action Encoding** (`src/rl/action_encoding.rs`):
+   - Versioned action vector encoding (ACTION_VERSION = 1)
+   - Bounded control surface mapped to normalized vectors
+   - Per-venue: spread_scale [0.5, 3.0] → [0, 1], size_scale [0.0, 2.0] → [0, 1], rprice_offset [-10, 10] → [-1, 1]
+   - Global: hedge_scale [0.0, 2.0] → [0, 1], hedge_venue_weights (simplex)
+   - Round-trip encode/decode with clamping semantics
+   - Total action dimension: 3×num_venues + 1 + num_venues = 21 (for 5 venues)
+
+2. **Observation Encoding** (`src/rl/trajectory.rs`):
+   - Global features (17): fair_value, sigma_eff, vol_ratio_clipped, spread/size/band_mult, inventory, basis, pnl, risk state
+   - Per-venue features (14×num_venues): mid, spread, depth, staleness, local_vol, status (one-hot), toxicity, position, funding, margin, dist_liq_sigma
+   - Total observation dimension: 17 + 14×num_venues = 87 (for 5 venues)
+
+3. **Trajectory Collection** (`src/rl/trajectory.rs`):
+   - `TrajectoryCollector`: vectorised rollouts with HeuristicPolicy
+   - `TrajectoryRecord`: (obs_features, action_target, reward, terminal, kill_reason, episode_idx, step_idx, seed)
+   - `TrajectoryMetadata`: version info, collection config, stats (kill_rate, mean_episode_length, mean_pnl)
+   - Deterministic: same seed → identical output
+
+4. **Python Bindings** (`paraphina_env/src/lib.rs`):
+   - `TrajectoryCollector` class with `collect(num_episodes)` and `collect_arrays(num_episodes)`
+   - `obs_version()`, `action_version()`, `trajectory_version()` functions
+
+5. **Python Scripts** (`python/rl2_bc/`):
+   - `generate_dataset.py`: collect trajectories, save as NPY arrays + JSON metadata
+   - `train_bc.py`: PyTorch MLP training with deterministic seeding
+   - `eval_bc.py`: holdout error + rollout comparison vs heuristic
+
+**Dataset Format:**
+
+```
+{output_dir}/
+  metadata.json      # versions, config, stats
+  observations.npy   # [N, 87] float32
+  actions.npy        # [N, 21] float32
+  rewards.npy        # [N] float32
+  terminals.npy      # [N] bool
+  episode_indices.npy # [N] uint32
+```
+
+**metadata.json schema:**
+```json
+{
+  "trajectory_version": 1,
+  "obs_version": 1,
+  "action_version": 1,
+  "policy_version": "heuristic-v1.0.0",
+  "base_seed": 42,
+  "num_episodes": 100,
+  "num_transitions": 50000,
+  "obs_dim": 87,
+  "action_dim": 21,
+  "domain_rand_preset": "deterministic",
+  "kill_rate": 0.05,
+  "mean_episode_length": 500.0,
+  "mean_pnl": 10.5
+}
+```
+
+**Test Coverage:**
+- `test_action_encoding_determinism_identity`: identity action encoding is deterministic
+- `test_action_encoding_round_trip_identity`: encode/decode preserves values
+- `test_action_encoding_clamping`: out-of-bounds values are clamped
+- `test_trajectory_collection_determinism_small`: same seed → identical trajectories
+- `test_trajectory_collection_different_seeds`: different seeds → different trajectories
+- `test_heuristic_policy_determinism`: policy is deterministic on same observation
+
+**Exit Criteria (per ROADMAP.md):**
+- Action prediction MAE < 0.1 on holdout data
+- Rollout kill rate ≤ heuristic kill rate × 1.1
+- Rollout mean PnL ≥ heuristic mean PnL × 0.9
+
+**Reproducibility:**
+- Rust trajectory collection: deterministic given seed
+- Python training: deterministic with `torch.use_deterministic_algorithms(True)`
+- Known limitation: GPU cuDNN may introduce minor non-determinism; use CPU for full reproducibility
+
+**Usage:**
+
+```bash
+# Generate dataset
+python python/rl2_bc/generate_dataset.py \
+    --num-episodes 1000 --seed 42 --output-dir runs/rl2_data
+
+# Train BC policy
+python python/rl2_bc/train_bc.py \
+    --data-dir runs/rl2_data --output-dir runs/rl2_model --epochs 100
+
+# Evaluate
+python python/rl2_bc/eval_bc.py \
+    --model-dir runs/rl2_model --eval-holdout --eval-rollout
+```
 
 ---
 
