@@ -1,0 +1,25 @@
+[package]
+name = "paraphina_env"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+# Build as a Python extension module.
+name = "paraphina_env"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Core paraphina engine.
+paraphina = { path = "../paraphina" }
+
+# Python bindings.
+pyo3 = { workspace = true }
+
+# Serialization.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Deterministic RNG.
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+

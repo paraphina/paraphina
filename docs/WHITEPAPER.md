@@ -259,6 +259,7 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | MM quoting | Implemented | Stops on kill_switch OR HardLimit (Milestone C) |
 | Hedging | Partial | Cost model is simplified vs canonical; stops on kill_switch |
 | Cross-venue exits | Implemented (Milestone E) | Full allocator with net edge, basis/funding, fragmentation; lot size + min notional enforcement |
+| RL-1: Gym-style env | Implemented | SimEnv/VecEnv with Python bindings via paraphina_env crate |
 | Production I/O | Planned | Current focus is deterministic sim + telemetry |
 
 ### Milestone E: Cross-venue Exit Allocator (Section 12)
@@ -309,6 +310,68 @@ Section 12 cross-venue exit optimization with the following features:
 MM quotes → MM fills → recompute → EXIT → recompute → hedge → recompute
 ```
 This ordering is enforced in both `src/strategy.rs` and `src/bin/monte_carlo.rs`.
+
+---
+
+### RL-1: Gym-style Environment and Vectorised Simulation (Implemented)
+
+**Status: Implemented**
+
+Per ROADMAP.md RL-1, this milestone provides a Gym-style RL environment for training policies without modifying baseline trading behaviour.
+
+**Components:**
+
+1. **`paraphina_env` crate** - PyO3 Python bindings exposing:
+   - `Env` class with `reset(seed=None)` and `step(action)` methods
+   - `VecEnv` class for N parallel environments with `reset_all(seeds)` and `step(actions)`
+   - All observations derive from the RL-0 `Observation` schema and remain versioned
+
+2. **`SimEnv`** - Rust Gym-style environment wrapper:
+   - Wraps the existing simulation engine without duplicating logic
+   - `reset(seed)` returns initial observation with domain randomisation applied
+   - `step(action)` applies PolicyAction modifiers and returns (obs, reward, done, info)
+   - Deterministic given seed: same seed + same actions = identical outputs
+
+3. **`VecEnv`** - Vectorised environment for parallel rollouts:
+   - Manages N independent `SimEnv` instances
+   - `reset_all(seeds)` resets all environments (random seeds if None)
+   - `step(actions)` steps all environments and returns batched results
+   - Deterministic per-environment given respective seeds
+
+4. **Domain Randomisation** (`DomainRandConfig`, `DomainRandSampler`):
+   - Deterministic sampling from seed for: fees, spreads, slippage, funding regimes, volatility regimes, venue staleness/disable events
+   - Presets: `default()`, `mild()`, `deterministic()` for different training stages
+
+**Usage Example (Python):**
+
+```python
+import paraphina_env
+
+# Single environment
+env = paraphina_env.Env(max_ticks=1000, apply_domain_rand=True)
+obs = env.reset(seed=42)
+action = env.identity_action()  # baseline behaviour
+obs, reward, done, info = env.step(action)
+
+# Vectorised environments
+vec_env = paraphina_env.VecEnv(n=8, max_ticks=1000)
+observations = vec_env.reset_all(seeds=[100, 200, 300, 400, 500, 600, 700, 800])
+actions = vec_env.identity_actions()
+observations, rewards, dones, infos = vec_env.step(actions)
+```
+
+**Test Coverage:**
+- `test_sim_env_determinism_same_seed_same_actions`: verifies byte-identical outputs
+- `test_sim_env_determinism_with_domain_rand`: determinism with domain randomisation
+- `test_vec_env_determinism`: vectorised environment determinism across all envs
+- `test_vec_env_smoke`: basic VecEnv stepping smoke test
+- `test_domain_rand_sampler_determinism`: domain randomisation sampler determinism
+
+**Key Design Decisions:**
+- RL-1 is simulation-mode only; baseline trading behaviour unchanged
+- Actions map to existing RL-0 `PolicyAction` control surface (spread_scale, size_scale, hedge_scale, etc.)
+- Errors converted to Python exceptions via PyO3
+- APIs designed small and stable for forward compatibility
 
 ---
 

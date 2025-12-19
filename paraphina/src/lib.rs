@@ -28,6 +28,14 @@
 //! - **Policy**: Trait for strategy decision-making (heuristic or learned)
 //! - **ShadowRunner**: Parallel execution of baseline + shadow policies
 //! - **RLTelemetry**: Logging of policy inputs/outputs and reward components
+//!
+//! # RL-1 Gym Environment (per ROADMAP.md)
+//!
+//! The `rl` module also provides Gym-style environments for RL training:
+//!
+//! - **SimEnv**: Single Gym-style environment (reset, step)
+//! - **VecEnv**: Vectorised environments for parallel rollouts
+//! - **DomainRandConfig**: Domain randomisation for training robustness
 
 pub mod actions;
 pub mod config;
@@ -94,9 +102,13 @@ pub use types::{FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueSt
 // RL-0 Foundations (per ROADMAP.md)
 pub use rl::{
     EpisodeConfig, EpisodeSummary, HeuristicPolicy, NoopPolicy, Observation, Policy, PolicyAction,
-    RLTelemetry, RewardComponents, ShadowRunner, TerminationReason, TickRecord, VenueObservation,
-    HEURISTIC_POLICY_VERSION, OBS_VERSION,
+    RLTelemetry, RewardComponents, RewardWeights, ShadowRunner, TerminationReason, TickRecord,
+    VenueObservation, HEURISTIC_POLICY_VERSION, OBS_VERSION,
 };
+
+// RL-1 Gym Environment (per ROADMAP.md)
+pub use rl::sim_env::{SimEnvConfig, StepInfo};
+pub use rl::{DomainRandConfig, DomainRandSample, DomainRandSampler, SimEnv, StepResult, VecEnv};
 
 // --- PnL / basis unit tests -------------------------------------------------
 
