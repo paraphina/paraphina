@@ -4,6 +4,7 @@
 //
 // This module provides:
 // - ScenarioSpec: Versioned scenario definition (YAML-parsed)
+// - SuiteSpec: Suite manifest for grouping scenarios with CI gates
 // - RunSummary: Output schema with determinism checksum
 // - BuildInfo: Git SHA and dirty flag for reproducibility
 //
@@ -11,6 +12,7 @@
 
 pub mod output;
 pub mod scenario;
+pub mod suite;
 
 pub use output::{
     create_output_dir, write_build_info, write_config_resolved, BuildInfo, ConfigResolved,
@@ -21,3 +23,4 @@ pub use scenario::{
     MarketModelType, MicrostructureModel, PnlLinearityCheck, Rng, ScenarioError, ScenarioSpec,
     SyntheticConfig, SyntheticParams, SyntheticProcess, SCENARIO_SCHEMA_VERSION,
 };
+pub use suite::{ScenarioRef, SuiteError, SuiteSpec, SUITE_SCHEMA_VERSION};

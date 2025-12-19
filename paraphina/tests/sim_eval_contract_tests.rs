@@ -13,7 +13,7 @@ use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
     BuildInfo, Engine, ExpectKillSwitch, KillSwitchInfo, MarketModelType, PnlLinearityCheck,
-    RunSummary, ScenarioSpec, SyntheticProcess,
+    RunSummary, ScenarioSpec, SuiteSpec, SyntheticProcess,
 };
 
 // --------------------------------------------------------------------------
@@ -405,4 +405,217 @@ market_model:
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("synthetic"));
+}
+
+// --------------------------------------------------------------------------
+// Test: Suite parsing
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_parse_ci_smoke_suite_yaml() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scenarios/suites/ci_smoke_v1.yaml");
+
+    let suite = SuiteSpec::from_yaml_file(&path).expect("Should parse ci_smoke_v1.yaml");
+
+    assert_eq!(suite.suite_id, "ci_smoke_v1");
+    assert_eq!(suite.suite_version, 1);
+    assert_eq!(suite.repeat_runs, 2);
+    assert_eq!(suite.out_dir, "runs/ci");
+    assert_eq!(suite.scenarios.len(), 3);
+    assert_eq!(suite.scenarios[0].path, "scenarios/v1/synth_baseline.yaml");
+    assert_eq!(suite.scenarios[1].path, "scenarios/v1/synth_jump.yaml");
+    assert_eq!(
+        suite.scenarios[2].path,
+        "scenarios/v1/historical_replay_stub.yaml"
+    );
+}
+
+#[test]
+fn test_suite_parsing_inline() {
+    let yaml = r#"
+suite_id: test_suite
+suite_version: 1
+repeat_runs: 3
+out_dir: test_out
+scenarios:
+  - path: scenario1.yaml
+  - path: scenario2.yaml
+"#;
+
+    let suite = SuiteSpec::from_yaml_str(yaml).expect("Should parse");
+    assert_eq!(suite.suite_id, "test_suite");
+    assert_eq!(suite.suite_version, 1);
+    assert_eq!(suite.repeat_runs, 3);
+    assert_eq!(suite.out_dir, "test_out");
+    assert_eq!(suite.scenarios.len(), 2);
+}
+
+#[test]
+fn test_suite_default_values() {
+    let yaml = r#"
+suite_id: minimal
+suite_version: 1
+scenarios:
+  - path: test.yaml
+"#;
+
+    let suite = SuiteSpec::from_yaml_str(yaml).expect("Should parse");
+    assert_eq!(suite.repeat_runs, 1); // Default
+    assert_eq!(suite.out_dir, "runs/ci"); // Default
+}
+
+#[test]
+fn test_suite_validation_empty_id() {
+    let yaml = r#"
+suite_id: ""
+suite_version: 1
+scenarios:
+  - path: test.yaml
+"#;
+
+    let result = SuiteSpec::from_yaml_str(yaml);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("suite_id"));
+}
+
+#[test]
+fn test_suite_validation_empty_scenarios() {
+    let yaml = r#"
+suite_id: test
+suite_version: 1
+scenarios: []
+"#;
+
+    let result = SuiteSpec::from_yaml_str(yaml);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("scenarios"));
+}
+
+#[test]
+fn test_suite_validation_zero_repeat_runs() {
+    let yaml = r#"
+suite_id: test
+suite_version: 1
+repeat_runs: 0
+scenarios:
+  - path: test.yaml
+"#;
+
+    let result = SuiteSpec::from_yaml_str(yaml);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("repeat_runs"));
+}
+
+// --------------------------------------------------------------------------
+// Test: Determinism gate (simulates what the suite runner does)
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_determinism_gate_passes_for_identical_runs() {
+    // Simulate the determinism gate: run N times and compare checksums
+    let seed = 999u64;
+    let steps = 50u64;
+    let repeat_runs = 3;
+
+    let checksums: Vec<String> = (0..repeat_runs)
+        .map(|_| run_simulation_for_checksum(seed, steps))
+        .collect();
+
+    // Verify all checksums are identical (determinism gate passes)
+    let first = &checksums[0];
+    let all_same = checksums.iter().all(|c| c == first);
+    assert!(
+        all_same,
+        "Determinism gate should pass: all checksums should be identical"
+    );
+}
+
+#[test]
+fn test_determinism_gate_would_fail_for_different_seeds() {
+    // Demonstrate that different seeds produce different checksums
+    // (this is how a non-deterministic implementation would fail the gate)
+    let steps = 50u64;
+
+    let checksum1 = run_simulation_for_checksum(100, steps);
+    let checksum2 = run_simulation_for_checksum(101, steps);
+
+    // Different seeds should give different checksums
+    assert_ne!(
+        checksum1, checksum2,
+        "Different seeds should produce different checksums (gate would catch non-determinism)"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Test: Schema completeness (verify RunSummary has all required fields)
+// --------------------------------------------------------------------------
+
+#[test]
+fn test_schema_completeness_all_fields_present() {
+    let spec = ScenarioSpec {
+        scenario_id: "schema_test".to_string(),
+        scenario_version: 1,
+        engine: Engine::RlSimEnv,
+        horizon: paraphina::sim_eval::Horizon {
+            steps: 100,
+            dt_seconds: 0.5,
+        },
+        rng: paraphina::sim_eval::Rng::default(),
+        initial_state: paraphina::sim_eval::InitialState {
+            risk_profile: "balanced".to_string(),
+            init_q_tao: 0.0,
+        },
+        market_model: paraphina::sim_eval::MarketModel::default(),
+        microstructure_model: paraphina::sim_eval::MicrostructureModel::default(),
+        invariants: paraphina::sim_eval::Invariants::default(),
+    };
+
+    let summary = RunSummary::new(
+        &spec,
+        42,
+        BuildInfo::for_test(),
+        100.0,
+        50.0,
+        KillSwitchInfo::default(),
+    );
+
+    // Verify all required fields per docs/SIM_OUTPUT_SCHEMA.md are present and valid
+    // Top-level
+    assert!(!summary.scenario_id.is_empty(), "scenario_id required");
+    assert!(summary.scenario_version >= 1, "scenario_version >= 1");
+    // seed is always present (u64)
+
+    // build_info
+    assert!(!summary.build_info.git_sha.is_empty(), "git_sha required");
+    // dirty is always present (bool)
+
+    // config
+    assert!(
+        !summary.config.risk_profile.is_empty(),
+        "risk_profile required"
+    );
+    assert!(summary.config.steps > 0, "steps > 0");
+    assert!(summary.config.dt_seconds > 0.0, "dt_seconds > 0");
+    // init_q_tao can be any value
+
+    // results
+    // final_pnl_usd and max_drawdown_usd can be any values
+    // kill_switch fields have defaults
+
+    // determinism
+    assert!(
+        !summary.determinism.checksum.is_empty(),
+        "checksum required"
+    );
+    assert_eq!(
+        summary.determinism.checksum.len(),
+        64,
+        "checksum must be 64 hex chars (SHA256)"
+    );
 }
