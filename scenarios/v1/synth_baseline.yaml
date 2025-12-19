@@ -1,0 +1,33 @@
+scenario_id: synth_baseline
+scenario_version: 1
+
+engine: rl_sim_env
+
+horizon:
+  steps: 2000
+  dt_seconds: 0.25
+
+rng:
+  base_seed: 42
+  num_seeds: 5
+
+initial_state:
+  risk_profile: balanced
+  init_q_tao: 0.0
+
+market_model:
+  type: synthetic
+  synthetic:
+    process: gbm
+    params:
+      vol: 0.015
+      drift: 0.0
+
+microstructure_model:
+  fees_bps_maker: 0.0
+  fees_bps_taker: 0.0
+  latency_ms: 0.0
+
+invariants:
+  expect_kill_switch: allowed
+  pnl_linearity_check: disabled

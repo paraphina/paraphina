@@ -1,0 +1,30 @@
+scenario_id: historical_stub
+scenario_version: 1
+
+engine: replay_stub
+
+horizon:
+  steps: 1000
+  dt_seconds: 1.0
+
+rng:
+  base_seed: 1
+  num_seeds: 1
+
+initial_state:
+  risk_profile: balanced
+  init_q_tao: 0.0
+
+market_model:
+  type: historical_stub
+  historical_stub:
+    dataset_id: "TODO:dataset_pointer_only"
+
+microstructure_model:
+  fees_bps_maker: 0.0
+  fees_bps_taker: 0.0
+  latency_ms: 0.0
+
+invariants:
+  expect_kill_switch: allowed
+  pnl_linearity_check: disabled
