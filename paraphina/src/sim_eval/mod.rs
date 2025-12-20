@@ -13,6 +13,7 @@
 pub mod output;
 pub mod scenario;
 pub mod suite;
+pub mod summarize;
 
 pub use output::{
     create_output_dir, write_build_info, write_config_resolved, BuildInfo, ConfigResolved,
@@ -24,3 +25,4 @@ pub use scenario::{
     SyntheticConfig, SyntheticParams, SyntheticProcess, SCENARIO_SCHEMA_VERSION,
 };
 pub use suite::{ScenarioRef, SuiteError, SuiteSpec, SUITE_SCHEMA_VERSION};
+pub use summarize::{summarize, SummarizeResult, SummaryRow};
