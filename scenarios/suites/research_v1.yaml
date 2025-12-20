@@ -1,0 +1,12 @@
+suite_id: research_v1
+suite_version: 1
+repeat_runs: 1
+
+# Where to write run artifacts (runner will create per-scenario/seed subdirs).
+out_dir: runs/research
+
+# Scenario list is just file paths into the committed registry.
+scenarios:
+  - path: scenarios/v1/synth_baseline.yaml
+  - path: scenarios/v1/synth_jump.yaml
+  - path: scenarios/v1/historical_replay_stub.yaml

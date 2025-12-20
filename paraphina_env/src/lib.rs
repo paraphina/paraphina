@@ -13,9 +13,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use paraphina::{
-    Config, DomainRandConfig, Observation, PolicyAction, SimEnv as RustSimEnv, SimEnvConfig,
-    StepInfo, TrajectoryCollector as RustTrajectoryCollector, TrajectoryMetadata, TrajectoryRecord,
-    VecEnv as RustVecEnv, VenueObservation, ACTION_VERSION, OBS_VERSION, TRAJECTORY_VERSION,
+    AblationSet, Config, DomainRandConfig, Observation, PolicyAction, SimEnv as RustSimEnv,
+    SimEnvConfig, StepInfo, TrajectoryCollector as RustTrajectoryCollector, TrajectoryMetadata,
+    TrajectoryRecord, VecEnv as RustVecEnv, VenueObservation, ACTION_VERSION, OBS_VERSION,
+    TRAJECTORY_VERSION,
 };
 
 /// Convert a Rust Observation to a Python dictionary.
@@ -230,6 +231,7 @@ impl Env {
             domain_rand,
             reward_weights: Default::default(),
             apply_domain_rand,
+            ablations: AblationSet::new(),
         };
 
         let inner = RustSimEnv::new(base_config, env_config);
@@ -364,6 +366,7 @@ impl VecEnv {
             domain_rand,
             reward_weights: Default::default(),
             apply_domain_rand,
+            ablations: AblationSet::new(),
         };
 
         let inner = RustVecEnv::new(n, base_config, env_config);

@@ -15,6 +15,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::Command;
 
+use super::ablation::AblationSet;
 use super::scenario::ScenarioSpec;
 
 /// Output schema version.
@@ -56,6 +57,9 @@ pub struct ConfigResolved {
     pub dt_seconds: f64,
     /// Number of steps.
     pub steps: u64,
+    /// Active ablations (sorted list of ablation IDs).
+    #[serde(default)]
+    pub ablations: Vec<String>,
 }
 
 impl ConfigResolved {
@@ -66,6 +70,18 @@ impl ConfigResolved {
             init_q_tao: spec.initial_state.init_q_tao,
             dt_seconds: spec.horizon.dt_seconds,
             steps: spec.horizon.steps,
+            ablations: Vec::new(),
+        }
+    }
+
+    /// Create from scenario spec with ablations.
+    pub fn from_scenario_with_ablations(spec: &ScenarioSpec, ablations: &AblationSet) -> Self {
+        Self {
+            risk_profile: spec.initial_state.risk_profile.clone(),
+            init_q_tao: spec.initial_state.init_q_tao,
+            dt_seconds: spec.horizon.dt_seconds,
+            steps: spec.horizon.steps,
+            ablations: ablations.ablations.clone(),
         }
     }
 }
@@ -116,10 +132,13 @@ pub struct RunSummary {
     pub results: ResultsInfo,
     /// Determinism information.
     pub determinism: DeterminismInfo,
+    /// Active ablations (sorted list of ablation IDs).
+    #[serde(default)]
+    pub ablations: Vec<String>,
 }
 
 impl RunSummary {
-    /// Create a new run summary.
+    /// Create a new run summary (baseline, no ablations).
     pub fn new(
         scenario: &ScenarioSpec,
         seed: u64,
@@ -128,15 +147,36 @@ impl RunSummary {
         max_drawdown_usd: f64,
         kill_switch: KillSwitchInfo,
     ) -> Self {
-        let config = ConfigResolved::from_scenario(scenario);
+        Self::with_ablations(
+            scenario,
+            seed,
+            build_info,
+            final_pnl_usd,
+            max_drawdown_usd,
+            kill_switch,
+            &AblationSet::new(),
+        )
+    }
+
+    /// Create a new run summary with ablations.
+    pub fn with_ablations(
+        scenario: &ScenarioSpec,
+        seed: u64,
+        build_info: BuildInfo,
+        final_pnl_usd: f64,
+        max_drawdown_usd: f64,
+        kill_switch: KillSwitchInfo,
+        ablations: &AblationSet,
+    ) -> Self {
+        let config = ConfigResolved::from_scenario_with_ablations(scenario, ablations);
         let results = ResultsInfo {
             final_pnl_usd,
             max_drawdown_usd,
             kill_switch,
         };
 
-        // Compute checksum from deterministic fields
-        let checksum = Self::compute_checksum(&config, &results, seed);
+        // Compute checksum from deterministic fields including ablations
+        let checksum = Self::compute_checksum(&config, &results, seed, ablations);
 
         Self {
             scenario_id: scenario.scenario_id.clone(),
@@ -146,6 +186,7 @@ impl RunSummary {
             config,
             results,
             determinism: DeterminismInfo { checksum },
+            ablations: ablations.ablations.clone(),
         }
     }
 
@@ -155,7 +196,13 @@ impl RunSummary {
     /// - seed
     /// - config (risk_profile, init_q_tao, dt_seconds, steps)
     /// - results (final_pnl_usd, max_drawdown_usd, kill_switch)
-    pub fn compute_checksum(config: &ConfigResolved, results: &ResultsInfo, seed: u64) -> String {
+    /// - ablations (sorted list of ablation IDs)
+    pub fn compute_checksum(
+        config: &ConfigResolved,
+        results: &ResultsInfo,
+        seed: u64,
+        ablations: &AblationSet,
+    ) -> String {
         let mut hasher = Sha256::new();
 
         // Seed
@@ -166,6 +213,9 @@ impl RunSummary {
         hasher.update(config.init_q_tao.to_le_bytes());
         hasher.update(config.dt_seconds.to_le_bytes());
         hasher.update(config.steps.to_le_bytes());
+
+        // Ablations (sorted, joined by "|")
+        hasher.update(ablations.checksum_bytes());
 
         // Results (use fixed-precision to ensure determinism)
         // Round to 6 decimal places for floating point stability
@@ -254,14 +304,59 @@ pub fn create_output_dir(
     Ok(path)
 }
 
+/// Create the output directory structure with ablation hash.
+///
+/// Creates: runs/<scenario_id>/<git_sha>/<ablation_hash>/<seed>/
+///
+/// The ablation_hash is "baseline" for empty ablation set, otherwise a 6-char hex hash.
+/// This ensures different ablation sets write to different directories.
+pub fn create_output_dir_with_ablations(
+    base_dir: &Path,
+    scenario_id: &str,
+    git_sha: &str,
+    seed: u64,
+    ablations: &AblationSet,
+) -> std::io::Result<std::path::PathBuf> {
+    let ablation_hash = ablations.short_hash();
+    let path = base_dir
+        .join(scenario_id)
+        .join(git_sha)
+        .join(ablation_hash)
+        .join(seed.to_string());
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
 /// Write config_resolved.json (full scenario + defaults).
 pub fn write_config_resolved<P: AsRef<Path>>(
     path: P,
     scenario: &ScenarioSpec,
 ) -> std::io::Result<()> {
+    write_config_resolved_with_ablations(path, scenario, &AblationSet::new())
+}
+
+/// Write config_resolved.json with ablations included.
+pub fn write_config_resolved_with_ablations<P: AsRef<Path>>(
+    path: P,
+    scenario: &ScenarioSpec,
+    ablations: &AblationSet,
+) -> std::io::Result<()> {
+    // Create a combined structure that includes both scenario and ablations
+    #[derive(Serialize)]
+    struct ConfigResolvedFull<'a> {
+        #[serde(flatten)]
+        scenario: &'a ScenarioSpec,
+        ablations: &'a Vec<String>,
+    }
+
+    let full = ConfigResolvedFull {
+        scenario,
+        ablations: &ablations.ablations,
+    };
+
     let file = File::create(path)?;
     let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, scenario)?;
+    serde_json::to_writer_pretty(writer, &full)?;
     Ok(())
 }
 
@@ -386,5 +481,62 @@ mod tests {
         let summary2 = RunSummary::new(&scenario, 42, build_info, 200.0, 50.0, kill_switch);
 
         assert_ne!(summary1.determinism.checksum, summary2.determinism.checksum);
+    }
+
+    #[test]
+    fn test_checksum_differs_with_ablations() {
+        let scenario = make_test_scenario();
+        let build_info = BuildInfo::for_test();
+        let kill_switch = KillSwitchInfo::default();
+
+        // Baseline (no ablations)
+        let summary_baseline = RunSummary::new(
+            &scenario,
+            42,
+            build_info.clone(),
+            100.0,
+            50.0,
+            kill_switch.clone(),
+        );
+
+        // With ablations
+        let ablations = AblationSet::from_ids(&["disable_vol_floor".to_string()]).unwrap();
+        let summary_ablated = RunSummary::with_ablations(
+            &scenario,
+            42,
+            build_info,
+            100.0,
+            50.0,
+            kill_switch,
+            &ablations,
+        );
+
+        // Checksums should differ due to ablations
+        assert_ne!(
+            summary_baseline.determinism.checksum,
+            summary_ablated.determinism.checksum
+        );
+
+        // Ablations should be in the summary
+        assert!(summary_baseline.ablations.is_empty());
+        assert_eq!(summary_ablated.ablations, vec!["disable_vol_floor"]);
+    }
+
+    #[test]
+    fn test_config_resolved_includes_ablations() {
+        let scenario = make_test_scenario();
+        let ablations = AblationSet::from_ids(&[
+            "disable_vol_floor".to_string(),
+            "disable_toxicity_gate".to_string(),
+        ])
+        .unwrap();
+
+        let config = ConfigResolved::from_scenario_with_ablations(&scenario, &ablations);
+
+        assert_eq!(config.ablations.len(), 2);
+        assert!(config
+            .ablations
+            .contains(&"disable_toxicity_gate".to_string()));
+        assert!(config.ablations.contains(&"disable_vol_floor".to_string()));
     }
 }
