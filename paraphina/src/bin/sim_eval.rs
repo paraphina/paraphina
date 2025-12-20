@@ -2,13 +2,15 @@
 //
 // Simulation & Evaluation runner binary (Option B per ROADMAP.md).
 //
-// This binary supports two subcommands:
+// This binary supports three subcommands:
 // - run <SCENARIO_PATH>: Run a single scenario
 // - suite <SUITE_PATH>: Run a CI suite with gates
+// - summarize <RUNS_DIR>: Summarize run results from a directory
 //
 // Usage:
 //   cargo run -p paraphina --bin sim_eval -- run scenarios/v1/synth_baseline.yaml
 //   cargo run -p paraphina --bin sim_eval -- suite scenarios/suites/ci_smoke_v1.yaml
+//   cargo run -p paraphina --bin sim_eval -- summarize runs/
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -19,9 +21,9 @@ use paraphina::metrics::DrawdownTracker;
 use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
-    create_output_dir, write_build_info, write_config_resolved, BuildInfo, Engine,
+    create_output_dir, summarize, write_build_info, write_config_resolved, BuildInfo, Engine,
     ExpectKillSwitch, KillSwitchInfo, MarketModelType, RunSummary, ScenarioSpec, SuiteSpec,
-    SyntheticProcess,
+    SummarizeResult, SyntheticProcess,
 };
 
 // =============================================================================
@@ -32,6 +34,7 @@ use paraphina::sim_eval::{
 enum Command {
     Run(RunArgs),
     Suite(SuiteArgs),
+    Summarize(SummarizeArgs),
 }
 
 #[derive(Debug)]
@@ -48,6 +51,11 @@ struct SuiteArgs {
     verbose: bool,
 }
 
+#[derive(Debug)]
+struct SummarizeArgs {
+    runs_dir: PathBuf,
+}
+
 fn usage() -> &'static str {
     "\
 sim_eval - Simulation & Evaluation runner (Option B)
@@ -55,10 +63,12 @@ sim_eval - Simulation & Evaluation runner (Option B)
 USAGE:
   sim_eval run <SCENARIO_PATH> [OPTIONS]
   sim_eval suite <SUITE_PATH> [OPTIONS]
+  sim_eval summarize <RUNS_DIR>
 
 SUBCOMMANDS:
-  run    Run a single scenario
-  suite  Run a CI suite with determinism and invariant gates
+  run       Run a single scenario
+  suite     Run a CI suite with determinism and invariant gates
+  summarize Discover and summarize run_summary.json files
 
 RUN OPTIONS:
   --output-dir DIR   Output directory (default: runs/)
@@ -75,6 +85,7 @@ EXAMPLES:
   sim_eval run scenarios/v1/synth_baseline.yaml
   sim_eval run scenarios/v1/synth_jump.yaml --output-dir ./my_runs --verbose
   sim_eval suite scenarios/suites/ci_smoke_v1.yaml
+  sim_eval summarize runs/
 "
 }
 
@@ -173,6 +184,37 @@ fn parse_args() -> Result<Command, String> {
             }
 
             Ok(Command::Suite(suite_args))
+        }
+        "summarize" => {
+            let mut summarize_args = SummarizeArgs {
+                runs_dir: PathBuf::new(),
+            };
+            let mut runs_dir_set = false;
+
+            for arg in args.by_ref() {
+                match arg.as_str() {
+                    "--help" | "-h" => {
+                        println!("{}", usage());
+                        std::process::exit(0);
+                    }
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("Unknown option: {}", arg));
+                    }
+                    _ => {
+                        if runs_dir_set {
+                            return Err("Multiple runs directories provided".to_string());
+                        }
+                        summarize_args.runs_dir = PathBuf::from(arg);
+                        runs_dir_set = true;
+                    }
+                }
+            }
+
+            if !runs_dir_set {
+                return Err("Missing required argument: <RUNS_DIR>".to_string());
+            }
+
+            Ok(Command::Summarize(summarize_args))
         }
         // Legacy support: if first arg looks like a path, treat as `run`
         other if !other.starts_with('-') => {
@@ -900,6 +942,47 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
 }
 
 // =============================================================================
+// Summarize subcommand
+// =============================================================================
+
+fn cmd_summarize(args: SummarizeArgs) -> i32 {
+    if !args.runs_dir.exists() {
+        eprintln!("Error: Directory not found: {}", args.runs_dir.display());
+        return 1;
+    }
+
+    if !args.runs_dir.is_dir() {
+        eprintln!("Error: Not a directory: {}", args.runs_dir.display());
+        return 1;
+    }
+
+    let stdout = std::io::stdout();
+    let handle = stdout.lock();
+
+    match summarize(&args.runs_dir, handle) {
+        Ok(SummarizeResult::Success(count)) => {
+            eprintln!("\nFound {} run(s)", count);
+            0
+        }
+        Ok(SummarizeResult::NoFilesFound) => {
+            eprintln!(
+                "Error: No run_summary.json files found in {}",
+                args.runs_dir.display()
+            );
+            1
+        }
+        Ok(SummarizeResult::NoParseable) => {
+            eprintln!("Error: Found run_summary.json files but none could be parsed");
+            1
+        }
+        Err(e) => {
+            eprintln!("Error reading directory: {}", e);
+            1
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -915,6 +998,7 @@ fn main() {
     let exit_code = match cmd {
         Command::Run(args) => cmd_run(args),
         Command::Suite(args) => cmd_suite(args),
+        Command::Summarize(args) => cmd_summarize(args),
     };
 
     std::process::exit(exit_code);
