@@ -1,0 +1,32 @@
+name: sim-eval-smoke
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  sim-eval-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo test
+        run: cargo test
+
+      - name: Run sim_eval CI smoke suite
+        run: cargo run -p paraphina --bin sim_eval -- suite scenarios/suites/ci_smoke_v1.yaml
+
+      - name: Upload run summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-eval-run-summaries
+          path: |
+            runs/ci/**/run_summary.json
+            runs/ci/**/config_resolved.json
+            runs/ci/**/build_info.json
