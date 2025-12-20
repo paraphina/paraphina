@@ -22,3 +22,4 @@ For live or high-fidelity sim runs we recommend:
 
 Larger starting inventories are allowed, but may hit the kill-switch quickly under
 adverse moves.
+
