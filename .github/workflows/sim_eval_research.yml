@@ -165,11 +165,36 @@ jobs:
           echo "Reports written:"
           ls -la runs/_reports
 
+      # Step 6: Generate research report comparing ablations to baseline
+      - name: Generate research report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Ensure _reports directory exists
+          mkdir -p _reports
+
+          # Run the research report script
+          # Exit codes: 0=success, 1=kill-switch, 2=missing baseline match, 3=missing fields, 4=other
+          python3 tools/sim_eval_report.py \
+              --run-root runs \
+              --baseline-suite research__baseline \
+              --suite-prefix research__ \
+              --out-md _reports/research_report.md \
+              --out-csv _reports/research_report.csv
+
+          # Append the markdown report to GitHub Step Summary
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "---" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat _reports/research_report.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sim-eval-research-${{ github.run_id }}
           path: |
-            runs/_reports
-            runs/*
+            _reports/
+            runs/_reports/
+            runs/research__*
           retention-days: 14

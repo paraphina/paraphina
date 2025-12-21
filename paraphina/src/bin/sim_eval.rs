@@ -21,10 +21,10 @@ use paraphina::metrics::DrawdownTracker;
 use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
-    create_output_dir, print_ablations, summarize, write_build_info, write_config_resolved,
-    write_config_resolved_with_ablations, AblationSet, BuildInfo, Engine, ExpectKillSwitch,
-    KillSwitchInfo, MarketModelType, RunSummary, ScenarioSpec, SuiteSpec, SummarizeResult,
-    SyntheticProcess,
+    create_output_dir, print_ablations, run_report, summarize, write_build_info,
+    write_config_resolved, write_config_resolved_with_ablations, AblationSet, BuildInfo, Engine,
+    ExpectKillSwitch, KillSwitchInfo, MarketModelType, ReportArgs, ReportResult, RunSummary,
+    ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
 };
 
 // =============================================================================
@@ -36,7 +36,18 @@ enum Command {
     Run(RunArgs),
     Suite(SuiteArgs),
     Summarize(SummarizeArgs),
+    Report(ReportArgsLocal),
     Ablations,
+}
+
+#[derive(Debug)]
+struct ReportArgsLocal {
+    baseline_dir: PathBuf,
+    variants: Vec<(String, PathBuf)>,
+    out_md: PathBuf,
+    out_json: PathBuf,
+    gate_max_regression_usd: Option<f64>,
+    gate_max_regression_pct: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -67,12 +78,14 @@ USAGE:
   sim_eval run <SCENARIO_PATH> [OPTIONS]
   sim_eval suite <SUITE_PATH> [OPTIONS]
   sim_eval summarize <RUNS_DIR>
+  sim_eval report --baseline <DIR> --variant <NAME>=<DIR> ... --out-md <PATH> --out-json <PATH> [OPTIONS]
   sim_eval ablations
 
 SUBCOMMANDS:
   run       Run a single scenario
   suite     Run a CI suite with determinism and invariant gates
   summarize Discover and summarize run_summary.json files
+  report    Generate baseline-vs-ablations research report in Markdown + JSON
   ablations List supported ablation IDs and descriptions
 
 RUN OPTIONS:
@@ -84,6 +97,14 @@ SUITE OPTIONS:
   --verbose              Print verbose output
   --ablation <ID>        Enable an ablation (can be specified multiple times)
 
+REPORT OPTIONS:
+  --baseline <DIR>              Baseline runs directory (required)
+  --variant <NAME>=<DIR>        Variant name and directory (can be specified multiple times, at least one required)
+  --out-md <PATH>               Output path for Markdown report (required)
+  --out-json <PATH>             Output path for JSON report (required)
+  --gate-max-regression-usd <N> Maximum allowed regression in USD (optional gate)
+  --gate-max-regression-pct <N> Maximum allowed regression as percentage (optional gate)
+
 COMMON OPTIONS:
   --help             Show this help
 
@@ -94,6 +115,8 @@ EXAMPLES:
   sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor
   sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor --ablation disable_toxicity_gate
   sim_eval summarize runs/
+  sim_eval report --baseline runs/baseline --variant ablation1=runs/ablation1 --out-md report.md --out-json report.json
+  sim_eval report --baseline runs/baseline --variant v1=runs/v1 --variant v2=runs/v2 --out-md report.md --out-json report.json --gate-max-regression-usd 50.0
   sim_eval ablations
 "
 }
@@ -206,6 +229,142 @@ fn parse_args() -> Result<Command, String> {
             Ok(Command::Suite(suite_args))
         }
         "ablations" => Ok(Command::Ablations),
+        "report" => {
+            let mut report_args = ReportArgsLocal {
+                baseline_dir: PathBuf::new(),
+                variants: Vec::new(),
+                out_md: PathBuf::new(),
+                out_json: PathBuf::new(),
+                gate_max_regression_usd: None,
+                gate_max_regression_pct: None,
+            };
+            let mut baseline_set = false;
+            let mut out_md_set = false;
+            let mut out_json_set = false;
+
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--help" | "-h" => {
+                        println!("{}", usage());
+                        std::process::exit(0);
+                    }
+                    "--baseline" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --baseline".to_string())?;
+                        report_args.baseline_dir = PathBuf::from(val);
+                        baseline_set = true;
+                    }
+                    "--variant" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --variant".to_string())?;
+                        let parts: Vec<&str> = val.splitn(2, '=').collect();
+                        if parts.len() != 2 {
+                            return Err(format!(
+                                "Invalid --variant format '{}', expected NAME=DIR",
+                                val
+                            ));
+                        }
+                        report_args
+                            .variants
+                            .push((parts[0].to_string(), PathBuf::from(parts[1])));
+                    }
+                    "--out-md" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --out-md".to_string())?;
+                        report_args.out_md = PathBuf::from(val);
+                        out_md_set = true;
+                    }
+                    "--out-json" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --out-json".to_string())?;
+                        report_args.out_json = PathBuf::from(val);
+                        out_json_set = true;
+                    }
+                    "--gate-max-regression-usd" => {
+                        let val = args.next().ok_or_else(|| {
+                            "Missing value for --gate-max-regression-usd".to_string()
+                        })?;
+                        let parsed: f64 = val.parse().map_err(|_| {
+                            format!("Invalid number for --gate-max-regression-usd: {}", val)
+                        })?;
+                        report_args.gate_max_regression_usd = Some(parsed);
+                    }
+                    "--gate-max-regression-pct" => {
+                        let val = args.next().ok_or_else(|| {
+                            "Missing value for --gate-max-regression-pct".to_string()
+                        })?;
+                        let parsed: f64 = val.parse().map_err(|_| {
+                            format!("Invalid number for --gate-max-regression-pct: {}", val)
+                        })?;
+                        report_args.gate_max_regression_pct = Some(parsed);
+                    }
+                    _ if arg.starts_with("--baseline=") => {
+                        report_args.baseline_dir = PathBuf::from(&arg["--baseline=".len()..]);
+                        baseline_set = true;
+                    }
+                    _ if arg.starts_with("--variant=") => {
+                        let val = &arg["--variant=".len()..];
+                        let parts: Vec<&str> = val.splitn(2, '=').collect();
+                        if parts.len() != 2 {
+                            return Err(format!(
+                                "Invalid --variant format '{}', expected NAME=DIR",
+                                val
+                            ));
+                        }
+                        report_args
+                            .variants
+                            .push((parts[0].to_string(), PathBuf::from(parts[1])));
+                    }
+                    _ if arg.starts_with("--out-md=") => {
+                        report_args.out_md = PathBuf::from(&arg["--out-md=".len()..]);
+                        out_md_set = true;
+                    }
+                    _ if arg.starts_with("--out-json=") => {
+                        report_args.out_json = PathBuf::from(&arg["--out-json=".len()..]);
+                        out_json_set = true;
+                    }
+                    _ if arg.starts_with("--gate-max-regression-usd=") => {
+                        let val = &arg["--gate-max-regression-usd=".len()..];
+                        let parsed: f64 = val.parse().map_err(|_| {
+                            format!("Invalid number for --gate-max-regression-usd: {}", val)
+                        })?;
+                        report_args.gate_max_regression_usd = Some(parsed);
+                    }
+                    _ if arg.starts_with("--gate-max-regression-pct=") => {
+                        let val = &arg["--gate-max-regression-pct=".len()..];
+                        let parsed: f64 = val.parse().map_err(|_| {
+                            format!("Invalid number for --gate-max-regression-pct: {}", val)
+                        })?;
+                        report_args.gate_max_regression_pct = Some(parsed);
+                    }
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("Unknown option: {}", arg));
+                    }
+                    _ => {
+                        return Err(format!("Unexpected argument: {}", arg));
+                    }
+                }
+            }
+
+            if !baseline_set {
+                return Err("Missing required argument: --baseline".to_string());
+            }
+            if report_args.variants.is_empty() {
+                return Err("At least one --variant is required".to_string());
+            }
+            if !out_md_set {
+                return Err("Missing required argument: --out-md".to_string());
+            }
+            if !out_json_set {
+                return Err("Missing required argument: --out-json".to_string());
+            }
+
+            Ok(Command::Report(report_args))
+        }
         "summarize" => {
             let mut summarize_args = SummarizeArgs {
                 runs_dir: PathBuf::new(),
@@ -877,18 +1036,14 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
 
             // Write outputs (once per seed, not per repeat)
             // Note: ablation info is already encoded in effective_out_dir suffix
-            let output_dir = match create_output_dir(
-                out_dir,
-                &spec.scenario_id,
-                &build_info.git_sha,
-                *seed,
-            ) {
-                Ok(dir) => dir,
-                Err(e) => {
-                    eprintln!("  Failed to create output directory: {}", e);
-                    continue;
-                }
-            };
+            let output_dir =
+                match create_output_dir(out_dir, &spec.scenario_id, &build_info.git_sha, *seed) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        eprintln!("  Failed to create output directory: {}", e);
+                        continue;
+                    }
+                };
 
             let summary_with_build = RunSummary::with_ablations(
                 &spec,
@@ -1042,6 +1197,62 @@ fn cmd_summarize(args: SummarizeArgs) -> i32 {
 }
 
 // =============================================================================
+// Report subcommand
+// =============================================================================
+
+fn cmd_report(args: ReportArgsLocal) -> i32 {
+    if !args.baseline_dir.exists() {
+        eprintln!(
+            "Error: Baseline directory not found: {}",
+            args.baseline_dir.display()
+        );
+        return 1;
+    }
+
+    for (name, path) in &args.variants {
+        if !path.exists() {
+            eprintln!(
+                "Error: Variant '{}' directory not found: {}",
+                name,
+                path.display()
+            );
+            return 1;
+        }
+    }
+
+    let report_args = ReportArgs {
+        baseline_dir: args.baseline_dir,
+        variants: args.variants,
+        out_md: args.out_md,
+        out_json: args.out_json,
+        gate_max_regression_usd: args.gate_max_regression_usd,
+        gate_max_regression_pct: args.gate_max_regression_pct,
+    };
+
+    match run_report(report_args) {
+        ReportResult::Success {
+            variants,
+            gates_passed,
+        } => {
+            eprintln!("\nAnalyzed {} variant(s)", variants);
+            if gates_passed {
+                0
+            } else {
+                1
+            }
+        }
+        ReportResult::NoBaselineRuns => {
+            eprintln!("Error: No run_summary.json files found in baseline directory");
+            1
+        }
+        ReportResult::Error(e) => {
+            eprintln!("Error: {}", e);
+            1
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -1063,6 +1274,7 @@ fn main() {
         Command::Run(args) => cmd_run(args),
         Command::Suite(args) => cmd_suite(args),
         Command::Summarize(args) => cmd_summarize(args),
+        Command::Report(args) => cmd_report(args),
         Command::Ablations => cmd_ablations(),
     };
 

@@ -13,6 +13,7 @@
 
 pub mod ablation;
 pub mod output;
+pub mod report;
 pub mod scenario;
 pub mod suite;
 pub mod summarize;
@@ -24,6 +25,12 @@ pub use output::{
     create_output_dir, create_output_dir_with_ablations, write_build_info, write_config_resolved,
     write_config_resolved_with_ablations, BuildInfo, ConfigResolved, DeterminismInfo,
     KillSwitchInfo, MetricRecord, MetricsWriter, ResultsInfo, RunSummary,
+};
+pub use report::{
+    check_gates, compute_stats, generate_report, load_run_summaries, match_runs,
+    print_console_summary, run_report, write_json_report, write_markdown_report, MatchedRun,
+    ReportArgs, ReportResult, ResearchReport, ResultsMinimal, RunSummaryMinimal, VariantReport,
+    VariantStats,
 };
 pub use scenario::{
     Engine, ExpectKillSwitch, HistoricalStubConfig, Horizon, InitialState, Invariants, MarketModel,
