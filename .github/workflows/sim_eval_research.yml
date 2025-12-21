@@ -56,22 +56,16 @@ jobs:
           mkdir -p runs
 
           # Read out_dir from suite yaml (simple parse; no YAML library needed).
-          OUT_DIR_BASE="$(python3 - <<'PY' "$SUITE"
-import sys
-path=sys.argv[1]
-out=None
-for raw in open(path, "r", encoding="utf-8"):
-    line = raw.split("#", 1)[0].strip()
-    if not line:
-        continue
-    if line.startswith("out_dir:"):
-        out = line.split(":", 1)[1].strip()
-        break
-if not out:
-    raise SystemExit(f"ERROR: could not find out_dir: in {path}")
-print(out)
-PY
-)"
+          OUT_DIR_BASE="$(python3 -c "
+          import sys
+          path = sys.argv[1]
+          for raw in open(path, 'r', encoding='utf-8'):
+              line = raw.split('#', 1)[0].strip()
+              if line.startswith('out_dir:'):
+                  print(line.split(':', 1)[1].strip())
+                  sys.exit(0)
+          sys.exit('ERROR: could not find out_dir in ' + path)
+          " "$SUITE")"
           echo "OUT_DIR_BASE=$OUT_DIR_BASE"
 
           echo "=== Running baseline ==="
@@ -122,22 +116,16 @@ PY
 
           SUITE="${{ inputs.suite }}"
 
-          OUT_DIR_BASE="$(python3 - <<'PY' "$SUITE"
-import sys
-path=sys.argv[1]
-out=None
-for raw in open(path, "r", encoding="utf-8"):
-    line = raw.split("#", 1)[0].strip()
-    if not line:
-        continue
-    if line.startswith("out_dir:"):
-        out = line.split(":", 1)[1].strip()
-        break
-if not out:
-    raise SystemExit(f"ERROR: could not find out_dir: in {path}")
-print(out)
-PY
-)"
+          OUT_DIR_BASE="$(python3 -c "
+          import sys
+          path = sys.argv[1]
+          for raw in open(path, 'r', encoding='utf-8'):
+              line = raw.split('#', 1)[0].strip()
+              if line.startswith('out_dir:'):
+                  print(line.split(':', 1)[1].strip())
+                  sys.exit(0)
+          sys.exit('ERROR: could not find out_dir in ' + path)
+          " "$SUITE")"
           echo "OUT_DIR_BASE=$OUT_DIR_BASE"
 
           mkdir -p runs/_reports
