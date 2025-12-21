@@ -27,6 +27,6 @@ jobs:
         with:
           name: sim-eval-run-summaries
           path: |
-            runs/ci/**/run_summary.json
-            runs/ci/**/config_resolved.json
-            runs/ci/**/build_info.json
+            runs/ci*/**/run_summary.json
+            runs/ci*/**/config_resolved.json
+            runs/ci*/**/build_info.json
