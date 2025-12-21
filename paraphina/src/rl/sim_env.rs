@@ -18,8 +18,10 @@ use crate::engine::Engine;
 use crate::exit;
 use crate::gateway::{ExecutionGateway, SimGateway};
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
-use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
-use crate::state::{GlobalState, PendingMarkoutRecord};
+use crate::mm::{compute_mm_quotes_with_ablations, mm_quotes_to_order_intents};
+use crate::sim_eval::AblationSet;
+use crate::state::{GlobalState, PendingMarkoutRecord, RiskRegime};
+use crate::toxicity::update_toxicity_and_health_with_ablations;
 use crate::types::{FillEvent, OrderIntent, Side, TimestampMs};
 
 use super::domain_rand::{DomainRandConfig, DomainRandSample, DomainRandSampler};
@@ -104,6 +106,8 @@ pub struct SimEnvConfig {
     pub reward_weights: RewardWeights,
     /// Whether to apply domain randomisation.
     pub apply_domain_rand: bool,
+    /// Active ablations for research experiments.
+    pub ablations: AblationSet,
 }
 
 impl Default for SimEnvConfig {
@@ -114,6 +118,7 @@ impl Default for SimEnvConfig {
             domain_rand: DomainRandConfig::default(),
             reward_weights: RewardWeights::default(),
             apply_domain_rand: true,
+            ablations: AblationSet::new(),
         }
     }
 }
@@ -127,6 +132,7 @@ impl SimEnvConfig {
             domain_rand: DomainRandConfig::deterministic(),
             reward_weights: RewardWeights::default(),
             apply_domain_rand: false,
+            ablations: AblationSet::new(),
         }
     }
 
@@ -138,7 +144,14 @@ impl SimEnvConfig {
             domain_rand: DomainRandConfig::mild(),
             reward_weights: RewardWeights::default(),
             apply_domain_rand: true,
+            ablations: AblationSet::new(),
         }
+    }
+
+    /// Set ablations on this config.
+    pub fn with_ablations(mut self, ablations: AblationSet) -> Self {
+        self.ablations = ablations;
+        self
     }
 }
 
@@ -469,8 +482,13 @@ impl SimEnv {
         // 2) Mark-to-fair inventory / basis / unrealised PnL
         self.state.recompute_after_fills(&self.config);
 
-        // 3) Toxicity + venue health
-        crate::toxicity::update_toxicity_and_health(&mut self.state, &self.config, now_ms);
+        // 3) Toxicity + venue health (with ablation support)
+        update_toxicity_and_health_with_ablations(
+            &mut self.state,
+            &self.config,
+            now_ms,
+            &self.env_config.ablations,
+        );
 
         // 4) Risk limits + regime / kill switch
         self.update_risk_limits_and_regime();
@@ -525,11 +543,17 @@ impl SimEnv {
             self.state.fv_long_vol = var_long_new.max(0.0).sqrt();
         }
 
-        // Effective vol with floor
-        self.state.sigma_eff = self
-            .state
-            .fv_short_vol
-            .max(self.config.volatility.sigma_min);
+        // Effective vol with floor (disable_vol_floor ablation bypasses the floor)
+        if self.env_config.ablations.disable_vol_floor() {
+            // Bypass the floor - use raw short vol (can be 0)
+            self.state.sigma_eff = self.state.fv_short_vol.max(1e-12); // Small epsilon to avoid div by zero
+        } else {
+            // Normal behavior: clamp to sigma_min
+            self.state.sigma_eff = self
+                .state
+                .fv_short_vol
+                .max(self.config.volatility.sigma_min);
+        }
 
         // Vol ratio and scalars
         let vol_ratio = if self.config.volatility.vol_ref > 0.0 {
@@ -565,6 +589,13 @@ impl SimEnv {
         self.state.daily_pnl_total =
             self.state.daily_realised_pnl + self.state.daily_unrealised_pnl;
 
+        // If disable_risk_regime ablation is active, skip regime switching and keep Normal
+        if self.env_config.ablations.disable_risk_regime() {
+            self.state.risk_regime = RiskRegime::Normal;
+            // Don't trigger kill switch for risk reasons (but still track limits for reporting)
+            return;
+        }
+
         // Hard breach conditions
         let delta_abs = self.state.dollar_delta_usd.abs();
         let basis_abs = self.state.basis_usd.abs();
@@ -592,7 +623,6 @@ impl SimEnv {
         }
 
         // Risk regime
-        use crate::state::RiskRegime;
         self.state.risk_regime = if self.state.kill_switch
             || pnl_hard_breach
             || delta_hard_breach
@@ -620,8 +650,9 @@ impl SimEnv {
 
         let mut all_fills = Vec::new();
 
-        // 1) Market-making
-        let mm_quotes = compute_mm_quotes(&self.config, &self.state);
+        // 1) Market-making (with ablation support for fair value gating)
+        let mm_quotes =
+            compute_mm_quotes_with_ablations(&self.config, &self.state, &self.env_config.ablations);
         let mm_intents = mm_quotes_to_order_intents(&mm_quotes);
 
         // Apply action modifiers to MM intents

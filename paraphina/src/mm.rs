@@ -30,6 +30,7 @@
 //       Only quote if edge >= EDGE_LOCAL_MIN and venue passes gating
 
 use crate::config::{Config, VenueConfig};
+use crate::sim_eval::AblationSet;
 use crate::state::{GlobalState, RiskRegime, VenueState};
 use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
 
@@ -142,6 +143,19 @@ pub fn compute_venue_targets(cfg: &Config, state: &GlobalState) -> Vec<VenueTarg
 /// inventory, etc.) and per-venue state, then produces local quotes
 /// for each venue.
 pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
+    compute_mm_quotes_with_ablations(cfg, state, &AblationSet::new())
+}
+
+/// Main MM quoting function with ablation support.
+///
+/// Ablations:
+/// - disable_fair_value_gating: Gating always allows (never blocks quoting)
+/// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
+pub fn compute_mm_quotes_with_ablations(
+    cfg: &Config,
+    state: &GlobalState,
+    ablations: &AblationSet,
+) -> Vec<MmQuote> {
     let n = cfg.venues.len();
     let mut out = Vec::with_capacity(n);
 
@@ -256,6 +270,7 @@ pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
             spread_mult,
             size_mult,
             risk_regime,
+            ablations,
         );
 
         out.push(MmQuote {
@@ -319,6 +334,10 @@ fn compute_maker_cost(vcfg: &VenueConfig, price: f64) -> f64 {
 ///   - passivity enforcement.
 ///
 /// Section 9–11 spec alignment.
+///
+/// Ablation support:
+/// - disable_fair_value_gating: Gating always allows (never blocks quoting)
+/// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
 #[allow(clippy::too_many_arguments)]
 fn compute_single_venue_quotes(
     cfg: &Config,
@@ -338,39 +357,55 @@ fn compute_single_venue_quotes(
     spread_mult: f64,
     size_mult: f64,
     risk_regime: RiskRegime,
+    ablations: &AblationSet,
 ) -> (Option<MmLevel>, Option<MmLevel>) {
     let mm_cfg = &cfg.mm;
     let risk_cfg = &cfg.risk;
     let tox_cfg = &cfg.toxicity;
 
+    // Check if fair value gating is disabled (always allow quoting)
+    let disable_fv_gating = ablations.disable_fair_value_gating();
+    let disable_tox_gating = ablations.disable_toxicity_gate();
+
     // ---------------------------------------------------------------------
     // 0) Venue-level gating
     // ---------------------------------------------------------------------
 
-    // If the venue is Disabled, no quoting.
-    if matches!(vstate.status, VenueStatus::Disabled) {
+    // If the venue is Disabled, no quoting (unless toxicity gating is disabled).
+    if !disable_tox_gating && matches!(vstate.status, VenueStatus::Disabled) {
         return (None, None);
     }
 
     // If liquidation distance is below critical, do not quote at all.
+    // (This is not affected by fair value gating ablation - it's risk-based)
     let dist_liq = vstate.dist_liq_sigma;
     if dist_liq <= risk_cfg.liq_crit_sigma {
         return (None, None);
     }
 
     // Toxicity gating: if toxicity >= TOX_HIGH_THRESHOLD, skip venue.
-    if vstate.toxicity >= tox_cfg.tox_high_threshold {
+    // (Skip if toxicity gating is disabled)
+    if !disable_tox_gating && vstate.toxicity >= tox_cfg.tox_high_threshold {
         return (None, None);
     }
 
     // Stale book check: if we have no mid or it's stale, don't quote.
-    if vstate.mid.is_none() {
+    // (Skip if fair value gating is disabled - use fair value as mid)
+    if vstate.mid.is_none() && !disable_fv_gating {
         return (None, None);
     }
 
     // Check for valid spread/depth.
-    let spread = vstate.spread.unwrap_or(0.0);
-    if spread <= 0.0 || vstate.depth_near_mid <= 0.0 {
+    // (Skip if fair value gating is disabled - use defaults)
+    let spread = vstate
+        .spread
+        .unwrap_or(if disable_fv_gating { 0.01 } else { 0.0 });
+    let depth = if disable_fv_gating && vstate.depth_near_mid <= 0.0 {
+        10_000.0 // Default depth when gating disabled
+    } else {
+        vstate.depth_near_mid
+    };
+    if spread <= 0.0 || depth <= 0.0 {
         return (None, None);
     }
 
@@ -567,14 +602,16 @@ fn compute_single_venue_quotes(
         size_ask *= k_liq;
     }
 
-    // Venue health: Warning venues get reduced size.
-    if matches!(vstate.status, VenueStatus::Warning) {
+    // Venue health: Warning venues get reduced size (skip if toxicity gating is disabled).
+    if !disable_tox_gating && matches!(vstate.status, VenueStatus::Warning) {
         size_bid *= 0.5;
         size_ask *= 0.5;
     }
 
-    // Toxicity: medium toxicity reduces sizes.
-    if vstate.toxicity >= tox_cfg.tox_med_threshold && vstate.toxicity < tox_cfg.tox_high_threshold
+    // Toxicity: medium toxicity reduces sizes (skip if toxicity gating is disabled).
+    if !disable_tox_gating
+        && vstate.toxicity >= tox_cfg.tox_med_threshold
+        && vstate.toxicity < tox_cfg.tox_high_threshold
     {
         let tox_factor = 1.0 - (vstate.toxicity - tox_cfg.tox_med_threshold) / (0.3_f64).max(1e-6);
         size_bid *= tox_factor.clamp(0.1, 1.0);

@@ -21,9 +21,10 @@ use paraphina::metrics::DrawdownTracker;
 use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
-    create_output_dir, summarize, write_build_info, write_config_resolved, BuildInfo, Engine,
-    ExpectKillSwitch, KillSwitchInfo, MarketModelType, RunSummary, ScenarioSpec, SuiteSpec,
-    SummarizeResult, SyntheticProcess,
+    create_output_dir, create_output_dir_with_ablations, print_ablations, summarize,
+    write_build_info, write_config_resolved, write_config_resolved_with_ablations, AblationSet,
+    BuildInfo, Engine, ExpectKillSwitch, KillSwitchInfo, MarketModelType, RunSummary, ScenarioSpec,
+    SuiteSpec, SummarizeResult, SyntheticProcess,
 };
 
 // =============================================================================
@@ -35,6 +36,7 @@ enum Command {
     Run(RunArgs),
     Suite(SuiteArgs),
     Summarize(SummarizeArgs),
+    Ablations,
 }
 
 #[derive(Debug)]
@@ -49,6 +51,7 @@ struct RunArgs {
 struct SuiteArgs {
     suite_path: PathBuf,
     verbose: bool,
+    ablations: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -64,11 +67,13 @@ USAGE:
   sim_eval run <SCENARIO_PATH> [OPTIONS]
   sim_eval suite <SUITE_PATH> [OPTIONS]
   sim_eval summarize <RUNS_DIR>
+  sim_eval ablations
 
 SUBCOMMANDS:
   run       Run a single scenario
   suite     Run a CI suite with determinism and invariant gates
   summarize Discover and summarize run_summary.json files
+  ablations List supported ablation IDs and descriptions
 
 RUN OPTIONS:
   --output-dir DIR   Output directory (default: runs/)
@@ -76,7 +81,8 @@ RUN OPTIONS:
   --verbose          Print verbose output
 
 SUITE OPTIONS:
-  --verbose          Print verbose output
+  --verbose              Print verbose output
+  --ablation <ID>        Enable an ablation (can be specified multiple times)
 
 COMMON OPTIONS:
   --help             Show this help
@@ -85,7 +91,10 @@ EXAMPLES:
   sim_eval run scenarios/v1/synth_baseline.yaml
   sim_eval run scenarios/v1/synth_jump.yaml --output-dir ./my_runs --verbose
   sim_eval suite scenarios/suites/ci_smoke_v1.yaml
+  sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor
+  sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor --ablation disable_toxicity_gate
   sim_eval summarize runs/
+  sim_eval ablations
 "
 }
 
@@ -154,10 +163,11 @@ fn parse_args() -> Result<Command, String> {
             let mut suite_args = SuiteArgs {
                 suite_path: PathBuf::new(),
                 verbose: false,
+                ablations: Vec::new(),
             };
             let mut suite_set = false;
 
-            for arg in args.by_ref() {
+            while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--help" | "-h" => {
                         println!("{}", usage());
@@ -165,6 +175,16 @@ fn parse_args() -> Result<Command, String> {
                     }
                     "--verbose" | "-v" => {
                         suite_args.verbose = true;
+                    }
+                    "--ablation" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --ablation".to_string())?;
+                        suite_args.ablations.push(val);
+                    }
+                    _ if arg.starts_with("--ablation=") => {
+                        let val = arg["--ablation=".len()..].to_string();
+                        suite_args.ablations.push(val);
                     }
                     _ if arg.starts_with('-') => {
                         return Err(format!("Unknown option: {}", arg));
@@ -185,6 +205,7 @@ fn parse_args() -> Result<Command, String> {
 
             Ok(Command::Suite(suite_args))
         }
+        "ablations" => Ok(Command::Ablations),
         "summarize" => {
             let mut summarize_args = SummarizeArgs {
                 runs_dir: PathBuf::new(),
@@ -284,6 +305,16 @@ pub struct RunResult {
 
 /// Run simulation for a single seed using SimEnv.
 pub fn run_single_seed(spec: &ScenarioSpec, seed: u64, verbose: bool) -> (RunResult, RunSummary) {
+    run_single_seed_with_ablations(spec, seed, verbose, &AblationSet::new())
+}
+
+/// Run simulation for a single seed using SimEnv with ablations.
+pub fn run_single_seed_with_ablations(
+    spec: &ScenarioSpec,
+    seed: u64,
+    verbose: bool,
+    ablations: &AblationSet,
+) -> (RunResult, RunSummary) {
     let start = Instant::now();
 
     // Create config from risk profile
@@ -309,6 +340,7 @@ pub fn run_single_seed(spec: &ScenarioSpec, seed: u64, verbose: bool) -> (RunRes
     let mut env_config = SimEnvConfig::deterministic();
     env_config.max_ticks = spec.horizon.steps;
     env_config.dt_ms = dt_ms;
+    env_config.ablations = ablations.clone();
 
     // Apply domain randomization based on market model
     if let Some(ref synth) = spec.market_model.synthetic {
@@ -367,13 +399,14 @@ pub fn run_single_seed(spec: &ScenarioSpec, seed: u64, verbose: bool) -> (RunRes
 
     // Create summary (includes checksum computation)
     let build_info = BuildInfo::for_test(); // Placeholder for checksum computation
-    let summary = RunSummary::new(
+    let summary = RunSummary::with_ablations(
         spec,
         seed,
         build_info,
         final_pnl,
         max_drawdown,
         kill_switch.clone(),
+        ablations,
     );
 
     let run_result = RunResult {
@@ -697,6 +730,15 @@ struct SuiteStats {
 }
 
 fn cmd_suite(args: SuiteArgs) -> i32 {
+    // Validate and create ablation set
+    let ablations = match AblationSet::from_ids(&args.ablations) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 2;
+        }
+    };
+
     let suite = match SuiteSpec::from_yaml_file(&args.suite_path) {
         Ok(s) => s,
         Err(e) => {
@@ -720,6 +762,9 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
         build_info.dirty
     );
     println!("               | output_dir={}", suite.out_dir);
+    if !ablations.is_empty() {
+        println!("               | ablations={}", ablations);
+    }
     println!();
 
     let out_dir = Path::new(&suite.out_dir);
@@ -779,7 +824,8 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
                     );
                 }
 
-                let (result, summary) = run_single_seed(&spec, *seed, false);
+                let (result, summary) =
+                    run_single_seed_with_ablations(&spec, *seed, false, &ablations);
                 checksums.push(result.checksum.clone());
 
                 stats.runs_total += 1;
@@ -827,26 +873,36 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
             }
 
             // Write outputs (once per seed, not per repeat)
-            let output_dir =
-                match create_output_dir(out_dir, &spec.scenario_id, &build_info.git_sha, *seed) {
-                    Ok(dir) => dir,
-                    Err(e) => {
-                        eprintln!("  Failed to create output directory: {}", e);
-                        continue;
-                    }
-                };
+            let output_dir = match create_output_dir_with_ablations(
+                out_dir,
+                &spec.scenario_id,
+                &build_info.git_sha,
+                *seed,
+                &ablations,
+            ) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("  Failed to create output directory: {}", e);
+                    continue;
+                }
+            };
 
-            let summary_with_build = RunSummary::new(
+            let summary_with_build = RunSummary::with_ablations(
                 &spec,
                 *seed,
                 build_info.clone(),
                 result.final_pnl,
                 result.max_drawdown,
                 result.kill_switch.clone(),
+                &ablations,
             );
 
             let _ = summary_with_build.write_to_file(output_dir.join("run_summary.json"));
-            let _ = write_config_resolved(output_dir.join("config_resolved.json"), &spec);
+            let _ = write_config_resolved_with_ablations(
+                output_dir.join("config_resolved.json"),
+                &spec,
+                &ablations,
+            );
             let _ = write_build_info(output_dir.join("build_info.json"), &build_info);
 
             // Print seed status
@@ -986,6 +1042,11 @@ fn cmd_summarize(args: SummarizeArgs) -> i32 {
 // Main
 // =============================================================================
 
+fn cmd_ablations() -> i32 {
+    print_ablations();
+    0
+}
+
 fn main() {
     let cmd = match parse_args() {
         Ok(cmd) => cmd,
@@ -999,6 +1060,7 @@ fn main() {
         Command::Run(args) => cmd_run(args),
         Command::Suite(args) => cmd_suite(args),
         Command::Summarize(args) => cmd_summarize(args),
+        Command::Ablations => cmd_ablations(),
     };
 
     std::process::exit(exit_code);

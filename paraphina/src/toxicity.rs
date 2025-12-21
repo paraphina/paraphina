@@ -25,8 +25,12 @@
 //
 // The legacy volatility-based toxicity feature is retained as a fallback
 // when no mid/depth data is available.
+//
+// Ablation support:
+// - disable_toxicity_gate: All venues remain Healthy regardless of toxicity score
 
 use crate::config::Config;
+use crate::sim_eval::AblationSet;
 use crate::state::GlobalState;
 use crate::types::{Side, TimestampMs, VenueStatus};
 
@@ -38,6 +42,19 @@ use crate::types::{Side, TimestampMs, VenueStatus};
 /// 3. Falls back to volatility-based toxicity when no book data exists.
 /// 4. Sets venue health status based on toxicity thresholds.
 pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config, now_ms: TimestampMs) {
+    update_toxicity_and_health_with_ablations(state, cfg, now_ms, &AblationSet::new());
+}
+
+/// Update per-venue toxicity scores and health status with ablation support.
+///
+/// Same as update_toxicity_and_health, but with ablation support:
+/// - disable_toxicity_gate: All venues remain Healthy regardless of toxicity score
+pub fn update_toxicity_and_health_with_ablations(
+    state: &mut GlobalState,
+    cfg: &Config,
+    now_ms: TimestampMs,
+    ablations: &AblationSet,
+) {
     let tox_cfg = &cfg.toxicity;
     let vol_cfg = &cfg.volatility;
 
@@ -117,13 +134,18 @@ pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config, now_ms:
         venue.toxicity = venue.toxicity.clamp(0.0, 1.0);
 
         // --- 5) Set venue health status based on toxicity thresholds ---
-        venue.status = if venue.toxicity >= tox_cfg.tox_high_threshold {
-            VenueStatus::Disabled
-        } else if venue.toxicity >= tox_cfg.tox_med_threshold {
-            VenueStatus::Warning
+        // If disable_toxicity_gate ablation is active, all venues remain Healthy
+        if ablations.disable_toxicity_gate() {
+            venue.status = VenueStatus::Healthy;
         } else {
-            VenueStatus::Healthy
-        };
+            venue.status = if venue.toxicity >= tox_cfg.tox_high_threshold {
+                VenueStatus::Disabled
+            } else if venue.toxicity >= tox_cfg.tox_med_threshold {
+                VenueStatus::Warning
+            } else {
+                VenueStatus::Healthy
+            };
+        }
     }
 }
 

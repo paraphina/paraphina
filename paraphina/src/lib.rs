@@ -88,15 +88,16 @@ pub use hedge::{
 pub use logging::{EventSink, FileSink, NoopSink};
 
 pub use mm::{
-    compute_mm_quotes, compute_order_actions, compute_venue_targets, mm_quotes_to_order_intents,
-    should_replace_order, ActiveMmOrder, MmLevel, MmOrderAction, MmQuote, VenueTargetInventory,
+    compute_mm_quotes, compute_mm_quotes_with_ablations, compute_order_actions,
+    compute_venue_targets, mm_quotes_to_order_intents, should_replace_order, ActiveMmOrder,
+    MmLevel, MmOrderAction, MmQuote, VenueTargetInventory,
 };
 
 pub use state::{GlobalState, KillReason, PendingMarkout, RiskRegime, VenueState};
 
 pub use strategy::StrategyRunner;
 
-pub use toxicity::update_toxicity_and_health;
+pub use toxicity::{update_toxicity_and_health, update_toxicity_and_health_with_ablations};
 
 pub use types::{FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
 
@@ -119,12 +120,14 @@ pub use rl::{
 
 // Simulation & Evaluation (Option B per ROADMAP.md)
 pub use sim_eval::{
-    create_output_dir, write_build_info, write_config_resolved, BuildInfo, ConfigResolved,
-    DeterminismInfo, Engine as SimEngine, ExpectKillSwitch, HistoricalStubConfig, Horizon,
-    InitialState, Invariants, KillSwitchInfo, MarketModel, MarketModelType, MetricRecord,
-    MetricsWriter, MicrostructureModel, PnlLinearityCheck, ResultsInfo, Rng as SimRng, RunSummary,
-    ScenarioError, ScenarioSpec, SyntheticConfig, SyntheticParams, SyntheticProcess,
-    SCENARIO_SCHEMA_VERSION,
+    create_output_dir, create_output_dir_with_ablations, print_ablations, write_build_info,
+    write_config_resolved, write_config_resolved_with_ablations, AblationError, AblationSet,
+    BuildInfo, ConfigResolved, DeterminismInfo, Engine as SimEngine, ExpectKillSwitch,
+    HistoricalStubConfig, Horizon, InitialState, Invariants, KillSwitchInfo, MarketModel,
+    MarketModelType, MetricRecord, MetricsWriter, MicrostructureModel, PnlLinearityCheck,
+    ResultsInfo, Rng as SimRng, RunSummary, ScenarioError, ScenarioSpec, SyntheticConfig,
+    SyntheticParams, SyntheticProcess, ABLATION_DESCRIPTIONS, SCENARIO_SCHEMA_VERSION,
+    VALID_ABLATION_IDS,
 };
 
 // --- PnL / basis unit tests -------------------------------------------------

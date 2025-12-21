@@ -17,6 +17,7 @@ fn make_default_env_config() -> SimEnvConfig {
         domain_rand: DomainRandConfig::deterministic(),
         reward_weights: Default::default(),
         apply_domain_rand: false,
+        ablations: Default::default(),
     }
 }
 
@@ -27,6 +28,7 @@ fn make_rand_env_config() -> SimEnvConfig {
         domain_rand: DomainRandConfig::mild(),
         reward_weights: Default::default(),
         apply_domain_rand: true,
+        ablations: Default::default(),
     }
 }
 
