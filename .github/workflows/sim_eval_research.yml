@@ -1,0 +1,187 @@
+name: sim-eval-research
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Suite YAML path in repo"
+        required: true
+        default: "scenarios/suites/research_v1.yaml"
+      ablations:
+        description: "Comma-separated list, or 'all', or 'none'"
+        required: true
+        default: "all"
+      run_pairs:
+        description: "Run all ablation pairs (true/false)"
+        required: true
+        default: "false"
+
+concurrency:
+  group: sim-eval-research-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build sim_eval (release)
+        run: cargo build --locked --release -p paraphina --bin sim_eval
+
+      - name: Run baseline + ablations
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUITE="${{ inputs.suite }}"
+          ABLATIONS_INPUT="${{ inputs.ablations }}"
+          RUN_PAIRS="${{ inputs.run_pairs }}"
+
+          echo "SUITE=$SUITE"
+          echo "ABLATIONS_INPUT=$ABLATIONS_INPUT"
+          echo "RUN_PAIRS=$RUN_PAIRS"
+
+          # Clean outputs each workflow run (runner is ephemeral, but keep it deterministic)
+          rm -rf runs
+          mkdir -p runs
+
+          # Read out_dir from suite yaml (simple parse; no YAML library needed).
+          OUT_DIR_BASE="$(python3 - <<'PY' "$SUITE"
+import sys
+path=sys.argv[1]
+out=None
+for raw in open(path, "r", encoding="utf-8"):
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    if line.startswith("out_dir:"):
+        out = line.split(":", 1)[1].strip()
+        break
+if not out:
+    raise SystemExit(f"ERROR: could not find out_dir: in {path}")
+print(out)
+PY
+)"
+          echo "OUT_DIR_BASE=$OUT_DIR_BASE"
+
+          echo "=== Running baseline ==="
+          ./target/release/sim_eval suite "$SUITE"
+
+          if [[ "$ABLATIONS_INPUT" == "none" ]]; then
+            echo "Ablations: none (skipping)"
+            exit 0
+          fi
+
+          # Discover supported ablations from the binary unless user provided a list.
+          if [[ "$ABLATIONS_INPUT" == "all" ]]; then
+            mapfile -t ABLATIONS < <(./target/release/sim_eval ablations | awk 'NF>=2 && $1 ~ /^[a-z0-9_]+$/ {print $1}')
+          else
+            IFS=',' read -r -a ABLATIONS <<< "$ABLATIONS_INPUT"
+            for i in "${!ABLATIONS[@]}"; do
+              ABLATIONS[$i]="$(echo "${ABLATIONS[$i]}" | xargs)"
+            done
+          fi
+
+          echo "=== Running single ablations (${#ABLATIONS[@]}) ==="
+          printf '%s\n' "${ABLATIONS[@]}"
+
+          for a in "${ABLATIONS[@]}"; do
+            echo "--- ablation: $a ---"
+            ./target/release/sim_eval suite "$SUITE" --ablation "$a"
+          done
+
+          if [[ "$RUN_PAIRS" == "true" ]]; then
+            echo "=== Running all ablation pairs ==="
+            for ((i=0; i<${#ABLATIONS[@]}; i++)); do
+              for ((j=i+1; j<${#ABLATIONS[@]}; j++)); do
+                a="${ABLATIONS[$i]}"
+                b="${ABLATIONS[$j]}"
+                echo "--- pair: $a + $b ---"
+                ./target/release/sim_eval suite "$SUITE" --ablation "$a" --ablation "$b"
+              done
+            done
+          fi
+
+          echo "=== Top-level runs dir ==="
+          ls -la runs
+
+      - name: Summarize outputs + write reports + GH summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUITE="${{ inputs.suite }}"
+
+          OUT_DIR_BASE="$(python3 - <<'PY' "$SUITE"
+import sys
+path=sys.argv[1]
+out=None
+for raw in open(path, "r", encoding="utf-8"):
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    if line.startswith("out_dir:"):
+        out = line.split(":", 1)[1].strip()
+        break
+if not out:
+    raise SystemExit(f"ERROR: could not find out_dir: in {path}")
+print(out)
+PY
+)"
+          echo "OUT_DIR_BASE=$OUT_DIR_BASE"
+
+          mkdir -p runs/_reports
+
+          # out_dir might be runs/research. Effective outputs may be:
+          # - runs/research
+          # - runs/research__baseline
+          # - runs/research__disable_x
+          # so we glob out_dir + "*"
+          shopt -s nullglob
+          RUN_DIRS=( ${OUT_DIR_BASE}* )
+          shopt -u nullglob
+
+          echo "Found ${#RUN_DIRS[@]} run directories to summarize:"
+          printf '%s\n' "${RUN_DIRS[@]}"
+
+          echo "## sim_eval research summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Suite:** \`${{ inputs.suite }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          for d in "${RUN_DIRS[@]}"; do
+            if [[ -d "$d" ]]; then
+              name="$(basename "$d")"
+              out="runs/_reports/${name}.txt"
+              echo "Summarizing $d -> $out"
+              ./target/release/sim_eval summarize "$d" > "$out"
+
+              echo "### $name" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              head -n 120 "$out" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          echo "Reports written:"
+          ls -la runs/_reports
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-eval-research-${{ github.run_id }}
+          path: |
+            runs/_reports
+            runs/*
+          retention-days: 14
