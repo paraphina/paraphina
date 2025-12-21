@@ -21,10 +21,10 @@ use paraphina::metrics::DrawdownTracker;
 use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
-    create_output_dir, create_output_dir_with_ablations, print_ablations, summarize,
-    write_build_info, write_config_resolved, write_config_resolved_with_ablations, AblationSet,
-    BuildInfo, Engine, ExpectKillSwitch, KillSwitchInfo, MarketModelType, RunSummary, ScenarioSpec,
-    SuiteSpec, SummarizeResult, SyntheticProcess,
+    create_output_dir, print_ablations, summarize, write_build_info, write_config_resolved,
+    write_config_resolved_with_ablations, AblationSet, BuildInfo, Engine, ExpectKillSwitch,
+    KillSwitchInfo, MarketModelType, RunSummary, ScenarioSpec, SuiteSpec, SummarizeResult,
+    SyntheticProcess,
 };
 
 // =============================================================================
@@ -749,6 +749,9 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
 
     let build_info = BuildInfo::capture();
 
+    // Compute effective output directory with ablation suffix
+    let effective_out_dir = format!("{}{}", suite.out_dir, ablations.dir_suffix());
+
     println!(
         "sim_eval suite | suite={} version={} repeat_runs={} scenarios={}",
         suite.suite_id,
@@ -761,13 +764,13 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
         &build_info.git_sha[..8.min(build_info.git_sha.len())],
         build_info.dirty
     );
-    println!("               | output_dir={}", suite.out_dir);
+    println!("               | output_dir={}", effective_out_dir);
     if !ablations.is_empty() {
         println!("               | ablations={}", ablations);
     }
     println!();
 
-    let out_dir = Path::new(&suite.out_dir);
+    let out_dir = Path::new(&effective_out_dir);
     let mut stats = SuiteStats {
         scenarios_total: suite.scenarios.len(),
         scenarios_passed: 0,
@@ -873,12 +876,12 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
             }
 
             // Write outputs (once per seed, not per repeat)
-            let output_dir = match create_output_dir_with_ablations(
+            // Note: ablation info is already encoded in effective_out_dir suffix
+            let output_dir = match create_output_dir(
                 out_dir,
                 &spec.scenario_id,
                 &build_info.git_sha,
                 *seed,
-                &ablations,
             ) {
                 Ok(dir) => dir,
                 Err(e) => {
@@ -984,7 +987,7 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
     if stats.gate_failures.is_empty() {
         println!("✓ ALL GATES PASSED");
         println!();
-        println!("Output written to: {}/", suite.out_dir);
+        println!("Output written to: {}/", effective_out_dir);
         0
     } else {
         println!("✗ {} GATE FAILURES:", stats.gate_failures.len());
@@ -992,7 +995,7 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
             println!("  - {}", failure);
         }
         println!();
-        println!("Output written to: {}/", suite.out_dir);
+        println!("Output written to: {}/", effective_out_dir);
         1
     }
 }
