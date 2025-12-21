@@ -139,6 +139,26 @@ impl AblationSet {
     pub fn checksum_bytes(&self) -> Vec<u8> {
         self.ablations.join("|").into_bytes()
     }
+
+    /// Compute a deterministic directory suffix for the ablation set.
+    ///
+    /// Returns:
+    /// - `__baseline` if no ablations are active
+    /// - `__<id>` if one ablation is active
+    /// - `__<id1>__<id2>` if multiple ablations (sorted alphabetically)
+    ///
+    /// Examples:
+    /// - `[]` → `__baseline`
+    /// - `["disable_vol_floor"]` → `__disable_vol_floor`
+    /// - `["disable_vol_floor", "disable_toxicity_gate"]` → `__disable_toxicity_gate__disable_vol_floor`
+    pub fn dir_suffix(&self) -> String {
+        if self.ablations.is_empty() {
+            "__baseline".to_string()
+        } else {
+            // ablations are already sorted (BTreeSet in from_ids)
+            format!("__{}", self.ablations.join("__"))
+        }
+    }
 }
 
 impl fmt::Display for AblationSet {
@@ -318,5 +338,55 @@ mod tests {
         let json = "{}";
         let parsed: AblationSet = serde_json::from_str(json).unwrap();
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn test_dir_suffix_no_ablation() {
+        let set = AblationSet::new();
+        assert_eq!(set.dir_suffix(), "__baseline");
+    }
+
+    #[test]
+    fn test_dir_suffix_one_ablation() {
+        let ids = vec!["disable_vol_floor".to_string()];
+        let set = AblationSet::from_ids(&ids).unwrap();
+        assert_eq!(set.dir_suffix(), "__disable_vol_floor");
+    }
+
+    #[test]
+    fn test_dir_suffix_two_ablations_sorted() {
+        // Test that order of input doesn't matter - output is always sorted
+        let ids1 = vec![
+            "disable_vol_floor".to_string(),
+            "disable_toxicity_gate".to_string(),
+        ];
+        let ids2 = vec![
+            "disable_toxicity_gate".to_string(),
+            "disable_vol_floor".to_string(),
+        ];
+
+        let set1 = AblationSet::from_ids(&ids1).unwrap();
+        let set2 = AblationSet::from_ids(&ids2).unwrap();
+
+        // Both should produce the same suffix (sorted alphabetically)
+        assert_eq!(set1.dir_suffix(), set2.dir_suffix());
+        assert_eq!(
+            set1.dir_suffix(),
+            "__disable_toxicity_gate__disable_vol_floor"
+        );
+    }
+
+    #[test]
+    fn test_dir_suffix_three_ablations_sorted() {
+        let ids = vec![
+            "disable_risk_regime".to_string(),
+            "disable_vol_floor".to_string(),
+            "disable_toxicity_gate".to_string(),
+        ];
+        let set = AblationSet::from_ids(&ids).unwrap();
+        assert_eq!(
+            set.dir_suffix(),
+            "__disable_risk_regime__disable_toxicity_gate__disable_vol_floor"
+        );
     }
 }
