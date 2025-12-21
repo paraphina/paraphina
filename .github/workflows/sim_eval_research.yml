@@ -1,21 +1,53 @@
+# =============================================================================
+# sim-eval-research.yml
+#
+# Quant-grade CI workflow for research experiments with ablation studies.
+#
+# Security:
+#   - Uses only GITHUB_TOKEN with minimal read permissions
+#   - No PATs, SSH keys, or secrets exposed
+#
+# Reproducibility:
+#   - Unique RUN_ROOT per run (includes github.run_id)
+#   - All bash scripts use set -euo pipefail
+#   - All paths are quoted
+#   - Deterministic glob ordering via sorted arrays
+#
+# Concurrency:
+#   - cancel-in-progress: false - allows parallel runs for different refs
+#   - Prevents stomping between workflow_dispatch runs on same ref
+#
+# =============================================================================
+
 name: sim-eval-research
 
 on:
   workflow_dispatch:
     inputs:
-      suite:
+      suite_path:
         description: "Suite YAML path in repo"
         required: true
         default: "scenarios/suites/research_v1.yaml"
+      repeat_runs:
+        description: "Repeat runs per seed (empty = use suite default). NOTE: Currently informational only; sim_eval uses suite's repeat_runs value."
+        required: false
+        default: ""
       ablations:
-        description: "Comma-separated list, or 'all', or 'none'"
-        required: true
-        default: "all"
-      run_pairs:
-        description: "Run all ablation pairs (true/false)"
-        required: true
-        default: "false"
+        description: "Comma-separated ablation IDs (empty = baseline only)"
+        required: false
+        default: ""
+      run_all_default_ablations:
+        description: "Run matrix across standard ablations (disable_vol_floor, disable_toxicity_gate, disable_risk_regime)"
+        required: false
+        type: boolean
+        default: false
 
+# Minimal permissions - only need to read repo contents
+permissions:
+  contents: read
+
+# Prevent overlapping workflow_dispatch runs from conflicting
+# cancel-in-progress: false ensures existing runs complete (important for research)
 concurrency:
   group: sim-eval-research-${{ github.ref }}
   cancel-in-progress: false
@@ -25,7 +57,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    # Environment variables for consistent path contracts
+    env:
+      # Unique output root per run to prevent stomping
+      RUN_ROOT: "runs/ci/${{ github.run_id }}"
+      REPORT_DIR: "_reports"
+      # Standard ablation IDs for run_all_default_ablations
+      DEFAULT_ABLATIONS: "disable_vol_floor,disable_toxicity_gate,disable_risk_regime"
+
     steps:
+      # =========================================================================
+      # Setup
+      # =========================================================================
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -36,27 +80,41 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build sim_eval (release)
-        run: cargo build --locked --release -p paraphina --bin sim_eval
-
-      - name: Run baseline + ablations
         shell: bash
         run: |
           set -euo pipefail
+          cargo build --locked --release -p paraphina --bin sim_eval
+          echo "✓ sim_eval built successfully"
 
-          SUITE="${{ inputs.suite }}"
-          ABLATIONS_INPUT="${{ inputs.ablations }}"
-          RUN_PAIRS="${{ inputs.run_pairs }}"
+      # =========================================================================
+      # Compute effective configuration
+      # =========================================================================
 
-          echo "SUITE=$SUITE"
-          echo "ABLATIONS_INPUT=$ABLATIONS_INPUT"
-          echo "RUN_PAIRS=$RUN_PAIRS"
+      - name: Compute run configuration
+        id: config
+        shell: bash
+        env:
+          INPUT_SUITE_PATH: ${{ inputs.suite_path }}
+          INPUT_ABLATIONS: ${{ inputs.ablations }}
+          INPUT_RUN_ALL_DEFAULT: ${{ inputs.run_all_default_ablations }}
+        run: |
+          set -euo pipefail
 
-          # Clean outputs each workflow run (runner is ephemeral, but keep it deterministic)
-          rm -rf runs
-          mkdir -p runs
+          SUITE_PATH="${INPUT_SUITE_PATH}"
+          RUN_ROOT="${{ env.RUN_ROOT }}"
+          REPORT_DIR="${{ env.REPORT_DIR }}"
+          DEFAULT_ABLATIONS="${{ env.DEFAULT_ABLATIONS }}"
 
-          # Read out_dir from suite yaml (simple parse; no YAML library needed).
-          OUT_DIR_BASE="$(python3 -c "
+          echo "=== Input Configuration ==="
+          echo "suite_path: ${SUITE_PATH}"
+          echo "ablations input: '${INPUT_ABLATIONS}'"
+          echo "run_all_default_ablations: ${INPUT_RUN_ALL_DEFAULT}"
+          echo "run_root: ${RUN_ROOT}"
+          echo "report_dir: ${REPORT_DIR}"
+          echo ""
+
+          # Parse out_dir from suite YAML for naming reference
+          SUITE_OUT_DIR="$(python3 -c "
           import sys
           path = sys.argv[1]
           for raw in open(path, 'r', encoding='utf-8'):
@@ -64,137 +122,366 @@ jobs:
               if line.startswith('out_dir:'):
                   print(line.split(':', 1)[1].strip())
                   sys.exit(0)
-          sys.exit('ERROR: could not find out_dir in ' + path)
-          " "$SUITE")"
-          echo "OUT_DIR_BASE=$OUT_DIR_BASE"
+          print('runs/research')  # default fallback
+          " "${SUITE_PATH}")"
+          echo "suite_out_dir: ${SUITE_OUT_DIR}"
 
-          echo "=== Running baseline ==="
-          ./target/release/sim_eval suite "$SUITE"
+          # Compute ablation list
+          # Note: GitHub Actions booleans come as literal 'true'/'false' strings
+          ABLATION_LIST=""
+          if [[ "${INPUT_RUN_ALL_DEFAULT}" == "true" ]]; then
+            ABLATION_LIST="${DEFAULT_ABLATIONS}"
+            echo "Using default ablations: ${ABLATION_LIST}"
+          elif [[ -n "${INPUT_ABLATIONS}" ]]; then
+            ABLATION_LIST="${INPUT_ABLATIONS}"
+            echo "Using input ablations: ${ABLATION_LIST}"
+          else
+            echo "No ablations specified - baseline only"
+          fi
 
-          if [[ "$ABLATIONS_INPUT" == "none" ]]; then
-            echo "Ablations: none (skipping)"
+          # Export to GITHUB_OUTPUT for subsequent steps
+          echo "suite_path=${SUITE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "suite_out_dir=${SUITE_OUT_DIR}" >> "$GITHUB_OUTPUT"
+          echo "ablation_list=${ABLATION_LIST}" >> "$GITHUB_OUTPUT"
+          echo "run_root=${RUN_ROOT}" >> "$GITHUB_OUTPUT"
+          echo "report_dir=${REPORT_DIR}" >> "$GITHUB_OUTPUT"
+
+      # =========================================================================
+      # Create output directories
+      # =========================================================================
+
+      - name: Initialize output directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_ROOT="${{ steps.config.outputs.run_root }}"
+          REPORT_DIR="${{ steps.config.outputs.report_dir }}"
+
+          echo "Creating output directories..."
+          mkdir -p "${RUN_ROOT}"
+          mkdir -p "${REPORT_DIR}"
+
+          echo "RUN_ROOT=${RUN_ROOT}"
+          echo "REPORT_DIR=${REPORT_DIR}"
+
+          # Write determinism metadata using Python for proper JSON escaping
+          python3 << 'PYEOF'
+          import json
+          from datetime import datetime, timezone
+
+          metadata = {
+              "github_run_id": "${{ github.run_id }}",
+              "github_run_attempt": "${{ github.run_attempt }}",
+              "github_sha": "${{ github.sha }}",
+              "github_ref": "${{ github.ref }}",
+              "github_actor": "${{ github.actor }}",
+              "suite_path": "${{ steps.config.outputs.suite_path }}",
+              "ablation_list": "${{ steps.config.outputs.ablation_list }}",
+              "timestamp_utc": datetime.now(timezone.utc).isoformat()
+          }
+
+          with open("${{ steps.config.outputs.run_root }}/ci_metadata.json", "w") as f:
+              json.dump(metadata, f, indent=2)
+          PYEOF
+
+          echo "✓ Directories initialized"
+          echo "✓ CI metadata written to ${RUN_ROOT}/ci_metadata.json"
+
+      # =========================================================================
+      # Run baseline
+      # =========================================================================
+
+      - name: Run baseline suite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUITE_PATH="${{ steps.config.outputs.suite_path }}"
+          SUITE_OUT_DIR="${{ steps.config.outputs.suite_out_dir }}"
+          RUN_ROOT="${{ steps.config.outputs.run_root }}"
+
+          echo "=== Running baseline suite ==="
+          echo "Suite: ${SUITE_PATH}"
+          echo "Suite out_dir: ${SUITE_OUT_DIR}"
+          echo "Run root: ${RUN_ROOT}"
+
+          # Run the suite - sim_eval appends __baseline suffix automatically
+          ./target/release/sim_eval suite "${SUITE_PATH}" \
+            2>&1 | tee "${RUN_ROOT}/baseline_run.log"
+
+          # Move outputs from suite's out_dir to our unique run root
+          SOURCE_DIR="${SUITE_OUT_DIR}__baseline"
+          DEST_DIR="${RUN_ROOT}/research__baseline"
+
+          if [[ -d "${SOURCE_DIR}" ]]; then
+            echo "Moving ${SOURCE_DIR} -> ${DEST_DIR}"
+            mv "${SOURCE_DIR}" "${DEST_DIR}"
+          else
+            echo "WARNING: Expected baseline output directory not found: ${SOURCE_DIR}"
+            echo "Listing parent directory:"
+            ls -la "$(dirname "${SOURCE_DIR}")" || true
+          fi
+
+          echo ""
+          echo "=== Baseline complete ==="
+          ls -la "${RUN_ROOT}" || true
+
+      # =========================================================================
+      # Run ablation variants
+      # =========================================================================
+
+      - name: Run ablation variants
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SUITE_PATH="${{ steps.config.outputs.suite_path }}"
+          SUITE_OUT_DIR="${{ steps.config.outputs.suite_out_dir }}"
+          RUN_ROOT="${{ steps.config.outputs.run_root }}"
+          ABLATION_LIST="${{ steps.config.outputs.ablation_list }}"
+
+          if [[ -z "${ABLATION_LIST}" ]]; then
+            echo "No ablations specified - skipping ablation runs"
             exit 0
           fi
 
-          # Discover supported ablations from the binary unless user provided a list.
-          if [[ "$ABLATIONS_INPUT" == "all" ]]; then
-            mapfile -t ABLATIONS < <(./target/release/sim_eval ablations | awk 'NF>=2 && $1 ~ /^[a-z0-9_]+$/ {print $1}')
-          else
-            IFS=',' read -r -a ABLATIONS <<< "$ABLATIONS_INPUT"
-            for i in "${!ABLATIONS[@]}"; do
-              ABLATIONS[$i]="$(echo "${ABLATIONS[$i]}" | xargs)"
-            done
-          fi
+          echo "=== Running ablation variants ==="
+          echo "Suite: ${SUITE_PATH}"
+          echo "Suite out_dir: ${SUITE_OUT_DIR}"
+          echo "Run root: ${RUN_ROOT}"
+          echo "Ablation list: ${ABLATION_LIST}"
 
-          echo "=== Running single ablations (${#ABLATIONS[@]}) ==="
-          printf '%s\n' "${ABLATIONS[@]}"
-
-          for a in "${ABLATIONS[@]}"; do
-            echo "--- ablation: $a ---"
-            ./target/release/sim_eval suite "$SUITE" --ablation "$a"
-          done
-
-          if [[ "$RUN_PAIRS" == "true" ]]; then
-            echo "=== Running all ablation pairs ==="
-            for ((i=0; i<${#ABLATIONS[@]}; i++)); do
-              for ((j=i+1; j<${#ABLATIONS[@]}; j++)); do
-                a="${ABLATIONS[$i]}"
-                b="${ABLATIONS[$j]}"
-                echo "--- pair: $a + $b ---"
-                ./target/release/sim_eval suite "$SUITE" --ablation "$a" --ablation "$b"
-              done
-            done
-          fi
-
-          echo "=== Top-level runs dir ==="
-          ls -la runs
-
-      - name: Summarize outputs + write reports + GH summary
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SUITE="${{ inputs.suite }}"
-
-          OUT_DIR_BASE="$(python3 -c "
-          import sys
-          path = sys.argv[1]
-          for raw in open(path, 'r', encoding='utf-8'):
-              line = raw.split('#', 1)[0].strip()
-              if line.startswith('out_dir:'):
-                  print(line.split(':', 1)[1].strip())
-                  sys.exit(0)
-          sys.exit('ERROR: could not find out_dir in ' + path)
-          " "$SUITE")"
-          echo "OUT_DIR_BASE=$OUT_DIR_BASE"
-
-          mkdir -p runs/_reports
-
-          # out_dir might be runs/research. Effective outputs may be:
-          # - runs/research
-          # - runs/research__baseline
-          # - runs/research__disable_x
-          # so we glob out_dir + "*"
-          shopt -s nullglob
-          RUN_DIRS=( ${OUT_DIR_BASE}* )
-          shopt -u nullglob
-
-          echo "Found ${#RUN_DIRS[@]} run directories to summarize:"
-          printf '%s\n' "${RUN_DIRS[@]}"
-
-          echo "## sim_eval research summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Suite:** \`${{ inputs.suite }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          for d in "${RUN_DIRS[@]}"; do
-            if [[ -d "$d" ]]; then
-              name="$(basename "$d")"
-              out="runs/_reports/${name}.txt"
-              echo "Summarizing $d -> $out"
-              ./target/release/sim_eval summarize "$d" > "$out"
-
-              echo "### $name" >> "$GITHUB_STEP_SUMMARY"
-              echo '```' >> "$GITHUB_STEP_SUMMARY"
-              head -n 120 "$out" >> "$GITHUB_STEP_SUMMARY"
-              echo '```' >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
+          # Convert comma-separated list to sorted array (deterministic order)
+          IFS=',' read -r -a ABLATIONS_RAW <<< "${ABLATION_LIST}"
+          ABLATIONS=()
+          for a in "${ABLATIONS_RAW[@]}"; do
+            trimmed="$(echo "${a}" | xargs)"
+            if [[ -n "${trimmed}" ]]; then
+              ABLATIONS+=("${trimmed}")
             fi
           done
 
-          echo "Reports written:"
-          ls -la runs/_reports
+          # Sort for deterministic iteration order
+          IFS=$'\n' ABLATIONS_SORTED=($(printf '%s\n' "${ABLATIONS[@]}" | sort))
+          unset IFS
 
-      # Step 6: Generate research report comparing ablations to baseline
+          echo "Sorted ablations (${#ABLATIONS_SORTED[@]}):"
+          printf '  - %s\n' "${ABLATIONS_SORTED[@]}"
+          echo ""
+
+          # Run each ablation sequentially
+          for ablation in "${ABLATIONS_SORTED[@]}"; do
+            echo "━━━ Ablation: ${ablation} ━━━"
+
+            ./target/release/sim_eval suite "${SUITE_PATH}" --ablation "${ablation}" \
+              2>&1 | tee "${RUN_ROOT}/${ablation}_run.log"
+
+            # Move outputs from suite's out_dir to our unique run root
+            SOURCE_DIR="${SUITE_OUT_DIR}__${ablation}"
+            DEST_DIR="${RUN_ROOT}/research__${ablation}"
+
+            if [[ -d "${SOURCE_DIR}" ]]; then
+              echo "Moving ${SOURCE_DIR} -> ${DEST_DIR}"
+              mv "${SOURCE_DIR}" "${DEST_DIR}"
+            else
+              echo "WARNING: Expected ablation output directory not found: ${SOURCE_DIR}"
+              echo "Listing parent directory:"
+              ls -la "$(dirname "${SOURCE_DIR}")" || true
+            fi
+
+            echo ""
+          done
+
+          echo "=== All ablations complete ==="
+          ls -la "${RUN_ROOT}"
+
+      # =========================================================================
+      # Generate research report
+      # =========================================================================
+
       - name: Generate research report
+        id: report
         shell: bash
         run: |
           set -euo pipefail
 
-          # Ensure _reports directory exists
-          mkdir -p _reports
+          RUN_ROOT="${{ steps.config.outputs.run_root }}"
+          REPORT_DIR="${{ steps.config.outputs.report_dir }}"
 
-          # Run the research report script
-          # Exit codes: 0=success, 1=kill-switch, 2=missing baseline match, 3=missing fields, 4=other
+          echo "=== Generating research report ==="
+          echo "Run root: ${RUN_ROOT}"
+          echo "Report dir: ${REPORT_DIR}"
+
+          # Ensure report directory exists
+          mkdir -p "${REPORT_DIR}"
+
+          # Run the quant-grade research report script
+          # Exit codes: 0=success, 1=kill-switch triggered, 2=critical error
+          # We capture exit code to allow workflow to continue for artifact upload
+          REPORT_EXIT=0
           python3 tools/sim_eval_report.py \
-              --run-root runs \
-              --baseline-suite research__baseline \
-              --suite-prefix research__ \
-              --out-md _reports/research_report.md \
-              --out-csv _reports/research_report.csv
+              --run-root "${RUN_ROOT}" \
+              --out-dir "${REPORT_DIR}" || REPORT_EXIT=$?
 
-          # Append the markdown report to GitHub Step Summary
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "---" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          cat _reports/research_report.md >> "$GITHUB_STEP_SUMMARY"
+          echo "report_exit_code=${REPORT_EXIT}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifacts
+          echo ""
+          echo "=== Report generation complete (exit: ${REPORT_EXIT}) ==="
+          ls -la "${REPORT_DIR}"
+
+          # Exit 2 = critical error, fail immediately
+          if [[ "${REPORT_EXIT}" -eq 2 ]]; then
+            echo "❌ Critical error in report generation"
+            exit 2
+          fi
+
+          # Exit 1 = kill switch triggered, note but continue
+          if [[ "${REPORT_EXIT}" -eq 1 ]]; then
+            echo "⚠️ Kill switch triggered in one or more runs (reports generated)"
+          fi
+
+      # =========================================================================
+      # Write GitHub Step Summary
+      # =========================================================================
+
+      - name: Write executive summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT_DIR="${{ steps.config.outputs.report_dir }}"
+          ABLATION_LIST="${{ steps.config.outputs.ablation_list }}"
+
+          # Write CI context header
+          # Note: The report generator (sim_eval_report.py) already wrote the
+          # delta overview table to GITHUB_STEP_SUMMARY. We add context here.
+          {
+            echo "## 🔬 sim_eval Research Run"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Run ID** | \`${{ github.run_id }}\` (attempt ${{ github.run_attempt }}) |"
+            echo "| **SHA** | \`${{ github.sha }}\` |"
+            echo "| **Suite** | \`${{ steps.config.outputs.suite_path }}\` |"
+            echo "| **Ablations** | \`${ABLATION_LIST:-baseline only}\` |"
+            echo ""
+            echo "---"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Append the full research report (includes delta tables)
+          if [[ -f "${REPORT_DIR}/research_report.md" ]]; then
+            cat "${REPORT_DIR}/research_report.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "⚠️ No research report generated" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # =========================================================================
+      # Validation
+      # =========================================================================
+
+      - name: Validate outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_ROOT="${{ steps.config.outputs.run_root }}"
+          REPORT_DIR="${{ steps.config.outputs.report_dir }}"
+
+          echo "=== Validating outputs ==="
+          ERRORS=0
+
+          # Check 1: At least one run_summary.json exists
+          echo "Checking for run_summary.json files..."
+          SUMMARY_COUNT=$(find "${RUN_ROOT}" -name "run_summary.json" -type f | wc -l)
+          if [[ "${SUMMARY_COUNT}" -lt 1 ]]; then
+            echo "❌ ERROR: No run_summary.json files found under ${RUN_ROOT}"
+            ERRORS=$((ERRORS + 1))
+          else
+            echo "✓ Found ${SUMMARY_COUNT} run_summary.json file(s)"
+          fi
+
+          # Check 2: Report files exist
+          echo "Checking for report files..."
+          if [[ ! -f "${REPORT_DIR}/research_report.md" ]]; then
+            echo "❌ ERROR: Missing ${REPORT_DIR}/research_report.md"
+            ERRORS=$((ERRORS + 1))
+          else
+            echo "✓ Found ${REPORT_DIR}/research_report.md"
+          fi
+
+          if [[ ! -f "${REPORT_DIR}/research_report.json" ]]; then
+            echo "❌ ERROR: Missing ${REPORT_DIR}/research_report.json"
+            ERRORS=$((ERRORS + 1))
+          else
+            echo "✓ Found ${REPORT_DIR}/research_report.json"
+          fi
+
+          # Check 3: CI metadata exists
+          if [[ ! -f "${RUN_ROOT}/ci_metadata.json" ]]; then
+            echo "❌ ERROR: Missing ${RUN_ROOT}/ci_metadata.json"
+            ERRORS=$((ERRORS + 1))
+          else
+            echo "✓ Found ${RUN_ROOT}/ci_metadata.json"
+          fi
+
+          # Summary
+          echo ""
+          echo "=== Validation Summary ==="
+          echo "Run root contents:"
+          find "${RUN_ROOT}" -type f -name "*.json" | head -20 | sort
+          echo ""
+          echo "Report dir contents:"
+          ls -la "${REPORT_DIR}"
+
+          if [[ "${ERRORS}" -gt 0 ]]; then
+            echo ""
+            echo "❌ Validation failed with ${ERRORS} error(s)"
+            exit 1
+          fi
+
+          echo ""
+          echo "✓ All validations passed"
+
+      # =========================================================================
+      # Upload artifacts
+      # =========================================================================
+
+      - name: Upload run summaries
         uses: actions/upload-artifact@v4
         with:
-          name: sim-eval-research-${{ github.run_id }}
+          name: run-summaries-${{ github.run_id }}
           path: |
-            _reports/
-            runs/_reports/
-            runs/research__*
+            ${{ steps.config.outputs.run_root }}/
           retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload research reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-reports-${{ github.run_id }}
+          path: |
+            ${{ steps.config.outputs.report_dir }}/research_report.md
+            ${{ steps.config.outputs.report_dir }}/research_report.json
+          retention-days: 14
+          if-no-files-found: error
+
+      # =========================================================================
+      # Final status check
+      # =========================================================================
+
+      - name: Check for kill switches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT_EXIT="${{ steps.report.outputs.report_exit_code }}"
+
+          if [[ "${REPORT_EXIT}" -eq 1 ]]; then
+            echo "❌ Workflow completed but kill switch(es) were triggered."
+            echo "   Review the research report artifacts for details."
+            exit 1
+          fi
+
+          echo "✓ Research run completed successfully with no kill switches"

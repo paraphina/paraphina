@@ -21,10 +21,10 @@ use paraphina::metrics::DrawdownTracker;
 use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
-    create_output_dir, print_ablations, run_report, summarize, write_build_info,
+    create_output_dir, print_ablations, run_report, summarize_with_format, write_build_info,
     write_config_resolved, write_config_resolved_with_ablations, AblationSet, BuildInfo, Engine,
-    ExpectKillSwitch, KillSwitchInfo, MarketModelType, ReportArgs, ReportResult, RunSummary,
-    ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
+    ExpectKillSwitch, KillSwitchInfo, MarketModelType, OutputFormat, ReportArgs, ReportResult,
+    RunSummary, ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
 };
 
 // =============================================================================
@@ -68,6 +68,7 @@ struct SuiteArgs {
 #[derive(Debug)]
 struct SummarizeArgs {
     runs_dir: PathBuf,
+    format: OutputFormat,
 }
 
 fn usage() -> &'static str {
@@ -77,7 +78,7 @@ sim_eval - Simulation & Evaluation runner (Option B)
 USAGE:
   sim_eval run <SCENARIO_PATH> [OPTIONS]
   sim_eval suite <SUITE_PATH> [OPTIONS]
-  sim_eval summarize <RUNS_DIR>
+  sim_eval summarize <RUNS_DIR> [OPTIONS]
   sim_eval report --baseline <DIR> --variant <NAME>=<DIR> ... --out-md <PATH> --out-json <PATH> [OPTIONS]
   sim_eval ablations
 
@@ -97,6 +98,9 @@ SUITE OPTIONS:
   --verbose              Print verbose output
   --ablation <ID>        Enable an ablation (can be specified multiple times)
 
+SUMMARIZE OPTIONS:
+  --format <FORMAT>      Output format: text (default) or md (Markdown)
+
 REPORT OPTIONS:
   --baseline <DIR>              Baseline runs directory (required)
   --variant <NAME>=<DIR>        Variant name and directory (can be specified multiple times, at least one required)
@@ -115,6 +119,7 @@ EXAMPLES:
   sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor
   sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor --ablation disable_toxicity_gate
   sim_eval summarize runs/
+  sim_eval summarize runs/ --format md
   sim_eval report --baseline runs/baseline --variant ablation1=runs/ablation1 --out-md report.md --out-json report.json
   sim_eval report --baseline runs/baseline --variant v1=runs/v1 --variant v2=runs/v2 --out-md report.md --out-json report.json --gate-max-regression-usd 50.0
   sim_eval ablations
@@ -368,14 +373,43 @@ fn parse_args() -> Result<Command, String> {
         "summarize" => {
             let mut summarize_args = SummarizeArgs {
                 runs_dir: PathBuf::new(),
+                format: OutputFormat::Text,
             };
             let mut runs_dir_set = false;
 
-            for arg in args.by_ref() {
+            while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--help" | "-h" => {
                         println!("{}", usage());
                         std::process::exit(0);
+                    }
+                    "--format" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --format".to_string())?;
+                        summarize_args.format = match val.to_lowercase().as_str() {
+                            "text" => OutputFormat::Text,
+                            "md" | "markdown" => OutputFormat::Markdown,
+                            _ => {
+                                return Err(format!(
+                                    "Unknown format '{}', expected 'text' or 'md'",
+                                    val
+                                ))
+                            }
+                        };
+                    }
+                    _ if arg.starts_with("--format=") => {
+                        let val = &arg["--format=".len()..];
+                        summarize_args.format = match val.to_lowercase().as_str() {
+                            "text" => OutputFormat::Text,
+                            "md" | "markdown" => OutputFormat::Markdown,
+                            _ => {
+                                return Err(format!(
+                                    "Unknown format '{}', expected 'text' or 'md'",
+                                    val
+                                ))
+                            }
+                        };
                     }
                     _ if arg.starts_with('-') => {
                         return Err(format!("Unknown option: {}", arg));
@@ -1173,7 +1207,7 @@ fn cmd_summarize(args: SummarizeArgs) -> i32 {
     let stdout = std::io::stdout();
     let handle = stdout.lock();
 
-    match summarize(&args.runs_dir, handle) {
+    match summarize_with_format(&args.runs_dir, handle, args.format) {
         Ok(SummarizeResult::Success(count)) => {
             eprintln!("\nFound {} run(s)", count);
             0
