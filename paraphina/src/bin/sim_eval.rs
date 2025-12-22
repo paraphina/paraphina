@@ -22,9 +22,9 @@ use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
     create_output_dir, print_ablations, run_report, summarize_with_format, write_build_info,
-    write_config_resolved, write_config_resolved_with_ablations, AblationSet, BuildInfo, Engine,
-    ExpectKillSwitch, KillSwitchInfo, MarketModelType, OutputFormat, ReportArgs, ReportResult,
-    RunSummary, ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
+    write_config_resolved, write_config_resolved_with_ablations, write_evidence_pack, AblationSet,
+    BuildInfo, Engine, ExpectKillSwitch, KillSwitchInfo, MarketModelType, OutputFormat, ReportArgs,
+    ReportResult, RunSummary, ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
 };
 
 // =============================================================================
@@ -973,6 +973,9 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
         gate_failures: Vec::new(),
     };
 
+    // Track artifact paths relative to output_root for evidence pack
+    let mut artifact_paths: Vec<PathBuf> = Vec::new();
+
     for scenario_ref in &suite.scenarios {
         println!("━━━ Scenario: {} ━━━", scenario_ref.path);
 
@@ -1089,13 +1092,25 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
                 &ablations,
             );
 
-            let _ = summary_with_build.write_to_file(output_dir.join("run_summary.json"));
-            let _ = write_config_resolved_with_ablations(
-                output_dir.join("config_resolved.json"),
-                &spec,
-                &ablations,
-            );
-            let _ = write_build_info(output_dir.join("build_info.json"), &build_info);
+            // Write output files and track relative paths for evidence pack
+            let run_summary_path = output_dir.join("run_summary.json");
+            let config_resolved_path = output_dir.join("config_resolved.json");
+            let build_info_path = output_dir.join("build_info.json");
+
+            let _ = summary_with_build.write_to_file(&run_summary_path);
+            let _ = write_config_resolved_with_ablations(&config_resolved_path, &spec, &ablations);
+            let _ = write_build_info(&build_info_path, &build_info);
+
+            // Track artifact paths relative to out_dir for evidence pack
+            if let Ok(rel_path) = run_summary_path.strip_prefix(out_dir) {
+                artifact_paths.push(rel_path.to_path_buf());
+            }
+            if let Ok(rel_path) = config_resolved_path.strip_prefix(out_dir) {
+                artifact_paths.push(rel_path.to_path_buf());
+            }
+            if let Ok(rel_path) = build_info_path.strip_prefix(out_dir) {
+                artifact_paths.push(rel_path.to_path_buf());
+            }
 
             // Print seed status
             let determinism_status = if suite.repeat_runs > 1 {
@@ -1173,12 +1188,29 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
     );
     println!();
 
+    // Generate Evidence Pack v1 (per docs/EVIDENCE_PACK.md)
+    // Evidence pack generation failure is fatal (integrity boundary)
+    println!();
+    println!("Generating Evidence Pack...");
+    if let Err(e) = write_evidence_pack(out_dir, &args.suite_path, &artifact_paths) {
+        eprintln!("✗ EVIDENCE PACK GENERATION FAILED: {}", e);
+        eprintln!();
+        eprintln!("Output written to: {}/", effective_out_dir);
+        return 1;
+    }
+    println!(
+        "✓ Evidence Pack written to: {}/evidence_pack/",
+        effective_out_dir
+    );
+
     if stats.gate_failures.is_empty() {
+        println!();
         println!("✓ ALL GATES PASSED");
         println!();
         println!("Output written to: {}/", effective_out_dir);
         0
     } else {
+        println!();
         println!("✗ {} GATE FAILURES:", stats.gate_failures.len());
         for failure in &stats.gate_failures {
             println!("  - {}", failure);

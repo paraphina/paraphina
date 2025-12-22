@@ -6,15 +6,21 @@
 // 1. Parsing scenarios/v1/synth_baseline.yaml succeeds
 // 2. Required output fields are present
 // 3. Determinism: two runs with same scenario+seed produce same checksum
+// 4. Evidence Pack: files exist, manifest parses, SHA256SUMS verify
 
 use paraphina::config::{Config, RiskProfile};
 use paraphina::metrics::DrawdownTracker;
 use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
-    BuildInfo, Engine, ExpectKillSwitch, KillSwitchInfo, MarketModelType, PnlLinearityCheck,
-    RunSummary, ScenarioSpec, SuiteSpec, SyntheticProcess,
+    write_evidence_pack, BuildInfo, Engine, ExpectKillSwitch, KillSwitchInfo, MarketModelType,
+    PnlLinearityCheck, RunSummary, ScenarioSpec, SuiteSpec, SyntheticProcess,
 };
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 // --------------------------------------------------------------------------
 // Test 1: Parsing scenarios/v1/synth_baseline.yaml succeeds
@@ -550,6 +556,392 @@ fn test_determinism_gate_would_fail_for_different_seeds() {
         checksum1, checksum2,
         "Different seeds should produce different checksums (gate would catch non-determinism)"
     );
+}
+
+// --------------------------------------------------------------------------
+// Evidence Pack Contract Tests (per docs/EVIDENCE_PACK.md)
+// --------------------------------------------------------------------------
+
+/// Helper to compute SHA256 hash of file contents (Rust-native, no external binary).
+fn compute_file_sha256(path: &Path) -> String {
+    let mut file = fs::File::open(path).expect("Failed to open file for hashing");
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let bytes_read = file.read(&mut buffer).expect("Failed to read file");
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    let hash = hasher.finalize();
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Helper to create a test file with content.
+fn create_test_file(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create parent directories");
+    }
+    fs::write(path, content).expect("Failed to write test file");
+}
+
+#[test]
+fn test_evidence_pack_files_exist() {
+    // Test that write_evidence_pack creates all required files
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let output_root = temp_dir.path().join("output");
+    fs::create_dir_all(&output_root).expect("Failed to create output dir");
+
+    // Create mock suite file
+    let suite_path = temp_dir.path().join("suite.yaml");
+    let suite_content = "suite_id: test\nsuite_version: 1\nscenarios:\n  - path: test.yaml\n";
+    create_test_file(&suite_path, suite_content);
+
+    // Create mock artifact files
+    let artifact1_path = output_root.join("results/run_001/run_summary.json");
+    create_test_file(&artifact1_path, r#"{"scenario_id": "test", "seed": 42}"#);
+
+    let artifact2_path = output_root.join("results/run_002/run_summary.json");
+    create_test_file(&artifact2_path, r#"{"scenario_id": "test", "seed": 43}"#);
+
+    // Generate evidence pack
+    let artifact_paths = vec![
+        PathBuf::from("results/run_001/run_summary.json"),
+        PathBuf::from("results/run_002/run_summary.json"),
+    ];
+    write_evidence_pack(&output_root, &suite_path, &artifact_paths)
+        .expect("write_evidence_pack should succeed");
+
+    // Contract: evidence_pack/manifest.json exists
+    let manifest_path = output_root.join("evidence_pack/manifest.json");
+    assert!(
+        manifest_path.exists(),
+        "evidence_pack/manifest.json must exist"
+    );
+
+    // Contract: evidence_pack/suite.yaml exists
+    let suite_copy_path = output_root.join("evidence_pack/suite.yaml");
+    assert!(
+        suite_copy_path.exists(),
+        "evidence_pack/suite.yaml must exist"
+    );
+
+    // Contract: evidence_pack/SHA256SUMS exists
+    let sha256sums_path = output_root.join("evidence_pack/SHA256SUMS");
+    assert!(
+        sha256sums_path.exists(),
+        "evidence_pack/SHA256SUMS must exist"
+    );
+}
+
+#[test]
+fn test_evidence_pack_manifest_required_keys() {
+    // Test that manifest.json contains all required keys per docs/EVIDENCE_PACK.md
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let output_root = temp_dir.path().join("output");
+    fs::create_dir_all(&output_root).expect("Failed to create output dir");
+
+    let suite_path = temp_dir.path().join("suite.yaml");
+    create_test_file(&suite_path, "suite_id: test\nsuite_version: 1\n");
+
+    create_test_file(&output_root.join("artifact.json"), r#"{"result": "ok"}"#);
+
+    write_evidence_pack(&output_root, &suite_path, &[PathBuf::from("artifact.json")])
+        .expect("write_evidence_pack should succeed");
+
+    // Parse manifest.json
+    let manifest_path = output_root.join("evidence_pack/manifest.json");
+    let manifest_content = fs::read_to_string(&manifest_path).expect("Failed to read manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest_content).expect("manifest.json must be valid JSON");
+
+    // Contract: Required top-level keys per docs/EVIDENCE_PACK.md
+    assert!(
+        manifest.get("evidence_pack_schema_version").is_some(),
+        "manifest must have evidence_pack_schema_version"
+    );
+    assert_eq!(
+        manifest["evidence_pack_schema_version"].as_str(),
+        Some("v1"),
+        "evidence_pack_schema_version must be 'v1'"
+    );
+
+    assert!(
+        manifest.get("generated_at_unix_ms").is_some(),
+        "manifest must have generated_at_unix_ms"
+    );
+    assert!(
+        manifest["generated_at_unix_ms"].is_u64(),
+        "generated_at_unix_ms must be an integer"
+    );
+
+    assert!(
+        manifest.get("paraphina_version").is_some(),
+        "manifest must have paraphina_version"
+    );
+
+    // Contract: repository section with required fields
+    let repo = manifest
+        .get("repository")
+        .expect("manifest must have repository section");
+    assert!(
+        repo.get("git_commit").is_some(),
+        "repository must have git_commit (may be null)"
+    );
+    assert!(
+        repo.get("cargo_lock_sha256").is_some(),
+        "repository must have cargo_lock_sha256 (may be null)"
+    );
+    assert!(
+        repo.get("sim_output_schema_sha256").is_some(),
+        "repository must have sim_output_schema_sha256 (may be null)"
+    );
+
+    // Contract: suite section with required fields
+    let suite = manifest
+        .get("suite")
+        .expect("manifest must have suite section");
+    assert!(
+        suite.get("source_path").is_some(),
+        "suite must have source_path"
+    );
+    assert!(
+        suite.get("copied_to").is_some(),
+        "suite must have copied_to"
+    );
+    assert_eq!(
+        suite["copied_to"].as_str(),
+        Some("evidence_pack/suite.yaml"),
+        "suite.copied_to must be 'evidence_pack/suite.yaml'"
+    );
+    assert!(suite.get("sha256").is_some(), "suite must have sha256");
+    assert!(
+        suite["sha256"]
+            .as_str()
+            .map(|s| s.starts_with("sha256:"))
+            .unwrap_or(false),
+        "suite.sha256 must start with 'sha256:'"
+    );
+
+    // Contract: artifacts array exists and is sorted by path
+    let artifacts = manifest
+        .get("artifacts")
+        .expect("manifest must have artifacts array");
+    assert!(artifacts.is_array(), "artifacts must be an array");
+
+    let artifact_list = artifacts.as_array().unwrap();
+    assert!(
+        !artifact_list.is_empty(),
+        "artifacts array must not be empty"
+    );
+
+    // Verify sorting by path
+    let paths: Vec<&str> = artifact_list
+        .iter()
+        .filter_map(|a| a.get("path").and_then(|p| p.as_str()))
+        .collect();
+    let mut sorted_paths = paths.clone();
+    sorted_paths.sort();
+    assert_eq!(paths, sorted_paths, "artifacts must be sorted by path");
+
+    // Contract: manifest.json itself must NOT be in artifacts
+    for artifact in artifact_list {
+        let path = artifact.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        assert_ne!(
+            path, "evidence_pack/manifest.json",
+            "manifest.json must NOT be in artifacts array (self-referential)"
+        );
+    }
+
+    // Each artifact must have path and sha256
+    for artifact in artifact_list {
+        assert!(
+            artifact.get("path").is_some(),
+            "each artifact must have 'path'"
+        );
+        assert!(
+            artifact.get("sha256").is_some(),
+            "each artifact must have 'sha256'"
+        );
+    }
+}
+
+#[test]
+fn test_evidence_pack_sha256sums_verification() {
+    // Test that every path in SHA256SUMS exists and its hash matches
+    // This is a Rust-native implementation (no sha256sum binary) for CI portability
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let output_root = temp_dir.path().join("output");
+    fs::create_dir_all(&output_root).expect("Failed to create output dir");
+
+    let suite_path = temp_dir.path().join("suite.yaml");
+    let suite_content = "suite_id: verification_test\nsuite_version: 1\n";
+    create_test_file(&suite_path, suite_content);
+
+    // Create multiple artifacts at different paths
+    create_test_file(
+        &output_root.join("scenario_a/42/run_summary.json"),
+        r#"{"scenario_id": "a", "seed": 42, "pnl": 100.5}"#,
+    );
+    create_test_file(
+        &output_root.join("scenario_b/43/run_summary.json"),
+        r#"{"scenario_id": "b", "seed": 43, "pnl": -50.0}"#,
+    );
+
+    write_evidence_pack(
+        &output_root,
+        &suite_path,
+        &[
+            PathBuf::from("scenario_a/42/run_summary.json"),
+            PathBuf::from("scenario_b/43/run_summary.json"),
+        ],
+    )
+    .expect("write_evidence_pack should succeed");
+
+    // Read SHA256SUMS
+    let sha256sums_path = output_root.join("evidence_pack/SHA256SUMS");
+    let sha256sums_content =
+        fs::read_to_string(&sha256sums_path).expect("Failed to read SHA256SUMS");
+
+    // Parse and verify each line
+    let mut verified_count = 0;
+    for line in sha256sums_content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Format: "<hash>  <path>" (two spaces between hash and path, per sha256sum standard)
+        let parts: Vec<&str> = line.splitn(2, "  ").collect();
+        assert_eq!(
+            parts.len(),
+            2,
+            "SHA256SUMS line must have format '<hash>  <path>': {}",
+            line
+        );
+
+        let expected_hash = parts[0];
+        let relative_path = parts[1];
+
+        // Contract: file must exist under output_root
+        let file_path = output_root.join(relative_path);
+        assert!(
+            file_path.exists(),
+            "File referenced in SHA256SUMS must exist: {}",
+            relative_path
+        );
+
+        // Contract: SHA256 must match (Rust-native computation)
+        let actual_hash = compute_file_sha256(&file_path);
+        assert_eq!(
+            actual_hash, expected_hash,
+            "SHA256 mismatch for {}: expected {} but got {}",
+            relative_path, expected_hash, actual_hash
+        );
+
+        verified_count += 1;
+    }
+
+    // Sanity check: we should have verified at least manifest.json, suite.yaml, and 2 artifacts
+    assert!(
+        verified_count >= 4,
+        "Should verify at least 4 files (manifest, suite, 2 artifacts), got {}",
+        verified_count
+    );
+}
+
+#[test]
+fn test_evidence_pack_suite_yaml_byte_identical() {
+    // Contract: evidence_pack/suite.yaml must be byte-identical to source
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let output_root = temp_dir.path().join("output");
+    fs::create_dir_all(&output_root).expect("Failed to create output dir");
+
+    // Use specific content with trailing newlines to test byte-identity
+    let suite_path = temp_dir.path().join("suite.yaml");
+    let suite_content = b"# Suite with specific whitespace\nsuite_id: byte_test\n\n# trailing\n";
+    fs::write(&suite_path, suite_content).expect("Failed to write suite");
+
+    write_evidence_pack(&output_root, &suite_path, &[])
+        .expect("write_evidence_pack should succeed");
+
+    let copied_path = output_root.join("evidence_pack/suite.yaml");
+    let copied_content = fs::read(&copied_path).expect("Failed to read copied suite");
+
+    assert_eq!(
+        copied_content,
+        suite_content.to_vec(),
+        "evidence_pack/suite.yaml must be byte-identical to source"
+    );
+}
+
+#[test]
+fn test_evidence_pack_sha256sums_includes_manifest() {
+    // Contract: SHA256SUMS must include evidence_pack/manifest.json
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let output_root = temp_dir.path().join("output");
+    fs::create_dir_all(&output_root).expect("Failed to create output dir");
+
+    let suite_path = temp_dir.path().join("suite.yaml");
+    create_test_file(&suite_path, "suite_id: test\n");
+
+    write_evidence_pack(&output_root, &suite_path, &[])
+        .expect("write_evidence_pack should succeed");
+
+    let sha256sums_content =
+        fs::read_to_string(output_root.join("evidence_pack/SHA256SUMS")).unwrap();
+
+    let paths_in_sums: HashSet<&str> = sha256sums_content
+        .lines()
+        .filter_map(|line| line.split("  ").nth(1))
+        .collect();
+
+    assert!(
+        paths_in_sums.contains("evidence_pack/manifest.json"),
+        "SHA256SUMS must include evidence_pack/manifest.json"
+    );
+    assert!(
+        paths_in_sums.contains("evidence_pack/suite.yaml"),
+        "SHA256SUMS must include evidence_pack/suite.yaml"
+    );
+}
+
+#[test]
+fn test_evidence_pack_paths_are_relative() {
+    // Contract: All paths in manifest.json must be relative (no absolute paths)
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let output_root = temp_dir.path().join("output");
+    fs::create_dir_all(&output_root).expect("Failed to create output dir");
+
+    let suite_path = temp_dir.path().join("suite.yaml");
+    create_test_file(&suite_path, "suite_id: test\n");
+
+    create_test_file(&output_root.join("artifact.json"), "{}");
+
+    write_evidence_pack(&output_root, &suite_path, &[PathBuf::from("artifact.json")])
+        .expect("write_evidence_pack should succeed");
+
+    let manifest_content =
+        fs::read_to_string(output_root.join("evidence_pack/manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
+
+    // Check suite.source_path is in manifest (may be relative or have specific format)
+    // Check all artifact paths are relative
+    for artifact in manifest["artifacts"].as_array().unwrap() {
+        let path = artifact["path"].as_str().unwrap();
+        assert!(
+            !path.starts_with('/'),
+            "Artifact path must be relative, not absolute: {}",
+            path
+        );
+        assert!(
+            !path.contains(".."),
+            "Artifact path must not contain '..': {}",
+            path
+        );
+    }
 }
 
 // --------------------------------------------------------------------------
