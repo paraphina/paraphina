@@ -8,10 +8,12 @@
 // - RunSummary: Output schema with determinism checksum
 // - BuildInfo: Git SHA and dirty flag for reproducibility
 // - AblationSet: Ablation harness for research experiments
+// - EvidencePack: Audit-grade output bundle with provenance and integrity
 //
 // Design principle: scenarios fully define runs, outputs are CI-comparable.
 
 pub mod ablation;
+pub mod evidence_pack;
 pub mod output;
 pub mod report;
 pub mod scenario;
@@ -41,3 +43,6 @@ pub use suite::{ScenarioRef, SuiteError, SuiteSpec, SUITE_SCHEMA_VERSION};
 pub use summarize::{
     get_summary_rows, summarize, summarize_with_format, OutputFormat, SummarizeResult, SummaryRow,
 };
+
+// Evidence Pack v1 (per docs/EVIDENCE_PACK.md)
+pub use evidence_pack::write_evidence_pack;

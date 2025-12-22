@@ -121,13 +121,13 @@ pub use rl::{
 // Simulation & Evaluation (Option B per ROADMAP.md)
 pub use sim_eval::{
     create_output_dir, create_output_dir_with_ablations, print_ablations, write_build_info,
-    write_config_resolved, write_config_resolved_with_ablations, AblationError, AblationSet,
-    BuildInfo, ConfigResolved, DeterminismInfo, Engine as SimEngine, ExpectKillSwitch,
-    HistoricalStubConfig, Horizon, InitialState, Invariants, KillSwitchInfo, MarketModel,
-    MarketModelType, MetricRecord, MetricsWriter, MicrostructureModel, PnlLinearityCheck,
-    ResultsInfo, Rng as SimRng, RunSummary, ScenarioError, ScenarioSpec, SyntheticConfig,
-    SyntheticParams, SyntheticProcess, ABLATION_DESCRIPTIONS, SCENARIO_SCHEMA_VERSION,
-    VALID_ABLATION_IDS,
+    write_config_resolved, write_config_resolved_with_ablations, write_evidence_pack,
+    AblationError, AblationSet, BuildInfo, ConfigResolved, DeterminismInfo, Engine as SimEngine,
+    ExpectKillSwitch, HistoricalStubConfig, Horizon, InitialState, Invariants, KillSwitchInfo,
+    MarketModel, MarketModelType, MetricRecord, MetricsWriter, MicrostructureModel,
+    PnlLinearityCheck, ResultsInfo, Rng as SimRng, RunSummary, ScenarioError, ScenarioSpec,
+    SyntheticConfig, SyntheticParams, SyntheticProcess, ABLATION_DESCRIPTIONS,
+    SCENARIO_SCHEMA_VERSION, VALID_ABLATION_IDS,
 };
 
 // --- PnL / basis unit tests -------------------------------------------------
