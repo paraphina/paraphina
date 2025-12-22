@@ -15,7 +15,7 @@ Throughout this document, algorithmic claims are annotated with one of:
 - **Planned (not yet implemented; milestone X)** — in roadmap but no code yet
 - **Partial (milestone X)** — scaffolding exists but incomplete
 
-All implementation evidence is documented in detail in `docs/EVIDENCE_PACK.md`.
+For audit-grade provenance and integrity of simulation outputs, see `docs/EVIDENCE_PACK.md` (Evidence Pack v1 specification).
 
 ---
 
@@ -319,6 +319,7 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | Cross-venue exits | Implemented (Milestone E) | Full allocator with net edge, basis/funding, fragmentation; lot size + min notional enforcement |
 | RL-1: Gym-style env | Implemented | SimEnv/VecEnv with Python bindings via paraphina_env crate |
 | RL-2: BC baseline | Implemented | Action encoding, trajectory collection, Python BC training scripts |
+| Evidence Pack v1 | Planned (Step 6) | Audit-grade provenance for sim_eval outputs; see `docs/EVIDENCE_PACK.md` |
 | Production I/O | Planned | Current focus is deterministic sim + telemetry |
 
 ### Milestone E: Cross-venue Exit Allocator (Section 12)
@@ -540,6 +541,33 @@ python python/rl2_bc/train_bc.py \
 python python/rl2_bc/eval_bc.py \
     --model-dir runs/rl2_model --eval-holdout --eval-rollout
 ```
+
+---
+
+### Step 6: Evidence Pack v1 (Planned)
+
+**Status: Planned**
+
+> **Specification:** See `docs/EVIDENCE_PACK.md`
+
+Step 6 introduces an audit-grade Evidence Pack for `sim_eval` outputs, providing provenance and integrity guarantees.
+
+**Deliverables:**
+
+1. **Directory structure**: `<output_root>/evidence_pack/{manifest.json, suite.yaml, SHA256SUMS}`
+2. **manifest.json**: Schema version, timestamps, git commit, Cargo.lock hash, suite metadata, artifact checksums
+3. **SHA256SUMS**: Standard format verifiable via `sha256sum -c`
+4. **Determinism**: Relative paths only, stable ordering (sorted by path), atomic writes
+
+**Non-goals (v1):**
+- Cryptographic signing/attestation (reserved for future versions)
+- Full environment capture (reserved for future versions)
+
+**Acceptance Criteria:**
+- Evidence pack generated for every sim_eval run
+- `sha256sum -c evidence_pack/SHA256SUMS` passes from output root
+- Manifest contains all required fields per `docs/EVIDENCE_PACK.md`
+- CI produces and archives evidence pack as build artifact
 
 ---
 
