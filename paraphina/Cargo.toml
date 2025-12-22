@@ -34,6 +34,9 @@ rand_chacha = { workspace = true }
 # For checksum computation.
 sha2 = { workspace = true }
 
+# For ergonomic error handling.
+anyhow = "1"
+
 [dev-dependencies]
 # For creating temporary directories in tests.
 tempfile = "3"
