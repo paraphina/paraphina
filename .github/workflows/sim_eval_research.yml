@@ -445,6 +445,136 @@ jobs:
           echo "✓ All validations passed"
 
       # =========================================================================
+      # Verify and bundle evidence packs
+      # =========================================================================
+
+      - name: Verify and bundle evidence packs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Finding evidence packs ==="
+
+          # Find all SHA256SUMS files in evidence_pack directories
+          SUMS_FILES=$(find . -type f -path '*/evidence_pack/SHA256SUMS' | sort)
+
+          if [[ -z "${SUMS_FILES}" ]]; then
+            echo "❌ ERROR: No evidence_pack/SHA256SUMS files found"
+            exit 1
+          fi
+
+          # Count and list evidence packs
+          PACK_COUNT=$(echo "${SUMS_FILES}" | wc -l)
+          echo "Found ${PACK_COUNT} evidence pack(s):"
+          echo "${SUMS_FILES}"
+          echo ""
+
+          # Verify each evidence pack
+          echo "=== Verifying evidence packs ==="
+          OUTPUT_ROOTS=()
+
+          while IFS= read -r sums_file; do
+            # Get output_root (2 levels above SHA256SUMS)
+            evidence_pack_dir=$(dirname "${sums_file}")
+            output_root=$(dirname "${evidence_pack_dir}")
+            OUTPUT_ROOTS+=("${output_root}")
+
+            echo "Verifying: ${output_root}"
+            (cd "${output_root}" && sha256sum -c evidence_pack/SHA256SUMS)
+            echo "✓ Verified: ${output_root}"
+            echo ""
+          done <<< "${SUMS_FILES}"
+
+          echo "=== Creating deterministic bundle ==="
+
+          # Build file list from SHA256SUMS entries (paths relative to repo root)
+          > evidence_pack_files.txt
+
+          while IFS= read -r sums_file; do
+            evidence_pack_dir=$(dirname "${sums_file}")
+            output_root=$(dirname "${evidence_pack_dir}")
+
+            # Read each line from SHA256SUMS and convert to repo-relative path
+            while IFS= read -r line; do
+              # SHA256SUMS format: <hash>  <relative_path>
+              # Extract the path (everything after the hash and two spaces)
+              file_path="${line#*  }"
+              repo_relative="${output_root}/${file_path}"
+              # Normalize path (remove leading ./)
+              repo_relative="${repo_relative#./}"
+              echo "${repo_relative}" >> evidence_pack_files.txt
+            done < "${sums_file}"
+          done <<< "${SUMS_FILES}"
+
+          # Deduplicate and sort
+          sort -u evidence_pack_files.txt -o evidence_pack_files.txt
+
+          FILE_COUNT=$(wc -l < evidence_pack_files.txt)
+          echo "Bundle will contain ${FILE_COUNT} files"
+
+          # Create deterministic tarball
+          # Check if GNU tar is available with required flags
+          if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+            echo "Using GNU tar for deterministic archive"
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -cf evidence_pack_bundle.tar -T evidence_pack_files.txt
+          else
+            echo "WARNING: GNU tar not detected, falling back to basic tar (less deterministic)"
+            tar -cf evidence_pack_bundle.tar -T evidence_pack_files.txt
+          fi
+
+          gzip -n evidence_pack_bundle.tar
+
+          # Compute and print sha256 of bundle
+          BUNDLE_SHA256=$(sha256sum evidence_pack_bundle.tar.gz | cut -d' ' -f1)
+          echo ""
+          echo "✓ Bundle created: evidence_pack_bundle.tar.gz"
+          echo "  SHA256: ${BUNDLE_SHA256}"
+
+          # Write step summary
+          echo "=== Writing step summary ==="
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 📦 Evidence Pack Bundle"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| **Evidence packs found** | ${PACK_COUNT} |"
+            echo "| **Files in bundle** | ${FILE_COUNT} |"
+            echo "| **Bundle SHA256** | \`${BUNDLE_SHA256}\` |"
+            echo ""
+            echo "### Output directories"
+            echo ""
+            printf '%s\n' "${OUTPUT_ROOTS[@]}" | sed 's/^/- `/' | sed 's/$/`/'
+            echo ""
+            echo "### Verification after download"
+            echo ""
+            echo '```bash'
+            echo 'tar -xzf evidence_pack_bundle.tar.gz'
+            for root in "${OUTPUT_ROOTS[@]}"; do
+              # Normalize the root path
+              normalized="${root#./}"
+              echo "(cd \"${normalized}\" && sha256sum -c evidence_pack/SHA256SUMS)"
+            done
+            echo '```'
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "✓ Evidence pack verification and bundling complete"
+
+      - name: Upload evidence pack bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-pack-v1
+          path: |
+            evidence_pack_bundle.tar.gz
+            evidence_pack_files.txt
+          retention-days: 14
+          if-no-files-found: error
+
+      # =========================================================================
       # Upload artifacts
       # =========================================================================
 
