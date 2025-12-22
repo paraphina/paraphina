@@ -38,4 +38,6 @@ pub use scenario::{
     SyntheticConfig, SyntheticParams, SyntheticProcess, SCENARIO_SCHEMA_VERSION,
 };
 pub use suite::{ScenarioRef, SuiteError, SuiteSpec, SUITE_SCHEMA_VERSION};
-pub use summarize::{summarize, SummarizeResult, SummaryRow};
+pub use summarize::{
+    get_summary_rows, summarize, summarize_with_format, OutputFormat, SummarizeResult, SummaryRow,
+};
