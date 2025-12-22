@@ -506,6 +506,9 @@ jobs:
             done < "${sums_file}"
           done <<< "${SUMS_FILES}"
 
+          # Also include SHA256SUMS files themselves (required for post-download verification)
+          echo "${SUMS_FILES}" | sed 's|^\./||' >> evidence_pack_files.txt
+
           # Deduplicate and sort
           sort -u evidence_pack_files.txt -o evidence_pack_files.txt
 
@@ -524,6 +527,16 @@ jobs:
           fi
 
           gzip -n evidence_pack_bundle.tar
+
+          # Hard assertion: verify all SHA256SUMS files are in the bundle
+          expected_count=$(find . -type f -path '*/evidence_pack/SHA256SUMS' | wc -l | tr -d ' ')
+          actual_count=$(tar -tzf evidence_pack_bundle.tar.gz | grep -c '/evidence_pack/SHA256SUMS$' || true)
+          if [ "$actual_count" -ne "$expected_count" ]; then
+            echo "ERROR: bundle missing SHA256SUMS files (expected=$expected_count actual=$actual_count)"
+            echo "This breaks post-download verification."
+            exit 1
+          fi
+          echo "✓ Verified bundle contains all ${expected_count} SHA256SUMS file(s)"
 
           # Compute and print sha256 of bundle
           BUNDLE_SHA256=$(sha256sum evidence_pack_bundle.tar.gz | cut -d' ' -f1)
