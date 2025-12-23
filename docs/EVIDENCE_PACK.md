@@ -136,27 +136,34 @@ All lines should report `OK`. Any mismatch indicates tampering or corruption.
 
 For strict verification of evidence packs, use the `sim_eval` CLI verifier. This validates manifest schema, all checksums, and directory structure.
 
-### Verifying an extracted bundle
+### Verifying an evidence tree
 
-After downloading and extracting an evidence pack bundle:
+Verify the directory structure and all artifact checksums:
 
 ```bash
-# Extract the bundle
-tar -xzf evidence_pack_bundle.tar.gz -C extracted
-
-# Run the strict verifier
-cargo run -p paraphina --bin sim_eval -- verify-evidence-tree extracted
+cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs/demo_step_7_1
 ```
 
-The verifier checks:
+### Verifying an evidence pack
+
+Verify the evidence pack manifest and checksums specifically:
+
+```bash
+cargo run -p paraphina --bin sim_eval -- verify-evidence-pack runs/demo_step_7_1
+```
+
+### What the verifier checks
+
 - Manifest schema version and required fields
 - All artifact checksums match SHA256SUMS
 - Directory structure is valid
 - No missing or extra files
 
-Exit codes:
+### Exit codes
+
 - `0`: All checks passed
-- Non-zero: Verification failed (details printed to stderr)
+- `2`: Verification failed (integrity or schema mismatch)
+- `3`: I/O or usage error (missing path, unreadable file)
 
 ### Note
 
