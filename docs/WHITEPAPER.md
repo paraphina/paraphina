@@ -587,6 +587,11 @@ Step 7 adds a strict offline verifier for evidence packs and integrates verifica
 3. **CI gate**: Workflow extracts bundled evidence pack and runs verifier before artifact upload
 4. **Additive verification**: Complements existing `sha256sum -c` checks; does not replace them
 
+**Step 7.1: Operator CLI (verify-evidence-pack / verify-evidence-tree)**
+- Provides `verify-evidence-pack` and `verify-evidence-tree` subcommands for operators to verify bundles offline
+- Exit codes: `0` (pass), `2` (verification failure), `3` (I/O/usage error)
+- See `docs/EVIDENCE_PACK.md` § Offline Verification (CLI) for usage examples
+
 **Acceptance Criteria:**
 - `sim_eval verify-evidence-tree` exists and validates extracted bundles
 - CI workflow verifies every evidence pack bundle before upload
