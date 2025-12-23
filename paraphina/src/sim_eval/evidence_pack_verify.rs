@@ -51,10 +51,7 @@ pub fn verify_evidence_pack_dir(output_root: &Path) -> Result<EvidencePackVerifi
     let sha256sums_path = output_root.join("evidence_pack/SHA256SUMS");
 
     if !sha256sums_path.exists() {
-        bail!(
-            "SHA256SUMS not found at {}",
-            sha256sums_path.display()
-        );
+        bail!("SHA256SUMS not found at {}", sha256sums_path.display());
     }
 
     // Parse SHA256SUMS
@@ -99,7 +96,10 @@ pub fn verify_evidence_pack_tree(root: &Path) -> Result<EvidencePackVerification
     let sha256sums_files = find_sha256sums_files(root)?;
 
     if sha256sums_files.is_empty() {
-        bail!("No evidence_pack/SHA256SUMS files found under {}", root.display());
+        bail!(
+            "No evidence_pack/SHA256SUMS files found under {}",
+            root.display()
+        );
     }
 
     let mut total_report = EvidencePackVerificationReport::default();
@@ -113,8 +113,12 @@ pub fn verify_evidence_pack_tree(root: &Path) -> Result<EvidencePackVerification
             .parent()
             .context("evidence_pack has no parent directory")?;
 
-        let report = verify_evidence_pack_dir(output_root)
-            .with_context(|| format!("Failed to verify evidence pack at {}", output_root.display()))?;
+        let report = verify_evidence_pack_dir(output_root).with_context(|| {
+            format!(
+                "Failed to verify evidence pack at {}",
+                output_root.display()
+            )
+        })?;
 
         total_report.packs_verified += report.packs_verified;
         total_report.files_verified += report.files_verified;
@@ -256,7 +260,10 @@ fn normalize_and_validate_path(path: &str) -> Result<String> {
     for component in path_obj.components() {
         match component {
             Component::ParentDir => {
-                bail!("Parent directory component (..) not allowed: {:?}", normalized);
+                bail!(
+                    "Parent directory component (..) not allowed: {:?}",
+                    normalized
+                );
             }
             Component::Prefix(_) => {
                 bail!("Path prefix not allowed: {:?}", normalized);
@@ -292,7 +299,9 @@ fn is_windows_path(path: &str) -> bool {
 
 /// Check that SHA256SUMS includes entries for manifest.json and suite.yaml.
 fn check_required_entries(entries: &[Sha256Entry]) -> Result<()> {
-    let has_manifest = entries.iter().any(|e| e.path == "evidence_pack/manifest.json");
+    let has_manifest = entries
+        .iter()
+        .any(|e| e.path == "evidence_pack/manifest.json");
     let has_suite = entries.iter().any(|e| e.path == "evidence_pack/suite.yaml");
 
     if !has_manifest {
@@ -326,9 +335,12 @@ fn verify_entry(output_root: &Path, entry: &Sha256Entry) -> Result<()> {
     let file_path = output_root.join(&entry.path);
 
     // Canonicalize both paths to ensure file is under output_root
-    let canonical_root = output_root
-        .canonicalize()
-        .with_context(|| format!("Failed to canonicalize output_root: {}", output_root.display()))?;
+    let canonical_root = output_root.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize output_root: {}",
+            output_root.display()
+        )
+    })?;
 
     // First check if file exists (before canonicalize, which would fail)
     if !file_path.exists() {
@@ -358,17 +370,11 @@ fn verify_entry(output_root: &Path, entry: &Sha256Entry) -> Result<()> {
         .with_context(|| format!("Failed to get metadata for: {}", file_path.display()))?;
 
     if metadata.file_type().is_symlink() {
-        bail!(
-            "Symlinks not allowed: {:?} is a symlink",
-            entry.path
-        );
+        bail!("Symlinks not allowed: {:?} is a symlink", entry.path);
     }
 
     if !metadata.is_file() {
-        bail!(
-            "Not a regular file: {:?}",
-            entry.path
-        );
+        bail!("Not a regular file: {:?}", entry.path);
     }
 
     // Compute hash using streaming reads
@@ -440,7 +446,11 @@ fn find_sha256sums_recursive(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(
 
         if path.is_dir() {
             // Check if this is an evidence_pack directory with SHA256SUMS
-            if path.file_name().map(|n| n == "evidence_pack").unwrap_or(false) {
+            if path
+                .file_name()
+                .map(|n| n == "evidence_pack")
+                .unwrap_or(false)
+            {
                 let sha256sums = path.join("SHA256SUMS");
                 if sha256sums.exists() && sha256sums.is_file() {
                     results.push(sha256sums);
@@ -507,7 +517,10 @@ mod tests {
             "{}  evidence_pack/manifest.json\n{}  evidence_pack/suite.yaml\n{}  results/run_001.json\n",
             manifest_hash, suite_hash, artifact_hash
         );
-        create_file(&evidence_pack_dir.join("SHA256SUMS"), sha256sums_content.as_bytes())?;
+        create_file(
+            &evidence_pack_dir.join("SHA256SUMS"),
+            sha256sums_content.as_bytes(),
+        )?;
 
         Ok(())
     }
@@ -691,17 +704,18 @@ mod tests {
         let bad_hash = "c".repeat(64);
 
         // Path with parent directory traversal - this should fail during parsing
-        let sha256sums = format!(
-            "{}  ../escape.txt\n",
-            bad_hash
-        );
+        let sha256sums = format!("{}  ../escape.txt\n", bad_hash);
         create_file(&evidence_pack_dir.join("SHA256SUMS"), sha256sums.as_bytes()).unwrap();
 
         let result = verify_evidence_pack_dir(dir.path());
         assert!(result.is_err());
         // Use the full error chain to check for the underlying cause
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("Parent directory component") || err.contains(".."), "Got error: {}", err);
+        assert!(
+            err.contains("Parent directory component") || err.contains(".."),
+            "Got error: {}",
+            err
+        );
     }
 
     #[test]
@@ -713,17 +727,18 @@ mod tests {
         let bad_hash = "d".repeat(64);
 
         // Absolute path - this should fail during parsing
-        let sha256sums = format!(
-            "{}  /etc/passwd\n",
-            bad_hash
-        );
+        let sha256sums = format!("{}  /etc/passwd\n", bad_hash);
         create_file(&evidence_pack_dir.join("SHA256SUMS"), sha256sums.as_bytes()).unwrap();
 
         let result = verify_evidence_pack_dir(dir.path());
         assert!(result.is_err());
         // Use the full error chain to check for the underlying cause
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("Absolute path not allowed") || err.contains("/etc/passwd"), "Got error: {}", err);
+        assert!(
+            err.contains("Absolute path not allowed") || err.contains("/etc/passwd"),
+            "Got error: {}",
+            err
+        );
     }
 
     #[test]
@@ -828,7 +843,11 @@ mod tests {
         assert!(result.is_err());
         // Use the full error chain to check for the underlying cause
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("Windows path prefix") || err.contains("C:\\"), "Got error: {}", err);
+        assert!(
+            err.contains("Windows path prefix") || err.contains("C:\\"),
+            "Got error: {}",
+            err
+        );
     }
 
     #[test]
@@ -846,7 +865,11 @@ mod tests {
         assert!(result.is_err());
         // Use the full error chain to check for the underlying cause
         let err = format!("{:#}", result.unwrap_err());
-        assert!(err.contains("Windows path prefix") || err.contains("\\\\server"), "Got error: {}", err);
+        assert!(
+            err.contains("Windows path prefix") || err.contains("\\\\server"),
+            "Got error: {}",
+            err
+        );
     }
 
     #[cfg(unix)]
@@ -996,4 +1019,3 @@ mod tests {
         assert!(!is_windows_path("evidence_pack/manifest.json"));
     }
 }
-
