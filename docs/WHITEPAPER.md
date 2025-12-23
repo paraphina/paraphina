@@ -319,7 +319,8 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | Cross-venue exits | Implemented (Milestone E) | Full allocator with net edge, basis/funding, fragmentation; lot size + min notional enforcement |
 | RL-1: Gym-style env | Implemented | SimEnv/VecEnv with Python bindings via paraphina_env crate |
 | RL-2: BC baseline | Implemented | Action encoding, trajectory collection, Python BC training scripts |
-| Evidence Pack v1 | Planned (Step 6) | Audit-grade provenance for sim_eval outputs; see `docs/EVIDENCE_PACK.md` |
+| Evidence Pack v1 | Implemented (Step 6) | Audit-grade provenance for sim_eval outputs; see `docs/EVIDENCE_PACK.md` |
+| Evidence Pack Verifier + CI Gate | Implemented (Step 7) | Strict verifier CLI + CI gate verifies extracted bundles |
 | Production I/O | Planned | Current focus is deterministic sim + telemetry |
 
 ### Milestone E: Cross-venue Exit Allocator (Section 12)
@@ -544,9 +545,9 @@ python python/rl2_bc/eval_bc.py \
 
 ---
 
-### Step 6: Evidence Pack v1 (Planned)
+### Step 6: Evidence Pack v1 (Implemented)
 
-**Status: Planned**
+**Status: Implemented**
 
 > **Specification:** See `docs/EVIDENCE_PACK.md`
 
@@ -568,6 +569,28 @@ Step 6 introduces an audit-grade Evidence Pack for `sim_eval` outputs, providing
 - `sha256sum -c evidence_pack/SHA256SUMS` passes from output root
 - Manifest contains all required fields per `docs/EVIDENCE_PACK.md`
 - CI produces and archives evidence pack as build artifact
+
+---
+
+### Step 7: Evidence Pack Verifier + CI Gate (Implemented)
+
+**Status: Implemented**
+
+> **Implementation:** `sim_eval verify-evidence-tree` CLI command + CI gate in `.github/workflows/sim_eval_research.yml`
+
+Step 7 adds a strict offline verifier for evidence packs and integrates verification into CI as a gate.
+
+**Deliverables:**
+
+1. **Strict verifier**: `verify-evidence-tree` command validates manifest schema, checksums, and directory structure
+2. **CLI interface**: `sim_eval verify-evidence-tree <extracted_bundle_root>` for offline verification
+3. **CI gate**: Workflow extracts bundled evidence pack and runs verifier before artifact upload
+4. **Additive verification**: Complements existing `sha256sum -c` checks; does not replace them
+
+**Acceptance Criteria:**
+- `sim_eval verify-evidence-tree` exists and validates extracted bundles
+- CI workflow verifies every evidence pack bundle before upload
+- Verification failures block artifact upload
 
 ---
 
