@@ -140,14 +140,62 @@ EXAMPLES:
   sim_eval run scenarios/v1/synth_jump.yaml --output-dir ./my_runs --verbose
   sim_eval suite scenarios/suites/ci_smoke_v1.yaml
   sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor
-  sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor --ablation disable_toxicity_gate
   sim_eval summarize runs/
   sim_eval summarize runs/ --format md
   sim_eval report --baseline runs/baseline --variant ablation1=runs/ablation1 --out-md report.md --out-json report.json
-  sim_eval report --baseline runs/baseline --variant v1=runs/v1 --variant v2=runs/v2 --out-md report.md --out-json report.json --gate-max-regression-usd 50.0
   sim_eval ablations
-  sim_eval verify-evidence-pack runs/my_suite/
-  sim_eval verify-evidence-tree runs/
+  sim_eval verify-evidence-pack runs/demo_step_7_1
+  sim_eval verify-evidence-tree runs/demo_step_7_1
+"
+}
+
+fn verify_evidence_pack_usage() -> &'static str {
+    "\
+USAGE:
+  sim_eval verify-evidence-pack <OUTPUT_ROOT>
+
+DESCRIPTION:
+  Verify a single evidence pack at <OUTPUT_ROOT>/evidence_pack/.
+  Checks SHA256SUMS integrity and validates all referenced artifacts.
+
+ARGUMENTS:
+  <OUTPUT_ROOT>    Directory containing evidence_pack/ subdirectory
+
+OPTIONS:
+  --help           Show this help
+
+EXIT CODES:
+  0  Verification succeeded
+  2  Usage error (missing or extra arguments)
+  3  Verification failed
+
+EXAMPLE:
+  sim_eval verify-evidence-pack runs/demo_step_7_1
+"
+}
+
+fn verify_evidence_tree_usage() -> &'static str {
+    "\
+USAGE:
+  sim_eval verify-evidence-tree <ROOT>
+
+DESCRIPTION:
+  Recursively find and verify all evidence packs under <ROOT>.
+  Searches for evidence_pack/SHA256SUMS files and verifies each pack.
+
+ARGUMENTS:
+  <ROOT>           Root directory to search for evidence packs
+
+OPTIONS:
+  --help           Show this help
+
+EXIT CODES:
+  0  All packs verified successfully
+  2  Usage error (missing or extra arguments)
+  3  Verification failed (any pack)
+
+EXAMPLE:
+  sim_eval verify-evidence-tree runs/demo_step_7_1
 "
 }
 
@@ -464,15 +512,21 @@ fn parse_args() -> Result<Command, String> {
             for arg in args.by_ref() {
                 match arg.as_str() {
                     "--help" | "-h" => {
-                        println!("{}", usage());
+                        println!("{}", verify_evidence_pack_usage());
                         std::process::exit(0);
                     }
                     _ if arg.starts_with('-') => {
-                        return Err(format!("Unknown option: {}", arg));
+                        eprintln!("Unknown option: {}\n\n{}", arg, verify_evidence_pack_usage());
+                        std::process::exit(2);
                     }
                     _ => {
                         if path_set {
-                            return Err("Multiple output roots provided".to_string());
+                            eprintln!(
+                                "unexpected argument: {}\n\n{}",
+                                arg,
+                                verify_evidence_pack_usage()
+                            );
+                            std::process::exit(2);
                         }
                         verify_args.output_root = PathBuf::from(arg);
                         path_set = true;
@@ -481,7 +535,11 @@ fn parse_args() -> Result<Command, String> {
             }
 
             if !path_set {
-                return Err("Missing required argument: <OUTPUT_ROOT>".to_string());
+                eprintln!(
+                    "Missing required argument: <OUTPUT_ROOT>\n\n{}",
+                    verify_evidence_pack_usage()
+                );
+                std::process::exit(2);
             }
 
             Ok(Command::VerifyEvidencePack(verify_args))
@@ -495,15 +553,21 @@ fn parse_args() -> Result<Command, String> {
             for arg in args.by_ref() {
                 match arg.as_str() {
                     "--help" | "-h" => {
-                        println!("{}", usage());
+                        println!("{}", verify_evidence_tree_usage());
                         std::process::exit(0);
                     }
                     _ if arg.starts_with('-') => {
-                        return Err(format!("Unknown option: {}", arg));
+                        eprintln!("Unknown option: {}\n\n{}", arg, verify_evidence_tree_usage());
+                        std::process::exit(2);
                     }
                     _ => {
                         if path_set {
-                            return Err("Multiple roots provided".to_string());
+                            eprintln!(
+                                "unexpected argument: {}\n\n{}",
+                                arg,
+                                verify_evidence_tree_usage()
+                            );
+                            std::process::exit(2);
                         }
                         verify_args.root = PathBuf::from(arg);
                         path_set = true;
@@ -512,7 +576,11 @@ fn parse_args() -> Result<Command, String> {
             }
 
             if !path_set {
-                return Err("Missing required argument: <ROOT>".to_string());
+                eprintln!(
+                    "Missing required argument: <ROOT>\n\n{}",
+                    verify_evidence_tree_usage()
+                );
+                std::process::exit(2);
             }
 
             Ok(Command::VerifyEvidenceTree(verify_args))
