@@ -14,6 +14,7 @@
 
 pub mod ablation;
 pub mod evidence_pack;
+pub mod evidence_pack_verify;
 pub mod output;
 pub mod report;
 pub mod scenario;
@@ -46,3 +47,8 @@ pub use summarize::{
 
 // Evidence Pack v1 (per docs/EVIDENCE_PACK.md)
 pub use evidence_pack::write_evidence_pack;
+
+// Evidence Pack v1 verification
+pub use evidence_pack_verify::{
+    verify_evidence_pack_dir, verify_evidence_pack_tree, EvidencePackVerificationReport,
+};
