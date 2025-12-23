@@ -8,6 +8,7 @@
 //     MM fills -> recompute -> exits -> recompute -> hedge -> recompute
 // - Adds controlled stochasticity via jittered tick times (so dummy mids differ per seed)
 //   without changing core engine logic.
+// - Generates Evidence Pack v1 for audit/verification (Step 7.1).
 //
 // Run examples:
 //   cargo run --bin monte_carlo -- --runs 50 --ticks 600 --seed 1 --jitter-ms 500 --profile Balanced
@@ -16,14 +17,17 @@
 // Optional CSV export:
 //   cargo run --bin monte_carlo -- --runs 200 --ticks 1200 --seed 7 --jitter-ms 250 --csv runs.csv
 //
+// Default output directory:
+//   cargo run --bin monte_carlo -- --output-dir runs/demo_step_7_1
+//
 // Notes:
 // - This harness applies intents as immediate fills (no gateway), using venue taker fees.
 //   This keeps the harness dependency-free and deterministic.
 
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use paraphina::config::{Config, RiskProfile};
 use paraphina::engine::Engine;
@@ -31,8 +35,10 @@ use paraphina::exit;
 use paraphina::hedge;
 use paraphina::metrics::{DrawdownTracker, OnlineStats};
 use paraphina::mm;
+use paraphina::sim_eval::write_evidence_pack;
 use paraphina::state::{GlobalState, KillReason};
 use paraphina::types::{OrderIntent, TimestampMs};
+use serde::Serialize;
 
 const DEFAULT_RUNS: usize = 50;
 const DEFAULT_TICKS: usize = 600;
@@ -40,6 +46,7 @@ const DEFAULT_SEED: u64 = 1;
 const DEFAULT_TICK_MS: i64 = 1000;
 const DEFAULT_JITTER_MS: i64 = 0;
 const DEFAULT_PRINT_EVERY: usize = 1;
+const DEFAULT_OUTPUT_DIR: &str = "runs/demo_step_7_1";
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -52,6 +59,7 @@ struct Args {
     quiet: bool,
     print_every: usize,
     csv_out: Option<PathBuf>,
+    output_dir: PathBuf,
 }
 
 impl Args {
@@ -75,13 +83,22 @@ FLAGS:
   --tick-ms MS         Base tick duration in ms (default: 1000)
   --jitter-ms MS       Per-tick jitter added to tick-ms in [-MS, +MS] (default: 0)
   --print-every N      Print every N runs (default: 1). Ignored with --quiet.
-  --csv PATH           Write per-run CSV rows to PATH
+  --csv PATH           Write per-run CSV rows to PATH (relative to output-dir)
+  --output-dir DIR     Output directory (default: runs/demo_step_7_1)
   --quiet              Suppress per-run lines; only print final summary
   --help               Show this help
 
+OUTPUT:
+  The harness writes to <output-dir>/:
+    - mc_summary.json     Per-run statistics and aggregate summary
+    - mc_runs.csv         CSV of per-run metrics (if --csv specified)
+    - monte_carlo.yaml    Configuration used for this run
+    - evidence_pack/      Evidence Pack v1 for verification
+
 EXAMPLES:
   cargo run --bin monte_carlo -- --runs 100 --ticks 1200 --seed 7 --jitter-ms 500 --profile Balanced
-  PARAPHINA_RISK_PROFILE=Conservative cargo run --bin monte_carlo -- --runs 200 --ticks 800 --seed 42 --csv out.csv
+  cargo run --bin monte_carlo -- --output-dir runs/my_experiment --runs 50
+  PARAPHINA_RISK_PROFILE=Conservative cargo run --bin monte_carlo -- --runs 200 --ticks 800 --seed 42 --csv mc_runs.csv
 "
     }
 
@@ -106,6 +123,7 @@ EXAMPLES:
             quiet: false,
             print_every: DEFAULT_PRINT_EVERY,
             csv_out: None,
+            output_dir: PathBuf::from(DEFAULT_OUTPUT_DIR),
         };
 
         let mut it = env::args().skip(1);
@@ -197,6 +215,12 @@ EXAMPLES:
                         .ok_or_else(|| "Missing value for --csv".to_string())?;
                     out.csv_out = Some(PathBuf::from(v));
                 }
+                "--output-dir" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "Missing value for --output-dir".to_string())?;
+                    out.output_dir = PathBuf::from(v);
+                }
 
                 // Support --flag=value style for convenience.
                 _ if arg.starts_with("--profile=") => {
@@ -261,6 +285,10 @@ EXAMPLES:
                 _ if arg.starts_with("--csv=") => {
                     let v = &arg["--csv=".len()..];
                     out.csv_out = Some(PathBuf::from(v));
+                }
+                _ if arg.starts_with("--output-dir=") => {
+                    let v = &arg["--output-dir=".len()..];
+                    out.output_dir = PathBuf::from(v);
                 }
 
                 other => return Err(format!("Unknown argument: {other}")),
@@ -368,6 +396,81 @@ fn update_peaks(
 
     let tox = state.venues.iter().fold(0.0_f64, |m, v| m.max(v.toxicity));
     *max_venue_toxicity = max_venue_toxicity.max(tox);
+}
+
+// ============================================================================
+// JSON output structures for Monte Carlo summary
+// ============================================================================
+
+/// Monte Carlo configuration parameters.
+#[derive(Debug, Clone, Serialize)]
+struct McConfig {
+    runs: usize,
+    ticks: usize,
+    seed: u64,
+    tick_ms: i64,
+    jitter_ms: i64,
+    profile: String,
+}
+
+/// Single run record for JSON output.
+#[derive(Debug, Clone, Serialize)]
+struct McRunRecord {
+    run: usize,
+    seed: u64,
+    ticks_executed: usize,
+    kill_tick: Option<usize>,
+    kill_switch: bool,
+    kill_reason: String,
+    final_pnl: f64,
+    max_drawdown: f64,
+    max_abs_delta_usd: f64,
+    max_abs_basis_usd: f64,
+    max_abs_q_tao: f64,
+    max_venue_toxicity: f64,
+}
+
+/// Aggregate statistics for a metric.
+#[derive(Debug, Clone, Serialize)]
+struct AggregateStats {
+    mean: f64,
+    std_pop: f64,
+    min: f64,
+    max: f64,
+    p05: f64,
+    p50: f64,
+    p95: f64,
+}
+
+/// Monte Carlo summary output.
+#[derive(Debug, Clone, Serialize)]
+struct McSummary {
+    paraphina_version: String,
+    config: McConfig,
+    runs: Vec<McRunRecord>,
+    aggregate: McAggregateStats,
+}
+
+/// Aggregate statistics across all runs.
+#[derive(Debug, Clone, Serialize)]
+struct McAggregateStats {
+    kill_rate: f64,
+    kill_count: u64,
+    pnl: AggregateStats,
+    max_drawdown: AggregateStats,
+    max_abs_delta_usd: SimpleStats,
+    max_abs_basis_usd: SimpleStats,
+    max_abs_q_tao: SimpleStats,
+    max_venue_toxicity: SimpleStats,
+}
+
+/// Simple statistics without percentiles.
+#[derive(Debug, Clone, Serialize)]
+struct SimpleStats {
+    mean: f64,
+    std_pop: f64,
+    min: f64,
+    max: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -512,14 +615,54 @@ fn p05_p50_p95(mut xs: Vec<f64>) -> (f64, f64, f64) {
     )
 }
 
+/// Write a file atomically (temp file + rename).
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let temp_name = format!(
+        ".tmp_{}_{}",
+        std::process::id(),
+        path.file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default()
+    );
+    let temp_path = parent.join(&temp_name);
+
+    let mut file = File::create(&temp_path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
 fn main() {
     let args = Args::parse_or_exit();
 
     let (profile, profile_src) = resolve_profile(args.profile);
     let cfg = Config::for_profile(profile);
 
-    let mut csv: Option<File> = match args.csv_out.as_ref() {
+    // Create output directory
+    if let Err(e) = fs::create_dir_all(&args.output_dir) {
+        eprintln!(
+            "Failed to create output directory {:?}: {e}",
+            args.output_dir
+        );
+        std::process::exit(2);
+    }
+
+    // Determine CSV path (in output directory)
+    let csv_path = args.csv_out.as_ref().map(|p| {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            args.output_dir.join(p)
+        }
+    });
+
+    let mut csv: Option<File> = match csv_path.as_ref() {
         Some(path) => {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             let mut f = File::create(path).unwrap_or_else(|e| {
                 eprintln!("Failed to create CSV file {:?}: {e}", path);
                 std::process::exit(2);
@@ -535,7 +678,7 @@ fn main() {
     };
 
     println!(
-        "paraphina-mc v{} | profile={} ({}) runs={} ticks={} seed={} tick_ms={} jitter_ms={} print_every={} csv={}",
+        "paraphina-mc v{} | profile={} ({}) runs={} ticks={} seed={} tick_ms={} jitter_ms={} print_every={} output_dir={} csv={}",
         env!("CARGO_PKG_VERSION"),
         profile_name(profile),
         profile_src,
@@ -545,7 +688,8 @@ fn main() {
         args.tick_ms,
         args.jitter_ms,
         args.print_every,
-        args.csv_out
+        args.output_dir.display(),
+        csv_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "-".to_string())
@@ -563,6 +707,9 @@ fn main() {
 
     let mut kills: u64 = 0;
     let mut kill_tick_stats = OnlineStats::default();
+
+    // Collect run records for JSON output
+    let mut run_records: Vec<McRunRecord> = Vec::with_capacity(args.runs);
 
     for i in 0..args.runs {
         let run_seed = args.seed.wrapping_add(i as u64);
@@ -583,9 +730,26 @@ fn main() {
             kill_tick_stats.add(kt as f64);
         }
 
+        let kill_reason_str = format!("{:?}", r.kill_reason);
+
+        // Store run record
+        run_records.push(McRunRecord {
+            run: i + 1,
+            seed: run_seed,
+            ticks_executed: r.ticks_executed,
+            kill_tick: r.kill_tick,
+            kill_switch: r.kill_switch,
+            kill_reason: kill_reason_str.clone(),
+            final_pnl: r.final_pnl,
+            max_drawdown: r.max_drawdown,
+            max_abs_delta_usd: r.max_abs_delta,
+            max_abs_basis_usd: r.max_abs_basis,
+            max_abs_q_tao: r.max_abs_q,
+            max_venue_toxicity: r.max_venue_toxicity,
+        });
+
         if let Some(f) = csv.as_mut() {
             let kt = r.kill_tick.map(|x| x.to_string()).unwrap_or_default();
-            let kill_reason_str = format!("{:?}", r.kill_reason);
             writeln!(
                 f,
                 "{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
@@ -613,7 +777,7 @@ fn main() {
                 .kill_tick
                 .map(|x| x.to_string())
                 .unwrap_or_else(|| "-".to_string());
-            let kill_reason_str = if r.kill_switch {
+            let kill_reason_display = if r.kill_switch {
                 format!("{:?}", r.kill_reason)
             } else {
                 "-".to_string()
@@ -631,7 +795,7 @@ fn main() {
                 r.max_venue_toxicity,
                 r.kill_switch,
                 kill_tick_str,
-                kill_reason_str,
+                kill_reason_display,
                 r.ticks_executed
             );
         }
@@ -708,4 +872,154 @@ fn main() {
         max_tox_stats.min(),
         max_tox_stats.max()
     );
+
+    // =========================================================================
+    // Write output files
+    // =========================================================================
+
+    // Build summary structure
+    let summary = McSummary {
+        paraphina_version: env!("CARGO_PKG_VERSION").to_string(),
+        config: McConfig {
+            runs: args.runs,
+            ticks: args.ticks,
+            seed: args.seed,
+            tick_ms: args.tick_ms,
+            jitter_ms: args.jitter_ms,
+            profile: profile_name(profile).to_string(),
+        },
+        runs: run_records,
+        aggregate: McAggregateStats {
+            kill_rate,
+            kill_count: kills,
+            pnl: AggregateStats {
+                mean: pnl_stats.mean(),
+                std_pop: pnl_stats.stddev_population(),
+                min: pnl_stats.min(),
+                max: pnl_stats.max(),
+                p05: pnl_p05,
+                p50: pnl_p50,
+                p95: pnl_p95,
+            },
+            max_drawdown: AggregateStats {
+                mean: dd_stats.mean(),
+                std_pop: dd_stats.stddev_population(),
+                min: dd_stats.min(),
+                max: dd_stats.max(),
+                p05: dd_p05,
+                p50: dd_p50,
+                p95: dd_p95,
+            },
+            max_abs_delta_usd: SimpleStats {
+                mean: max_abs_delta_stats.mean(),
+                std_pop: max_abs_delta_stats.stddev_population(),
+                min: max_abs_delta_stats.min(),
+                max: max_abs_delta_stats.max(),
+            },
+            max_abs_basis_usd: SimpleStats {
+                mean: max_abs_basis_stats.mean(),
+                std_pop: max_abs_basis_stats.stddev_population(),
+                min: max_abs_basis_stats.min(),
+                max: max_abs_basis_stats.max(),
+            },
+            max_abs_q_tao: SimpleStats {
+                mean: max_abs_q_stats.mean(),
+                std_pop: max_abs_q_stats.stddev_population(),
+                min: max_abs_q_stats.min(),
+                max: max_abs_q_stats.max(),
+            },
+            max_venue_toxicity: SimpleStats {
+                mean: max_tox_stats.mean(),
+                std_pop: max_tox_stats.stddev_population(),
+                min: max_tox_stats.min(),
+                max: max_tox_stats.max(),
+            },
+        },
+    };
+
+    // Write mc_summary.json
+    let summary_path = args.output_dir.join("mc_summary.json");
+    let summary_json =
+        serde_json::to_string_pretty(&summary).expect("Failed to serialize mc_summary.json");
+    if let Err(e) = atomic_write(&summary_path, summary_json.as_bytes()) {
+        eprintln!("Failed to write mc_summary.json: {e}");
+        std::process::exit(1);
+    }
+    println!();
+    println!("Wrote: {}", summary_path.display());
+
+    // Write monte_carlo.yaml (suite file for evidence pack)
+    // This is a synthetic suite file capturing the Monte Carlo parameters.
+    let suite_yaml = format!(
+        r#"# Monte Carlo run configuration
+# Generated by paraphina monte_carlo harness
+#
+# This file captures the parameters used for this Monte Carlo run.
+# It serves as the "suite" file for the Evidence Pack.
+
+suite_id: monte_carlo
+suite_version: 1
+description: Monte Carlo simulation run
+
+config:
+  runs: {}
+  ticks: {}
+  seed: {}
+  tick_ms: {}
+  jitter_ms: {}
+  profile: {}
+
+paraphina_version: {}
+"#,
+        args.runs,
+        args.ticks,
+        args.seed,
+        args.tick_ms,
+        args.jitter_ms,
+        profile_name(profile),
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let suite_path = args.output_dir.join("monte_carlo.yaml");
+    if let Err(e) = atomic_write(&suite_path, suite_yaml.as_bytes()) {
+        eprintln!("Failed to write monte_carlo.yaml: {e}");
+        std::process::exit(1);
+    }
+    println!("Wrote: {}", suite_path.display());
+
+    // =========================================================================
+    // Generate Evidence Pack v1
+    // =========================================================================
+
+    // Collect artifact paths relative to output_dir
+    let mut artifact_paths: Vec<PathBuf> = Vec::new();
+
+    // Add mc_summary.json
+    artifact_paths.push(PathBuf::from("mc_summary.json"));
+
+    // Add CSV file if it was written to the output directory
+    if let Some(csv_rel_path) = args.csv_out.as_ref() {
+        if !csv_rel_path.is_absolute() {
+            artifact_paths.push(csv_rel_path.clone());
+        }
+    }
+
+    // Write evidence pack
+    println!();
+    println!("Generating Evidence Pack...");
+    match write_evidence_pack(&args.output_dir, &suite_path, &artifact_paths) {
+        Ok(()) => {
+            println!(
+                "✓ Evidence Pack written to: {}/evidence_pack/",
+                args.output_dir.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("✗ EVIDENCE PACK GENERATION FAILED: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    println!();
+    println!("Output written to: {}/", args.output_dir.display());
 }

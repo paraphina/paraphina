@@ -516,7 +516,11 @@ fn parse_args() -> Result<Command, String> {
                         std::process::exit(0);
                     }
                     _ if arg.starts_with('-') => {
-                        eprintln!("Unknown option: {}\n\n{}", arg, verify_evidence_pack_usage());
+                        eprintln!(
+                            "Unknown option: {}\n\n{}",
+                            arg,
+                            verify_evidence_pack_usage()
+                        );
                         std::process::exit(2);
                     }
                     _ => {
@@ -557,7 +561,11 @@ fn parse_args() -> Result<Command, String> {
                         std::process::exit(0);
                     }
                     _ if arg.starts_with('-') => {
-                        eprintln!("Unknown option: {}\n\n{}", arg, verify_evidence_tree_usage());
+                        eprintln!(
+                            "Unknown option: {}\n\n{}",
+                            arg,
+                            verify_evidence_tree_usage()
+                        );
                         std::process::exit(2);
                     }
                     _ => {

@@ -217,4 +217,3 @@ fn verify_pack_accepts_positional_output_root() {
         combined
     );
 }
-
