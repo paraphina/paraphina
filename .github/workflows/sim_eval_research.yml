@@ -538,6 +538,19 @@ jobs:
           fi
           echo "✓ Verified bundle contains all ${expected_count} SHA256SUMS file(s)"
 
+          # ---------------------------------------------------------------
+          # Run strict evidence tree verifier (requires debug build)
+          # ---------------------------------------------------------------
+          echo "=== Building sim_eval (debug) for verification ==="
+          cargo build --locked -p paraphina --bin sim_eval
+          echo "✓ sim_eval (debug) built successfully"
+
+          echo "=== Verifying extracted bundle with evidence tree verifier ==="
+          mkdir -p verify_extract
+          tar -xzf evidence_pack_bundle.tar.gz -C verify_extract
+          ./target/debug/sim_eval verify-evidence-tree verify_extract
+          echo "✓ Evidence tree verifier passed"
+
           # Compute and print sha256 of bundle
           BUNDLE_SHA256=$(sha256sum evidence_pack_bundle.tar.gz | cut -d' ' -f1)
           echo ""
