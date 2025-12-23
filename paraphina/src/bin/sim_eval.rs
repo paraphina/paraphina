@@ -21,10 +21,11 @@ use paraphina::metrics::DrawdownTracker;
 use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
-    create_output_dir, print_ablations, run_report, summarize_with_format, write_build_info,
-    write_config_resolved, write_config_resolved_with_ablations, write_evidence_pack, AblationSet,
-    BuildInfo, Engine, ExpectKillSwitch, KillSwitchInfo, MarketModelType, OutputFormat, ReportArgs,
-    ReportResult, RunSummary, ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
+    create_output_dir, print_ablations, run_report, summarize_with_format,
+    verify_evidence_pack_dir, verify_evidence_pack_tree, write_build_info, write_config_resolved,
+    write_config_resolved_with_ablations, write_evidence_pack, AblationSet, BuildInfo, Engine,
+    ExpectKillSwitch, KillSwitchInfo, MarketModelType, OutputFormat, ReportArgs, ReportResult,
+    RunSummary, ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
 };
 
 // =============================================================================
@@ -38,6 +39,8 @@ enum Command {
     Summarize(SummarizeArgs),
     Report(ReportArgsLocal),
     Ablations,
+    VerifyEvidencePack(VerifyEvidencePackArgs),
+    VerifyEvidenceTree(VerifyEvidenceTreeArgs),
 }
 
 #[derive(Debug)]
@@ -71,6 +74,16 @@ struct SummarizeArgs {
     format: OutputFormat,
 }
 
+#[derive(Debug)]
+struct VerifyEvidencePackArgs {
+    output_root: PathBuf,
+}
+
+#[derive(Debug)]
+struct VerifyEvidenceTreeArgs {
+    root: PathBuf,
+}
+
 fn usage() -> &'static str {
     "\
 sim_eval - Simulation & Evaluation runner (Option B)
@@ -81,13 +94,17 @@ USAGE:
   sim_eval summarize <RUNS_DIR> [OPTIONS]
   sim_eval report --baseline <DIR> --variant <NAME>=<DIR> ... --out-md <PATH> --out-json <PATH> [OPTIONS]
   sim_eval ablations
+  sim_eval verify-evidence-pack <OUTPUT_ROOT>
+  sim_eval verify-evidence-tree <ROOT>
 
 SUBCOMMANDS:
-  run       Run a single scenario
-  suite     Run a CI suite with determinism and invariant gates
-  summarize Discover and summarize run_summary.json files
-  report    Generate baseline-vs-ablations research report in Markdown + JSON
-  ablations List supported ablation IDs and descriptions
+  run                  Run a single scenario
+  suite                Run a CI suite with determinism and invariant gates
+  summarize            Discover and summarize run_summary.json files
+  report               Generate baseline-vs-ablations research report in Markdown + JSON
+  ablations            List supported ablation IDs and descriptions
+  verify-evidence-pack Verify a single evidence pack at <OUTPUT_ROOT>/evidence_pack/
+  verify-evidence-tree Verify all evidence packs under <ROOT>
 
 RUN OPTIONS:
   --output-dir DIR   Output directory (default: runs/)
@@ -112,6 +129,12 @@ REPORT OPTIONS:
 COMMON OPTIONS:
   --help             Show this help
 
+EXIT CODES:
+  0  Success
+  1  Runtime error
+  2  Invalid arguments / usage
+  3  Verification failure (verify-evidence-pack, verify-evidence-tree)
+
 EXAMPLES:
   sim_eval run scenarios/v1/synth_baseline.yaml
   sim_eval run scenarios/v1/synth_jump.yaml --output-dir ./my_runs --verbose
@@ -123,6 +146,8 @@ EXAMPLES:
   sim_eval report --baseline runs/baseline --variant ablation1=runs/ablation1 --out-md report.md --out-json report.json
   sim_eval report --baseline runs/baseline --variant v1=runs/v1 --variant v2=runs/v2 --out-md report.md --out-json report.json --gate-max-regression-usd 50.0
   sim_eval ablations
+  sim_eval verify-evidence-pack runs/my_suite/
+  sim_eval verify-evidence-tree runs/
 "
 }
 
@@ -429,6 +454,68 @@ fn parse_args() -> Result<Command, String> {
             }
 
             Ok(Command::Summarize(summarize_args))
+        }
+        "verify-evidence-pack" => {
+            let mut verify_args = VerifyEvidencePackArgs {
+                output_root: PathBuf::new(),
+            };
+            let mut path_set = false;
+
+            for arg in args.by_ref() {
+                match arg.as_str() {
+                    "--help" | "-h" => {
+                        println!("{}", usage());
+                        std::process::exit(0);
+                    }
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("Unknown option: {}", arg));
+                    }
+                    _ => {
+                        if path_set {
+                            return Err("Multiple output roots provided".to_string());
+                        }
+                        verify_args.output_root = PathBuf::from(arg);
+                        path_set = true;
+                    }
+                }
+            }
+
+            if !path_set {
+                return Err("Missing required argument: <OUTPUT_ROOT>".to_string());
+            }
+
+            Ok(Command::VerifyEvidencePack(verify_args))
+        }
+        "verify-evidence-tree" => {
+            let mut verify_args = VerifyEvidenceTreeArgs {
+                root: PathBuf::new(),
+            };
+            let mut path_set = false;
+
+            for arg in args.by_ref() {
+                match arg.as_str() {
+                    "--help" | "-h" => {
+                        println!("{}", usage());
+                        std::process::exit(0);
+                    }
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("Unknown option: {}", arg));
+                    }
+                    _ => {
+                        if path_set {
+                            return Err("Multiple roots provided".to_string());
+                        }
+                        verify_args.root = PathBuf::from(arg);
+                        path_set = true;
+                    }
+                }
+            }
+
+            if !path_set {
+                return Err("Missing required argument: <ROOT>".to_string());
+            }
+
+            Ok(Command::VerifyEvidenceTree(verify_args))
         }
         // Legacy support: if first arg looks like a path, treat as `run`
         other if !other.starts_with('-') => {
@@ -1319,6 +1406,46 @@ fn cmd_report(args: ReportArgsLocal) -> i32 {
 }
 
 // =============================================================================
+// Verify subcommands
+// =============================================================================
+
+fn cmd_verify_evidence_pack(args: VerifyEvidencePackArgs) -> i32 {
+    match verify_evidence_pack_dir(&args.output_root) {
+        Ok(report) => {
+            println!(
+                "OK: verified {} file(s) in 1 evidence pack",
+                report.files_verified
+            );
+            0
+        }
+        Err(e) => {
+            // Get the root cause for concise error message
+            let root_cause = e.root_cause();
+            eprintln!("ERROR: verification failed: {}", root_cause);
+            3
+        }
+    }
+}
+
+fn cmd_verify_evidence_tree(args: VerifyEvidenceTreeArgs) -> i32 {
+    match verify_evidence_pack_tree(&args.root) {
+        Ok(report) => {
+            println!(
+                "OK: verified {} file(s) in {} evidence pack(s)",
+                report.files_verified, report.packs_verified
+            );
+            0
+        }
+        Err(e) => {
+            // Get the root cause for concise error message
+            let root_cause = e.root_cause();
+            eprintln!("ERROR: verification failed: {}", root_cause);
+            3
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -1342,6 +1469,8 @@ fn main() {
         Command::Summarize(args) => cmd_summarize(args),
         Command::Report(args) => cmd_report(args),
         Command::Ablations => cmd_ablations(),
+        Command::VerifyEvidencePack(args) => cmd_verify_evidence_pack(args),
+        Command::VerifyEvidenceTree(args) => cmd_verify_evidence_tree(args),
     };
 
     std::process::exit(exit_code);
