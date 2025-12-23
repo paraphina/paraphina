@@ -587,13 +587,35 @@ Step 7 adds a strict offline verifier for evidence packs and integrates verifica
 3. **CI gate**: Workflow extracts bundled evidence pack and runs verifier before artifact upload
 4. **Additive verification**: Complements existing `sha256sum -c` checks; does not replace them
 
-**Step 7.1: Operator CLI (verify-evidence-pack / verify-evidence-tree)**
+**Step 7.1: Operator CLI + Monte Carlo Evidence Pack**
+
+*Verifier CLI:*
 - Provides `verify-evidence-pack` and `verify-evidence-tree` subcommands for operators to verify bundles offline
-- Exit codes: `0` (pass), `2` (verification failure), `3` (I/O/usage error)
+- Exit codes: `0` (pass), `3` (verification failure), `2` (I/O/usage error)
 - See `docs/EVIDENCE_PACK.md` § Offline Verification (CLI) for usage examples
+
+*Monte Carlo Evidence Pack:*
+- The `monte_carlo` binary now generates Evidence Pack v1 artifacts
+- Default output directory: `runs/demo_step_7_1/`
+- Outputs: `mc_summary.json`, `monte_carlo.yaml`, and `evidence_pack/` with manifest, suite.yaml, SHA256SUMS
+- Verification: `sim_eval verify-evidence-pack runs/demo_step_7_1` or `sim_eval verify-evidence-tree runs`
+
+**Usage:**
+```bash
+# Run Monte Carlo (generates evidence pack)
+cargo run -p paraphina --bin monte_carlo
+
+# Verify single evidence pack
+cargo run -p paraphina --bin sim_eval -- verify-evidence-pack runs/demo_step_7_1
+
+# Verify all evidence packs under runs/
+cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs
+```
 
 **Acceptance Criteria:**
 - `sim_eval verify-evidence-tree` exists and validates extracted bundles
+- `monte_carlo` generates valid Evidence Pack v1 at `runs/demo_step_7_1/`
+- `verify-evidence-pack` and `verify-evidence-tree` succeed on monte_carlo output
 - CI workflow verifies every evidence pack bundle before upload
 - Verification failures block artifact upload
 
