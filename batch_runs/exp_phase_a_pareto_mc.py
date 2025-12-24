@@ -21,10 +21,11 @@ Risk tier budgets:
 - mean_pnl >= budget
 
 Usage:
-    python batch_runs/exp_phase_a_pareto_mc.py [--smoke] [--full] [--help]
+    python3 batch_runs/exp_phase_a_pareto_mc.py [--smoke] [--full] [--out DIR] [--help]
 
     --smoke   Quick test mode (fewer candidates, fewer MC runs)
     --full    Full sweep mode (more candidates, more MC runs)
+    --out     Output directory (default: runs/exp_phase_a_pareto_mc)
     --help    Show this help
 
 Follows AI_PLAYBOOK exp03 template pattern.
@@ -33,19 +34,17 @@ Follows AI_PLAYBOOK exp03 template pattern.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
+import math
 import os
-import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-# pandas is the only heavy dep - already used in other exp scripts
-import pandas as pd
 
 
 # ===========================================================================
@@ -400,7 +399,6 @@ def compute_pareto_frontier(results: List[CandidateResult]) -> List[CandidateRes
 
 def is_nan(x: float) -> bool:
     """Check if value is NaN."""
-    import math
     return math.isnan(x) if isinstance(x, float) else False
 
 
@@ -434,7 +432,7 @@ def select_best_under_budget(
 
 
 # ===========================================================================
-# Output writing
+# Output writing (stdlib csv, no pandas)
 # ===========================================================================
 
 def result_to_row(result: CandidateResult) -> Dict[str, Any]:
@@ -462,13 +460,23 @@ def result_to_row(result: CandidateResult) -> Dict[str, Any]:
 
 
 def write_runs_csv(results: List[CandidateResult], path: Path) -> None:
-    """Write per-candidate results to CSV."""
+    """Write per-candidate results to CSV using stdlib csv module."""
+    if not results:
+        # Write empty CSV with header
+        path.write_text("")
+        return
+
     rows = [result_to_row(r) for r in results]
-    df = pd.DataFrame(rows)
-    # Sort columns for determinism
-    cols = sorted(df.columns)
-    df = df[cols]
-    df.to_csv(path, index=False)
+    # Get all unique keys across all rows, sorted for determinism
+    all_keys = set()
+    for row in rows:
+        all_keys.update(row.keys())
+    fieldnames = sorted(all_keys)
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def write_summary_csv(
@@ -477,7 +485,7 @@ def write_summary_csv(
     best_by_tier: Dict[str, Optional[CandidateResult]],
     path: Path,
 ) -> None:
-    """Write summary CSV with Pareto frontier and best-per-tier."""
+    """Write summary CSV with Pareto frontier and best-per-tier using stdlib csv."""
     rows = []
 
     # Add Pareto frontier members
@@ -495,11 +503,23 @@ def write_summary_csv(
             row["tier"] = tier
             rows.append(row)
 
-    df = pd.DataFrame(rows)
-    if len(df) > 0:
-        cols = ["category", "tier"] + sorted([c for c in df.columns if c not in ["category", "tier"]])
-        df = df[cols]
-    df.to_csv(path, index=False)
+    if not rows:
+        # Write empty CSV
+        path.write_text("")
+        return
+
+    # Get all unique keys, with category and tier first
+    all_keys = set()
+    for row in rows:
+        all_keys.update(row.keys())
+    # Ensure category and tier are first
+    other_keys = sorted(k for k in all_keys if k not in ["category", "tier"])
+    fieldnames = ["category", "tier"] + other_keys
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def write_promoted_config(
@@ -579,6 +599,12 @@ def main() -> None:
         action="store_true",
         help="Full sweep mode (more candidates, more MC runs)",
     )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Output directory (default: runs/exp_phase_a_pareto_mc)",
+    )
 
     args = parser.parse_args()
 
@@ -616,8 +642,11 @@ def main() -> None:
         print("Run: cargo build --release -p paraphina --bin sim_eval")
         sys.exit(1)
 
+    # Use --out if provided, otherwise default EXP_DIR
+    base_dir = args.out if args.out else EXP_DIR
+
     # Create experiment directory
-    exp_dir = EXP_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{mode}"
+    exp_dir = base_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{mode}"
     exp_dir.mkdir(parents=True, exist_ok=True)
     print(f"[phase_a] Output directory: {exp_dir}")
 
@@ -682,12 +711,13 @@ def main() -> None:
             env_path, record_path = write_promoted_config(result, tier, exp_dir)
             print(f"  Wrote: {env_path.name}, {record_path.name}")
 
-    # Also create a symlink for easy access
-    latest_link = EXP_DIR / "latest"
-    if latest_link.exists() or latest_link.is_symlink():
-        latest_link.unlink()
-    latest_link.symlink_to(exp_dir.name)
-    print(f"  Symlink: {latest_link} -> {exp_dir.name}")
+    # Also create a symlink for easy access (only if using default EXP_DIR)
+    if args.out is None:
+        latest_link = EXP_DIR / "latest"
+        if latest_link.exists() or latest_link.is_symlink():
+            latest_link.unlink()
+        latest_link.symlink_to(exp_dir.name)
+        print(f"  Symlink: {latest_link} -> {exp_dir.name}")
 
     print("\n[phase_a] Done!")
     print(f"\nResults in: {exp_dir}")
@@ -701,4 +731,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
