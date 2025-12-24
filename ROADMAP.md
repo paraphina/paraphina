@@ -584,15 +584,32 @@ This repo evolves in three layers:
 ### Phase A — Quant Optimisation Foundation (pre-RL, highest ROI)
 **Goal:** improve robustness and performance without introducing ML risk.
 
+**Status: PARTIAL (A1 vertical slice implemented)**
+
 - [ ] Scenario library (seeded, reproducible)
   - volatility regimes, spread/depth shocks, venue outages, funding inversions, basis spikes
   - latency / partial fill / cancel storm modelling
+- [x] **Tail risk metrics emitted** (A1)
+  - `mc_summary.json` schema_version=2 includes `tail_risk` section
+  - PnL quantiles (p01, p05, p50, p95, p99)
+  - PnL VaR/CVaR at alpha=0.95
+  - Max drawdown quantiles and VaR/CVaR
+  - Kill probability with Wilson 95% CI (point estimate, lower, upper)
+  - **Implemented:** `paraphina/src/tail_risk.rs`, `paraphina/src/bin/monte_carlo.rs`
+- [x] **Pareto harness scaffold** (A1)
+  - `batch_runs/exp_phase_a_pareto_mc.py` provides:
+    - Deterministic knob sweeps (grid or seeded random)
+    - Isolated candidate runs with evidence pack verification
+    - Pareto frontier computation (multi-objective)
+    - Risk-tier budget selection (kill_prob_ci_upper, drawdown_cvar, min_mean_pnl)
+    - Promoted config output (env file + promotion record JSON)
+  - Usage: `python3 batch_runs/exp_phase_a_pareto_mc.py --smoke`
 - [ ] Monte Carlo runner at scale
   - generate thousands–millions of scenarios
-  - report tail risk metrics: VaR/CVaR, worst-quantile drawdown, kill probability confidence intervals
+  - (foundation exists via monte_carlo binary; need advanced scenario generation)
 - [ ] Adversarial / worst-case search
   - CEM / evolutionary search over scenario parameters to find failures quickly
-  - promote “failure seeds” to a permanent regression suite
+  - promote "failure seeds" to a permanent regression suite
 - [ ] Multi-objective tuning of strategy knobs
   - Bayesian optimisation / CMA-ES / evolutionary search
   - constraints enforced by risk-tier budgets (kill_prob, drawdown, min pnl)

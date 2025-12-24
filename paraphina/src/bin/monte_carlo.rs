@@ -37,6 +37,7 @@ use paraphina::metrics::{DrawdownTracker, OnlineStats};
 use paraphina::mm;
 use paraphina::sim_eval::write_evidence_pack;
 use paraphina::state::{GlobalState, KillReason};
+use paraphina::tail_risk::{TailRiskMetrics, DEFAULT_VAR_ALPHA};
 use paraphina::types::{OrderIntent, TimestampMs};
 use serde::Serialize;
 
@@ -420,13 +421,17 @@ struct AggregateStats {
     p95: f64,
 }
 
-/// Monte Carlo summary output.
+/// Monte Carlo summary output (versioned schema).
 #[derive(Debug, Clone, Serialize)]
 struct McSummary {
+    /// Schema version for mc_summary.json. Increment on breaking changes.
+    schema_version: u32,
     paraphina_version: String,
     config: McConfig,
     runs: Vec<McRunRecord>,
     aggregate: McAggregateStats,
+    /// Tail risk metrics for Appendix B compliance (Phase A).
+    tail_risk: TailRiskMetrics,
 }
 
 /// Aggregate statistics across all runs.
@@ -786,8 +791,10 @@ fn main() {
     }
 
     let kill_rate = (kills as f64) / (args.runs as f64);
-    let (pnl_p05, pnl_p50, pnl_p95) = p05_p50_p95(pnl_samples);
-    let (dd_p05, dd_p50, dd_p95) = p05_p50_p95(dd_samples);
+    // Clone samples before passing to p05_p50_p95 (which takes ownership)
+    // so we can reuse them for tail_risk computation later
+    let (pnl_p05, pnl_p50, pnl_p95) = p05_p50_p95(pnl_samples.clone());
+    let (dd_p05, dd_p50, dd_p95) = p05_p50_p95(dd_samples.clone());
 
     println!();
     println!("SUMMARY");
@@ -861,8 +868,18 @@ fn main() {
     // Write output files
     // =========================================================================
 
+    // Compute tail risk metrics (Phase A)
+    let tail_risk = TailRiskMetrics::compute(
+        &pnl_samples,
+        &dd_samples,
+        kills,
+        DEFAULT_VAR_ALPHA,
+        0.95, // 95% Wilson CI
+    );
+
     // Build summary structure
     let summary = McSummary {
+        schema_version: 2, // Version 2: adds tail_risk field
         paraphina_version: env!("CARGO_PKG_VERSION").to_string(),
         config: McConfig {
             runs: args.runs,
@@ -919,6 +936,7 @@ fn main() {
                 max: max_tox_stats.max(),
             },
         },
+        tail_risk,
     };
 
     // Write mc_summary.json
