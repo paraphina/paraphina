@@ -16,7 +16,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use paraphina::config::{Config, RiskProfile};
+use paraphina::config::{resolve_effective_profile, Config, RiskProfile};
 use paraphina::metrics::DrawdownTracker;
 use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
@@ -59,6 +59,8 @@ struct RunArgs {
     output_dir: PathBuf,
     write_metrics: bool,
     verbose: bool,
+    /// CLI-provided profile override (highest precedence).
+    profile: Option<RiskProfile>,
 }
 
 #[derive(Debug)]
@@ -66,6 +68,8 @@ struct SuiteArgs {
     suite_path: PathBuf,
     verbose: bool,
     ablations: Vec<String>,
+    /// CLI-provided profile override (highest precedence).
+    profile: Option<RiskProfile>,
 }
 
 #[derive(Debug)]
@@ -110,10 +114,18 @@ RUN OPTIONS:
   --output-dir DIR   Output directory (default: runs/)
   --metrics          Write metrics.jsonl for each run
   --verbose          Print verbose output
+  --profile NAME     Override risk profile (balanced|conservative|aggressive)
 
 SUITE OPTIONS:
   --verbose              Print verbose output
   --ablation <ID>        Enable an ablation (can be specified multiple times)
+  --profile NAME         Override risk profile (balanced|conservative|aggressive)
+
+PROFILE PRECEDENCE:
+  1) --profile CLI argument (highest)
+  2) PARAPHINA_RISK_PROFILE env var
+  3) scenario file risk_profile field
+  4) default (Balanced)
 
 SUMMARIZE OPTIONS:
   --format <FORMAT>      Output format: text (default) or md (Markdown)
@@ -217,6 +229,7 @@ fn parse_args() -> Result<Command, String> {
                 output_dir: PathBuf::from("runs"),
                 write_metrics: false,
                 verbose: false,
+                profile: None,
             };
             let mut scenario_set = false;
 
@@ -238,8 +251,26 @@ fn parse_args() -> Result<Command, String> {
                     "--verbose" | "-v" => {
                         run_args.verbose = true;
                     }
+                    "--profile" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --profile".to_string())?;
+                        run_args.profile = Some(
+                            RiskProfile::parse(&val).ok_or_else(|| {
+                                format!("Invalid --profile '{}'. Expected: balanced|conservative|aggressive", val)
+                            })?,
+                        );
+                    }
                     _ if arg.starts_with("--output-dir=") => {
                         run_args.output_dir = PathBuf::from(&arg["--output-dir=".len()..]);
+                    }
+                    _ if arg.starts_with("--profile=") => {
+                        let val = &arg["--profile=".len()..];
+                        run_args.profile = Some(
+                            RiskProfile::parse(val).ok_or_else(|| {
+                                format!("Invalid --profile '{}'. Expected: balanced|conservative|aggressive", val)
+                            })?,
+                        );
                     }
                     _ if arg.starts_with('-') => {
                         return Err(format!("Unknown option: {}", arg));
@@ -265,6 +296,7 @@ fn parse_args() -> Result<Command, String> {
                 suite_path: PathBuf::new(),
                 verbose: false,
                 ablations: Vec::new(),
+                profile: None,
             };
             let mut suite_set = false;
 
@@ -283,9 +315,27 @@ fn parse_args() -> Result<Command, String> {
                             .ok_or_else(|| "Missing value for --ablation".to_string())?;
                         suite_args.ablations.push(val);
                     }
+                    "--profile" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --profile".to_string())?;
+                        suite_args.profile = Some(
+                            RiskProfile::parse(&val).ok_or_else(|| {
+                                format!("Invalid --profile '{}'. Expected: balanced|conservative|aggressive", val)
+                            })?,
+                        );
+                    }
                     _ if arg.starts_with("--ablation=") => {
                         let val = arg["--ablation=".len()..].to_string();
                         suite_args.ablations.push(val);
+                    }
+                    _ if arg.starts_with("--profile=") => {
+                        let val = &arg["--profile=".len()..];
+                        suite_args.profile = Some(
+                            RiskProfile::parse(val).ok_or_else(|| {
+                                format!("Invalid --profile '{}'. Expected: balanced|conservative|aggressive", val)
+                            })?,
+                        );
                     }
                     _ if arg.starts_with('-') => {
                         return Err(format!("Unknown option: {}", arg));
@@ -600,6 +650,7 @@ fn parse_args() -> Result<Command, String> {
                 output_dir: PathBuf::from("runs"),
                 write_metrics: false,
                 verbose: false,
+                profile: None,
             };
 
             while let Some(arg) = args.next() {
@@ -616,8 +667,26 @@ fn parse_args() -> Result<Command, String> {
                     "--verbose" | "-v" => {
                         run_args.verbose = true;
                     }
+                    "--profile" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --profile".to_string())?;
+                        run_args.profile = Some(
+                            RiskProfile::parse(&val).ok_or_else(|| {
+                                format!("Invalid --profile '{}'. Expected: balanced|conservative|aggressive", val)
+                            })?,
+                        );
+                    }
                     _ if arg.starts_with("--output-dir=") => {
                         run_args.output_dir = PathBuf::from(&arg["--output-dir=".len()..]);
+                    }
+                    _ if arg.starts_with("--profile=") => {
+                        let val = &arg["--profile=".len()..];
+                        run_args.profile = Some(
+                            RiskProfile::parse(val).ok_or_else(|| {
+                                format!("Invalid --profile '{}'. Expected: balanced|conservative|aggressive", val)
+                            })?,
+                        );
                     }
                     _ if arg.starts_with('-') => {
                         return Err(format!("Unknown option: {}", arg));
@@ -638,15 +707,6 @@ fn parse_args() -> Result<Command, String> {
 // Simulation logic
 // =============================================================================
 
-/// Map risk profile string to RiskProfile enum.
-fn parse_risk_profile(s: &str) -> RiskProfile {
-    match s.to_lowercase().as_str() {
-        "conservative" | "cons" | "c" => RiskProfile::Conservative,
-        "aggressive" | "agg" | "a" => RiskProfile::Aggressive,
-        _ => RiskProfile::Balanced,
-    }
-}
-
 /// Run result for a single seed.
 #[derive(Debug, Clone)]
 pub struct RunResult {
@@ -661,7 +721,7 @@ pub struct RunResult {
 
 /// Run simulation for a single seed using SimEnv.
 pub fn run_single_seed(spec: &ScenarioSpec, seed: u64, verbose: bool) -> (RunResult, RunSummary) {
-    run_single_seed_with_ablations(spec, seed, verbose, &AblationSet::new())
+    run_single_seed_with_profile(spec, seed, verbose, &AblationSet::new(), None)
 }
 
 /// Run simulation for a single seed using SimEnv with ablations.
@@ -671,11 +731,24 @@ pub fn run_single_seed_with_ablations(
     verbose: bool,
     ablations: &AblationSet,
 ) -> (RunResult, RunSummary) {
+    run_single_seed_with_profile(spec, seed, verbose, ablations, None)
+}
+
+/// Run simulation for a single seed using SimEnv with ablations and optional profile override.
+///
+/// Profile precedence: cli_profile > env var > scenario > default
+pub fn run_single_seed_with_profile(
+    spec: &ScenarioSpec,
+    seed: u64,
+    verbose: bool,
+    ablations: &AblationSet,
+    cli_profile: Option<RiskProfile>,
+) -> (RunResult, RunSummary) {
     let start = Instant::now();
 
-    // Create config from risk profile
-    let risk_profile = parse_risk_profile(&spec.initial_state.risk_profile);
-    let mut config = Config::for_profile(risk_profile);
+    // Resolve profile with proper precedence: CLI > env > scenario > default
+    let effective = resolve_effective_profile(cli_profile, Some(&spec.initial_state.risk_profile));
+    let mut config = Config::for_profile(effective.profile);
     config.initial_q_tao = spec.initial_state.init_q_tao;
 
     // Apply market model parameters
@@ -857,6 +930,12 @@ fn cmd_run(args: RunArgs) -> i32 {
         }
     };
 
+    // Resolve profile with proper precedence: CLI > env > scenario > default
+    let effective = resolve_effective_profile(args.profile, Some(&spec.initial_state.risk_profile));
+
+    // Explicit startup log line (required by spec)
+    effective.log_startup();
+
     let build_info = BuildInfo::capture();
 
     println!(
@@ -868,8 +947,11 @@ fn cmd_run(args: RunArgs) -> i32 {
         spec.rng.num_seeds
     );
     println!(
-        "         | risk_profile={} init_q_tao={:.2} dt_seconds={:.3}",
-        spec.initial_state.risk_profile, spec.initial_state.init_q_tao, spec.horizon.dt_seconds
+        "         | risk_profile={} (source={}) init_q_tao={:.2} dt_seconds={:.3}",
+        effective.profile.as_str(),
+        effective.source.as_str(),
+        spec.initial_state.init_q_tao,
+        spec.horizon.dt_seconds
     );
     println!(
         "         | git_sha={} dirty={}",
@@ -900,7 +982,13 @@ fn cmd_run(args: RunArgs) -> i32 {
             eprintln!("Running seed {} ({}/{})", seed, k + 1, spec.rng.num_seeds);
         }
 
-        let (result, summary) = run_single_seed(&spec, *seed, args.verbose);
+        let (result, summary) = run_single_seed_with_profile(
+            &spec,
+            *seed,
+            args.verbose,
+            &AblationSet::new(),
+            args.profile,
+        );
 
         if let Err(e) = check_invariants(&spec, &result) {
             invariant_failures.push(e.clone());
@@ -1103,6 +1191,20 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
         }
     };
 
+    // Log the CLI/env profile override if present (suite runs multiple scenarios,
+    // so we log once at the start if a global override is in effect)
+    if args.profile.is_some() {
+        let effective = resolve_effective_profile(args.profile, None);
+        effective.log_startup();
+    } else if let Ok(env_val) = std::env::var("PARAPHINA_RISK_PROFILE") {
+        if !env_val.is_empty() {
+            eprintln!(
+                "effective_risk_profile={} source=env (will override scenario defaults)",
+                env_val.to_lowercase()
+            );
+        }
+    }
+
     let build_info = BuildInfo::capture();
 
     // Compute effective output directory with ablation suffix
@@ -1123,6 +1225,12 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
     println!("               | output_dir={}", effective_out_dir);
     if !ablations.is_empty() {
         println!("               | ablations={}", ablations);
+    }
+    if let Some(profile) = args.profile {
+        println!(
+            "               | profile_override={} (source=cli)",
+            profile.as_str()
+        );
     }
     println!();
 
@@ -1187,7 +1295,7 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
                 }
 
                 let (result, summary) =
-                    run_single_seed_with_ablations(&spec, *seed, false, &ablations);
+                    run_single_seed_with_profile(&spec, *seed, false, &ablations, args.profile);
                 checksums.push(result.checksum.clone());
 
                 stats.runs_total += 1;

@@ -29,7 +29,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use paraphina::config::{Config, RiskProfile};
+use paraphina::config::{resolve_effective_profile, Config, RiskProfile};
 use paraphina::engine::Engine;
 use paraphina::exit;
 use paraphina::hedge;
@@ -141,7 +141,7 @@ EXAMPLES:
                         .next()
                         .ok_or_else(|| "Missing value for --profile".to_string())?;
                     out.profile = Some(
-                        parse_profile(&v).ok_or_else(|| {
+                        RiskProfile::parse(&v).ok_or_else(|| {
                             "Invalid --profile. Expected: Balanced | Conservative | Aggressive (or Loose)".to_string()
                         })?,
                     );
@@ -226,7 +226,7 @@ EXAMPLES:
                 _ if arg.starts_with("--profile=") => {
                     let v = arg["--profile=".len()..].to_string();
                     out.profile = Some(
-                        parse_profile(&v).ok_or_else(|| {
+                        RiskProfile::parse(&v).ok_or_else(|| {
                             "Invalid --profile. Expected: Balanced | Conservative | Aggressive (or Loose)".to_string()
                         })?,
                     );
@@ -332,34 +332,12 @@ impl XorShift64Star {
     }
 }
 
-fn parse_profile(s: &str) -> Option<RiskProfile> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "balanced" | "b" => Some(RiskProfile::Balanced),
-        "conservative" | "c" => Some(RiskProfile::Conservative),
-        // Accept both names for the same enum variant to reduce CLI friction.
-        "aggressive" | "a" | "loose" | "l" => Some(RiskProfile::Aggressive),
-        _ => None,
-    }
-}
-
 fn profile_name(p: RiskProfile) -> &'static str {
     match p {
         RiskProfile::Balanced => "Balanced",
         RiskProfile::Conservative => "Conservative",
         RiskProfile::Aggressive => "Aggressive",
     }
-}
-
-fn resolve_profile(cli: Option<RiskProfile>) -> (RiskProfile, &'static str) {
-    if let Some(p) = cli {
-        return (p, "cli");
-    }
-    if let Ok(envp) = env::var("PARAPHINA_RISK_PROFILE") {
-        if let Some(p) = parse_profile(&envp) {
-            return (p, "env");
-        }
-    }
-    (RiskProfile::Balanced, "default")
 }
 
 /// Apply intents as immediate fills using taker fees.
@@ -637,8 +615,14 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 fn main() {
     let args = Args::parse_or_exit();
 
-    let (profile, profile_src) = resolve_profile(args.profile);
+    // Resolve profile with proper precedence: CLI > env > default
+    // (No scenario profile for monte_carlo, so pass None)
+    let effective = resolve_effective_profile(args.profile, None);
+    let profile = effective.profile;
     let cfg = Config::for_profile(profile);
+
+    // Explicit startup log line (required by spec)
+    effective.log_startup();
 
     // Create output directory
     if let Err(e) = fs::create_dir_all(&args.output_dir) {
@@ -681,7 +665,7 @@ fn main() {
         "paraphina-mc v{} | profile={} ({}) runs={} ticks={} seed={} tick_ms={} jitter_ms={} print_every={} output_dir={} csv={}",
         env!("CARGO_PKG_VERSION"),
         profile_name(profile),
-        profile_src,
+        effective.source.as_str(),
         args.runs,
         args.ticks,
         args.seed,
