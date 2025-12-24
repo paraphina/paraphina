@@ -504,15 +504,15 @@ mod tests {
         let qs = QuantileSet::from_data(&mut data);
 
         // p01 ≈ 1.99, p05 ≈ 5.95, p50 = 50.5, p95 ≈ 95.05, p99 ≈ 99.01
-        assert!(qs.p01 >= 1.0 && qs.p01 <= 2.0, "p01 should be ~1-2");
-        assert!(qs.p05 >= 5.0 && qs.p05 <= 6.0, "p05 should be ~5-6");
+        assert!((1.0..=2.0).contains(&qs.p01), "p01 should be ~1-2");
+        assert!((5.0..=6.0).contains(&qs.p05), "p05 should be ~5-6");
         assert!(
             approx_eq(qs.p50, 50.5, 0.1),
             "p50 should be 50.5, got {}",
             qs.p50
         );
-        assert!(qs.p95 >= 95.0 && qs.p95 <= 96.0, "p95 should be ~95-96");
-        assert!(qs.p99 >= 99.0 && qs.p99 <= 100.0, "p99 should be ~99-100");
+        assert!((95.0..=96.0).contains(&qs.p95), "p95 should be ~95-96");
+        assert!((99.0..=100.0).contains(&qs.p99), "p99 should be ~99-100");
     }
 
     // ------------------------------------------------------------------------

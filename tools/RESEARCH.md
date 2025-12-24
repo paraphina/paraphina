@@ -42,7 +42,7 @@ JSONL dataset.
 
 Typical usage:
 
-    python tools/research_ticks.py \
+    python3 tools/research_ticks.py \
       --telemetry runs/manual_telemetry/test_run.jsonl \
       --profile balanced \
       --label manual_balanced_001 \
@@ -61,7 +61,7 @@ Summarise a research JSONL dataset produced by `research_ticks.py`.
 
 Example:
 
-    python tools/research_summary.py \
+    python3 tools/research_summary.py \
       --input research_dataset_v001.jsonl
 
 Outputs:
@@ -123,7 +123,7 @@ Very high-level overview:
 
 Most of these scripts can be run simply as:
 
-    python tools/exp0X_*.py
+    python3 tools/exp0X_*.py
 
 They all write their outputs under `runs/` with an `exp0X_` prefix. See the
 docstring in each script for detailed options.
@@ -187,7 +187,7 @@ What it does:
 How to run:
 
     cd ~/code/paraphina
-    python tools/exp10_world_model_alignment.py
+    python3 tools/exp10_world_model_alignment.py
 
 ---
 
@@ -218,7 +218,7 @@ What it does:
 
 Simple run over the whole dataset:
 
-    python tools/exp11_research_alignment.py \
+    python3 tools/exp11_research_alignment.py \
       --dataset research_dataset_v004.jsonl
 
 You can also restrict to a subset of runs with:
@@ -258,7 +258,7 @@ What it does:
 
 How to run:
 
-    python tools/exp12_profile_saftey_tuner.py
+    python3 tools/exp12_profile_saftey_tuner.py
 
 The resulting `exp12_tuned_presets.csv` is a reference when updating
 `Config::for_profile` in `src/config.rs`.
@@ -291,7 +291,7 @@ For each risk profile `p` in `{conservative, balanced, aggressive}`:
 
    For each telemetry file, the script calls:
 
-       python tools/research_ticks.py \
+       python3 tools/research_ticks.py \
          --telemetry runs/exp13_auto/<profile>_r<idx>.jsonl \
          --profile <profile> \
          --label <label_prefix>_<profile>_rXXX \
@@ -304,7 +304,7 @@ After all runs finish:
 
 3. **Summarise the research dataset**
 
-       python tools/research_summary.py \
+       python3 tools/research_summary.py \
          --input <dataset>
 
    This prints the global and per-profile summaries and ranks the top runs by
@@ -312,7 +312,7 @@ After all runs finish:
 
 4. **Run world-model alignment on the dataset**
 
-       python tools/exp11_research_alignment.py \
+       python3 tools/exp11_research_alignment.py \
          --dataset <dataset>
 
    This checks whether the empirical behaviour in the dataset is consistent
@@ -325,14 +325,14 @@ end-to-end report.
 
 Minimal example (1 run per profile, 1000 ticks):
 
-    python tools/exp13_auto_research_harness.py \
+    python3 tools/exp13_auto_research_harness.py \
       --ticks 1000 \
       --runs-per-profile 1 \
       --dataset research_dataset_v004.jsonl
 
 Heavier example (3 runs per profile, 2000 ticks):
 
-    python tools/exp13_auto_research_harness.py \
+    python3 tools/exp13_auto_research_harness.py \
       --ticks 2000 \
       --runs-per-profile 3 \
       --dataset research_dataset_v004.jsonl
@@ -369,7 +369,7 @@ A typical “is everything still safe?” check might look like:
 
 2. Run Exp13 over the current profiles:
 
-       python tools/exp13_auto_research_harness.py \
+       python3 tools/exp13_auto_research_harness.py \
          --ticks 2000 \
          --runs-per-profile 2 \
          --dataset research_dataset_v004.jsonl

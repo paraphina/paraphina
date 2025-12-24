@@ -181,7 +181,7 @@ Example pattern (see `batch_runs/exp03_stress_search.py`):
    - typically `target/release/paraphina`
 
 2) Run the experiment:
-   - `python batch_runs/exp03_stress_search.py`
+   - `python3 batch_runs/exp03_stress_search.py`
 
 Outputs (expected):
 - `runs/exp03_stress_search/exp03_stress_runs.csv`
@@ -190,7 +190,7 @@ Outputs (expected):
 ### 5.2 Telemetry-based research harness (tools)
 Example pattern (see `tools/exp13_auto_research_harness.py`):
 
-- `python tools/exp13_auto_research_harness.py --ticks 2000 --runs-per-profile 2 --dataset research_dataset_vXXX.jsonl`
+- `python3 tools/exp13_auto_research_harness.py --ticks 2000 --runs-per-profile 2 --dataset research_dataset_vXXX.jsonl`
 
 Outputs (expected):
 - telemetry:
