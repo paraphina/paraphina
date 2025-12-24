@@ -584,7 +584,7 @@ This repo evolves in three layers:
 ### Phase A — Quant Optimisation Foundation (pre-RL, highest ROI)
 **Goal:** improve robustness and performance without introducing ML risk.
 
-**Status: PARTIAL (A1 + A2 implemented)**
+**Status: COMPLETE (A1 + A2 fully implemented)**
 
 - [ ] Scenario library (seeded, reproducible)
   - volatility regimes, spread/depth shocks, venue outages, funding inversions, basis spikes
@@ -607,7 +607,7 @@ This repo evolves in three layers:
 - [ ] Monte Carlo runner at scale
   - generate thousands–millions of scenarios
   - (foundation exists via monte_carlo binary; need advanced scenario generation)
-- [x] **Adversarial / worst-case search** (A2) — **PARTIAL**
+- [x] **Adversarial / worst-case search** (A2)
   - `batch_runs/exp_phase_a_adversarial_search.py` provides:
     - Adversarial scenario sampling (vol, spread, latency, depth, inventory stress)
     - Monte Carlo runs per scenario with isolated output dirs
@@ -621,11 +621,28 @@ This repo evolves in three layers:
     - Uploads failure seeds as artifacts
   - Usage: `python3 batch_runs/exp_phase_a_adversarial_search.py --smoke --out runs/adv_smoke`
   - **Remaining:** CEM/evolutionary optimizers, ADR integration, time-to-failure minimization
-- [ ] Multi-objective tuning of strategy knobs
-  - Bayesian optimisation / CMA-ES / evolutionary search
-  - constraints enforced by risk-tier budgets (kill_prob, drawdown, min pnl)
-- [ ] Promotion pipeline
-  - only promote presets that pass out-of-sample + adversarial regression suites
+- [x] **Multi-objective tuning of strategy knobs** (A2)
+  - `batch_runs/phase_a/promote_pipeline.py` provides:
+    - Deterministic candidate generation (seeded RNG + evolutionary mutation)
+    - Multi-objective Pareto frontier computation
+    - Objectives: maximize mean_pnl, minimize kill_prob_ci_upper, minimize drawdown_cvar
+    - Budget-tier selection with deterministic tie-breaking
+    - Outputs: `trials.jsonl`, `pareto.json`, `pareto.csv`
+  - Usage: `python3 -m batch_runs.phase_a.promote_pipeline --smoke --study-dir runs/phaseA_smoke`
+  - Unit tests: `batch_runs/phase_a/tests/test_pareto.py`, `test_budgets.py`, `test_winner_selection.py`
+- [x] **Promotion pipeline** (A2)
+  - `batch_runs/phase_a/promote_pipeline.py` implements budget-gated promotion:
+    - Creates isolated trial directories: `runs/phaseA/<study>/<trial_id>/`
+    - Writes `candidate.env` with configuration overrides
+    - Runs `monte_carlo` with evidence pack generation
+    - Runs out-of-sample suite: `scenarios/suites/research_v1.yaml`
+    - Runs adversarial regression suite: `scenarios/suites/adversarial_regression_v1.yaml`
+    - Verifies evidence packs (`sim_eval verify-evidence-tree`)
+    - Parses metrics from `mc_summary.json` (JSON artifacts, not stdout)
+    - Promotes winners to: `configs/presets/promoted/<tier>/phaseA_<study>_<timestamp>.env`
+    - Writes `PROMOTION_RECORD.json` with full provenance
+  - Documentation: `docs/PHASE_A_PROMOTION_PIPELINE.md`
+  - Unit tests: `batch_runs/phase_a/tests/test_env_parsing.py`
 
 ### Phase B — World Model (Learned Simulator) on GPUs
 **Goal:** learn a high-fidelity dynamics model from telemetry so RL is sample-efficient.

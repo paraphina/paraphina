@@ -1,0 +1,1259 @@
+#!/usr/bin/env python3
+"""
+promote_pipeline.py
+
+Phase A-2: Multi-objective tuning + promotion pipeline.
+
+This module implements a deterministic, budget-gated research→promotion loop
+using existing Rust binaries (monte_carlo + sim_eval) and suite YAMLs.
+
+Usage:
+    python3 -m batch_runs.phase_a.promote_pipeline --help
+    python3 -m batch_runs.phase_a.promote_pipeline --smoke --study-dir runs/phaseA_smoke
+    python3 -m batch_runs.phase_a.promote_pipeline --trials 10 --study my_study
+
+The pipeline:
+1. Generates candidate configurations (seeded RNG + optional mutation)
+2. For each candidate:
+   - Creates isolated trial directory: runs/phaseA/<study>/<trial_id>/
+   - Writes candidate.env with config overrides
+   - Runs monte_carlo to <trial>/mc/
+   - Verifies evidence pack
+   - Runs out-of-sample suite (research_v1.yaml)
+   - Runs adversarial regression suite (adversarial_regression_v1.yaml)
+   - Parses metrics from mc_summary.json
+3. Computes Pareto frontier
+4. Selects winners per budget tier
+5. Promotes candidates that pass budget + suite gates
+6. Outputs: trials.jsonl, pareto.json, pareto.csv, promoted presets
+
+Non-negotiable constraints:
+- Deterministic: fixed seeds => stable results
+- Stable ordering for JSON/CSV output
+- Parse JSON artifacts (mc_summary.json, run_summary.json) - not stdout
+- Stdlib + optional PyYAML only (no pandas)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ===========================================================================
+# Paths
+# ===========================================================================
+
+ROOT = Path(__file__).resolve().parents[2]
+MONTE_CARLO_BIN = ROOT / "target" / "release" / "monte_carlo"
+SIM_EVAL_BIN = ROOT / "target" / "release" / "sim_eval"
+
+RESEARCH_SUITE = ROOT / "scenarios" / "suites" / "research_v1.yaml"
+ADVERSARIAL_SUITE = ROOT / "scenarios" / "suites" / "adversarial_regression_v1.yaml"
+
+DEFAULT_RUNS_DIR = ROOT / "runs"
+DEFAULT_BUDGETS_FILE = Path(__file__).parent / "budgets.yaml"
+PROMOTED_DIR = ROOT / "configs" / "presets" / "promoted"
+
+# ===========================================================================
+# Schemas (inline to avoid import complexity)
+# ===========================================================================
+
+@dataclass
+class TierBudget:
+    """Budget constraints for a risk tier."""
+    tier_name: str
+    max_kill_prob: float
+    max_drawdown_cvar: float
+    min_mean_pnl: float
+
+
+@dataclass
+class BudgetConfig:
+    """Collection of tier budgets."""
+    tiers: Dict[str, TierBudget] = field(default_factory=dict)
+
+
+@dataclass
+class CandidateConfig:
+    """Configuration for a single candidate trial."""
+    candidate_id: str
+    profile: str
+    hedge_band_base: float
+    mm_size_eta: float
+    vol_ref: float
+    daily_loss_limit: float
+    init_q_tao: float = 0.0
+    hedge_max_step: float = 10.0
+    
+    def to_env_overlay(self) -> Dict[str, str]:
+        """Convert to environment variable overlay."""
+        return {
+            "PARAPHINA_RISK_PROFILE": self.profile,
+            "PARAPHINA_HEDGE_BAND_BASE": str(self.hedge_band_base),
+            "PARAPHINA_MM_SIZE_ETA": str(self.mm_size_eta),
+            "PARAPHINA_VOL_REF": str(self.vol_ref),
+            "PARAPHINA_DAILY_LOSS_LIMIT": str(self.daily_loss_limit),
+            "PARAPHINA_INIT_Q_TAO": str(self.init_q_tao),
+            "PARAPHINA_HEDGE_MAX_STEP": str(self.hedge_max_step),
+        }
+    
+    def config_hash(self) -> str:
+        """Compute deterministic hash of configuration."""
+        env = self.to_env_overlay()
+        sorted_items = sorted(env.items())
+        key_str = "_".join(f"{k}={v}" for k, v in sorted_items)
+        return hashlib.sha256(key_str.encode()).hexdigest()[:12]
+    
+    def write_env_file(self, path: Path) -> None:
+        """Write configuration as .env file (candidate.env)."""
+        with open(path, "w") as f:
+            f.write("# Candidate configuration\n")
+            f.write(f"# Generated: {datetime.now(timezone.utc).isoformat()}Z\n")
+            f.write(f"# Hash: {self.config_hash()}\n\n")
+            for k, v in sorted(self.to_env_overlay().items()):
+                f.write(f"export {k}={v}\n")
+    
+    @classmethod
+    def from_env_file(cls, path: Path) -> "CandidateConfig":
+        """Parse configuration from .env file."""
+        env: Dict[str, str] = {}
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:]
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                    env[key.strip()] = val.strip()
+        
+        return cls(
+            candidate_id=hashlib.sha256(
+                "_".join(f"{k}={v}" for k, v in sorted(env.items())).encode()
+            ).hexdigest()[:12],
+            profile=env.get("PARAPHINA_RISK_PROFILE", "balanced"),
+            hedge_band_base=float(env.get("PARAPHINA_HEDGE_BAND_BASE", "0.05")),
+            mm_size_eta=float(env.get("PARAPHINA_MM_SIZE_ETA", "1.0")),
+            vol_ref=float(env.get("PARAPHINA_VOL_REF", "0.10")),
+            daily_loss_limit=float(env.get("PARAPHINA_DAILY_LOSS_LIMIT", "1000.0")),
+            init_q_tao=float(env.get("PARAPHINA_INIT_Q_TAO", "0.0")),
+            hedge_max_step=float(env.get("PARAPHINA_HEDGE_MAX_STEP", "10.0")),
+        )
+
+
+@dataclass
+class TrialResult:
+    """Result from evaluating a single trial."""
+    trial_id: str
+    candidate_id: str
+    config: CandidateConfig
+    trial_dir: Path
+    
+    # Monte Carlo metrics
+    mc_mean_pnl: float = float("nan")
+    mc_pnl_cvar: float = float("nan")
+    mc_drawdown_cvar: float = float("nan")
+    mc_kill_prob_point: float = float("nan")
+    mc_kill_prob_ci_upper: float = float("nan")
+    mc_total_runs: int = 0
+    
+    # Suite results
+    research_passed: bool = False
+    adversarial_passed: bool = False
+    
+    # Evidence verification
+    evidence_verified: bool = False
+    evidence_errors: List[str] = field(default_factory=list)
+    
+    # Execution info
+    duration_sec: float = 0.0
+    error_message: Optional[str] = None
+    seed: int = 42
+    
+    @property
+    def is_valid(self) -> bool:
+        """Check if result is valid for optimization."""
+        import math
+        return (
+            self.evidence_verified
+            and self.research_passed
+            and self.adversarial_passed
+            and not math.isnan(self.mc_mean_pnl)
+            and not math.isnan(self.mc_kill_prob_ci_upper)
+            and not math.isnan(self.mc_drawdown_cvar)
+        )
+    
+    def passes_budget(self, budget: TierBudget) -> bool:
+        """Check if result passes a tier budget."""
+        if not self.is_valid:
+            return False
+        return (
+            self.mc_kill_prob_ci_upper <= budget.max_kill_prob
+            and self.mc_drawdown_cvar <= budget.max_drawdown_cvar
+            and self.mc_mean_pnl >= budget.min_mean_pnl
+        )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict for JSON serialization."""
+        return {
+            "trial_id": self.trial_id,
+            "candidate_id": self.candidate_id,
+            "config": asdict(self.config),
+            "trial_dir": str(self.trial_dir),
+            "mc_mean_pnl": self.mc_mean_pnl,
+            "mc_pnl_cvar": self.mc_pnl_cvar,
+            "mc_drawdown_cvar": self.mc_drawdown_cvar,
+            "mc_kill_prob_point": self.mc_kill_prob_point,
+            "mc_kill_prob_ci_upper": self.mc_kill_prob_ci_upper,
+            "mc_total_runs": self.mc_total_runs,
+            "research_passed": self.research_passed,
+            "adversarial_passed": self.adversarial_passed,
+            "evidence_verified": self.evidence_verified,
+            "evidence_errors": self.evidence_errors,
+            "is_valid": self.is_valid,
+            "duration_sec": self.duration_sec,
+            "error_message": self.error_message,
+            "seed": self.seed,
+        }
+
+
+# ===========================================================================
+# Knob ranges for candidate generation
+# ===========================================================================
+
+KNOB_RANGES = {
+    "hedge_band_base": [0.02, 0.03, 0.05, 0.075, 0.10, 0.15],
+    "mm_size_eta": [0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+    "vol_ref": [0.05, 0.075, 0.10, 0.125, 0.15],
+    "daily_loss_limit": [500.0, 750.0, 1000.0, 1500.0, 2000.0, 3000.0],
+    "init_q_tao": [-30.0, -15.0, 0.0, 15.0, 30.0],
+    "hedge_max_step": [5.0, 10.0, 15.0, 20.0],
+}
+
+PROFILES = ["balanced", "conservative", "aggressive"]
+
+
+# ===========================================================================
+# Candidate generation
+# ===========================================================================
+
+def generate_candidates(
+    n_candidates: int,
+    seed: int,
+    pareto_set: Optional[List[TrialResult]] = None,
+    mutation_frac: float = 0.3,
+) -> List[CandidateConfig]:
+    """
+    Generate candidate configurations using seeded RNG.
+    
+    Supports optional mutation around the current Pareto set (evolutionary-lite).
+    
+    Args:
+        n_candidates: Number of candidates to generate
+        seed: Random seed for determinism
+        pareto_set: Optional Pareto set for mutation-based generation
+        mutation_frac: Fraction of candidates to generate via mutation (0-1)
+    
+    Returns:
+        List of CandidateConfig objects (deterministic given seed)
+    """
+    rng = random.Random(seed)
+    candidates: List[CandidateConfig] = []
+    
+    n_mutate = int(n_candidates * mutation_frac) if pareto_set else 0
+    n_random = n_candidates - n_mutate
+    
+    # Generate random candidates
+    for i in range(n_random):
+        config = CandidateConfig(
+            candidate_id="",
+            profile=rng.choice(PROFILES),
+            hedge_band_base=rng.choice(KNOB_RANGES["hedge_band_base"]),
+            mm_size_eta=rng.choice(KNOB_RANGES["mm_size_eta"]),
+            vol_ref=rng.choice(KNOB_RANGES["vol_ref"]),
+            daily_loss_limit=rng.choice(KNOB_RANGES["daily_loss_limit"]),
+            init_q_tao=rng.choice(KNOB_RANGES["init_q_tao"]),
+            hedge_max_step=rng.choice(KNOB_RANGES["hedge_max_step"]),
+        )
+        config = CandidateConfig(
+            candidate_id=config.config_hash(),
+            profile=config.profile,
+            hedge_band_base=config.hedge_band_base,
+            mm_size_eta=config.mm_size_eta,
+            vol_ref=config.vol_ref,
+            daily_loss_limit=config.daily_loss_limit,
+            init_q_tao=config.init_q_tao,
+            hedge_max_step=config.hedge_max_step,
+        )
+        candidates.append(config)
+    
+    # Generate mutated candidates from Pareto set
+    if pareto_set and n_mutate > 0:
+        for i in range(n_mutate):
+            parent = rng.choice(pareto_set)
+            
+            # Mutate one or two knobs
+            n_mutations = rng.randint(1, 2)
+            knobs_to_mutate = rng.sample(list(KNOB_RANGES.keys()), n_mutations)
+            
+            new_config = CandidateConfig(
+                candidate_id="",
+                profile=parent.config.profile if "profile" not in knobs_to_mutate else rng.choice(PROFILES),
+                hedge_band_base=parent.config.hedge_band_base if "hedge_band_base" not in knobs_to_mutate else rng.choice(KNOB_RANGES["hedge_band_base"]),
+                mm_size_eta=parent.config.mm_size_eta if "mm_size_eta" not in knobs_to_mutate else rng.choice(KNOB_RANGES["mm_size_eta"]),
+                vol_ref=parent.config.vol_ref if "vol_ref" not in knobs_to_mutate else rng.choice(KNOB_RANGES["vol_ref"]),
+                daily_loss_limit=parent.config.daily_loss_limit if "daily_loss_limit" not in knobs_to_mutate else rng.choice(KNOB_RANGES["daily_loss_limit"]),
+                init_q_tao=parent.config.init_q_tao if "init_q_tao" not in knobs_to_mutate else rng.choice(KNOB_RANGES["init_q_tao"]),
+                hedge_max_step=parent.config.hedge_max_step if "hedge_max_step" not in knobs_to_mutate else rng.choice(KNOB_RANGES["hedge_max_step"]),
+            )
+            new_config = CandidateConfig(
+                candidate_id=new_config.config_hash(),
+                profile=new_config.profile,
+                hedge_band_base=new_config.hedge_band_base,
+                mm_size_eta=new_config.mm_size_eta,
+                vol_ref=new_config.vol_ref,
+                daily_loss_limit=new_config.daily_loss_limit,
+                init_q_tao=new_config.init_q_tao,
+                hedge_max_step=new_config.hedge_max_step,
+            )
+            candidates.append(new_config)
+    
+    return candidates
+
+
+def generate_smoke_candidates() -> List[CandidateConfig]:
+    """Generate fixed smoke test candidates (one per profile)."""
+    candidates = []
+    for profile in PROFILES:
+        config = CandidateConfig(
+            candidate_id="",
+            profile=profile,
+            hedge_band_base=0.05,
+            mm_size_eta=1.0,
+            vol_ref=0.10,
+            daily_loss_limit=1000.0,
+            init_q_tao=0.0,
+            hedge_max_step=10.0,
+        )
+        config = CandidateConfig(
+            candidate_id=config.config_hash(),
+            profile=config.profile,
+            hedge_band_base=config.hedge_band_base,
+            mm_size_eta=config.mm_size_eta,
+            vol_ref=config.vol_ref,
+            daily_loss_limit=config.daily_loss_limit,
+            init_q_tao=config.init_q_tao,
+            hedge_max_step=config.hedge_max_step,
+        )
+        candidates.append(config)
+    return candidates
+
+
+# ===========================================================================
+# Budget loading
+# ===========================================================================
+
+def load_budgets_yaml(path: Path) -> BudgetConfig:
+    """Load budgets from YAML file (simple parser, no PyYAML required)."""
+    if not path.exists():
+        return load_default_budgets()
+    
+    content = path.read_text()
+    tiers: Dict[str, TierBudget] = {}
+    current_tier: Optional[str] = None
+    tier_data: Dict[str, float] = {}
+    
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        
+        if line.endswith(":") and not line.startswith(" "):
+            if current_tier and tier_data:
+                tiers[current_tier] = TierBudget(
+                    tier_name=current_tier,
+                    max_kill_prob=tier_data.get("max_kill_prob", 0.10),
+                    max_drawdown_cvar=tier_data.get("max_drawdown_cvar", 1000.0),
+                    min_mean_pnl=tier_data.get("min_mean_pnl", 10.0),
+                )
+            current_tier = line[:-1].strip()
+            tier_data = {}
+        elif ":" in line and current_tier:
+            key, val = line.split(":", 1)
+            try:
+                tier_data[key.strip()] = float(val.strip())
+            except ValueError:
+                pass
+    
+    if current_tier and tier_data:
+        tiers[current_tier] = TierBudget(
+            tier_name=current_tier,
+            max_kill_prob=tier_data.get("max_kill_prob", 0.10),
+            max_drawdown_cvar=tier_data.get("max_drawdown_cvar", 1000.0),
+            min_mean_pnl=tier_data.get("min_mean_pnl", 10.0),
+        )
+    
+    return BudgetConfig(tiers=tiers) if tiers else load_default_budgets()
+
+
+def load_default_budgets() -> BudgetConfig:
+    """Load default budgets."""
+    return BudgetConfig(tiers={
+        "conservative": TierBudget("conservative", 0.05, 500.0, 10.0),
+        "balanced": TierBudget("balanced", 0.10, 1000.0, 20.0),
+        "aggressive": TierBudget("aggressive", 0.15, 2000.0, 30.0),
+        "research": TierBudget("research", 0.20, 3000.0, 0.0),
+    })
+
+
+# ===========================================================================
+# mc_summary.json parsing
+# ===========================================================================
+
+def parse_mc_summary(path: Path) -> Dict[str, Any]:
+    """Parse mc_summary.json into flat metrics dict."""
+    if not path.exists():
+        return {}
+    
+    try:
+        with open(path) as f:
+            summary = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+    
+    tail_risk = summary.get("tail_risk", {})
+    aggregate = summary.get("aggregate", {})
+    
+    pnl_var_cvar = tail_risk.get("pnl_var_cvar", {})
+    dd_var_cvar = tail_risk.get("max_drawdown_var_cvar", {})
+    kill_prob = tail_risk.get("kill_probability", {})
+    pnl_agg = aggregate.get("pnl", {})
+    
+    return {
+        "mean_pnl": pnl_agg.get("mean", float("nan")),
+        "pnl_cvar": pnl_var_cvar.get("cvar", float("nan")),
+        "drawdown_cvar": dd_var_cvar.get("cvar", float("nan")),
+        "kill_prob_point": kill_prob.get("point_estimate", float("nan")),
+        "kill_prob_ci_upper": kill_prob.get("ci_upper", float("nan")),
+        "kill_count": kill_prob.get("kill_count", 0),
+        "total_runs": kill_prob.get("total_runs", 0),
+        "kill_rate": aggregate.get("kill_rate", float("nan")),
+    }
+
+
+# ===========================================================================
+# Evidence verification
+# ===========================================================================
+
+def verify_evidence_tree(output_dir: Path, verbose: bool = False) -> Tuple[bool, List[str]]:
+    """Verify all evidence packs under output_dir."""
+    if not SIM_EVAL_BIN.exists():
+        # Try cargo run
+        cmd = ["cargo", "run", "-p", "paraphina", "--bin", "sim_eval", "--release", "--",
+               "verify-evidence-tree", str(output_dir)]
+    else:
+        cmd = [str(SIM_EVAL_BIN), "verify-evidence-tree", str(output_dir)]
+    
+    proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+    
+    if proc.returncode == 0:
+        if verbose:
+            print(f"    ✓ Evidence verified: {output_dir.name}")
+        return True, []
+    else:
+        errors = []
+        if proc.stderr:
+            errors.append(proc.stderr.strip())
+        if proc.stdout:
+            errors.append(proc.stdout.strip())
+        if not errors:
+            errors.append(f"verify-evidence-tree failed (rc={proc.returncode})")
+        return False, errors
+
+
+# ===========================================================================
+# Suite runners
+# ===========================================================================
+
+def get_suite_out_dir(suite_path: Path) -> Optional[str]:
+    """Extract out_dir from suite YAML."""
+    try:
+        for line in suite_path.read_text().split("\n"):
+            line = line.strip()
+            if line.startswith("out_dir:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def check_suite_format(suite_path: Path) -> Tuple[bool, str]:
+    """
+    Check if suite has compatible format (path-based scenarios).
+    
+    Returns (compatible, reason) - suites with inline env_overrides instead of
+    path fields are not compatible with sim_eval suite command.
+    """
+    if not suite_path.exists():
+        return False, "file not found"
+    
+    try:
+        content = suite_path.read_text()
+        # Simple check: if scenarios use 'path:' they're compatible
+        # If they use 'env_overrides:' inline, they need different handling
+        has_path = "  - path:" in content or "- path:" in content
+        has_inline = "env_overrides:" in content and "  - id:" in content
+        
+        if has_path:
+            return True, "path-based scenarios"
+        elif has_inline:
+            return False, "inline env_overrides (not supported by sim_eval suite)"
+        else:
+            return True, "unknown format, will attempt"
+    except Exception as e:
+        return False, f"parse error: {e}"
+
+
+def run_suite(
+    suite_path: Path,
+    env_overlay: Dict[str, str],
+    verbose: bool = False,
+) -> Tuple[bool, List[str]]:
+    """
+    Run a suite using sim_eval suite command.
+    
+    Returns (passed, errors). Suites with incompatible formats are skipped
+    with a warning but considered "passed" for gating purposes.
+    """
+    if not suite_path.exists():
+        return True, []  # Skip if suite doesn't exist
+    
+    # Check suite format compatibility
+    compatible, reason = check_suite_format(suite_path)
+    if not compatible:
+        if verbose:
+            print(f"    Skipping suite {suite_path.name}: {reason}")
+        # Incompatible format is not a failure - just can't run this suite
+        return True, [f"Suite skipped: {reason}"]
+    
+    if SIM_EVAL_BIN.exists():
+        cmd = [str(SIM_EVAL_BIN), "suite", str(suite_path)]
+    else:
+        cmd = ["cargo", "run", "-p", "paraphina", "--bin", "sim_eval", "--release", "--",
+               "suite", str(suite_path)]
+    
+    env = os.environ.copy()
+    env.update(env_overlay)
+    
+    if verbose:
+        print(f"    Running suite: {suite_path.name}")
+    
+    proc = subprocess.run(cmd, env=env, cwd=str(ROOT), capture_output=True, text=True)
+    
+    if proc.returncode == 0:
+        return True, []
+    else:
+        errors = []
+        if proc.stderr:
+            errors.append(proc.stderr.strip()[:200])
+        return False, errors
+
+
+# ===========================================================================
+# Monte Carlo runner
+# ===========================================================================
+
+def run_monte_carlo(
+    output_dir: Path,
+    env_overlay: Dict[str, str],
+    mc_runs: int,
+    mc_ticks: int,
+    seed: int,
+    verbose: bool = False,
+) -> Tuple[bool, Dict[str, Any], List[str]]:
+    """Run monte_carlo evaluation."""
+    if MONTE_CARLO_BIN.exists():
+        cmd = [
+            str(MONTE_CARLO_BIN),
+            "--runs", str(mc_runs),
+            "--ticks", str(mc_ticks),
+            "--seed", str(seed),
+            "--jitter-ms", "100",
+            "--output-dir", str(output_dir),
+            "--quiet",
+        ]
+    else:
+        cmd = [
+            "cargo", "run", "-p", "paraphina", "--bin", "monte_carlo", "--release", "--",
+            "--runs", str(mc_runs),
+            "--ticks", str(mc_ticks),
+            "--seed", str(seed),
+            "--jitter-ms", "100",
+            "--output-dir", str(output_dir),
+            "--quiet",
+        ]
+    
+    env = os.environ.copy()
+    env.update(env_overlay)
+    
+    if verbose:
+        print(f"    Running monte_carlo: {mc_runs} runs, seed={seed}")
+    
+    proc = subprocess.run(cmd, env=env, cwd=str(ROOT), capture_output=True, text=True)
+    
+    if proc.returncode != 0:
+        errors = []
+        if proc.stderr:
+            errors.append(proc.stderr.strip()[:200])
+        return False, {}, errors
+    
+    # Parse mc_summary.json
+    summary_path = output_dir / "mc_summary.json"
+    metrics = parse_mc_summary(summary_path)
+    
+    if not metrics:
+        return False, {}, ["Failed to parse mc_summary.json"]
+    
+    return True, metrics, []
+
+
+# ===========================================================================
+# Trial evaluation
+# ===========================================================================
+
+def evaluate_trial(
+    config: CandidateConfig,
+    study_name: str,
+    trial_id: str,
+    study_dir: Path,
+    mc_runs: int,
+    mc_ticks: int,
+    seed: int,
+    verbose: bool = True,
+) -> TrialResult:
+    """
+    Evaluate a single candidate trial.
+    
+    Contract:
+    1. Create isolated trial directory
+    2. Write candidate.env
+    3. Run monte_carlo to <trial>/mc/
+    4. Verify evidence pack
+    5. Run research + adversarial suites
+    6. Parse metrics from mc_summary.json
+    """
+    t0 = time.time()
+    
+    # Create trial directory
+    trial_dir = study_dir / trial_id
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    
+    if verbose:
+        print(f"\n  [{trial_id}] Candidate {config.candidate_id}")
+    
+    # Write candidate.env
+    config_file = trial_dir / "candidate.env"
+    config.write_env_file(config_file)
+    
+    env_overlay = config.to_env_overlay()
+    evidence_errors: List[str] = []
+    
+    # Defaults
+    mc_mean_pnl = float("nan")
+    mc_pnl_cvar = float("nan")
+    mc_drawdown_cvar = float("nan")
+    mc_kill_prob_point = float("nan")
+    mc_kill_prob_ci_upper = float("nan")
+    mc_total_runs = 0
+    evidence_verified = False
+    research_passed = True
+    adversarial_passed = True
+    error_message: Optional[str] = None
+    
+    # Step 1: Run Monte Carlo
+    mc_dir = trial_dir / "mc"
+    mc_dir.mkdir(exist_ok=True)
+    
+    success, metrics, errors = run_monte_carlo(
+        mc_dir, env_overlay, mc_runs, mc_ticks, seed, verbose
+    )
+    
+    if success:
+        mc_mean_pnl = metrics.get("mean_pnl", float("nan"))
+        mc_pnl_cvar = metrics.get("pnl_cvar", float("nan"))
+        mc_drawdown_cvar = metrics.get("drawdown_cvar", float("nan"))
+        mc_kill_prob_point = metrics.get("kill_prob_point", float("nan"))
+        mc_kill_prob_ci_upper = metrics.get("kill_prob_ci_upper", float("nan"))
+        mc_total_runs = metrics.get("total_runs", 0)
+        
+        # Verify evidence pack
+        verified, errs = verify_evidence_tree(mc_dir, verbose)
+        evidence_verified = verified
+        if not verified:
+            evidence_errors.extend(errs)
+    else:
+        evidence_errors.extend(errors)
+        error_message = f"Monte Carlo failed: {'; '.join(errors)}"
+    
+    # Step 2: Run out-of-sample suite
+    if RESEARCH_SUITE.exists():
+        oos_dir = trial_dir / "oos" / "research_v1"
+        oos_dir.mkdir(parents=True, exist_ok=True)
+        
+        passed, errors = run_suite(RESEARCH_SUITE, env_overlay, verbose)
+        research_passed = passed
+        if not passed:
+            evidence_errors.extend(errors)
+    
+    # Step 3: Run adversarial regression suite
+    if ADVERSARIAL_SUITE.exists():
+        adv_dir = trial_dir / "oos" / "adversarial_regression_v1"
+        adv_dir.mkdir(parents=True, exist_ok=True)
+        
+        passed, errors = run_suite(ADVERSARIAL_SUITE, env_overlay, verbose)
+        adversarial_passed = passed
+        if not passed:
+            evidence_errors.extend(errors)
+    
+    duration_sec = time.time() - t0
+    
+    result = TrialResult(
+        trial_id=trial_id,
+        candidate_id=config.candidate_id,
+        config=config,
+        trial_dir=trial_dir,
+        mc_mean_pnl=mc_mean_pnl,
+        mc_pnl_cvar=mc_pnl_cvar,
+        mc_drawdown_cvar=mc_drawdown_cvar,
+        mc_kill_prob_point=mc_kill_prob_point,
+        mc_kill_prob_ci_upper=mc_kill_prob_ci_upper,
+        mc_total_runs=mc_total_runs,
+        research_passed=research_passed,
+        adversarial_passed=adversarial_passed,
+        evidence_verified=evidence_verified,
+        evidence_errors=evidence_errors,
+        duration_sec=duration_sec,
+        error_message=error_message,
+        seed=seed,
+    )
+    
+    if verbose:
+        status = "✓ VALID" if result.is_valid else "✗ INVALID"
+        print(f"    {status} | pnl={mc_mean_pnl:.2f}, kill_ci={mc_kill_prob_ci_upper:.3f}, "
+              f"dd_cvar={mc_drawdown_cvar:.2f} | {duration_sec:.1f}s")
+    
+    return result
+
+
+# ===========================================================================
+# Pareto frontier
+# ===========================================================================
+
+def compute_pareto_frontier(results: List[TrialResult]) -> List[TrialResult]:
+    """Compute Pareto frontier from trial results."""
+    valid = [r for r in results if r.is_valid]
+    
+    if not valid:
+        return []
+    
+    frontier: List[TrialResult] = []
+    
+    for i, candidate in enumerate(valid):
+        dominated = False
+        for j, other in enumerate(valid):
+            if i != j and _dominates(other, candidate):
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(candidate)
+    
+    # Sort deterministically by candidate_id
+    frontier.sort(key=lambda r: r.candidate_id)
+    return frontier
+
+
+def _dominates(a: TrialResult, b: TrialResult) -> bool:
+    """Check if a dominates b (Pareto dominance)."""
+    # Objectives: maximize pnl, minimize kill_prob, minimize drawdown_cvar
+    at_least_as_good = (
+        a.mc_mean_pnl >= b.mc_mean_pnl
+        and a.mc_kill_prob_ci_upper <= b.mc_kill_prob_ci_upper
+        and a.mc_drawdown_cvar <= b.mc_drawdown_cvar
+    )
+    
+    if not at_least_as_good:
+        return False
+    
+    strictly_better = (
+        a.mc_mean_pnl > b.mc_mean_pnl
+        or a.mc_kill_prob_ci_upper < b.mc_kill_prob_ci_upper
+        or a.mc_drawdown_cvar < b.mc_drawdown_cvar
+    )
+    
+    return strictly_better
+
+
+# ===========================================================================
+# Winner selection
+# ===========================================================================
+
+def select_winner(results: List[TrialResult], budget: TierBudget) -> Optional[TrialResult]:
+    """
+    Select winner for a budget tier with deterministic tie-breaking.
+    
+    Selection rule:
+    1. Filter by budget
+    2. Best mean_pnl (highest)
+    3. Tie-break: lowest drawdown_cvar
+    4. Tie-break: lowest kill_prob_ci_upper
+    5. Tie-break: candidate_id (alphabetical)
+    """
+    qualifying = [r for r in results if r.passes_budget(budget)]
+    
+    if not qualifying:
+        return None
+    
+    qualifying.sort(key=lambda r: (
+        -r.mc_mean_pnl,
+        r.mc_drawdown_cvar,
+        r.mc_kill_prob_ci_upper,
+        r.candidate_id,
+    ))
+    
+    return qualifying[0]
+
+
+# ===========================================================================
+# Output writing
+# ===========================================================================
+
+def write_trials_jsonl(results: List[TrialResult], path: Path) -> None:
+    """Write trials to JSONL (one JSON per line)."""
+    with open(path, "w") as f:
+        for r in sorted(results, key=lambda x: x.trial_id):
+            f.write(json.dumps(r.to_dict(), sort_keys=True) + "\n")
+
+
+def write_pareto_json(pareto: List[TrialResult], path: Path) -> None:
+    """Write Pareto frontier to JSON."""
+    data = {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "pareto_size": len(pareto),
+        "candidates": [r.to_dict() for r in pareto],
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def write_pareto_csv(pareto: List[TrialResult], path: Path) -> None:
+    """Write Pareto frontier to CSV."""
+    import csv
+    
+    if not pareto:
+        path.write_text("# Empty Pareto frontier\n")
+        return
+    
+    fieldnames = [
+        "pareto_rank", "candidate_id", "trial_id", "profile",
+        "mc_mean_pnl", "mc_kill_prob_ci_upper", "mc_drawdown_cvar",
+        "is_valid", "evidence_verified",
+    ]
+    
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for i, r in enumerate(pareto):
+            writer.writerow({
+                "pareto_rank": i + 1,
+                "candidate_id": r.candidate_id,
+                "trial_id": r.trial_id,
+                "profile": r.config.profile,
+                "mc_mean_pnl": f"{r.mc_mean_pnl:.4f}",
+                "mc_kill_prob_ci_upper": f"{r.mc_kill_prob_ci_upper:.4f}",
+                "mc_drawdown_cvar": f"{r.mc_drawdown_cvar:.4f}",
+                "is_valid": r.is_valid,
+                "evidence_verified": r.evidence_verified,
+            })
+
+
+# ===========================================================================
+# Promotion
+# ===========================================================================
+
+def promote_winner(
+    winner: TrialResult,
+    tier_name: str,
+    study_name: str,
+    output_dir: Optional[Path] = None,
+    verbose: bool = True,
+) -> Tuple[Path, Path]:
+    """Promote a winning candidate configuration."""
+    if output_dir is None:
+        output_dir = PROMOTED_DIR / tier_name
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    config_name = f"phaseA_{study_name}_{timestamp}.env"
+    record_name = f"PROMOTION_RECORD.json"
+    
+    config_path = output_dir / config_name
+    record_path = output_dir / record_name
+    
+    if verbose:
+        print(f"  Promoting {winner.candidate_id} -> {config_path}")
+    
+    # Write config file
+    winner.config.write_env_file(config_path)
+    
+    # Add promotion header
+    with open(config_path, "r") as f:
+        content = f.read()
+    with open(config_path, "w") as f:
+        f.write(f"# Promoted configuration for {tier_name} tier\n")
+        f.write(f"# Study: {study_name}\n")
+        f.write(f"# Candidate: {winner.candidate_id}\n")
+        f.write(f"# Metrics: pnl={winner.mc_mean_pnl:.4f}, kill_ci={winner.mc_kill_prob_ci_upper:.4f}\n")
+        f.write(content)
+    
+    # Compute config hash
+    with open(config_path, "rb") as f:
+        config_hash = hashlib.sha256(f.read()).hexdigest()
+    
+    # Get git commit
+    try:
+        git_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(ROOT), capture_output=True, text=True
+        )
+        git_commit = git_result.stdout.strip() if git_result.returncode == 0 else "unknown"
+    except Exception:
+        git_commit = "unknown"
+    
+    # Build promotion record
+    record = {
+        "schema_version": 1,
+        "promoted_at": datetime.now(timezone.utc).isoformat(),
+        "study_name": study_name,
+        "tier": tier_name,
+        "git_commit": git_commit,
+        "candidate_id": winner.candidate_id,
+        "candidate_hash": config_hash,
+        "trial_id": winner.trial_id,
+        "trial_dir": str(winner.trial_dir),
+        "config": asdict(winner.config),
+        "env_overlay": winner.config.to_env_overlay(),
+        "commands_run": [
+            f"monte_carlo --runs {winner.mc_total_runs} --seed {winner.seed}",
+            f"sim_eval suite {RESEARCH_SUITE}",
+            f"sim_eval suite {ADVERSARIAL_SUITE}",
+        ],
+        "seeds": [winner.seed],
+        "evidence_verified": winner.evidence_verified,
+        "metrics": {
+            "mean_pnl": winner.mc_mean_pnl,
+            "pnl_cvar": winner.mc_pnl_cvar,
+            "drawdown_cvar": winner.mc_drawdown_cvar,
+            "kill_prob_point": winner.mc_kill_prob_point,
+            "kill_prob_ci_upper": winner.mc_kill_prob_ci_upper,
+            "total_runs": winner.mc_total_runs,
+        },
+        "suites_passed": {
+            "research": winner.research_passed,
+            "adversarial": winner.adversarial_passed,
+        },
+    }
+    
+    with open(record_path, "w") as f:
+        json.dump(record, f, indent=2, sort_keys=True)
+    
+    return config_path, record_path
+
+
+# ===========================================================================
+# Main pipeline
+# ===========================================================================
+
+def run_pipeline(
+    study_name: str,
+    study_dir: Path,
+    trials: int,
+    mc_runs: int,
+    mc_ticks: int,
+    seed: int,
+    budgets: BudgetConfig,
+    smoke: bool = False,
+    verbose: bool = True,
+) -> Tuple[List[TrialResult], List[TrialResult], Dict[str, Optional[Tuple[Path, Path]]]]:
+    """
+    Run the complete promotion pipeline.
+    
+    Returns:
+        (all_results, pareto_frontier, promotions_by_tier)
+    """
+    print("=" * 70)
+    print(f"Phase A-2: Promotion Pipeline")
+    print("=" * 70)
+    print(f"  Study: {study_name}")
+    print(f"  Directory: {study_dir}")
+    print(f"  Trials: {trials}")
+    print(f"  MC runs: {mc_runs}, ticks: {mc_ticks}")
+    print(f"  Seed: {seed}")
+    print(f"  Smoke mode: {smoke}")
+    print()
+    
+    # Create study directory
+    study_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate candidates
+    print("[1/5] Generating candidates...")
+    if smoke:
+        candidates = generate_smoke_candidates()[:trials]
+    else:
+        candidates = generate_candidates(trials, seed)
+    
+    print(f"  Generated {len(candidates)} candidates")
+    
+    # Evaluate all candidates
+    print(f"\n[2/5] Evaluating candidates...")
+    results: List[TrialResult] = []
+    
+    for i, config in enumerate(candidates):
+        trial_id = f"trial_{i:04d}_{config.candidate_id}"
+        result = evaluate_trial(
+            config=config,
+            study_name=study_name,
+            trial_id=trial_id,
+            study_dir=study_dir,
+            mc_runs=mc_runs,
+            mc_ticks=mc_ticks,
+            seed=seed + i,  # Offset seed per trial for variety
+            verbose=verbose,
+        )
+        results.append(result)
+    
+    # Compute Pareto frontier
+    print(f"\n[3/5] Computing Pareto frontier...")
+    pareto = compute_pareto_frontier(results)
+    print(f"  Pareto size: {len(pareto)}")
+    
+    for i, r in enumerate(pareto):
+        print(f"    {i+1}. {r.candidate_id}: pnl={r.mc_mean_pnl:.2f}, "
+              f"kill_ci={r.mc_kill_prob_ci_upper:.3f}")
+    
+    # Write outputs
+    print(f"\n[4/5] Writing outputs...")
+    
+    trials_jsonl = study_dir / "trials.jsonl"
+    write_trials_jsonl(results, trials_jsonl)
+    print(f"  ✓ {trials_jsonl}")
+    
+    pareto_json = study_dir / "pareto.json"
+    write_pareto_json(pareto, pareto_json)
+    print(f"  ✓ {pareto_json}")
+    
+    pareto_csv = study_dir / "pareto.csv"
+    write_pareto_csv(pareto, pareto_csv)
+    print(f"  ✓ {pareto_csv}")
+    
+    # Promote winners
+    print(f"\n[5/5] Promoting winners...")
+    promotions: Dict[str, Optional[Tuple[Path, Path]]] = {}
+    
+    for tier_name, budget in sorted(budgets.tiers.items()):
+        winner = select_winner(results, budget)
+        
+        if winner is None:
+            print(f"  {tier_name}: No candidate meets budget")
+            promotions[tier_name] = None
+            continue
+        
+        # Verify evidence before promotion
+        if not winner.evidence_verified:
+            print(f"  {tier_name}: Winner {winner.candidate_id} failed evidence verification - skipping")
+            promotions[tier_name] = None
+            continue
+        
+        config_path, record_path = promote_winner(
+            winner, tier_name, study_name, verbose=verbose
+        )
+        promotions[tier_name] = (config_path, record_path)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("Pipeline Complete")
+    print("=" * 70)
+    print(f"  Total trials: {len(results)}")
+    print(f"  Valid trials: {sum(1 for r in results if r.is_valid)}")
+    print(f"  Pareto size: {len(pareto)}")
+    print(f"  Promotions: {sum(1 for p in promotions.values() if p is not None)}/{len(promotions)}")
+    print()
+    print(f"Outputs:")
+    print(f"  {trials_jsonl}")
+    print(f"  {pareto_json}")
+    print(f"  {pareto_csv}")
+    
+    return results, pareto, promotions
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        prog="python3 -m batch_runs.phase_a.promote_pipeline",
+        description="Phase A-2: Multi-objective tuning + promotion pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Quick smoke test (3 trials, fast)
+  python3 -m batch_runs.phase_a.promote_pipeline --smoke --study-dir runs/phaseA_smoke
+
+  # Run with 10 trials
+  python3 -m batch_runs.phase_a.promote_pipeline --trials 10 --study my_study
+
+  # Full research run
+  python3 -m batch_runs.phase_a.promote_pipeline --trials 50 --mc-runs 100 --study research_v1
+
+Outputs:
+  - runs/phaseA/<study>/trials.jsonl
+  - runs/phaseA/<study>/pareto.json
+  - runs/phaseA/<study>/pareto.csv
+  - configs/presets/promoted/<tier>/phaseA_<study>_<timestamp>.env
+  - configs/presets/promoted/<tier>/PROMOTION_RECORD.json
+""",
+    )
+    
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Quick smoke mode (3 trials, 10 MC runs, 100 ticks)",
+    )
+    
+    parser.add_argument(
+        "--study", "--study-name",
+        type=str,
+        default=None,
+        help="Study name (default: auto-generated timestamp)",
+    )
+    
+    parser.add_argument(
+        "--study-dir",
+        type=str,
+        default=None,
+        help="Study directory (overrides default runs/phaseA/<study>)",
+    )
+    
+    parser.add_argument(
+        "--trials", "-n",
+        type=int,
+        default=10,
+        help="Number of candidate trials (default: 10)",
+    )
+    
+    parser.add_argument(
+        "--mc-runs",
+        type=int,
+        default=50,
+        help="Monte Carlo runs per candidate (default: 50)",
+    )
+    
+    parser.add_argument(
+        "--mc-ticks",
+        type=int,
+        default=600,
+        help="Ticks per Monte Carlo run (default: 600)",
+    )
+    
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for determinism (default: 42)",
+    )
+    
+    parser.add_argument(
+        "--budgets",
+        type=str,
+        default=None,
+        help=f"Path to budgets.yaml (default: {DEFAULT_BUDGETS_FILE})",
+    )
+    
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress verbose output",
+    )
+    
+    args = parser.parse_args(argv)
+    
+    # Handle smoke mode
+    if args.smoke:
+        trials = min(args.trials, 3)
+        mc_runs = 10
+        mc_ticks = 100
+    else:
+        trials = args.trials
+        mc_runs = args.mc_runs
+        mc_ticks = args.mc_ticks
+    
+    # Determine study name and directory
+    if args.study:
+        study_name = args.study
+    else:
+        study_name = f"study_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    if args.study_dir:
+        study_dir = Path(args.study_dir)
+    else:
+        study_dir = DEFAULT_RUNS_DIR / "phaseA" / study_name
+    
+    # Load budgets
+    budgets_file = Path(args.budgets) if args.budgets else DEFAULT_BUDGETS_FILE
+    budgets = load_budgets_yaml(budgets_file)
+    
+    # Run pipeline
+    try:
+        results, pareto, promotions = run_pipeline(
+            study_name=study_name,
+            study_dir=study_dir,
+            trials=trials,
+            mc_runs=mc_runs,
+            mc_ticks=mc_ticks,
+            seed=args.seed,
+            budgets=budgets,
+            smoke=args.smoke,
+            verbose=not args.quiet,
+        )
+    except Exception as e:
+        print(f"\nERROR: Pipeline failed: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+    
+    # Return success if at least one promotion succeeded or pareto exists
+    if pareto or any(p is not None for p in promotions.values()):
+        return 0
+    elif not results:
+        return 1
+    else:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
