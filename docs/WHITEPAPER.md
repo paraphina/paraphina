@@ -4807,7 +4807,7 @@ The optimisation loop has three layers:
 APPENDIX B — ADVANCED QUANT OPTIMISATION METHODS (PRE-RL)
 ------------------------------------------------------------------
 
-> **[STATUS: Partial]** Phase A "A1" vertical slice is **Implemented**: Monte Carlo tail-risk metrics (VaR, CVaR, quantiles, Wilson CI for kill probability) are emitted in `mc_summary.json` (schema_version=2). Pareto tuning harness scaffold exists at `batch_runs/exp_phase_a_pareto_mc.py` with risk-tier budgets. Remaining methods (B2-B5) are **Planned (see ROADMAP.md Phase A)**. The batch harness (`batch_runs/`) provides foundational infrastructure.
+> **[STATUS: Partial]** Phase A "A1" vertical slice is **Implemented**: Monte Carlo tail-risk metrics (VaR, CVaR, quantiles, Wilson CI for kill probability) are emitted in `mc_summary.json` (schema_version=2). Pareto tuning harness scaffold exists at `batch_runs/exp_phase_a_pareto_mc.py` with risk-tier budgets. **Phase A-2 (B2) is Partial**: Adversarial search harness at `batch_runs/exp_phase_a_adversarial_search.py` with failure seed extraction and regression suite generation (`scenarios/suites/adversarial_regression_v1.yaml`). CI gate at `.github/workflows/adversarial_regression.yml`. Remaining methods (B3-B5) are **Planned (see ROADMAP.md Phase A)**. The batch harness (`batch_runs/`) provides foundational infrastructure.
 
 Before moving to RL, we maximise strategy performance and robustness using a suite of
 quant methods that directly integrate with the existing telemetry-first research harness.
@@ -4823,14 +4823,16 @@ B1) Monte Carlo scenario engine (core requirement)
     basis-risk tails, liquidation-distance tails, worst-case PnL.
 
 B2) Stress + adversarial search (find failures faster than random MC)
-- Replace “random scenarios” with systematic adversaries:
+> **[STATUS: Partial]** Adversarial search harness implemented at `batch_runs/exp_phase_a_adversarial_search.py`. Samples adversarial scenario parameters (vol, spread, latency, depth, inventory stress), runs monte_carlo, scores by kill_prob_ci_upper + drawdown_cvar - mean_pnl, extracts top-K failure seeds to `failure_seeds.json`, and generates regression suite at `scenarios/suites/adversarial_regression_v1.yaml`. CI workflow at `.github/workflows/adversarial_regression.yml`.
+
+- Replace "random scenarios" with systematic adversaries:
   - search for minimal changes that trigger kill, liquidation proximity,
     or persistent basis limit violations.
 - Practical methods:
   - cross-entropy method (CEM) over scenario parameters,
   - adversarial domain randomisation (ADR),
   - hill-climbing / evolutionary search over scenario seeds,
-  - constrained optimisation that minimises “time-to-failure”.
+  - constrained optimisation that minimises "time-to-failure".
 
 B3) Multi-objective optimisation over configs (Pareto front, not single-score)
 Optimise over a vector objective:

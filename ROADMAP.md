@@ -584,7 +584,7 @@ This repo evolves in three layers:
 ### Phase A — Quant Optimisation Foundation (pre-RL, highest ROI)
 **Goal:** improve robustness and performance without introducing ML risk.
 
-**Status: PARTIAL (A1 vertical slice implemented)**
+**Status: PARTIAL (A1 + A2 implemented)**
 
 - [ ] Scenario library (seeded, reproducible)
   - volatility regimes, spread/depth shocks, venue outages, funding inversions, basis spikes
@@ -607,9 +607,20 @@ This repo evolves in three layers:
 - [ ] Monte Carlo runner at scale
   - generate thousands–millions of scenarios
   - (foundation exists via monte_carlo binary; need advanced scenario generation)
-- [ ] Adversarial / worst-case search
-  - CEM / evolutionary search over scenario parameters to find failures quickly
-  - promote "failure seeds" to a permanent regression suite
+- [x] **Adversarial / worst-case search** (A2) — **PARTIAL**
+  - `batch_runs/exp_phase_a_adversarial_search.py` provides:
+    - Adversarial scenario sampling (vol, spread, latency, depth, inventory stress)
+    - Monte Carlo runs per scenario with isolated output dirs
+    - Adversarial scoring: maximize kill_prob_ci_upper, drawdown_cvar; minimize mean_pnl
+    - Top-K failure seed extraction to `failure_seeds.json`
+    - Regression suite generation: `scenarios/suites/adversarial_regression_v1.yaml`
+    - Python unit tests: `batch_runs/test_adversarial_search.py`
+  - CI gate: `.github/workflows/adversarial_regression.yml`
+    - Runs adversarial smoke suite on PRs
+    - Verifies evidence packs for all scenarios
+    - Uploads failure seeds as artifacts
+  - Usage: `python3 batch_runs/exp_phase_a_adversarial_search.py --smoke --out runs/adv_smoke`
+  - **Remaining:** CEM/evolutionary optimizers, ADR integration, time-to-failure minimization
 - [ ] Multi-objective tuning of strategy knobs
   - Bayesian optimisation / CMA-ES / evolutionary search
   - constraints enforced by risk-tier budgets (kill_prob, drawdown, min pnl)
