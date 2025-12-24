@@ -52,6 +52,7 @@ pub mod sim_eval;
 pub mod state;
 pub mod strategy;
 pub mod strategy_core;
+pub mod tail_risk;
 pub mod telemetry;
 pub mod toxicity;
 pub mod types;
@@ -100,6 +101,12 @@ pub use strategy::StrategyRunner;
 pub use toxicity::{update_toxicity_and_health, update_toxicity_and_health_with_ablations};
 
 pub use types::{FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
+
+// Tail risk metrics (Phase A)
+pub use tail_risk::{
+    cvar_at_alpha, var_at_alpha, wilson_ci, KillProbabilityCI, QuantileSet, TailRiskMetrics,
+    VaRCVaR, DEFAULT_VAR_ALPHA, STANDARD_QUANTILES,
+};
 
 // RL-0 Foundations (per ROADMAP.md)
 pub use rl::{

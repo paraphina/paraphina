@@ -4807,7 +4807,7 @@ The optimisation loop has three layers:
 APPENDIX B — ADVANCED QUANT OPTIMISATION METHODS (PRE-RL)
 ------------------------------------------------------------------
 
-> **[STATUS: Planned]** All methods in this appendix are **Planned (not yet implemented; Phase A in ROADMAP.md)**. The batch harness (`batch_runs/`) provides foundational infrastructure.
+> **[STATUS: Partial]** Phase A "A1" vertical slice is **Implemented**: Monte Carlo tail-risk metrics (VaR, CVaR, quantiles, Wilson CI for kill probability) are emitted in `mc_summary.json` (schema_version=2). Pareto tuning harness scaffold exists at `batch_runs/exp_phase_a_pareto_mc.py` with risk-tier budgets. Remaining methods (B2-B5) are **Planned (see ROADMAP.md Phase A)**. The batch harness (`batch_runs/`) provides foundational infrastructure.
 
 Before moving to RL, we maximise strategy performance and robustness using a suite of
 quant methods that directly integrate with the existing telemetry-first research harness.
