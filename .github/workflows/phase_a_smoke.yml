@@ -1,0 +1,77 @@
+name: phase-a-smoke
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  phase-a-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Phase A unit tests
+        run: python3 -m unittest discover -s batch_runs/phase_a/tests -v
+
+      - name: Verify CLI --help works
+        run: python3 -m batch_runs.phase_a.cli --help
+
+  phase-a-smoke:
+    runs-on: ubuntu-latest
+    needs: phase-a-unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build release binaries
+        run: cargo build --release -p paraphina --bin monte_carlo --bin sim_eval
+
+      - name: Run Phase A optimize smoke test
+        run: |
+          python3 -m batch_runs.phase_a.cli optimize \
+            --trials 2 \
+            --mc-runs 10 \
+            --mc-ticks 50 \
+            --out runs/phaseA_ci_smoke \
+            --study ci_smoke \
+            --seed 1
+
+      - name: Verify expected output files exist
+        run: |
+          test -f runs/phaseA_ci_smoke/phaseA/ci_smoke/runs.csv
+          test -f runs/phaseA_ci_smoke/phaseA/ci_smoke/pareto.csv
+          test -f runs/phaseA_ci_smoke/phaseA/ci_smoke/report.md
+          test -f runs/phaseA_ci_smoke/phaseA/ci_smoke/study_meta.json
+
+      - name: Run Phase A promote smoke test
+        run: |
+          python3 -m batch_runs.phase_a.cli promote \
+            --study ci_smoke \
+            --out runs/phaseA_ci_smoke \
+            --promote-dir runs/phaseA_ci_smoke/promoted
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-a-smoke-artifacts
+          path: |
+            runs/phaseA_ci_smoke/**/*.csv
+            runs/phaseA_ci_smoke/**/*.json
+            runs/phaseA_ci_smoke/**/*.md
+            runs/phaseA_ci_smoke/**/*.env
+
