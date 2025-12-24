@@ -58,7 +58,7 @@ pub mod types;
 
 // --- Re-exports for ergonomic external use ---------------------------------
 
-pub use config::Config;
+pub use config::{resolve_effective_profile, Config, EffectiveProfile, ProfileSource, RiskProfile};
 pub use engine::Engine;
 
 // Legacy gateway (preserved for backwards compatibility)

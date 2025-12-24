@@ -273,9 +273,12 @@ Breaking this contract breaks `batch_runs/ts_metrics.py` and `tools/research_tic
 
 These are the highest-impact mismatches currently observed in the repo wiring and tools:
 
-1) **CLI profile vs env profile precedence**
-   - Current main wiring defaults to a CLI profile and can ignore `PARAPHINA_RISK_PROFILE`.
-   - This can silently invalidate runs that rely on env overlays.
+1) ~~**CLI profile vs env profile precedence**~~ **FIXED**
+   - Profile precedence is now correct: CLI arg > env var > scenario file > default.
+   - Both `monte_carlo` and `sim_eval` binaries support `--profile` argument.
+   - `PARAPHINA_RISK_PROFILE` env var is properly honored when no CLI arg is provided.
+   - Explicit startup log line: `effective_risk_profile=<profile> source=<cli|env|scenario|default>`
+   - See `config.rs::resolve_effective_profile()` and tests in `config_profile_tests.rs`.
 
 2) ~~**HardLimit still allows MM quotes**~~ **FIXED (Milestone C)**
    - HardLimit (Critical) regime now implies `kill_switch=true`.

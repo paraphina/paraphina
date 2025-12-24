@@ -43,11 +43,143 @@ pub struct Config {
 ///
 /// These presets only tweak a small set of hyperparameters on top of the
 /// whitepaper-spec default (which we treat as "Balanced").
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskProfile {
     Conservative,
     Balanced,
     Aggressive,
+}
+
+impl RiskProfile {
+    /// Return a stable lowercase name for the profile (used in logs/telemetry).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RiskProfile::Conservative => "conservative",
+            RiskProfile::Balanced => "balanced",
+            RiskProfile::Aggressive => "aggressive",
+        }
+    }
+
+    /// Parse a profile name (case-insensitive). Returns None if unrecognized.
+    pub fn parse(s: &str) -> Option<RiskProfile> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "balanced" | "bal" | "b" => Some(RiskProfile::Balanced),
+            "conservative" | "cons" | "c" => Some(RiskProfile::Conservative),
+            "aggressive" | "agg" | "a" | "loose" | "l" => Some(RiskProfile::Aggressive),
+            _ => None,
+        }
+    }
+}
+
+/// Source of the effective risk profile (for logging/debugging precedence).
+///
+/// Precedence order (highest to lowest):
+/// 1. CLI argument (--profile)
+/// 2. Environment variable (PARAPHINA_RISK_PROFILE)
+/// 3. Scenario file (if applicable)
+/// 4. Default (Balanced)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileSource {
+    /// Explicitly provided via CLI argument (highest priority).
+    Cli,
+    /// Loaded from PARAPHINA_RISK_PROFILE environment variable.
+    Env,
+    /// Loaded from scenario YAML file (sim_eval only).
+    Scenario,
+    /// Default fallback (Balanced).
+    Default,
+}
+
+impl ProfileSource {
+    /// Return a stable lowercase name for the source (used in logs/telemetry).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProfileSource::Cli => "cli",
+            ProfileSource::Env => "env",
+            ProfileSource::Scenario => "scenario",
+            ProfileSource::Default => "default",
+        }
+    }
+}
+
+/// Resolved profile with its source for logging.
+#[derive(Debug, Clone, Copy)]
+pub struct EffectiveProfile {
+    pub profile: RiskProfile,
+    pub source: ProfileSource,
+}
+
+impl EffectiveProfile {
+    /// Log the effective profile at startup (INFO level to stderr).
+    ///
+    /// Format: `effective_risk_profile=<profile> source=<source>`
+    pub fn log_startup(&self) {
+        eprintln!(
+            "effective_risk_profile={} source={}",
+            self.profile.as_str(),
+            self.source.as_str()
+        );
+    }
+}
+
+/// Resolve the effective risk profile using standard precedence rules.
+///
+/// Precedence (highest to lowest):
+/// 1. `cli_profile` - if Some, use it (source=cli)
+/// 2. `PARAPHINA_RISK_PROFILE` env var - if set and parseable (source=env)
+/// 3. `scenario_profile` - if Some and parseable (source=scenario, for sim_eval)
+/// 4. Default Balanced (source=default)
+///
+/// # Arguments
+/// * `cli_profile` - Profile from CLI argument (--profile), if provided
+/// * `scenario_profile` - Profile from scenario spec, if applicable (sim_eval)
+///
+/// # Returns
+/// `EffectiveProfile` with the resolved profile and its source.
+pub fn resolve_effective_profile(
+    cli_profile: Option<RiskProfile>,
+    scenario_profile: Option<&str>,
+) -> EffectiveProfile {
+    // 1. CLI takes highest precedence
+    if let Some(p) = cli_profile {
+        return EffectiveProfile {
+            profile: p,
+            source: ProfileSource::Cli,
+        };
+    }
+
+    // 2. Environment variable
+    if let Ok(env_val) = std::env::var("PARAPHINA_RISK_PROFILE") {
+        if !env_val.is_empty() {
+            if let Some(p) = RiskProfile::parse(&env_val) {
+                return EffectiveProfile {
+                    profile: p,
+                    source: ProfileSource::Env,
+                };
+            }
+            // Non-empty but unparseable: warn and fall through
+            eprintln!(
+                "[config] WARN: invalid PARAPHINA_RISK_PROFILE={:?}; ignoring",
+                env_val
+            );
+        }
+    }
+
+    // 3. Scenario profile (for sim_eval)
+    if let Some(s) = scenario_profile {
+        if let Some(p) = RiskProfile::parse(s) {
+            return EffectiveProfile {
+                profile: p,
+                source: ProfileSource::Scenario,
+            };
+        }
+    }
+
+    // 4. Default
+    EffectiveProfile {
+        profile: RiskProfile::Balanced,
+        source: ProfileSource::Default,
+    }
 }
 
 #[derive(Debug, Clone)]
