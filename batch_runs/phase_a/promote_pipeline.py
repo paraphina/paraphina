@@ -528,19 +528,127 @@ def check_suite_format(suite_path: Path) -> Tuple[bool, str]:
         return False, f"parse error: {e}"
 
 
+def parse_suite_yaml(suite_path: Path) -> Dict[str, Any]:
+    """
+    Parse a suite YAML file into a dictionary.
+    
+    Simple parser that handles:
+    - suite_id, out_dir, repeat_runs
+    - scenarios with id, path, seed, profile, env_overrides
+    """
+    if not suite_path.exists():
+        return {}
+    
+    result: Dict[str, Any] = {"scenarios": []}
+    current_scenario: Optional[Dict[str, Any]] = None
+    in_env_overrides = False
+    
+    try:
+        for line in suite_path.read_text().split("\n"):
+            stripped = line.strip()
+            
+            # Skip comments and empty lines
+            if not stripped or stripped.startswith("#"):
+                continue
+            
+            # Top-level keys
+            if not line.startswith(" ") and ":" in stripped:
+                key, val = stripped.split(":", 1)
+                key = key.strip()
+                val = val.strip()
+                if key == "suite_id":
+                    result["suite_id"] = val
+                elif key == "out_dir":
+                    result["out_dir"] = val
+                elif key == "repeat_runs":
+                    try:
+                        result["repeat_runs"] = int(val)
+                    except ValueError:
+                        pass
+                in_env_overrides = False
+                current_scenario = None
+                continue
+            
+            # Scenario list item
+            if stripped.startswith("- id:") or stripped.startswith("- path:"):
+                if current_scenario:
+                    result["scenarios"].append(current_scenario)
+                current_scenario = {}
+                in_env_overrides = False
+                
+                if stripped.startswith("- id:"):
+                    current_scenario["id"] = stripped.split(":", 1)[1].strip()
+                else:
+                    current_scenario["path"] = stripped.split(":", 1)[1].strip()
+                continue
+            
+            # Scenario properties
+            if current_scenario is not None:
+                if stripped.startswith("id:"):
+                    current_scenario["id"] = stripped.split(":", 1)[1].strip()
+                elif stripped.startswith("path:"):
+                    current_scenario["path"] = stripped.split(":", 1)[1].strip()
+                elif stripped.startswith("seed:"):
+                    try:
+                        current_scenario["seed"] = int(stripped.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif stripped.startswith("profile:"):
+                    current_scenario["profile"] = stripped.split(":", 1)[1].strip()
+                elif stripped.startswith("env_overrides:"):
+                    in_env_overrides = True
+                    current_scenario["env_overrides"] = {}
+                elif in_env_overrides and ":" in stripped:
+                    key, val = stripped.split(":", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if key.startswith("PARAPHINA_"):
+                        current_scenario["env_overrides"][key] = val
+        
+        # Add final scenario
+        if current_scenario:
+            result["scenarios"].append(current_scenario)
+    except Exception:
+        pass
+    
+    return result
+
+
+def merge_env_overlays(
+    candidate_env: Dict[str, str],
+    suite_scenario_env: Dict[str, str],
+) -> Dict[str, str]:
+    """
+    Merge candidate env overlay with suite scenario env_overrides.
+    
+    Priority (highest to lowest):
+    1. suite scenario env_overrides (stress test params)
+    2. candidate config env overlay (tuning params)
+    3. existing environment (os.environ)
+    
+    This allows adversarial suites to override candidate settings.
+    """
+    merged = candidate_env.copy()
+    merged.update(suite_scenario_env)
+    return merged
+
+
 def run_suite(
     suite_path: Path,
+    output_dir: Path,
     env_overlay: Dict[str, str],
     verbose: bool = False,
 ) -> Tuple[bool, List[str]]:
     """
-    Run a suite using sim_eval suite command.
+    Run a suite using sim_eval suite command with --output-dir.
     
-    Returns (passed, errors). All suite formats are now supported including
-    inline env_overrides (Phase A-2.1 implementation).
+    ALWAYS uses --output-dir for institutional-grade output isolation.
+    Merges candidate env_overlay with suite scenario env_overrides.
+    
+    Returns (passed, errors).
     """
     if not suite_path.exists():
-        return True, []  # Skip if suite doesn't exist
+        return False, [f"Suite file not found: {suite_path}"]
     
     # Check suite format (for logging purposes only, all formats supported)
     compatible, reason = check_suite_format(suite_path)
@@ -549,19 +657,36 @@ def run_suite(
             print(f"    Suite {suite_path.name}: {reason}")
         return False, [f"Suite check failed: {reason}"]
     
+    # Parse suite to get env_overrides from scenarios
+    suite_data = parse_suite_yaml(suite_path)
+    
+    # Build merged env with all scenario env_overrides
+    # (sim_eval will handle per-scenario overrides, but we provide base env)
+    merged_env = os.environ.copy()
+    merged_env.update(env_overlay)
+    
+    # If suite has inline scenarios with env_overrides, those override candidate env
+    for scenario in suite_data.get("scenarios", []):
+        scenario_env = scenario.get("env_overrides", {})
+        if scenario_env:
+            merged_env = merge_env_overlays(merged_env, scenario_env)
+    
+    # Ensure output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ALWAYS use --output-dir for institutional-grade output isolation
     if SIM_EVAL_BIN.exists():
-        cmd = [str(SIM_EVAL_BIN), "suite", str(suite_path)]
+        cmd = [str(SIM_EVAL_BIN), "suite", str(suite_path),
+               "--output-dir", str(output_dir), "--verbose"]
     else:
         cmd = ["cargo", "run", "-p", "paraphina", "--bin", "sim_eval", "--release", "--",
-               "suite", str(suite_path)]
-    
-    env = os.environ.copy()
-    env.update(env_overlay)
+               "suite", str(suite_path), "--output-dir", str(output_dir), "--verbose"]
     
     if verbose:
-        print(f"    Running suite: {suite_path.name} ({reason})")
+        print(f"    Running suite: {suite_path.name} -> {output_dir}")
+        print(f"      Format: {reason}")
     
-    proc = subprocess.run(cmd, env=env, cwd=str(ROOT), capture_output=True, text=True)
+    proc = subprocess.run(cmd, env=merged_env, cwd=str(ROOT), capture_output=True, text=True)
     
     if proc.returncode == 0:
         return True, []
@@ -653,12 +778,16 @@ def evaluate_trial(
     Evaluate a single candidate trial.
     
     Contract:
-    1. Create isolated trial directory
+    1. Create isolated trial directory: runs/phaseA/<study>/<trial_id>/
     2. Write candidate.env
     3. Run monte_carlo to <trial>/mc/
-    4. Verify evidence pack
-    5. Run research + adversarial suites
-    6. Parse metrics from mc_summary.json
+    4. Verify evidence pack (hard fail if verification fails)
+    5. Run research suite with --output-dir <trial>/suite/research_v1/
+    6. Run adversarial suite with --output-dir <trial>/suite/adversarial_regression_v1/
+    7. Verify evidence tree for entire trial (hard fail if verification fails)
+    8. Parse metrics from mc_summary.json
+    
+    CRITICAL: Adversarial suites are NEVER skipped. Missing suite = trial failure.
     """
     t0 = time.time()
     
@@ -684,8 +813,8 @@ def evaluate_trial(
     mc_kill_prob_ci_upper = float("nan")
     mc_total_runs = 0
     evidence_verified = False
-    research_passed = True
-    adversarial_passed = True
+    research_passed = False  # Default to False - must explicitly pass
+    adversarial_passed = False  # Default to False - must explicitly pass
     error_message: Optional[str] = None
     
     # Step 1: Run Monte Carlo
@@ -704,34 +833,84 @@ def evaluate_trial(
         mc_kill_prob_ci_upper = metrics.get("kill_prob_ci_upper", float("nan"))
         mc_total_runs = metrics.get("total_runs", 0)
         
-        # Verify evidence pack
+        # Verify MC evidence pack
         verified, errs = verify_evidence_tree(mc_dir, verbose)
-        evidence_verified = verified
         if not verified:
             evidence_errors.extend(errs)
+            if verbose:
+                print(f"    ✗ MC evidence verification FAILED")
     else:
         evidence_errors.extend(errors)
         error_message = f"Monte Carlo failed: {'; '.join(errors)}"
     
-    # Step 2: Run out-of-sample suite
+    # Step 2: Run research suite with --output-dir (REQUIRED)
+    # Suite output goes to: <trial>/suite/research_v1/
+    research_suite_dir = trial_dir / "suite" / "research_v1"
+    
     if RESEARCH_SUITE.exists():
-        oos_dir = trial_dir / "oos" / "research_v1"
-        oos_dir.mkdir(parents=True, exist_ok=True)
-        
-        passed, errors = run_suite(RESEARCH_SUITE, env_overlay, verbose)
+        passed, errors = run_suite(RESEARCH_SUITE, research_suite_dir, env_overlay, verbose)
         research_passed = passed
         if not passed:
             evidence_errors.extend(errors)
+            if verbose:
+                print(f"    ✗ Research suite FAILED")
+        else:
+            # Verify research suite evidence
+            verified, errs = verify_evidence_tree(research_suite_dir, verbose)
+            if not verified:
+                evidence_errors.extend(errs)
+                research_passed = False
+                if verbose:
+                    print(f"    ✗ Research suite evidence verification FAILED")
+    else:
+        # Missing suite file is a configuration error, not skippable
+        if verbose:
+            print(f"    ✗ Research suite file not found: {RESEARCH_SUITE}")
+        evidence_errors.append(f"Research suite file not found: {RESEARCH_SUITE}")
     
-    # Step 3: Run adversarial regression suite
+    # Step 3: Run adversarial regression suite with --output-dir (REQUIRED - NEVER SKIP)
+    # Suite output goes to: <trial>/suite/adversarial_regression_v1/
+    adversarial_suite_dir = trial_dir / "suite" / "adversarial_regression_v1"
+    
     if ADVERSARIAL_SUITE.exists():
-        adv_dir = trial_dir / "oos" / "adversarial_regression_v1"
-        adv_dir.mkdir(parents=True, exist_ok=True)
-        
-        passed, errors = run_suite(ADVERSARIAL_SUITE, env_overlay, verbose)
+        passed, errors = run_suite(ADVERSARIAL_SUITE, adversarial_suite_dir, env_overlay, verbose)
         adversarial_passed = passed
         if not passed:
             evidence_errors.extend(errors)
+            if verbose:
+                print(f"    ✗ Adversarial suite FAILED")
+        else:
+            # Verify adversarial suite evidence
+            verified, errs = verify_evidence_tree(adversarial_suite_dir, verbose)
+            if not verified:
+                evidence_errors.extend(errs)
+                adversarial_passed = False
+                if verbose:
+                    print(f"    ✗ Adversarial suite evidence verification FAILED")
+    else:
+        # Missing adversarial suite is a HARD FAILURE - never skip
+        if verbose:
+            print(f"    ✗ CRITICAL: Adversarial suite file not found: {ADVERSARIAL_SUITE}")
+        evidence_errors.append(f"CRITICAL: Adversarial suite file not found: {ADVERSARIAL_SUITE}")
+    
+    # Step 4: Final evidence verification for entire trial directory
+    # This catches any missed evidence packs and enforces provenance
+    if verbose:
+        print(f"    Verifying trial evidence tree: {trial_dir}")
+    
+    final_verified, final_errs = verify_evidence_tree(trial_dir, verbose)
+    if not final_verified:
+        evidence_errors.extend(final_errs)
+        if verbose:
+            print(f"    ✗ Trial evidence tree verification FAILED")
+    
+    # Evidence is verified only if ALL verification steps passed
+    evidence_verified = (
+        final_verified
+        and research_passed
+        and adversarial_passed
+        and not error_message
+    )
     
     duration_sec = time.time() - t0
     

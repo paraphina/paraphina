@@ -134,32 +134,41 @@ def run_suite(
     verbose: bool = False,
 ) -> Tuple[bool, Dict[str, Any], List[str]]:
     """
-    Run a suite using sim_eval suite command.
+    Run a suite using sim_eval suite command with --output-dir.
     
-    Note: sim_eval suite uses out_dir from the suite YAML file, not CLI.
-    We run it anyway for validation and aggregate metrics from the default location.
+    ALWAYS uses --output-dir for institutional-grade output isolation.
+    All artifacts go under output_dir, including evidence packs.
     
     Returns (success, metrics_dict, error_messages).
     """
     if not SIM_EVAL_BIN.exists():
-        return False, {}, [f"sim_eval binary not found at {SIM_EVAL_BIN}"]
+        # Try cargo run fallback
+        cmd = [
+            "cargo", "run", "-p", "paraphina", "--bin", "sim_eval", "--release", "--",
+            "suite", str(suite_path),
+            "--output-dir", str(output_dir),
+            "--verbose",
+        ]
+    else:
+        cmd = [
+            str(SIM_EVAL_BIN),
+            "suite",
+            str(suite_path),
+            "--output-dir", str(output_dir),
+            "--verbose",
+        ]
     
     if not suite_path.exists():
         return False, {}, [f"Suite file not found: {suite_path}"]
     
-    # Note: sim_eval suite command doesn't support --output-dir
-    # The suite uses its own out_dir from the YAML file
-    cmd = [
-        str(SIM_EVAL_BIN),
-        "suite",
-        str(suite_path),
-    ]
+    # Ensure output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     env = os.environ.copy()
     env.update(env_overlay)
     
     if verbose:
-        print(f"    Running suite: {suite_path.name}")
+        print(f"    Running suite: {suite_path.name} -> {output_dir}")
     
     proc = subprocess.run(
         cmd,
@@ -177,13 +186,8 @@ def run_suite(
             errors.append(f"Suite run failed with code {proc.returncode}")
         return False, {}, errors
     
-    # Parse summary from the suite's default output directory
-    # Read out_dir from suite YAML
-    suite_out_dir = get_suite_out_dir(suite_path)
-    if suite_out_dir:
-        metrics = aggregate_suite_metrics(ROOT / suite_out_dir)
-    else:
-        metrics = aggregate_suite_metrics(output_dir)
+    # Parse metrics from our output directory (not suite's default out_dir)
+    metrics = aggregate_suite_metrics(output_dir)
     
     return True, metrics, []
 
@@ -402,13 +406,14 @@ def evaluate_candidate(
     error_message: Optional[str] = None
     
     # =========================================================================
-    # Step 1: Run research suite (optional - doesn't fail candidate if missing)
+    # Step 1: Run research suite (REQUIRED - failure marks trial invalid)
+    # Output goes to: <trial>/suite/research_v1/
     # =========================================================================
     if verbose:
         print(f"  [1/3] Research suite...")
     
-    research_dir = trial_dir / "research"
-    research_dir.mkdir(exist_ok=True)
+    research_dir = trial_dir / "suite" / "research_v1"
+    research_dir.mkdir(parents=True, exist_ok=True)
     
     if RESEARCH_SUITE.exists():
         success, metrics, errors = run_suite(
@@ -421,34 +426,34 @@ def evaluate_candidate(
             research_drawdown_cvar = metrics.get("drawdown_cvar", float("nan"))
             research_passed = True
             
-            # Verify evidence if available
-            suite_out = get_suite_out_dir(RESEARCH_SUITE)
-            if suite_out:
-                verified, errs = verify_evidence_tree(ROOT / suite_out, verbose=verbose)
-                if not verified:
-                    # Evidence verification failure is informational, not blocking
-                    if verbose:
-                        print(f"    Research suite evidence verification: {errs}")
+            # Verify evidence in our output directory
+            verified, errs = verify_evidence_tree(research_dir, verbose=verbose)
+            if not verified:
+                research_passed = False
+                all_evidence_verified = False
+                evidence_errors.extend(errs)
+                if verbose:
+                    print(f"    ✗ Research suite evidence verification FAILED")
         else:
-            # Suite failures are warnings, not hard failures
+            research_passed = False
+            evidence_errors.extend(errors)
             if verbose:
-                print(f"    Research suite skipped: {'; '.join(errors)[:100]}...")
-            # Mark as passed anyway to not block on suite issues
-            research_passed = True
+                print(f"    ✗ Research suite FAILED: {'; '.join(errors)[:100]}")
     else:
         if verbose:
-            print(f"    Research suite not found: {RESEARCH_SUITE}")
-        # Continue without research suite for smoke tests
-        research_passed = True
+            print(f"    ✗ Research suite file not found: {RESEARCH_SUITE}")
+        research_passed = False
+        evidence_errors.append(f"Research suite file not found: {RESEARCH_SUITE}")
     
     # =========================================================================
-    # Step 2: Run adversarial regression suite (optional - informational)
+    # Step 2: Run adversarial regression suite (REQUIRED - NEVER SKIP)
+    # Output goes to: <trial>/suite/adversarial_regression_v1/
     # =========================================================================
     if verbose:
         print(f"  [2/3] Adversarial regression suite...")
     
-    adversarial_dir = trial_dir / "adversarial"
-    adversarial_dir.mkdir(exist_ok=True)
+    adversarial_dir = trial_dir / "suite" / "adversarial_regression_v1"
+    adversarial_dir.mkdir(parents=True, exist_ok=True)
     
     if ADVERSARIAL_SUITE.exists():
         success, metrics, errors = run_suite(
@@ -461,23 +466,25 @@ def evaluate_candidate(
             adversarial_drawdown_cvar = metrics.get("drawdown_cvar", float("nan"))
             adversarial_passed = True
             
-            # Verify evidence if available
-            suite_out = get_suite_out_dir(ADVERSARIAL_SUITE)
-            if suite_out:
-                verified, errs = verify_evidence_tree(ROOT / suite_out, verbose=verbose)
-                if not verified:
-                    if verbose:
-                        print(f"    Adversarial suite evidence verification: {errs}")
+            # Verify evidence in our output directory
+            verified, errs = verify_evidence_tree(adversarial_dir, verbose=verbose)
+            if not verified:
+                adversarial_passed = False
+                all_evidence_verified = False
+                evidence_errors.extend(errs)
+                if verbose:
+                    print(f"    ✗ Adversarial suite evidence verification FAILED")
         else:
-            # Suite failures are warnings, not hard failures
+            adversarial_passed = False
+            evidence_errors.extend(errors)
             if verbose:
-                print(f"    Adversarial suite skipped: {'; '.join(errors)[:100]}...")
-            adversarial_passed = True
+                print(f"    ✗ Adversarial suite FAILED: {'; '.join(errors)[:100]}")
     else:
+        # Missing adversarial suite is a HARD FAILURE - never skip
         if verbose:
-            print(f"    Adversarial suite not found: {ADVERSARIAL_SUITE}")
-        # Continue without adversarial suite for smoke tests
-        adversarial_passed = True
+            print(f"    ✗ CRITICAL: Adversarial suite file not found: {ADVERSARIAL_SUITE}")
+        adversarial_passed = False
+        evidence_errors.append(f"CRITICAL: Adversarial suite file not found: {ADVERSARIAL_SUITE}")
     
     # =========================================================================
     # Step 3: Run Monte Carlo robustness evaluation
