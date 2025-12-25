@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use paraphina::config::{resolve_effective_profile, Config, RiskProfile};
 use paraphina::metrics::DrawdownTracker;
@@ -69,7 +69,8 @@ struct RunArgs {
 struct SuiteArgs {
     suite_path: PathBuf,
     /// Base output directory for suite runs (overrides suite's out_dir).
-    output_dir: PathBuf,
+    /// If None, a unique default directory will be generated.
+    output_dir: Option<PathBuf>,
     verbose: bool,
     ablations: Vec<String>,
     /// CLI-provided profile override (highest precedence).
@@ -121,8 +122,8 @@ RUN OPTIONS:
   --profile NAME     Override risk profile (balanced|conservative|aggressive)
 
 SUITE OPTIONS:
-  --output-dir DIR       Base output directory (default: runs/)
-                         Output goes exactly to DIR (no suffix unless ablations active)
+  --output-dir DIR       Explicit output directory (all artifacts go here)
+                         If not specified, uses: runs/suites/<suite_id>/<timestamp>/
   --verbose              Print verbose output
   --ablation <ID>        Enable an ablation (can be specified multiple times)
   --profile NAME         Override risk profile (balanced|conservative|aggressive)
@@ -227,6 +228,190 @@ EXAMPLE:
 "
 }
 
+// =============================================================================
+// Suite output directory generation
+// =============================================================================
+
+/// Generate a unique default output directory for a suite run.
+///
+/// Format: `runs/suites/<suite_id>/<timestamp>/`
+///
+/// The timestamp format is `YYYYMMDD_HHMMSS` for lexicographic sorting.
+///
+/// This ensures suite outputs are isolated and don't pollute the `runs/`
+/// directory directly, making it easier to identify and verify specific runs.
+pub fn generate_default_suite_output_dir(suite_id: &str) -> PathBuf {
+    let timestamp = generate_timestamp_str();
+    PathBuf::from("runs")
+        .join("suites")
+        .join(suite_id)
+        .join(timestamp)
+}
+
+/// Generate a timestamp string for directory naming.
+///
+/// Format: `YYYYMMDD_HHMMSS` (e.g., `20251225_143052`)
+fn generate_timestamp_str() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    // Convert to components (simplified, not timezone-aware)
+    let total_secs = now.as_secs();
+    let secs_per_min = 60;
+    let secs_per_hour = 3600;
+    let secs_per_day = 86400;
+
+    // Days since epoch for date calculation
+    let days_since_epoch = total_secs / secs_per_day;
+    let time_of_day = total_secs % secs_per_day;
+
+    let hours = time_of_day / secs_per_hour;
+    let minutes = (time_of_day % secs_per_hour) / secs_per_min;
+    let seconds = time_of_day % secs_per_min;
+
+    // Calculate year, month, day (simplified algorithm)
+    let (year, month, day) = days_to_ymd(days_since_epoch as i64);
+
+    format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+/// Convert days since epoch to (year, month, day).
+///
+/// Simplified Gregorian calendar calculation.
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    // Days since 1970-01-01
+    let mut remaining = days;
+    let mut year = 1970;
+
+    // Find year
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+
+    // Find month
+    let days_in_months: [i64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1;
+    for days_in_month in &days_in_months {
+        if remaining < *days_in_month {
+            break;
+        }
+        remaining -= *days_in_month;
+        month += 1;
+    }
+
+    let day = remaining + 1; // Days are 1-indexed
+
+    (year, month, day as u32)
+}
+
+/// Check if a year is a leap year.
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Parse suite arguments from an iterator of strings.
+///
+/// This is a testable version of the suite argument parsing logic.
+/// Used for testing CLI argument parsing without relying on env::args().
+#[cfg(test)]
+fn parse_suite_args_from_iter<I, S>(args: I) -> Result<SuiteArgs, String>
+where
+    I: Iterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut suite_args = SuiteArgs {
+        suite_path: PathBuf::new(),
+        output_dir: None,
+        verbose: false,
+        ablations: Vec::new(),
+        profile: None,
+    };
+    let mut suite_set = false;
+    let mut args = args.peekable();
+
+    while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
+        match arg {
+            "--help" | "-h" => {
+                // In tests, we don't want to exit; just skip
+                continue;
+            }
+            "--output-dir" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --output-dir".to_string())?;
+                suite_args.output_dir = Some(PathBuf::from(val.as_ref()));
+            }
+            "--verbose" | "-v" => {
+                suite_args.verbose = true;
+            }
+            "--ablation" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --ablation".to_string())?;
+                suite_args.ablations.push(val.as_ref().to_string());
+            }
+            "--profile" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --profile".to_string())?;
+                suite_args.profile = Some(RiskProfile::parse(val.as_ref()).ok_or_else(|| {
+                    format!(
+                        "Invalid --profile '{}'. Expected: balanced|conservative|aggressive",
+                        val.as_ref()
+                    )
+                })?);
+            }
+            _ if arg.starts_with("--output-dir=") => {
+                suite_args.output_dir = Some(PathBuf::from(&arg["--output-dir=".len()..]));
+            }
+            _ if arg.starts_with("--ablation=") => {
+                let val = arg["--ablation=".len()..].to_string();
+                suite_args.ablations.push(val);
+            }
+            _ if arg.starts_with("--profile=") => {
+                let val = &arg["--profile=".len()..];
+                suite_args.profile = Some(RiskProfile::parse(val).ok_or_else(|| {
+                    format!(
+                        "Invalid --profile '{}'. Expected: balanced|conservative|aggressive",
+                        val
+                    )
+                })?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("Unknown option: {}", arg));
+            }
+            _ => {
+                if suite_set {
+                    return Err("Multiple suite paths provided".to_string());
+                }
+                suite_args.suite_path = PathBuf::from(arg);
+                suite_set = true;
+            }
+        }
+    }
+
+    if !suite_set {
+        return Err("Missing required argument: <SUITE_PATH>".to_string());
+    }
+
+    Ok(suite_args)
+}
+
 fn parse_args() -> Result<Command, String> {
     let mut args = env::args().skip(1);
 
@@ -310,7 +495,7 @@ fn parse_args() -> Result<Command, String> {
         "suite" => {
             let mut suite_args = SuiteArgs {
                 suite_path: PathBuf::new(),
-                output_dir: PathBuf::from("runs"),
+                output_dir: None, // None means use default unique directory
                 verbose: false,
                 ablations: Vec::new(),
                 profile: None,
@@ -327,7 +512,7 @@ fn parse_args() -> Result<Command, String> {
                         let val = args
                             .next()
                             .ok_or_else(|| "Missing value for --output-dir".to_string())?;
-                        suite_args.output_dir = PathBuf::from(val);
+                        suite_args.output_dir = Some(PathBuf::from(val));
                     }
                     "--verbose" | "-v" => {
                         suite_args.verbose = true;
@@ -349,7 +534,7 @@ fn parse_args() -> Result<Command, String> {
                         );
                     }
                     _ if arg.starts_with("--output-dir=") => {
-                        suite_args.output_dir = PathBuf::from(&arg["--output-dir=".len()..]);
+                        suite_args.output_dir = Some(PathBuf::from(&arg["--output-dir=".len()..]));
                     }
                     _ if arg.starts_with("--ablation=") => {
                         let val = arg["--ablation=".len()..].to_string();
@@ -1504,10 +1689,20 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
 
     let build_info = BuildInfo::capture();
 
-    // Use CLI-provided output_dir as base.
+    // Determine output directory:
+    // - If user specified --output-dir, use that exactly
+    // - Otherwise, generate a unique default: runs/suites/<suite_id>/<timestamp>/
+    let base_out_dir = match &args.output_dir {
+        Some(dir) => dir.clone(),
+        None => generate_default_suite_output_dir(&suite.suite_id),
+    };
+
     // Only append ablation suffix if ablations are actually active (not for baseline).
-    let base_out_dir = args.output_dir.to_string_lossy();
-    let effective_out_dir = format!("{}{}", base_out_dir, ablations.dir_suffix_optional());
+    let effective_out_dir = format!(
+        "{}{}",
+        base_out_dir.display(),
+        ablations.dir_suffix_optional()
+    );
 
     println!(
         "sim_eval suite | suite={} version={} repeat_runs={} scenarios={}",
@@ -1892,11 +2087,29 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
         effective_out_dir
     );
 
+    // Print explicit next-steps for verification
+    println!();
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("OUTPUT LOCATIONS & VERIFICATION");
+    println!("═══════════════════════════════════════════════════════════════");
+    println!("Output written to: {}/", effective_out_dir);
+    println!(
+        "Evidence Pack written to: {}/evidence_pack/",
+        effective_out_dir
+    );
+    println!();
+    println!(
+        "To verify all packs:      sim_eval verify-evidence-tree {}",
+        effective_out_dir
+    );
+    println!(
+        "To verify the root pack:  sim_eval verify-evidence-pack {}",
+        effective_out_dir
+    );
+
     if stats.gate_failures.is_empty() {
         println!();
         println!("✓ ALL GATES PASSED");
-        println!();
-        println!("Output written to: {}/", effective_out_dir);
         0
     } else {
         println!();
@@ -1904,8 +2117,6 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
         for failure in &stats.gate_failures {
             println!("  - {}", failure);
         }
-        println!();
-        println!("Output written to: {}/", effective_out_dir);
         1
     }
 }
@@ -2030,6 +2241,28 @@ fn cmd_verify_evidence_pack(args: VerifyEvidencePackArgs) -> i32 {
 }
 
 fn cmd_verify_evidence_tree(args: VerifyEvidenceTreeArgs) -> i32 {
+    // Check if user passed an evidence_pack directory directly
+    // This is a common operator error - detect and provide a helpful hint
+    if is_evidence_pack_dir(&args.root) {
+        eprintln!("ERROR: You passed an evidence_pack directory.");
+        eprintln!();
+        eprintln!(
+            "The path '{}' appears to be an evidence_pack directory",
+            args.root.display()
+        );
+        eprintln!("(it contains SHA256SUMS at the root level).");
+        eprintln!();
+        eprintln!("To verify this evidence pack, use one of:");
+        if let Some(parent) = args.root.parent() {
+            eprintln!("  sim_eval verify-evidence-pack {}", parent.display());
+            eprintln!("  sim_eval verify-evidence-tree {}", parent.display());
+        } else {
+            eprintln!("  sim_eval verify-evidence-pack <parent_directory>");
+            eprintln!("  sim_eval verify-evidence-tree <suite_root>");
+        }
+        return 3;
+    }
+
     match verify_evidence_pack_tree(&args.root) {
         Ok(report) => {
             println!(
@@ -2045,6 +2278,24 @@ fn cmd_verify_evidence_tree(args: VerifyEvidenceTreeArgs) -> i32 {
             3
         }
     }
+}
+
+/// Check if a path appears to be an evidence_pack directory.
+///
+/// Returns true if:
+/// - The path ends with "evidence_pack" AND
+/// - The path contains SHA256SUMS at the root level
+fn is_evidence_pack_dir(path: &Path) -> bool {
+    // Check if path name is "evidence_pack"
+    let is_named_evidence_pack = path
+        .file_name()
+        .map(|n| n == "evidence_pack")
+        .unwrap_or(false);
+
+    // Check if SHA256SUMS exists at root level
+    let has_sha256sums = path.join("SHA256SUMS").exists();
+
+    is_named_evidence_pack && has_sha256sums
 }
 
 // =============================================================================
@@ -2076,4 +2327,338 @@ fn main() {
     };
 
     std::process::exit(exit_code);
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// Test that default suite output directory is NOT `runs/` directly.
+    ///
+    /// This ensures output isolation - suites should go to:
+    ///   runs/suites/<suite_id>/<timestamp>/
+    #[test]
+    fn test_default_suite_output_dir_not_runs_directly() {
+        let suite_id = "test_suite";
+        let output_dir = generate_default_suite_output_dir(suite_id);
+
+        // Should NOT be just "runs/"
+        assert_ne!(output_dir, PathBuf::from("runs"));
+        assert_ne!(output_dir, PathBuf::from("runs/"));
+
+        // Should start with "runs/suites/"
+        let path_str = output_dir.to_string_lossy();
+        assert!(
+            path_str.starts_with("runs/suites/"),
+            "Expected path to start with 'runs/suites/', got: {}",
+            path_str
+        );
+
+        // Should contain the suite_id
+        assert!(
+            path_str.contains(suite_id),
+            "Expected path to contain suite_id '{}', got: {}",
+            suite_id,
+            path_str
+        );
+    }
+
+    /// Test that default suite output directory has the correct structure.
+    #[test]
+    fn test_default_suite_output_dir_structure() {
+        let suite_id = "my_ci_smoke";
+        let output_dir = generate_default_suite_output_dir(suite_id);
+
+        // Parse the path components
+        let components: Vec<_> = output_dir.components().collect();
+
+        // Should have at least 4 components: runs, suites, <suite_id>, <timestamp>
+        assert!(
+            components.len() >= 4,
+            "Expected at least 4 path components, got: {:?}",
+            components
+        );
+
+        // First component should be "runs"
+        assert_eq!(
+            components[0].as_os_str(),
+            "runs",
+            "First component should be 'runs'"
+        );
+
+        // Second component should be "suites"
+        assert_eq!(
+            components[1].as_os_str(),
+            "suites",
+            "Second component should be 'suites'"
+        );
+
+        // Third component should be the suite_id
+        assert_eq!(
+            components[2].as_os_str(),
+            suite_id,
+            "Third component should be the suite_id"
+        );
+
+        // Fourth component should be a timestamp (8 digits + underscore + 6 digits)
+        let timestamp = components[3].as_os_str().to_string_lossy();
+        assert!(
+            timestamp.len() == 15, // YYYYMMDD_HHMMSS
+            "Timestamp should be 15 characters (YYYYMMDD_HHMMSS), got: {} (len={})",
+            timestamp,
+            timestamp.len()
+        );
+        assert!(
+            timestamp.chars().nth(8) == Some('_'),
+            "Timestamp should have underscore at position 8, got: {}",
+            timestamp
+        );
+    }
+
+    /// Test that timestamp generation produces valid format.
+    #[test]
+    fn test_timestamp_format() {
+        let timestamp = generate_timestamp_str();
+
+        // Should be exactly 15 characters: YYYYMMDD_HHMMSS
+        assert_eq!(
+            timestamp.len(),
+            15,
+            "Timestamp should be 15 characters, got: {} (len={})",
+            timestamp,
+            timestamp.len()
+        );
+
+        // Should have underscore at position 8
+        assert_eq!(
+            timestamp.chars().nth(8),
+            Some('_'),
+            "Expected underscore at position 8, got: {}",
+            timestamp
+        );
+
+        // Date part should be all digits
+        let date_part = &timestamp[..8];
+        assert!(
+            date_part.chars().all(|c| c.is_ascii_digit()),
+            "Date part should be all digits, got: {}",
+            date_part
+        );
+
+        // Time part should be all digits
+        let time_part = &timestamp[9..];
+        assert!(
+            time_part.chars().all(|c| c.is_ascii_digit()),
+            "Time part should be all digits, got: {}",
+            time_part
+        );
+
+        // Year should be reasonable (2020-2100)
+        let year: u32 = date_part[..4].parse().unwrap();
+        assert!(
+            (2020..=2100).contains(&year),
+            "Year should be between 2020 and 2100, got: {}",
+            year
+        );
+
+        // Month should be 01-12
+        let month: u32 = date_part[4..6].parse().unwrap();
+        assert!(
+            (1..=12).contains(&month),
+            "Month should be between 1 and 12, got: {}",
+            month
+        );
+
+        // Day should be 01-31
+        let day: u32 = date_part[6..8].parse().unwrap();
+        assert!(
+            (1..=31).contains(&day),
+            "Day should be between 1 and 31, got: {}",
+            day
+        );
+    }
+
+    /// Test that is_evidence_pack_dir correctly identifies evidence pack directories.
+    #[test]
+    fn test_is_evidence_pack_dir_detection() {
+        let dir = tempdir().unwrap();
+
+        // Create a valid evidence_pack directory structure
+        let evidence_pack_dir = dir.path().join("evidence_pack");
+        fs::create_dir_all(&evidence_pack_dir).unwrap();
+        fs::write(evidence_pack_dir.join("SHA256SUMS"), "test content").unwrap();
+
+        // Should detect this as an evidence_pack directory
+        assert!(
+            is_evidence_pack_dir(&evidence_pack_dir),
+            "Should detect evidence_pack directory with SHA256SUMS"
+        );
+
+        // Parent directory should NOT be detected as evidence_pack
+        assert!(
+            !is_evidence_pack_dir(dir.path()),
+            "Parent directory should not be detected as evidence_pack"
+        );
+    }
+
+    /// Test that is_evidence_pack_dir returns false for non-evidence directories.
+    #[test]
+    fn test_is_evidence_pack_dir_false_positives() {
+        let dir = tempdir().unwrap();
+
+        // Directory named "evidence_pack" but no SHA256SUMS
+        let ep_without_sums = dir.path().join("evidence_pack");
+        fs::create_dir_all(&ep_without_sums).unwrap();
+        assert!(
+            !is_evidence_pack_dir(&ep_without_sums),
+            "evidence_pack directory without SHA256SUMS should not match"
+        );
+
+        // Directory with SHA256SUMS but wrong name
+        let wrong_name = dir.path().join("outputs");
+        fs::create_dir_all(&wrong_name).unwrap();
+        fs::write(wrong_name.join("SHA256SUMS"), "content").unwrap();
+        assert!(
+            !is_evidence_pack_dir(&wrong_name),
+            "Directory with SHA256SUMS but wrong name should not match"
+        );
+
+        // Regular file named evidence_pack (not a directory)
+        let file_path = dir.path().join("evidence_pack_file");
+        fs::write(&file_path, "not a directory").unwrap();
+        assert!(
+            !is_evidence_pack_dir(&file_path),
+            "File should not be detected as evidence_pack directory"
+        );
+    }
+
+    /// Test that consecutive calls generate different directories.
+    #[test]
+    fn test_unique_directories_per_call() {
+        // Sleep to ensure timestamps differ
+        let dir1 = generate_default_suite_output_dir("test_suite");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let dir2 = generate_default_suite_output_dir("test_suite");
+
+        // Directories should be different (different timestamps)
+        // Note: This test might occasionally fail if both calls happen in the same second
+        // In practice, the 1-second sleep should prevent this
+        assert_ne!(
+            dir1, dir2,
+            "Consecutive calls should generate different directories"
+        );
+    }
+
+    /// Test that different suite IDs generate different directory prefixes.
+    #[test]
+    fn test_different_suite_ids_different_directories() {
+        let dir1 = generate_default_suite_output_dir("suite_a");
+        let dir2 = generate_default_suite_output_dir("suite_b");
+
+        // Paths should contain respective suite IDs
+        assert!(
+            dir1.to_string_lossy().contains("suite_a"),
+            "dir1 should contain 'suite_a'"
+        );
+        assert!(
+            dir2.to_string_lossy().contains("suite_b"),
+            "dir2 should contain 'suite_b'"
+        );
+
+        // The suite_id portion should be different
+        assert_ne!(
+            dir1.parent(),
+            dir2.parent(),
+            "Different suite IDs should have different parent directories"
+        );
+    }
+
+    /// Test that suite CLI accepts --output-dir and parses it correctly.
+    ///
+    /// Regression test: ensures `sim_eval suite <path> --output-dir <dir> --verbose`
+    /// correctly sets output_dir in the parsed SuiteArgs.
+    #[test]
+    fn test_suite_output_dir_cli_parsing() {
+        // Test: sim_eval suite suites/test.yaml --output-dir /custom/output --verbose
+        let args = vec![
+            "suites/test.yaml",
+            "--output-dir",
+            "/custom/output",
+            "--verbose",
+        ];
+
+        let parsed =
+            parse_suite_args_from_iter(args.into_iter()).expect("Should parse successfully");
+
+        assert_eq!(
+            parsed.suite_path,
+            PathBuf::from("suites/test.yaml"),
+            "suite_path should be set correctly"
+        );
+        assert_eq!(
+            parsed.output_dir,
+            Some(PathBuf::from("/custom/output")),
+            "--output-dir should be parsed as Some(PathBuf)"
+        );
+        assert!(parsed.verbose, "--verbose should be true");
+    }
+
+    /// Test that suite CLI accepts --output-dir= syntax.
+    #[test]
+    fn test_suite_output_dir_equals_syntax() {
+        // Test: sim_eval suite suites/test.yaml --output-dir=/path/to/output
+        let args = vec!["suites/test.yaml", "--output-dir=/path/to/output"];
+
+        let parsed =
+            parse_suite_args_from_iter(args.into_iter()).expect("Should parse successfully");
+
+        assert_eq!(
+            parsed.output_dir,
+            Some(PathBuf::from("/path/to/output")),
+            "--output-dir= syntax should be parsed correctly"
+        );
+    }
+
+    /// Test that suite CLI without --output-dir leaves output_dir as None.
+    #[test]
+    fn test_suite_no_output_dir_is_none() {
+        // Test: sim_eval suite suites/test.yaml --verbose
+        let args = vec!["suites/test.yaml", "--verbose"];
+
+        let parsed =
+            parse_suite_args_from_iter(args.into_iter()).expect("Should parse successfully");
+
+        assert_eq!(
+            parsed.output_dir, None,
+            "output_dir should be None when --output-dir not specified"
+        );
+    }
+
+    /// Test that suite CLI with multiple options parses correctly.
+    #[test]
+    fn test_suite_full_options_parsing() {
+        // Test: sim_eval suite suites/ci.yaml --output-dir ./runs/custom --verbose --ablation disable_vol_floor
+        let args = vec![
+            "suites/ci.yaml",
+            "--output-dir",
+            "./runs/custom",
+            "--verbose",
+            "--ablation",
+            "disable_vol_floor",
+        ];
+
+        let parsed =
+            parse_suite_args_from_iter(args.into_iter()).expect("Should parse successfully");
+
+        assert_eq!(parsed.suite_path, PathBuf::from("suites/ci.yaml"));
+        assert_eq!(parsed.output_dir, Some(PathBuf::from("./runs/custom")));
+        assert!(parsed.verbose);
+        assert_eq!(parsed.ablations, vec!["disable_vol_floor"]);
+    }
 }
