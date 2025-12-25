@@ -29,66 +29,82 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Run Python unit tests
+        run: |
+          python3 -m unittest discover -s batch_runs/phase_a/tests -p "test_*.py" -q
+
       - name: Run adversarial search (smoke mode for CI)
         run: |
-          python3 batch_runs/exp_phase_a_adversarial_search.py \
+          python3 -m batch_runs.phase_a.adversarial_search_promote \
             --smoke \
-            --out runs/ci_adversarial \
-            --top-k 3
+            --out runs/phaseA_adv_search_smoke_ci
 
-      - name: Verify evidence packs for adversarial scenarios
+      - name: Verify adversarial search evidence
         run: |
-          # Find all scenario directories and verify each
-          for dir in runs/ci_adversarial/run_*/scenario_*; do
-            if [ -d "$dir" ]; then
-              echo "Verifying: $dir"
-              cargo run --release -p paraphina --bin sim_eval -- verify-evidence-pack "$dir"
+          cargo run --release -p paraphina --bin sim_eval -- \
+            verify-evidence-tree runs/phaseA_adv_search_smoke_ci
+
+      - name: Run adversarial regression suite v2
+        run: |
+          if [ -f scenarios/suites/adversarial_regression_v2.yaml ]; then
+            echo "Running adversarial regression suite v2 (path-based)..."
+            cargo run --release -p paraphina --bin sim_eval -- \
+              suite scenarios/suites/adversarial_regression_v2.yaml \
+              --output-dir runs/adv_reg_v2_smoke_ci \
+              --verbose
+            echo "✓ Adversarial regression suite v2 completed"
+          else
+            echo "No adversarial_regression_v2.yaml found, trying v1..."
+            if [ -f scenarios/suites/adversarial_regression_v1.yaml ]; then
+              cargo run --release -p paraphina --bin sim_eval -- \
+                suite scenarios/suites/adversarial_regression_v1.yaml \
+                --output-dir runs/adv_reg_v1_smoke_ci \
+                --verbose
+              echo "✓ Adversarial regression suite v1 completed"
+            else
+              echo "No adversarial suite found, skipping"
             fi
-          done
+          fi
 
-      - name: Check for critical failures
+      - name: Verify adversarial suite evidence
         run: |
-          # Parse failure_seeds.json and fail if any scenario has kill_rate > 0
-          # This is a safety gate for adversarial regression
+          # Verify v2 suite output
+          if [ -d runs/adv_reg_v2_smoke_ci ]; then
+            echo "Verifying evidence packs in runs/adv_reg_v2_smoke_ci..."
+            cargo run --release -p paraphina --bin sim_eval -- \
+              verify-evidence-tree runs/adv_reg_v2_smoke_ci
+            echo "✓ Evidence packs verified"
+          # Fallback to v1 output
+          elif [ -d runs/adv_reg_v1_smoke_ci ]; then
+            echo "Verifying evidence packs in runs/adv_reg_v1_smoke_ci..."
+            cargo run --release -p paraphina --bin sim_eval -- \
+              verify-evidence-tree runs/adv_reg_v1_smoke_ci
+            echo "✓ Evidence packs verified"
+          else
+            echo "No adversarial suite output found"
+          fi
+
+      - name: Check search results
+        run: |
           python3 - <<'EOF'
           import json
-          import sys
           from pathlib import Path
           
-          # Find the latest run directory
-          runs_dir = Path("runs/ci_adversarial")
-          if not runs_dir.exists():
-              print("ERROR: No adversarial run directory found")
-              sys.exit(1)
+          topk_path = Path("runs/phaseA_adv_search_smoke_ci/topk.json")
+          if not topk_path.exists():
+              print("ERROR: topk.json not found")
+              exit(1)
           
-          run_dirs = sorted([d for d in runs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")])
-          if not run_dirs:
-              print("ERROR: No run directories found")
-              sys.exit(1)
-          
-          latest_run = run_dirs[-1]
-          failure_seeds_path = latest_run / "failure_seeds.json"
-          
-          if not failure_seeds_path.exists():
-              print(f"ERROR: failure_seeds.json not found in {latest_run}")
-              sys.exit(1)
-          
-          with open(failure_seeds_path) as f:
+          with open(topk_path) as f:
               data = json.load(f)
           
-          failures = data.get("failure_seeds", [])
-          print(f"Found {len(failures)} failure seeds")
+          scenarios = data.get("scenarios", [])
+          print(f"Promoted {len(scenarios)} adversarial scenarios:")
           
-          # In adversarial mode, we expect to find failures.
-          # The CI gate is: evidence packs must verify (checked above)
-          # and we log the failure seeds for review.
+          for s in scenarios:
+              print(f"  Rank {s['rank']}: seed={s['seed']}, score={s['adversarial_score']:.2f}")
           
-          for seed in failures:
-              print(f"  Rank {seed['rank']}: {seed['scenario_id']} "
-                    f"(kill_ci_upper={seed.get('kill_prob_ci_upper', 'N/A'):.3f})")
-          
-          print("\nAdversarial regression completed successfully.")
-          print("Failure seeds have been logged for review.")
+          print("\n✓ Adversarial search completed successfully")
           EOF
 
       - name: Upload adversarial results
@@ -97,31 +113,8 @@ jobs:
         with:
           name: adversarial-regression-results
           path: |
-            runs/ci_adversarial/**/exp_phase_a_adversarial_search_runs.csv
-            runs/ci_adversarial/**/exp_phase_a_adversarial_search_summary.csv
-            runs/ci_adversarial/**/failure_seeds.json
-            runs/ci_adversarial/**/mc_summary.json
-
-      - name: Run adversarial regression suite
-        run: |
-          if [ -f scenarios/suites/adversarial_regression_v1.yaml ]; then
-            echo "Running adversarial regression suite (env_overrides now supported)..."
-            cargo run --release -p paraphina --bin sim_eval -- \
-              suite scenarios/suites/adversarial_regression_v1.yaml
-            echo "✓ Adversarial regression suite completed"
-          else
-            echo "No adversarial_regression_v1.yaml found, skipping suite run"
-          fi
-
-      - name: Verify adversarial suite evidence packs
-        run: |
-          # The adversarial suite writes to runs/adversarial_regression per its YAML
-          if [ -d runs/adversarial_regression ]; then
-            echo "Verifying evidence packs in runs/adversarial_regression..."
-            cargo run --release -p paraphina --bin sim_eval -- \
-              verify-evidence-tree runs/adversarial_regression
-            echo "✓ Evidence packs verified"
-          else
-            echo "No adversarial suite output found"
-          fi
+            runs/phaseA_adv_search_smoke_ci/
+            runs/adv_reg_v2_smoke_ci/
+            scenarios/suites/adversarial_regression_v2.yaml
+            scenarios/v1/adversarial/generated_v1/
 
