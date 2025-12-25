@@ -39,10 +39,69 @@ A scenario is a versioned spec that fully defines a run:
 
 ## 2) Output Schema (artifacts)
 
-Runner outputs a directory per run:
-runs/<scenario_id>/<timestamp_or_commit>/<seed_k>/
+### Single Scenario Runs
 
-Required files:
+For `sim_eval run`, outputs go to:
+
+```
+runs/<scenario_id>/<timestamp_or_commit>/<seed_k>/
+```
+
+### Suite Runs
+
+For `sim_eval suite`, output isolation is institutional-grade:
+
+- **With `--output-dir`**: All artifacts go exactly to the specified directory
+- **Without `--output-dir`**: A unique directory is auto-generated:
+  ```
+  runs/suites/<suite_id>/<timestamp>/
+  ```
+
+The **suite output root** contains:
+
+```
+runs/suites/<suite_id>/<timestamp>/
+├── evidence_pack/           # Root evidence pack for the entire suite
+│   ├── manifest.json
+│   ├── suite.yaml
+│   └── SHA256SUMS
+├── <scenario_1>/            # Per-scenario outputs
+│   ├── run_summary.json
+│   ├── config_resolved.json
+│   ├── build_info.json
+│   └── evidence_pack/       # Per-scenario evidence pack
+└── <scenario_N>/
+    └── ...
+```
+
+### Suite `--output-dir` Option
+
+The `sim_eval suite` command supports an explicit `--output-dir` option:
+
+```bash
+# Run suite with explicit output directory
+sim_eval suite suites/ci_smoke.yaml --output-dir ./my_run
+
+# All artifacts go under ./my_run/
+# Evidence pack is at ./my_run/evidence_pack/
+```
+
+When `--output-dir` is specified:
+- All suite artifacts are written exactly to that directory
+- Evidence pack is written to `<output-dir>/evidence_pack/`
+
+To verify the outputs:
+
+```bash
+# Verify all evidence packs (root + per-scenario)
+sim_eval verify-evidence-tree <output-dir>
+
+# Verify only the root evidence pack
+sim_eval verify-evidence-pack <output-dir>
+```
+
+### Required files per run
+
 - run_summary.json  # small, stable; CI compares this
 - metrics.jsonl     # optional streaming metrics (tick or periodic)
 - config_resolved.json  # fully resolved scenario + defaults applied
