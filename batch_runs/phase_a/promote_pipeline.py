@@ -500,25 +500,28 @@ def get_suite_out_dir(suite_path: Path) -> Optional[str]:
 
 def check_suite_format(suite_path: Path) -> Tuple[bool, str]:
     """
-    Check if suite has compatible format (path-based scenarios).
+    Check if suite has compatible format.
     
-    Returns (compatible, reason) - suites with inline env_overrides instead of
-    path fields are not compatible with sim_eval suite command.
+    Returns (compatible, reason) - all suite formats are now supported,
+    including inline env_overrides (Phase A-2.1 implementation).
     """
     if not suite_path.exists():
         return False, "file not found"
     
     try:
         content = suite_path.read_text()
-        # Simple check: if scenarios use 'path:' they're compatible
-        # If they use 'env_overrides:' inline, they need different handling
+        # All formats are now supported:
+        # - path-based scenarios: run in-process
+        # - inline env_overrides: run as subprocess with merged env
         has_path = "  - path:" in content or "- path:" in content
         has_inline = "env_overrides:" in content and "  - id:" in content
         
-        if has_path:
-            return True, "path-based scenarios"
+        if has_path and has_inline:
+            return True, "mixed path and inline scenarios"
         elif has_inline:
-            return False, "inline env_overrides (not supported by sim_eval suite)"
+            return True, "inline env_overrides (subprocess mode)"
+        elif has_path:
+            return True, "path-based scenarios"
         else:
             return True, "unknown format, will attempt"
     except Exception as e:
@@ -533,19 +536,18 @@ def run_suite(
     """
     Run a suite using sim_eval suite command.
     
-    Returns (passed, errors). Suites with incompatible formats are skipped
-    with a warning but considered "passed" for gating purposes.
+    Returns (passed, errors). All suite formats are now supported including
+    inline env_overrides (Phase A-2.1 implementation).
     """
     if not suite_path.exists():
         return True, []  # Skip if suite doesn't exist
     
-    # Check suite format compatibility
+    # Check suite format (for logging purposes only, all formats supported)
     compatible, reason = check_suite_format(suite_path)
     if not compatible:
         if verbose:
-            print(f"    Skipping suite {suite_path.name}: {reason}")
-        # Incompatible format is not a failure - just can't run this suite
-        return True, [f"Suite skipped: {reason}"]
+            print(f"    Suite {suite_path.name}: {reason}")
+        return False, [f"Suite check failed: {reason}"]
     
     if SIM_EVAL_BIN.exists():
         cmd = [str(SIM_EVAL_BIN), "suite", str(suite_path)]
@@ -557,7 +559,7 @@ def run_suite(
     env.update(env_overlay)
     
     if verbose:
-        print(f"    Running suite: {suite_path.name}")
+        print(f"    Running suite: {suite_path.name} ({reason})")
     
     proc = subprocess.run(cmd, env=env, cwd=str(ROOT), capture_output=True, text=True)
     
@@ -567,6 +569,11 @@ def run_suite(
         errors = []
         if proc.stderr:
             errors.append(proc.stderr.strip()[:200])
+        if proc.stdout:
+            # Include last few lines of stdout which may have failure info
+            stdout_lines = proc.stdout.strip().split('\n')
+            if stdout_lines:
+                errors.append("; ".join(stdout_lines[-3:])[:200])
         return False, errors
 
 

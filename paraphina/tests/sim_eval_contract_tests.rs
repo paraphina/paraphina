@@ -431,11 +431,17 @@ fn test_parse_ci_smoke_suite_yaml() {
     assert_eq!(suite.repeat_runs, 2);
     assert_eq!(suite.out_dir, "runs/ci");
     assert_eq!(suite.scenarios.len(), 3);
-    assert_eq!(suite.scenarios[0].path, "scenarios/v1/synth_baseline.yaml");
-    assert_eq!(suite.scenarios[1].path, "scenarios/v1/synth_jump.yaml");
     assert_eq!(
-        suite.scenarios[2].path,
-        "scenarios/v1/historical_replay_stub.yaml"
+        suite.scenarios[0].path(),
+        Some("scenarios/v1/synth_baseline.yaml")
+    );
+    assert_eq!(
+        suite.scenarios[1].path(),
+        Some("scenarios/v1/synth_jump.yaml")
+    );
+    assert_eq!(
+        suite.scenarios[2].path(),
+        Some("scenarios/v1/historical_replay_stub.yaml")
     );
 }
 

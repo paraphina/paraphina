@@ -12,6 +12,7 @@
 //   cargo run -p paraphina --bin sim_eval -- suite scenarios/suites/ci_smoke_v1.yaml
 //   cargo run -p paraphina --bin sim_eval -- summarize runs/
 
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -22,10 +23,11 @@ use paraphina::rl::sim_env::SimEnvConfig;
 use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
     create_output_dir, print_ablations, run_report, summarize_with_format,
-    verify_evidence_pack_dir, verify_evidence_pack_tree, write_build_info, write_config_resolved,
-    write_config_resolved_with_ablations, write_evidence_pack, AblationSet, BuildInfo, Engine,
-    ExpectKillSwitch, KillSwitchInfo, MarketModelType, OutputFormat, ReportArgs, ReportResult,
-    RunSummary, ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
+    verify_evidence_pack_dir, verify_evidence_pack_tree, with_env_overrides, write_build_info,
+    write_config_resolved, write_config_resolved_with_ablations, write_evidence_pack, AblationSet,
+    BuildInfo, Engine, ExpectKillSwitch, InlineScenario, KillSwitchInfo, MarketModelType,
+    OutputFormat, ReportArgs, ReportResult, RunSummary, ScenarioRef, ScenarioSpec, SuiteSpec,
+    SummarizeResult, SyntheticProcess,
 };
 
 // =============================================================================
@@ -66,6 +68,8 @@ struct RunArgs {
 #[derive(Debug)]
 struct SuiteArgs {
     suite_path: PathBuf,
+    /// Base output directory for suite runs (overrides suite's out_dir).
+    output_dir: PathBuf,
     verbose: bool,
     ablations: Vec<String>,
     /// CLI-provided profile override (highest precedence).
@@ -117,9 +121,20 @@ RUN OPTIONS:
   --profile NAME     Override risk profile (balanced|conservative|aggressive)
 
 SUITE OPTIONS:
+  --output-dir DIR       Base output directory (default: runs/)
+                         Output goes exactly to DIR (no suffix unless ablations active)
   --verbose              Print verbose output
   --ablation <ID>        Enable an ablation (can be specified multiple times)
   --profile NAME         Override risk profile (balanced|conservative|aggressive)
+
+  Suites support inline env_overrides per scenario (see SUITE YAML SUPPORT).
+
+SUITE YAML SUPPORT:
+  Inline scenarios with env_overrides allow per-scenario environment configuration:
+    - id: my_scenario
+      seed: 42
+      env_overrides: { PARAPHINA_RISK_PROFILE: aggressive }
+  env_overrides can be YAML mappings or lists of KEY=VALUE strings.
 
 PROFILE PRECEDENCE:
   1) --profile CLI argument (highest)
@@ -151,6 +166,7 @@ EXAMPLES:
   sim_eval run scenarios/v1/synth_baseline.yaml
   sim_eval run scenarios/v1/synth_jump.yaml --output-dir ./my_runs --verbose
   sim_eval suite scenarios/suites/ci_smoke_v1.yaml
+  sim_eval suite scenarios/suites/ci_smoke_v1.yaml --output-dir ./my_runs
   sim_eval suite scenarios/suites/research_v1.yaml --ablation disable_vol_floor
   sim_eval summarize runs/
   sim_eval summarize runs/ --format md
@@ -294,6 +310,7 @@ fn parse_args() -> Result<Command, String> {
         "suite" => {
             let mut suite_args = SuiteArgs {
                 suite_path: PathBuf::new(),
+                output_dir: PathBuf::from("runs"),
                 verbose: false,
                 ablations: Vec::new(),
                 profile: None,
@@ -305,6 +322,12 @@ fn parse_args() -> Result<Command, String> {
                     "--help" | "-h" => {
                         println!("{}", usage());
                         std::process::exit(0);
+                    }
+                    "--output-dir" => {
+                        let val = args
+                            .next()
+                            .ok_or_else(|| "Missing value for --output-dir".to_string())?;
+                        suite_args.output_dir = PathBuf::from(val);
                     }
                     "--verbose" | "-v" => {
                         suite_args.verbose = true;
@@ -324,6 +347,9 @@ fn parse_args() -> Result<Command, String> {
                                 format!("Invalid --profile '{}'. Expected: balanced|conservative|aggressive", val)
                             })?,
                         );
+                    }
+                    _ if arg.starts_with("--output-dir=") => {
+                        suite_args.output_dir = PathBuf::from(&arg["--output-dir=".len()..]);
                     }
                     _ if arg.starts_with("--ablation=") => {
                         let val = arg["--ablation=".len()..].to_string();
@@ -1123,6 +1149,11 @@ enum GateFailure {
         path: String,
         message: String,
     },
+    SubprocessFailed {
+        scenario_id: String,
+        exit_code: Option<i32>,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for GateFailure {
@@ -1159,6 +1190,20 @@ impl std::fmt::Display for GateFailure {
             GateFailure::ScenarioLoad { path, message } => {
                 write!(f, "[LOAD] {}: {}", path, message)
             }
+            GateFailure::SubprocessFailed {
+                scenario_id,
+                exit_code,
+                message,
+            } => {
+                let code_str = exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                write!(
+                    f,
+                    "[SUBPROCESS] {}: exit={} - {}",
+                    scenario_id, code_str, message
+                )
+            }
         }
     }
 }
@@ -1171,6 +1216,258 @@ struct SuiteStats {
     seeds_passed: usize,
     runs_total: usize,
     gate_failures: Vec<GateFailure>,
+}
+
+/// Result of running an inline scenario in-process.
+struct InlineScenarioResult {
+    output_dir: PathBuf,
+    success: bool,
+    error_message: Option<String>,
+    run_result: Option<RunResult>,
+}
+
+/// Create a minimal ScenarioSpec for inline scenarios.
+///
+/// The inline scenario has limited fields, so we create a default spec
+/// and let env_overrides control the actual configuration.
+fn create_inline_scenario_spec(inline: &InlineScenario, steps: u64) -> ScenarioSpec {
+    use paraphina::sim_eval::{
+        Horizon, InitialState, Invariants, MarketModel, MarketModelType, MicrostructureModel,
+        PnlLinearityCheck, Rng, SyntheticConfig, SyntheticParams,
+    };
+
+    // Parse profile from string (env_overrides may override this)
+    let risk_profile = RiskProfile::parse(&inline.profile)
+        .unwrap_or(RiskProfile::Balanced)
+        .as_str()
+        .to_string();
+
+    ScenarioSpec {
+        scenario_id: inline.id.clone(),
+        scenario_version: 1,
+        engine: Engine::RlSimEnv,
+        horizon: Horizon {
+            steps,
+            dt_seconds: 0.1,
+        },
+        rng: Rng {
+            base_seed: inline.seed,
+            num_seeds: 1,
+        },
+        initial_state: InitialState {
+            risk_profile,
+            init_q_tao: 0.0,
+        },
+        market_model: MarketModel {
+            model_type: MarketModelType::Synthetic,
+            synthetic: Some(SyntheticConfig {
+                process: SyntheticProcess::Gbm,
+                params: SyntheticParams {
+                    vol: 0.20,
+                    drift: 0.0,
+                    jump_intensity: 0.0,
+                    jump_sigma: 0.0,
+                },
+            }),
+            historical_stub: None,
+        },
+        microstructure_model: MicrostructureModel {
+            fees_bps_maker: -0.25,
+            fees_bps_taker: 0.75,
+            latency_ms: 1.0,
+        },
+        invariants: Invariants {
+            expect_kill_switch: ExpectKillSwitch::Allowed,
+            pnl_linearity_check: PnlLinearityCheck::Disabled,
+        },
+    }
+}
+
+/// Run an inline scenario in-process with scoped environment overrides.
+///
+/// Uses with_env_overrides to temporarily set environment variables,
+/// runs the simulation, then restores the previous environment.
+#[allow(clippy::too_many_arguments)]
+fn run_inline_scenario(
+    inline: &InlineScenario,
+    scenario_index: usize,
+    suite_env: &BTreeMap<String, String>,
+    out_dir: &Path,
+    repeat_runs: u32,
+    verbose: bool,
+    build_info: &BuildInfo,
+    ablations: &AblationSet,
+    cli_profile: Option<RiskProfile>,
+) -> InlineScenarioResult {
+    // Merge environment: suite-level + scenario-level (scenario wins)
+    let merged_env = inline.merge_env(suite_env);
+
+    // Create stable output directory: <out_dir>/<index>_<scenario_id>/
+    let scenario_out_dir = out_dir.join(format!("{:04}_{}", scenario_index, &inline.id));
+
+    if let Err(e) = std::fs::create_dir_all(&scenario_out_dir) {
+        return InlineScenarioResult {
+            output_dir: scenario_out_dir,
+            success: false,
+            error_message: Some(format!("Failed to create output directory: {}", e)),
+            run_result: None,
+        };
+    }
+
+    if verbose {
+        eprintln!(
+            "    Running inline scenario: {} (seed={}, {} env overrides)",
+            inline.id,
+            inline.seed,
+            merged_env.len()
+        );
+        for (k, v) in &merged_env {
+            eprintln!("      {}={}", k, v);
+        }
+    }
+
+    // Run simulation with scoped environment overrides
+    let steps = 100; // Smoke-level steps for inline scenarios
+    let spec = create_inline_scenario_spec(inline, steps);
+
+    // Run repeat_runs times to check determinism
+    let run_result: Result<(RunResult, RunSummary, Vec<String>), String> =
+        with_env_overrides(&merged_env, || {
+            let mut checksums: Vec<String> = Vec::with_capacity(repeat_runs as usize);
+            let mut last_result: Option<RunResult> = None;
+            let mut last_summary: Option<RunSummary> = None;
+
+            for run_idx in 0..repeat_runs {
+                if verbose && run_idx > 0 {
+                    eprintln!("      Repeat run {}/{}", run_idx + 1, repeat_runs);
+                }
+
+                let (result, summary) =
+                    run_single_seed_with_profile(&spec, inline.seed, false, ablations, cli_profile);
+                checksums.push(result.checksum.clone());
+                last_result = Some(result);
+                last_summary = Some(summary);
+            }
+
+            Ok((last_result.unwrap(), last_summary.unwrap(), checksums))
+        });
+
+    match run_result {
+        Ok((result, _summary, checksums)) => {
+            // Check determinism if repeat_runs > 1
+            if repeat_runs > 1 {
+                let first = &checksums[0];
+                if !checksums.iter().all(|c| c == first) {
+                    return InlineScenarioResult {
+                        output_dir: scenario_out_dir,
+                        success: false,
+                        error_message: Some(format!(
+                            "Determinism check failed: checksums differ across {} runs",
+                            repeat_runs
+                        )),
+                        run_result: Some(result),
+                    };
+                }
+            }
+
+            // Write output files
+            let summary_with_build = RunSummary::with_ablations(
+                &spec,
+                inline.seed,
+                build_info.clone(),
+                result.final_pnl,
+                result.max_drawdown,
+                result.kill_switch.clone(),
+                ablations,
+            );
+
+            let run_summary_path = scenario_out_dir.join("run_summary.json");
+            let config_resolved_path = scenario_out_dir.join("config_resolved.json");
+            let build_info_path = scenario_out_dir.join("build_info.json");
+
+            if let Err(e) = summary_with_build.write_to_file(&run_summary_path) {
+                return InlineScenarioResult {
+                    output_dir: scenario_out_dir,
+                    success: false,
+                    error_message: Some(format!("Failed to write run_summary.json: {}", e)),
+                    run_result: Some(result),
+                };
+            }
+
+            if let Err(e) =
+                write_config_resolved_with_ablations(&config_resolved_path, &spec, ablations)
+            {
+                return InlineScenarioResult {
+                    output_dir: scenario_out_dir,
+                    success: false,
+                    error_message: Some(format!("Failed to write config_resolved.json: {}", e)),
+                    run_result: Some(result),
+                };
+            }
+
+            if let Err(e) = write_build_info(&build_info_path, build_info) {
+                return InlineScenarioResult {
+                    output_dir: scenario_out_dir,
+                    success: false,
+                    error_message: Some(format!("Failed to write build_info.json: {}", e)),
+                    run_result: Some(result),
+                };
+            }
+
+            // Write evidence pack for this scenario
+            let artifact_paths = vec![
+                PathBuf::from("run_summary.json"),
+                PathBuf::from("config_resolved.json"),
+                PathBuf::from("build_info.json"),
+            ];
+
+            // Create a synthetic suite path for the evidence pack
+            let suite_yaml_content = format!(
+                "# Auto-generated for inline scenario\nscenario_id: {}\nseed: {}\nenv_overrides:\n{}",
+                inline.id,
+                inline.seed,
+                merged_env
+                    .iter()
+                    .map(|(k, v)| format!("  {}: \"{}\"", k, v))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+
+            let synthetic_suite_path = scenario_out_dir.join("scenario.yaml");
+            if let Err(e) = std::fs::write(&synthetic_suite_path, &suite_yaml_content) {
+                return InlineScenarioResult {
+                    output_dir: scenario_out_dir,
+                    success: false,
+                    error_message: Some(format!("Failed to write scenario.yaml: {}", e)),
+                    run_result: Some(result),
+                };
+            }
+
+            if let Err(e) =
+                write_evidence_pack(&scenario_out_dir, &synthetic_suite_path, &artifact_paths)
+            {
+                return InlineScenarioResult {
+                    output_dir: scenario_out_dir,
+                    success: false,
+                    error_message: Some(format!("Failed to write evidence pack: {}", e)),
+                    run_result: Some(result),
+                };
+            }
+
+            InlineScenarioResult {
+                output_dir: scenario_out_dir,
+                success: true,
+                error_message: None,
+                run_result: Some(result),
+            }
+        }
+        Err(e) => InlineScenarioResult {
+            output_dir: scenario_out_dir,
+            success: false,
+            error_message: Some(e),
+            run_result: None,
+        },
+    }
 }
 
 fn cmd_suite(args: SuiteArgs) -> i32 {
@@ -1207,8 +1504,10 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
 
     let build_info = BuildInfo::capture();
 
-    // Compute effective output directory with ablation suffix
-    let effective_out_dir = format!("{}{}", suite.out_dir, ablations.dir_suffix());
+    // Use CLI-provided output_dir as base.
+    // Only append ablation suffix if ablations are actually active (not for baseline).
+    let base_out_dir = args.output_dir.to_string_lossy();
+    let effective_out_dir = format!("{}{}", base_out_dir, ablations.dir_suffix_optional());
 
     println!(
         "sim_eval suite | suite={} version={} repeat_runs={} scenarios={}",
@@ -1247,198 +1546,317 @@ fn cmd_suite(args: SuiteArgs) -> i32 {
     // Track artifact paths relative to output_root for evidence pack
     let mut artifact_paths: Vec<PathBuf> = Vec::new();
 
-    for scenario_ref in &suite.scenarios {
-        println!("━━━ Scenario: {} ━━━", scenario_ref.path);
-
-        let spec = match ScenarioSpec::from_yaml_file(&scenario_ref.path) {
-            Ok(s) => s,
-            Err(e) => {
-                stats.gate_failures.push(GateFailure::ScenarioLoad {
-                    path: scenario_ref.path.clone(),
-                    message: e.to_string(),
-                });
-                println!("  FAILED to load: {}", e);
-                println!();
-                continue;
-            }
-        };
-
-        // Warn about unsupported engines/models
-        if spec.engine == Engine::ReplayStub {
-            println!("  Warning: replay_stub engine not implemented, using rl_sim_env fallback");
-        }
-        if spec.market_model.model_type == MarketModelType::HistoricalStub {
+    // Log if suite has inline scenarios
+    if suite.has_inline_scenarios() {
+        println!("               | mode=subprocess (suite has inline env_overrides)");
+        if !suite.env_overrides.is_empty() {
             println!(
-                "  Warning: historical_stub market model not implemented, using synthetic fallback"
+                "               | suite_env_overrides={:?}",
+                suite.env_overrides.keys().collect::<Vec<_>>()
             );
         }
+        println!();
+    }
 
-        let seeds = spec.expand_seeds();
-        stats.seeds_total += seeds.len();
+    for (scenario_index, scenario_ref) in suite.scenarios.iter().enumerate() {
+        match scenario_ref {
+            ScenarioRef::Path { path } => {
+                // Path-based scenario: run in-process (original behavior)
+                println!("━━━ Scenario: {} ━━━", path);
 
-        let mut scenario_passed = true;
-
-        for (_k, seed) in &seeds {
-            // Collect checksums across repeat_runs
-            let mut checksums: Vec<String> = Vec::with_capacity(suite.repeat_runs as usize);
-            let mut last_result: Option<RunResult> = None;
-            let mut last_summary: Option<RunSummary> = None;
-
-            for run_idx in 0..suite.repeat_runs {
-                if args.verbose {
-                    eprintln!(
-                        "  Running seed {} run {}/{}",
-                        seed,
-                        run_idx + 1,
-                        suite.repeat_runs
-                    );
-                }
-
-                let (result, summary) =
-                    run_single_seed_with_profile(&spec, *seed, false, &ablations, args.profile);
-                checksums.push(result.checksum.clone());
-
-                stats.runs_total += 1;
-
-                // Store last result for invariant checking and output writing
-                last_result = Some(result);
-                last_summary = Some(summary);
-            }
-
-            let result = last_result.unwrap();
-            let summary = last_summary.unwrap();
-
-            // Gate 1: Schema completeness
-            if let Err(e) = verify_schema_completeness(&summary) {
-                stats.gate_failures.push(GateFailure::SchemaCompleteness {
-                    scenario_id: spec.scenario_id.clone(),
-                    seed: *seed,
-                    message: e,
-                });
-                scenario_passed = false;
-            }
-
-            // Gate 2: Determinism (if repeat_runs > 1)
-            if suite.repeat_runs > 1 {
-                let first_checksum = &checksums[0];
-                let all_same = checksums.iter().all(|c| c == first_checksum);
-                if !all_same {
-                    stats.gate_failures.push(GateFailure::Determinism {
-                        scenario_id: spec.scenario_id.clone(),
-                        seed: *seed,
-                        checksums: checksums.clone(),
-                    });
-                    scenario_passed = false;
-                }
-            }
-
-            // Gate 3: Invariants
-            if let Err(e) = check_invariants(&spec, &result) {
-                stats.gate_failures.push(GateFailure::Invariant {
-                    scenario_id: spec.scenario_id.clone(),
-                    seed: *seed,
-                    message: e,
-                });
-                scenario_passed = false;
-            }
-
-            // Write outputs (once per seed, not per repeat)
-            // Note: ablation info is already encoded in effective_out_dir suffix
-            let output_dir =
-                match create_output_dir(out_dir, &spec.scenario_id, &build_info.git_sha, *seed) {
-                    Ok(dir) => dir,
+                let spec = match ScenarioSpec::from_yaml_file(path) {
+                    Ok(s) => s,
                     Err(e) => {
-                        eprintln!("  Failed to create output directory: {}", e);
+                        stats.gate_failures.push(GateFailure::ScenarioLoad {
+                            path: path.clone(),
+                            message: e.to_string(),
+                        });
+                        println!("  FAILED to load: {}", e);
+                        println!();
                         continue;
                     }
                 };
 
-            let summary_with_build = RunSummary::with_ablations(
-                &spec,
-                *seed,
-                build_info.clone(),
-                result.final_pnl,
-                result.max_drawdown,
-                result.kill_switch.clone(),
-                &ablations,
-            );
-
-            // Write output files and track relative paths for evidence pack
-            let run_summary_path = output_dir.join("run_summary.json");
-            let config_resolved_path = output_dir.join("config_resolved.json");
-            let build_info_path = output_dir.join("build_info.json");
-
-            let _ = summary_with_build.write_to_file(&run_summary_path);
-            let _ = write_config_resolved_with_ablations(&config_resolved_path, &spec, &ablations);
-            let _ = write_build_info(&build_info_path, &build_info);
-
-            // Track artifact paths relative to out_dir for evidence pack
-            if let Ok(rel_path) = run_summary_path.strip_prefix(out_dir) {
-                artifact_paths.push(rel_path.to_path_buf());
-            }
-            if let Ok(rel_path) = config_resolved_path.strip_prefix(out_dir) {
-                artifact_paths.push(rel_path.to_path_buf());
-            }
-            if let Ok(rel_path) = build_info_path.strip_prefix(out_dir) {
-                artifact_paths.push(rel_path.to_path_buf());
-            }
-
-            // Print seed status
-            let determinism_status = if suite.repeat_runs > 1 {
-                let first = &checksums[0];
-                if checksums.iter().all(|c| c == first) {
-                    "DETERM"
-                } else {
-                    "DIFFER"
+                // Warn about unsupported engines/models
+                if spec.engine == Engine::ReplayStub {
+                    println!(
+                        "  Warning: replay_stub engine not implemented, using rl_sim_env fallback"
+                    );
                 }
-            } else {
-                "N/A"
-            };
+                if spec.market_model.model_type == MarketModelType::HistoricalStub {
+                    println!(
+                    "  Warning: historical_stub market model not implemented, using synthetic fallback"
+                );
+                }
 
-            let kill_str = if result.kill_switch.triggered {
-                format!(
-                    "KILL@{}",
-                    result
-                        .kill_switch
-                        .step
-                        .map(|s| s.to_string())
-                        .unwrap_or_default()
-                )
-            } else {
-                "OK".to_string()
-            };
+                let seeds = spec.expand_seeds();
+                stats.seeds_total += seeds.len();
 
-            let seed_passed = !stats.gate_failures.iter().any(|f| match f {
-                GateFailure::SchemaCompleteness { seed: s, .. }
-                | GateFailure::Determinism { seed: s, .. }
-                | GateFailure::Invariant { seed: s, .. } => *s == *seed,
-                _ => false,
-            });
+                let mut scenario_passed = true;
 
-            if seed_passed {
-                stats.seeds_passed += 1;
+                for (_k, seed) in &seeds {
+                    // Collect checksums across repeat_runs
+                    let mut checksums: Vec<String> = Vec::with_capacity(suite.repeat_runs as usize);
+                    let mut last_result: Option<RunResult> = None;
+                    let mut last_summary: Option<RunSummary> = None;
+
+                    for run_idx in 0..suite.repeat_runs {
+                        if args.verbose {
+                            eprintln!(
+                                "  Running seed {} run {}/{}",
+                                seed,
+                                run_idx + 1,
+                                suite.repeat_runs
+                            );
+                        }
+
+                        let (result, summary) = run_single_seed_with_profile(
+                            &spec,
+                            *seed,
+                            false,
+                            &ablations,
+                            args.profile,
+                        );
+                        checksums.push(result.checksum.clone());
+
+                        stats.runs_total += 1;
+
+                        // Store last result for invariant checking and output writing
+                        last_result = Some(result);
+                        last_summary = Some(summary);
+                    }
+
+                    let result = last_result.unwrap();
+                    let summary = last_summary.unwrap();
+
+                    // Gate 1: Schema completeness
+                    if let Err(e) = verify_schema_completeness(&summary) {
+                        stats.gate_failures.push(GateFailure::SchemaCompleteness {
+                            scenario_id: spec.scenario_id.clone(),
+                            seed: *seed,
+                            message: e,
+                        });
+                        scenario_passed = false;
+                    }
+
+                    // Gate 2: Determinism (if repeat_runs > 1)
+                    if suite.repeat_runs > 1 {
+                        let first_checksum = &checksums[0];
+                        let all_same = checksums.iter().all(|c| c == first_checksum);
+                        if !all_same {
+                            stats.gate_failures.push(GateFailure::Determinism {
+                                scenario_id: spec.scenario_id.clone(),
+                                seed: *seed,
+                                checksums: checksums.clone(),
+                            });
+                            scenario_passed = false;
+                        }
+                    }
+
+                    // Gate 3: Invariants
+                    if let Err(e) = check_invariants(&spec, &result) {
+                        stats.gate_failures.push(GateFailure::Invariant {
+                            scenario_id: spec.scenario_id.clone(),
+                            seed: *seed,
+                            message: e,
+                        });
+                        scenario_passed = false;
+                    }
+
+                    // Write outputs (once per seed, not per repeat)
+                    let output_dir = match create_output_dir(
+                        out_dir,
+                        &spec.scenario_id,
+                        &build_info.git_sha,
+                        *seed,
+                    ) {
+                        Ok(dir) => dir,
+                        Err(e) => {
+                            eprintln!("  Failed to create output directory: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let summary_with_build = RunSummary::with_ablations(
+                        &spec,
+                        *seed,
+                        build_info.clone(),
+                        result.final_pnl,
+                        result.max_drawdown,
+                        result.kill_switch.clone(),
+                        &ablations,
+                    );
+
+                    // Write output files and track relative paths for evidence pack
+                    let run_summary_path = output_dir.join("run_summary.json");
+                    let config_resolved_path = output_dir.join("config_resolved.json");
+                    let build_info_path = output_dir.join("build_info.json");
+
+                    let _ = summary_with_build.write_to_file(&run_summary_path);
+                    let _ = write_config_resolved_with_ablations(
+                        &config_resolved_path,
+                        &spec,
+                        &ablations,
+                    );
+                    let _ = write_build_info(&build_info_path, &build_info);
+
+                    // Track artifact paths relative to out_dir for evidence pack
+                    if let Ok(rel_path) = run_summary_path.strip_prefix(out_dir) {
+                        artifact_paths.push(rel_path.to_path_buf());
+                    }
+                    if let Ok(rel_path) = config_resolved_path.strip_prefix(out_dir) {
+                        artifact_paths.push(rel_path.to_path_buf());
+                    }
+                    if let Ok(rel_path) = build_info_path.strip_prefix(out_dir) {
+                        artifact_paths.push(rel_path.to_path_buf());
+                    }
+
+                    // Print seed status
+                    let determinism_status = if suite.repeat_runs > 1 {
+                        let first = &checksums[0];
+                        if checksums.iter().all(|c| c == first) {
+                            "DETERM"
+                        } else {
+                            "DIFFER"
+                        }
+                    } else {
+                        "N/A"
+                    };
+
+                    let kill_str = if result.kill_switch.triggered {
+                        format!(
+                            "KILL@{}",
+                            result
+                                .kill_switch
+                                .step
+                                .map(|s| s.to_string())
+                                .unwrap_or_default()
+                        )
+                    } else {
+                        "OK".to_string()
+                    };
+
+                    let seed_passed = !stats.gate_failures.iter().any(|f| match f {
+                        GateFailure::SchemaCompleteness { seed: s, .. }
+                        | GateFailure::Determinism { seed: s, .. }
+                        | GateFailure::Invariant { seed: s, .. } => *s == *seed,
+                        _ => false,
+                    });
+
+                    if seed_passed {
+                        stats.seeds_passed += 1;
+                    }
+
+                    let status_icon = if seed_passed { "✓" } else { "✗" };
+
+                    println!(
+                        "  {} seed={:<5} pnl={:>10.2} status={:<10} determ={:<6} checksum={}",
+                        status_icon,
+                        seed,
+                        result.final_pnl,
+                        kill_str,
+                        determinism_status,
+                        &result.checksum[..16]
+                    );
+                }
+
+                if scenario_passed {
+                    stats.scenarios_passed += 1;
+                    println!("  → PASS");
+                } else {
+                    println!("  → FAIL");
+                }
+                println!();
             }
 
-            let status_icon = if seed_passed { "✓" } else { "✗" };
+            ScenarioRef::Inline(inline) => {
+                // Inline scenario: run in-process with scoped env overrides
+                println!(
+                    "━━━ Scenario: {} (inline, seed={}) ━━━",
+                    inline.id, inline.seed
+                );
 
-            println!(
-                "  {} seed={:<5} pnl={:>10.2} status={:<10} determ={:<6} checksum={}",
-                status_icon,
-                seed,
-                result.final_pnl,
-                kill_str,
-                determinism_status,
-                &result.checksum[..16]
-            );
-        }
+                stats.seeds_total += 1; // Inline scenarios have a single seed
 
-        if scenario_passed {
-            stats.scenarios_passed += 1;
-            println!("  → PASS");
-        } else {
-            println!("  → FAIL");
+                let result = run_inline_scenario(
+                    inline,
+                    scenario_index,
+                    &suite.env_overrides,
+                    out_dir,
+                    suite.repeat_runs,
+                    args.verbose,
+                    &build_info,
+                    &ablations,
+                    args.profile,
+                );
+
+                stats.runs_total += suite.repeat_runs as usize;
+
+                if result.success {
+                    stats.seeds_passed += 1;
+                    stats.scenarios_passed += 1;
+
+                    // Track run_summary.json as artifact for evidence pack
+                    let run_summary_path = result.output_dir.join("run_summary.json");
+                    if let Ok(rel_path) = run_summary_path.strip_prefix(out_dir) {
+                        artifact_paths.push(rel_path.to_path_buf());
+                    }
+
+                    // Track config_resolved.json
+                    let config_resolved_path = result.output_dir.join("config_resolved.json");
+                    if let Ok(rel_path) = config_resolved_path.strip_prefix(out_dir) {
+                        artifact_paths.push(rel_path.to_path_buf());
+                    }
+
+                    // Track build_info.json
+                    let build_info_path = result.output_dir.join("build_info.json");
+                    if let Ok(rel_path) = build_info_path.strip_prefix(out_dir) {
+                        artifact_paths.push(rel_path.to_path_buf());
+                    }
+
+                    let pnl_str = result
+                        .run_result
+                        .as_ref()
+                        .map(|r| format!("{:.2}", r.final_pnl))
+                        .unwrap_or_else(|| "N/A".to_string());
+
+                    let checksum_str = result
+                        .run_result
+                        .as_ref()
+                        .map(|r| &r.checksum[..16])
+                        .unwrap_or("N/A");
+
+                    println!(
+                        "  ✓ seed={:<5} pnl={:>10} status=OK checksum={}",
+                        inline.seed, pnl_str, checksum_str
+                    );
+                    println!("  → PASS");
+                } else {
+                    let error_msg = result
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    stats.gate_failures.push(GateFailure::SubprocessFailed {
+                        scenario_id: inline.id.clone(),
+                        exit_code: None,
+                        message: error_msg.clone(),
+                    });
+                    println!("  ✗ seed={:<5} status=FAIL", inline.seed);
+                    println!("    Error: {}", error_msg);
+                    println!("  → FAIL");
+                }
+                println!();
+            }
         }
-        println!();
+    }
+
+    // Check for 0 scenarios executed
+    if stats.runs_total == 0 {
+        eprintln!();
+        eprintln!("ERROR: Suite executed 0 scenarios. Check your suite YAML.");
+        eprintln!();
+        eprintln!("Output written to: {}/", effective_out_dir);
+        return 1;
     }
 
     // Print final summary

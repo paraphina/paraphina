@@ -13,6 +13,7 @@
 // Design principle: scenarios fully define runs, outputs are CI-comparable.
 
 pub mod ablation;
+pub mod env_override;
 pub mod evidence_pack;
 pub mod evidence_pack_verify;
 pub mod output;
@@ -40,7 +41,9 @@ pub use scenario::{
     MarketModelType, MicrostructureModel, PnlLinearityCheck, Rng, ScenarioError, ScenarioSpec,
     SyntheticConfig, SyntheticParams, SyntheticProcess, SCENARIO_SCHEMA_VERSION,
 };
-pub use suite::{ScenarioRef, SuiteError, SuiteSpec, SUITE_SCHEMA_VERSION};
+pub use suite::{
+    InlineScenario, ScenarioRef, SuiteError, SuiteInvariants, SuiteSpec, SUITE_SCHEMA_VERSION,
+};
 pub use summarize::{
     get_summary_rows, summarize, summarize_with_format, OutputFormat, SummarizeResult, SummaryRow,
 };
@@ -52,3 +55,6 @@ pub use evidence_pack::write_evidence_pack;
 pub use evidence_pack_verify::{
     verify_evidence_pack_dir, verify_evidence_pack_tree, EvidencePackVerificationReport,
 };
+
+// Scoped environment variable overrides for inline scenarios
+pub use env_override::{parse_env_overrides, with_env_overrides};
