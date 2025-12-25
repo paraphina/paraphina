@@ -1,0 +1,44 @@
+# Adversarial scenario discovered by adversarial_search_promote.py
+# Seed: 44, Profile: aggressive
+# Generated: 2025-12-25T18:46:57.084712+00:00
+
+scenario_id: adv_s00044_c026f852
+scenario_version: 1
+
+engine: rl_sim_env
+
+horizon:
+  steps: 100
+  dt_seconds: 0.25
+
+rng:
+  base_seed: 44
+  num_seeds: 2
+
+initial_state:
+  risk_profile: aggressive
+  init_q_tao: 30.00
+
+market_model:
+  type: synthetic
+  synthetic:
+    process: jump_diffusion_stub
+    params:
+      vol: 0.040000
+      drift: 0.0
+      jump_intensity: 0.001000
+      jump_sigma: 0.0500
+
+microstructure_model:
+  fees_bps_maker: 0.0
+  fees_bps_taker: 2.00
+  latency_ms: 10.0
+
+# Adversarial search metadata
+adversarial_params:
+  vol_multiplier: 2.0000
+  daily_loss_limit: 1000.00
+
+invariants:
+  expect_kill_switch: allowed
+  pnl_linearity_check: disabled
