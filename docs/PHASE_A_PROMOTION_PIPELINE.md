@@ -65,21 +65,34 @@ Options:
 
 ### Trial Directory Structure
 
-Each trial creates an isolated directory:
+Each trial creates an isolated directory with institutional-grade output isolation:
 
 ```
 runs/phaseA/<study>/<trial_id>/
-├── candidate.env           # Configuration overrides
-├── mc/                     # Monte Carlo outputs
-│   ├── mc_summary.json     # Aggregated metrics + tail risk
-│   ├── monte_carlo.yaml    # Run configuration
-│   └── evidence_pack/      # Evidence Pack v1
+├── candidate.env                           # Configuration overrides
+├── mc/                                     # Monte Carlo outputs
+│   ├── mc_summary.json                     # Aggregated metrics + tail risk
+│   ├── monte_carlo.yaml                    # Run configuration
+│   └── evidence_pack/                      # Evidence Pack v1
 │       ├── SHA256SUMS
 │       └── manifest.json
-└── oos/                    # Out-of-sample suite results
-    ├── research_v1/
-    └── adversarial_regression_v1/
+└── suite/                                  # Suite outputs (using --output-dir)
+    ├── research_v1/                        # Research suite output
+    │   ├── evidence_pack/                  # Suite evidence pack
+    │   │   ├── SHA256SUMS
+    │   │   └── manifest.json
+    │   └── <scenario_outputs>/
+    └── adversarial_regression_v1/          # Adversarial suite output
+        ├── evidence_pack/                  # Suite evidence pack
+        │   ├── SHA256SUMS
+        │   └── manifest.json
+        └── <scenario_outputs>/
 ```
+
+**IMPORTANT**: Suites are ALWAYS run with `--output-dir` to ensure:
+- All artifacts are isolated under the trial directory
+- Evidence packs are verifiable with a single command
+- No cross-contamination between trial runs
 
 ### Study-Level Outputs
 
@@ -104,15 +117,58 @@ configs/presets/promoted/<tier>/
 
 For each candidate:
 
-1. Create isolated trial directory
+1. Create isolated trial directory: `runs/phaseA/<study>/<trial_id>/`
 2. Write `candidate.env` with configuration overrides
-3. Run `monte_carlo` binary with env overlay → `mc/`
-4. Verify evidence pack: `sim_eval verify-evidence-tree <trial>/mc/`
-5. Run out-of-sample suite: `sim_eval suite scenarios/suites/research_v1.yaml`
-6. Run adversarial suite: `sim_eval suite scenarios/suites/adversarial_regression_v1.yaml`
-7. Parse metrics from `mc_summary.json`
+3. Run `monte_carlo` binary with env overlay → `<trial>/mc/`
+4. Verify MC evidence pack: `sim_eval verify-evidence-tree <trial>/mc/`
+5. Run research suite WITH --output-dir:
+   ```bash
+   sim_eval suite scenarios/suites/research_v1.yaml \
+     --output-dir <trial>/suite/research_v1 --verbose
+   ```
+6. Verify research evidence: `sim_eval verify-evidence-tree <trial>/suite/research_v1`
+7. Run adversarial suite WITH --output-dir (NEVER SKIPPED):
+   ```bash
+   sim_eval suite scenarios/suites/adversarial_regression_v1.yaml \
+     --output-dir <trial>/suite/adversarial_regression_v1 --verbose
+   ```
+8. Verify adversarial evidence: `sim_eval verify-evidence-tree <trial>/suite/adversarial_regression_v1`
+9. Final verification of entire trial: `sim_eval verify-evidence-tree <trial>/`
+10. Parse metrics from `mc_summary.json`
 
-**Trial fails if evidence verification fails.**
+**Trial fails if ANY evidence verification fails.**
+**Adversarial suite is NEVER skipped - missing suite file = hard failure.**
+
+### Suite env_overrides Merging
+
+When running suites with inline `env_overrides` (e.g., adversarial scenarios):
+
+1. **Candidate env** (from `candidate.env`) provides base configuration
+2. **Suite scenario env_overrides** can override any candidate setting
+3. This allows adversarial scenarios to stress-test specific conditions
+
+Priority (highest to lowest):
+1. Suite scenario `env_overrides` (stress test params)
+2. Candidate config env overlay (tuning params)
+3. Process environment
+
+### Verification Commands
+
+After a trial completes, verify evidence packs:
+
+```bash
+# Verify entire trial directory (all evidence packs)
+sim_eval verify-evidence-tree runs/phaseA/<study>/<trial_id>/
+
+# Verify just the MC evidence pack
+sim_eval verify-evidence-pack runs/phaseA/<study>/<trial_id>/mc/
+
+# Verify just a suite evidence pack
+sim_eval verify-evidence-pack runs/phaseA/<study>/<trial_id>/suite/research_v1/
+
+# Verify entire study directory
+sim_eval verify-evidence-tree runs/phaseA/<study>/
+```
 
 ### 2. Multi-Objective Optimization
 
@@ -194,9 +250,10 @@ export PARAPHINA_MM_SIZE_ETA=1.0
   "config": { ... },
   "env_overlay": { ... },
   "commands_run": [
-    "monte_carlo --runs 50 --seed 47",
-    "sim_eval suite scenarios/suites/research_v1.yaml",
-    "sim_eval suite scenarios/suites/adversarial_regression_v1.yaml"
+    "monte_carlo --runs 50 --seed 47 --output-dir <trial>/mc/",
+    "sim_eval suite research_v1.yaml --output-dir <trial>/suite/research_v1 --verbose",
+    "sim_eval suite adversarial_regression_v1.yaml --output-dir <trial>/suite/adversarial_regression_v1 --verbose",
+    "sim_eval verify-evidence-tree <trial>/"
   ],
   "seeds": [47],
   "evidence_verified": true,

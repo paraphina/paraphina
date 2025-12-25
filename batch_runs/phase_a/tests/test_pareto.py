@@ -160,6 +160,59 @@ class TestParetoFrontier(unittest.TestCase):
             # Should be sorted by candidate_id
             ids = [r.candidate_id for r in pareto]
             self.assertEqual(ids, sorted(ids))
+    
+    def test_pareto_selection_determinism_across_runs(self):
+        """
+        Test that Pareto frontier selection is fully deterministic.
+        
+        This is critical for reproducibility: given the same input,
+        we must always get the same Pareto frontier in the same order.
+        """
+        # Create a set of candidates with various tradeoffs
+        results = [
+            self._make_result("alpha", mean_pnl=100.0, kill_prob=0.15, drawdown_cvar=600.0),
+            self._make_result("beta", mean_pnl=70.0, kill_prob=0.08, drawdown_cvar=400.0),
+            self._make_result("gamma", mean_pnl=40.0, kill_prob=0.02, drawdown_cvar=200.0),
+            self._make_result("delta", mean_pnl=60.0, kill_prob=0.10, drawdown_cvar=500.0),
+            self._make_result("epsilon", mean_pnl=80.0, kill_prob=0.20, drawdown_cvar=800.0),
+        ]
+        
+        # Compute frontier 10 times
+        frontiers = [compute_pareto_frontier(results) for _ in range(10)]
+        
+        # All should be identical
+        first = [(r.candidate_id, r.mc_mean_pnl, r.mc_kill_prob_ci_upper) for r in frontiers[0]]
+        for frontier in frontiers[1:]:
+            current = [(r.candidate_id, r.mc_mean_pnl, r.mc_kill_prob_ci_upper) for r in frontier]
+            self.assertEqual(first, current, "Pareto frontier not deterministic across runs")
+    
+    def test_pareto_selection_determinism_shuffled_input(self):
+        """
+        Test determinism even when input order is shuffled.
+        
+        The Pareto frontier should be the same regardless of input ordering.
+        """
+        import random
+        
+        base_results = [
+            self._make_result("a1", mean_pnl=100.0, kill_prob=0.15, drawdown_cvar=600.0),
+            self._make_result("a2", mean_pnl=70.0, kill_prob=0.08, drawdown_cvar=400.0),
+            self._make_result("a3", mean_pnl=40.0, kill_prob=0.02, drawdown_cvar=200.0),
+        ]
+        
+        # Get reference frontier
+        reference = compute_pareto_frontier(base_results)
+        reference_ids = sorted(r.candidate_id for r in reference)
+        
+        # Test with different shufflings
+        rng = random.Random(42)
+        for _ in range(10):
+            shuffled = list(base_results)
+            rng.shuffle(shuffled)
+            frontier = compute_pareto_frontier(shuffled)
+            frontier_ids = sorted(r.candidate_id for r in frontier)
+            self.assertEqual(reference_ids, frontier_ids, 
+                           "Pareto frontier changed with input order shuffle")
 
 
 class TestParetoCandidate(unittest.TestCase):
