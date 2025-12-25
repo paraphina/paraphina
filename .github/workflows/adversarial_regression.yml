@@ -102,15 +102,26 @@ jobs:
             runs/ci_adversarial/**/failure_seeds.json
             runs/ci_adversarial/**/mc_summary.json
 
-      - name: Run adversarial suite if exists
-        continue-on-error: true
+      - name: Run adversarial regression suite
         run: |
           if [ -f scenarios/suites/adversarial_regression_v1.yaml ]; then
-            echo "Running adversarial regression suite..."
+            echo "Running adversarial regression suite (env_overrides now supported)..."
             cargo run --release -p paraphina --bin sim_eval -- \
-              suite scenarios/suites/adversarial_regression_v1.yaml \
-              || echo "Note: Adversarial suite may have expected failures"
+              suite scenarios/suites/adversarial_regression_v1.yaml
+            echo "✓ Adversarial regression suite completed"
           else
             echo "No adversarial_regression_v1.yaml found, skipping suite run"
+          fi
+
+      - name: Verify adversarial suite evidence packs
+        run: |
+          # The adversarial suite writes to runs/adversarial_regression per its YAML
+          if [ -d runs/adversarial_regression ]; then
+            echo "Verifying evidence packs in runs/adversarial_regression..."
+            cargo run --release -p paraphina --bin sim_eval -- \
+              verify-evidence-tree runs/adversarial_regression
+            echo "✓ Evidence packs verified"
+          else
+            echo "No adversarial suite output found"
           fi
 

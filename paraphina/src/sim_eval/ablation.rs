@@ -159,6 +159,22 @@ impl AblationSet {
             format!("__{}", self.ablations.join("__"))
         }
     }
+
+    /// Compute a directory suffix, but return empty string for baseline (no ablations).
+    ///
+    /// This is useful when a user explicitly provides --output-dir and wants exact control.
+    /// Only returns a suffix if ablations are actually active.
+    ///
+    /// Examples:
+    /// - `[]` → ``
+    /// - `["disable_vol_floor"]` → `__disable_vol_floor`
+    pub fn dir_suffix_optional(&self) -> String {
+        if self.ablations.is_empty() {
+            String::new()
+        } else {
+            format!("__{}", self.ablations.join("__"))
+        }
+    }
 }
 
 impl fmt::Display for AblationSet {
