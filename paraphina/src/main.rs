@@ -13,7 +13,7 @@
 
 use clap::{ArgAction, Parser, ValueEnum};
 
-use paraphina::config::{Config, RiskProfile};
+use paraphina::config::{resolve_effective_profile, Config, RiskProfile};
 use paraphina::gateway::SimGateway;
 use paraphina::logging::NoopSink;
 use paraphina::strategy::StrategyRunner;
@@ -50,21 +50,6 @@ struct Args {
     verbose: u8,
 }
 
-fn parse_env_profile() -> RiskProfile {
-    match std::env::var("PARAPHINA_RISK_PROFILE") {
-        Ok(s) => {
-            let s = s.to_lowercase();
-            match s.as_str() {
-                "conservative" | "cons" | "c" => RiskProfile::Conservative,
-                "aggressive" | "agg" | "a" => RiskProfile::Aggressive,
-                "balanced" | "bal" | "b" | "" => RiskProfile::Balanced,
-                _ => RiskProfile::Balanced,
-            }
-        }
-        Err(_) => RiskProfile::Balanced,
-    }
-}
-
 fn fnv1a64(s: &str) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -79,15 +64,20 @@ fn fnv1a64(s: &str) -> u64 {
 fn main() {
     let args = Args::parse();
 
-    // Profile precedence: CLI > env > Balanced
-    let profile = match args.profile {
-        Some(p) => match p {
-            ProfileArg::Conservative => RiskProfile::Conservative,
-            ProfileArg::Balanced => RiskProfile::Balanced,
-            ProfileArg::Aggressive => RiskProfile::Aggressive,
-        },
-        None => parse_env_profile(),
-    };
+    // Convert CLI ProfileArg to RiskProfile (if provided)
+    let cli_profile = args.profile.map(|p| match p {
+        ProfileArg::Conservative => RiskProfile::Conservative,
+        ProfileArg::Balanced => RiskProfile::Balanced,
+        ProfileArg::Aggressive => RiskProfile::Aggressive,
+    });
+
+    // Resolve profile with proper precedence: CLI > env > default
+    // (No scenario profile for main binary, so pass None)
+    let effective = resolve_effective_profile(cli_profile, None);
+    let profile = effective.profile;
+
+    // Explicit startup log line (required by spec for observability)
+    effective.log_startup();
 
     // Profile presets + env overrides already handled in Config.
     let cfg = Config::from_env_or_profile(profile);
