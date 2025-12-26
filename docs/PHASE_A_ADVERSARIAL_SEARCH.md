@@ -188,6 +188,57 @@ cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs/adv_reg_test
 # cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs/adv_reg_test/evidence_pack
 ```
 
+## Verification
+
+The adversarial search script automatically generates a **root evidence pack** after completing the search. This provides cryptographic integrity for all outputs.
+
+### Output Structure with Evidence Pack
+
+```
+runs/phaseA_adv_search/<study_id>/
+├── evidence_pack/                  # Root evidence pack (auto-generated)
+│   ├── SHA256SUMS                  # Checksums for all files
+│   ├── manifest.json               # Structured metadata
+│   └── suite.yaml                  # For verifier compatibility
+├── candidates/
+├── generated_suite/
+├── runs/
+├── search_results.jsonl
+└── summary.json
+```
+
+### Verification Commands
+
+```bash
+# Verify the search output root (verifies root evidence pack)
+sim_eval verify-evidence-pack runs/phaseA_adv_search_smoke
+
+# Verify all evidence packs (root + any nested suite packs)
+sim_eval verify-evidence-tree runs/phaseA_adv_search_smoke
+```
+
+### Reproducing from Artifacts
+
+Given a verified study directory:
+
+1. The `summary.json` contains the complete CEM state and top-K list
+2. The `search_results.jsonl` contains all evaluated candidates
+3. The `generated_suite/` directory is self-contained and runnable
+4. The `evidence_pack/SHA256SUMS` provides integrity verification
+
+To reproduce from artifacts:
+```bash
+# 1. Verify the evidence pack
+sim_eval verify-evidence-pack runs/phaseA_adv_search_study/
+
+# 2. Run the generated suite
+sim_eval suite runs/phaseA_adv_search_study/generated_suite/adversarial_regression_generated.yaml \
+  --output-dir runs/reproduce_test
+
+# 3. Compare results (should be deterministic)
+diff <(jq -S . runs/original/summary.json) <(jq -S . runs/reproduce_test/summary.json)
+```
+
 ## CLI Reference
 
 ```

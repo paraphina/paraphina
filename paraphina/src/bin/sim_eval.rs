@@ -24,10 +24,10 @@ use paraphina::rl::{PolicyAction, SimEnv};
 use paraphina::sim_eval::{
     create_output_dir, print_ablations, run_report, summarize_with_format,
     verify_evidence_pack_dir, verify_evidence_pack_tree, with_env_overrides, write_build_info,
-    write_config_resolved, write_config_resolved_with_ablations, write_evidence_pack, AblationSet,
-    BuildInfo, Engine, ExpectKillSwitch, InlineScenario, KillSwitchInfo, MarketModelType,
-    OutputFormat, ReportArgs, ReportResult, RunSummary, ScenarioRef, ScenarioSpec, SuiteSpec,
-    SummarizeResult, SyntheticProcess,
+    write_config_resolved, write_config_resolved_with_ablations, write_evidence_pack,
+    write_root_evidence_pack, AblationSet, BuildInfo, Engine, ExpectKillSwitch, InlineScenario,
+    KillSwitchInfo, MarketModelType, OutputFormat, ReportArgs, ReportResult, RunSummary,
+    ScenarioRef, ScenarioSpec, SuiteSpec, SummarizeResult, SyntheticProcess,
 };
 
 // =============================================================================
@@ -41,8 +41,14 @@ enum Command {
     Summarize(SummarizeArgs),
     Report(ReportArgsLocal),
     Ablations,
+    WriteEvidencePack(WriteEvidencePackArgs),
     VerifyEvidencePack(VerifyEvidencePackArgs),
     VerifyEvidenceTree(VerifyEvidenceTreeArgs),
+}
+
+#[derive(Debug)]
+struct WriteEvidencePackArgs {
+    root: PathBuf,
 }
 
 #[derive(Debug)]
@@ -103,6 +109,7 @@ USAGE:
   sim_eval summarize <RUNS_DIR> [OPTIONS]
   sim_eval report --baseline <DIR> --variant <NAME>=<DIR> ... --out-md <PATH> --out-json <PATH> [OPTIONS]
   sim_eval ablations
+  sim_eval write-evidence-pack <ROOT>
   sim_eval verify-evidence-pack <OUTPUT_ROOT>
   sim_eval verify-evidence-tree <ROOT>
 
@@ -112,6 +119,7 @@ SUBCOMMANDS:
   summarize            Discover and summarize run_summary.json files
   report               Generate baseline-vs-ablations research report in Markdown + JSON
   ablations            List supported ablation IDs and descriptions
+  write-evidence-pack  Generate evidence pack for a directory (all files under ROOT)
   verify-evidence-pack Verify a single evidence pack at <OUTPUT_ROOT>/evidence_pack/
   verify-evidence-tree Verify all evidence packs under <ROOT>
 
@@ -175,6 +183,38 @@ EXAMPLES:
   sim_eval ablations
   sim_eval verify-evidence-pack runs/demo_step_7_1
   sim_eval verify-evidence-tree runs/demo_step_7_1
+"
+}
+
+fn write_evidence_pack_usage() -> &'static str {
+    "\
+USAGE:
+  sim_eval write-evidence-pack <ROOT>
+
+DESCRIPTION:
+  Generate an evidence pack for a directory.
+  Scans all files under ROOT, computes SHA256 hashes, and writes:
+    <ROOT>/evidence_pack/SHA256SUMS
+    <ROOT>/evidence_pack/manifest.json
+    <ROOT>/evidence_pack/suite.yaml (for verifier compatibility)
+
+  Excludes: evidence_pack/, .git/, target/, __pycache__/, .pytest_cache/
+
+  The SHA256SUMS file is deterministic (sorted by path) and written atomically.
+
+ARGUMENTS:
+  <ROOT>           Directory to create evidence pack for
+
+OPTIONS:
+  --help           Show this help
+
+EXIT CODES:
+  0  Success
+  1  Error (directory not found, I/O error)
+  2  Usage error (missing or extra arguments)
+
+EXAMPLE:
+  sim_eval write-evidence-pack runs/phaseA_study_001
 "
 }
 
@@ -763,6 +803,47 @@ fn parse_args() -> Result<Command, String> {
             }
 
             Ok(Command::Summarize(summarize_args))
+        }
+        "write-evidence-pack" => {
+            let mut write_args = WriteEvidencePackArgs {
+                root: PathBuf::new(),
+            };
+            let mut path_set = false;
+
+            for arg in args.by_ref() {
+                match arg.as_str() {
+                    "--help" | "-h" => {
+                        println!("{}", write_evidence_pack_usage());
+                        std::process::exit(0);
+                    }
+                    _ if arg.starts_with('-') => {
+                        eprintln!("Unknown option: {}\n\n{}", arg, write_evidence_pack_usage());
+                        std::process::exit(2);
+                    }
+                    _ => {
+                        if path_set {
+                            eprintln!(
+                                "unexpected argument: {}\n\n{}",
+                                arg,
+                                write_evidence_pack_usage()
+                            );
+                            std::process::exit(2);
+                        }
+                        write_args.root = PathBuf::from(arg);
+                        path_set = true;
+                    }
+                }
+            }
+
+            if !path_set {
+                eprintln!(
+                    "Missing required argument: <ROOT>\n\n{}",
+                    write_evidence_pack_usage()
+                );
+                std::process::exit(2);
+            }
+
+            Ok(Command::WriteEvidencePack(write_args))
         }
         "verify-evidence-pack" => {
             let mut verify_args = VerifyEvidencePackArgs {
@@ -2222,6 +2303,23 @@ fn cmd_report(args: ReportArgsLocal) -> i32 {
 // Verify subcommands
 // =============================================================================
 
+fn cmd_write_evidence_pack(args: WriteEvidencePackArgs) -> i32 {
+    match write_root_evidence_pack(&args.root) {
+        Ok(file_count) => {
+            println!(
+                "OK: wrote evidence pack for {} ({} files hashed)",
+                args.root.display(),
+                file_count
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("ERROR: failed to write evidence pack: {}", e);
+            1
+        }
+    }
+}
+
 fn cmd_verify_evidence_pack(args: VerifyEvidencePackArgs) -> i32 {
     match verify_evidence_pack_dir(&args.output_root) {
         Ok(report) => {
@@ -2322,6 +2420,7 @@ fn main() {
         Command::Summarize(args) => cmd_summarize(args),
         Command::Report(args) => cmd_report(args),
         Command::Ablations => cmd_ablations(),
+        Command::WriteEvidencePack(args) => cmd_write_evidence_pack(args),
         Command::VerifyEvidencePack(args) => cmd_verify_evidence_pack(args),
         Command::VerifyEvidenceTree(args) => cmd_verify_evidence_tree(args),
     };
