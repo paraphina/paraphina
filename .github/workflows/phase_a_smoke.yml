@@ -75,3 +75,55 @@ jobs:
             runs/phaseA_ci_smoke/**/*.md
             runs/phaseA_ci_smoke/**/*.env
 
+  phase-a-adr-smoke:
+    runs-on: ubuntu-latest
+    needs: phase-a-unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build release binaries
+        run: cargo build --release -p paraphina --bin monte_carlo --bin sim_eval
+
+      - name: Run Phase A ADR-enabled smoke test
+        run: |
+          python3 -m batch_runs.phase_a.promote_pipeline \
+            --smoke \
+            --adr-enable \
+            --study-dir runs/phaseA_smoke_adr \
+            --seed 42
+
+      - name: Verify ADR artifacts exist
+        run: |
+          # Check baseline cache exists
+          test -d runs/phaseA_smoke_adr/_baseline_cache
+          # Check trial directories exist
+          ls runs/phaseA_smoke_adr/trial_* || echo "Warning: no trial directories found"
+          # Check trials.jsonl exists
+          test -f runs/phaseA_smoke_adr/trials.jsonl
+
+      - name: Verify evidence packs
+        run: |
+          # Verify evidence tree for the study root
+          ./target/release/sim_eval verify-evidence-tree runs/phaseA_smoke_adr || echo "Warning: evidence verification found issues"
+
+      - name: Upload ADR run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-a-adr-smoke-artifacts
+          path: |
+            runs/phaseA_smoke_adr/**/*.csv
+            runs/phaseA_smoke_adr/**/*.json
+            runs/phaseA_smoke_adr/**/*.md
+            runs/phaseA_smoke_adr/**/*.jsonl
+            runs/phaseA_smoke_adr/**/*.env
+

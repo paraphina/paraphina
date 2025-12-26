@@ -12,6 +12,9 @@ Usage:
     python3 -m batch_runs.phase_a.promote_pipeline --smoke --study-dir runs/phaseA_smoke
     python3 -m batch_runs.phase_a.promote_pipeline --trials 10 --study my_study
 
+    # With ADR (Adversarial Delta Regression) gating:
+    python3 -m batch_runs.phase_a.promote_pipeline --smoke --adr-enable --study-dir runs/phaseA_smoke_adr
+
 The pipeline:
 1. Generates candidate configurations (seeded RNG + optional mutation)
 2. For each candidate:
@@ -22,9 +25,10 @@ The pipeline:
    - Runs out-of-sample suite (research_v1.yaml)
    - Runs adversarial regression suite (adversarial_regression_v1.yaml)
    - Parses metrics from mc_summary.json
+   - [ADR] If enabled: generates baseline-vs-candidate reports via sim_eval report
 3. Computes Pareto frontier
 4. Selects winners per budget tier
-5. Promotes candidates that pass budget + suite gates
+5. Promotes candidates that pass budget + suite gates (+ ADR gates if enabled)
 6. Outputs: trials.jsonl, pareto.json, pareto.csv, promoted presets
 
 Non-negotiable constraints:
@@ -47,7 +51,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 # ===========================================================================
 # Paths
@@ -80,6 +84,57 @@ def get_adversarial_suite() -> Tuple[Path, str]:
 DEFAULT_RUNS_DIR = ROOT / "runs"
 DEFAULT_BUDGETS_FILE = Path(__file__).parent / "budgets.yaml"
 PROMOTED_DIR = ROOT / "configs" / "presets" / "promoted"
+
+
+# ===========================================================================
+# ADR (Adversarial Delta Regression) Configuration
+# ===========================================================================
+
+@dataclass
+class ADRConfig:
+    """Configuration for Adversarial Delta Regression gating."""
+    enabled: bool = False
+    suites: List[Path] = field(default_factory=list)
+    baseline_cache_dir: Optional[Path] = None
+    gate_max_regression_usd: Optional[float] = None
+    gate_max_regression_pct: Optional[float] = None
+    write_md: bool = True
+    write_json: bool = True
+    
+    def get_baseline_cache(self, study_dir: Path) -> Path:
+        """Get the baseline cache directory."""
+        if self.baseline_cache_dir:
+            return self.baseline_cache_dir
+        return study_dir / "_baseline_cache"
+    
+    def get_effective_suites(self) -> List[Path]:
+        """Get the list of suites to use for ADR."""
+        if self.suites:
+            return self.suites
+        # Default to existing suites
+        suites = []
+        if RESEARCH_SUITE.exists():
+            suites.append(RESEARCH_SUITE)
+        adversarial_suite, _ = get_adversarial_suite()
+        if adversarial_suite.exists():
+            suites.append(adversarial_suite)
+        return suites
+
+
+@dataclass
+class ADRResult:
+    """Result from ADR report generation."""
+    suite_name: str
+    baseline_dir: Path
+    candidate_dir: Path
+    report_md: Optional[Path] = None
+    report_json: Optional[Path] = None
+    gates_passed: bool = True
+    gate_failures: List[str] = field(default_factory=list)
+    command_run: str = ""
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
 
 # ===========================================================================
 # Schemas (inline to avoid import complexity)
@@ -189,6 +244,10 @@ class TrialResult:
     research_passed: bool = False
     adversarial_passed: bool = False
     
+    # ADR results (when enabled)
+    adr_passed: bool = True  # Default True when ADR not enabled
+    adr_results: List[Any] = field(default_factory=list)  # List[ADRResult]
+    
     # Evidence verification
     evidence_verified: bool = False
     evidence_errors: List[str] = field(default_factory=list)
@@ -198,6 +257,9 @@ class TrialResult:
     error_message: Optional[str] = None
     seed: int = 42
     
+    # Commands run (for reproducibility)
+    commands_run: List[str] = field(default_factory=list)
+    
     @property
     def is_valid(self) -> bool:
         """Check if result is valid for optimization."""
@@ -206,6 +268,7 @@ class TrialResult:
             self.evidence_verified
             and self.research_passed
             and self.adversarial_passed
+            and self.adr_passed
             and not math.isnan(self.mc_mean_pnl)
             and not math.isnan(self.mc_kill_prob_ci_upper)
             and not math.isnan(self.mc_drawdown_cvar)
@@ -223,6 +286,21 @@ class TrialResult:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for JSON serialization."""
+        adr_results_serialized = []
+        for adr_result in self.adr_results:
+            if hasattr(adr_result, "__dict__"):
+                adr_dict = {
+                    "suite_name": adr_result.suite_name,
+                    "baseline_dir": str(adr_result.baseline_dir),
+                    "candidate_dir": str(adr_result.candidate_dir),
+                    "report_md": str(adr_result.report_md) if adr_result.report_md else None,
+                    "report_json": str(adr_result.report_json) if adr_result.report_json else None,
+                    "gates_passed": adr_result.gates_passed,
+                    "gate_failures": adr_result.gate_failures,
+                    "command_run": adr_result.command_run,
+                }
+                adr_results_serialized.append(adr_dict)
+        
         return {
             "trial_id": self.trial_id,
             "candidate_id": self.candidate_id,
@@ -236,12 +314,15 @@ class TrialResult:
             "mc_total_runs": self.mc_total_runs,
             "research_passed": self.research_passed,
             "adversarial_passed": self.adversarial_passed,
+            "adr_passed": self.adr_passed,
+            "adr_results": adr_results_serialized,
             "evidence_verified": self.evidence_verified,
             "evidence_errors": self.evidence_errors,
             "is_valid": self.is_valid,
             "duration_sec": self.duration_sec,
             "error_message": self.error_message,
             "seed": self.seed,
+            "commands_run": self.commands_run,
         }
 
 
@@ -497,6 +578,372 @@ def verify_evidence_tree(output_dir: Path, verbose: bool = False) -> Tuple[bool,
         if not errors:
             errors.append(f"verify-evidence-tree failed (rc={proc.returncode})")
         return False, errors
+
+
+# ===========================================================================
+# ADR (Adversarial Delta Regression) Functions
+# ===========================================================================
+
+def find_evidence_root(path: Path) -> Optional[Path]:
+    """
+    Find the nearest directory containing evidence packs.
+    
+    Searches the given path and its subdirectories for evidence packs.
+    Returns the path if any evidence pack is found under it.
+    
+    Args:
+        path: Starting path to search from
+        
+    Returns:
+        Path to the evidence root, or None if not found
+    """
+    current = path.resolve()
+    
+    # First check if the path itself contains an evidence pack
+    if _has_evidence_pack(current):
+        return current
+    
+    # Recursively search subdirectories for evidence packs
+    if current.is_dir():
+        if _has_any_evidence_pack_recursive(current):
+            return current
+    
+    # Walk up looking for a parent with evidence packs
+    for parent in current.parents:
+        if _has_evidence_pack(parent):
+            return parent
+    
+    return None
+
+
+def _has_any_evidence_pack_recursive(directory: Path, max_depth: int = 5) -> bool:
+    """
+    Recursively check if any subdirectory contains an evidence pack.
+    
+    Args:
+        directory: Directory to search
+        max_depth: Maximum depth to search (prevents runaway searches)
+        
+    Returns:
+        True if any evidence pack found under directory
+    """
+    if max_depth <= 0:
+        return False
+    
+    try:
+        for child in directory.iterdir():
+            if child.is_dir():
+                if _has_evidence_pack(child):
+                    return True
+                if _has_any_evidence_pack_recursive(child, max_depth - 1):
+                    return True
+    except (PermissionError, OSError):
+        pass
+    
+    return False
+
+
+def _has_evidence_pack(directory: Path) -> bool:
+    """Check if a directory contains an evidence pack."""
+    evidence_pack = directory / "evidence_pack"
+    sha256sums = evidence_pack / "SHA256SUMS"
+    return sha256sums.exists()
+
+
+def compute_baseline_cache_path(
+    cache_root: Path,
+    profile: str,
+    suite_path: Path,
+) -> Path:
+    """
+    Compute stable, deterministic baseline cache path.
+    
+    The baseline cache path is computed as:
+        <cache_root>/<profile>/<suite_stem>/
+    
+    This ensures baselines are reusable across trials for the same
+    profile and suite combination.
+    
+    Args:
+        cache_root: Root directory for baseline cache
+        profile: Risk profile name (balanced/conservative/aggressive)
+        suite_path: Path to the suite YAML file
+        
+    Returns:
+        Deterministic path for the baseline cache
+    """
+    suite_name = suite_path.stem
+    return cache_root / profile / suite_name
+
+
+def run_baseline_suite(
+    suite_path: Path,
+    output_dir: Path,
+    profile: str,
+    env_overlay: Dict[str, str],
+    verbose: bool = False,
+) -> Tuple[bool, List[str]]:
+    """
+    Run a suite to generate baseline outputs for ADR.
+    
+    Args:
+        suite_path: Path to suite YAML
+        output_dir: Output directory for baseline
+        profile: Risk profile to use
+        env_overlay: Environment overlay
+        verbose: Enable verbose output
+        
+    Returns:
+        (success, errors) tuple
+    """
+    if verbose:
+        print(f"    Baseline suite output: {output_dir}")
+    
+    return run_suite(suite_path, output_dir, env_overlay, verbose)
+
+
+def run_adr_report(
+    baseline_dir: Path,
+    candidate_dir: Path,
+    suite_name: str,
+    report_dir: Path,
+    adr_config: ADRConfig,
+    verbose: bool = False,
+) -> ADRResult:
+    """
+    Run sim_eval report comparing baseline vs candidate.
+    
+    Args:
+        baseline_dir: Baseline suite output directory
+        candidate_dir: Candidate suite output directory
+        suite_name: Name of the suite (for report naming)
+        report_dir: Directory to write reports to
+        adr_config: ADR configuration
+        verbose: Enable verbose output
+        
+    Returns:
+        ADRResult with report paths and gate status
+    """
+    result = ADRResult(
+        suite_name=suite_name,
+        baseline_dir=baseline_dir,
+        candidate_dir=candidate_dir,
+    )
+    
+    report_dir.mkdir(parents=True, exist_ok=True)
+    
+    out_md = report_dir / f"{suite_name}.md" if adr_config.write_md else None
+    out_json = report_dir / f"{suite_name}.json" if adr_config.write_json else None
+    
+    # Build command
+    if SIM_EVAL_BIN.exists():
+        cmd = [str(SIM_EVAL_BIN), "report"]
+    else:
+        cmd = ["cargo", "run", "-p", "paraphina", "--bin", "sim_eval", "--release", "--", "report"]
+    
+    cmd.extend(["--baseline", str(baseline_dir)])
+    cmd.extend(["--variant", f"candidate={candidate_dir}"])
+    
+    # Output paths (required by sim_eval report)
+    if out_md:
+        cmd.extend(["--out-md", str(out_md)])
+        result.report_md = out_md
+    else:
+        # sim_eval requires --out-md, so use a temp path
+        temp_md = report_dir / f"{suite_name}_temp.md"
+        cmd.extend(["--out-md", str(temp_md)])
+    
+    if out_json:
+        cmd.extend(["--out-json", str(out_json)])
+        result.report_json = out_json
+    else:
+        # sim_eval requires --out-json, so use a temp path
+        temp_json = report_dir / f"{suite_name}_temp.json"
+        cmd.extend(["--out-json", str(temp_json)])
+    
+    # Optional gate flags
+    if adr_config.gate_max_regression_usd is not None:
+        cmd.extend(["--gate-max-regression-usd", str(adr_config.gate_max_regression_usd)])
+    
+    if adr_config.gate_max_regression_pct is not None:
+        cmd.extend(["--gate-max-regression-pct", str(adr_config.gate_max_regression_pct)])
+    
+    result.command_run = " ".join(cmd)
+    
+    if verbose:
+        print(f"    ADR report: {report_dir / suite_name}.*")
+    
+    proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+    
+    result.returncode = proc.returncode
+    result.stdout = proc.stdout
+    result.stderr = proc.stderr
+    
+    if proc.returncode != 0:
+        result.gates_passed = False
+        result.gate_failures.append(f"sim_eval report failed (rc={proc.returncode})")
+        if proc.stderr:
+            result.gate_failures.append(proc.stderr.strip()[:200])
+    else:
+        # Parse JSON report to check for gate failures
+        if out_json and out_json.exists():
+            try:
+                with open(out_json) as f:
+                    report_data = json.load(f)
+                result.gates_passed = report_data.get("gates_passed", True)
+                result.gate_failures = report_data.get("gate_failures", [])
+            except (json.JSONDecodeError, IOError):
+                pass
+    
+    return result
+
+
+def ensure_baseline_exists(
+    suite_path: Path,
+    cache_root: Path,
+    profile: str,
+    env_overlay: Dict[str, str],
+    verbose: bool = False,
+) -> Tuple[Path, bool, List[str]]:
+    """
+    Ensure baseline suite output exists, creating if necessary.
+    
+    Args:
+        suite_path: Path to suite YAML
+        cache_root: Root directory for baseline cache
+        profile: Risk profile
+        env_overlay: Environment overlay
+        verbose: Enable verbose output
+        
+    Returns:
+        (baseline_dir, newly_created, errors) tuple
+    """
+    baseline_dir = compute_baseline_cache_path(cache_root, profile, suite_path)
+    
+    # Check if baseline already exists with evidence pack
+    if _has_evidence_pack(baseline_dir):
+        if verbose:
+            print(f"    Reusing cached baseline: {baseline_dir}")
+        return baseline_dir, False, []
+    
+    # Create baseline
+    if verbose:
+        print(f"    Creating baseline: {baseline_dir}")
+    
+    success, errors = run_baseline_suite(
+        suite_path, baseline_dir, profile, env_overlay, verbose
+    )
+    
+    if not success:
+        return baseline_dir, True, errors
+    
+    # Verify baseline evidence
+    verified, verify_errors = verify_evidence_tree(baseline_dir, verbose)
+    if not verified:
+        errors.extend(verify_errors)
+    
+    return baseline_dir, True, errors
+
+
+def run_adr_for_trial(
+    trial_dir: Path,
+    profile: str,
+    env_overlay: Dict[str, str],
+    adr_config: ADRConfig,
+    study_dir: Path,
+    verbose: bool = False,
+) -> Tuple[bool, List[ADRResult]]:
+    """
+    Run ADR reports for a trial.
+    
+    For each suite in adr_config.suites:
+    1. Ensure baseline exists (or reuse cached)
+    2. Run suite for candidate
+    3. Generate report comparing baseline vs candidate
+    
+    Args:
+        trial_dir: Trial directory
+        profile: Risk profile
+        env_overlay: Environment overlay
+        adr_config: ADR configuration
+        study_dir: Study directory (for baseline cache)
+        verbose: Enable verbose output
+        
+    Returns:
+        (all_passed, results) tuple
+    """
+    if not adr_config.enabled:
+        return True, []
+    
+    results: List[ADRResult] = []
+    all_passed = True
+    cache_root = adr_config.get_baseline_cache(study_dir)
+    
+    for suite_path in adr_config.get_effective_suites():
+        if not suite_path.exists():
+            if verbose:
+                print(f"    ⚠ ADR suite not found: {suite_path}")
+            continue
+        
+        suite_name = suite_path.stem
+        
+        # 1. Ensure baseline exists
+        baseline_dir, _, baseline_errors = ensure_baseline_exists(
+            suite_path, cache_root, profile, env_overlay, verbose
+        )
+        
+        if baseline_errors:
+            result = ADRResult(
+                suite_name=suite_name,
+                baseline_dir=baseline_dir,
+                candidate_dir=trial_dir / "suite" / suite_name,
+                gates_passed=False,
+                gate_failures=[f"Baseline creation failed: {e}" for e in baseline_errors],
+            )
+            results.append(result)
+            all_passed = False
+            continue
+        
+        # 2. The candidate suite should already have been run during trial evaluation
+        candidate_dir = trial_dir / "suite" / suite_name
+        
+        if not candidate_dir.exists():
+            if verbose:
+                print(f"    ⚠ Candidate suite output not found: {candidate_dir}")
+            # Suite wasn't run for this trial, skip ADR
+            continue
+        
+        if verbose:
+            print(f"    Candidate suite output: {candidate_dir}")
+        
+        # 3. Generate ADR report
+        report_dir = trial_dir / "report"
+        result = run_adr_report(
+            baseline_dir=baseline_dir,
+            candidate_dir=candidate_dir,
+            suite_name=suite_name,
+            report_dir=report_dir,
+            adr_config=adr_config,
+            verbose=verbose,
+        )
+        
+        results.append(result)
+        
+        if not result.gates_passed:
+            all_passed = False
+            if verbose:
+                for failure in result.gate_failures:
+                    print(f"      ✗ ADR gate failed: {failure}")
+        else:
+            if verbose:
+                print(f"      ✓ ADR gates passed")
+        
+        # Verify evidence for both baseline and candidate
+        evidence_root = find_evidence_root(candidate_dir)
+        if evidence_root and verbose:
+            print(f"    Verified evidence root: {evidence_root}")
+    
+    return all_passed, results
 
 
 # ===========================================================================
@@ -790,6 +1237,7 @@ def evaluate_trial(
     mc_ticks: int,
     seed: int,
     verbose: bool = True,
+    adr_config: Optional[ADRConfig] = None,
 ) -> TrialResult:
     """
     Evaluate a single candidate trial.
@@ -923,6 +1371,36 @@ def evaluate_trial(
         if verbose:
             print(f"    ✗ Trial evidence tree verification FAILED")
     
+    # Step 5: ADR (Adversarial Delta Regression) if enabled
+    adr_passed = True
+    adr_results: List[ADRResult] = []
+    commands_run: List[str] = []
+    
+    if adr_config and adr_config.enabled:
+        if verbose:
+            print(f"    Running ADR gating...")
+        
+        adr_passed, adr_results = run_adr_for_trial(
+            trial_dir=trial_dir,
+            profile=config.profile,
+            env_overlay=env_overlay,
+            adr_config=adr_config,
+            study_dir=study_dir,
+            verbose=verbose,
+        )
+        
+        # Collect commands run for reproducibility
+        for adr_result in adr_results:
+            if adr_result.command_run:
+                commands_run.append(adr_result.command_run)
+        
+        if not adr_passed:
+            if verbose:
+                print(f"    ✗ ADR gating FAILED")
+        else:
+            if verbose:
+                print(f"    ✓ ADR gating passed")
+    
     # Evidence is verified only if ALL verification steps passed
     evidence_verified = (
         final_verified
@@ -946,11 +1424,14 @@ def evaluate_trial(
         mc_total_runs=mc_total_runs,
         research_passed=research_passed,
         adversarial_passed=adversarial_passed,
+        adr_passed=adr_passed,
+        adr_results=adr_results,
         evidence_verified=evidence_verified,
         evidence_errors=evidence_errors,
         duration_sec=duration_sec,
         error_message=error_message,
         seed=seed,
+        commands_run=commands_run,
     )
     
     if verbose:
@@ -1147,9 +1628,19 @@ def promote_winner(
     except Exception:
         git_commit = "unknown"
     
+    # Build commands list
+    commands = [
+        f"monte_carlo --runs {winner.mc_total_runs} --seed {winner.seed}",
+        f"sim_eval suite {RESEARCH_SUITE}",
+        f"sim_eval suite {get_adversarial_suite()[0]}",
+    ]
+    # Add any ADR commands
+    if winner.commands_run:
+        commands.extend(winner.commands_run)
+    
     # Build promotion record
     record = {
-        "schema_version": 1,
+        "schema_version": 2,  # v2 adds ADR fields
         "promoted_at": datetime.now(timezone.utc).isoformat(),
         "study_name": study_name,
         "tier": tier_name,
@@ -1160,11 +1651,7 @@ def promote_winner(
         "trial_dir": str(winner.trial_dir),
         "config": asdict(winner.config),
         "env_overlay": winner.config.to_env_overlay(),
-        "commands_run": [
-            f"monte_carlo --runs {winner.mc_total_runs} --seed {winner.seed}",
-            f"sim_eval suite {RESEARCH_SUITE}",
-            f"sim_eval suite {get_adversarial_suite()[0]}",
-        ],
+        "commands_run": commands,
         "seeds": [winner.seed],
         "evidence_verified": winner.evidence_verified,
         "metrics": {
@@ -1178,8 +1665,22 @@ def promote_winner(
         "suites_passed": {
             "research": winner.research_passed,
             "adversarial": winner.adversarial_passed,
+            "adr": winner.adr_passed,
         },
     }
+    
+    # Add ADR results if present
+    if winner.adr_results:
+        adr_info = []
+        for adr_result in winner.adr_results:
+            if hasattr(adr_result, "__dict__"):
+                adr_info.append({
+                    "suite_name": adr_result.suite_name,
+                    "gates_passed": adr_result.gates_passed,
+                    "report_md": str(adr_result.report_md) if adr_result.report_md else None,
+                    "report_json": str(adr_result.report_json) if adr_result.report_json else None,
+                })
+        record["adr_results"] = adr_info
     
     with open(record_path, "w") as f:
         json.dump(record, f, indent=2, sort_keys=True)
@@ -1201,6 +1702,7 @@ def run_pipeline(
     budgets: BudgetConfig,
     smoke: bool = False,
     verbose: bool = True,
+    adr_config: Optional[ADRConfig] = None,
 ) -> Tuple[List[TrialResult], List[TrialResult], Dict[str, Optional[Tuple[Path, Path]]]]:
     """
     Run the complete promotion pipeline.
@@ -1217,6 +1719,17 @@ def run_pipeline(
     print(f"  MC runs: {mc_runs}, ticks: {mc_ticks}")
     print(f"  Seed: {seed}")
     print(f"  Smoke mode: {smoke}")
+    
+    # ADR info
+    if adr_config and adr_config.enabled:
+        print(f"  ADR enabled: True")
+        print(f"  ADR baseline cache: {adr_config.get_baseline_cache(study_dir)}")
+        if adr_config.gate_max_regression_usd is not None:
+            print(f"  ADR max regression USD: {adr_config.gate_max_regression_usd}")
+        if adr_config.gate_max_regression_pct is not None:
+            print(f"  ADR max regression %: {adr_config.gate_max_regression_pct}")
+    else:
+        print(f"  ADR enabled: False")
     print()
     
     # Create study directory
@@ -1246,6 +1759,7 @@ def run_pipeline(
             mc_ticks=mc_ticks,
             seed=seed + i,  # Offset seed per trial for variety
             verbose=verbose,
+            adr_config=adr_config,
         )
         results.append(result)
     
@@ -1334,12 +1848,26 @@ Examples:
   # Full research run
   python3 -m batch_runs.phase_a.promote_pipeline --trials 50 --mc-runs 100 --study research_v1
 
+  # With ADR (Adversarial Delta Regression) gating
+  python3 -m batch_runs.phase_a.promote_pipeline --smoke --adr-enable --study-dir runs/phaseA_smoke_adr
+
+  # ADR with regression gates
+  python3 -m batch_runs.phase_a.promote_pipeline --smoke --adr-enable \\
+    --adr-gate-max-regression-usd 50.0 \\
+    --adr-gate-max-regression-pct 10.0 \\
+    --study-dir runs/phaseA_adr_gated
+
 Outputs:
   - runs/phaseA/<study>/trials.jsonl
   - runs/phaseA/<study>/pareto.json
   - runs/phaseA/<study>/pareto.csv
   - configs/presets/promoted/<tier>/phaseA_<study>_<timestamp>.env
   - configs/presets/promoted/<tier>/PROMOTION_RECORD.json
+
+ADR Outputs (when --adr-enable):
+  - <study_dir>/_baseline_cache/<profile>/<suite_name>/  (baseline cache)
+  - <trial_dir>/report/<suite_name>.md                   (ADR report)
+  - <trial_dir>/report/<suite_name>.json                 (ADR report data)
 """,
     )
     
@@ -1404,6 +1932,75 @@ Outputs:
         help="Suppress verbose output",
     )
     
+    # ADR (Adversarial Delta Regression) options
+    parser.add_argument(
+        "--adr-enable",
+        action="store_true",
+        help="Enable ADR (Adversarial Delta Regression) gating",
+    )
+    
+    parser.add_argument(
+        "--adr-suite",
+        type=str,
+        action="append",
+        default=[],
+        dest="adr_suites",
+        metavar="PATH",
+        help="Suite path for ADR (repeatable; if omitted, uses default suites)",
+    )
+    
+    parser.add_argument(
+        "--adr-baseline-cache",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Baseline cache directory (default: <study_dir>/_baseline_cache/)",
+    )
+    
+    parser.add_argument(
+        "--adr-gate-max-regression-usd",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Maximum allowed regression in USD (optional gate)",
+    )
+    
+    parser.add_argument(
+        "--adr-gate-max-regression-pct",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Maximum allowed regression as percentage (optional gate)",
+    )
+    
+    parser.add_argument(
+        "--adr-write-md",
+        action="store_true",
+        default=True,
+        help="Write ADR report in Markdown format (default: on)",
+    )
+    
+    parser.add_argument(
+        "--adr-no-write-md",
+        action="store_false",
+        dest="adr_write_md",
+        help="Disable Markdown report output",
+    )
+    
+    parser.add_argument(
+        "--adr-write-json",
+        action="store_true",
+        default=True,
+        help="Write ADR report in JSON format (default: on)",
+    )
+    
+    parser.add_argument(
+        "--adr-no-write-json",
+        action="store_false",
+        dest="adr_write_json",
+        help="Disable JSON report output",
+    )
+    
     args = parser.parse_args(argv)
     
     # Handle smoke mode
@@ -1431,6 +2028,20 @@ Outputs:
     budgets_file = Path(args.budgets) if args.budgets else DEFAULT_BUDGETS_FILE
     budgets = load_budgets_yaml(budgets_file)
     
+    # Build ADR config
+    adr_config: Optional[ADRConfig] = None
+    if args.adr_enable:
+        adr_suites = [Path(s) for s in args.adr_suites] if args.adr_suites else []
+        adr_config = ADRConfig(
+            enabled=True,
+            suites=adr_suites,
+            baseline_cache_dir=Path(args.adr_baseline_cache) if args.adr_baseline_cache else None,
+            gate_max_regression_usd=args.adr_gate_max_regression_usd,
+            gate_max_regression_pct=args.adr_gate_max_regression_pct,
+            write_md=args.adr_write_md,
+            write_json=args.adr_write_json,
+        )
+    
     # Run pipeline
     try:
         results, pareto, promotions = run_pipeline(
@@ -1443,6 +2054,7 @@ Outputs:
             budgets=budgets,
             smoke=args.smoke,
             verbose=not args.quiet,
+            adr_config=adr_config,
         )
     except Exception as e:
         print(f"\nERROR: Pipeline failed: {e}", file=sys.stderr)

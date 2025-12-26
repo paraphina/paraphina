@@ -59,7 +59,122 @@ Options:
   --seed N            Random seed for determinism (default: 42)
   --budgets PATH      Path to budgets.yaml (default: batch_runs/phase_a/budgets.yaml)
   --quiet, -q         Suppress verbose output
+
+ADR (Adversarial Delta Regression) Options:
+  --adr-enable                      Enable ADR gating
+  --adr-suite PATH                  Suite path for ADR (repeatable)
+  --adr-baseline-cache DIR          Baseline cache directory
+  --adr-gate-max-regression-usd N   Maximum allowed regression in USD
+  --adr-gate-max-regression-pct N   Maximum allowed regression as percentage
+  --adr-write-md                    Write ADR report in Markdown (default: on)
+  --adr-no-write-md                 Disable Markdown report output
+  --adr-write-json                  Write ADR report in JSON (default: on)
+  --adr-no-write-json               Disable JSON report output
 ```
+
+## ADR (Adversarial Delta Regression) Gating
+
+ADR provides institutional-grade regression gating by comparing candidate trial outputs
+against cached baseline outputs using `sim_eval report`.
+
+### What ADR Does
+
+1. **Baseline Caching**: For each (profile, suite) combination, a baseline suite run is
+   cached under `<study_dir>/_baseline_cache/<profile>/<suite_name>/`. This baseline is
+   reused across all trials with the same profile.
+
+2. **Report Generation**: After each candidate's suite run, `sim_eval report` compares
+   the candidate outputs against the cached baseline, generating:
+   - `<trial_dir>/report/<suite_name>.md` - Markdown report
+   - `<trial_dir>/report/<suite_name>.json` - JSON report data
+
+3. **Regression Gating**: If `--adr-gate-max-regression-usd` or `--adr-gate-max-regression-pct`
+   is specified, the report command enforces these as hard gates. Candidates that exceed
+   the regression threshold fail ADR gating and are excluded from promotion.
+
+### ADR Quick Start
+
+```bash
+# Run smoke test with ADR enabled
+python3 -m batch_runs.phase_a.promote_pipeline --smoke --adr-enable \
+  --study-dir runs/phaseA_smoke_adr
+
+# Run with ADR and regression gates
+python3 -m batch_runs.phase_a.promote_pipeline --smoke --adr-enable \
+  --adr-gate-max-regression-usd 50.0 \
+  --adr-gate-max-regression-pct 10.0 \
+  --study-dir runs/phaseA_adr_gated
+```
+
+### How Baseline Caching Works
+
+The baseline cache path is computed deterministically:
+
+```
+<study_dir>/_baseline_cache/<profile>/<suite_stem>/
+```
+
+For example:
+- Study dir: `runs/phaseA_smoke_adr`
+- Profile: `balanced`
+- Suite: `scenarios/suites/research_v1.yaml`
+- Baseline cache: `runs/phaseA_smoke_adr/_baseline_cache/balanced/research_v1/`
+
+The baseline is created once per (profile, suite) combination and reused for all
+subsequent trials. This ensures:
+- Deterministic comparisons (same baseline for all candidates)
+- Efficient runtime (baseline only generated once)
+- Reproducibility (baseline artifacts are preserved)
+
+### ADR Output Structure
+
+When ADR is enabled, additional outputs are generated:
+
+```
+runs/phaseA/<study>/
+├── _baseline_cache/                    # Cached baselines (reused across trials)
+│   ├── balanced/
+│   │   ├── research_v1/               # Baseline for balanced + research_v1
+│   │   │   ├── evidence_pack/
+│   │   │   └── <scenario_outputs>/
+│   │   └── adversarial_regression_v2/ # Baseline for balanced + adversarial
+│   ├── conservative/
+│   │   └── ...
+│   └── aggressive/
+│       └── ...
+├── trial_0000_<hash>/
+│   ├── suite/                         # Candidate suite outputs
+│   │   ├── research_v1/
+│   │   └── adversarial_regression_v2/
+│   └── report/                        # ADR reports
+│       ├── research_v1.md
+│       ├── research_v1.json
+│       ├── adversarial_regression_v2.md
+│       └── adversarial_regression_v2.json
+└── ...
+```
+
+### Reproducing an ADR Report
+
+To reproduce an ADR report from artifacts:
+
+```bash
+# 1. Identify baseline and candidate directories from trials.jsonl
+# 2. Run sim_eval report manually
+cargo run --release -p paraphina --bin sim_eval -- report \
+  --baseline runs/phaseA_smoke_adr/_baseline_cache/balanced/research_v1 \
+  --variant candidate=runs/phaseA_smoke_adr/trial_0000_abc123/suite/research_v1 \
+  --out-md report_reproduced.md \
+  --out-json report_reproduced.json
+
+# 3. Compare with original report
+diff runs/phaseA_smoke_adr/trial_0000_abc123/report/research_v1.json report_reproduced.json
+```
+
+### ADR and Smoke Mode
+
+In smoke mode, ADR still exercises the full path but with minimal scenarios/seeds.
+This ensures the ADR integration is tested without exploding runtime.
 
 ## Artifacts
 
@@ -207,6 +322,7 @@ A candidate passes a tier budget if:
 - Evidence verification passed
 - Research suite passed
 - Adversarial suite passed
+- ADR gating passed (if `--adr-enable` is set)
 
 ### 4. Winner Selection
 
@@ -238,7 +354,7 @@ export PARAPHINA_MM_SIZE_ETA=1.0
 **Promotion record** (`PROMOTION_RECORD.json`):
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "promoted_at": "2025-12-24T20:30:00.000Z",
   "study_name": "research_v1",
   "tier": "balanced",
@@ -253,7 +369,8 @@ export PARAPHINA_MM_SIZE_ETA=1.0
     "monte_carlo --runs 50 --seed 47 --output-dir <trial>/mc/",
     "sim_eval suite research_v1.yaml --output-dir <trial>/suite/research_v1 --verbose",
     "sim_eval suite adversarial_regression_v1.yaml --output-dir <trial>/suite/adversarial_regression_v1 --verbose",
-    "sim_eval verify-evidence-tree <trial>/"
+    "sim_eval verify-evidence-tree <trial>/",
+    "sim_eval report --baseline ... --variant candidate=... --out-md ... --out-json ..."
   ],
   "seeds": [47],
   "evidence_verified": true,
@@ -267,10 +384,22 @@ export PARAPHINA_MM_SIZE_ETA=1.0
   },
   "suites_passed": {
     "research": true,
-    "adversarial": true
-  }
+    "adversarial": true,
+    "adr": true
+  },
+  "adr_results": [
+    {
+      "suite_name": "research_v1",
+      "gates_passed": true,
+      "report_md": "<trial>/report/research_v1.md",
+      "report_json": "<trial>/report/research_v1.json"
+    }
+  ]
 }
 ```
+
+Note: `schema_version: 2` indicates the record includes ADR fields. The `adr_results` field
+is only present when ADR gating was enabled.
 
 ## Reproducing a Promoted Candidate
 
@@ -314,12 +443,24 @@ python3 -m pytest batch_runs/phase_a/tests/test_pareto.py -v
 python3 -m pytest batch_runs/phase_a/tests/test_budgets.py -v
 python3 -m pytest batch_runs/phase_a/tests/test_winner_selection.py -v
 python3 -m pytest batch_runs/phase_a/tests/test_env_parsing.py -v
+python3 -m pytest batch_runs/phase_a/tests/test_adr.py -v
 ```
 
 Or with unittest:
 
 ```bash
 python3 -m unittest discover -s batch_runs/phase_a/tests -v
+```
+
+### ADR Tests
+
+The ADR tests verify:
+- Baseline cache path computation is stable and deterministic
+- Report command construction is correct
+- Evidence root selection works on synthetic directory trees
+
+```bash
+python3 -m unittest batch_runs.phase_a.tests.test_adr -v
 ```
 
 ## Dependencies
@@ -334,7 +475,7 @@ python3 -m unittest discover -s batch_runs/phase_a/tests -v
 batch_runs/phase_a/
 ├── __init__.py
 ├── __main__.py          # Entry point
-├── promote_pipeline.py  # Main CLI and pipeline logic
+├── promote_pipeline.py  # Main CLI and pipeline logic (includes ADR)
 ├── cli.py              # Legacy CLI (optimize/promote subcommands)
 ├── evaluate.py         # Candidate evaluation
 ├── optimize.py         # Pareto + winner selection
@@ -342,6 +483,7 @@ batch_runs/phase_a/
 ├── schemas.py          # Data types
 ├── budgets.yaml        # Default budget definitions
 └── tests/
+    ├── test_adr.py           # ADR gating tests
     ├── test_pareto.py
     ├── test_budgets.py
     ├── test_winner_selection.py
