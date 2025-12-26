@@ -4823,7 +4823,7 @@ B1) Monte Carlo scenario engine (core requirement)
     basis-risk tails, liquidation-distance tails, worst-case PnL.
 
 B2) Stress + adversarial search (find failures faster than random MC)
-> **[STATUS: Partial]** Adversarial search harness implemented at `batch_runs/exp_phase_a_adversarial_search.py`. Samples adversarial scenario parameters (vol, spread, latency, depth, inventory stress), runs monte_carlo, scores by kill_prob_ci_upper + drawdown_cvar - mean_pnl, extracts top-K failure seeds to `failure_seeds.json`, and generates regression suite at `scenarios/suites/adversarial_regression_v1.yaml`. CI workflow at `.github/workflows/adversarial_regression.yml`.
+> **[STATUS: Implemented]** Cross-Entropy Method (CEM) adversarial search at `batch_runs/phase_a/adversarial_search_promote.py`. Maintains mean/std per parameter, samples bounded population per iteration, selects elite top-20%, updates distribution toward elite. Output isolation: all artifacts under `runs/phaseA_adv_search/` by default (git-clean workflow). Explicit promotion via `--promote-suite` writes to `scenarios/suites/adversarial_regression_v3.yaml`. Non-empty suite guarantee with fallbacks. Deterministic given seed. See `docs/PHASE_A_ADVERSARIAL_SEARCH.md`.
 
 - Replace "random scenarios" with systematic adversaries:
   - search for minimal changes that trigger kill, liquidation proximity,

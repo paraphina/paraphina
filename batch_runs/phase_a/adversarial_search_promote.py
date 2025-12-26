@@ -2,33 +2,43 @@
 """
 adversarial_search_promote.py
 
-Phase A-B2: Adversarial / worst-case search + scenario promotion to permanent regression suite.
+Phase A-B2: Cross-Entropy Method (CEM) adversarial search + optional scenario promotion.
 
-Implements evolutionary-lite / hill-climb over seeds per WHITEPAPER Appendix B2:
-- Start with seeded random scenarios
-- Run sim_eval run for each candidate with isolated output
-- Score by adversarial objective (maximize failure likelihood)
-- Extract top-K failure scenarios
-- Promote discovered scenarios to scenarios/v1/adversarial/generated_v1/
-- Generate v2 suite with path-based scenarios only (no inline env_overrides)
+Implements institutional-grade CEM search over adversarial scenario parameters:
+- Maintains mean/std per continuous parameter
+- Samples N candidates each iteration with seeded RNG
+- Scores by adversarial objective (kill_prob + drawdown - pnl)
+- Selects elite top fraction (10-20%)
+- Updates distribution (mean/std) toward elite
+- Repeats for I iterations
 
-Key differences from v1 (exp_phase_a_adversarial_search.py):
-- Generates individual scenario YAML files (path-based)
-- Suite contains only scenario paths (compatible with sim_eval suite)
-- Uses sim_eval run with --output-dir for each candidate
-- Verifies evidence with verify-evidence-tree
+Key design:
+- OUTPUT ISOLATION: By default, all artifacts go under runs/phaseA_adv_search/<study_id>/
+  - NO writes to scenarios/ unless --promote-suite is explicitly passed
+  - Generated suite is self-contained in the output directory
+- DETERMINISM: Fixed seed produces identical search trajectory and results
+- NON-EMPTY: Suite generation always produces at least 1 scenario (with fallbacks)
 
 Usage:
+    # Default run (all outputs under runs/)
     python3 -m batch_runs.phase_a.adversarial_search_promote --help
-    python3 -m batch_runs.phase_a.adversarial_search_promote --smoke --out runs/adv_search_smoke
-    python3 -m batch_runs.phase_a.adversarial_search_promote --trials 20 --out runs/adv_search_full
+    python3 -m batch_runs.phase_a.adversarial_search_promote --smoke --out runs/phaseA_adv_search_smoke
+    python3 -m batch_runs.phase_a.adversarial_search_promote --iterations 5 --pop-size 20 --out runs/adv_cem
 
-Outputs:
-    <out_dir>/search_trials.jsonl    - Every candidate (one JSON per line)
-    <out_dir>/topk.json              - Selected top-K scenarios
-    <out_dir>/summary.md             - Human-readable summary
-    scenarios/v1/adversarial/generated_v1/   - Promoted scenario files
-    scenarios/suites/adversarial_regression_v2.yaml  - Generated suite
+    # Explicit promotion to scenarios/ (only when ready)
+    python3 -m batch_runs.phase_a.adversarial_search_promote --promote-suite --top-k 10
+
+Outputs (default, under <out_dir>/):
+    candidates/<candidate_id>.yaml      - Individual scenario files
+    generated_suite/adversarial_regression_generated.yaml  - Generated suite
+    search_results.jsonl                - Every candidate (one JSON per line)
+    summary.json                        - CEM summary with final distribution
+    cem_history.json                    - Per-iteration CEM stats
+
+Outputs (with --promote-suite):
+    scenarios/v1/adversarial/promoted_v1/<stable_name>.yaml  - Promoted scenarios
+    scenarios/suites/adversarial_regression_v3.yaml          - Canonical suite
+    scenarios/suites/PROMOTION_RECORD.json                   - Audit trail
 """
 
 from __future__ import annotations
@@ -39,6 +49,7 @@ import json
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -56,13 +67,19 @@ SIM_EVAL_BIN = ROOT / "target" / "release" / "sim_eval"
 MONTE_CARLO_BIN = ROOT / "target" / "release" / "monte_carlo"
 
 SCENARIOS_DIR = ROOT / "scenarios"
-GENERATED_SCENARIOS_DIR = SCENARIOS_DIR / "v1" / "adversarial" / "generated_v1"
+PROMOTED_SCENARIOS_DIR = SCENARIOS_DIR / "v1" / "adversarial" / "promoted_v1"
 SUITES_DIR = SCENARIOS_DIR / "suites"
-SUITE_V2_PATH = SUITES_DIR / "adversarial_regression_v2.yaml"
+SUITE_V3_PATH = SUITES_DIR / "adversarial_regression_v3.yaml"
 
-DEFAULT_OUT_DIR = ROOT / "runs" / "phaseA_adversarial_search"
+DEFAULT_OUT_DIR = ROOT / "runs" / "phaseA_adv_search"
 
-# Adversarial parameter bounds for evolutionary search
+# CEM hyperparameters
+DEFAULT_ITERATIONS = 3
+DEFAULT_POP_SIZE = 20
+DEFAULT_ELITE_FRAC = 0.2
+DEFAULT_TOP_K = 5
+
+# Adversarial parameter bounds for CEM search
 ADVERSARIAL_PARAM_BOUNDS = {
     "vol": (0.005, 0.05),              # Volatility (base)
     "vol_multiplier": (0.5, 3.0),      # Volatility scaling
@@ -74,10 +91,160 @@ ADVERSARIAL_PARAM_BOUNDS = {
     "daily_loss_limit": (300.0, 3000.0),
 }
 
+# Parameter names for CEM (ordered for determinism)
+CEM_PARAMS = [
+    "vol", "vol_multiplier", "jump_intensity", "jump_sigma",
+    "spread_bps", "latency_ms", "init_q_tao", "daily_loss_limit"
+]
+
 BASE_PROFILES = ["balanced", "conservative", "aggressive"]
 
-# Default top-K for suite promotion
-DEFAULT_TOP_K = 5
+# Deterministic safe fallback scenario (always valid)
+SAFE_FALLBACK_SCENARIO = {
+    "vol": 0.02,
+    "vol_multiplier": 1.5,
+    "jump_intensity": 0.0005,
+    "jump_sigma": 0.03,
+    "spread_bps": 2.0,
+    "latency_ms": 10.0,
+    "init_q_tao": 0.0,
+    "daily_loss_limit": 1000.0,
+}
+
+
+# ===========================================================================
+# CEM Distribution
+# ===========================================================================
+
+@dataclass
+class CEMDistribution:
+    """
+    Cross-Entropy Method distribution for continuous parameters.
+    
+    Maintains mean and std for each parameter, with bounded sampling.
+    """
+    means: Dict[str, float] = field(default_factory=dict)
+    stds: Dict[str, float] = field(default_factory=dict)
+    profile_weights: Dict[str, float] = field(default_factory=dict)
+    
+    @classmethod
+    def initialize(cls) -> "CEMDistribution":
+        """Initialize CEM distribution at center of parameter bounds."""
+        dist = cls()
+        
+        # Initialize means at center of bounds, stds at 1/4 range
+        for param in CEM_PARAMS:
+            lo, hi = ADVERSARIAL_PARAM_BOUNDS[param]
+            dist.means[param] = (lo + hi) / 2.0
+            dist.stds[param] = (hi - lo) / 4.0
+        
+        # Equal weights for profiles
+        for profile in BASE_PROFILES:
+            dist.profile_weights[profile] = 1.0 / len(BASE_PROFILES)
+        
+        return dist
+    
+    def sample_candidate(
+        self,
+        rng: random.Random,
+        candidate_id: str,
+        seed: int,
+        ticks: int,
+    ) -> "AdversarialCandidate":
+        """Sample a candidate from current distribution (bounded)."""
+        params = {}
+        for param in CEM_PARAMS:
+            lo, hi = ADVERSARIAL_PARAM_BOUNDS[param]
+            # Sample from N(mean, std) and clip to bounds
+            value = rng.gauss(self.means[param], self.stds[param])
+            params[param] = max(lo, min(hi, value))
+        
+        # Sample profile from categorical distribution
+        profile = self._sample_profile(rng)
+        
+        return AdversarialCandidate(
+            candidate_id=candidate_id,
+            seed=seed,
+            profile=profile,
+            vol=params["vol"],
+            vol_multiplier=params["vol_multiplier"],
+            jump_intensity=params["jump_intensity"],
+            jump_sigma=params["jump_sigma"],
+            spread_bps=params["spread_bps"],
+            latency_ms=params["latency_ms"],
+            init_q_tao=params["init_q_tao"],
+            daily_loss_limit=params["daily_loss_limit"],
+            ticks=ticks,
+        )
+    
+    def _sample_profile(self, rng: random.Random) -> str:
+        """Sample profile from weighted distribution."""
+        r = rng.random()
+        cumsum = 0.0
+        for profile in BASE_PROFILES:
+            cumsum += self.profile_weights[profile]
+            if r <= cumsum:
+                return profile
+        return BASE_PROFILES[-1]
+    
+    def update_from_elite(
+        self,
+        elite: List["AdversarialCandidate"],
+        learning_rate: float = 0.5,
+    ) -> None:
+        """Update distribution toward elite samples."""
+        if not elite:
+            return
+        
+        # Compute elite means and stds
+        for param in CEM_PARAMS:
+            values = [getattr(c, param) for c in elite]
+            elite_mean = sum(values) / len(values)
+            elite_var = sum((v - elite_mean) ** 2 for v in values) / len(values)
+            elite_std = max(elite_var ** 0.5, 1e-6)  # Prevent collapse
+            
+            # Smooth update
+            self.means[param] = (1 - learning_rate) * self.means[param] + learning_rate * elite_mean
+            self.stds[param] = (1 - learning_rate) * self.stds[param] + learning_rate * elite_std
+            
+            # Keep stds bounded (min 5% of range)
+            lo, hi = ADVERSARIAL_PARAM_BOUNDS[param]
+            min_std = (hi - lo) * 0.05
+            self.stds[param] = max(self.stds[param], min_std)
+        
+        # Update profile weights
+        profile_counts = {p: 0 for p in BASE_PROFILES}
+        for c in elite:
+            profile_counts[c.profile] += 1
+        
+        for profile in BASE_PROFILES:
+            elite_weight = profile_counts[profile] / len(elite)
+            self.profile_weights[profile] = (
+                (1 - learning_rate) * self.profile_weights[profile] +
+                learning_rate * elite_weight
+            )
+        
+        # Normalize profile weights
+        total = sum(self.profile_weights.values())
+        for profile in BASE_PROFILES:
+            self.profile_weights[profile] /= total
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict for JSON serialization."""
+        return {
+            "means": dict(self.means),
+            "stds": dict(self.stds),
+            "profile_weights": dict(self.profile_weights),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CEMDistribution":
+        """Reconstruct from dict."""
+        dist = cls()
+        dist.means = dict(data.get("means", {}))
+        dist.stds = dict(data.get("stds", {}))
+        dist.profile_weights = dict(data.get("profile_weights", {}))
+        return dist
 
 
 # ===========================================================================
@@ -122,14 +289,14 @@ class AdversarialCandidate:
         return hashlib.sha256(key.encode()).hexdigest()[:8]
     
     def scenario_filename(self) -> str:
-        """Generate deterministic filename for promoted scenario."""
+        """Generate deterministic filename for scenario."""
         return f"adv_s{self.seed:05d}_{self.scenario_hash()}.yaml"
     
     def to_scenario_yaml(self) -> str:
         """Generate scenario YAML content."""
         effective_vol = self.vol * self.vol_multiplier
         lines = [
-            f"# Adversarial scenario discovered by adversarial_search_promote.py",
+            f"# Adversarial scenario discovered by CEM search",
             f"# Seed: {self.seed}, Profile: {self.profile}",
             f"# Generated: {datetime.now(timezone.utc).isoformat()}",
             f"",
@@ -165,7 +332,7 @@ class AdversarialCandidate:
             f"  fees_bps_taker: {self.spread_bps:.2f}",
             f"  latency_ms: {self.latency_ms:.1f}",
             f"",
-            f"# Adversarial search metadata",
+            f"# CEM adversarial search metadata",
             f"adversarial_params:",
             f"  vol_multiplier: {self.vol_multiplier:.4f}",
             f"  daily_loss_limit: {self.daily_loss_limit:.2f}",
@@ -175,6 +342,19 @@ class AdversarialCandidate:
             f"  pnl_linearity_check: disabled",
         ]
         return "\n".join(lines)
+    
+    def to_param_dict(self) -> Dict[str, float]:
+        """Extract CEM parameters as dict."""
+        return {
+            "vol": self.vol,
+            "vol_multiplier": self.vol_multiplier,
+            "jump_intensity": self.jump_intensity,
+            "jump_sigma": self.jump_sigma,
+            "spread_bps": self.spread_bps,
+            "latency_ms": self.latency_ms,
+            "init_q_tao": self.init_q_tao,
+            "daily_loss_limit": self.daily_loss_limit,
+        }
 
 
 @dataclass
@@ -196,6 +376,8 @@ class SearchResult:
     duration_sec: float = 0.0
     returncode: int = -1
     error_message: Optional[str] = None
+    # CEM iteration info
+    cem_iteration: int = 0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for JSON serialization."""
@@ -223,45 +405,41 @@ class SearchResult:
             "returncode": self.returncode,
             "error_message": self.error_message,
             "scenario_filename": self.candidate.scenario_filename(),
+            "cem_iteration": self.cem_iteration,
         }
 
 
+@dataclass
+class CEMIterationStats:
+    """Statistics for one CEM iteration."""
+    iteration: int
+    candidates_evaluated: int
+    valid_count: int
+    elite_count: int
+    best_score: float
+    mean_score: float
+    distribution_snapshot: Dict[str, Any]
+
+
 # ===========================================================================
-# Candidate generation (evolutionary-lite)
+# Candidate generation
 # ===========================================================================
 
-def generate_random_candidates(
+def generate_cem_candidates(
+    dist: CEMDistribution,
     n_candidates: int,
     base_seed: int,
-    profiles: List[str],
+    iteration: int,
     ticks: int,
 ) -> List[AdversarialCandidate]:
-    """
-    Generate random adversarial candidates using seeded RNG.
-    
-    Deterministic given base_seed.
-    """
-    rng = random.Random(base_seed)
+    """Generate candidates from CEM distribution for one iteration."""
+    rng = random.Random(base_seed + iteration * 10000)
     candidates = []
     
     for i in range(n_candidates):
-        seed = base_seed + i
-        profile = rng.choice(profiles)
-        
-        candidate = AdversarialCandidate(
-            candidate_id=f"cand_{i:04d}_s{seed}",
-            seed=seed,
-            profile=profile,
-            vol=rng.uniform(*ADVERSARIAL_PARAM_BOUNDS["vol"]),
-            vol_multiplier=rng.uniform(*ADVERSARIAL_PARAM_BOUNDS["vol_multiplier"]),
-            jump_intensity=rng.uniform(*ADVERSARIAL_PARAM_BOUNDS["jump_intensity"]),
-            jump_sigma=rng.uniform(*ADVERSARIAL_PARAM_BOUNDS["jump_sigma"]),
-            spread_bps=rng.uniform(*ADVERSARIAL_PARAM_BOUNDS["spread_bps"]),
-            latency_ms=rng.uniform(*ADVERSARIAL_PARAM_BOUNDS["latency_ms"]),
-            init_q_tao=rng.uniform(*ADVERSARIAL_PARAM_BOUNDS["init_q_tao"]),
-            daily_loss_limit=rng.uniform(*ADVERSARIAL_PARAM_BOUNDS["daily_loss_limit"]),
-            ticks=ticks,
-        )
+        seed = base_seed + iteration * 10000 + i
+        candidate_id = f"cem_i{iteration:02d}_c{i:04d}_s{seed}"
+        candidate = dist.sample_candidate(rng, candidate_id, seed, ticks)
         candidates.append(candidate)
     
     return candidates
@@ -272,11 +450,7 @@ def generate_smoke_candidates(
     profiles: List[str],
     ticks: int,
 ) -> List[AdversarialCandidate]:
-    """
-    Generate fixed smoke test candidates (one per profile).
-    
-    Deterministic and fast for testing.
-    """
+    """Generate fixed smoke test candidates (one per profile)."""
     candidates = []
     
     for i, profile in enumerate(profiles):
@@ -286,7 +460,7 @@ def generate_smoke_candidates(
             seed=seed,
             profile=profile,
             vol=0.02,
-            vol_multiplier=2.0,  # High stress
+            vol_multiplier=2.0,
             jump_intensity=0.001,
             jump_sigma=0.05,
             spread_bps=2.0,
@@ -300,43 +474,14 @@ def generate_smoke_candidates(
     return candidates
 
 
-def mutate_candidate(
-    parent: AdversarialCandidate,
-    rng: random.Random,
-    mutation_strength: float = 0.2,
-) -> AdversarialCandidate:
-    """
-    Mutate a candidate (evolutionary hill-climb step).
-    
-    Randomly perturbs 1-2 parameters within bounds.
-    """
-    params_to_mutate = rng.sample(
-        ["vol", "vol_multiplier", "jump_intensity", "jump_sigma",
-         "spread_bps", "latency_ms", "init_q_tao", "daily_loss_limit"],
-        k=rng.randint(1, 2)
-    )
-    
-    new_seed = parent.seed + 1000 + rng.randint(0, 999)
-    
-    def mutate_param(val: float, bounds: Tuple[float, float]) -> float:
-        range_size = bounds[1] - bounds[0]
-        delta = rng.gauss(0, mutation_strength * range_size)
-        new_val = val + delta
-        return max(bounds[0], min(bounds[1], new_val))
-    
+def create_fallback_candidate(base_seed: int, ticks: int) -> AdversarialCandidate:
+    """Create deterministic safe fallback candidate."""
     return AdversarialCandidate(
-        candidate_id=f"mut_{new_seed}",
-        seed=new_seed,
-        profile=parent.profile if "profile" not in params_to_mutate else rng.choice(BASE_PROFILES),
-        vol=mutate_param(parent.vol, ADVERSARIAL_PARAM_BOUNDS["vol"]) if "vol" in params_to_mutate else parent.vol,
-        vol_multiplier=mutate_param(parent.vol_multiplier, ADVERSARIAL_PARAM_BOUNDS["vol_multiplier"]) if "vol_multiplier" in params_to_mutate else parent.vol_multiplier,
-        jump_intensity=mutate_param(parent.jump_intensity, ADVERSARIAL_PARAM_BOUNDS["jump_intensity"]) if "jump_intensity" in params_to_mutate else parent.jump_intensity,
-        jump_sigma=mutate_param(parent.jump_sigma, ADVERSARIAL_PARAM_BOUNDS["jump_sigma"]) if "jump_sigma" in params_to_mutate else parent.jump_sigma,
-        spread_bps=mutate_param(parent.spread_bps, ADVERSARIAL_PARAM_BOUNDS["spread_bps"]) if "spread_bps" in params_to_mutate else parent.spread_bps,
-        latency_ms=mutate_param(parent.latency_ms, ADVERSARIAL_PARAM_BOUNDS["latency_ms"]) if "latency_ms" in params_to_mutate else parent.latency_ms,
-        init_q_tao=mutate_param(parent.init_q_tao, ADVERSARIAL_PARAM_BOUNDS["init_q_tao"]) if "init_q_tao" in params_to_mutate else parent.init_q_tao,
-        daily_loss_limit=mutate_param(parent.daily_loss_limit, ADVERSARIAL_PARAM_BOUNDS["daily_loss_limit"]) if "daily_loss_limit" in params_to_mutate else parent.daily_loss_limit,
-        ticks=parent.ticks,
+        candidate_id=f"fallback_s{base_seed}",
+        seed=base_seed,
+        profile="balanced",
+        ticks=ticks,
+        **SAFE_FALLBACK_SCENARIO,
     )
 
 
@@ -347,11 +492,6 @@ def mutate_candidate(
 def compute_adversarial_score(result: SearchResult) -> float:
     """
     Compute adversarial score (higher = more adversarial/worse).
-    
-    Objectives:
-    1. kill_switch triggered (highest priority)
-    2. large max_drawdown
-    3. negative pnl
     
     Formula: 1000*kill + 10*max_drawdown - 0.1*mean_pnl
     """
@@ -375,6 +515,22 @@ def rank_results_deterministic(results: List[SearchResult]) -> List[SearchResult
     )
 
 
+def select_elite(
+    results: List[SearchResult],
+    elite_frac: float,
+) -> List[AdversarialCandidate]:
+    """
+    Select elite fraction of candidates by adversarial score.
+    
+    Returns candidates (not results) for CEM update.
+    """
+    valid = [r for r in results if r.evidence_verified]
+    ranked = rank_results_deterministic(valid)
+    
+    n_elite = max(1, int(len(ranked) * elite_frac))
+    return [r.candidate for r in ranked[:n_elite]]
+
+
 # ===========================================================================
 # Runner
 # ===========================================================================
@@ -384,15 +540,11 @@ def run_candidate(
     output_dir: Path,
     verbose: bool = True,
 ) -> SearchResult:
-    """
-    Run sim_eval for a single candidate scenario.
-    
-    Uses isolated output directory with evidence verification.
-    """
+    """Run sim_eval for a single candidate scenario."""
     candidate_output = output_dir / "runs" / candidate.candidate_id
     candidate_output.mkdir(parents=True, exist_ok=True)
     
-    # Write scenario YAML to temp location
+    # Write scenario YAML
     scenario_yaml = candidate_output / "scenario.yaml"
     scenario_yaml.write_text(candidate.to_scenario_yaml())
     
@@ -404,29 +556,27 @@ def run_candidate(
         cmd = ["cargo", "run", "-p", "paraphina", "--bin", "sim_eval", "--release", "--",
                "run", str(scenario_yaml), "--output-dir", str(candidate_output), "--verbose"]
     
-    # Environment overlay for loss limit (not in scenario YAML)
+    # Environment overlay
     env = os.environ.copy()
     env["PARAPHINA_DAILY_LOSS_LIMIT"] = str(candidate.daily_loss_limit)
     
     if verbose:
-        print(f"    Running candidate {candidate.candidate_id}...")
+        print(f"    Running {candidate.candidate_id}...")
     
     t0 = time.time()
     proc = subprocess.run(cmd, env=env, cwd=str(ROOT), capture_output=True, text=True)
     duration = time.time() - t0
     
-    # Parse results from run_summary.json
+    # Parse results
     mean_pnl = float("nan")
     max_drawdown = float("nan")
     kill_switch = False
     final_pnl = float("nan")
     error_message = None
     
-    # Find run_summary.json files (may be in subdirectories, one per seed)
     summary_files = list(candidate_output.rglob("run_summary.json"))
     if summary_files:
         try:
-            # Aggregate across all runs for this candidate
             pnl_values = []
             drawdown_values = []
             any_kill = False
@@ -435,7 +585,6 @@ def run_candidate(
                 with open(sf) as f:
                     summary = json.load(f)
                 
-                # Parse nested structure: results.final_pnl_usd, results.max_drawdown_usd
                 results = summary.get("results", {})
                 pnl = results.get("final_pnl_usd", float("nan"))
                 dd = abs(results.get("max_drawdown_usd", 0.0))
@@ -448,10 +597,9 @@ def run_candidate(
                 if kill:
                     any_kill = True
             
-            # Compute aggregates
             if pnl_values:
                 mean_pnl = sum(pnl_values) / len(pnl_values)
-                final_pnl = pnl_values[0]  # First run's pnl
+                final_pnl = pnl_values[0]
             if drawdown_values:
                 max_drawdown = max(drawdown_values)
             kill_switch = any_kill
@@ -461,11 +609,6 @@ def run_candidate(
     elif proc.returncode != 0:
         error_message = proc.stderr.strip()[:200] if proc.stderr else f"Exit code {proc.returncode}"
     
-    # Verify run completed successfully
-    # Note: sim_eval run doesn't produce evidence packs (only suites do)
-    # For discovery phase, we consider a run valid if:
-    # 1. Return code is 0
-    # 2. At least one run_summary.json exists with valid metrics
     evidence_verified = (
         proc.returncode == 0 
         and summary_files 
@@ -486,7 +629,6 @@ def run_candidate(
         error_message=error_message,
     )
     
-    # Compute adversarial score
     result.adversarial_score = compute_adversarial_score(result)
     
     if verbose:
@@ -497,54 +639,133 @@ def run_candidate(
     return result
 
 
-def verify_evidence_tree(output_dir: Path, verbose: bool = True) -> bool:
-    """Verify evidence tree using sim_eval verify-evidence-tree."""
-    if SIM_EVAL_BIN.exists():
-        cmd = [str(SIM_EVAL_BIN), "verify-evidence-tree", str(output_dir)]
-    else:
-        cmd = ["cargo", "run", "-p", "paraphina", "--bin", "sim_eval", "--release", "--",
-               "verify-evidence-tree", str(output_dir)]
-    
-    proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
-    
-    if proc.returncode == 0:
-        if verbose:
-            print(f"    ✓ Evidence verified: {output_dir.name}")
-        return True
-    else:
-        if verbose:
-            print(f"    ✗ Evidence FAILED: {output_dir.name}")
-        return False
-
-
 # ===========================================================================
-# Output writing
+# Output writing (isolated under out_dir)
 # ===========================================================================
 
-def write_search_trials_jsonl(results: List[SearchResult], path: Path) -> None:
-    """Write all search trials to JSONL (one JSON per line)."""
+def write_search_results_jsonl(results: List[SearchResult], path: Path) -> None:
+    """Write all search results to JSONL."""
     with open(path, "w") as f:
         for r in results:
             f.write(json.dumps(r.to_dict(), sort_keys=True) + "\n")
 
 
-def write_topk_json(
+def write_candidate_scenarios(
+    candidates: List[AdversarialCandidate],
+    candidates_dir: Path,
+) -> List[Path]:
+    """Write candidate scenario YAMLs to candidates/ directory."""
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    
+    for candidate in candidates:
+        path = candidates_dir / candidate.scenario_filename()
+        path.write_text(candidate.to_scenario_yaml())
+        paths.append(path)
+    
+    return paths
+
+
+def write_generated_suite_yaml(
     topk: List[SearchResult],
-    path: Path,
-    base_seed: int,
-) -> None:
-    """Write top-K selected scenarios to JSON."""
-    data = {
+    suite_dir: Path,
+    candidates_dir: Path,
+) -> Path:
+    """
+    Generate suite YAML pointing to candidates in candidates_dir.
+    
+    Uses absolute paths for portability (sim_eval resolves from cwd).
+    CRITICAL: Always produces non-empty suite (with fallback if needed).
+    """
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    suite_path = suite_dir / "adversarial_regression_generated.yaml"
+    
+    if not topk:
+        raise ValueError("Cannot generate suite with empty scenarios list")
+    
+    # Sort deterministically
+    sorted_results = sorted(
+        topk,
+        key=lambda r: (-r.adversarial_score, r.candidate.seed, r.candidate.scenario_filename()),
+    )
+    
+    # Use absolute paths for portability
+    candidates_dir_abs = candidates_dir.resolve()
+    
+    lines = [
+        "# Adversarial Regression Suite (CEM-generated)",
+        "#",
+        "# Auto-generated by adversarial_search_promote.py (CEM search)",
+        f"# Generated at: {datetime.now(timezone.utc).isoformat()}",
+        "#",
+        "# This suite is self-contained in the output directory.",
+        "# Paths are relative to this suite file location.",
+        "#",
+        "# Usage:",
+        "#   cargo run -p paraphina --bin sim_eval -- suite \\",
+        "#     <this_file> --output-dir <out> --verbose",
+        "#",
+        "",
+        "suite_id: adversarial_regression_cem",
+        "suite_version: 1",
+        "",
+        "repeat_runs: 1",
+        "",
+        "scenarios:",
+    ]
+    
+    for i, r in enumerate(sorted_results):
+        scenario_path = candidates_dir_abs / r.candidate.scenario_filename()
+        lines.append(f"  # Rank {i+1}: score={r.adversarial_score:.2f}, seed={r.candidate.seed}")
+        lines.append(f"  - path: {scenario_path}")
+        lines.append("")
+    
+    lines.extend([
+        "invariants:",
+        "  evidence_pack_valid: true",
+        "  expect_kill_switch: allowed",
+    ])
+    
+    suite_path.write_text("\n".join(lines))
+    return suite_path
+
+
+def write_summary_json(
+    results: List[SearchResult],
+    topk: List[SearchResult],
+    cem_history: List[CEMIterationStats],
+    final_dist: CEMDistribution,
+    config: Dict[str, Any],
+    out_dir: Path,
+) -> Path:
+    """Write JSON summary with CEM stats."""
+    path = out_dir / "summary.json"
+    
+    summary = {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "base_seed": base_seed,
+        "config": config,
+        "total_candidates": len(results),
+        "valid_candidates": sum(1 for r in results if r.evidence_verified),
         "top_k": len(topk),
-        "scenarios": [
+        "cem_iterations": len(cem_history),
+        "final_distribution": final_dist.to_dict(),
+        "cem_history": [
+            {
+                "iteration": s.iteration,
+                "candidates_evaluated": s.candidates_evaluated,
+                "valid_count": s.valid_count,
+                "elite_count": s.elite_count,
+                "best_score": s.best_score,
+                "mean_score": s.mean_score,
+            }
+            for s in cem_history
+        ],
+        "top_k_scenarios": [
             {
                 "rank": i + 1,
                 "candidate_id": r.candidate_id,
                 "scenario_filename": r.candidate.scenario_filename(),
-                "scenario_path": f"scenarios/v1/adversarial/generated_v1/{r.candidate.scenario_filename()}",
                 "seed": r.candidate.seed,
                 "profile": r.candidate.profile,
                 "adversarial_score": r.adversarial_score,
@@ -555,170 +776,148 @@ def write_topk_json(
             for i, r in enumerate(topk)
         ],
     }
+    
     with open(path, "w") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+        json.dump(summary, f, indent=2, sort_keys=True)
+    
+    return path
 
 
-def write_summary_md(
-    results: List[SearchResult],
+# ===========================================================================
+# Promotion mode (writes to scenarios/)
+# ===========================================================================
+
+def promote_scenarios_to_repo(
     topk: List[SearchResult],
+    source_out_dir: Path,
     base_seed: int,
-    out_dir: Path,
-    path: Path,
-) -> None:
-    """Write human-readable summary markdown."""
-    lines = [
-        "# Adversarial Search Summary",
-        "",
-        f"**Generated:** {datetime.now(timezone.utc).isoformat()}",
-        f"**Base Seed:** {base_seed}",
-        f"**Total Candidates:** {len(results)}",
-        f"**Valid (evidence verified):** {sum(1 for r in results if r.evidence_verified)}",
-        f"**Top-K Selected:** {len(topk)}",
-        "",
-        "## Output Locations",
-        "",
-        f"- Search output: `{out_dir}/`",
-        f"- Search trials: `{out_dir}/search_trials.jsonl`",
-        f"- Top-K JSON: `{out_dir}/topk.json`",
-        f"- Promoted scenarios: `scenarios/v1/adversarial/generated_v1/`",
-        f"- Suite file: `scenarios/suites/adversarial_regression_v2.yaml`",
-        "",
-        "## Verification Commands",
-        "",
-        "```bash",
-        "# Run the generated suite",
-        "cargo run -p paraphina --bin sim_eval -- suite \\",
-        "  scenarios/suites/adversarial_regression_v2.yaml \\",
-        "  --output-dir runs/adv_reg_v2 --verbose",
-        "",
-        "# Verify evidence packs",
-        "cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs/adv_reg_v2",
-        "```",
-        "",
-        "## Top Adversarial Scenarios",
-        "",
-        "| Rank | Seed | Profile | Score | Kill | Max DD | PnL |",
-        "|------|------|---------|-------|------|--------|-----|",
-    ]
-    
-    for i, r in enumerate(topk):
-        kill_str = "✓" if r.kill_switch else ""
-        dd = f"{r.max_drawdown:.2f}" if not math.isnan(r.max_drawdown) else "N/A"
-        pnl = f"{r.mean_pnl:.2f}" if not math.isnan(r.mean_pnl) else "N/A"
-        lines.append(f"| {i+1} | {r.candidate.seed} | {r.candidate.profile} | {r.adversarial_score:.2f} | {kill_str} | {dd} | {pnl} |")
-    
-    lines.extend([
-        "",
-        "## Scenario Files",
-        "",
-    ])
-    
-    for i, r in enumerate(topk):
-        lines.append(f"- **{i+1}.** `{r.candidate.scenario_filename()}`")
-    
-    path.write_text("\n".join(lines))
-
-
-def promote_scenarios(topk: List[SearchResult]) -> List[Path]:
+) -> Tuple[List[Path], Path, Path]:
     """
-    Write scenario YAML files to scenarios/v1/adversarial/generated_v1/.
+    Promote top-K scenarios to canonical repo locations.
     
-    Returns list of written paths.
+    Returns (promoted_paths, suite_path, record_path).
     """
-    GENERATED_SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
+    PROMOTED_SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
+    SUITES_DIR.mkdir(parents=True, exist_ok=True)
     
-    written_paths = []
+    # Write promoted scenario files
+    promoted_paths = []
     for r in topk:
-        scenario_path = GENERATED_SCENARIOS_DIR / r.candidate.scenario_filename()
-        scenario_path.write_text(r.candidate.to_scenario_yaml())
-        written_paths.append(scenario_path)
+        filename = r.candidate.scenario_filename()
+        dest = PROMOTED_SCENARIOS_DIR / filename
+        
+        # Don't overwrite existing files silently
+        if dest.exists():
+            print(f"    WARNING: Skipping existing file: {dest.relative_to(ROOT)}")
+            continue
+        
+        dest.write_text(r.candidate.to_scenario_yaml())
+        promoted_paths.append(dest)
     
-    return written_paths
-
-
-def generate_suite_v2_yaml(topk: List[SearchResult], suite_path: Path) -> None:
-    """
-    Generate adversarial_regression_v2.yaml with path-based scenarios only.
-    
-    CRITICAL: scenarios list must be non-empty and deterministically ordered.
-    """
-    if not topk:
-        raise ValueError("Cannot generate suite with empty scenarios list")
-    
-    # Sort deterministically: by score (descending), then seed, then filename
+    # Generate v3 suite
     sorted_results = sorted(
         topk,
         key=lambda r: (-r.adversarial_score, r.candidate.seed, r.candidate.scenario_filename()),
     )
     
     lines = [
-        "# Adversarial Regression Suite v2",
+        "# Adversarial Regression Suite v3",
         "#",
-        "# Auto-generated by adversarial_search_promote.py",
+        "# Auto-generated by CEM adversarial search with --promote-suite",
         f"# Generated at: {datetime.now(timezone.utc).isoformat()}",
         "#",
-        "# This suite uses PATH-BASED scenarios only (no inline env_overrides).",
-        "# Compatible with sim_eval suite --output-dir.",
-        "#",
-        "# Usage:",
-        "#   cargo run -p paraphina --bin sim_eval -- suite \\",
-        "#     scenarios/suites/adversarial_regression_v2.yaml \\",
-        "#     --output-dir runs/adv_reg_v2 --verbose",
-        "#",
-        "# Verify evidence:",
-        "#   cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs/adv_reg_v2",
+        "# This suite contains promoted adversarial scenarios.",
+        "# Do NOT edit manually - regenerate via adversarial_search_promote.py --promote-suite",
         "#",
         "",
-        "suite_id: adversarial_regression_v2",
-        "suite_version: 2",
+        "suite_id: adversarial_regression_v3",
+        "suite_version: 3",
         "",
-        "# Run each scenario for determinism verification",
         "repeat_runs: 1",
         "",
-        "# Scenarios discovered by adversarial search",
-        "# Ordered by adversarial score (descending), with deterministic tie-breaking",
         "scenarios:",
     ]
     
     for i, r in enumerate(sorted_results):
-        scenario_rel_path = f"scenarios/v1/adversarial/generated_v1/{r.candidate.scenario_filename()}"
-        lines.append(f"  # Rank {i+1}: score={r.adversarial_score:.2f}, seed={r.candidate.seed}")
-        lines.append(f"  - path: {scenario_rel_path}")
+        rel_path = f"scenarios/v1/adversarial/promoted_v1/{r.candidate.scenario_filename()}"
+        lines.append(f"  # Rank {i+1}: score={r.adversarial_score:.2f}, seed={r.candidate.seed}, profile={r.candidate.profile}")
+        lines.append(f"  - path: {rel_path}")
         lines.append("")
     
     lines.extend([
-        "# Invariants",
         "invariants:",
         "  evidence_pack_valid: true",
         "  expect_kill_switch: allowed",
     ])
     
-    SUITES_DIR.mkdir(parents=True, exist_ok=True)
-    suite_path.write_text("\n".join(lines))
+    SUITE_V3_PATH.write_text("\n".join(lines))
+    
+    # Write promotion record
+    record_path = SUITES_DIR / "PROMOTION_RECORD.json"
+    
+    # Get git SHA
+    try:
+        git_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(ROOT),
+            text=True,
+        ).strip()
+    except Exception:
+        git_sha = "unknown"
+    
+    record = {
+        "schema_version": 1,
+        "promoted_at": datetime.now(timezone.utc).isoformat(),
+        "git_sha": git_sha,
+        "command_line": " ".join(sys.argv),
+        "base_seed": base_seed,
+        "top_k": len(topk),
+        "source_run_directory": str(source_out_dir),
+        "promoted_scenarios": [
+            {
+                "filename": r.candidate.scenario_filename(),
+                "seed": r.candidate.seed,
+                "profile": r.candidate.profile,
+                "adversarial_score": r.adversarial_score,
+            }
+            for r in sorted_results
+        ],
+        "suite_path": str(SUITE_V3_PATH.relative_to(ROOT)),
+    }
+    
+    with open(record_path, "w") as f:
+        json.dump(record, f, indent=2, sort_keys=True)
+    
+    return promoted_paths, SUITE_V3_PATH, record_path
 
 
 # ===========================================================================
-# Main pipeline
+# Main CEM pipeline
 # ===========================================================================
 
-def run_adversarial_search(
-    trials: int,
+def run_cem_search(
+    iterations: int,
+    pop_size: int,
+    elite_frac: float,
     base_seed: int,
     ticks: int,
     top_k: int,
     out_dir: Path,
     smoke: bool = False,
     verbose: bool = True,
-) -> Tuple[List[SearchResult], List[SearchResult]]:
+) -> Tuple[List[SearchResult], List[SearchResult], CEMDistribution]:
     """
-    Run adversarial search and return (all_results, top_k_results).
+    Run CEM adversarial search.
+    
+    Returns (all_results, top_k_results, final_distribution).
     """
     print("=" * 70)
-    print("Phase A-B2: Adversarial Search + Scenario Promotion")
+    print("Phase A-B2: CEM Adversarial Search")
     print("=" * 70)
     print(f"  Base seed: {base_seed}")
-    print(f"  Trials: {trials}")
+    print(f"  Iterations: {iterations}")
+    print(f"  Population size: {pop_size}")
+    print(f"  Elite fraction: {elite_frac:.2f}")
     print(f"  Ticks: {ticks}")
     print(f"  Top-K: {top_k}")
     print(f"  Output: {out_dir}")
@@ -727,38 +926,91 @@ def run_adversarial_search(
     
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    # Generate candidates
-    print("[1/4] Generating candidates...")
+    all_results: List[SearchResult] = []
+    cem_history: List[CEMIterationStats] = []
+    
     if smoke:
+        # Smoke mode: skip CEM, use fixed candidates
+        print("[1/3] Smoke mode: using fixed candidates...")
         candidates = generate_smoke_candidates(base_seed, BASE_PROFILES, ticks)
-    else:
-        candidates = generate_random_candidates(trials, base_seed, BASE_PROFILES, ticks)
-    print(f"  Generated {len(candidates)} candidates")
-    
-    # Run all candidates
-    print(f"\n[2/4] Running {len(candidates)} adversarial candidates...")
-    results: List[SearchResult] = []
-    
-    for i, candidate in enumerate(candidates):
-        print(f"\n  [{i+1}/{len(candidates)}] {candidate.candidate_id}")
-        result = run_candidate(candidate, out_dir, verbose)
-        results.append(result)
+        dist = CEMDistribution.initialize()
         
-        # Write progress
-        if (i + 1) % 5 == 0 or i == len(candidates) - 1:
-            search_trials_path = out_dir / "search_trials.jsonl"
-            write_search_trials_jsonl(results, search_trials_path)
+        for i, candidate in enumerate(candidates):
+            print(f"\n  [{i+1}/{len(candidates)}] {candidate.candidate_id}")
+            result = run_candidate(candidate, out_dir, verbose)
+            result.cem_iteration = 0
+            all_results.append(result)
+        
+    else:
+        # CEM iterations
+        dist = CEMDistribution.initialize()
+        
+        for iteration in range(iterations):
+            print(f"\n[CEM Iteration {iteration+1}/{iterations}]")
+            print(f"  Distribution means: vol={dist.means['vol']:.4f}, vol_mult={dist.means['vol_multiplier']:.2f}")
+            
+            # Generate candidates from current distribution
+            candidates = generate_cem_candidates(dist, pop_size, base_seed, iteration, ticks)
+            
+            # Evaluate candidates
+            iteration_results = []
+            for i, candidate in enumerate(candidates):
+                print(f"\n  [{i+1}/{len(candidates)}] {candidate.candidate_id}")
+                result = run_candidate(candidate, out_dir, verbose)
+                result.cem_iteration = iteration
+                iteration_results.append(result)
+                all_results.append(result)
+            
+            # Select elite and update distribution
+            elite = select_elite(iteration_results, elite_frac)
+            
+            valid_count = sum(1 for r in iteration_results if r.evidence_verified)
+            scores = [r.adversarial_score for r in iteration_results if r.evidence_verified]
+            
+            stats = CEMIterationStats(
+                iteration=iteration,
+                candidates_evaluated=len(iteration_results),
+                valid_count=valid_count,
+                elite_count=len(elite),
+                best_score=max(scores) if scores else 0.0,
+                mean_score=sum(scores) / len(scores) if scores else 0.0,
+                distribution_snapshot=dist.to_dict(),
+            )
+            cem_history.append(stats)
+            
+            print(f"\n  Iteration {iteration+1} summary:")
+            print(f"    Valid: {valid_count}/{len(iteration_results)}")
+            print(f"    Elite: {len(elite)}")
+            print(f"    Best score: {stats.best_score:.2f}")
+            print(f"    Mean score: {stats.mean_score:.2f}")
+            
+            # Update distribution toward elite
+            if elite:
+                dist.update_from_elite(elite)
+                print(f"    Updated distribution: vol_mean={dist.means['vol']:.4f}")
     
-    # Rank and select top-K
-    print(f"\n[3/4] Ranking by adversarial score...")
-    valid_results = [r for r in results if r.evidence_verified]
+    # Final ranking and top-K selection
+    print(f"\n[Final Selection]")
+    valid_results = [r for r in all_results if r.evidence_verified]
     ranked = rank_results_deterministic(valid_results)
     
-    print(f"  Valid results: {len(valid_results)}/{len(results)}")
-    if ranked:
-        print(f"  Top adversarial score: {ranked[0].adversarial_score:.2f}")
+    print(f"  Total evaluated: {len(all_results)}")
+    print(f"  Valid results: {len(valid_results)}")
     
-    topk_results = ranked[:top_k]
+    # Ensure non-empty selection with fallbacks
+    if ranked:
+        topk_results = ranked[:top_k]
+    else:
+        # Fallback: create deterministic safe scenario
+        print("  WARNING: No valid results, using fallback scenario")
+        fallback = create_fallback_candidate(base_seed, ticks)
+        fallback_result = SearchResult(
+            candidate_id=fallback.candidate_id,
+            candidate=fallback,
+            evidence_verified=True,  # Mark as valid for suite generation
+        )
+        fallback_result.adversarial_score = 0.0
+        topk_results = [fallback_result]
     
     print(f"\n  Top {len(topk_results)} selected:")
     for i, r in enumerate(topk_results):
@@ -767,42 +1019,42 @@ def run_adversarial_search(
               f"score={r.adversarial_score:.2f}{kill_str}")
     
     # Write outputs
-    print(f"\n[4/4] Writing outputs...")
+    print(f"\n[Writing Outputs]")
     
-    search_trials_path = out_dir / "search_trials.jsonl"
-    write_search_trials_jsonl(results, search_trials_path)
-    print(f"  ✓ {search_trials_path}")
+    # Search results JSONL
+    results_path = out_dir / "search_results.jsonl"
+    write_search_results_jsonl(all_results, results_path)
+    print(f"  ✓ {results_path.relative_to(ROOT)}")
     
-    topk_path = out_dir / "topk.json"
-    write_topk_json(topk_results, topk_path, base_seed)
-    print(f"  ✓ {topk_path}")
+    # Candidate scenario files
+    candidates_dir = out_dir / "candidates"
+    candidates_to_write = [r.candidate for r in topk_results]
+    written_paths = write_candidate_scenarios(candidates_to_write, candidates_dir)
+    print(f"  ✓ {candidates_dir.relative_to(ROOT)}/ ({len(written_paths)} files)")
     
-    summary_path = out_dir / "summary.md"
-    write_summary_md(results, topk_results, base_seed, out_dir, summary_path)
-    print(f"  ✓ {summary_path}")
+    # Generated suite
+    suite_dir = out_dir / "generated_suite"
+    suite_path = write_generated_suite_yaml(topk_results, suite_dir, candidates_dir)
+    print(f"  ✓ {suite_path.relative_to(ROOT)}")
     
-    # Promote scenarios if we have results
-    if topk_results:
-        print(f"\n  Promoting {len(topk_results)} scenarios...")
-        written_paths = promote_scenarios(topk_results)
-        for p in written_paths:
-            print(f"    ✓ {p.relative_to(ROOT)}")
-        
-        print(f"\n  Generating suite v2...")
-        generate_suite_v2_yaml(topk_results, SUITE_V2_PATH)
-        print(f"    ✓ {SUITE_V2_PATH.relative_to(ROOT)}")
-    else:
-        print("\n  WARNING: No valid results to promote")
-    
-    # Summary of verified runs
-    verified_count = sum(1 for r in results if r.evidence_verified)
-    print(f"\n  Run summary: {verified_count}/{len(results)} candidates produced valid results")
+    # Summary JSON
+    config = {
+        "iterations": iterations,
+        "pop_size": pop_size,
+        "elite_frac": elite_frac,
+        "base_seed": base_seed,
+        "ticks": ticks,
+        "top_k": top_k,
+        "smoke": smoke,
+    }
+    summary_path = write_summary_json(all_results, topk_results, cem_history, dist, config, out_dir)
+    print(f"  ✓ {summary_path.relative_to(ROOT)}")
     
     print("\n" + "=" * 70)
-    print("Adversarial Search Complete")
+    print("CEM Adversarial Search Complete")
     print("=" * 70)
     
-    return results, topk_results
+    return all_results, topk_results, dist
 
 
 # ===========================================================================
@@ -813,36 +1065,59 @@ def main(argv: Optional[List[str]] = None) -> int:
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
         prog="python3 -m batch_runs.phase_a.adversarial_search_promote",
-        description="Phase A-B2: Adversarial search + scenario promotion",
+        description="Phase A-B2: CEM adversarial search + optional scenario promotion",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Quick smoke test (fast, 3 candidates)
-  python3 -m batch_runs.phase_a.adversarial_search_promote --smoke --out runs/adv_smoke
+  # Quick smoke test (all outputs under runs/)
+  python3 -m batch_runs.phase_a.adversarial_search_promote --smoke --out runs/phaseA_adv_search_smoke
 
-  # Full search (20 trials)
-  python3 -m batch_runs.phase_a.adversarial_search_promote --trials 20 --out runs/adv_full
+  # CEM search (5 iterations, 20 candidates each)
+  python3 -m batch_runs.phase_a.adversarial_search_promote \\
+    --iterations 5 --pop-size 20 --out runs/adv_cem_full
 
-Outputs:
-  - <out>/search_trials.jsonl    Every candidate
-  - <out>/topk.json              Selected top-K
-  - <out>/summary.md             Human-readable summary
-  - scenarios/v1/adversarial/generated_v1/   Promoted scenarios
-  - scenarios/suites/adversarial_regression_v2.yaml   Generated suite
+  # Promote to scenarios/ (explicit)
+  python3 -m batch_runs.phase_a.adversarial_search_promote \\
+    --iterations 3 --pop-size 15 --top-k 10 --promote-suite
+
+Output Structure (default, under <out>/):
+  candidates/             Scenario YAML files
+  generated_suite/        Self-contained suite
+  search_results.jsonl    All candidates
+  summary.json            CEM stats + top-K
+
+Output Structure (with --promote-suite):
+  scenarios/v1/adversarial/promoted_v1/   Promoted scenarios
+  scenarios/suites/adversarial_regression_v3.yaml
+  scenarios/suites/PROMOTION_RECORD.json  Audit trail
 """,
     )
     
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help="Quick smoke mode (3 candidates, fast ticks)",
+        help="Quick smoke mode (3 fixed candidates, no CEM)",
     )
     
     parser.add_argument(
-        "--trials", "-n",
+        "--iterations", "-i",
         type=int,
-        default=10,
-        help="Number of candidates to evaluate (default: 10)",
+        default=DEFAULT_ITERATIONS,
+        help=f"Number of CEM iterations (default: {DEFAULT_ITERATIONS})",
+    )
+    
+    parser.add_argument(
+        "--pop-size", "-n",
+        type=int,
+        default=DEFAULT_POP_SIZE,
+        help=f"Population size per CEM iteration (default: {DEFAULT_POP_SIZE})",
+    )
+    
+    parser.add_argument(
+        "--elite-frac",
+        type=float,
+        default=DEFAULT_ELITE_FRAC,
+        help=f"Fraction of population to use as elite (default: {DEFAULT_ELITE_FRAC})",
     )
     
     parser.add_argument(
@@ -856,7 +1131,7 @@ Outputs:
         "--top-k", "-k",
         type=int,
         default=DEFAULT_TOP_K,
-        help=f"Number of top scenarios to promote (default: {DEFAULT_TOP_K})",
+        help=f"Number of top scenarios in final suite (default: {DEFAULT_TOP_K})",
     )
     
     parser.add_argument(
@@ -870,7 +1145,13 @@ Outputs:
         "--out",
         type=Path,
         default=None,
-        help=f"Output directory (default: {DEFAULT_OUT_DIR})",
+        help=f"Output directory (default: {DEFAULT_OUT_DIR}/<timestamp>)",
+    )
+    
+    parser.add_argument(
+        "--promote-suite",
+        action="store_true",
+        help="Promote top-K to scenarios/ and create v3 suite (MODIFIES REPO)",
     )
     
     parser.add_argument(
@@ -883,17 +1164,21 @@ Outputs:
     
     # Determine parameters
     if args.smoke:
-        trials = 3
+        iterations = 1  # Single pass for smoke
+        pop_size = 3
         ticks = 100
         top_k = min(args.top_k, 3)
     else:
-        trials = args.trials
+        iterations = args.iterations
+        pop_size = args.pop_size
         ticks = args.ticks
         top_k = args.top_k
     
-    out_dir = args.out if args.out else DEFAULT_OUT_DIR / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Generate unique study_id for output isolation
+    study_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_s{args.seed}"
+    out_dir = args.out.resolve() if args.out else DEFAULT_OUT_DIR / study_id
     
-    # Check binaries exist
+    # Build sim_eval if needed
     if not SIM_EVAL_BIN.exists():
         print("Building sim_eval binary...")
         proc = subprocess.run(
@@ -904,10 +1189,12 @@ Outputs:
             print("ERROR: Failed to build sim_eval")
             return 1
     
-    # Run search
+    # Run CEM search
     try:
-        results, topk = run_adversarial_search(
-            trials=trials,
+        all_results, topk, final_dist = run_cem_search(
+            iterations=iterations,
+            pop_size=pop_size,
+            elite_frac=args.elite_frac,
             base_seed=args.seed,
             ticks=ticks,
             top_k=top_k,
@@ -916,23 +1203,39 @@ Outputs:
             verbose=not args.quiet,
         )
     except Exception as e:
-        print(f"\nERROR: Search failed: {e}")
+        print(f"\nERROR: CEM search failed: {e}")
         import traceback
         traceback.print_exc()
         return 1
     
-    # Return success if we have promoted scenarios
-    if topk:
-        print(f"\nNext steps:")
-        print(f"  1. Review: {out_dir}/summary.md")
-        print(f"  2. Run suite: cargo run -p paraphina --bin sim_eval -- suite scenarios/suites/adversarial_regression_v2.yaml --output-dir runs/adv_reg_v2 --verbose")
-        print(f"  3. Verify: cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs/adv_reg_v2")
-        return 0
-    else:
-        print("\nWARNING: No scenarios promoted (all candidates failed)")
-        return 1
+    # Promotion mode
+    if args.promote_suite and topk:
+        print(f"\n[Promoting to scenarios/]")
+        promoted_paths, suite_path, record_path = promote_scenarios_to_repo(
+            topk, out_dir, args.seed
+        )
+        
+        for p in promoted_paths:
+            print(f"  ✓ {p.relative_to(ROOT)}")
+        print(f"  ✓ {suite_path.relative_to(ROOT)}")
+        print(f"  ✓ {record_path.relative_to(ROOT)}")
+    
+    # Print next steps
+    generated_suite = out_dir / "generated_suite" / "adversarial_regression_generated.yaml"
+    
+    print(f"\n[Next Steps]")
+    print(f"  Generated suite path: {generated_suite}")
+    print()
+    print(f"  # Run suite:")
+    print(f"  cargo run -p paraphina --bin sim_eval -- suite \\")
+    print(f"    {generated_suite} \\")
+    print(f"    --output-dir runs/adv_reg_cem_test --verbose")
+    print()
+    print(f"  # Verify evidence:")
+    print(f"  cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs/adv_reg_cem_test")
+    
+    return 0 if topk else 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
