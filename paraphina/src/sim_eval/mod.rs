@@ -49,7 +49,7 @@ pub use summarize::{
 };
 
 // Evidence Pack v1 (per docs/EVIDENCE_PACK.md)
-pub use evidence_pack::write_evidence_pack;
+pub use evidence_pack::{write_evidence_pack, write_root_evidence_pack};
 
 // Evidence Pack v1 verification
 pub use evidence_pack_verify::{

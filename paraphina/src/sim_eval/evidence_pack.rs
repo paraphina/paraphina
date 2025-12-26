@@ -455,6 +455,261 @@ pub fn write_evidence_pack(
     Ok(())
 }
 
+// ============================================================================
+// Root Evidence Pack (simplified, for Python batch outputs)
+// ============================================================================
+
+/// Directories to exclude from root evidence pack scanning.
+const EXCLUDED_DIRS: &[&str] = &[
+    "evidence_pack",
+    ".git",
+    "target",
+    "__pycache__",
+    ".pytest_cache",
+    "node_modules",
+    ".venv",
+    "venv",
+];
+
+/// Write a root-level Evidence Pack for a directory.
+///
+/// This is a simplified evidence pack that:
+/// - Scans all files under `root` (excluding evidence_pack/ and common junk dirs)
+/// - Generates `<root>/evidence_pack/SHA256SUMS` with deterministic ordering
+/// - Generates `<root>/evidence_pack/manifest.json` with minimal metadata
+/// - Creates a synthetic `<root>/evidence_pack/suite.yaml` for verifier compatibility
+///
+/// Unlike `write_evidence_pack`, this does not require a pre-existing suite file
+/// or explicit artifact list - it discovers all files automatically.
+///
+/// # Arguments
+///
+/// * `root` - Directory to create evidence pack for
+///
+/// # Returns
+///
+/// Number of files hashed on success.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - File I/O operations fail
+/// - Root directory does not exist
+pub fn write_root_evidence_pack(root: &Path) -> Result<usize> {
+    if !root.exists() {
+        bail!("Root directory does not exist: {}", root.display());
+    }
+
+    if !root.is_dir() {
+        bail!("Root path is not a directory: {}", root.display());
+    }
+
+    // Collect all files recursively, excluding evidence_pack/ and junk dirs
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files_recursive(root, &mut files)?;
+
+    // Sort by relative path for determinism
+    files.sort();
+
+    // Create evidence_pack directory
+    let evidence_pack_dir = root.join("evidence_pack");
+    fs::create_dir_all(&evidence_pack_dir).with_context(|| {
+        format!(
+            "Failed to create evidence_pack dir: {}",
+            evidence_pack_dir.display()
+        )
+    })?;
+
+    // Create minimal suite.yaml (for verifier compatibility)
+    let suite_content = format!(
+        "# Auto-generated root evidence pack\n# Generated at: {}\ntype: root_evidence_pack\nroot: {}\n",
+        generate_timestamp_str(),
+        root.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string())
+    );
+    let suite_path = evidence_pack_dir.join("suite.yaml");
+    atomic_write(&suite_path, suite_content.as_bytes())?;
+    let suite_hash = hash_file_sha256_raw(&suite_path)?;
+
+    // Build manifest
+    let mut artifacts: Vec<ArtifactEntry> = Vec::new();
+
+    // Add suite.yaml
+    artifacts.push(ArtifactEntry {
+        path: "evidence_pack/suite.yaml".to_string(),
+        sha256: format!("sha256:{}", suite_hash),
+    });
+
+    // Hash all discovered files
+    for file_path in &files {
+        let rel_path = file_path
+            .strip_prefix(root)
+            .with_context(|| format!("Failed to get relative path for: {}", file_path.display()))?;
+        let hash = hash_file_sha256(file_path)?;
+        let path_str = normalize_path_str(rel_path);
+
+        artifacts.push(ArtifactEntry {
+            path: path_str,
+            sha256: hash,
+        });
+    }
+
+    // Sort artifacts by path
+    artifacts.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // Build manifest
+    let generated_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let manifest = Manifest {
+        evidence_pack_schema_version: SCHEMA_VERSION.to_string(),
+        generated_at_unix_ms,
+        paraphina_version: PARAPHINA_VERSION.to_string(),
+        repository: collect_repository_info(),
+        suite: SuiteInfo {
+            source_path: "(generated)".to_string(),
+            copied_to: "evidence_pack/suite.yaml".to_string(),
+            sha256: format!("sha256:{}", suite_hash),
+        },
+        artifacts: artifacts.clone(),
+    };
+
+    // Write manifest.json
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).context("Failed to serialize manifest to JSON")?;
+    let manifest_path = evidence_pack_dir.join("manifest.json");
+    atomic_write(&manifest_path, manifest_json.as_bytes())?;
+    let manifest_hash = hash_file_sha256_raw(&manifest_path)?;
+
+    // Build SHA256SUMS
+    let mut sha256sums_lines: Vec<String> = Vec::new();
+
+    // manifest.json first
+    sha256sums_lines.push(format!("{}  evidence_pack/manifest.json", manifest_hash));
+
+    // suite.yaml second
+    sha256sums_lines.push(format!("{}  evidence_pack/suite.yaml", suite_hash));
+
+    // All artifacts from manifest (sorted by path)
+    for artifact in &artifacts {
+        // Skip suite.yaml (already added)
+        if artifact.path == "evidence_pack/suite.yaml" {
+            continue;
+        }
+        let artifact_abs_path = root.join(&artifact.path);
+        let hash_raw = hash_file_sha256_raw(&artifact_abs_path)?;
+        sha256sums_lines.push(format!("{}  {}", hash_raw, artifact.path));
+    }
+
+    let sha256sums_content = sha256sums_lines.join("\n") + "\n";
+
+    // Write SHA256SUMS atomically
+    let sha256sums_path = evidence_pack_dir.join("SHA256SUMS");
+    atomic_write(&sha256sums_path, sha256sums_content.as_bytes())?;
+
+    Ok(files.len())
+}
+
+/// Recursively collect all files under a directory, excluding certain paths.
+fn collect_files_recursive(current: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = fs::read_dir(current)
+        .with_context(|| format!("Failed to read directory: {}", current.display()))?;
+
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("Failed to read entry in: {}", current.display()))?;
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if path.is_dir() {
+            // Skip excluded directories
+            if EXCLUDED_DIRS.contains(&file_name.as_str()) {
+                continue;
+            }
+            collect_files_recursive(&path, files)?;
+        } else if path.is_file() {
+            // Skip hidden files (starting with .)
+            if !file_name.starts_with('.') {
+                files.push(path);
+            }
+        }
+        // Skip symlinks and other non-regular files
+    }
+
+    Ok(())
+}
+
+/// Generate a timestamp string for suite.yaml comment.
+fn generate_timestamp_str() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let total_secs = now.as_secs();
+    let secs_per_min = 60;
+    let secs_per_hour = 3600;
+    let secs_per_day = 86400;
+
+    let days_since_epoch = total_secs / secs_per_day;
+    let time_of_day = total_secs % secs_per_day;
+
+    let hours = time_of_day / secs_per_hour;
+    let minutes = (time_of_day % secs_per_hour) / secs_per_min;
+    let seconds = time_of_day % secs_per_min;
+
+    let (year, month, day) = days_to_ymd(days_since_epoch as i64);
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hours, minutes, seconds
+    )
+}
+
+/// Convert days since epoch to (year, month, day).
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    let mut remaining = days;
+    let mut year = 1970;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+
+    let days_in_months: [i64; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1;
+    for days_in_month in &days_in_months {
+        if remaining < *days_in_month {
+            break;
+        }
+        remaining -= *days_in_month;
+        month += 1;
+    }
+
+    let day = remaining + 1;
+
+    (year, month, day as u32)
+}
+
+/// Check if a year is a leap year.
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,5 +1167,159 @@ mod tests {
         assert_eq!(manifest1.suite.sha256, manifest2.suite.sha256);
         assert_eq!(manifest1.suite.copied_to, manifest2.suite.copied_to);
         assert_eq!(manifest1.artifacts, manifest2.artifacts);
+    }
+
+    // ========================================================================
+    // write_root_evidence_pack tests
+    // ========================================================================
+
+    #[test]
+    fn test_write_root_evidence_pack_basic() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("output");
+        fs::create_dir_all(&root).unwrap();
+
+        // Create some files
+        create_dummy_file(&root.join("file1.txt"), "content1").unwrap();
+        create_dummy_file(&root.join("file2.json"), r#"{"a":1}"#).unwrap();
+        create_dummy_file(&root.join("subdir/nested.txt"), "nested").unwrap();
+
+        // Write root evidence pack
+        let file_count = write_root_evidence_pack(&root).unwrap();
+        assert_eq!(file_count, 3);
+
+        // Verify evidence_pack directory exists
+        let evidence_pack_dir = root.join("evidence_pack");
+        assert!(evidence_pack_dir.exists());
+
+        // Verify SHA256SUMS exists
+        let sha256sums_path = evidence_pack_dir.join("SHA256SUMS");
+        assert!(sha256sums_path.exists());
+
+        // Verify manifest.json exists
+        let manifest_path = evidence_pack_dir.join("manifest.json");
+        assert!(manifest_path.exists());
+
+        // Verify suite.yaml exists (for verifier compatibility)
+        let suite_path = evidence_pack_dir.join("suite.yaml");
+        assert!(suite_path.exists());
+    }
+
+    #[test]
+    fn test_write_root_evidence_pack_excludes_junk_dirs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("output");
+        fs::create_dir_all(&root).unwrap();
+
+        // Create a regular file
+        create_dummy_file(&root.join("good_file.txt"), "content").unwrap();
+
+        // Create files in excluded directories
+        create_dummy_file(&root.join("__pycache__/cache.pyc"), "cache").unwrap();
+        create_dummy_file(&root.join(".git/objects/abc"), "git object").unwrap();
+        create_dummy_file(&root.join("target/debug/binary"), "binary").unwrap();
+
+        // Write root evidence pack
+        let file_count = write_root_evidence_pack(&root).unwrap();
+        assert_eq!(file_count, 1); // Only good_file.txt
+
+        // Verify SHA256SUMS only contains good_file.txt (plus evidence_pack files)
+        let sha256sums_path = root.join("evidence_pack/SHA256SUMS");
+        let sha256sums_content = fs::read_to_string(&sha256sums_path).unwrap();
+
+        assert!(!sha256sums_content.contains("__pycache__"));
+        assert!(!sha256sums_content.contains(".git"));
+        assert!(!sha256sums_content.contains("target"));
+        assert!(sha256sums_content.contains("good_file.txt"));
+    }
+
+    #[test]
+    fn test_write_root_evidence_pack_deterministic() {
+        let dir1 = tempdir().unwrap();
+        let root1 = dir1.path().join("output");
+        fs::create_dir_all(&root1).unwrap();
+
+        let dir2 = tempdir().unwrap();
+        let root2 = dir2.path().join("output");
+        fs::create_dir_all(&root2).unwrap();
+
+        // Create identical files in both directories
+        create_dummy_file(&root1.join("z_file.txt"), "z content").unwrap();
+        create_dummy_file(&root1.join("a_file.txt"), "a content").unwrap();
+        create_dummy_file(&root1.join("m_file.txt"), "m content").unwrap();
+
+        create_dummy_file(&root2.join("z_file.txt"), "z content").unwrap();
+        create_dummy_file(&root2.join("a_file.txt"), "a content").unwrap();
+        create_dummy_file(&root2.join("m_file.txt"), "m content").unwrap();
+
+        // Write root evidence packs
+        write_root_evidence_pack(&root1).unwrap();
+        write_root_evidence_pack(&root2).unwrap();
+
+        // Compare SHA256SUMS (excluding evidence_pack lines which have timestamps)
+        let sha256sums1 = fs::read_to_string(root1.join("evidence_pack/SHA256SUMS")).unwrap();
+        let sha256sums2 = fs::read_to_string(root2.join("evidence_pack/SHA256SUMS")).unwrap();
+
+        // Extract user file lines (not evidence_pack/* lines)
+        let user_lines1: Vec<&str> = sha256sums1
+            .lines()
+            .filter(|l| !l.contains("evidence_pack/"))
+            .collect();
+        let user_lines2: Vec<&str> = sha256sums2
+            .lines()
+            .filter(|l| !l.contains("evidence_pack/"))
+            .collect();
+
+        assert_eq!(user_lines1, user_lines2);
+
+        // Verify files are sorted alphabetically
+        let paths1: Vec<&str> = user_lines1
+            .iter()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .collect();
+        let mut sorted_paths1 = paths1.clone();
+        sorted_paths1.sort();
+        assert_eq!(paths1, sorted_paths1, "Paths should be sorted");
+    }
+
+    #[test]
+    fn test_write_root_evidence_pack_error_nonexistent() {
+        let result = write_root_evidence_pack(Path::new("/nonexistent/path"));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("does not exist"));
+    }
+
+    #[test]
+    fn test_write_root_evidence_pack_error_not_directory() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("not_a_dir.txt");
+        create_dummy_file(&file_path, "content").unwrap();
+
+        let result = write_root_evidence_pack(&file_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not a directory"));
+    }
+
+    #[test]
+    fn test_write_root_evidence_pack_verifiable() {
+        use super::super::evidence_pack_verify::verify_evidence_pack_dir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("output");
+        fs::create_dir_all(&root).unwrap();
+
+        // Create some files
+        create_dummy_file(&root.join("data.json"), r#"{"key": "value"}"#).unwrap();
+        create_dummy_file(&root.join("nested/file.txt"), "nested content").unwrap();
+
+        // Write evidence pack
+        write_root_evidence_pack(&root).unwrap();
+
+        // Verify with the verifier
+        let report = verify_evidence_pack_dir(&root).unwrap();
+        assert!(report.files_verified >= 4); // At least manifest, suite, data.json, nested/file.txt
+        assert_eq!(report.packs_verified, 1);
     }
 }

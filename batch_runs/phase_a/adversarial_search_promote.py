@@ -532,6 +532,84 @@ def select_elite(
 
 
 # ===========================================================================
+# Evidence Pack Helpers
+# ===========================================================================
+
+def _write_evidence_pack(out_dir: Path, verbose: bool = True, smoke: bool = False) -> int:
+    """
+    Write a root evidence pack for the output directory.
+    
+    Calls `sim_eval write-evidence-pack <out_dir>`.
+    
+    Returns exit code (0 = success).
+    """
+    if SIM_EVAL_BIN.exists():
+        cmd = [str(SIM_EVAL_BIN), "write-evidence-pack", str(out_dir)]
+    else:
+        cmd = [
+            "cargo", "run", "-p", "paraphina", "--bin", "sim_eval",
+            "--release" if not smoke else "",
+            "--", "write-evidence-pack", str(out_dir)
+        ]
+        # Remove empty strings from command
+        cmd = [c for c in cmd if c]
+    
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        if verbose and proc.returncode == 0:
+            # Print the output from sim_eval
+            for line in proc.stdout.strip().split('\n'):
+                if line:
+                    print(f"    {line}")
+        elif proc.returncode != 0:
+            print(f"    ERROR: {proc.stderr.strip()}")
+        return proc.returncode
+    except Exception as e:
+        print(f"    ERROR: Failed to run sim_eval write-evidence-pack: {e}")
+        return 1
+
+
+def _verify_evidence_pack(out_dir: Path, verbose: bool = True) -> int:
+    """
+    Verify a root evidence pack.
+    
+    Calls `sim_eval verify-evidence-pack <out_dir>`.
+    
+    Returns exit code (0 = success).
+    """
+    if SIM_EVAL_BIN.exists():
+        cmd = [str(SIM_EVAL_BIN), "verify-evidence-pack", str(out_dir)]
+    else:
+        cmd = [
+            "cargo", "run", "-p", "paraphina", "--bin", "sim_eval",
+            "--", "verify-evidence-pack", str(out_dir)
+        ]
+    
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        if verbose and proc.returncode == 0:
+            for line in proc.stdout.strip().split('\n'):
+                if line:
+                    print(f"    {line}")
+        elif proc.returncode != 0:
+            print(f"    ERROR: {proc.stderr.strip()}")
+        return proc.returncode
+    except Exception as e:
+        print(f"    ERROR: Failed to run sim_eval verify-evidence-pack: {e}")
+        return 1
+
+
+# ===========================================================================
 # Runner
 # ===========================================================================
 
@@ -1219,6 +1297,21 @@ Output Structure (with --promote-suite):
             print(f"  ✓ {p.relative_to(ROOT)}")
         print(f"  ✓ {suite_path.relative_to(ROOT)}")
         print(f"  ✓ {record_path.relative_to(ROOT)}")
+    
+    # Write root evidence pack for the output directory
+    print(f"\n[Writing Evidence Pack]")
+    evidence_pack_result = _write_evidence_pack(out_dir, verbose=not args.quiet, smoke=args.smoke)
+    if evidence_pack_result != 0:
+        print(f"  WARNING: Evidence pack generation failed (exit code {evidence_pack_result})")
+    else:
+        print(f"  ✓ Evidence pack written to: {out_dir / 'evidence_pack'}")
+        # In smoke mode, also verify immediately
+        if args.smoke:
+            verify_result = _verify_evidence_pack(out_dir, verbose=not args.quiet)
+            if verify_result != 0:
+                print(f"  WARNING: Evidence pack verification failed (exit code {verify_result})")
+            else:
+                print(f"  ✓ Evidence pack verified")
     
     # Print next steps
     generated_suite = out_dir / "generated_suite" / "adversarial_regression_generated.yaml"

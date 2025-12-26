@@ -490,6 +490,65 @@ batch_runs/phase_a/
     └── test_env_parsing.py
 ```
 
+## Verification
+
+The promotion pipeline automatically generates a **root evidence pack** after completing all trials. This provides cryptographic integrity for all pipeline outputs.
+
+### Output Structure with Evidence Pack
+
+```
+runs/phaseA_smoke/
+├── evidence_pack/                 # Root evidence pack (auto-generated)
+│   ├── SHA256SUMS                 # Checksums for all study files
+│   ├── manifest.json              # Structured metadata
+│   └── suite.yaml                 # For verifier compatibility
+├── trial_0000_*/                  # Trial directories
+│   ├── mc/                        # Monte Carlo outputs
+│   │   └── evidence_pack/         # Per-MC evidence pack
+│   ├── suite/                     # Suite outputs
+│   │   └── */evidence_pack/       # Per-suite evidence packs
+│   └── report/                    # ADR reports (if enabled)
+├── _baseline_cache/               # ADR baseline cache (if enabled)
+├── trials.jsonl                   # All trial results
+├── pareto.json                    # Pareto frontier
+└── pareto.csv                     # Pareto as CSV
+```
+
+### Verification Commands
+
+```bash
+# Verify the study output root (root evidence pack)
+sim_eval verify-evidence-pack runs/phaseA_smoke
+
+# Verify all evidence packs (root + all nested trial/suite packs)
+sim_eval verify-evidence-tree runs/phaseA_smoke
+```
+
+In smoke mode, the pipeline automatically verifies the root evidence pack after generation.
+
+### Reproducing from Artifacts
+
+Given a verified study directory:
+
+1. The `trials.jsonl` contains complete trial results with all metrics
+2. The `pareto.json` contains the Pareto frontier candidates
+3. Each trial's `mc/` and `suite/` directories contain verifiable outputs
+4. The `evidence_pack/SHA256SUMS` provides integrity verification
+
+```bash
+# 1. Verify the evidence pack
+sim_eval verify-evidence-pack runs/phaseA_study/
+
+# 2. Verify all nested packs
+sim_eval verify-evidence-tree runs/phaseA_study/
+
+# 3. Reproduce the Monte Carlo for a specific trial
+sim_eval run <trial_dir>/scenario.yaml --output-dir runs/reproduce_mc
+
+# 4. Compare results (should be deterministic)
+diff runs/original/trial_0000*/mc/summary.json runs/reproduce_mc/summary.json
+```
+
 ## Related Documentation
 
 - [WHITEPAPER.md](WHITEPAPER.md) - Strategy specification
