@@ -240,8 +240,13 @@ The hedge controller:
 - If kill switch is active, hedging is disabled (Milestone C).
 
 **Known gaps vs canonical** (future work):
-- allocation does not yet incorporate basis/funding/margin/liquidation constraints at canonical depth.
-- **Partial (Milestone F):** Current implementation has simplified cost model vs canonical Section 13
+- None; Milestone F complete.
+
+**Milestone F Complete:**
+- Per-venue margin constraint enforcement (only caps when increasing abs exposure).
+- Multi-chunk allocation per venue with deterministic tie-breaking (aggregated into single order per venue).
+- Convexity cost option for spreading flow across venues.
+- See `hedge.rs` helper functions: `increases_abs_exposure`, `compute_abs_limit_after_trade`, `cap_dq_by_abs_limit`, `build_chunk_candidates`, `greedy_allocate_chunks`.
 
 **Implemented:**
 - Deadband: `paraphina/src/hedge.rs::compute_hedge_plan` (L135-L148)
@@ -3092,7 +3097,7 @@ hedge engine.
 
 ------------------------------------------------------------------ 
 
-> **[STATUS: Partial (Milestone F)]** Deadband and greedy allocation implemented in `hedge.rs`. Cost model includes exec cost, funding, basis, liq penalty, fragmentation. Full canonical depth (per-venue margin constraints, multi-chunk allocation) not yet complete. See EVIDENCE_PACK.md §4.
+> **[STATUS: Implemented (Milestone F Complete)]** Deadband, greedy multi-chunk allocation, per-venue margin constraints, and cost model all implemented in `hedge.rs`. Cost model includes exec cost, funding, basis, liq penalty, fragmentation. Margin constraints enforce caps only when increasing absolute exposure. Multi-chunk allocation generates internal chunks but aggregates to single order per venue. Optional convexity cost for spreading. See EVIDENCE_PACK.md §4 and tests in `hedge_allocator_tests.rs`.
 
   
 

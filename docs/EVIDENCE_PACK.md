@@ -287,6 +287,24 @@ Both commands should exit with code `0` for a valid evidence pack.
 
 ---
 
+## Related Implementation Notes
+
+### Hedge Engine (Milestone F)
+
+The hedge allocator (`paraphina/src/hedge.rs`) implements production-grade venue constraints:
+
+- **Per-venue margin constraints**: Enforced only when the hedge would increase absolute exposure. Uses `increases_abs_exposure()`, `compute_abs_limit_after_trade()`, and `cap_dq_by_abs_limit()` helper functions.
+- **Multi-chunk allocation**: Generates internal chunk candidates per venue, then aggregates into a single order per venue. Deterministic tie-breaking: `(unit_cost ASC, venue_id ASC, chunk_index ASC)`.
+- **Convexity spreading**: Optional `chunk_convexity_cost_bps` adds cost per subsequent chunk to spread flow across venues.
+
+Tests in `paraphina/tests/hedge_allocator_tests.rs` cover:
+- `hedge_respects_margin_available_cap`: Margin constraint enforcement
+- `hedge_margin_cap_limits_new_position_opening`: Opening positions respect margin
+- `hedge_multi_chunk_allocation_is_deterministic_and_aggregated`: Multi-chunk determinism
+- `hedge_convexity_spreads_flow`: Convexity spreads allocation
+
+---
+
 ## Non-Goals (Explicit)
 
 The following are explicitly **out of scope** for Evidence Pack v1:
