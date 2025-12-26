@@ -393,6 +393,28 @@ pub struct HedgeConfig {
     /// Penalty scale for liquidation proximity (USD/TAO per sigma below warn).
     pub liq_penalty_scale: f64,
 
+    // ----- Margin constraints (Milestone F) -----
+    /// Safety buffer for margin-based hedge caps.
+    /// Applied as: additional_cap = (margin_available * max_leverage * safety_buffer) / price
+    /// Default: 0.95
+    pub margin_safety_buffer: f64,
+
+    /// Max leverage assumption for hedge margin calculations.
+    /// Default: 10.0
+    pub max_leverage: f64,
+
+    // ----- Multi-chunk allocation (Milestone F) -----
+    /// Chunk size in TAO for multi-chunk allocation.
+    /// If <= 0, a default is computed from max_venue_tao_per_tick / 4.
+    /// Default: 0.0 (use computed default)
+    pub chunk_size_tao: f64,
+
+    /// Convexity cost per chunk in basis points.
+    /// Each subsequent chunk on the same venue adds this to its unit cost.
+    /// Enables "spreading" across venues when > 0.
+    /// Default: 0.0 (no convexity, preserves existing behavior)
+    pub chunk_convexity_cost_bps: f64,
+
     // ----- Legacy compat (for migration) -----
     /// Legacy: Base half-band in TAO. Alias for band_base_tao.
     pub hedge_band_base: f64,
@@ -739,6 +761,14 @@ impl Default for Config {
             liq_warn_sigma: 5.0,     // start penalizing inside 5σ
             liq_crit_sigma: 2.0,     // hard-skip inside 2σ
             liq_penalty_scale: 0.10, // USD/TAO per sigma below warn
+
+            // Margin constraints (Milestone F)
+            margin_safety_buffer: 0.95, // use 95% of available margin headroom
+            max_leverage: 10.0,         // max leverage for margin calculations
+
+            // Multi-chunk allocation (Milestone F)
+            chunk_size_tao: 0.0, // 0 = use default (max_venue_tao_per_tick / 4)
+            chunk_convexity_cost_bps: 0.0, // 0 = no convexity, preserves existing behavior
 
             // Legacy aliases (for backwards compat)
             hedge_band_base: BAND_BASE,
