@@ -1,0 +1,519 @@
+{
+  "version": "1.0.0",
+  "description": "Golden test vectors for hedge allocator verification. These vectors lock in expected behavior for critical edge cases. Do NOT modify expected outputs without careful review.",
+  "vectors": [
+    {
+      "description": "Basic long position hedge - sell to reduce exposure",
+      "input": {
+        "q_global_tao": 10.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 10.0,
+        "max_venue_tao_per_tick": 10.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 0.5,
+        "margin_safety_buffer": 0.95,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 5.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 5000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Sell",
+            "size_nano": 5000000000,
+            "price_nano": 99500000000
+          }
+        ]
+      }
+    },
+    {
+      "description": "Basic short position hedge - buy to cover",
+      "input": {
+        "q_global_tao": -10.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 10.0,
+        "max_venue_tao_per_tick": 10.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 0.5,
+        "margin_safety_buffer": 0.95,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 5.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": -5000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Buy",
+            "size_nano": 5000000000,
+            "price_nano": 100500000000
+          }
+        ]
+      }
+    },
+    {
+      "description": "Deadband - position inside band produces no hedge",
+      "input": {
+        "q_global_tao": 0.5,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 10.0,
+        "max_venue_tao_per_tick": 10.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 0.5,
+        "margin_safety_buffer": 0.95,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 5.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 0,
+        "intents": []
+      }
+    },
+    {
+      "description": "Margin cap binding - limited margin constrains allocation",
+      "input": {
+        "q_global_tao": 20.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 15.0,
+        "max_venue_tao_per_tick": 15.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 1.0,
+        "margin_safety_buffer": 1.0,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 5.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 200.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 15000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Sell",
+            "size_nano": 15000000000,
+            "price_nano": 99500000000
+          }
+        ]
+      }
+    },
+    {
+      "description": "Depth cap binding - low depth constrains allocation",
+      "input": {
+        "q_global_tao": 20.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 15.0,
+        "max_venue_tao_per_tick": 15.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 1.0,
+        "margin_safety_buffer": 0.95,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 5.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 400.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 15000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Sell",
+            "size_nano": 2000000000,
+            "price_nano": 99500000000
+          },
+          {
+            "venue_index": 1,
+            "side": "Sell",
+            "size_nano": 13000000000,
+            "price_nano": 99500000000
+          }
+        ]
+      }
+    },
+    {
+      "description": "Deterministic tie-break - equal cost venues sorted by index",
+      "input": {
+        "q_global_tao": 15.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 10.0,
+        "max_venue_tao_per_tick": 5.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 1.0,
+        "margin_safety_buffer": 0.95,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 5.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 10000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Sell",
+            "size_nano": 5000000000,
+            "price_nano": 99500000000
+          },
+          {
+            "venue_index": 2,
+            "side": "Sell",
+            "size_nano": 5000000000,
+            "price_nano": 99500000000
+          }
+        ]
+      }
+    },
+    {
+      "description": "Chunking with convexity - spreads allocation across venues",
+      "input": {
+        "q_global_tao": 12.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 10.0,
+        "max_venue_tao_per_tick": 10.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 1.0,
+        "margin_safety_buffer": 0.95,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 2.0,
+        "chunk_convexity_cost_bps": 100.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 10000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Sell",
+            "size_nano": 6000000000,
+            "price_nano": 99500000000
+          },
+          {
+            "venue_index": 1,
+            "side": "Sell",
+            "size_nano": 4000000000,
+            "price_nano": 99500000000
+          }
+        ]
+      }
+    },
+    {
+      "description": "Max step cap - large position clamped by max_step_tao",
+      "input": {
+        "q_global_tao": 100.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 5.0,
+        "max_venue_tao_per_tick": 10.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 1.0,
+        "margin_safety_buffer": 0.95,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 5.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 5000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Sell",
+            "size_nano": 5000000000,
+            "price_nano": 99500000000
+          }
+        ]
+      }
+    },
+    {
+      "description": "Zero margin venue skipped when flat - allocation goes to venue with margin",
+      "input": {
+        "q_global_tao": 10.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 10.0,
+        "max_venue_tao_per_tick": 10.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 0.5,
+        "margin_safety_buffer": 1.0,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 5.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 0.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 5000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Sell",
+            "size_nano": 5000000000,
+            "price_nano": 99500000000
+          }
+        ]
+      }
+    },
+    {
+      "description": "Multiple venues allocation - fills from cheapest first",
+      "input": {
+        "q_global_tao": 25.0,
+        "fair_value": 100.0,
+        "vol_ratio": 1.0,
+        "max_step_tao": 20.0,
+        "max_venue_tao_per_tick": 8.0,
+        "band_base_tao": 1.0,
+        "k_hedge": 1.0,
+        "margin_safety_buffer": 0.95,
+        "max_leverage": 10.0,
+        "chunk_size_tao": 4.0,
+        "chunk_convexity_cost_bps": 0.0,
+        "venues": [
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          },
+          {
+            "mid": 100.0,
+            "spread": 0.5,
+            "depth_usd": 100000.0,
+            "position_tao": 0.0,
+            "margin_available_usd": 100000.0,
+            "dist_liq_sigma": 10.0,
+            "funding_8h": 0.0,
+            "taker_fee_bps": 5.0
+          }
+        ]
+      },
+      "expected": {
+        "desired_delta_nano": 20000000000,
+        "intents": [
+          {
+            "venue_index": 0,
+            "side": "Sell",
+            "size_nano": 8000000000,
+            "price_nano": 99500000000
+          },
+          {
+            "venue_index": 1,
+            "side": "Sell",
+            "size_nano": 4000000000,
+            "price_nano": 99500000000
+          },
+          {
+            "venue_index": 2,
+            "side": "Sell",
+            "size_nano": 8000000000,
+            "price_nano": 99500000000
+          }
+        ]
+      }
+    }
+  ]
+}
