@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import subprocess
@@ -52,6 +53,13 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
+
+# Import confidence bound functions from stats module
+from batch_runs.phase_a.stats import (
+    wilson_ucb,
+    normal_lcb,
+    get_statistics_metadata,
+)
 
 # ===========================================================================
 # Paths
@@ -214,17 +222,33 @@ class ADRResult:
 
 @dataclass
 class TierBudget:
-    """Budget constraints for a risk tier."""
+    """
+    Budget constraints for a risk tier (confidence-aware).
+    
+    A candidate passes the budget if:
+    - kill_ucb <= max_kill_ucb (Wilson UCB of kill probability)
+    - dd_cvar <= max_dd_cvar (CVaR is already a tail measure)
+    - pnl_lcb >= min_pnl_lcb_usd (Normal LCB of mean PnL)
+    
+    Legacy fields (max_kill_prob, max_drawdown_cvar, min_mean_pnl) are
+    kept for backward compatibility but the new fields take precedence.
+    """
     tier_name: str
-    max_kill_prob: float
-    max_drawdown_cvar: float
-    min_mean_pnl: float
+    # New confidence-aware fields
+    max_kill_ucb: float
+    max_dd_cvar: float
+    min_pnl_lcb_usd: float
+    # Legacy fields (for backward compatibility)
+    max_kill_prob: float = 0.0
+    max_drawdown_cvar: float = 0.0
+    min_mean_pnl: float = 0.0
 
 
 @dataclass
 class BudgetConfig:
-    """Collection of tier budgets."""
+    """Collection of tier budgets with statistical configuration."""
     tiers: Dict[str, TierBudget] = field(default_factory=dict)
+    alpha: float = 0.05  # Significance level for confidence bounds
 
 
 @dataclass
@@ -304,13 +328,19 @@ class TrialResult:
     config: CandidateConfig
     trial_dir: Path
     
-    # Monte Carlo metrics
+    # Monte Carlo metrics - point estimates
     mc_mean_pnl: float = float("nan")
+    mc_pnl_stdev: float = float("nan")
     mc_pnl_cvar: float = float("nan")
     mc_drawdown_cvar: float = float("nan")
     mc_kill_prob_point: float = float("nan")
     mc_kill_prob_ci_upper: float = float("nan")
     mc_total_runs: int = 0
+    mc_kill_count: int = 0
+    
+    # Confidence bounds (computed from point estimates + alpha)
+    mc_pnl_lcb: float = float("nan")  # Normal LCB
+    mc_kill_ucb: float = float("nan")  # Wilson UCB
     
     # Suite results
     research_passed: bool = False
@@ -334,26 +364,44 @@ class TrialResult:
     
     @property
     def is_valid(self) -> bool:
-        """Check if result is valid for optimization."""
-        import math
+        """
+        Check if result is valid for optimization.
+        
+        A result is valid if:
+        - All evidence is verified
+        - All required suites passed
+        - All required statistics are available (not NaN)
+        
+        Fail closed: if any required stat is missing, result is invalid.
+        """
         return (
             self.evidence_verified
             and self.research_passed
             and self.adversarial_passed
             and self.adr_passed
             and not math.isnan(self.mc_mean_pnl)
-            and not math.isnan(self.mc_kill_prob_ci_upper)
+            and not math.isnan(self.mc_kill_ucb)
+            and not math.isnan(self.mc_pnl_lcb)
             and not math.isnan(self.mc_drawdown_cvar)
         )
     
     def passes_budget(self, budget: TierBudget) -> bool:
-        """Check if result passes a tier budget."""
+        """
+        Check if result passes a tier budget using confidence bounds.
+        
+        Uses confidence-aware gating:
+        - kill_ucb <= max_kill_ucb (Wilson UCB)
+        - pnl_lcb >= min_pnl_lcb_usd (Normal LCB)
+        - dd_cvar <= max_dd_cvar (CVaR is already a tail measure)
+        
+        Fail closed: if result is not valid, it does not pass.
+        """
         if not self.is_valid:
             return False
         return (
-            self.mc_kill_prob_ci_upper <= budget.max_kill_prob
-            and self.mc_drawdown_cvar <= budget.max_drawdown_cvar
-            and self.mc_mean_pnl >= budget.min_mean_pnl
+            self.mc_kill_ucb <= budget.max_kill_ucb
+            and self.mc_drawdown_cvar <= budget.max_dd_cvar
+            and self.mc_pnl_lcb >= budget.min_pnl_lcb_usd
         )
     
     def to_dict(self) -> Dict[str, Any]:
@@ -378,12 +426,25 @@ class TrialResult:
             "candidate_id": self.candidate_id,
             "config": asdict(self.config),
             "trial_dir": str(self.trial_dir),
+            # Point estimates
+            "pnl_mean": self.mc_mean_pnl,
+            "pnl_stdev": self.mc_pnl_stdev,
+            "pnl_cvar": self.mc_pnl_cvar,
+            "dd_cvar": self.mc_drawdown_cvar,
+            "kill_rate": self.mc_kill_prob_point,
+            "kill_k": self.mc_kill_count,
+            "kill_n": self.mc_total_runs,
+            # Confidence bounds
+            "pnl_lcb": self.mc_pnl_lcb,
+            "kill_ucb": self.mc_kill_ucb,
+            # Legacy fields (for backward compatibility)
             "mc_mean_pnl": self.mc_mean_pnl,
             "mc_pnl_cvar": self.mc_pnl_cvar,
             "mc_drawdown_cvar": self.mc_drawdown_cvar,
             "mc_kill_prob_point": self.mc_kill_prob_point,
             "mc_kill_prob_ci_upper": self.mc_kill_prob_ci_upper,
             "mc_total_runs": self.mc_total_runs,
+            # Suite results
             "research_passed": self.research_passed,
             "adversarial_passed": self.adversarial_passed,
             "adr_passed": self.adr_passed,
@@ -535,7 +596,16 @@ def generate_smoke_candidates() -> List[CandidateConfig]:
 # ===========================================================================
 
 def load_budgets_yaml(path: Path) -> BudgetConfig:
-    """Load budgets from YAML file (simple parser, no PyYAML required)."""
+    """
+    Load budgets from YAML file (simple parser, no PyYAML required).
+    
+    Supports both new confidence-aware fields and legacy fields:
+    - New: max_kill_ucb, max_dd_cvar, min_pnl_lcb_usd, alpha
+    - Legacy: max_kill_prob, max_drawdown_cvar, min_mean_pnl
+    
+    If old fields are present but new fields are missing, the old fields
+    are used to populate the new fields for backward compatibility.
+    """
     if not path.exists():
         return load_default_budgets()
     
@@ -543,20 +613,24 @@ def load_budgets_yaml(path: Path) -> BudgetConfig:
     tiers: Dict[str, TierBudget] = {}
     current_tier: Optional[str] = None
     tier_data: Dict[str, float] = {}
+    global_alpha: float = 0.05
     
     for line in content.split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         
+        # Check for global alpha at top level
+        if line.startswith("alpha:") and current_tier is None:
+            try:
+                global_alpha = float(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+            continue
+        
         if line.endswith(":") and not line.startswith(" "):
             if current_tier and tier_data:
-                tiers[current_tier] = TierBudget(
-                    tier_name=current_tier,
-                    max_kill_prob=tier_data.get("max_kill_prob", 0.10),
-                    max_drawdown_cvar=tier_data.get("max_drawdown_cvar", 1000.0),
-                    min_mean_pnl=tier_data.get("min_mean_pnl", 10.0),
-                )
+                tiers[current_tier] = _create_tier_budget(current_tier, tier_data)
             current_tier = line[:-1].strip()
             tier_data = {}
         elif ":" in line and current_tier:
@@ -567,24 +641,77 @@ def load_budgets_yaml(path: Path) -> BudgetConfig:
                 pass
     
     if current_tier and tier_data:
-        tiers[current_tier] = TierBudget(
-            tier_name=current_tier,
-            max_kill_prob=tier_data.get("max_kill_prob", 0.10),
-            max_drawdown_cvar=tier_data.get("max_drawdown_cvar", 1000.0),
-            min_mean_pnl=tier_data.get("min_mean_pnl", 10.0),
-        )
+        tiers[current_tier] = _create_tier_budget(current_tier, tier_data)
     
-    return BudgetConfig(tiers=tiers) if tiers else load_default_budgets()
+    if not tiers:
+        return load_default_budgets()
+    
+    return BudgetConfig(tiers=tiers, alpha=global_alpha)
+
+
+def _create_tier_budget(tier_name: str, tier_data: Dict[str, float]) -> TierBudget:
+    """
+    Create a TierBudget from parsed YAML data.
+    
+    Handles backward compatibility by mapping old fields to new fields
+    if the new fields are not present.
+    """
+    # New fields (confidence-aware)
+    max_kill_ucb = tier_data.get("max_kill_ucb")
+    max_dd_cvar = tier_data.get("max_dd_cvar")
+    min_pnl_lcb_usd = tier_data.get("min_pnl_lcb_usd")
+    
+    # Legacy fields
+    max_kill_prob = tier_data.get("max_kill_prob", 0.10)
+    max_drawdown_cvar = tier_data.get("max_drawdown_cvar", 1000.0)
+    min_mean_pnl = tier_data.get("min_mean_pnl", 10.0)
+    
+    # Map legacy to new if new fields are missing
+    if max_kill_ucb is None:
+        max_kill_ucb = max_kill_prob
+    if max_dd_cvar is None:
+        max_dd_cvar = max_drawdown_cvar
+    if min_pnl_lcb_usd is None:
+        min_pnl_lcb_usd = min_mean_pnl
+    
+    return TierBudget(
+        tier_name=tier_name,
+        max_kill_ucb=max_kill_ucb,
+        max_dd_cvar=max_dd_cvar,
+        min_pnl_lcb_usd=min_pnl_lcb_usd,
+        max_kill_prob=max_kill_prob,
+        max_drawdown_cvar=max_drawdown_cvar,
+        min_mean_pnl=min_mean_pnl,
+    )
 
 
 def load_default_budgets() -> BudgetConfig:
-    """Load default budgets."""
-    return BudgetConfig(tiers={
-        "conservative": TierBudget("conservative", 0.05, 500.0, 10.0),
-        "balanced": TierBudget("balanced", 0.10, 1000.0, 20.0),
-        "aggressive": TierBudget("aggressive", 0.15, 2000.0, 30.0),
-        "research": TierBudget("research", 0.20, 3000.0, 0.0),
-    })
+    """Load default budgets with confidence-aware thresholds."""
+    return BudgetConfig(
+        tiers={
+            "conservative": TierBudget(
+                tier_name="conservative",
+                max_kill_ucb=0.05, max_dd_cvar=500.0, min_pnl_lcb_usd=10.0,
+                max_kill_prob=0.05, max_drawdown_cvar=500.0, min_mean_pnl=10.0,
+            ),
+            "balanced": TierBudget(
+                tier_name="balanced",
+                max_kill_ucb=0.10, max_dd_cvar=1000.0, min_pnl_lcb_usd=20.0,
+                max_kill_prob=0.10, max_drawdown_cvar=1000.0, min_mean_pnl=20.0,
+            ),
+            "aggressive": TierBudget(
+                tier_name="aggressive",
+                max_kill_ucb=0.15, max_dd_cvar=2000.0, min_pnl_lcb_usd=30.0,
+                max_kill_prob=0.15, max_drawdown_cvar=2000.0, min_mean_pnl=30.0,
+            ),
+            "research": TierBudget(
+                tier_name="research",
+                max_kill_ucb=0.20, max_dd_cvar=3000.0, min_pnl_lcb_usd=0.0,
+                max_kill_prob=0.20, max_drawdown_cvar=3000.0, min_mean_pnl=0.0,
+            ),
+        },
+        alpha=0.05,
+    )
 
 
 # ===========================================================================
@@ -592,7 +719,14 @@ def load_default_budgets() -> BudgetConfig:
 # ===========================================================================
 
 def parse_mc_summary(path: Path) -> Dict[str, Any]:
-    """Parse mc_summary.json into flat metrics dict."""
+    """
+    Parse mc_summary.json into flat metrics dict.
+    
+    Extracts all fields needed for confidence-aware gating:
+    - mean_pnl, pnl_stdev, pnl_cvar (for normal LCB)
+    - kill_count, total_runs (for Wilson UCB)
+    - drawdown_cvar (used directly as a tail measure)
+    """
     if not path.exists():
         return {}
     
@@ -611,15 +745,60 @@ def parse_mc_summary(path: Path) -> Dict[str, Any]:
     pnl_agg = aggregate.get("pnl", {})
     
     return {
+        # PnL point estimates
         "mean_pnl": pnl_agg.get("mean", float("nan")),
+        "pnl_stdev": pnl_agg.get("std_pop", float("nan")),  # Population stdev
         "pnl_cvar": pnl_var_cvar.get("cvar", float("nan")),
+        # Drawdown
         "drawdown_cvar": dd_var_cvar.get("cvar", float("nan")),
+        # Kill probability
         "kill_prob_point": kill_prob.get("point_estimate", float("nan")),
         "kill_prob_ci_upper": kill_prob.get("ci_upper", float("nan")),
         "kill_count": kill_prob.get("kill_count", 0),
         "total_runs": kill_prob.get("total_runs", 0),
         "kill_rate": aggregate.get("kill_rate", float("nan")),
     }
+
+
+def compute_confidence_bounds(
+    metrics: Dict[str, Any],
+    alpha: float = 0.05,
+) -> Tuple[float, float]:
+    """
+    Compute confidence bounds from MC summary metrics.
+    
+    Returns (pnl_lcb, kill_ucb) using the appropriate statistical methods.
+    
+    Args:
+        metrics: Dictionary from parse_mc_summary
+        alpha: Significance level (default 0.05)
+        
+    Returns:
+        Tuple of (pnl_lcb, kill_ucb)
+    """
+    # Extract required fields
+    mean_pnl = metrics.get("mean_pnl", float("nan"))
+    pnl_stdev = metrics.get("pnl_stdev", float("nan"))
+    total_runs = metrics.get("total_runs", 0)
+    kill_count = metrics.get("kill_count", 0)
+    
+    # Compute PnL LCB using normal interval
+    pnl_lcb = float("nan")
+    if not math.isnan(mean_pnl) and not math.isnan(pnl_stdev) and total_runs > 0:
+        try:
+            pnl_lcb = normal_lcb(mean_pnl, pnl_stdev, total_runs, alpha)
+        except ValueError:
+            pass
+    
+    # Compute kill UCB using Wilson score
+    kill_ucb = float("nan")
+    if total_runs > 0:
+        try:
+            kill_ucb = wilson_ucb(kill_count, total_runs, alpha)
+        except ValueError:
+            pass
+    
+    return (pnl_lcb, kill_ucb)
 
 
 # ===========================================================================
@@ -1310,6 +1489,7 @@ def evaluate_trial(
     seed: int,
     verbose: bool = True,
     adr_config: Optional[ADRConfig] = None,
+    alpha: float = 0.05,
 ) -> TrialResult:
     """
     Evaluate a single candidate trial.
@@ -1344,11 +1524,15 @@ def evaluate_trial(
     
     # Defaults
     mc_mean_pnl = float("nan")
+    mc_pnl_stdev = float("nan")
     mc_pnl_cvar = float("nan")
     mc_drawdown_cvar = float("nan")
     mc_kill_prob_point = float("nan")
     mc_kill_prob_ci_upper = float("nan")
     mc_total_runs = 0
+    mc_kill_count = 0
+    mc_pnl_lcb = float("nan")
+    mc_kill_ucb = float("nan")
     evidence_verified = False
     research_passed = False  # Default to False - must explicitly pass
     adversarial_passed = False  # Default to False - must explicitly pass
@@ -1364,11 +1548,16 @@ def evaluate_trial(
     
     if success:
         mc_mean_pnl = metrics.get("mean_pnl", float("nan"))
+        mc_pnl_stdev = metrics.get("pnl_stdev", float("nan"))
         mc_pnl_cvar = metrics.get("pnl_cvar", float("nan"))
         mc_drawdown_cvar = metrics.get("drawdown_cvar", float("nan"))
         mc_kill_prob_point = metrics.get("kill_prob_point", float("nan"))
         mc_kill_prob_ci_upper = metrics.get("kill_prob_ci_upper", float("nan"))
         mc_total_runs = metrics.get("total_runs", 0)
+        mc_kill_count = metrics.get("kill_count", 0)
+        
+        # Compute confidence bounds
+        mc_pnl_lcb, mc_kill_ucb = compute_confidence_bounds(metrics, alpha)
         
         # Verify MC evidence pack
         verified, errs = verify_evidence_tree(mc_dir, verbose)
@@ -1489,11 +1678,15 @@ def evaluate_trial(
         config=config,
         trial_dir=trial_dir,
         mc_mean_pnl=mc_mean_pnl,
+        mc_pnl_stdev=mc_pnl_stdev,
         mc_pnl_cvar=mc_pnl_cvar,
         mc_drawdown_cvar=mc_drawdown_cvar,
         mc_kill_prob_point=mc_kill_prob_point,
         mc_kill_prob_ci_upper=mc_kill_prob_ci_upper,
         mc_total_runs=mc_total_runs,
+        mc_kill_count=mc_kill_count,
+        mc_pnl_lcb=mc_pnl_lcb,
+        mc_kill_ucb=mc_kill_ucb,
         research_passed=research_passed,
         adversarial_passed=adversarial_passed,
         adr_passed=adr_passed,
@@ -1508,7 +1701,7 @@ def evaluate_trial(
     
     if verbose:
         status = "✓ VALID" if result.is_valid else "✗ INVALID"
-        print(f"    {status} | pnl={mc_mean_pnl:.2f}, kill_ci={mc_kill_prob_ci_upper:.3f}, "
+        print(f"    {status} | pnl_mean={mc_mean_pnl:.2f} pnl_lcb={mc_pnl_lcb:.2f}, kill_ucb={mc_kill_ucb:.3f}, "
               f"dd_cvar={mc_drawdown_cvar:.2f} | {duration_sec:.1f}s")
     
     return result
@@ -1616,7 +1809,7 @@ def write_pareto_json(pareto: List[TrialResult], path: Path) -> None:
 
 
 def write_pareto_csv(pareto: List[TrialResult], path: Path) -> None:
-    """Write Pareto frontier to CSV."""
+    """Write Pareto frontier to CSV with confidence bounds."""
     import csv
     
     if not pareto:
@@ -1625,7 +1818,13 @@ def write_pareto_csv(pareto: List[TrialResult], path: Path) -> None:
     
     fieldnames = [
         "pareto_rank", "candidate_id", "trial_id", "profile",
-        "mc_mean_pnl", "mc_kill_prob_ci_upper", "mc_drawdown_cvar",
+        # Point estimates
+        "pnl_mean", "pnl_stdev", "kill_rate", "dd_cvar",
+        # Confidence bounds
+        "pnl_lcb", "kill_ucb",
+        # Kill statistics
+        "kill_k", "kill_n",
+        # Status
         "is_valid", "evidence_verified",
     ]
     
@@ -1638,9 +1837,18 @@ def write_pareto_csv(pareto: List[TrialResult], path: Path) -> None:
                 "candidate_id": r.candidate_id,
                 "trial_id": r.trial_id,
                 "profile": r.config.profile,
-                "mc_mean_pnl": f"{r.mc_mean_pnl:.4f}",
-                "mc_kill_prob_ci_upper": f"{r.mc_kill_prob_ci_upper:.4f}",
-                "mc_drawdown_cvar": f"{r.mc_drawdown_cvar:.4f}",
+                # Point estimates
+                "pnl_mean": f"{r.mc_mean_pnl:.4f}",
+                "pnl_stdev": f"{r.mc_pnl_stdev:.4f}",
+                "kill_rate": f"{r.mc_kill_prob_point:.4f}",
+                "dd_cvar": f"{r.mc_drawdown_cvar:.4f}",
+                # Confidence bounds
+                "pnl_lcb": f"{r.mc_pnl_lcb:.4f}",
+                "kill_ucb": f"{r.mc_kill_ucb:.4f}",
+                # Kill statistics
+                "kill_k": r.mc_kill_count,
+                "kill_n": r.mc_total_runs,
+                # Status
                 "is_valid": r.is_valid,
                 "evidence_verified": r.evidence_verified,
             })
@@ -1656,8 +1864,10 @@ def promote_winner(
     study_name: str,
     output_dir: Optional[Path] = None,
     verbose: bool = True,
+    alpha: float = 0.05,
+    seed_schedule: Optional[List[int]] = None,
 ) -> Tuple[Path, Path]:
-    """Promote a winning candidate configuration."""
+    """Promote a winning candidate configuration with full provenance."""
     if output_dir is None:
         output_dir = PROMOTED_DIR / tier_name
     
@@ -1710,9 +1920,9 @@ def promote_winner(
     if winner.commands_run:
         commands.extend(winner.commands_run)
     
-    # Build promotion record
+    # Build promotion record with confidence-aware statistics
     record = {
-        "schema_version": 2,  # v2 adds ADR fields
+        "schema_version": 3,  # v3 adds statistics section with confidence bounds
         "promoted_at": datetime.now(timezone.utc).isoformat(),
         "study_name": study_name,
         "tier": tier_name,
@@ -1724,16 +1934,29 @@ def promote_winner(
         "config": asdict(winner.config),
         "env_overlay": winner.config.to_env_overlay(),
         "commands_run": commands,
-        "seeds": [winner.seed],
+        "seeds": seed_schedule if seed_schedule else [winner.seed],
         "evidence_verified": winner.evidence_verified,
+        # Point estimates
         "metrics": {
-            "mean_pnl": winner.mc_mean_pnl,
+            "pnl_mean": winner.mc_mean_pnl,
+            "pnl_stdev": winner.mc_pnl_stdev,
             "pnl_cvar": winner.mc_pnl_cvar,
+            "dd_cvar": winner.mc_drawdown_cvar,
+            "kill_rate": winner.mc_kill_prob_point,
+            "kill_k": winner.mc_kill_count,
+            "kill_n": winner.mc_total_runs,
+            # Confidence bounds
+            "pnl_lcb": winner.mc_pnl_lcb,
+            "kill_ucb": winner.mc_kill_ucb,
+            # Legacy fields
+            "mean_pnl": winner.mc_mean_pnl,
             "drawdown_cvar": winner.mc_drawdown_cvar,
             "kill_prob_point": winner.mc_kill_prob_point,
             "kill_prob_ci_upper": winner.mc_kill_prob_ci_upper,
             "total_runs": winner.mc_total_runs,
         },
+        # Statistics metadata (new in v3)
+        "statistics": get_statistics_metadata(alpha),
         "suites_passed": {
             "research": winner.research_passed,
             "adversarial": winner.adversarial_passed,
@@ -1818,6 +2041,7 @@ def run_pipeline(
     
     # Evaluate all candidates
     print(f"\n[2/5] Evaluating candidates...")
+    print(f"  Statistical confidence level: alpha={budgets.alpha}")
     results: List[TrialResult] = []
     
     for i, config in enumerate(candidates):
@@ -1832,6 +2056,7 @@ def run_pipeline(
             seed=seed + i,  # Offset seed per trial for variety
             verbose=verbose,
             adr_config=adr_config,
+            alpha=budgets.alpha,
         )
         results.append(result)
     
@@ -1841,8 +2066,8 @@ def run_pipeline(
     print(f"  Pareto size: {len(pareto)}")
     
     for i, r in enumerate(pareto):
-        print(f"    {i+1}. {r.candidate_id}: pnl={r.mc_mean_pnl:.2f}, "
-              f"kill_ci={r.mc_kill_prob_ci_upper:.3f}")
+        print(f"    {i+1}. {r.candidate_id}: pnl_mean={r.mc_mean_pnl:.2f} (lcb={r.mc_pnl_lcb:.2f}), "
+              f"kill_rate={r.mc_kill_prob_point:.3f} (ucb={r.mc_kill_ucb:.3f}), dd_cvar={r.mc_drawdown_cvar:.2f}")
     
     # Write outputs
     print(f"\n[4/5] Writing outputs...")
@@ -1877,8 +2102,14 @@ def run_pipeline(
             promotions[tier_name] = None
             continue
         
+        # Compute seed schedule for provenance
+        seed_schedule = [seed + i for i in range(trials)]
+        
         config_path, record_path = promote_winner(
-            winner, tier_name, study_name, verbose=verbose
+            winner, tier_name, study_name, 
+            verbose=verbose,
+            alpha=budgets.alpha,
+            seed_schedule=seed_schedule,
         )
         promotions[tier_name] = (config_path, record_path)
     
