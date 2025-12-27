@@ -61,6 +61,17 @@ from batch_runs.phase_a.stats import (
     get_statistics_metadata,
 )
 
+# Phase B imports (optional - fail gracefully if not available)
+try:
+    from batch_runs.phase_b.gate import (
+        PromotionDecision as PhaseBDecision,
+        PromotionGate as PhaseBGate,
+        PromotionOutcome as PhaseBOutcome,
+    )
+    PHASE_B_AVAILABLE = True
+except ImportError:
+    PHASE_B_AVAILABLE = False
+
 # ===========================================================================
 # Paths
 # ===========================================================================
@@ -215,6 +226,38 @@ class ADRResult:
     returncode: int = 0
     stdout: str = ""
     stderr: str = ""
+
+
+# ===========================================================================
+# Phase B Configuration
+# ===========================================================================
+
+@dataclass
+class PhaseBConfig:
+    """
+    Configuration for Phase B: Confidence-Aware Statistical Gating.
+    
+    Phase B adds bootstrap-based confidence intervals and statistical
+    dominance testing to the promotion decision.
+    """
+    enabled: bool = False
+    alpha: float = 0.05  # Significance level for confidence intervals
+    n_bootstrap: int = 1000  # Number of bootstrap samples
+    seed: int = 42  # Random seed for reproducibility
+    kill_threshold: Optional[float] = None  # Max allowed kill rate
+    require_strict_dominance: bool = True  # Require candidate to strictly dominate
+    baseline_run_dir: Optional[Path] = None  # Path to baseline run (optional)
+
+
+@dataclass
+class PhaseBResult:
+    """Result from Phase B gating."""
+    passed: bool = True
+    decision: Optional[Any] = None  # PhaseBDecision when available
+    fail_reasons: List[str] = field(default_factory=list)
+    report_json: Optional[Path] = None
+    report_md: Optional[Path] = None
+
 
 # ===========================================================================
 # Schemas (inline to avoid import complexity)
@@ -1984,6 +2027,135 @@ def promote_winner(
 
 
 # ===========================================================================
+# Phase B Statistical Gate
+# ===========================================================================
+
+def run_phase_b_gate(
+    winner: "TrialResult",
+    study_dir: Path,
+    phase_b_config: PhaseBConfig,
+    verbose: bool = True,
+) -> PhaseBResult:
+    """
+    Run Phase B confidence-aware statistical gating for a winner candidate.
+    
+    Phase B uses bootstrap-based confidence intervals to ensure statistically
+    rigorous promotion decisions.
+    
+    Args:
+        winner: The winning TrialResult from Phase A
+        study_dir: Study directory for output
+        phase_b_config: Phase B configuration
+        verbose: Print progress
+        
+    Returns:
+        PhaseBResult with pass/fail status and reasons
+    """
+    if not phase_b_config.enabled:
+        return PhaseBResult(passed=True)
+    
+    if not PHASE_B_AVAILABLE:
+        if verbose:
+            print("    ⚠ Phase B not available (import failed) - skipping")
+        return PhaseBResult(passed=True, fail_reasons=["Phase B module not available"])
+    
+    if verbose:
+        print(f"    Running Phase B confidence gate...")
+    
+    try:
+        # Create gate with configuration
+        gate = PhaseBGate(
+            alpha=phase_b_config.alpha,
+            n_bootstrap=phase_b_config.n_bootstrap,
+            seed=phase_b_config.seed,
+            kill_threshold=phase_b_config.kill_threshold,
+            require_strict_dominance=phase_b_config.require_strict_dominance,
+        )
+        
+        # Load candidate data from MC directory
+        mc_dir = winner.trial_dir / "mc"
+        if not mc_dir.exists():
+            return PhaseBResult(
+                passed=False,
+                fail_reasons=[f"MC directory not found: {mc_dir}"]
+            )
+        
+        # Load run data
+        from batch_runs.phase_b.gate import load_run_data
+        candidate_pnl, candidate_kills = load_run_data(mc_dir)
+        
+        # Load baseline if provided
+        baseline_pnl = None
+        baseline_kills = None
+        baseline_path = None
+        
+        if phase_b_config.baseline_run_dir is not None:
+            baseline_path = phase_b_config.baseline_run_dir
+            if baseline_path.exists():
+                try:
+                    baseline_pnl, baseline_kills = load_run_data(baseline_path)
+                except Exception as e:
+                    if verbose:
+                        print(f"    ⚠ Could not load baseline: {e}")
+        
+        # Run the gate
+        decision = gate.evaluate(
+            candidate_pnl=candidate_pnl,
+            candidate_kills=candidate_kills,
+            baseline_pnl=baseline_pnl,
+            baseline_kills=baseline_kills,
+            candidate_path=mc_dir,
+            baseline_path=baseline_path,
+        )
+        
+        # Write reports
+        report_dir = winner.trial_dir / "phase_b_gate"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        
+        json_path = report_dir / "confidence_report.json"
+        with open(json_path, "w") as f:
+            json.dump(decision.to_dict(), f, indent=2, default=str)
+        
+        md_path = report_dir / "confidence_report.md"
+        with open(md_path, "w") as f:
+            f.write(decision.to_markdown())
+        
+        if verbose:
+            print(f"    ✓ Phase B report: {json_path}")
+        
+        # Check result
+        if decision.outcome == PhaseBOutcome.PROMOTE:
+            if verbose:
+                print(f"    ✓ Phase B gate PASSED")
+            return PhaseBResult(
+                passed=True,
+                decision=decision,
+                report_json=json_path,
+                report_md=md_path,
+            )
+        else:
+            if verbose:
+                print(f"    ✗ Phase B gate FAILED")
+                for reason in decision.fail_reasons:
+                    print(f"      - {reason}")
+            return PhaseBResult(
+                passed=False,
+                decision=decision,
+                fail_reasons=decision.fail_reasons,
+                report_json=json_path,
+                report_md=md_path,
+            )
+    
+    except Exception as e:
+        if verbose:
+            print(f"    ✗ Phase B gate error: {e}")
+        return PhaseBResult(
+            passed=False,
+            fail_reasons=[f"Phase B error: {e}"]
+        )
+
+
+# ===========================================================================
 # Main pipeline
 # ===========================================================================
 
@@ -1998,6 +2170,7 @@ def run_pipeline(
     smoke: bool = False,
     verbose: bool = True,
     adr_config: Optional[ADRConfig] = None,
+    phase_b_config: Optional[PhaseBConfig] = None,
 ) -> Tuple[List[TrialResult], List[TrialResult], Dict[str, Optional[Tuple[Path, Path]]]]:
     """
     Run the complete promotion pipeline.
@@ -2025,6 +2198,18 @@ def run_pipeline(
             print(f"  ADR max regression %: {adr_config.gate_max_regression_pct}")
     else:
         print(f"  ADR enabled: False")
+    
+    # Phase B info
+    if phase_b_config and phase_b_config.enabled:
+        print(f"  Phase B enabled: True")
+        print(f"  Phase B alpha: {phase_b_config.alpha}")
+        print(f"  Phase B n_bootstrap: {phase_b_config.n_bootstrap}")
+        if phase_b_config.kill_threshold is not None:
+            print(f"  Phase B kill threshold: {phase_b_config.kill_threshold}")
+        if phase_b_config.baseline_run_dir is not None:
+            print(f"  Phase B baseline: {phase_b_config.baseline_run_dir}")
+    else:
+        print(f"  Phase B enabled: False")
     print()
     
     # Create study directory
@@ -2096,11 +2281,27 @@ def run_pipeline(
             promotions[tier_name] = None
             continue
         
+        print(f"  {tier_name}: Candidate {winner.candidate_id}")
+        
         # Verify evidence before promotion
         if not winner.evidence_verified:
-            print(f"  {tier_name}: Winner {winner.candidate_id} failed evidence verification - skipping")
+            print(f"    ✗ Evidence verification failed - skipping")
             promotions[tier_name] = None
             continue
+        
+        # Phase B: Confidence-aware statistical gating
+        if phase_b_config and phase_b_config.enabled:
+            phase_b_result = run_phase_b_gate(
+                winner=winner,
+                study_dir=study_dir,
+                phase_b_config=phase_b_config,
+                verbose=verbose,
+            )
+            
+            if not phase_b_result.passed:
+                print(f"    ✗ Phase B gate failed - skipping promotion")
+                promotions[tier_name] = None
+                continue
         
         # Compute seed schedule for provenance
         seed_schedule = [seed + i for i in range(trials)]
@@ -2112,6 +2313,7 @@ def run_pipeline(
             seed_schedule=seed_schedule,
         )
         promotions[tier_name] = (config_path, record_path)
+        print(f"    ✓ Promoted to {config_path.name}")
     
     # Summary
     print("\n" + "=" * 70)
@@ -2304,6 +2506,59 @@ ADR Outputs (when --adr-enable):
         help="Disable JSON report output",
     )
     
+    # Phase B (Confidence-Aware Statistical Gating) options
+    parser.add_argument(
+        "--phase-b-enable",
+        action="store_true",
+        help="Enable Phase B confidence-aware statistical gating",
+    )
+    
+    parser.add_argument(
+        "--phase-b-alpha",
+        type=float,
+        default=0.05,
+        metavar="ALPHA",
+        help="Significance level for Phase B confidence intervals (default: 0.05)",
+    )
+    
+    parser.add_argument(
+        "--phase-b-n-bootstrap",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="Number of bootstrap samples for Phase B (default: 1000)",
+    )
+    
+    parser.add_argument(
+        "--phase-b-seed",
+        type=int,
+        default=42,
+        metavar="SEED",
+        help="Random seed for Phase B bootstrap (default: 42)",
+    )
+    
+    parser.add_argument(
+        "--phase-b-kill-threshold",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help="Maximum allowed kill rate for Phase B (optional)",
+    )
+    
+    parser.add_argument(
+        "--phase-b-baseline",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to baseline run directory for Phase B comparison (optional)",
+    )
+    
+    parser.add_argument(
+        "--phase-b-no-strict-dominance",
+        action="store_true",
+        help="Don't require strict dominance (only non-inferiority) for Phase B",
+    )
+    
     args = parser.parse_args(argv)
     
     # Handle smoke mode
@@ -2345,6 +2600,19 @@ ADR Outputs (when --adr-enable):
             write_json=args.adr_write_json,
         )
     
+    # Build Phase B config
+    phase_b_config: Optional[PhaseBConfig] = None
+    if args.phase_b_enable:
+        phase_b_config = PhaseBConfig(
+            enabled=True,
+            alpha=args.phase_b_alpha,
+            n_bootstrap=args.phase_b_n_bootstrap,
+            seed=args.phase_b_seed,
+            kill_threshold=args.phase_b_kill_threshold,
+            require_strict_dominance=not args.phase_b_no_strict_dominance,
+            baseline_run_dir=Path(args.phase_b_baseline) if args.phase_b_baseline else None,
+        )
+    
     # Run pipeline
     try:
         results, pareto, promotions = run_pipeline(
@@ -2358,6 +2626,7 @@ ADR Outputs (when --adr-enable):
             smoke=args.smoke,
             verbose=not args.quiet,
             adr_config=adr_config,
+            phase_b_config=phase_b_config,
         )
     except Exception as e:
         print(f"\nERROR: Pipeline failed: {e}", file=sys.stderr)
