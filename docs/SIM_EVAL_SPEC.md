@@ -1,7 +1,11 @@
 # Simulation & Evaluation Spec (v1)
 
 Goal: make simulation runs reproducible, comparable, and CI-friendly.
-Rule: no “results” claims unless they are produced by a committed scenario + seed + commit hash.
+Rule: no "results" claims unless they are produced by a committed scenario + seed + commit hash.
+
+> **See also:**
+> - [EVIDENCE_PACK.md](EVIDENCE_PACK.md) — Evidence Pack v1 schema and verification
+> - [WHITEPAPER.md § Auditability and Reproducibility](WHITEPAPER.md#auditability-and-reproducibility) — operator runbook and CI gate requirements
 
 ---
 
