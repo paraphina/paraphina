@@ -1,6 +1,7 @@
 # Phase A Promotion Pipeline
 
-This document describes the Phase A-2 multi-objective tuning and promotion pipeline.
+This document describes the Phase A-2 multi-objective tuning and promotion pipeline with
+**confidence-aware gating**.
 
 ## Overview
 
@@ -9,9 +10,90 @@ The promotion pipeline implements a deterministic, budget-gated research→promo
 1. **Generate Candidates** - Seeded random sampling + optional mutation around Pareto set
 2. **Evaluate Each Candidate** - Monte Carlo + suite gating + evidence verification
 3. **Compute Pareto Frontier** - Multi-objective optimization over pnl/risk metrics
-4. **Promote Winners** - Budget-filtered selection per risk tier
+4. **Promote Winners** - Budget-filtered selection per risk tier using **confidence bounds**
 
 All operations are deterministic given a fixed seed.
+
+## Confidence-Aware Gating (v3)
+
+### Why Confidence Bounds?
+
+Promotion is a **decision under uncertainty**. A candidate's observed mean PnL or kill rate
+is just a point estimate from Monte Carlo samples. The true performance could be higher or
+lower, depending on sample variance and sample size.
+
+**Confidence-aware gating** uses statistical confidence bounds to make conservative decisions:
+- **PnL Lower Confidence Bound (LCB)**: We require the LCB (lower bound) of mean PnL to exceed the threshold, not just the mean itself. This ensures we have statistical confidence that the true PnL is acceptable.
+- **Kill Rate Upper Confidence Bound (UCB)**: We require the UCB (upper bound) of the kill rate to stay below the threshold, not just the observed rate. This protects against candidates that look safe but have high uncertainty.
+
+### Statistical Methods
+
+| Metric | Bound | Method | Formula |
+|--------|-------|--------|---------|
+| Kill Rate | UCB | Wilson Score | `(p̂ + z²/2n + z√(p̂(1-p̂)/n + z²/4n²)) / (1 + z²/n)` |
+| Mean PnL | LCB | Normal z-interval | `μ̂ - z × (σ/√n)` |
+| DD CVaR | — | Direct | CVaR is already a tail risk measure |
+
+Where:
+- `p̂` = observed kill rate (k/n)
+- `μ̂` = sample mean PnL
+- `σ` = sample standard deviation
+- `n` = number of MC runs
+- `z` = z-quantile from `statistics.NormalDist.inv_cdf(1-α)`
+- `α` = significance level (default: 0.05)
+
+### Configuration
+
+The `alpha` parameter controls the confidence level:
+
+```yaml
+# batch_runs/phase_a/budgets.yaml
+alpha: 0.05  # 95% confidence level
+
+balanced:
+  max_kill_ucb: 0.10      # UCB of kill probability
+  max_dd_cvar: 1000.0     # CVaR of drawdown (USD)
+  min_pnl_lcb_usd: 20.0   # LCB of mean PnL (USD)
+```
+
+### Backward Compatibility
+
+Old budget files using `max_kill_prob` and `min_mean_pnl` are automatically mapped:
+- `max_kill_prob` → `max_kill_ucb`
+- `min_mean_pnl` → `min_pnl_lcb_usd`
+- `max_drawdown_cvar` → `max_dd_cvar`
+
+If `alpha` is missing, default is 0.05.
+
+### PROMOTION_RECORD.json Statistics Section
+
+When a candidate is promoted, the statistics configuration is recorded:
+
+```json
+{
+  "schema_version": 3,
+  "statistics": {
+    "alpha": 0.05,
+    "methods": {
+      "kill_ucb": "wilson",
+      "pnl_lcb": "normal"
+    },
+    "z_source": "statistics.NormalDist.inv_cdf",
+    "description": "Confidence bounds computed using one-sided intervals at alpha=0.05..."
+  },
+  "metrics": {
+    "pnl_mean": 45.234,
+    "pnl_stdev": 12.567,
+    "pnl_lcb": 38.45,
+    "kill_rate": 0.04,
+    "kill_k": 2,
+    "kill_n": 50,
+    "kill_ucb": 0.0623,
+    "dd_cvar": 456.78
+  },
+  ...
+}
+```
 
 ## Quick Start
 
@@ -288,50 +370,55 @@ sim_eval verify-evidence-tree runs/phaseA/<study>/
 ### 2. Multi-Objective Optimization
 
 Objectives (Pareto optimization):
-- **Maximize** `mean_pnl`
-- **Minimize** `kill_prob_ci_upper` (95% Wilson CI upper bound)
-- **Minimize** `drawdown_cvar` (CVaR at 95%)
+- **Maximize** `pnl_mean` (point estimate for Pareto front)
+- **Minimize** `kill_ucb` (Wilson UCB at configured alpha)
+- **Minimize** `dd_cvar` (CVaR at 95%)
 
 A candidate is on the Pareto frontier if no other valid candidate dominates it on all objectives.
 
-### 3. Budget Gating
+### 3. Budget Gating (Confidence-Aware)
 
 Budgets are defined in `batch_runs/phase_a/budgets.yaml`:
 
 ```yaml
+# Global confidence level
+alpha: 0.05
+
 conservative:
-  max_kill_prob: 0.05
-  max_drawdown_cvar: 500.0
-  min_mean_pnl: 10.0
+  max_kill_ucb: 0.05       # Wilson UCB of kill probability
+  max_dd_cvar: 500.0       # CVaR of max drawdown (USD)
+  min_pnl_lcb_usd: 10.0    # Normal LCB of mean PnL (USD)
 
 balanced:
-  max_kill_prob: 0.10
-  max_drawdown_cvar: 1000.0
-  min_mean_pnl: 20.0
+  max_kill_ucb: 0.10
+  max_dd_cvar: 1000.0
+  min_pnl_lcb_usd: 20.0
 
 aggressive:
-  max_kill_prob: 0.15
-  max_drawdown_cvar: 2000.0
-  min_mean_pnl: 30.0
+  max_kill_ucb: 0.15
+  max_dd_cvar: 2000.0
+  min_pnl_lcb_usd: 30.0
 ```
 
 A candidate passes a tier budget if:
-- `kill_prob_ci_upper <= max_kill_prob`
-- `drawdown_cvar <= max_drawdown_cvar`
-- `mean_pnl >= min_mean_pnl`
+- `kill_ucb <= max_kill_ucb` (Wilson upper bound, not point estimate!)
+- `dd_cvar <= max_dd_cvar` (CVaR is already a tail measure)
+- `pnl_lcb >= min_pnl_lcb_usd` (Normal lower bound, not point estimate!)
 - Evidence verification passed
 - Research suite passed
 - Adversarial suite passed
 - ADR gating passed (if `--adr-enable` is set)
 
+**Fail Closed**: If any required statistic is missing (NaN), the candidate is NOT promotable.
+
 ### 4. Winner Selection
 
 For each tier, select the single winner using deterministic tie-breaking:
 
-1. Filter candidates by budget constraints
-2. Sort by `mean_pnl` descending (highest first)
-3. Tie-break: lowest `drawdown_cvar`
-4. Tie-break: lowest `kill_prob_ci_upper`
+1. Filter candidates by budget constraints (using confidence bounds)
+2. Sort by `pnl_mean` descending (highest first)
+3. Tie-break: lowest `dd_cvar`
+4. Tie-break: lowest `kill_ucb`
 5. Final tie-break: `candidate_id` alphabetically
 
 ### 5. Promotion Output
@@ -354,7 +441,7 @@ export PARAPHINA_MM_SIZE_ETA=1.0
 **Promotion record** (`PROMOTION_RECORD.json`):
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "promoted_at": "2025-12-24T20:30:00.000Z",
   "study_name": "research_v1",
   "tier": "balanced",
@@ -372,11 +459,28 @@ export PARAPHINA_MM_SIZE_ETA=1.0
     "sim_eval verify-evidence-tree <trial>/",
     "sim_eval report --baseline ... --variant candidate=... --out-md ... --out-json ..."
   ],
-  "seeds": [47],
+  "seeds": [42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
   "evidence_verified": true,
+  "statistics": {
+    "alpha": 0.05,
+    "methods": {
+      "kill_ucb": "wilson",
+      "pnl_lcb": "normal"
+    },
+    "z_source": "statistics.NormalDist.inv_cdf",
+    "description": "Confidence bounds computed using one-sided intervals at alpha=0.05..."
+  },
   "metrics": {
-    "mean_pnl": 45.234,
+    "pnl_mean": 45.234,
+    "pnl_stdev": 12.567,
     "pnl_cvar": -123.45,
+    "pnl_lcb": 38.45,
+    "dd_cvar": 456.78,
+    "kill_rate": 0.04,
+    "kill_k": 2,
+    "kill_n": 50,
+    "kill_ucb": 0.0623,
+    "mean_pnl": 45.234,
     "drawdown_cvar": 456.78,
     "kill_prob_point": 0.04,
     "kill_prob_ci_upper": 0.0623,
@@ -398,8 +502,11 @@ export PARAPHINA_MM_SIZE_ETA=1.0
 }
 ```
 
-Note: `schema_version: 2` indicates the record includes ADR fields. The `adr_results` field
-is only present when ADR gating was enabled.
+Note: `schema_version: 3` indicates the record includes:
+- `statistics` section with confidence bound configuration
+- Extended `metrics` with both point estimates and confidence bounds
+- `seeds` array with the full seed schedule used for MC
+- The `adr_results` field is only present when ADR gating was enabled.
 
 ## Reproducing a Promoted Candidate
 
@@ -444,6 +551,8 @@ python3 -m pytest batch_runs/phase_a/tests/test_budgets.py -v
 python3 -m pytest batch_runs/phase_a/tests/test_winner_selection.py -v
 python3 -m pytest batch_runs/phase_a/tests/test_env_parsing.py -v
 python3 -m pytest batch_runs/phase_a/tests/test_adr.py -v
+python3 -m pytest batch_runs/phase_a/tests/test_stats.py -v
+python3 -m pytest batch_runs/phase_a/tests/test_confidence_gating.py -v
 ```
 
 Or with unittest:
@@ -451,6 +560,12 @@ Or with unittest:
 ```bash
 python3 -m unittest discover -s batch_runs/phase_a/tests -v
 ```
+
+### Confidence-Aware Gating Tests
+
+The new tests verify:
+- `test_stats.py`: Wilson UCB/LCB, normal LCB/UCB, known values, monotonicity, edge cases
+- `test_confidence_gating.py`: Budget uses bounds (not means), fail-closed behavior, determinism
 
 ### ADR Tests
 
