@@ -86,6 +86,38 @@ class PromotionOutcome(Enum):
     ERROR = "error"          # Error during evaluation
 
 
+def decision_to_exit_code(decision: str) -> int:
+    """
+    Map a promotion decision string to a CLI exit code.
+    
+    Exit code semantics (institutional CI correctness):
+    - PROMOTE → 0: Candidate is provably better, pipeline succeeded
+    - HOLD → 0: Pipeline succeeded, not enough evidence yet (no regression)
+    - REJECT → 2: Candidate is worse / fails guardrails / rejectable
+    - ERROR → 3: Runtime/IO/parsing failure
+    
+    Args:
+        decision: One of "PROMOTE", "HOLD", "REJECT", "ERROR" (case-insensitive)
+        
+    Returns:
+        Exit code: 0, 2, or 3
+        
+    Raises:
+        ValueError: If decision is not a recognized value
+    """
+    decision_upper = decision.upper()
+    if decision_upper == "PROMOTE":
+        return 0
+    elif decision_upper == "HOLD":
+        return 0
+    elif decision_upper == "REJECT":
+        return 2
+    elif decision_upper == "ERROR":
+        return 3
+    else:
+        raise ValueError(f"Unknown decision: {decision!r}. Expected PROMOTE, HOLD, REJECT, or ERROR.")
+
+
 # =============================================================================
 # Promotion Decision
 # =============================================================================
@@ -153,15 +185,15 @@ class PromotionDecision:
     
     @property
     def exit_code(self) -> int:
-        """Get CLI exit code: 0 = promote, 4 = hold, 3 = reject, 1 = error."""
-        if self.outcome == PromotionOutcome.PROMOTE:
-            return 0
-        elif self.outcome == PromotionOutcome.HOLD:
-            return 4
-        elif self.outcome == PromotionOutcome.REJECT:
-            return 3
-        else:
-            return 1
+        """
+        Get CLI exit code for this decision.
+        
+        Exit code semantics (institutional CI correctness):
+        - 0: PROMOTE or HOLD (pipeline succeeded)
+        - 2: REJECT (candidate fails guardrails)
+        - 3: ERROR (runtime/IO/parsing failure)
+        """
+        return decision_to_exit_code(self.outcome.value)
     
     def summary(self) -> str:
         """Generate a human-readable summary."""

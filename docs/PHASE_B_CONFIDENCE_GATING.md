@@ -148,7 +148,7 @@ decision = evaluate_promotion(
 )
 
 print(decision.outcome)           # PROMOTE / HOLD / REJECT / ERROR
-print(decision.exit_code)         # 0=promote, 4=hold, 3=reject, 2=data error, 1=error
+print(decision.exit_code)         # 0=promote/hold, 2=reject, 3=error
 print(decision.guardrails_passed) # True if candidate not provably worse
 print(decision.promotion_passed)  # True if candidate provably better
 print(decision.decision_reason)   # Human-readable explanation
@@ -235,12 +235,10 @@ python3 -m batch_runs.phase_b.cli \
     --out-dir runs/phaseB_confidence_smoke
 ```
 
-### Exit Codes
-- `0`: PROMOTE - Candidate is provably better than baseline
-- `4`: HOLD - Candidate is not worse, but not provably better (common for smoke runs)
-- `3`: REJECT - Candidate is provably worse than baseline
-- `2`: DATA ERROR - Cannot load trials.jsonl or no usable observations
-- `1`: OTHER ERROR - Unexpected evaluation error
+### Exit Codes (Institutional CI Semantics)
+- `0`: PROMOTE or HOLD - Pipeline succeeded (HOLD means not enough evidence yet)
+- `2`: REJECT - Candidate is worse / fails guardrails
+- `3`: ERROR - Runtime/IO/parsing failure, data errors
 
 ### Outputs
 - `confidence_report.json`: Machine-readable report with all metrics and decisions
@@ -388,7 +386,7 @@ The `confidence_report.json` includes these key fields:
     {"name": "PnL superiority", "passed": false, "reason": "..."},
     {"name": "Drawdown superiority", "passed": false, "reason": "..."}
   ],
-  "exit_code": 4,
+  "exit_code": 0,               // 0=promote/hold, 2=reject, 3=error
   "alpha": 0.05,
   "n_bootstrap": 1000,
   "seed": 42,

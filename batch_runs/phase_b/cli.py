@@ -28,12 +28,10 @@ Decision outcomes (tri-state model):
     REJECT: Guardrails fail (candidate is provably worse)
     ERROR: Missing/invalid run data, parse errors, etc.
 
-Exit codes:
-    0 = PROMOTE (candidate is provably better)
-    4 = HOLD (candidate not worse, but not provably better; common for smoke runs)
-    3 = REJECT (candidate is provably worse)
-    2 = DATA ERROR (trials.jsonl not found or no usable observations)
-    1 = OTHER ERROR (unexpected error)
+Exit codes (institutional CI semantics):
+    0 = PROMOTE (candidate is provably better) or HOLD (pipeline succeeded; not enough evidence yet)
+    2 = REJECT (candidate is worse / fails guardrails)
+    3 = ERROR (runtime/IO/parsing failure)
 """
 
 from __future__ import annotations
@@ -96,7 +94,7 @@ def write_error_report(
         "promotion_passed": False,
         "decision_reason": f"ERROR: {error_message}",
         "is_promote": False,
-        "exit_code": 2,
+        "exit_code": 3,
         "candidate_path": str(candidate_run),
         "baseline_path": str(baseline_run) if baseline_run else None,
         "candidate_metrics": None,
@@ -285,12 +283,10 @@ Examples:
       --alpha 0.01 \\
       --n-bootstrap 2000
 
-Exit codes:
-  0 = PROMOTE (candidate is provably better than baseline)
-  4 = HOLD (candidate not worse, but not provably better; common for smoke runs)  
-  3 = REJECT (candidate is provably worse than baseline)
-  2 = DATA ERROR (trials.jsonl not found or no usable observations)
-  1 = OTHER ERROR (unexpected error)
+Exit codes (institutional CI semantics):
+  0 = PROMOTE or HOLD (pipeline succeeded; HOLD means not enough evidence yet)
+  2 = REJECT (candidate is worse / fails guardrails)
+  3 = ERROR (runtime/IO/parsing failure, data errors)
 
 Outputs:
   - confidence_report.json: Machine-readable report
@@ -385,11 +381,11 @@ Outputs:
     # Validate paths
     if not args.candidate_run.exists():
         print(f"ERROR: Candidate run directory not found: {args.candidate_run}", file=sys.stderr)
-        return 1
+        return 3
     
     if args.baseline_run is not None and not args.baseline_run.exists():
         print(f"ERROR: Baseline run directory not found: {args.baseline_run}", file=sys.stderr)
-        return 1
+        return 3
     
     # Validate run data can be loaded before running gate
     try:
@@ -409,7 +405,7 @@ Outputs:
             print()
             
     except RunDataError as e:
-        # Data loading failed - write error report and exit with code 2
+        # Data loading failed - write error report and exit with code 3
         error_msg = str(e)
         print(f"ERROR: {error_msg}", file=sys.stderr)
         
@@ -429,7 +425,7 @@ Outputs:
             print(f"  ✓ Wrote {args.out_dir / 'confidence_report.json'}")
             print(f"  ✓ Wrote {args.out_dir / 'confidence_report.md'}")
         
-        return 2
+        return 3
     
     # Run the gate
     try:
@@ -460,12 +456,12 @@ Outputs:
             n_bootstrap=args.n_bootstrap,
             seed=args.seed,
         )
-        return 2
+        return 3
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
-        return 1
+        return 3
 
 
 if __name__ == "__main__":
