@@ -23,6 +23,7 @@ from batch_runs.phase_b.gate import (
     PromotionDecision,
     PromotionGate,
     PromotionOutcome,
+    decision_to_exit_code,
 )
 
 
@@ -94,7 +95,7 @@ class TestPromotionGate(unittest.TestCase):
         
         self.assertEqual(decision.outcome, PromotionOutcome.REJECT)
         self.assertTrue(decision.is_reject)
-        self.assertEqual(decision.exit_code, 3)
+        self.assertEqual(decision.exit_code, 2)  # REJECT → exit code 2
         
         # Check that fail reason mentions kill rate
         kill_failures = [r for r in decision.fail_reasons if "kill" in r.lower()]
@@ -190,7 +191,14 @@ class TestPromotionDecision(unittest.TestCase):
     """Tests for PromotionDecision structure."""
     
     def test_decision_exit_codes(self):
-        """Test that exit codes are correct."""
+        """Test that exit codes follow institutional CI semantics.
+        
+        Exit code mapping (locked forever):
+        - PROMOTE → 0 (candidate is provably better, pipeline succeeded)
+        - HOLD → 0 (pipeline succeeded, not enough evidence yet)
+        - REJECT → 2 (candidate fails guardrails)
+        - ERROR → 3 (runtime/IO/parsing failure)
+        """
         promote = PromotionDecision(
             outcome=PromotionOutcome.PROMOTE,
             candidate_path=None,
@@ -209,7 +217,7 @@ class TestPromotionDecision(unittest.TestCase):
             baseline_metrics=None,
             comparison=None,
         )
-        self.assertEqual(hold.exit_code, 4)
+        self.assertEqual(hold.exit_code, 0)  # HOLD → 0 (pipeline succeeded)
         
         reject = PromotionDecision(
             outcome=PromotionOutcome.REJECT,
@@ -219,7 +227,7 @@ class TestPromotionDecision(unittest.TestCase):
             baseline_metrics=None,
             comparison=None,
         )
-        self.assertEqual(reject.exit_code, 3)
+        self.assertEqual(reject.exit_code, 2)  # REJECT → 2
         
         error = PromotionDecision(
             outcome=PromotionOutcome.ERROR,
@@ -229,7 +237,7 @@ class TestPromotionDecision(unittest.TestCase):
             baseline_metrics=None,
             comparison=None,
         )
-        self.assertEqual(error.exit_code, 1)
+        self.assertEqual(error.exit_code, 3)  # ERROR → 3
     
     def test_decision_to_dict(self):
         """Test JSON serialization of decision."""
@@ -368,7 +376,7 @@ class TestTriStateDecisions(unittest.TestCase):
         # (CIs overlap, so candidate is not provably better)
         self.assertEqual(decision.outcome, PromotionOutcome.HOLD)
         self.assertTrue(decision.is_hold)
-        self.assertEqual(decision.exit_code, 4)
+        self.assertEqual(decision.exit_code, 0)  # HOLD → 0 (pipeline succeeded)
         
         # Guardrails should pass
         self.assertTrue(decision.guardrails_passed)
@@ -406,7 +414,7 @@ class TestTriStateDecisions(unittest.TestCase):
         # Baseline dominates, so guardrails fail → REJECT
         self.assertEqual(decision.outcome, PromotionOutcome.REJECT)
         self.assertTrue(decision.is_reject)
-        self.assertEqual(decision.exit_code, 3)
+        self.assertEqual(decision.exit_code, 2)  # REJECT → 2
         
         # Guardrails should fail
         self.assertFalse(decision.guardrails_passed)
@@ -667,6 +675,163 @@ class TestTriStateDecisions(unittest.TestCase):
         self.assertIn("## Promotion Criteria (must pass to PROMOTE)", md)
         self.assertIn("Guardrails passed:", md)
         self.assertIn("Promotion criteria passed:", md)
+
+
+class TestDecisionToExitCode(unittest.TestCase):
+    """Tests for decision_to_exit_code helper function.
+    
+    These tests lock the exit code mapping forever per institutional CI semantics.
+    """
+    
+    def test_promote_returns_zero(self):
+        """PROMOTE → exit code 0."""
+        self.assertEqual(decision_to_exit_code("PROMOTE"), 0)
+        self.assertEqual(decision_to_exit_code("promote"), 0)
+        self.assertEqual(decision_to_exit_code("Promote"), 0)
+    
+    def test_hold_returns_zero(self):
+        """HOLD → exit code 0 (pipeline succeeded; not enough evidence yet)."""
+        self.assertEqual(decision_to_exit_code("HOLD"), 0)
+        self.assertEqual(decision_to_exit_code("hold"), 0)
+        self.assertEqual(decision_to_exit_code("Hold"), 0)
+    
+    def test_reject_returns_two(self):
+        """REJECT → exit code 2 (candidate fails guardrails)."""
+        self.assertEqual(decision_to_exit_code("REJECT"), 2)
+        self.assertEqual(decision_to_exit_code("reject"), 2)
+        self.assertEqual(decision_to_exit_code("Reject"), 2)
+    
+    def test_error_returns_three(self):
+        """ERROR → exit code 3 (runtime/IO/parsing failure)."""
+        self.assertEqual(decision_to_exit_code("ERROR"), 3)
+        self.assertEqual(decision_to_exit_code("error"), 3)
+        self.assertEqual(decision_to_exit_code("Error"), 3)
+    
+    def test_invalid_decision_raises_value_error(self):
+        """Unknown decision raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            decision_to_exit_code("UNKNOWN")
+        self.assertIn("Unknown decision", str(ctx.exception))
+        
+        with self.assertRaises(ValueError):
+            decision_to_exit_code("PASS")
+        
+        with self.assertRaises(ValueError):
+            decision_to_exit_code("")
+
+
+class TestCLIExitCodes(unittest.TestCase):
+    """CLI-level tests for exit code semantics.
+    
+    Uses mocking to avoid heavy bootstrap computation.
+    """
+    
+    def test_cli_hold_decision_exits_zero(self):
+        """CLI returns exit code 0 when decision is HOLD."""
+        from unittest.mock import patch, MagicMock
+        from batch_runs.phase_b.cli import main
+        
+        # Create a mock decision with HOLD outcome
+        mock_decision = MagicMock()
+        mock_decision.outcome = PromotionOutcome.HOLD
+        mock_decision.exit_code = 0
+        mock_decision.to_dict.return_value = {"decision": "HOLD", "exit_code": 0}
+        mock_decision.to_markdown.return_value = "# HOLD report"
+        mock_decision.summary.return_value = "HOLD summary"
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create mock candidate directory with trials.jsonl
+            candidate_dir = Path(tmpdir) / "candidate"
+            candidate_dir.mkdir()
+            trials_file = candidate_dir / "trials.jsonl"
+            trials_file.write_text('{"pnl": 100, "kill_ci": 0.05}\n')
+            
+            out_dir = Path(tmpdir) / "output"
+            
+            with patch('batch_runs.phase_b.cli.run_gate', return_value=mock_decision):
+                with patch('batch_runs.phase_b.cli.load_run_data') as mock_load:
+                    mock_loaded = MagicMock()
+                    mock_loaded.n_observations = 1
+                    mock_loaded.trials_file = trials_file
+                    mock_load.return_value = mock_loaded
+                    
+                    exit_code = main([
+                        '--candidate-run', str(candidate_dir),
+                        '--out-dir', str(out_dir),
+                        '--quiet',
+                    ])
+            
+            self.assertEqual(exit_code, 0)
+    
+    def test_cli_promote_decision_exits_zero(self):
+        """CLI returns exit code 0 when decision is PROMOTE."""
+        from unittest.mock import patch, MagicMock
+        from batch_runs.phase_b.cli import main
+        
+        mock_decision = MagicMock()
+        mock_decision.outcome = PromotionOutcome.PROMOTE
+        mock_decision.exit_code = 0
+        mock_decision.to_dict.return_value = {"decision": "PROMOTE", "exit_code": 0}
+        mock_decision.to_markdown.return_value = "# PROMOTE report"
+        mock_decision.summary.return_value = "PROMOTE summary"
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            candidate_dir = Path(tmpdir) / "candidate"
+            candidate_dir.mkdir()
+            trials_file = candidate_dir / "trials.jsonl"
+            trials_file.write_text('{"pnl": 100, "kill_ci": 0.05}\n')
+            
+            out_dir = Path(tmpdir) / "output"
+            
+            with patch('batch_runs.phase_b.cli.run_gate', return_value=mock_decision):
+                with patch('batch_runs.phase_b.cli.load_run_data') as mock_load:
+                    mock_loaded = MagicMock()
+                    mock_loaded.n_observations = 1
+                    mock_loaded.trials_file = trials_file
+                    mock_load.return_value = mock_loaded
+                    
+                    exit_code = main([
+                        '--candidate-run', str(candidate_dir),
+                        '--out-dir', str(out_dir),
+                        '--quiet',
+                    ])
+            
+            self.assertEqual(exit_code, 0)
+    
+    def test_cli_reject_decision_exits_two(self):
+        """CLI returns exit code 2 when decision is REJECT."""
+        from unittest.mock import patch, MagicMock
+        from batch_runs.phase_b.cli import main
+        
+        mock_decision = MagicMock()
+        mock_decision.outcome = PromotionOutcome.REJECT
+        mock_decision.exit_code = 2
+        mock_decision.to_dict.return_value = {"decision": "REJECT", "exit_code": 2}
+        mock_decision.to_markdown.return_value = "# REJECT report"
+        mock_decision.summary.return_value = "REJECT summary"
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            candidate_dir = Path(tmpdir) / "candidate"
+            candidate_dir.mkdir()
+            trials_file = candidate_dir / "trials.jsonl"
+            trials_file.write_text('{"pnl": 100, "kill_ci": 0.05}\n')
+            
+            out_dir = Path(tmpdir) / "output"
+            
+            with patch('batch_runs.phase_b.cli.run_gate', return_value=mock_decision):
+                with patch('batch_runs.phase_b.cli.load_run_data') as mock_load:
+                    mock_loaded = MagicMock()
+                    mock_loaded.n_observations = 1
+                    mock_loaded.trials_file = trials_file
+                    mock_load.return_value = mock_loaded
+                    
+                    exit_code = main([
+                        '--candidate-run', str(candidate_dir),
+                        '--out-dir', str(out_dir),
+                        '--quiet',
+                    ])
+            
+            self.assertEqual(exit_code, 2)
 
 
 if __name__ == "__main__":
