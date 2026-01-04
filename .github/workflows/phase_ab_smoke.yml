@@ -37,6 +37,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Check for forbidden Unicode control characters
+        run: python3 tools/check_unicode_controls.py
+
       - name: Build release binaries
         run: cargo build --release -p paraphina --bin monte_carlo --bin sim_eval
 
@@ -81,7 +84,16 @@ jobs:
           echo "  Note: HOLD is CI pass for smoke tests (expected with small sample sizes)"
           cat runs/ci/phase_ab_smoke/phase_ab_manifest.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  Candidate: {d[\"candidate_run_resolved\"]}'); print(f'  Baseline: {d[\"baseline_run_resolved\"]}')"
 
-      - name: Upload evidence pack artifact
+      - name: Upload Phase AB smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-ab-smoke-artifacts
+          path: |
+            runs/phaseAB_smoke/**/*.json
+            runs/phaseAB_smoke/**/*.md
+
+      - name: Upload Phase AB evidence pack
         if: always()
         uses: actions/upload-artifact@v4
         with:
