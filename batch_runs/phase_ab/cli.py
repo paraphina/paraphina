@@ -21,17 +21,27 @@ Exit codes (institutional CI semantics):
     0 = PROMOTE or HOLD (pipeline succeeded)
     2 = REJECT (candidate fails guardrails)
     3 = ERROR (runtime/IO/parsing failure)
+
+CI Mode:
+    --ci-mode smoke : HOLD is CI pass (exit 0) with clear messaging
+    --ci-mode strict : HOLD is CI fail (exit 1) - promotion required
+    
+    For smoke/integration tests, use --ci-mode smoke (the default for smoke command).
+    For promotion gates that require PROMOTE, use --ci-mode strict.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
 
 from batch_runs.phase_ab.pipeline import (
     run_phase_ab,
+    PhaseABResult,
     ROOT,
 )
 
@@ -43,6 +53,181 @@ from batch_runs.phase_ab.pipeline import (
 DEFAULT_SMOKE_OUT_DIR = ROOT / "runs" / "phaseAB_smoke"
 DEFAULT_CANDIDATE_SMOKE = ROOT / "runs" / "phaseA_candidate_smoke"
 DEFAULT_BASELINE_SMOKE = ROOT / "runs" / "phaseA_baseline_smoke"
+
+
+# =============================================================================
+# CI Exit Code Helper
+# =============================================================================
+
+def ci_exit_code_for_decision(decision: str, ci_mode: str = "smoke") -> int:
+    """
+    Compute CI exit code based on promotion decision and CI mode.
+    
+    CI Mode semantics:
+    - "smoke": HOLD is CI pass (exit 0), REJECT/ERROR are CI fail
+              Used for smoke tests where we only verify the pipeline runs correctly.
+    - "strict": HOLD is CI fail (exit 1), only PROMOTE passes
+                Used for promotion gates that require definitive superiority.
+    
+    Exit codes:
+    - 0: CI pass (PROMOTE always, HOLD in smoke mode)
+    - 1: CI fail for HOLD in strict mode
+    - 2: CI fail for REJECT
+    - 3: CI fail for ERROR
+    
+    Args:
+        decision: One of "PROMOTE", "HOLD", "REJECT", "ERROR"
+        ci_mode: "smoke" (default) or "strict"
+        
+    Returns:
+        Exit code for CI
+    """
+    decision_upper = decision.upper()
+    
+    if decision_upper == "PROMOTE":
+        return 0
+    elif decision_upper == "HOLD":
+        if ci_mode == "strict":
+            return 1  # Strict mode: HOLD is a failure
+        else:
+            return 0  # Smoke mode: HOLD is success (pipeline worked)
+    elif decision_upper == "REJECT":
+        return 2
+    elif decision_upper == "ERROR":
+        return 3
+    else:
+        return 3  # Unknown decision treated as error
+
+
+def print_ci_summary(result: PhaseABResult, ci_mode: str = "smoke") -> None:
+    """
+    Print a clear CI summary message based on decision.
+    
+    Args:
+        result: PhaseABResult from run_phase_ab
+        ci_mode: "smoke" or "strict"
+    """
+    decision = result.manifest.decision
+    exit_code = ci_exit_code_for_decision(decision, ci_mode)
+    
+    print()
+    print("=" * 70)
+    print("Phase AB CI Summary")
+    print("=" * 70)
+    print(f"  Decision: {decision}")
+    print(f"  CI Mode: {ci_mode}")
+    print(f"  Exit Code: {exit_code}")
+    print()
+    
+    if decision == "PROMOTE":
+        print("  ✓ CI PASS: Candidate is provably better than baseline.")
+        print("  → Candidate may be promoted.")
+    elif decision == "HOLD":
+        if ci_mode == "smoke":
+            print("  ✓ CI PASS: Pipeline succeeded. HOLD means not enough evidence yet.")
+            print("  → This is EXPECTED for smoke tests with small sample sizes.")
+            print("  → Guardrails passed (candidate not worse), but CIs overlap.")
+            print("  → For promotion, collect more data to narrow confidence intervals.")
+        else:
+            print("  ✗ CI FAIL: HOLD decision in strict mode.")
+            print("  → Strict mode requires PROMOTE for CI pass.")
+            print("  → Collect more data to achieve statistical significance.")
+    elif decision == "REJECT":
+        print("  ✗ CI FAIL: Candidate fails guardrails.")
+        print("  → Candidate is provably worse than baseline on at least one metric.")
+        print("  → Review confidence_report.md for details.")
+    elif decision == "ERROR":
+        print("  ✗ CI FAIL: Pipeline encountered an error.")
+        if result.manifest.errors:
+            for err in result.manifest.errors:
+                print(f"  → {err}")
+    
+    print()
+    print(f"  Manifest: {result.manifest.phase_b_out_dir}/phase_ab_manifest.json")
+    print(f"  Report: {result.manifest.confidence_report_md}")
+    print("=" * 70)
+
+
+def write_github_step_summary(result: PhaseABResult, ci_mode: str = "smoke") -> None:
+    """
+    Write GitHub Actions step summary if running in GitHub Actions.
+    
+    Writes to $GITHUB_STEP_SUMMARY if available.
+    
+    Args:
+        result: PhaseABResult from run_phase_ab
+        ci_mode: "smoke" or "strict"
+    """
+    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_file:
+        return
+    
+    decision = result.manifest.decision
+    exit_code = ci_exit_code_for_decision(decision, ci_mode)
+    
+    # Determine status emoji and text
+    if decision == "PROMOTE":
+        status_emoji = "✅"
+        status_text = "CI PASS"
+        detail = "Candidate is provably better than baseline."
+    elif decision == "HOLD":
+        if ci_mode == "smoke":
+            status_emoji = "✅"
+            status_text = "CI PASS"
+            detail = "Pipeline succeeded. HOLD means not enough evidence to prove superiority (expected for smoke tests)."
+        else:
+            status_emoji = "❌"
+            status_text = "CI FAIL"
+            detail = "Strict mode requires PROMOTE. Candidate not provably better."
+    elif decision == "REJECT":
+        status_emoji = "❌"
+        status_text = "CI FAIL"
+        detail = "Candidate fails guardrails (provably worse)."
+    else:
+        status_emoji = "❌"
+        status_text = "CI FAIL"
+        detail = f"Pipeline error: {', '.join(result.manifest.errors) if result.manifest.errors else 'Unknown error'}"
+    
+    # Generate Markdown summary
+    summary = f"""## Phase AB Confidence Gate Result
+
+| Field | Value |
+|-------|-------|
+| **Status** | {status_emoji} {status_text} |
+| **Decision** | `{decision}` |
+| **Exit Code** | `{exit_code}` |
+| **CI Mode** | `{ci_mode}` |
+| **Alpha** | `{result.manifest.alpha}` |
+| **Bootstrap Samples** | `{result.manifest.bootstrap_samples}` |
+| **Candidate Samples** | `{result.manifest.candidate_samples}` |
+| **Baseline Samples** | `{result.manifest.baseline_samples}` |
+
+### Details
+
+{detail}
+
+### Checks Summary
+
+| Check | Status |
+|-------|--------|
+| **Guardrails** | {'✅ Passed' if decision in ('PROMOTE', 'HOLD') else '❌ Failed'} |
+| **Promotion Criteria** | {'✅ Passed' if decision == 'PROMOTE' else ('⏸️ Insufficient evidence' if decision == 'HOLD' else '❌ Failed')} |
+
+### Output Files
+
+- Manifest: `{result.manifest.phase_b_out_dir}/phase_ab_manifest.json`
+- Report (JSON): `{result.manifest.confidence_report_json}`
+- Report (MD): `{result.manifest.confidence_report_md}`
+
+---
+*Generated by Phase AB Confidence Gate*
+"""
+    
+    try:
+        with open(summary_file, "a") as f:
+            f.write(summary)
+    except Exception:
+        pass  # Silently fail if we can't write summary
 
 
 # =============================================================================
@@ -159,7 +344,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         verbose=not args.quiet,
     )
     
-    return result.exit_code
+    # Determine CI mode (default to smoke for backwards compatibility)
+    ci_mode = getattr(args, 'ci_mode', 'smoke')
+    
+    # Print CI summary
+    if not args.quiet:
+        print_ci_summary(result, ci_mode=ci_mode)
+    
+    # Write GitHub Actions step summary
+    write_github_step_summary(result, ci_mode=ci_mode)
+    
+    # Return CI-appropriate exit code
+    return ci_exit_code_for_decision(result.manifest.decision, ci_mode=ci_mode)
 
 
 # =============================================================================
@@ -201,7 +397,18 @@ def cmd_smoke(args: argparse.Namespace) -> int:
         verbose=verbose,
     )
     
-    return result.exit_code
+    # Smoke mode always uses "smoke" CI mode (HOLD is pass)
+    ci_mode = getattr(args, 'ci_mode', 'smoke')
+    
+    # Print CI summary
+    if verbose:
+        print_ci_summary(result, ci_mode=ci_mode)
+    
+    # Write GitHub Actions step summary
+    write_github_step_summary(result, ci_mode=ci_mode)
+    
+    # Return CI-appropriate exit code
+    return ci_exit_code_for_decision(result.manifest.decision, ci_mode=ci_mode)
 
 
 # =============================================================================
@@ -232,8 +439,21 @@ Examples:
   # Smoke with auto-generate (creates Phase A runs if needed)
   python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea
 
-Exit codes (institutional CI semantics):
+  # Strict mode for promotion gates (HOLD = CI fail)
+  python3 -m batch_runs.phase_ab.cli run --ci-mode strict ...
+
+CI Mode:
+  --ci-mode smoke  : HOLD is CI pass (exit 0) - default
+  --ci-mode strict : HOLD is CI fail (exit 1) - for promotion gates
+
+Exit codes (with --ci-mode smoke):
   0 = PROMOTE or HOLD (pipeline succeeded)
+  2 = REJECT (candidate fails guardrails)
+  3 = ERROR (runtime/IO/parsing failure)
+
+Exit codes (with --ci-mode strict):
+  0 = PROMOTE only (candidate provably better)
+  1 = HOLD (not enough evidence)
   2 = REJECT (candidate fails guardrails)
   3 = ERROR (runtime/IO/parsing failure)
 
@@ -270,6 +490,13 @@ Outputs:
             "--skip-evidence-verify",
             action="store_true",
             help="Skip evidence pack verification",
+        )
+        p.add_argument(
+            "--ci-mode",
+            type=str,
+            choices=["smoke", "strict"],
+            default="smoke",
+            help="CI mode: 'smoke' (HOLD=pass, default) or 'strict' (HOLD=fail)",
         )
         p.add_argument(
             "--quiet", "-q",
@@ -347,4 +574,3 @@ Outputs:
 
 if __name__ == "__main__":
     sys.exit(main())
-

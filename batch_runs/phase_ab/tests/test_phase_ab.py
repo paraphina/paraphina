@@ -242,6 +242,109 @@ class TestResolveRunRootErrors(unittest.TestCase):
 
 
 # =============================================================================
+# Tests: sim_eval Binary Resolution
+# =============================================================================
+
+class TestSimEvalBinaryResolution(unittest.TestCase):
+    """Test sim_eval binary resolution logic."""
+    
+    def test_env_var_takes_precedence(self):
+        """Test that SIM_EVAL_BIN env var takes precedence over built binaries."""
+        from batch_runs.phase_ab.pipeline import find_sim_eval_bin
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a fake sim_eval binary
+            fake_bin = Path(tmpdir) / "custom_sim_eval"
+            fake_bin.touch()
+            fake_bin.chmod(0o755)  # Make executable
+            
+            with patch.dict(os.environ, {"SIM_EVAL_BIN": str(fake_bin)}):
+                result = find_sim_eval_bin()
+                self.assertEqual(result, fake_bin)
+    
+    def test_release_binary_preferred_over_debug(self):
+        """Test that target/release/sim_eval is preferred over target/debug."""
+        from batch_runs.phase_ab.pipeline import find_sim_eval_bin, ROOT
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_root = Path(tmpdir)
+            
+            # Create both release and debug binaries
+            release_bin = fake_root / "target" / "release" / "sim_eval"
+            debug_bin = fake_root / "target" / "debug" / "sim_eval"
+            
+            release_bin.parent.mkdir(parents=True)
+            debug_bin.parent.mkdir(parents=True)
+            
+            release_bin.touch()
+            debug_bin.touch()
+            
+            # Patch ROOT to use our fake root
+            with patch('batch_runs.phase_ab.pipeline.ROOT', fake_root):
+                with patch.dict(os.environ, {}, clear=False):
+                    # Remove SIM_EVAL_BIN if set
+                    os.environ.pop("SIM_EVAL_BIN", None)
+                    result = find_sim_eval_bin()
+                    self.assertEqual(result, release_bin)
+    
+    def test_debug_binary_used_when_release_absent(self):
+        """Test that target/debug/sim_eval is used when release is absent."""
+        from batch_runs.phase_ab.pipeline import find_sim_eval_bin
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_root = Path(tmpdir)
+            
+            # Create only debug binary
+            debug_bin = fake_root / "target" / "debug" / "sim_eval"
+            debug_bin.parent.mkdir(parents=True)
+            debug_bin.touch()
+            
+            # Patch ROOT to use our fake root
+            with patch('batch_runs.phase_ab.pipeline.ROOT', fake_root):
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("SIM_EVAL_BIN", None)
+                    result = find_sim_eval_bin()
+                    self.assertEqual(result, debug_bin)
+    
+    def test_raises_error_when_binary_not_found(self):
+        """Test that SimEvalNotFoundError is raised when no binary found."""
+        from batch_runs.phase_ab.pipeline import find_sim_eval_bin, SimEvalNotFoundError
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_root = Path(tmpdir)
+            # Don't create any binaries
+            
+            with patch('batch_runs.phase_ab.pipeline.ROOT', fake_root):
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("SIM_EVAL_BIN", None)
+                    with patch('shutil.which', return_value=None):
+                        with self.assertRaises(SimEvalNotFoundError) as ctx:
+                            find_sim_eval_bin()
+                        
+                        error_msg = str(ctx.exception)
+                        self.assertIn("cargo build", error_msg)
+                        self.assertIn("--release", error_msg)
+    
+    def test_error_message_includes_checked_paths(self):
+        """Test that error message lists all checked locations."""
+        from batch_runs.phase_ab.pipeline import find_sim_eval_bin, SimEvalNotFoundError
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_root = Path(tmpdir)
+            
+            with patch('batch_runs.phase_ab.pipeline.ROOT', fake_root):
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("SIM_EVAL_BIN", None)
+                    with patch('shutil.which', return_value=None):
+                        with self.assertRaises(SimEvalNotFoundError) as ctx:
+                            find_sim_eval_bin()
+                        
+                        error_msg = str(ctx.exception)
+                        self.assertIn("target/release/sim_eval", error_msg)
+                        self.assertIn("target/debug/sim_eval", error_msg)
+
+
+# =============================================================================
 # Tests: Evidence Verification
 # =============================================================================
 
@@ -260,6 +363,8 @@ class TestEvidenceVerification(unittest.TestCase):
     
     def test_evidence_verification_called_when_sha256sums_exists(self):
         """Test that verification is called when SHA256SUMS exists."""
+        from batch_runs.phase_ab.pipeline import find_sim_eval_bin
+        
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             
@@ -268,23 +373,30 @@ class TestEvidenceVerification(unittest.TestCase):
             evidence_pack.mkdir()
             (evidence_pack / "SHA256SUMS").write_text("abc123  file.txt\n")
             
-            # Mock subprocess.run
-            with patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(
-                    returncode=0,
-                    stdout="OK: verified 1 file",
-                    stderr="",
-                )
-                
-                success, errors = verify_evidence_pack(root)
-                
-                # Should have called subprocess
-                self.assertTrue(mock_run.called)
-                
-                # Check command contains verify-evidence-pack
-                call_args = mock_run.call_args[0][0]
-                self.assertIn("verify-evidence-pack", call_args)
-                self.assertIn(str(root), call_args)
+            # Create a fake sim_eval binary
+            fake_bin = Path(tmpdir) / "fake_sim_eval"
+            fake_bin.touch()
+            fake_bin.chmod(0o755)
+            
+            # Mock find_sim_eval_bin to return our fake binary
+            with patch('batch_runs.phase_ab.pipeline.find_sim_eval_bin', return_value=fake_bin):
+                # Mock subprocess.run
+                with patch('subprocess.run') as mock_run:
+                    mock_run.return_value = MagicMock(
+                        returncode=0,
+                        stdout="OK: verified 1 file",
+                        stderr="",
+                    )
+                    
+                    success, errors = verify_evidence_pack(root)
+                    
+                    # Should have called subprocess
+                    self.assertTrue(mock_run.called)
+                    
+                    # Check command contains verify-evidence-pack
+                    call_args = mock_run.call_args[0][0]
+                    self.assertIn("verify-evidence-pack", call_args)
+                    self.assertIn(str(root), call_args)
     
     def test_verification_failure_returns_errors(self):
         """Test that verification failure returns error messages."""
@@ -296,22 +408,104 @@ class TestEvidenceVerification(unittest.TestCase):
             evidence_pack.mkdir()
             (evidence_pack / "SHA256SUMS").write_text("abc123  file.txt\n")
             
-            # Mock subprocess.run to fail
-            with patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(
-                    returncode=1,
-                    stdout="",
-                    stderr="Hash mismatch for file.txt",
-                )
+            # Create a fake sim_eval binary
+            fake_bin = Path(tmpdir) / "fake_sim_eval"
+            fake_bin.touch()
+            fake_bin.chmod(0o755)
+            
+            # Mock find_sim_eval_bin and subprocess.run to fail
+            with patch('batch_runs.phase_ab.pipeline.find_sim_eval_bin', return_value=fake_bin):
+                with patch('subprocess.run') as mock_run:
+                    mock_run.return_value = MagicMock(
+                        returncode=1,
+                        stdout="",
+                        stderr="Hash mismatch for file.txt",
+                    )
+                    
+                    success, errors = verify_evidence_pack(root)
+                    
+                    self.assertFalse(success)
+                    # Check that error contains the mismatch message
+                    error_text = " ".join(errors)
+                    self.assertIn("Hash mismatch", error_text)
+    
+    def test_verification_fails_when_binary_not_found(self):
+        """Test that verification fails gracefully when sim_eval not found."""
+        from batch_runs.phase_ab.pipeline import SimEvalNotFoundError
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            
+            # Create evidence pack structure
+            evidence_pack = root / "evidence_pack"
+            evidence_pack.mkdir()
+            (evidence_pack / "SHA256SUMS").write_text("abc123  file.txt\n")
+            
+            # Mock find_sim_eval_bin to raise SimEvalNotFoundError
+            with patch('batch_runs.phase_ab.pipeline.find_sim_eval_bin') as mock_find:
+                mock_find.side_effect = SimEvalNotFoundError("Binary not found")
                 
                 success, errors = verify_evidence_pack(root)
                 
                 self.assertFalse(success)
-                self.assertIn("Hash mismatch", errors[0])
+                self.assertIn("Binary not found", errors[0])
 
 
 # =============================================================================
-# Tests: Exit Code Semantics
+# Tests: CI Exit Code Semantics
+# =============================================================================
+
+class TestCIExitCodeSemantics(unittest.TestCase):
+    """Test CI exit code semantics with ci_exit_code_for_decision helper."""
+    
+    def test_ci_exit_code_smoke_mode_promote_returns_0(self):
+        """PROMOTE returns 0 in smoke mode."""
+        from batch_runs.phase_ab.cli import ci_exit_code_for_decision
+        self.assertEqual(ci_exit_code_for_decision("PROMOTE", "smoke"), 0)
+        self.assertEqual(ci_exit_code_for_decision("promote", "smoke"), 0)
+    
+    def test_ci_exit_code_smoke_mode_hold_returns_0(self):
+        """HOLD returns 0 in smoke mode (CI pass - pipeline succeeded)."""
+        from batch_runs.phase_ab.cli import ci_exit_code_for_decision
+        self.assertEqual(ci_exit_code_for_decision("HOLD", "smoke"), 0)
+        self.assertEqual(ci_exit_code_for_decision("hold", "smoke"), 0)
+    
+    def test_ci_exit_code_smoke_mode_reject_returns_2(self):
+        """REJECT returns 2 in smoke mode (CI fail - guardrails failed)."""
+        from batch_runs.phase_ab.cli import ci_exit_code_for_decision
+        self.assertEqual(ci_exit_code_for_decision("REJECT", "smoke"), 2)
+        self.assertEqual(ci_exit_code_for_decision("reject", "smoke"), 2)
+    
+    def test_ci_exit_code_smoke_mode_error_returns_3(self):
+        """ERROR returns 3 in smoke mode (CI fail - runtime error)."""
+        from batch_runs.phase_ab.cli import ci_exit_code_for_decision
+        self.assertEqual(ci_exit_code_for_decision("ERROR", "smoke"), 3)
+        self.assertEqual(ci_exit_code_for_decision("error", "smoke"), 3)
+    
+    def test_ci_exit_code_strict_mode_promote_returns_0(self):
+        """PROMOTE returns 0 in strict mode."""
+        from batch_runs.phase_ab.cli import ci_exit_code_for_decision
+        self.assertEqual(ci_exit_code_for_decision("PROMOTE", "strict"), 0)
+    
+    def test_ci_exit_code_strict_mode_hold_returns_1(self):
+        """HOLD returns 1 in strict mode (CI fail - promotion required)."""
+        from batch_runs.phase_ab.cli import ci_exit_code_for_decision
+        self.assertEqual(ci_exit_code_for_decision("HOLD", "strict"), 1)
+    
+    def test_ci_exit_code_strict_mode_reject_returns_2(self):
+        """REJECT returns 2 in strict mode."""
+        from batch_runs.phase_ab.cli import ci_exit_code_for_decision
+        self.assertEqual(ci_exit_code_for_decision("REJECT", "strict"), 2)
+    
+    def test_ci_exit_code_default_is_smoke_mode(self):
+        """Default CI mode is smoke (HOLD = 0)."""
+        from batch_runs.phase_ab.cli import ci_exit_code_for_decision
+        # Without explicit mode, should use smoke semantics
+        self.assertEqual(ci_exit_code_for_decision("HOLD"), 0)
+
+
+# =============================================================================
+# Tests: Exit Code Semantics (Legacy)
 # =============================================================================
 
 class TestExitCodeSemantics(unittest.TestCase):

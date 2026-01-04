@@ -110,7 +110,11 @@ Phase AB writes:
 
 ## Exit Codes (CI Semantics)
 
-Phase AB uses institutional CI exit code semantics:
+Phase AB uses institutional CI exit code semantics with two modes:
+
+### CI Mode: Smoke (Default)
+
+Used for smoke tests and integration tests where we verify the pipeline runs correctly.
 
 | Exit Code | Decision | Meaning |
 |-----------|----------|---------|
@@ -119,7 +123,32 @@ Phase AB uses institutional CI exit code semantics:
 | 2 | REJECT | Candidate fails guardrails |
 | 3 | ERROR | Runtime/IO/parsing failure |
 
-**Key insight:** HOLD is exit code 0 because the pipeline *succeeded*—there's just not enough evidence to promote. This is expected for smoke runs with few trials.
+**Key insight:** HOLD is exit code 0 in smoke mode because the pipeline *succeeded*—there's just not enough evidence to promote. This is expected for smoke runs with few trials.
+
+### CI Mode: Strict
+
+Used for promotion gates that require definitive superiority.
+
+| Exit Code | Decision | Meaning |
+|-----------|----------|---------|
+| 0 | PROMOTE | Candidate is provably better |
+| 1 | HOLD | Not enough evidence (CI fail in strict mode) |
+| 2 | REJECT | Candidate fails guardrails |
+| 3 | ERROR | Runtime/IO/parsing failure |
+
+### Choosing CI Mode
+
+```bash
+# Smoke mode (default): HOLD is CI pass
+python3 -m batch_runs.phase_ab.cli run --ci-mode smoke ...
+
+# Strict mode: Only PROMOTE is CI pass
+python3 -m batch_runs.phase_ab.cli run --ci-mode strict ...
+```
+
+**When to use each mode:**
+- **Smoke mode**: For CI smoke tests, integration tests, and development validation
+- **Strict mode**: For production promotion gates where you require statistical proof of superiority
 
 ## What HOLD Means
 

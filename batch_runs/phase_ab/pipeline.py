@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Paths
 # =============================================================================
 
-ROOT = Path(__file__).resolve().parents[2].parent  # Repo root
+ROOT = Path(__file__).resolve().parents[2]  # Repo root (paraphina/)
 SIM_EVAL_BIN = ROOT / "target" / "release" / "sim_eval"
 
 
@@ -260,41 +260,88 @@ def resolve_run_root(directory: Path, verbose: bool = False) -> Path:
 # Evidence Verification
 # =============================================================================
 
-def _find_sim_eval_bin() -> Optional[Path]:
+class SimEvalNotFoundError(Exception):
+    """Raised when the sim_eval binary cannot be found."""
+    pass
+
+
+def find_sim_eval_bin(verbose: bool = False) -> Path:
     """
-    Find the sim_eval binary using standard fallback strategies.
+    Find the sim_eval binary from the repo's build output.
     
-    Order:
-    1. SIM_EVAL_BIN env var (if set and file exists)
-    2. target/release/sim_eval
-    3. target/debug/sim_eval
-    4. shutil.which("sim_eval") in PATH
-    5. None if not found
+    Priority order:
+    1. SIM_EVAL_BIN environment variable (if set and executable)
+    2. target/release/sim_eval (preferred)
+    3. target/debug/sim_eval (fallback for dev builds)
+    4. shutil.which("sim_eval") in PATH (last resort, with warning)
+    
+    Note: We prefer repo-built binaries to ensure compatibility with
+    the verify-evidence-pack command. System-installed sim_eval binaries
+    may not support all commands.
+    
+    Args:
+        verbose: Print which binary is being used
+        
+    Returns:
+        Path to sim_eval binary
+        
+    Raises:
+        SimEvalNotFoundError: If no sim_eval binary can be found
     """
     import shutil
     
-    # 1. Check environment variable
+    # 1. Check environment variable first
     env_bin = os.environ.get("SIM_EVAL_BIN")
     if env_bin:
         env_path = Path(env_bin)
-        if env_path.exists():
+        if env_path.exists() and os.access(env_path, os.X_OK):
+            if verbose:
+                print(f"  Using sim_eval from SIM_EVAL_BIN: {env_path}")
             return env_path
     
-    # 2. Check target/release and target/debug
-    candidates = [
-        ROOT / "target" / "release" / "sim_eval",
-        ROOT / "target" / "debug" / "sim_eval",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+    # 2. Check target/release (preferred)
+    release_bin = ROOT / "target" / "release" / "sim_eval"
+    if release_bin.exists():
+        if verbose:
+            print(f"  Using sim_eval from: {release_bin}")
+        return release_bin
     
-    # 3. Check PATH
+    # 3. Check target/debug (fallback for dev builds)
+    debug_bin = ROOT / "target" / "debug" / "sim_eval"
+    if debug_bin.exists():
+        if verbose:
+            print(f"  Using sim_eval from: {debug_bin}")
+        return debug_bin
+    
+    # 4. Last resort: check PATH (but warn, as it may be incompatible)
     which_result = shutil.which("sim_eval")
     if which_result:
-        return Path(which_result)
+        which_path = Path(which_result)
+        print(
+            f"WARNING: Using sim_eval from PATH: {which_path}\n"
+            f"  This may not support all commands. Consider building from source:\n"
+            f"  cargo build --release -p paraphina --bins",
+            file=sys.stderr
+        )
+        return which_path
     
-    return None
+    # No binary found - raise helpful error
+    raise SimEvalNotFoundError(
+        f"sim_eval binary not found.\n"
+        f"\n"
+        f"Phase AB requires the repo's sim_eval binary for evidence verification.\n"
+        f"Build it with:\n"
+        f"\n"
+        f"    cargo build --release -p paraphina --bins\n"
+        f"\n"
+        f"Or set the SIM_EVAL_BIN environment variable to point to a compatible binary.\n"
+        f"\n"
+        f"Checked locations:\n"
+        f"  - SIM_EVAL_BIN env var: {env_bin or '(not set)'}\n"
+        f"  - {release_bin}\n"
+        f"  - {debug_bin}\n"
+        f"  - PATH: (not found)"
+    )
 
 
 def verify_evidence_pack(run_root: Path, verbose: bool = False) -> Tuple[bool, List[str]]:
@@ -321,19 +368,17 @@ def verify_evidence_pack(run_root: Path, verbose: bool = False) -> Tuple[bool, L
         return True, []  # No evidence pack = nothing to verify
     
     # Find sim_eval binary
-    sim_eval = _find_sim_eval_bin()
+    try:
+        sim_eval = find_sim_eval_bin(verbose=verbose)
+    except SimEvalNotFoundError as e:
+        return False, [str(e)]
     
-    if sim_eval:
-        cmd = [str(sim_eval), "verify-evidence-pack", str(run_root)]
-    else:
-        # Fallback to cargo run
-        cmd = [
-            "cargo", "run", "-p", "paraphina", "--bin", "sim_eval",
-            "--", "verify-evidence-pack", str(run_root)
-        ]
+    # Build command: sim_eval verify-evidence-pack <run_root>
+    cmd = [str(sim_eval), "verify-evidence-pack", str(run_root)]
     
     if verbose:
         print(f"  Verifying evidence pack: {run_root}")
+        print(f"    Command: {' '.join(cmd)}")
     
     try:
         proc = subprocess.run(
@@ -350,15 +395,23 @@ def verify_evidence_pack(run_root: Path, verbose: bool = False) -> Tuple[bool, L
         else:
             errors = []
             if proc.stderr:
-                errors.append(proc.stderr.strip())
+                errors.append(f"stderr: {proc.stderr.strip()}")
             if proc.stdout:
-                errors.append(proc.stdout.strip())
+                errors.append(f"stdout: {proc.stdout.strip()}")
             if not errors:
                 errors.append(f"verify-evidence-pack failed (exit code {proc.returncode})")
+            
+            # Add helpful context
+            errors.append(f"Command: {' '.join(cmd)}")
+            errors.append(f"Binary: {sim_eval}")
             return False, errors
             
-    except FileNotFoundError:
-        return False, ["sim_eval binary not found and cargo not available"]
+    except FileNotFoundError as e:
+        return False, [
+            f"Failed to execute sim_eval: {e}",
+            f"Binary path: {sim_eval}",
+            "Try rebuilding: cargo build --release -p paraphina --bins"
+        ]
     except Exception as e:
         return False, [f"Evidence verification error: {e}"]
 

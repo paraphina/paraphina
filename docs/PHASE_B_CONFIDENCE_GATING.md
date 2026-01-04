@@ -240,6 +240,25 @@ python3 -m batch_runs.phase_b.cli \
 - `2`: REJECT - Candidate is worse / fails guardrails
 - `3`: ERROR - Runtime/IO/parsing failure, data errors
 
+### Smoke CI vs Promotion Gates
+
+**Smoke CI passes on HOLD; promotion requires PROMOTE.**
+
+For **smoke tests and integration CI**:
+- HOLD is exit code 0 (CI pass)
+- The pipeline succeeded and guardrails passed
+- HOLD is expected with small sample sizes
+
+For **production promotion gates** (using `--ci-mode strict` in Phase AB):
+- Only PROMOTE is exit code 0
+- HOLD returns exit code 1 (CI fail)
+- Use when you require statistical proof of superiority
+
+This separation ensures:
+1. CI smoke tests don't fail spuriously when evidence is insufficient
+2. Production promotion decisions require definitive statistical proof
+3. Clear messaging explains what HOLD means in each context
+
 ### Outputs
 - `confidence_report.json`: Machine-readable report with all metrics and decisions
 - `confidence_report.md`: Human-readable Markdown report
