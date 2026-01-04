@@ -412,10 +412,10 @@ class TestLoadRunData(unittest.TestCase):
 class TestObservationConversion(unittest.TestCase):
     """Tests for TrialObservation conversion methods."""
     
-    def test_to_pnl_array(self):
-        """Test conversion to PnL array."""
+    def test_to_pnl_list(self):
+        """Test conversion to PnL list."""
         obs = TrialObservation(pnl=123.45, kill_ci=0.1)
-        arr = obs.to_pnl_array()
+        arr = obs.to_pnl_list()
         
         self.assertEqual(len(arr), 1)
         self.assertEqual(arr[0], 123.45)

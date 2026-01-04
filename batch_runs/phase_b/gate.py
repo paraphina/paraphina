@@ -35,7 +35,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
+import random
 
 from batch_runs.phase_b.confidence import (
     ConfidenceInterval,
@@ -437,9 +437,9 @@ class PromotionGate:
     
     def evaluate(
         self,
-        candidate_pnl: List[np.ndarray],
+        candidate_pnl: List[List[float]],
         candidate_kills: List[bool],
-        baseline_pnl: Optional[List[np.ndarray]] = None,
+        baseline_pnl: Optional[List[List[float]]] = None,
         baseline_kills: Optional[List[bool]] = None,
         candidate_path: Optional[Path] = None,
         baseline_path: Optional[Path] = None,
@@ -662,7 +662,7 @@ class PromotionGate:
 # Loading Metrics from Files
 # =============================================================================
 
-def load_run_data(run_dir: Path) -> Tuple[List[np.ndarray], List[bool]]:
+def load_run_data(run_dir: Path) -> Tuple[List[List[float]], List[bool]]:
     """
     Load run data from a Phase A run directory or JSONL file.
     
@@ -695,8 +695,8 @@ def load_run_data(run_dir: Path) -> Tuple[List[np.ndarray], List[bool]]:
         pass
     
     # Legacy loading for mc_summary.json format (backwards compatibility)
-    pnl_per_run = []
-    kill_flags = []
+    pnl_per_run: List[List[float]] = []
+    kill_flags: List[bool] = []
     
     # Check for mc_summary.json
     mc_summary = run_dir / "mc_summary.json"
@@ -709,7 +709,7 @@ def load_run_data(run_dir: Path) -> Tuple[List[np.ndarray], List[bool]]:
         if runs_data:
             for run in runs_data:
                 pnl = run.get("pnl_series", [run.get("final_pnl", 0)])
-                pnl_per_run.append(np.array(pnl))
+                pnl_per_run.append([float(x) for x in pnl])
                 kill_flags.append(run.get("kill_switch", False))
         else:
             # Fallback: try to get aggregate data
@@ -722,11 +722,11 @@ def load_run_data(run_dir: Path) -> Tuple[List[np.ndarray], List[bool]]:
             std_pnl = pnl.get("std_pop", 0)
             kill_rate = aggregate.get("kill_rate", 0)
             
-            # Generate synthetic runs
-            rng = np.random.default_rng(42)
+            # Generate synthetic runs using stdlib random
+            rng = random.Random(42)
             for _ in range(n_runs):
-                final_pnl = rng.normal(mean_pnl, max(std_pnl, 0.01))
-                pnl_per_run.append(np.array([final_pnl]))
+                final_pnl = rng.gauss(mean_pnl, max(std_pnl, 0.01))
+                pnl_per_run.append([final_pnl])
                 kill_flags.append(rng.random() < kill_rate)
     
     # Check for runs directory
@@ -736,7 +736,7 @@ def load_run_data(run_dir: Path) -> Tuple[List[np.ndarray], List[bool]]:
             with open(run_file) as f:
                 run = json.load(f)
             pnl = run.get("pnl_series", [run.get("final_pnl", 0)])
-            pnl_per_run.append(np.array(pnl))
+            pnl_per_run.append([float(x) for x in pnl])
             kill_flags.append(run.get("kill_switch", False))
     
     if not pnl_per_run:

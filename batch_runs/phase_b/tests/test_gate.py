@@ -9,12 +9,12 @@ Tests:
 """
 
 import math
+import random
 import tempfile
 import unittest
 from pathlib import Path
 import sys
-
-import numpy as np
+from typing import List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -27,25 +27,37 @@ from batch_runs.phase_b.gate import (
 )
 
 
+def _cumsum(data: List[float]) -> List[float]:
+    """Compute cumulative sum."""
+    if not data:
+        return []
+    result = [0.0] * len(data)
+    result[0] = data[0]
+    for i in range(1, len(data)):
+        result[i] = result[i - 1] + data[i]
+    return result
+
+
 def generate_pnl_data(
     n_runs: int = 20,
     mean_pnl: float = 100.0,
     std_pnl: float = 20.0,
     kill_rate: float = 0.05,
     seed: int = 42,
-) -> tuple:
+) -> Tuple[List[List[float]], List[bool]]:
     """Generate synthetic PnL data for testing."""
-    np.random.seed(seed)
+    rng = random.Random(seed)
     
-    pnl_per_run = []
-    kill_flags = []
+    pnl_per_run: List[List[float]] = []
+    kill_flags: List[bool] = []
     
     for i in range(n_runs):
         # Generate a simple PnL series
-        final_pnl = np.random.normal(mean_pnl, std_pnl)
-        pnl_series = np.cumsum(np.random.randn(50) + final_pnl / 50)
+        final_pnl = rng.gauss(mean_pnl, std_pnl)
+        increments = [rng.gauss(0, 1) + final_pnl / 50 for _ in range(50)]
+        pnl_series = _cumsum(increments)
         pnl_per_run.append(pnl_series)
-        kill_flags.append(np.random.random() < kill_rate)
+        kill_flags.append(rng.random() < kill_rate)
     
     return pnl_per_run, kill_flags
 
@@ -431,13 +443,13 @@ class TestTriStateDecisions(unittest.TestCase):
         This is the expected behavior for smoke runs.
         """
         # Candidate with much higher PnL
-        np.random.seed(42)
-        candidate_pnl = [np.array([300.0 + np.random.randn() * 2]) for _ in range(30)]
+        rng = random.Random(42)
+        candidate_pnl = [[300.0 + rng.gauss(0, 2)] for _ in range(30)]
         candidate_kills = [False] * 30
         
         # Baseline with much lower PnL
-        np.random.seed(43)
-        baseline_pnl = [np.array([50.0 + np.random.randn() * 2]) for _ in range(30)]
+        rng = random.Random(43)
+        baseline_pnl = [[50.0 + rng.gauss(0, 2)] for _ in range(30)]
         baseline_kills = [False] * 30
         
         gate = PromotionGate(
@@ -468,22 +480,20 @@ class TestTriStateDecisions(unittest.TestCase):
         For PROMOTE, candidate must be provably better on BOTH PnL and drawdown.
         """
         # Candidate: high PnL, low drawdown (no drops in equity curve)
-        np.random.seed(42)
-        candidate_pnl = []
+        candidate_pnl: List[List[float]] = []
         for _ in range(30):
             # Strictly positive increments -> 0 drawdown, high final PnL
-            series = np.array([50.0, 50.0, 50.0, 50.0, 50.0, 50.0])  # equity = [50, 100, 150...] no drawdown
+            series = [50.0, 50.0, 50.0, 50.0, 50.0, 50.0]  # equity = [50, 100, 150...] no drawdown
             candidate_pnl.append(series)
         candidate_kills = [False] * 30
         
         # Baseline: low PnL, higher drawdown (has drops in equity curve)
-        np.random.seed(43)
-        baseline_pnl = []
+        baseline_pnl: List[List[float]] = []
         for _ in range(30):
             # Equity curve that goes up, drops, recovers - creates drawdown
             # pnl series: [10, -20, 15, -10, 5] -> equity [10, -10, 5, -5, 0]
             # Running max: [10, 10, 10, 10, 10], drawdown = [0, 20, 5, 15, 10], max = 20
-            series = np.array([10.0, -20.0, 15.0, -10.0, 5.0])
+            series = [10.0, -20.0, 15.0, -10.0, 5.0]
             baseline_pnl.append(series)
         baseline_kills = [False] * 30
         

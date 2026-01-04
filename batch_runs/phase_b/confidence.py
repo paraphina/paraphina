@@ -9,7 +9,7 @@ Implements:
 - Percentile-based confidence intervals
 - Deterministic RNG seeding for reproducibility
 
-This module uses only numpy (no scipy) for statistical computations.
+This module uses only Python stdlib (no numpy/scipy) for statistical computations.
 
 References:
 - Block bootstrap: Künsch (1989), "The Jackknife and the Bootstrap for General Stationary Observations"
@@ -19,18 +19,76 @@ References:
 from __future__ import annotations
 
 import math
+import random
+import statistics
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple, Union
-
-import numpy as np
 
 
 # =============================================================================
 # Type aliases
 # =============================================================================
 
-Array = np.ndarray
+# Use List[float] instead of numpy.ndarray
+Array = List[float]
 Estimator = Callable[[Array], float]
+
+
+# =============================================================================
+# Helper Functions (stdlib replacements for numpy)
+# =============================================================================
+
+def _cumsum(data: List[float]) -> List[float]:
+    """Compute cumulative sum of a list."""
+    if not data:
+        return []
+    result = [0.0] * len(data)
+    result[0] = data[0]
+    for i in range(1, len(data)):
+        result[i] = result[i - 1] + data[i]
+    return result
+
+
+def _running_max(data: List[float]) -> List[float]:
+    """Compute running maximum of a list."""
+    if not data:
+        return []
+    result = [0.0] * len(data)
+    result[0] = data[0]
+    for i in range(1, len(data)):
+        result[i] = max(result[i - 1], data[i])
+    return result
+
+
+def _percentile(sorted_data: List[float], p: float) -> float:
+    """
+    Compute p-th percentile of sorted data using linear interpolation.
+    
+    Args:
+        sorted_data: Sorted list of values
+        p: Percentile (0-100)
+        
+    Returns:
+        Interpolated percentile value
+    """
+    if not sorted_data:
+        return float("nan")
+    
+    n = len(sorted_data)
+    if n == 1:
+        return sorted_data[0]
+    
+    # Linear interpolation method (matches numpy's default)
+    k = (n - 1) * p / 100.0
+    f = math.floor(k)
+    c = math.ceil(k)
+    
+    if f == c:
+        return sorted_data[int(k)]
+    
+    d0 = sorted_data[int(f)] * (c - k)
+    d1 = sorted_data[int(c)] * (k - f)
+    return d0 + d1
 
 
 # =============================================================================
@@ -42,14 +100,14 @@ def compute_mean(data: Array) -> float:
     Compute the arithmetic mean.
     
     Args:
-        data: 1D array of values
+        data: List of values
         
     Returns:
         Mean of the data
     """
     if len(data) == 0:
         return float("nan")
-    return float(np.mean(data))
+    return statistics.mean(data)
 
 
 def compute_median(data: Array) -> float:
@@ -57,14 +115,14 @@ def compute_median(data: Array) -> float:
     Compute the median.
     
     Args:
-        data: 1D array of values
+        data: List of values
         
     Returns:
         Median of the data
     """
     if len(data) == 0:
         return float("nan")
-    return float(np.median(data))
+    return statistics.median(data)
 
 
 def compute_cvar(data: Array, alpha: float = 0.05) -> float:
@@ -75,7 +133,7 @@ def compute_cvar(data: Array, alpha: float = 0.05) -> float:
     For PnL, this is the expected loss in the worst tail.
     
     Args:
-        data: 1D array of values (e.g., PnL)
+        data: List of values (e.g., PnL)
         alpha: Tail probability (default 0.05 for 5% CVaR)
         
     Returns:
@@ -89,14 +147,14 @@ def compute_cvar(data: Array, alpha: float = 0.05) -> float:
     if alpha <= 0 or alpha > 1:
         raise ValueError(f"alpha must be in (0, 1], got {alpha}")
     
-    sorted_data = np.sort(data)
+    sorted_data = sorted(data)
     n = len(data)
     
     # Number of observations in the tail
-    k = max(1, int(np.ceil(n * alpha)))
+    k = max(1, math.ceil(n * alpha))
     
     # CVaR is mean of the k worst observations
-    return float(np.mean(sorted_data[:k]))
+    return statistics.mean(sorted_data[:k])
 
 
 def compute_max_drawdown(equity_curve: Array) -> float:
@@ -106,7 +164,7 @@ def compute_max_drawdown(equity_curve: Array) -> float:
     Maximum drawdown is the largest peak-to-trough decline.
     
     Args:
-        equity_curve: 1D array of cumulative PnL values
+        equity_curve: List of cumulative PnL values
         
     Returns:
         Maximum drawdown (positive value representing the loss)
@@ -117,12 +175,12 @@ def compute_max_drawdown(equity_curve: Array) -> float:
         return 0.0
     
     # Running maximum
-    running_max = np.maximum.accumulate(equity_curve)
+    running_max = _running_max(equity_curve)
     
     # Drawdown at each point
-    drawdowns = running_max - equity_curve
+    drawdowns = [rm - ec for rm, ec in zip(running_max, equity_curve)]
     
-    return float(np.max(drawdowns))
+    return max(drawdowns)
 
 
 def compute_drawdown_series(pnl_series: Array) -> Array:
@@ -130,22 +188,22 @@ def compute_drawdown_series(pnl_series: Array) -> Array:
     Compute drawdown series from PnL series.
     
     Args:
-        pnl_series: 1D array of per-period PnL values
+        pnl_series: List of per-period PnL values
         
     Returns:
-        Array of drawdowns at each point
+        List of drawdowns at each point
     """
     if len(pnl_series) == 0:
-        return np.array([])
+        return []
     
     # Convert to equity curve
-    equity = np.cumsum(pnl_series)
+    equity = _cumsum(pnl_series)
     
     # Running maximum
-    running_max = np.maximum.accumulate(equity)
+    running_max = _running_max(equity)
     
     # Drawdown at each point
-    return running_max - equity
+    return [rm - eq for rm, eq in zip(running_max, equity)]
 
 
 def compute_max_drawdowns_per_run(pnl_per_run: List[Array]) -> Array:
@@ -153,12 +211,12 @@ def compute_max_drawdowns_per_run(pnl_per_run: List[Array]) -> Array:
     Compute max drawdown for each run.
     
     Args:
-        pnl_per_run: List of PnL arrays, one per run
+        pnl_per_run: List of PnL lists, one per run
         
     Returns:
-        Array of max drawdowns, one per run
+        List of max drawdowns, one per run
     """
-    return np.array([compute_max_drawdown(np.cumsum(pnl)) for pnl in pnl_per_run])
+    return [compute_max_drawdown(_cumsum(pnl)) for pnl in pnl_per_run]
 
 
 # =============================================================================
@@ -182,46 +240,43 @@ class BlockBootstrap:
     n_bootstrap: int = 1000
     seed: int = 42
     
-    def resample(self, data: Array, rng: np.random.Generator) -> Array:
+    def resample(self, data: Array, rng: random.Random) -> Array:
         """
         Generate a single bootstrap sample using block resampling.
         
         Args:
-            data: 1D array to resample
-            rng: NumPy random generator
+            data: List to resample
+            rng: Python random.Random instance
             
         Returns:
             Bootstrap sample of same length as data
         """
         n = len(data)
         if n == 0:
-            return data.copy()
+            return list(data)
         
         # Default block size: sqrt(n) as per Künsch (1989)
-        block_size = self.block_size if self.block_size else max(1, int(np.sqrt(n)))
+        block_size = self.block_size if self.block_size else max(1, int(math.sqrt(n)))
         
         # Number of blocks needed (may slightly overshoot)
-        n_blocks = int(np.ceil(n / block_size))
+        n_blocks = math.ceil(n / block_size)
         
         # Randomly select block starting positions
         # Each block starts at a random position in [0, n - block_size]
         max_start = max(0, n - block_size)
         if max_start == 0:
             # Data shorter than block size - just return shuffled copy
-            starts = rng.integers(0, n, size=n_blocks)
-            return data[starts]
-        
-        starts = rng.integers(0, max_start + 1, size=n_blocks)
+            return [data[rng.randrange(n)] for _ in range(n)]
         
         # Extract blocks and concatenate
-        blocks = []
-        for start in starts:
+        blocks: List[float] = []
+        for _ in range(n_blocks):
+            start = rng.randint(0, max_start)
             end = min(start + block_size, n)
-            blocks.append(data[start:end])
+            blocks.extend(data[start:end])
         
-        # Concatenate and trim to original length
-        resampled = np.concatenate(blocks)[:n]
-        return resampled
+        # Trim to original length
+        return blocks[:n]
     
     def bootstrap_samples(
         self,
@@ -232,18 +287,18 @@ class BlockBootstrap:
         Generate bootstrap distribution of an estimator.
         
         Args:
-            data: 1D array of observations
-            estimator: Function mapping array to scalar statistic
+            data: List of observations
+            estimator: Function mapping list to scalar statistic
             
         Returns:
-            Array of bootstrap estimates (length n_bootstrap)
+            List of bootstrap estimates (length n_bootstrap)
         """
-        rng = np.random.default_rng(self.seed)
+        rng = random.Random(self.seed)
         
-        estimates = np.empty(self.n_bootstrap)
-        for i in range(self.n_bootstrap):
+        estimates: List[float] = []
+        for _ in range(self.n_bootstrap):
             sample = self.resample(data, rng)
-            estimates[i] = estimator(sample)
+            estimates.append(estimator(sample))
         
         return estimates
     
@@ -257,8 +312,8 @@ class BlockBootstrap:
         Compute percentile confidence interval via bootstrap.
         
         Args:
-            data: 1D array of observations
-            estimator: Function mapping array to scalar statistic
+            data: List of observations
+            estimator: Function mapping list to scalar statistic
             alpha: Significance level (default 0.05 for 95% CI)
             
         Returns:
@@ -277,8 +332,9 @@ class BlockBootstrap:
         lower_pct = alpha / 2 * 100
         upper_pct = (1 - alpha / 2) * 100
         
-        lower = float(np.percentile(boot_estimates, lower_pct))
-        upper = float(np.percentile(boot_estimates, upper_pct))
+        sorted_estimates = sorted(boot_estimates)
+        lower = _percentile(sorted_estimates, lower_pct)
+        upper = _percentile(sorted_estimates, upper_pct)
         
         return (lower, point, upper)
 
@@ -299,8 +355,8 @@ def bootstrap_ci(
     Compute bootstrap confidence interval for a statistic.
     
     Args:
-        data: Array or list of observations
-        estimator: Function mapping array to scalar statistic
+        data: List of observations
+        estimator: Function mapping list to scalar statistic
         alpha: Significance level (default 0.05 for 95% CI)
         n_bootstrap: Number of bootstrap samples
         block_size: Block size for block bootstrap (None = sqrt(n))
@@ -310,10 +366,10 @@ def bootstrap_ci(
         Tuple of (lower, point_estimate, upper)
         
     Example:
-        >>> data = np.random.randn(100)
+        >>> data = [random.gauss(0, 1) for _ in range(100)]
         >>> lower, point, upper = bootstrap_ci(data, compute_mean, alpha=0.05)
     """
-    arr = np.asarray(data)
+    arr = list(data)
     bootstrap = BlockBootstrap(
         block_size=block_size,
         n_bootstrap=n_bootstrap,
@@ -385,8 +441,8 @@ def compute_ci(
     Compute a ConfidenceInterval object for a statistic.
     
     Args:
-        data: Array or list of observations
-        estimator: Function mapping array to scalar statistic
+        data: List of observations
+        estimator: Function mapping list to scalar statistic
         estimator_name: Name of the estimator for reporting
         alpha: Significance level
         n_bootstrap: Number of bootstrap samples
@@ -396,7 +452,7 @@ def compute_ci(
     Returns:
         ConfidenceInterval object
     """
-    arr = np.asarray(data)
+    arr = list(data)
     lower, point, upper = bootstrap_ci(
         arr, estimator, alpha, n_bootstrap, block_size, seed
     )
@@ -466,7 +522,7 @@ def compute_run_metrics(
     Compute all metrics with confidence intervals from simulation runs.
     
     Args:
-        pnl_per_run: List of PnL arrays, one per run
+        pnl_per_run: List of PnL lists, one per run
         kill_flags: List of boolean kill switch flags, one per run
         alpha: Significance level for CIs
         n_bootstrap: Number of bootstrap samples
@@ -502,7 +558,7 @@ def compute_run_metrics(
         )
     
     # Aggregate metrics per run
-    final_pnl = np.array([np.sum(pnl) for pnl in pnl_per_run])
+    final_pnl = [sum(pnl) for pnl in pnl_per_run]
     max_drawdowns = compute_max_drawdowns_per_run(pnl_per_run)
     
     # Kill rate
@@ -545,4 +601,3 @@ def compute_run_metrics(
         alpha=alpha,
         seed=seed,
     )
-

@@ -69,12 +69,12 @@ Implements:
 - **Block Bootstrap**: Preserves temporal dependencies in time-series data
 - **Estimators**: `compute_mean`, `compute_median`, `compute_cvar`, `compute_max_drawdown`
 - **Percentile CIs**: Conservative confidence intervals via percentile method
-- **Deterministic RNG**: Seeded `numpy.random.Generator` for reproducibility
+- **Deterministic RNG**: Seeded `random.Random` for reproducibility
 
 ```python
 from batch_runs.phase_b.confidence import bootstrap_ci, compute_mean
 
-data = pnl_values  # numpy array
+data = pnl_values  # list of floats
 lower, point, upper = bootstrap_ci(
     data, compute_mean,
     alpha=0.05,      # 95% CI
@@ -374,8 +374,8 @@ python3 -m pytest batch_runs/phase_b/tests/test_gate.py -v        # Gate reasoni
 
 ## Dependencies
 
-- `numpy`: Array operations and random number generation
-- No scipy required (pure numpy implementation)
+- **Python stdlib only**: Uses `random`, `statistics`, `math` from standard library
+- No numpy/scipy required (pure Python implementation)
 - Python 3.8+ (uses `statistics.NormalDist`)
 
 ## Design Principles
