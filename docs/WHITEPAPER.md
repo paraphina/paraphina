@@ -1497,6 +1497,9 @@ Everything below this heading is included exactly as provided (unedited), but **
 | §15 Logging/Metrics | Partial | EVIDENCE_PACK.md §8 |
 | §16 Control Flow | Implemented | EVIDENCE_PACK.md §1 |
 | §17 Architecture | Partial (sim only) | Milestone H |
+| Phase A Pipeline | Implemented | PHASE_A_PROMOTION_PIPELINE.md |
+| Phase B Gating | Implemented | PHASE_B_CONFIDENCE_GATING.md |
+| Phase AB Orchestrator | Implemented | PHASE_AB_PIPELINE.md |
 
 ---
 
@@ -5705,6 +5708,14 @@ A candidate configuration/policy is promoted only if it:
 - does not increase operational complexity beyond defined thresholds.
 
 When guardrails pass but promotion criteria fail (CIs overlap), the decision is **HOLD**—indicating insufficient evidence to promote. This is common for smoke runs with 3-10 trials and should be expected. To achieve PROMOTE, collect more data to narrow confidence intervals.
+
+**Phase AB: Integrated Orchestrator.** The Phase AB module (`batch_runs/phase_ab/`) provides institutional-grade orchestration for running Phase B confidence gating on Phase A run outputs. Key features:
+- **Run Root Validation**: Validates and normalizes Phase A directories, finding `trials.jsonl` with smart fallbacks and diagnostic error messages
+- **Evidence Verification**: Optionally verifies evidence packs before gating
+- **CI-Friendly Smoke**: Deterministic smoke entrypoint (`python3 -m batch_runs.phase_ab.cli smoke`) usable by CI without manual path picking
+- **Canonical Outputs**: Writes `phase_ab_manifest.json` with all metadata, plus Phase B confidence reports
+
+Exit codes follow institutional CI semantics: 0 for PROMOTE/HOLD (pipeline succeeded), 2 for REJECT (guardrail failure), 3 for ERROR (runtime failure). See `docs/PHASE_AB_PIPELINE.md`.
 
 ------------------------------------------------------------------
 APPENDIX C — RL EVOLUTION PLAN (GPU) AND WHERE IT INTEGRATES

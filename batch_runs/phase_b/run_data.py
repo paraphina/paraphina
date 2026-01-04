@@ -23,8 +23,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-
 
 # =============================================================================
 # Exceptions
@@ -99,9 +97,9 @@ class TrialObservation:
     kill_rate: float = 0.0  # Point estimate of kill rate
     source_line: int = 0  # Line number in source file (1-indexed)
 
-    def to_pnl_array(self) -> np.ndarray:
-        """Return PnL as a single-element numpy array (for compatibility with gate)."""
-        return np.array([self.pnl])
+    def to_pnl_list(self) -> List[float]:
+        """Return PnL as a single-element list (for compatibility with gate)."""
+        return [self.pnl]
 
     @property
     def is_killed(self) -> bool:
@@ -412,9 +410,9 @@ class LoadedRunData:
         """Number of usable observations."""
         return len(self.observations)
 
-    def to_pnl_arrays(self) -> List[np.ndarray]:
-        """Convert observations to list of PnL arrays (for gate compatibility)."""
-        return [obs.to_pnl_array() for obs in self.observations]
+    def to_pnl_arrays(self) -> List[List[float]]:
+        """Convert observations to list of PnL lists (for gate compatibility)."""
+        return [obs.to_pnl_list() for obs in self.observations]
 
     def to_kill_flags(self) -> List[bool]:
         """Convert observations to list of kill flags (for gate compatibility)."""

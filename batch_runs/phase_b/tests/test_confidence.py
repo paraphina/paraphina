@@ -8,11 +8,11 @@ Tests:
 """
 
 import math
+import random
 import unittest
 from pathlib import Path
 import sys
-
-import numpy as np
+from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -36,35 +36,35 @@ class TestEstimators(unittest.TestCase):
     
     def test_compute_mean_basic(self):
         """Test mean computation."""
-        data = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        data = [1.0, 2.0, 3.0, 4.0, 5.0]
         self.assertAlmostEqual(compute_mean(data), 3.0)
     
     def test_compute_mean_empty(self):
-        """Test mean with empty array."""
-        data = np.array([])
+        """Test mean with empty list."""
+        data: List[float] = []
         self.assertTrue(math.isnan(compute_mean(data)))
     
     def test_compute_median_odd(self):
         """Test median with odd number of elements."""
-        data = np.array([1.0, 5.0, 3.0])
+        data = [1.0, 5.0, 3.0]
         self.assertAlmostEqual(compute_median(data), 3.0)
     
     def test_compute_median_even(self):
         """Test median with even number of elements."""
-        data = np.array([1.0, 2.0, 3.0, 4.0])
+        data = [1.0, 2.0, 3.0, 4.0]
         self.assertAlmostEqual(compute_median(data), 2.5)
     
     def test_compute_cvar_basic(self):
         """Test CVaR computation."""
         # 10 values, alpha=0.2 means worst 20% = 2 values
-        data = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+        data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
         cvar = compute_cvar(data, alpha=0.2)
         # Worst 20% = [1, 2], mean = 1.5
         self.assertAlmostEqual(cvar, 1.5)
     
     def test_compute_cvar_alpha_05(self):
         """Test CVaR at 5% level."""
-        data = np.array([i for i in range(1, 101)])  # 1 to 100
+        data = [float(i) for i in range(1, 101)]  # 1 to 100
         cvar = compute_cvar(data, alpha=0.05)
         # Worst 5% of 100 values = 5 values: [1, 2, 3, 4, 5]
         # Mean = 3
@@ -72,7 +72,7 @@ class TestEstimators(unittest.TestCase):
     
     def test_compute_cvar_invalid_alpha(self):
         """Test CVaR with invalid alpha."""
-        data = np.array([1.0, 2.0, 3.0])
+        data = [1.0, 2.0, 3.0]
         with self.assertRaises(ValueError):
             compute_cvar(data, alpha=0.0)
         with self.assertRaises(ValueError):
@@ -84,19 +84,19 @@ class TestEstimators(unittest.TestCase):
         # Running max: [10, 15, 15, 15, 15, 20]
         # Drawdowns:   [0,  0,  7,  3, 10, 0]
         # Max DD = 10
-        equity = np.array([10.0, 15.0, 8.0, 12.0, 5.0, 20.0])
+        equity = [10.0, 15.0, 8.0, 12.0, 5.0, 20.0]
         dd = compute_max_drawdown(equity)
         self.assertAlmostEqual(dd, 10.0)
     
     def test_compute_max_drawdown_no_drawdown(self):
         """Test max drawdown with monotonic increase."""
-        equity = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        equity = [1.0, 2.0, 3.0, 4.0, 5.0]
         dd = compute_max_drawdown(equity)
         self.assertAlmostEqual(dd, 0.0)
     
     def test_compute_max_drawdown_single_value(self):
         """Test max drawdown with single value."""
-        equity = np.array([10.0])
+        equity = [10.0]
         dd = compute_max_drawdown(equity)
         self.assertAlmostEqual(dd, 0.0)
 
@@ -106,24 +106,25 @@ class TestBlockBootstrap(unittest.TestCase):
     
     def test_resample_length(self):
         """Test that resampled data has same length as original."""
-        data = np.arange(100)
+        data = [float(i) for i in range(100)]
         bootstrap = BlockBootstrap(block_size=10, n_bootstrap=1, seed=42)
-        rng = np.random.default_rng(42)
+        rng = random.Random(42)
         resampled = bootstrap.resample(data, rng)
         self.assertEqual(len(resampled), len(data))
     
     def test_resample_values_from_original(self):
         """Test that resampled values come from original data."""
-        data = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        data = [1.0, 2.0, 3.0, 4.0, 5.0]
         bootstrap = BlockBootstrap(block_size=2, n_bootstrap=1, seed=42)
-        rng = np.random.default_rng(42)
+        rng = random.Random(42)
         resampled = bootstrap.resample(data, rng)
         for val in resampled:
             self.assertIn(val, data)
     
     def test_bootstrap_samples_deterministic(self):
         """Test that same seed gives same results."""
-        data = np.random.randn(100)
+        rng = random.Random(42)
+        data = [rng.gauss(0, 1) for _ in range(100)]
         
         bootstrap1 = BlockBootstrap(n_bootstrap=100, seed=42)
         samples1 = bootstrap1.bootstrap_samples(data, compute_mean)
@@ -131,11 +132,12 @@ class TestBlockBootstrap(unittest.TestCase):
         bootstrap2 = BlockBootstrap(n_bootstrap=100, seed=42)
         samples2 = bootstrap2.bootstrap_samples(data, compute_mean)
         
-        np.testing.assert_array_equal(samples1, samples2)
+        self.assertEqual(samples1, samples2)
     
     def test_bootstrap_samples_different_seeds(self):
         """Test that different seeds give different results."""
-        data = np.random.randn(100)
+        rng = random.Random(42)
+        data = [rng.gauss(0, 1) for _ in range(100)]
         
         bootstrap1 = BlockBootstrap(n_bootstrap=100, seed=42)
         samples1 = bootstrap1.bootstrap_samples(data, compute_mean)
@@ -144,7 +146,7 @@ class TestBlockBootstrap(unittest.TestCase):
         samples2 = bootstrap2.bootstrap_samples(data, compute_mean)
         
         # Should not be equal
-        self.assertFalse(np.allclose(samples1, samples2))
+        self.assertNotEqual(samples1, samples2)
 
 
 class TestBootstrapCIStability(unittest.TestCase):
@@ -152,8 +154,8 @@ class TestBootstrapCIStability(unittest.TestCase):
     
     def test_bootstrap_ci_stability(self):
         """Test that CI is stable across repeated calls with same seed."""
-        np.random.seed(42)
-        data = np.random.randn(100)
+        rng = random.Random(42)
+        data = [rng.gauss(0, 1) for _ in range(100)]
         
         # Run bootstrap CI multiple times
         results = []
@@ -174,7 +176,8 @@ class TestBootstrapCIStability(unittest.TestCase):
     
     def test_confidence_interval_contains_point(self):
         """Test that CI contains point estimate."""
-        data = np.random.randn(100) + 5  # Mean around 5
+        rng = random.Random(42)
+        data = [rng.gauss(0, 1) + 5 for _ in range(100)]  # Mean around 5
         lower, point, upper = bootstrap_ci(
             data, compute_mean,
             alpha=0.05,
@@ -187,10 +190,10 @@ class TestBootstrapCIStability(unittest.TestCase):
     
     def test_ci_width_decreases_with_sample_size(self):
         """Test that CI narrows with more data."""
-        np.random.seed(42)
+        rng = random.Random(42)
         
-        data_small = np.random.randn(50)
-        data_large = np.random.randn(500)
+        data_small = [rng.gauss(0, 1) for _ in range(50)]
+        data_large = [rng.gauss(0, 1) for _ in range(500)]
         
         lower_s, _, upper_s = bootstrap_ci(data_small, compute_mean, seed=42)
         lower_l, _, upper_l = bootstrap_ci(data_large, compute_mean, seed=42)
@@ -251,8 +254,8 @@ class TestComputeRunMetrics(unittest.TestCase):
     def test_basic_metrics(self):
         """Test basic metrics computation."""
         # Create synthetic run data
-        np.random.seed(42)
-        pnl_per_run = [np.random.randn(100) for _ in range(20)]
+        rng = random.Random(42)
+        pnl_per_run = [[rng.gauss(0, 1) for _ in range(100)] for _ in range(20)]
         kill_flags = [False] * 18 + [True] * 2  # 10% kill rate
         
         metrics = compute_run_metrics(
@@ -277,8 +280,8 @@ class TestComputeRunMetrics(unittest.TestCase):
     
     def test_metrics_to_dict(self):
         """Test RunMetrics JSON serialization."""
-        np.random.seed(42)
-        pnl_per_run = [np.random.randn(50) for _ in range(10)]
+        rng = random.Random(42)
+        pnl_per_run = [[rng.gauss(0, 1) for _ in range(50)] for _ in range(10)]
         kill_flags = [False] * 10
         
         metrics = compute_run_metrics(
@@ -299,8 +302,8 @@ class TestDeterminism(unittest.TestCase):
     
     def test_bootstrap_is_deterministic(self):
         """Test that bootstrap is deterministic with seed."""
-        np.random.seed(123)
-        data = np.random.randn(100)
+        rng = random.Random(123)
+        data = [rng.gauss(0, 1) for _ in range(100)]
         
         # Multiple calls with same seed should give same result
         results = []
@@ -317,8 +320,8 @@ class TestDeterminism(unittest.TestCase):
     
     def test_run_metrics_deterministic(self):
         """Test that run metrics are deterministic."""
-        np.random.seed(42)
-        pnl_per_run = [np.random.randn(50) for _ in range(10)]
+        rng = random.Random(42)
+        pnl_per_run = [[rng.gauss(0, 1) for _ in range(50)] for _ in range(10)]
         kill_flags = [False] * 8 + [True] * 2
         
         metrics1 = compute_run_metrics(
@@ -337,4 +340,3 @@ class TestDeterminism(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
