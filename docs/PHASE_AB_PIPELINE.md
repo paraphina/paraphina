@@ -29,6 +29,17 @@ python3 -m batch_runs.phase_ab.cli smoke
 
 # Auto-generate Phase A runs if they don't exist
 python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea
+
+# CI-friendly with deterministic output and seed
+python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea \
+    --out-dir runs/ci/phase_ab_smoke --seed 12345
+```
+
+### Verify Evidence Pack
+
+```bash
+# Verify an evidence pack after download
+python3 -m batch_runs.phase_ab.cli verify-evidence runs/ci/phase_ab_smoke/evidence_pack
 ```
 
 ## What Phase AB Does
@@ -83,6 +94,24 @@ Phase AB writes:
 | `phase_ab_manifest.json` | Canonical manifest with all metadata |
 | `confidence_report.json` | Machine-readable Phase B report |
 | `confidence_report.md` | Human-readable Phase B report |
+| `phase_ab_summary.json` | Machine-readable CI summary |
+| `evidence_pack/manifest.json` | Evidence pack integrity manifest |
+
+### 5. Evidence Pack Manifest
+
+When `--out-dir` is provided, Phase AB:
+1. Creates an `evidence_pack/` subdirectory
+2. Copies key output files to the evidence pack
+3. Generates a deterministic `manifest.json` with SHA-256 hashes
+4. Self-verifies the manifest immediately after creation
+
+The manifest enables integrity verification:
+
+```bash
+python3 -m batch_runs.phase_ab.cli verify-evidence runs/ci/phase_ab_smoke/evidence_pack
+```
+
+See [Evidence Pack Manifest](./evidence_pack_manifest.md) for details.
 
 ## Manifest Schema
 
@@ -184,14 +213,26 @@ python3 -m batch_runs.phase_ab.cli run \
 
 ```bash
 python3 -m batch_runs.phase_ab.cli smoke \
-    --out-dir <path>             # Optional: Output directory
+    --out-dir <path>             # Optional: Output directory (default: runs/phaseAB_smoke)
     --auto-generate-phasea       # Auto-generate Phase A runs if missing
     --alpha 0.05                 # Significance level (default: 0.05)
     --n-bootstrap 1000           # Bootstrap samples (default: 1000)
-    --seed 42                    # Random seed (default: 42)
+    --seed 42                    # Random seed for reproducibility (default: 42)
     --skip-evidence-verify       # Skip evidence verification
+    --ci-mode smoke|strict       # CI mode (default: smoke)
     --quiet                      # Suppress verbose output
 ```
+
+### `verify-evidence` Command
+
+```bash
+python3 -m batch_runs.phase_ab.cli verify-evidence <EVIDENCE_PACK_DIR> \
+    --allow-extra                # Allow extra files not in manifest
+```
+
+Exit codes:
+- `0`: Verification passed
+- `2`: Verification failed
 
 ## Programmatic Usage
 
@@ -273,21 +314,49 @@ Phase AB is designed for CI pipelines:
 
 1. **Deterministic**: Seeded RNG ensures reproducible results
 2. **Exit codes**: Standard semantics for CI gates
-3. **Artifacts**: All outputs are machine-readable
+3. **Artifacts**: All outputs are machine-readable with integrity guarantees
 4. **Smoke mode**: Quick validation without path picking
+5. **Evidence pack**: Verifiable artifact with SHA-256 hashes
 
-Example GitHub Actions workflow:
+### CI Artifact Upload
+
+The GitHub Actions workflow uploads the evidence pack as artifact **`phase-ab-evidence-pack`**.
 
 ```yaml
-- name: Run PhaseAB smoke
-  run: python3 -m batch_runs.phase_ab.cli smoke
+- name: Run PhaseAB smoke with deterministic output
+  run: |
+    python3 -m batch_runs.phase_ab.cli smoke \
+      --auto-generate-phasea \
+      --out-dir runs/ci/phase_ab_smoke \
+      --seed 12345
 
-- name: Upload artifacts
+- name: Upload evidence pack artifact
+  if: always()
   uses: actions/upload-artifact@v4
   with:
-    name: phaseAB-report
-    path: runs/phaseAB_smoke/**/confidence_report.*
+    name: phase-ab-evidence-pack
+    path: runs/ci/phase_ab_smoke
 ```
+
+### Verifying Downloaded Artifacts
+
+After downloading the artifact from GitHub Actions:
+
+```bash
+unzip phase-ab-evidence-pack.zip -d artifact
+python3 -m batch_runs.phase_ab.cli verify-evidence artifact/evidence_pack
+```
+
+### Summary Outputs
+
+Phase AB writes `phase_ab_summary.json` with:
+- `outcome`: PASS/FAIL/HOLD
+- `mode`: "smoke" or "run"
+- `evidence_pack_dir`: Path to evidence pack
+- `manifest_path`: Path to manifest.json
+- `seed`: Random seed (if provided)
+- `git_commit`: Git commit hash
+- `python_version`: Python version
 
 ## Error Handling
 

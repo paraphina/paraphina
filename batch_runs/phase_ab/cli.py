@@ -17,9 +17,16 @@ Usage:
     # Smoke with auto-generate (creates Phase A runs if needed)
     python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea
 
+    # Smoke with deterministic output (CI artifact-friendly)
+    python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea \\
+        --out-dir runs/ci/phase_ab_smoke --seed 12345
+
+    # Verify an existing evidence pack
+    python3 -m batch_runs.phase_ab.cli verify-evidence runs/ci/phase_ab_smoke/evidence_pack
+
 Exit codes (institutional CI semantics):
     0 = PROMOTE or HOLD (pipeline succeeded)
-    2 = REJECT (candidate fails guardrails)
+    2 = REJECT (candidate fails guardrails) or verify-evidence failure
     3 = ERROR (runtime/IO/parsing failure)
 
 CI Mode:
@@ -35,9 +42,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from batch_runs.phase_ab.pipeline import (
     run_phase_ab,
@@ -53,6 +62,28 @@ from batch_runs.phase_ab.pipeline import (
 DEFAULT_SMOKE_OUT_DIR = ROOT / "runs" / "phaseAB_smoke"
 DEFAULT_CANDIDATE_SMOKE = ROOT / "runs" / "phaseA_candidate_smoke"
 DEFAULT_BASELINE_SMOKE = ROOT / "runs" / "phaseA_baseline_smoke"
+
+
+# =============================================================================
+# Git Commit Helper
+# =============================================================================
+
+def _get_git_commit() -> Optional[str]:
+    """Get the current git commit hash, or None if not in a git repo."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 
 # =============================================================================
@@ -231,6 +262,86 @@ def write_github_step_summary(result: PhaseABResult, ci_mode: str = "smoke") -> 
 
 
 # =============================================================================
+# Evidence Pack Manifest Helpers
+# =============================================================================
+
+def _write_evidence_pack_manifest(
+    evidence_pack_dir: Path,
+    cli_args: List[str],
+    seed: Optional[int],
+) -> Path:
+    """
+    Write manifest.json for evidence pack.
+    
+    Args:
+        evidence_pack_dir: Path to evidence_pack directory
+        cli_args: CLI arguments used
+        seed: Random seed (if provided)
+        
+    Returns:
+        Path to manifest.json
+    """
+    from batch_runs.evidence_pack import write_manifest, verify_manifest
+    
+    metadata: Dict[str, Any] = {
+        "cli_args": cli_args,
+    }
+    if seed is not None:
+        metadata["seed"] = seed
+    
+    git_commit = _get_git_commit()
+    if git_commit:
+        metadata["git_commit"] = git_commit
+    
+    manifest_path = write_manifest(evidence_pack_dir, metadata)
+    
+    # Self-check: verify immediately after writing
+    verify_manifest(evidence_pack_dir)
+    
+    return manifest_path
+
+
+def _write_phase_ab_summary(
+    out_dir: Path,
+    outcome: str,
+    mode: str,
+    evidence_pack_dir: Path,
+    manifest_path: Path,
+    seed: Optional[int],
+) -> Path:
+    """
+    Write phase_ab_summary.json with machine-readable run info.
+    
+    Args:
+        out_dir: Output directory
+        outcome: PASS/FAIL/HOLD
+        mode: "smoke" or "run"
+        evidence_pack_dir: Path to evidence_pack
+        manifest_path: Path to manifest.json
+        seed: Random seed (if provided)
+        
+    Returns:
+        Path to summary file
+    """
+    summary = {
+        "outcome": outcome,
+        "mode": mode,
+        "evidence_pack_dir": str(evidence_pack_dir),
+        "manifest_path": str(manifest_path),
+        "seed": seed,
+        "git_commit": _get_git_commit(),
+        "python_version": sys.version.split()[0],
+    }
+    
+    summary_path = out_dir / "phase_ab_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+        f.write("\n")
+    
+    return summary_path
+
+
+# =============================================================================
 # Smoke Mode Helpers
 # =============================================================================
 
@@ -270,9 +381,13 @@ def _print_generate_commands() -> None:
     print()
 
 
-def _generate_phase_a_runs(verbose: bool = True) -> bool:
+def _generate_phase_a_runs(verbose: bool = True, seed: Optional[int] = None) -> bool:
     """
     Generate Phase A smoke runs.
+    
+    Args:
+        verbose: Print progress
+        seed: Base seed for RNG (candidate uses seed, baseline uses seed+1)
     
     Returns:
         True if generation succeeded, False otherwise
@@ -281,6 +396,10 @@ def _generate_phase_a_runs(verbose: bool = True) -> bool:
     
     if verbose:
         print("[PhaseAB Smoke] Generating Phase A smoke runs...")
+    
+    # Use provided seed or default
+    candidate_seed = seed if seed is not None else 42
+    baseline_seed = candidate_seed + 1
     
     # Generate candidate
     candidate_exists, baseline_exists = _check_phase_a_runs_exist()
@@ -293,7 +412,7 @@ def _generate_phase_a_runs(verbose: bool = True) -> bool:
             sys.executable, "-m", "batch_runs.phase_a.promote_pipeline",
             "--smoke",
             "--study-dir", str(DEFAULT_CANDIDATE_SMOKE),
-            "--seed", "42",
+            "--seed", str(candidate_seed),
         ]
         
         result = subprocess.run(cmd, cwd=str(ROOT))
@@ -313,7 +432,7 @@ def _generate_phase_a_runs(verbose: bool = True) -> bool:
             sys.executable, "-m", "batch_runs.phase_a.promote_pipeline",
             "--smoke",
             "--study-dir", str(DEFAULT_BASELINE_SMOKE),
-            "--seed", "43",
+            "--seed", str(baseline_seed),
         ]
         
         result = subprocess.run(cmd, cwd=str(ROOT))
@@ -333,6 +452,10 @@ def _generate_phase_a_runs(verbose: bool = True) -> bool:
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Run PhaseAB with explicit candidate/baseline paths."""
+    # Seed RNG if provided
+    if args.seed is not None:
+        random.seed(args.seed)
+    
     result = run_phase_ab(
         candidate_run=args.candidate_run,
         baseline_run=args.baseline_run,
@@ -354,6 +477,36 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Write GitHub Actions step summary
     write_github_step_summary(result, ci_mode=ci_mode)
     
+    # Handle evidence pack manifest (if out_dir has evidence_pack)
+    out_dir = Path(args.out_dir).resolve()
+    evidence_pack_dir = out_dir / "evidence_pack"
+    
+    if evidence_pack_dir.exists() and evidence_pack_dir.is_dir():
+        try:
+            cli_args = sys.argv[1:] if len(sys.argv) > 1 else []
+            manifest_path = _write_evidence_pack_manifest(
+                evidence_pack_dir,
+                cli_args,
+                args.seed,
+            )
+            if not args.quiet:
+                print(f"  Evidence pack manifest: {manifest_path}")
+            
+            # Write summary
+            outcome = result.manifest.decision
+            summary_path = _write_phase_ab_summary(
+                out_dir,
+                outcome=outcome,
+                mode="run",
+                evidence_pack_dir=evidence_pack_dir,
+                manifest_path=manifest_path,
+                seed=args.seed,
+            )
+            if not args.quiet:
+                print(f"  Phase AB summary: {summary_path}")
+        except Exception as e:
+            print(f"WARNING: Failed to write evidence pack manifest: {e}", file=sys.stderr)
+    
     # Return CI-appropriate exit code
     return ci_exit_code_for_decision(result.manifest.decision, ci_mode=ci_mode)
 
@@ -366,6 +519,10 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     """Run PhaseAB smoke test with standard paths."""
     verbose = not args.quiet
     
+    # Seed RNG if provided
+    if args.seed is not None:
+        random.seed(args.seed)
+    
     if verbose:
         print("=" * 70)
         print("Phase AB Smoke Test")
@@ -376,7 +533,7 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     
     if not candidate_exists or not baseline_exists:
         if args.auto_generate_phasea:
-            success = _generate_phase_a_runs(verbose=verbose)
+            success = _generate_phase_a_runs(verbose=verbose, seed=args.seed)
             if not success:
                 return 3
         else:
@@ -384,7 +541,8 @@ def cmd_smoke(args: argparse.Namespace) -> int:
             return 3
     
     # Run PhaseAB
-    out_dir = args.out_dir if args.out_dir else DEFAULT_SMOKE_OUT_DIR
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else DEFAULT_SMOKE_OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     
     result = run_phase_ab(
         candidate_run=DEFAULT_CANDIDATE_SMOKE,
@@ -407,8 +565,118 @@ def cmd_smoke(args: argparse.Namespace) -> int:
     # Write GitHub Actions step summary
     write_github_step_summary(result, ci_mode=ci_mode)
     
+    # Create evidence_pack directory and write manifest
+    evidence_pack_dir = out_dir / "evidence_pack"
+    evidence_pack_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Copy relevant files to evidence_pack
+    _populate_evidence_pack(out_dir, evidence_pack_dir, result)
+    
+    # Write evidence pack manifest
+    try:
+        cli_args = sys.argv[1:] if len(sys.argv) > 1 else []
+        manifest_path = _write_evidence_pack_manifest(
+            evidence_pack_dir,
+            cli_args,
+            args.seed,
+        )
+        if verbose:
+            print()
+            print(f"  Evidence pack: {evidence_pack_dir}")
+            print(f"  Evidence pack manifest: {manifest_path}")
+        
+        # Write summary
+        outcome = result.manifest.decision
+        summary_path = _write_phase_ab_summary(
+            out_dir,
+            outcome=outcome,
+            mode="smoke",
+            evidence_pack_dir=evidence_pack_dir,
+            manifest_path=manifest_path,
+            seed=args.seed,
+        )
+        if verbose:
+            print(f"  Phase AB summary: {summary_path}")
+    except Exception as e:
+        print(f"WARNING: Failed to write evidence pack manifest: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+    
+    # Print final outcome
+    if verbose:
+        print()
+        print("=" * 70)
+        print(f"  Gating outcome: {result.manifest.decision}")
+        print(f"  Evidence pack path: {evidence_pack_dir.absolute()}")
+        print("=" * 70)
+    
     # Return CI-appropriate exit code
     return ci_exit_code_for_decision(result.manifest.decision, ci_mode=ci_mode)
+
+
+def _populate_evidence_pack(out_dir: Path, evidence_pack_dir: Path, result: PhaseABResult) -> None:
+    """
+    Populate evidence_pack directory with relevant files.
+    
+    Copies key output files to evidence_pack for integrity verification.
+    """
+    import shutil
+    
+    # Files to include in evidence pack
+    files_to_copy = [
+        "phase_ab_manifest.json",
+        "confidence_report.json",
+        "confidence_report.md",
+    ]
+    
+    for filename in files_to_copy:
+        src = out_dir / filename
+        if src.exists():
+            dst = evidence_pack_dir / filename
+            shutil.copy2(src, dst)
+
+
+# =============================================================================
+# Command: verify-evidence
+# =============================================================================
+
+def cmd_verify_evidence(args: argparse.Namespace) -> int:
+    """
+    Verify an evidence pack directory.
+    
+    Exit codes:
+        0: Verification passed
+        2: Verification failed
+    """
+    from batch_runs.evidence_pack import verify_manifest, ManifestError, count_manifest_files
+    
+    evidence_dir = Path(args.evidence_dir).resolve()
+    
+    if not evidence_dir.exists():
+        print(f"ERROR: Evidence directory not found: {evidence_dir}", file=sys.stderr)
+        return 2
+    
+    if not evidence_dir.is_dir():
+        print(f"ERROR: Path is not a directory: {evidence_dir}", file=sys.stderr)
+        return 2
+    
+    manifest_path = evidence_dir / "manifest.json"
+    
+    try:
+        verify_manifest(evidence_dir, allow_extra=args.allow_extra)
+        
+        # Count files for summary
+        file_count = count_manifest_files(manifest_path)
+        
+        print(f"OK: Evidence pack verified ({file_count} files)")
+        return 0
+        
+    except ManifestError as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
 
 
 # =============================================================================
@@ -423,8 +691,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  run     Run PhaseAB with explicit candidate/baseline paths (default)
-  smoke   Run deterministic smoke test with standard paths (CI-friendly)
+  run             Run PhaseAB with explicit candidate/baseline paths (default)
+  smoke           Run deterministic smoke test with standard paths (CI-friendly)
+  verify-evidence Verify an evidence pack directory
 
 Examples:
   # Run mode with explicit paths
@@ -439,6 +708,13 @@ Examples:
   # Smoke with auto-generate (creates Phase A runs if needed)
   python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea
 
+  # Smoke with deterministic output for CI
+  python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea \\
+      --out-dir runs/ci/phase_ab_smoke --seed 12345
+
+  # Verify an evidence pack
+  python3 -m batch_runs.phase_ab.cli verify-evidence runs/ci/phase_ab_smoke/evidence_pack
+
   # Strict mode for promotion gates (HOLD = CI fail)
   python3 -m batch_runs.phase_ab.cli run --ci-mode strict ...
 
@@ -448,7 +724,7 @@ CI Mode:
 
 Exit codes (with --ci-mode smoke):
   0 = PROMOTE or HOLD (pipeline succeeded)
-  2 = REJECT (candidate fails guardrails)
+  2 = REJECT (candidate fails guardrails) or verify-evidence failure
   3 = ERROR (runtime/IO/parsing failure)
 
 Exit codes (with --ci-mode strict):
@@ -461,6 +737,8 @@ Outputs:
   - phase_ab_manifest.json: Canonical manifest with all metadata
   - confidence_report.json: Machine-readable Phase B report
   - confidence_report.md: Human-readable Phase B report
+  - evidence_pack/manifest.json: Deterministic evidence pack manifest
+  - phase_ab_summary.json: Machine-readable summary for CI
 """,
     )
     
@@ -549,6 +827,23 @@ Outputs:
     )
     add_common_args(smoke_parser)
     
+    # Command: verify-evidence
+    verify_parser = subparsers.add_parser(
+        "verify-evidence",
+        help="Verify an evidence pack directory",
+        description="Verify evidence pack integrity against manifest.json.",
+    )
+    verify_parser.add_argument(
+        "evidence_dir",
+        type=Path,
+        help="Path to evidence pack directory",
+    )
+    verify_parser.add_argument(
+        "--allow-extra",
+        action="store_true",
+        help="Allow extra files not in manifest",
+    )
+    
     # Parse arguments
     args = parser.parse_args(argv)
     
@@ -567,6 +862,8 @@ Outputs:
         return cmd_run(args)
     elif args.command == "smoke":
         return cmd_smoke(args)
+    elif args.command == "verify-evidence":
+        return cmd_verify_evidence(args)
     else:
         parser.print_help()
         return 0

@@ -54,55 +54,96 @@ jobs:
           $SIM_EVAL_BIN --help | grep -q "verify-evidence-tree" || (echo "ERROR: sim_eval missing verify-evidence-tree command" && exit 1)
           echo "✓ sim_eval binary validated"
 
-      - name: Generate Phase A candidate smoke run
+      - name: Run Phase AB smoke test with deterministic output
         run: |
-          python3 -m batch_runs.phase_a.promote_pipeline \
-            --smoke \
-            --study-dir runs/phaseA_candidate_smoke \
-            --seed 42
-
-      - name: Generate Phase A baseline smoke run
-        run: |
-          python3 -m batch_runs.phase_a.promote_pipeline \
-            --smoke \
-            --study-dir runs/phaseA_baseline_smoke \
-            --seed 43
-
-      - name: Verify Phase A runs exist
-        run: |
-          test -f runs/phaseA_candidate_smoke/trials.jsonl
-          test -f runs/phaseA_baseline_smoke/trials.jsonl
-
-      - name: Run Phase AB smoke test
-        run: |
-          python3 -m batch_runs.phase_ab.cli run \
-            --candidate-run runs/phaseA_candidate_smoke \
-            --baseline-run runs/phaseA_baseline_smoke \
-            --out-dir runs/phaseAB_smoke \
-            --n-bootstrap 100 \
-            --seed 42 \
-            --ci-mode smoke
+          python3 -m batch_runs.phase_ab.cli smoke \
+            --auto-generate-phasea \
+            --out-dir runs/ci/phase_ab_smoke \
+            --seed 12345
 
       - name: Verify Phase AB outputs exist
         run: |
-          test -f runs/phaseAB_smoke/phase_ab_manifest.json
-          test -f runs/phaseAB_smoke/confidence_report.json
-          test -f runs/phaseAB_smoke/confidence_report.md
+          test -f runs/ci/phase_ab_smoke/phase_ab_manifest.json
+          test -f runs/ci/phase_ab_smoke/confidence_report.json
+          test -f runs/ci/phase_ab_smoke/confidence_report.md
+          test -f runs/ci/phase_ab_smoke/evidence_pack/manifest.json
+          test -f runs/ci/phase_ab_smoke/phase_ab_summary.json
+
+      - name: Verify evidence pack integrity
+        run: |
+          python3 -m batch_runs.phase_ab.cli verify-evidence runs/ci/phase_ab_smoke/evidence_pack
 
       - name: Display decision from manifest
         run: |
           echo "Phase AB Decision:"
-          DECISION=$(cat runs/phaseAB_smoke/phase_ab_manifest.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['decision'])")
+          DECISION=$(cat runs/ci/phase_ab_smoke/phase_ab_manifest.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['decision'])")
           echo "  Decision: $DECISION"
           echo "  Note: HOLD is CI pass for smoke tests (expected with small sample sizes)"
-          cat runs/phaseAB_smoke/phase_ab_manifest.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  Candidate: {d[\"candidate_run_resolved\"]}'); print(f'  Baseline: {d[\"baseline_run_resolved\"]}')"
+          cat runs/ci/phase_ab_smoke/phase_ab_manifest.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'  Candidate: {d[\"candidate_run_resolved\"]}'); print(f'  Baseline: {d[\"baseline_run_resolved\"]}')"
 
-      - name: Upload Phase AB artifacts
+      - name: Upload evidence pack artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: phase-ab-smoke-artifacts
-          path: |
-            runs/phaseAB_smoke/**/*.json
-            runs/phaseAB_smoke/**/*.md
+          name: phase-ab-evidence-pack
+          path: runs/ci/phase_ab_smoke
 
+      - name: Generate job summary
+        if: always()
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          from pathlib import Path
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if not summary_file:
+              print("GITHUB_STEP_SUMMARY not set, skipping job summary")
+              exit(0)
+
+          # Read phase_ab_summary.json
+          summary_path = Path("runs/ci/phase_ab_smoke/phase_ab_summary.json")
+          manifest_path = Path("runs/ci/phase_ab_smoke/evidence_pack/manifest.json")
+
+          outcome = "UNKNOWN"
+          evidence_pack_dir = "N/A"
+          manifest_present = "No"
+          file_count = 0
+
+          if summary_path.exists():
+              with open(summary_path) as f:
+                  data = json.load(f)
+              outcome = data.get("outcome", "UNKNOWN")
+              evidence_pack_dir = data.get("evidence_pack_dir", "N/A")
+          
+          if manifest_path.exists():
+              manifest_present = "Yes"
+              with open(manifest_path) as f:
+                  manifest = json.load(f)
+              file_count = len(manifest.get("files", []))
+
+          # Write summary
+          summary = f"""## Phase AB Smoke
+
+          | Field | Value |
+          |-------|-------|
+          | **Outcome** | `{outcome}` |
+          | **Evidence Pack** | `{evidence_pack_dir}` |
+          | **Manifest Present** | {manifest_present} |
+          | **Files in Manifest** | {file_count} |
+
+          ### Artifact
+
+          The evidence pack is uploaded as artifact **phase-ab-evidence-pack**.
+
+          To verify locally after download:
+          ```bash
+          python3 -m batch_runs.phase_ab.cli verify-evidence <path-to-evidence_pack>
+          ```
+          """
+
+          with open(summary_file, "a") as f:
+              f.write(summary)
+          
+          print("Job summary written successfully")
+          EOF
