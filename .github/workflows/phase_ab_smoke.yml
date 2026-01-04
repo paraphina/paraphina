@@ -40,6 +40,20 @@ jobs:
       - name: Build release binaries
         run: cargo build --release -p paraphina --bin monte_carlo --bin sim_eval
 
+      - name: Configure sim_eval binary path
+        # Ensure Phase AB always uses the repo-built sim_eval binary,
+        # not any unrelated sim_eval that might be in PATH.
+        run: |
+          echo "SIM_EVAL_BIN=$GITHUB_WORKSPACE/target/release/sim_eval" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/target/release" >> $GITHUB_PATH
+          echo "Configured SIM_EVAL_BIN=$GITHUB_WORKSPACE/target/release/sim_eval"
+
+      - name: Verify sim_eval supports evidence-pack commands
+        run: |
+          $SIM_EVAL_BIN --help | grep -q "verify-evidence-pack" || (echo "ERROR: sim_eval missing verify-evidence-pack command" && exit 1)
+          $SIM_EVAL_BIN --help | grep -q "verify-evidence-tree" || (echo "ERROR: sim_eval missing verify-evidence-tree command" && exit 1)
+          echo "✓ sim_eval binary validated"
+
       - name: Generate Phase A candidate smoke run
         run: |
           python3 -m batch_runs.phase_a.promote_pipeline \

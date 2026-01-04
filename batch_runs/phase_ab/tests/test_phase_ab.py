@@ -27,7 +27,9 @@ from datetime import datetime, timezone
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from typing import List
 from batch_runs.phase_ab.pipeline import (
+    _validate_sim_eval_binary,
     resolve_run_root,
     verify_evidence_pack,
     run_phase_ab,
@@ -246,25 +248,41 @@ class TestResolveRunRootErrors(unittest.TestCase):
 # =============================================================================
 
 class TestSimEvalBinaryResolution(unittest.TestCase):
-    """Test sim_eval binary resolution logic."""
+    """Test sim_eval binary resolution logic with validation."""
     
-    def test_env_var_takes_precedence(self):
-        """Test that SIM_EVAL_BIN env var takes precedence over built binaries."""
-        from batch_runs.phase_ab.pipeline import find_sim_eval_bin
+    def _create_mock_validator(self, valid_paths: List[Path]):
+        """Create a mock validator that passes for specific paths."""
+        def mock_validate(bin_path: Path, verbose: bool = False) -> bool:
+            return bin_path in valid_paths
+        return mock_validate
+    
+    def test_env_var_takes_precedence_when_valid(self):
+        """Test that SIM_EVAL_BIN env var takes precedence when it passes validation."""
+        from batch_runs.phase_ab.pipeline import resolve_sim_eval_bin
         
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create a fake sim_eval binary
-            fake_bin = Path(tmpdir) / "custom_sim_eval"
-            fake_bin.touch()
-            fake_bin.chmod(0o755)  # Make executable
+            fake_root = Path(tmpdir)
             
-            with patch.dict(os.environ, {"SIM_EVAL_BIN": str(fake_bin)}):
-                result = find_sim_eval_bin()
-                self.assertEqual(result, fake_bin)
+            # Create fake binaries
+            env_bin = Path(tmpdir) / "custom_sim_eval"
+            release_bin = fake_root / "target" / "release" / "sim_eval"
+            
+            env_bin.touch()
+            env_bin.chmod(0o755)
+            release_bin.parent.mkdir(parents=True)
+            release_bin.touch()
+            
+            # Mock validator to pass for env_bin
+            with patch('batch_runs.phase_ab.pipeline._validate_sim_eval_binary') as mock_validate:
+                mock_validate.side_effect = lambda p, verbose=False: p == env_bin
+                
+                with patch.dict(os.environ, {"SIM_EVAL_BIN": str(env_bin)}):
+                    result = resolve_sim_eval_bin(repo_root=fake_root)
+                    self.assertEqual(result, env_bin)
     
-    def test_release_binary_preferred_over_debug(self):
-        """Test that target/release/sim_eval is preferred over target/debug."""
-        from batch_runs.phase_ab.pipeline import find_sim_eval_bin, ROOT
+    def test_release_binary_preferred_over_debug_when_both_valid(self):
+        """Test that target/release/sim_eval is preferred over target/debug when both valid."""
+        from batch_runs.phase_ab.pipeline import resolve_sim_eval_bin
         
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_root = Path(tmpdir)
@@ -279,69 +297,281 @@ class TestSimEvalBinaryResolution(unittest.TestCase):
             release_bin.touch()
             debug_bin.touch()
             
-            # Patch ROOT to use our fake root
-            with patch('batch_runs.phase_ab.pipeline.ROOT', fake_root):
+            # Mock validator to pass for both
+            with patch('batch_runs.phase_ab.pipeline._validate_sim_eval_binary') as mock_validate:
+                mock_validate.return_value = True
+                
                 with patch.dict(os.environ, {}, clear=False):
-                    # Remove SIM_EVAL_BIN if set
                     os.environ.pop("SIM_EVAL_BIN", None)
-                    result = find_sim_eval_bin()
+                    result = resolve_sim_eval_bin(repo_root=fake_root)
                     self.assertEqual(result, release_bin)
     
-    def test_debug_binary_used_when_release_absent(self):
-        """Test that target/debug/sim_eval is used when release is absent."""
-        from batch_runs.phase_ab.pipeline import find_sim_eval_bin
+    def test_release_binary_preferred_over_shutil_which(self):
+        """Test that target/release/sim_eval is preferred over shutil.which result."""
+        from batch_runs.phase_ab.pipeline import resolve_sim_eval_bin
         
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_root = Path(tmpdir)
             
-            # Create only debug binary
+            # Create release binary
+            release_bin = fake_root / "target" / "release" / "sim_eval"
+            release_bin.parent.mkdir(parents=True)
+            release_bin.touch()
+            
+            # Create a PATH binary
+            path_bin = Path(tmpdir) / "path_sim_eval"
+            path_bin.touch()
+            
+            # Mock validator to pass for both
+            with patch('batch_runs.phase_ab.pipeline._validate_sim_eval_binary') as mock_validate:
+                mock_validate.return_value = True
+                
+                with patch('shutil.which', return_value=str(path_bin)):
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("SIM_EVAL_BIN", None)
+                        result = resolve_sim_eval_bin(repo_root=fake_root)
+                        # Should prefer release_bin over path_bin
+                        self.assertEqual(result, release_bin)
+    
+    def test_debug_binary_used_when_release_invalid(self):
+        """Test that target/debug/sim_eval is used when release fails validation."""
+        from batch_runs.phase_ab.pipeline import resolve_sim_eval_bin
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_root = Path(tmpdir)
+            
+            # Create both binaries
+            release_bin = fake_root / "target" / "release" / "sim_eval"
             debug_bin = fake_root / "target" / "debug" / "sim_eval"
+            
+            release_bin.parent.mkdir(parents=True)
             debug_bin.parent.mkdir(parents=True)
+            
+            release_bin.touch()
             debug_bin.touch()
             
-            # Patch ROOT to use our fake root
-            with patch('batch_runs.phase_ab.pipeline.ROOT', fake_root):
+            # Mock validator to fail for release but pass for debug
+            def mock_validate(bin_path: Path, verbose: bool = False) -> bool:
+                return bin_path == debug_bin
+            
+            with patch('batch_runs.phase_ab.pipeline._validate_sim_eval_binary', side_effect=mock_validate):
                 with patch.dict(os.environ, {}, clear=False):
                     os.environ.pop("SIM_EVAL_BIN", None)
-                    result = find_sim_eval_bin()
+                    result = resolve_sim_eval_bin(repo_root=fake_root)
                     self.assertEqual(result, debug_bin)
     
-    def test_raises_error_when_binary_not_found(self):
-        """Test that SimEvalNotFoundError is raised when no binary found."""
-        from batch_runs.phase_ab.pipeline import find_sim_eval_bin, SimEvalNotFoundError
+    def test_path_binary_used_when_repo_binaries_invalid(self):
+        """Test that PATH binary is used when repo binaries fail validation."""
+        from batch_runs.phase_ab.pipeline import resolve_sim_eval_bin
         
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_root = Path(tmpdir)
-            # Don't create any binaries
             
-            with patch('batch_runs.phase_ab.pipeline.ROOT', fake_root):
-                with patch.dict(os.environ, {}, clear=False):
-                    os.environ.pop("SIM_EVAL_BIN", None)
-                    with patch('shutil.which', return_value=None):
+            # Create repo binaries
+            release_bin = fake_root / "target" / "release" / "sim_eval"
+            debug_bin = fake_root / "target" / "debug" / "sim_eval"
+            release_bin.parent.mkdir(parents=True)
+            debug_bin.parent.mkdir(parents=True)
+            release_bin.touch()
+            debug_bin.touch()
+            
+            # Create PATH binary
+            path_bin = Path(tmpdir) / "path_sim_eval"
+            path_bin.touch()
+            
+            # Mock validator to only pass for PATH binary
+            def mock_validate(bin_path: Path, verbose: bool = False) -> bool:
+                return bin_path == path_bin
+            
+            with patch('batch_runs.phase_ab.pipeline._validate_sim_eval_binary', side_effect=mock_validate):
+                with patch('shutil.which', return_value=str(path_bin)):
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("SIM_EVAL_BIN", None)
+                        result = resolve_sim_eval_bin(repo_root=fake_root)
+                        self.assertEqual(result, path_bin)
+    
+    def test_raises_error_when_all_candidates_fail_validation(self):
+        """Test that SimEvalNotFoundError is raised when all candidates fail validation."""
+        from batch_runs.phase_ab.pipeline import resolve_sim_eval_bin, SimEvalNotFoundError
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_root = Path(tmpdir)
+            
+            # Create binaries that will fail validation
+            release_bin = fake_root / "target" / "release" / "sim_eval"
+            release_bin.parent.mkdir(parents=True)
+            release_bin.touch()
+            
+            # Mock validator to always fail
+            with patch('batch_runs.phase_ab.pipeline._validate_sim_eval_binary', return_value=False):
+                with patch('shutil.which', return_value=None):
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("SIM_EVAL_BIN", None)
                         with self.assertRaises(SimEvalNotFoundError) as ctx:
-                            find_sim_eval_bin()
+                            resolve_sim_eval_bin(repo_root=fake_root)
                         
                         error_msg = str(ctx.exception)
                         self.assertIn("cargo build", error_msg)
                         self.assertIn("--release", error_msg)
     
-    def test_error_message_includes_checked_paths(self):
-        """Test that error message lists all checked locations."""
-        from batch_runs.phase_ab.pipeline import find_sim_eval_bin, SimEvalNotFoundError
+    def test_error_message_includes_candidates_tried(self):
+        """Test that error message lists all candidates tried."""
+        from batch_runs.phase_ab.pipeline import resolve_sim_eval_bin, SimEvalNotFoundError
         
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_root = Path(tmpdir)
             
-            with patch('batch_runs.phase_ab.pipeline.ROOT', fake_root):
-                with patch.dict(os.environ, {}, clear=False):
-                    os.environ.pop("SIM_EVAL_BIN", None)
-                    with patch('shutil.which', return_value=None):
+            # Mock validator to always fail
+            with patch('batch_runs.phase_ab.pipeline._validate_sim_eval_binary', return_value=False):
+                with patch('shutil.which', return_value=None):
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop("SIM_EVAL_BIN", None)
                         with self.assertRaises(SimEvalNotFoundError) as ctx:
-                            find_sim_eval_bin()
+                            resolve_sim_eval_bin(repo_root=fake_root)
                         
                         error_msg = str(ctx.exception)
-                        self.assertIn("target/release/sim_eval", error_msg)
-                        self.assertIn("target/debug/sim_eval", error_msg)
+                        self.assertIn("target/release", error_msg)
+                        self.assertIn("target/debug", error_msg)
+                        self.assertIn("not found", error_msg)
+    
+    def test_repo_root_parameter_allows_testing(self):
+        """Test that repo_root parameter enables isolated testing."""
+        from batch_runs.phase_ab.pipeline import resolve_sim_eval_bin
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_root = Path(tmpdir)
+            
+            # Create release binary in custom root
+            release_bin = fake_root / "target" / "release" / "sim_eval"
+            release_bin.parent.mkdir(parents=True)
+            release_bin.touch()
+            
+            # Mock validator to pass
+            with patch('batch_runs.phase_ab.pipeline._validate_sim_eval_binary', return_value=True):
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("SIM_EVAL_BIN", None)
+                    # Use repo_root parameter instead of patching ROOT constant
+                    result = resolve_sim_eval_bin(repo_root=fake_root)
+                    self.assertEqual(result, release_bin)
+
+
+# =============================================================================
+# Tests: sim_eval Binary Validation
+# =============================================================================
+
+class TestSimEvalBinaryValidation(unittest.TestCase):
+    """Test sim_eval binary validation logic."""
+    
+    def test_returns_false_for_nonexistent_binary(self):
+        """Test that validation returns False for non-existent binary."""
+        fake_bin = Path("/nonexistent/path/sim_eval")
+        result = _validate_sim_eval_binary(fake_bin)
+        self.assertFalse(result)
+    
+    def test_returns_false_for_non_executable(self):
+        """Test that validation returns False for non-executable file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "sim_eval"
+            fake_bin.touch()
+            fake_bin.chmod(0o644)  # Not executable
+            
+            result = _validate_sim_eval_binary(fake_bin)
+            self.assertFalse(result)
+    
+    def test_returns_true_when_help_contains_required_commands(self):
+        """Test that validation passes when --help contains required commands."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "sim_eval"
+            fake_bin.touch()
+            fake_bin.chmod(0o755)
+            
+            # Mock subprocess.run to return help output with required commands
+            mock_help_output = """
+sim_eval - Simulation & Evaluation runner
+
+SUBCOMMANDS:
+  run                   Run a single scenario
+  suite                 Run a CI suite
+  verify-evidence-pack  Verify evidence pack hashes
+  verify-evidence-tree  Verify evidence tree
+  write-evidence-pack   Write evidence pack
+"""
+            with patch('subprocess.run') as mock_run:
+                mock_run.return_value = MagicMock(
+                    stdout=mock_help_output,
+                    stderr="",
+                    returncode=0,
+                )
+                
+                result = _validate_sim_eval_binary(fake_bin)
+                self.assertTrue(result)
+    
+    def test_returns_false_when_missing_verify_evidence_pack(self):
+        """Test that validation fails when verify-evidence-pack is missing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "sim_eval"
+            fake_bin.touch()
+            fake_bin.chmod(0o755)
+            
+            # Help output missing verify-evidence-pack
+            mock_help_output = """
+sim_eval - Simulation & Evaluation runner
+
+SUBCOMMANDS:
+  run                   Run a single scenario
+  suite                 Run a CI suite
+  verify-evidence-tree  Verify evidence tree
+"""
+            with patch('subprocess.run') as mock_run:
+                mock_run.return_value = MagicMock(
+                    stdout=mock_help_output,
+                    stderr="",
+                    returncode=0,
+                )
+                
+                result = _validate_sim_eval_binary(fake_bin)
+                self.assertFalse(result)
+    
+    def test_returns_false_when_missing_verify_evidence_tree(self):
+        """Test that validation fails when verify-evidence-tree is missing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "sim_eval"
+            fake_bin.touch()
+            fake_bin.chmod(0o755)
+            
+            # Help output missing verify-evidence-tree
+            mock_help_output = """
+sim_eval - Simulation & Evaluation runner
+
+SUBCOMMANDS:
+  run                   Run a single scenario
+  suite                 Run a CI suite
+  verify-evidence-pack  Verify evidence pack hashes
+"""
+            with patch('subprocess.run') as mock_run:
+                mock_run.return_value = MagicMock(
+                    stdout=mock_help_output,
+                    stderr="",
+                    returncode=0,
+                )
+                
+                result = _validate_sim_eval_binary(fake_bin)
+                self.assertFalse(result)
+    
+    def test_returns_false_on_subprocess_timeout(self):
+        """Test that validation returns False when --help times out."""
+        import subprocess as sp
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "sim_eval"
+            fake_bin.touch()
+            fake_bin.chmod(0o755)
+            
+            with patch('subprocess.run') as mock_run:
+                mock_run.side_effect = sp.TimeoutExpired(cmd=["sim_eval"], timeout=10)
+                
+                result = _validate_sim_eval_binary(fake_bin)
+                self.assertFalse(result)
 
 
 # =============================================================================

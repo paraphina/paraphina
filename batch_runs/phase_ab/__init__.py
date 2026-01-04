@@ -39,7 +39,8 @@ from batch_runs.phase_ab.pipeline import (
     run_phase_ab,
     resolve_run_root,
     verify_evidence_pack,
-    find_sim_eval_bin,
+    resolve_sim_eval_bin,
+    find_sim_eval_bin,  # Alias for backward compatibility
     PhaseABResult,
     PhaseABManifest,
     RunRootError,
@@ -53,6 +54,7 @@ __all__ = [
     "run_phase_ab",
     "resolve_run_root",
     "verify_evidence_pack",
+    "resolve_sim_eval_bin",
     "find_sim_eval_bin",
     "PhaseABResult",
     "PhaseABManifest",
