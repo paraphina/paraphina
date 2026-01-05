@@ -1,0 +1,42 @@
+# Scenario Library v1: funding_inversion
+# Gradual funding drift (+0.5 bps/step)
+# Generated deterministically by batch_runs.phase_a.scenario_library_v1 v1.0.0
+
+scenario_id: slib_v1_fund_drift
+scenario_version: 1
+
+engine: rl_sim_env
+
+horizon:
+  steps: 1500
+  dt_seconds: 0.25
+
+rng:
+  base_seed: 4001
+  num_seeds: 3
+
+initial_state:
+  risk_profile: balanced
+  init_q_tao: 0.0
+
+market_model:
+  type: synthetic
+  synthetic:
+    process: gbm
+    params:
+      vol: 0.012000
+      drift: 0.0
+
+microstructure_model:
+  fees_bps_maker: 0.0
+  fees_bps_taker: 0.5
+  latency_ms: 3.0
+
+# Funding inversion: gradual drift
+funding_drift:
+  drift_bps_per_step: 0.5
+  start_step: 200
+
+invariants:
+  expect_kill_switch: allowed
+  pnl_linearity_check: disabled

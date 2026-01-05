@@ -275,6 +275,45 @@ Breaking this contract breaks `batch_runs/ts_metrics.py` and `tools/research_tic
 
 ---
 
+## Scenario Library v1 (CI-verified, deterministic)
+
+> **Implementation References:** `batch_runs/phase_a/scenario_library_v1.py`
+
+The Scenario Library v1 provides a canonical, reproducible set of stress scenarios for CI testing and regression verification. All scenarios are deterministically generated with stable filenames and SHA-256 manifest verification.
+
+**Scope (10 scenarios across 5 categories):**
+- **Vol regime (3):** low/medium/high volatility environments
+- **Liquidity shock (2):** spread widening + depth thinning
+- **Venue outage (1):** venue disabled for configurable window
+- **Funding inversion (2):** sign flip + gradual drift
+- **Basis spike (2):** positive + negative mid divergence
+
+**Usage:**
+```bash
+# Verify manifest integrity
+python3 -m batch_runs.phase_a.scenario_library_v1 check
+
+# Run smoke suite (CI-friendly subset of 5 scenarios)
+python3 -m batch_runs.phase_a.scenario_library_v1 smoke --seed 12345 --out-dir runs/ci/scenario_library_smoke
+
+# Regenerate library (produces identical output)
+python3 -m batch_runs.phase_a.scenario_library_v1 generate
+```
+
+**Implemented:**
+- Generator: `batch_runs/phase_a/scenario_library_v1.py::generate_library()`
+- Manifest check: `batch_runs/phase_a/scenario_library_v1.py::check_manifest()`
+- Smoke runner: `batch_runs/phase_a/scenario_library_v1.py::run_smoke()`
+- Scenario files: `scenarios/v1/scenario_library_v1/*.yaml`
+- Manifest: `scenarios/v1/scenario_library_v1/manifest_sha256.json`
+- Smoke suite: `scenarios/suites/scenario_library_smoke_v1.yaml`
+- CI workflow: `.github/workflows/scenario_library_smoke.yml`
+
+**Remaining (v2):**
+- Latency / partial fill / cancel storm modelling
+
+---
+
 ## Known drift (canonical spec vs current implementation)
 
 These are the highest-impact mismatches currently observed in the repo wiring and tools:
@@ -330,6 +369,7 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | RL-2: BC baseline | Implemented | Action encoding, trajectory collection, Python BC training scripts |
 | Evidence Pack v1 | Implemented (Step 6) | Audit-grade provenance for sim_eval outputs; see `docs/EVIDENCE_PACK.md` |
 | Evidence Pack Verifier + CI Gate | Implemented (Step 7) | Strict verifier CLI + CI gate verifies extracted bundles |
+| Scenario Library v1 | Implemented (Partial) | 10 scenarios, 5 categories; manifest-verified; CI smoke suite; v2 planned for latency/fill modelling |
 | Production I/O | Planned | Current focus is deterministic sim + telemetry |
 
 ### Milestone E: Cross-venue Exit Allocator (Section 12)

@@ -1,0 +1,93 @@
+name: scenario-library-smoke
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  scenario-library-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run unicode controls check
+        run: python3 tools/check_unicode_controls.py
+
+      - name: Run docs integrity check
+        run: python3 tools/check_docs_integrity.py
+
+      - name: Run Python unit tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_*.py' -q
+
+      - name: Cargo test
+        run: cargo test -q
+
+      - name: Build release binaries
+        run: cargo build --release -p paraphina --bin sim_eval
+
+      - name: Run scenario library manifest check
+        run: |
+          set -euo pipefail
+          echo "Checking scenario library manifest integrity..."
+          python3 -m batch_runs.phase_a.scenario_library_v1 check
+
+      - name: Run scenario library smoke suite
+        run: |
+          set -euo pipefail
+          rm -rf runs/ci/scenario_library_smoke
+          python3 -m batch_runs.phase_a.scenario_library_v1 smoke \
+            --seed 12345 \
+            --out-dir runs/ci/scenario_library_smoke
+        env:
+          PARAPHINA_RNG_SEED: "12345"
+
+      - name: Verify smoke run artifacts
+        run: |
+          set -euo pipefail
+          echo "Checking smoke run artifacts..."
+          
+          if [ ! -f runs/ci/scenario_library_smoke/smoke_run_summary.json ]; then
+            echo "ERROR: smoke_run_summary.json not found"
+            exit 1
+          fi
+          
+          python3 - <<'EOF'
+          import json
+          import sys
+          from pathlib import Path
+          
+          summary_path = Path("runs/ci/scenario_library_smoke/smoke_run_summary.json")
+          with open(summary_path) as f:
+              summary = json.load(f)
+          
+          if not summary.get("success"):
+              print("ERROR: Smoke run did not report success")
+              sys.exit(1)
+          
+          print(f"Smoke run completed successfully")
+          print(f"  Seed: {summary.get('seed')}")
+          print(f"  Output dir: {summary.get('output_dir')}")
+          print(f"  Timestamp: {summary.get('timestamp_utc')}")
+          EOF
+
+      - name: Upload smoke run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-library-smoke-artifacts
+          path: |
+            runs/ci/scenario_library_smoke/**
+            scenarios/v1/scenario_library_v1/manifest_sha256.json
+

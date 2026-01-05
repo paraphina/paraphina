@@ -1,0 +1,40 @@
+# Scenario Library v1: liquidity_shock
+# Spread widening shock (+50 bps)
+# Generated deterministically by batch_runs.phase_a.scenario_library_v1 v1.0.0
+
+scenario_id: slib_v1_liq_spread
+scenario_version: 1
+
+engine: rl_sim_env
+
+horizon:
+  steps: 1500
+  dt_seconds: 0.25
+
+rng:
+  base_seed: 2000
+  num_seeds: 3
+
+initial_state:
+  risk_profile: conservative
+  init_q_tao: 10.0
+
+market_model:
+  type: synthetic
+  synthetic:
+    process: gbm
+    params:
+      vol: 0.018000
+      drift: 0.0
+
+microstructure_model:
+  fees_bps_maker: 0.0
+  fees_bps_taker: 1.5
+  latency_ms: 10.0
+
+# Liquidity shock: spread widening
+spread_shock_bps: 50.0
+
+invariants:
+  expect_kill_switch: allowed
+  pnl_linearity_check: disabled

@@ -1,0 +1,39 @@
+# Scenario Library v1: vol_regime
+# High volatility regime (sigma=0.035)
+# Generated deterministically by batch_runs.phase_a.scenario_library_v1 v1.0.0
+
+scenario_id: slib_v1_vol_high
+scenario_version: 1
+
+engine: rl_sim_env
+
+horizon:
+  steps: 1500
+  dt_seconds: 0.25
+
+rng:
+  base_seed: 1002
+  num_seeds: 3
+
+initial_state:
+  risk_profile: balanced
+  init_q_tao: 0.0
+
+market_model:
+  type: synthetic
+  synthetic:
+    process: jump_diffusion_stub
+    params:
+      vol: 0.035000
+      drift: 0.0
+      jump_intensity: 0.000300
+      jump_sigma: 0.0200
+
+microstructure_model:
+  fees_bps_maker: 0.0
+  fees_bps_taker: 1.0
+  latency_ms: 5.0
+
+invariants:
+  expect_kill_switch: allowed
+  pnl_linearity_check: disabled
