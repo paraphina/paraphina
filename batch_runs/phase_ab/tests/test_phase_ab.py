@@ -713,19 +713,19 @@ class TestCIExitCodeSemantics(unittest.TestCase):
         self.assertEqual(ci_exit_code_for_decision("error", "smoke"), 3)
     
     def test_ci_exit_code_strict_mode_promote_returns_0(self):
-        """PROMOTE returns 0 in strict mode."""
+        """PROMOTE returns 0 in strict mode (PASS)."""
         from batch_runs.phase_ab.cli import ci_exit_code_for_decision
         self.assertEqual(ci_exit_code_for_decision("PROMOTE", "strict"), 0)
     
-    def test_ci_exit_code_strict_mode_hold_returns_1(self):
-        """HOLD returns 1 in strict mode (CI fail - promotion required)."""
+    def test_ci_exit_code_strict_mode_reject_returns_1(self):
+        """REJECT returns 1 in strict mode (FAIL)."""
         from batch_runs.phase_ab.cli import ci_exit_code_for_decision
-        self.assertEqual(ci_exit_code_for_decision("HOLD", "strict"), 1)
+        self.assertEqual(ci_exit_code_for_decision("REJECT", "strict"), 1)
     
-    def test_ci_exit_code_strict_mode_reject_returns_2(self):
-        """REJECT returns 2 in strict mode."""
+    def test_ci_exit_code_strict_mode_hold_returns_2(self):
+        """HOLD returns 2 in strict mode (insufficient evidence)."""
         from batch_runs.phase_ab.cli import ci_exit_code_for_decision
-        self.assertEqual(ci_exit_code_for_decision("REJECT", "strict"), 2)
+        self.assertEqual(ci_exit_code_for_decision("HOLD", "strict"), 2)
     
     def test_ci_exit_code_default_is_smoke_mode(self):
         """Default CI mode is smoke (HOLD = 0)."""

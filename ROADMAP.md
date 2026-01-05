@@ -647,6 +647,26 @@ This repo evolves in three layers:
     - Writes `PROMOTION_RECORD.json` with full provenance
   - Documentation: `docs/PHASE_A_PROMOTION_PIPELINE.md`
   - Unit tests: `batch_runs/phase_a/tests/test_env_parsing.py`
+- [x] **Phase AB Promotion Gate (Strict Mode)** **IMPLEMENTED**
+  - `batch_runs/phase_ab/cli.py` provides the `gate` command:
+    - Institutional-grade promotion gate with deterministic exit codes
+    - Exit codes: PASS=0, FAIL=1, HOLD=2, ERROR=3 (distinct and auditable)
+    - Mandatory evidence verification (cannot be skipped)
+    - Required seed for reproducibility
+    - Writes all standard outputs: `phase_ab_manifest.json`, `confidence_report.json`, `confidence_report.md`, `evidence_pack/manifest.json`, `phase_ab_summary.json`
+  - CLI: `python3 -m batch_runs.phase_ab.cli gate --out-dir <path> --seed <int> [--auto-generate-phasea | --candidate-run <path>]`
+  - CI workflow: `.github/workflows/phase_ab_promotion_gate.yml`
+    - Manual dispatch (workflow_dispatch) for controlled promotion decisions
+    - Configurable seed and n_bootstrap via workflow inputs
+    - Uploads artifacts: `phase-ab-gate-artifacts`, `phase-ab-gate-evidence-pack`
+    - Writes detailed GitHub Actions job summary
+  - Unit tests: `tests/test_phase_ab_exit_codes.py` (32 tests covering exit code contracts)
+  - Documentation: `docs/PHASE_AB_PIPELINE.md`
+  - **Exit code contract (strict mode):**
+    - 0 = PASS (PROMOTE - candidate is provably better)
+    - 1 = FAIL (REJECT - candidate fails guardrails)
+    - 2 = HOLD (insufficient evidence - needs more data)
+    - 3 = ERROR (runtime/IO/parsing failure)
 
 ### Phase B — World Model (Learned Simulator) on GPUs
 **Goal:** learn a high-fidelity dynamics model from telemetry so RL is sample-efficient.

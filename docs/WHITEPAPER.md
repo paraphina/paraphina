@@ -5715,7 +5715,17 @@ When guardrails pass but promotion criteria fail (CIs overlap), the decision is 
 - **CI-Friendly Smoke**: Deterministic smoke entrypoint (`python3 -m batch_runs.phase_ab.cli smoke`) usable by CI without manual path picking
 - **Canonical Outputs**: Writes `phase_ab_manifest.json` with all metadata, plus Phase B confidence reports
 
-Exit codes follow institutional CI semantics: 0 for PROMOTE/HOLD (pipeline succeeded), 2 for REJECT (guardrail failure), 3 for ERROR (runtime failure). See `docs/PHASE_AB_PIPELINE.md`.
+**Phase AB Promotion Gate (Strict Mode).** The `gate` command (`python3 -m batch_runs.phase_ab.cli gate`) provides an institutional-grade promotion gate with:
+- **Deterministic Exit Codes**: PASS=0, FAIL=1, HOLD=2, ERROR=3 (distinct and auditable)
+- **Mandatory Evidence Verification**: Cannot be skipped; gate fails if verification fails
+- **Required Seed**: Ensures deterministic, reproducible results
+- **GitHub Workflow**: Manual dispatch via `.github/workflows/phase_ab_promotion_gate.yml`
+
+Exit codes follow institutional CI semantics:
+- Smoke mode: 0 for PROMOTE/HOLD (pipeline succeeded), 2 for REJECT, 3 for ERROR
+- Strict/Gate mode: 0=PASS, 1=FAIL, 2=HOLD, 3=ERROR
+
+See `docs/PHASE_AB_PIPELINE.md` for complete documentation.
 
 ------------------------------------------------------------------
 APPENDIX C — RL EVOLUTION PLAN (GPU) AND WHERE IT INTEGRATES

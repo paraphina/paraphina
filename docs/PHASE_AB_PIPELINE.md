@@ -35,12 +35,40 @@ python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea \
     --out-dir runs/ci/phase_ab_smoke --seed 12345
 ```
 
+### Promotion Gate Mode (Strict/Institutional)
+
+```bash
+# Promotion gate with auto-generate (for CI)
+python3 -m batch_runs.phase_ab.cli gate \
+    --auto-generate-phasea \
+    --out-dir runs/ci/phase_ab_gate \
+    --seed 24680 \
+    --n-bootstrap 1000
+
+# Promotion gate with explicit paths
+python3 -m batch_runs.phase_ab.cli gate \
+    --candidate-run runs/phaseA_candidate \
+    --baseline-run runs/phaseA_baseline \
+    --out-dir runs/ci/phase_ab_gate \
+    --seed 24680
+```
+
 ### Verify Evidence Pack
 
 ```bash
 # Verify an evidence pack after download
 python3 -m batch_runs.phase_ab.cli verify-evidence runs/ci/phase_ab_smoke/evidence_pack
 ```
+
+## When to Use Smoke vs Gate
+
+| Mode | Use Case | HOLD Behavior | Exit Codes |
+|------|----------|---------------|------------|
+| **smoke** | CI smoke tests, integration tests, development | HOLD = exit 0 (CI pass) | 0=PASS/HOLD, 2=REJECT, 3=ERROR |
+| **gate** | Production promotion decisions, institutional gates | HOLD = exit 2 (needs more data) | 0=PASS, 1=FAIL, 2=HOLD, 3=ERROR |
+
+- Use **smoke** to verify the pipeline runs correctly without blocking on statistical significance
+- Use **gate** when you require definitive statistical evidence before promotion
 
 ## What Phase AB Does
 
@@ -141,7 +169,7 @@ See [Evidence Pack Manifest](./evidence_pack_manifest.md) for details.
 
 Phase AB uses institutional CI exit code semantics with two modes:
 
-### CI Mode: Smoke (Default)
+### CI Mode: Smoke (Default for `smoke` command)
 
 Used for smoke tests and integration tests where we verify the pipeline runs correctly.
 
@@ -154,30 +182,59 @@ Used for smoke tests and integration tests where we verify the pipeline runs cor
 
 **Key insight:** HOLD is exit code 0 in smoke mode because the pipeline *succeeded*—there's just not enough evidence to promote. This is expected for smoke runs with few trials.
 
-### CI Mode: Strict
+### CI Mode: Strict/Gate (Default for `gate` command)
 
-Used for promotion gates that require definitive superiority.
+Used for promotion gates that require definitive superiority. The `gate` command always uses strict mode.
 
 | Exit Code | Decision | Meaning |
 |-----------|----------|---------|
-| 0 | PROMOTE | Candidate is provably better |
-| 1 | HOLD | Not enough evidence (CI fail in strict mode) |
-| 2 | REJECT | Candidate fails guardrails |
+| 0 | PROMOTE | PASS - Candidate is provably better |
+| 1 | REJECT | FAIL - Candidate fails guardrails |
+| 2 | HOLD | Insufficient evidence - needs more data |
 | 3 | ERROR | Runtime/IO/parsing failure |
+
+**Key difference from smoke mode:**
+- REJECT returns exit code 1 (not 2) - clear FAIL signal
+- HOLD returns exit code 2 (not 0) - requires explicit action (collect more data)
+- Exit codes 0, 1, 2, 3 are distinct and deterministic
 
 ### Choosing CI Mode
 
 ```bash
-# Smoke mode (default): HOLD is CI pass
-python3 -m batch_runs.phase_ab.cli run --ci-mode smoke ...
+# Smoke mode (default for smoke command): HOLD is CI pass
+python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea ...
 
-# Strict mode: Only PROMOTE is CI pass
+# Gate mode (promotion gate with mandatory evidence verification)
+python3 -m batch_runs.phase_ab.cli gate --out-dir ... --seed ...
+
+# Strict mode with run command: HOLD returns exit 2
 python3 -m batch_runs.phase_ab.cli run --ci-mode strict ...
 ```
 
 **When to use each mode:**
-- **Smoke mode**: For CI smoke tests, integration tests, and development validation
-- **Strict mode**: For production promotion gates where you require statistical proof of superiority
+- **smoke**: For CI smoke tests, integration tests, and development validation
+- **gate**: For production promotion gates with mandatory evidence verification
+- **run --ci-mode strict**: For one-off promotion checks without auto-generation
+
+## Evidence Verification in Gate Mode
+
+The `gate` command enforces mandatory evidence verification:
+
+1. Runs Phase AB evaluation in strict mode
+2. Writes outputs to `--out-dir`
+3. Creates evidence pack with SHA-256 hashes
+4. **Immediately verifies** the evidence pack (cannot be skipped)
+5. Returns deterministic exit code
+
+If evidence verification fails, gate returns exit code 3 (ERROR).
+
+```bash
+# Gate command enforces evidence verification automatically
+python3 -m batch_runs.phase_ab.cli gate \
+    --auto-generate-phasea \
+    --out-dir runs/ci/phase_ab_gate \
+    --seed 24680
+```
 
 ## What HOLD Means
 
@@ -206,6 +263,7 @@ python3 -m batch_runs.phase_ab.cli run \
     --n-bootstrap 1000           # Bootstrap samples (default: 1000)
     --seed 42                    # Random seed (default: 42)
     --skip-evidence-verify       # Skip evidence verification
+    --ci-mode smoke|strict       # CI mode (default: smoke)
     --quiet                      # Suppress verbose output
 ```
 
@@ -222,6 +280,31 @@ python3 -m batch_runs.phase_ab.cli smoke \
     --ci-mode smoke|strict       # CI mode (default: smoke)
     --quiet                      # Suppress verbose output
 ```
+
+### `gate` Command
+
+```bash
+python3 -m batch_runs.phase_ab.cli gate \
+    --out-dir <path>             # Required: Output directory
+    --seed <int>                 # Required: Random seed for reproducibility
+    --n-bootstrap 1000           # Bootstrap samples (default: 1000)
+    --candidate-run <path>       # Path to candidate run (required if not auto-generate)
+    --baseline-run <path>        # Path to baseline run (optional)
+    --auto-generate-phasea       # Auto-generate Phase A runs if missing
+    --alpha 0.05                 # Significance level (default: 0.05)
+    --quiet                      # Suppress verbose output
+```
+
+Exit codes (strict mode - deterministic):
+- `0`: PASS (PROMOTE - candidate is provably better)
+- `1`: FAIL (REJECT - candidate fails guardrails)
+- `2`: HOLD (insufficient evidence - needs more data)
+- `3`: ERROR (runtime/IO/parsing failure)
+
+**Note:** The `gate` command:
+- Always uses strict mode (cannot be changed)
+- Mandatory evidence verification (cannot be skipped)
+- Requires `--out-dir` and `--seed` (for determinism)
 
 ### `verify-evidence` Command
 
@@ -316,11 +399,52 @@ Phase AB is designed for CI pipelines:
 2. **Exit codes**: Standard semantics for CI gates
 3. **Artifacts**: All outputs are machine-readable with integrity guarantees
 4. **Smoke mode**: Quick validation without path picking
-5. **Evidence pack**: Verifiable artifact with SHA-256 hashes
+5. **Gate mode**: Institutional-grade promotion with mandatory evidence verification
+6. **Evidence pack**: Verifiable artifact with SHA-256 hashes
 
-### CI Artifact Upload
+### GitHub Workflows
 
-The GitHub Actions workflow uploads the evidence pack as artifact **`phase-ab-evidence-pack`**.
+#### Smoke Workflow (`phase_ab_smoke.yml`)
+
+Runs automatically on PRs and pushes to main. Uses smoke mode (HOLD = exit 0).
+
+```bash
+# Triggered automatically on PR/push
+# Uses --ci-mode smoke (default)
+```
+
+Artifacts:
+- **phase-ab-smoke-artifacts**: JSON/MD outputs
+- **phase-ab-evidence-pack**: Evidence pack with manifest
+
+#### Promotion Gate Workflow (`phase_ab_promotion_gate.yml`)
+
+Manually triggered via GitHub UI. Uses strict/gate mode with deterministic exit codes.
+
+```bash
+# Trigger from GitHub UI: Actions → phase-ab-promotion-gate → Run workflow
+```
+
+**How to run from GitHub UI:**
+1. Go to Actions tab
+2. Select "phase-ab-promotion-gate" workflow
+3. Click "Run workflow"
+4. Optionally configure seed and n_bootstrap
+5. Click "Run workflow" button
+
+**Exit codes:**
+- 0 = PASS (PROMOTE)
+- 1 = FAIL (REJECT)
+- 2 = HOLD (needs more data)
+- 3 = ERROR
+
+Artifacts:
+- **phase-ab-gate-artifacts**: JSON/MD outputs (manifest, confidence reports, summary)
+- **phase-ab-gate-evidence-pack**: Cryptographically verifiable evidence pack
+
+### CI Artifact Upload Examples
+
+#### Smoke mode
 
 ```yaml
 - name: Run PhaseAB smoke with deterministic output
@@ -336,6 +460,35 @@ The GitHub Actions workflow uploads the evidence pack as artifact **`phase-ab-ev
   with:
     name: phase-ab-evidence-pack
     path: runs/ci/phase_ab_smoke
+```
+
+#### Gate mode
+
+```yaml
+- name: Run PhaseAB promotion gate
+  run: |
+    python3 -m batch_runs.phase_ab.cli gate \
+      --auto-generate-phasea \
+      --out-dir runs/ci/phase_ab_gate \
+      --seed 24680 \
+      --n-bootstrap 1000
+
+- name: Upload gate artifacts
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: phase-ab-gate-artifacts
+    path: |
+      runs/ci/phase_ab_gate/phase_ab_manifest.json
+      runs/ci/phase_ab_gate/confidence_report.json
+      runs/ci/phase_ab_gate/confidence_report.md
+
+- name: Upload evidence pack
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: phase-ab-gate-evidence-pack
+    path: runs/ci/phase_ab_gate/evidence_pack
 ```
 
 ### Verifying Downloaded Artifacts
