@@ -604,6 +604,13 @@ class TrialResult:
     # Commands run (for reproducibility)
     commands_run: List[str] = field(default_factory=list)
     
+    # MC backend metadata (for sharded MC integration)
+    mc_backend: str = "direct"  # "direct" or "sharded"
+    mc_shards: int = 1  # Number of shards (1 = direct mode)
+    mc_runs: int = 0  # Total MC runs
+    mc_dir: str = ""  # Relative path to MC output directory
+    mc_scale_manifest: Optional[str] = None  # Relative path to mc_scale_manifest.json (sharded only)
+    
     @property
     def is_valid(self) -> bool:
         """
@@ -699,6 +706,14 @@ class TrialResult:
             "error_message": self.error_message,
             "seed": self.seed,
             "commands_run": self.commands_run,
+            # MC backend metadata
+            "mc_backend": {
+                "backend": self.mc_backend,
+                "shards": self.mc_shards,
+                "runs": self.mc_runs,
+                "dir": self.mc_dir,
+                "scale_manifest": self.mc_scale_manifest,
+            },
         }
 
 
@@ -1734,6 +1749,7 @@ def evaluate_trial(
     adr_config: Optional[ADRConfig] = None,
     alpha: float = 0.05,
     scenario_library_config: Optional[ScenarioLibraryConfig] = None,
+    mc_shards: int = 1,
 ) -> TrialResult:
     """
     Evaluate a single candidate trial.
@@ -1786,9 +1802,56 @@ def evaluate_trial(
     mc_dir = trial_dir / "mc"
     mc_dir.mkdir(exist_ok=True)
     
-    success, metrics, errors = run_monte_carlo(
-        mc_dir, env_overlay, mc_runs, mc_ticks, seed, verbose
-    )
+    # Determine MC backend
+    use_sharded = mc_shards > 1
+    mc_backend_str = "sharded" if use_sharded else "direct"
+    mc_scale_manifest_path: Optional[str] = None
+    
+    if verbose:
+        print(f"    MC backend: {mc_backend_str}" + (f" (shards={mc_shards})" if use_sharded else ""))
+    
+    if use_sharded:
+        # Use mc_scale harness for sharded execution
+        from batch_runs.phase_a.mc_scale import run_mc_scale
+        
+        # Set environment for mc_scale subprocess
+        env_for_subprocess = os.environ.copy()
+        env_for_subprocess.update(env_overlay)
+        
+        # Save current environment and set overlay for subprocess
+        old_env = os.environ.copy()
+        os.environ.update(env_overlay)
+        
+        try:
+            ret = run_mc_scale(
+                out_dir=str(mc_dir),
+                seed=seed,
+                runs=mc_runs,
+                shards=mc_shards,
+                ticks=mc_ticks,
+                quiet=not verbose,
+            )
+            success = (ret == 0)
+        finally:
+            # Restore original environment
+            os.environ.clear()
+            os.environ.update(old_env)
+        
+        if success:
+            # Parse mc_summary.json produced by mc_scale
+            summary_path = mc_dir / "mc_summary.json"
+            metrics = parse_mc_summary(summary_path)
+            errors = [] if metrics else ["Failed to parse mc_summary.json"]
+            success = bool(metrics)
+            mc_scale_manifest_path = str(mc_dir / "mc_scale_manifest.json")
+        else:
+            metrics = {}
+            errors = [f"mc_scale failed with exit code {ret}"]
+    else:
+        # Use direct MC invocation (original behavior)
+        success, metrics, errors = run_monte_carlo(
+            mc_dir, env_overlay, mc_runs, mc_ticks, seed, verbose
+        )
     
     if success:
         mc_mean_pnl = metrics.get("mean_pnl", float("nan"))
@@ -1997,6 +2060,12 @@ def evaluate_trial(
         error_message=error_message,
         seed=seed,
         commands_run=commands_run,
+        # MC backend metadata
+        mc_backend=mc_backend_str,
+        mc_shards=mc_shards,
+        mc_runs=mc_runs,
+        mc_dir=str(mc_dir.relative_to(study_dir)) if mc_dir.is_relative_to(study_dir) else str(mc_dir),
+        mc_scale_manifest=mc_scale_manifest_path,
     )
     
     if verbose:
@@ -2440,6 +2509,7 @@ def run_pipeline(
     adr_config: Optional[ADRConfig] = None,
     phase_b_config: Optional[PhaseBConfig] = None,
     scenario_library_config: Optional[ScenarioLibraryConfig] = None,
+    mc_shards: int = 1,
 ) -> Tuple[List[TrialResult], List[TrialResult], Dict[str, Optional[Tuple[Path, Path]]]]:
     """
     Run the complete promotion pipeline.
@@ -2453,7 +2523,8 @@ def run_pipeline(
     print(f"  Study: {study_name}")
     print(f"  Directory: {study_dir}")
     print(f"  Trials: {trials}")
-    print(f"  MC runs: {mc_runs}, ticks: {mc_ticks}")
+    mc_backend_label = "sharded" if mc_shards > 1 else "direct"
+    print(f"  MC runs: {mc_runs}, ticks: {mc_ticks}, backend: {mc_backend_label}" + (f" (shards={mc_shards})" if mc_shards > 1 else ""))
     print(f"  Seed: {seed}")
     print(f"  Smoke mode: {smoke}")
     
@@ -2557,6 +2628,7 @@ def run_pipeline(
             adr_config=adr_config,
             alpha=budgets.alpha,
             scenario_library_config=scenario_library_config,
+            mc_shards=mc_shards,
         )
         results.append(result)
     
@@ -2730,6 +2802,13 @@ ADR Outputs (when --adr-enable):
         type=int,
         default=600,
         help="Ticks per Monte Carlo run (default: 600)",
+    )
+    
+    parser.add_argument(
+        "--mc-shards",
+        type=int,
+        default=1,
+        help="Number of MC shards (1 = direct mode, >1 = sharded via mc_scale; default: 1)",
     )
     
     parser.add_argument(
@@ -2944,6 +3023,15 @@ ADR Outputs (when --adr-enable):
             baseline_run_dir=Path(args.phase_b_baseline) if args.phase_b_baseline else None,
         )
     
+    # Validate and set mc_shards
+    mc_shards = args.mc_shards
+    if mc_shards < 1:
+        print(f"ERROR: --mc-shards must be >= 1, got {mc_shards}", file=sys.stderr)
+        return 1
+    if mc_shards > mc_runs:
+        print(f"ERROR: --mc-shards ({mc_shards}) cannot exceed --mc-runs ({mc_runs})", file=sys.stderr)
+        return 1
+    
     # Build Scenario Library config (ENABLED BY DEFAULT)
     scenario_library_config = ScenarioLibraryConfig(
         enabled=not args.skip_scenario_library,
@@ -2976,6 +3064,7 @@ ADR Outputs (when --adr-enable):
             adr_config=adr_config,
             phase_b_config=phase_b_config,
             scenario_library_config=scenario_library_config,
+            mc_shards=mc_shards,
         )
     except Exception as e:
         print(f"\nERROR: Pipeline failed: {e}", file=sys.stderr)

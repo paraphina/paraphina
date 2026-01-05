@@ -430,6 +430,114 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
 
 
 # =============================================================================
+# Programmatic API for pipeline integration
+# =============================================================================
+
+def run_mc_scale(
+    out_dir: str,
+    seed: int,
+    runs: int,
+    shards: int,
+    ticks: int,
+    monte_carlo_bin: Optional[str] = None,
+    sim_eval_bin: Optional[str] = None,
+    quiet: bool = True,
+) -> int:
+    """
+    Run the full mc_scale pipeline programmatically.
+    
+    This function is designed to be called from promote_pipeline.py
+    to run sharded Monte Carlo within a trial's MC directory.
+    
+    Args:
+        out_dir: Output directory for mc_scale outputs
+        seed: Base seed for Monte Carlo runs
+        runs: Total number of Monte Carlo runs
+        shards: Number of shards to split runs into
+        ticks: Number of ticks per run
+        monte_carlo_bin: Optional path to monte_carlo binary (auto-detected if None)
+        sim_eval_bin: Optional path to sim_eval binary (auto-detected if None)
+        quiet: If True, suppress output (default: True for pipeline integration)
+    
+    Returns:
+        0 on success, non-zero on failure
+    
+    Outputs written to out_dir:
+        - mc_scale_plan.json: Plan with shard ranges
+        - shards/shard_N/mc_runs.jsonl: Per-shard JSONL files
+        - mc_runs.jsonl: Aggregated JSONL
+        - mc_summary.json: Summary produced by monte_carlo summarize
+        - mc_scale_manifest.json: Manifest with hashes
+        - evidence_pack/: Evidence pack directory
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    
+    # Step 1: Plan
+    if not quiet:
+        print(f"mc_scale: planning {runs} runs across {shards} shards")
+    
+    plan_args = argparse.Namespace(
+        out_dir=str(out_path),
+        seed=seed,
+        runs=runs,
+        shards=shards,
+        ticks=ticks,
+    )
+    
+    # Suppress plan output in quiet mode
+    import io
+    import contextlib
+    
+    if quiet:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ret = cmd_plan(plan_args)
+    else:
+        ret = cmd_plan(plan_args)
+    
+    if ret != 0:
+        return ret
+    
+    # Step 2: Run all shards
+    plan_path = out_path / "mc_scale_plan.json"
+    with open(plan_path) as f:
+        plan = json.load(f)
+    
+    actual_shards = len(plan["shard_ranges"])
+    for i in range(actual_shards):
+        if not quiet:
+            print(f"mc_scale: running shard {i+1}/{actual_shards}")
+        
+        shard_args = argparse.Namespace(
+            plan=str(plan_path),
+            shard_index=i,
+        )
+        
+        if quiet:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ret = cmd_run_shard(shard_args)
+        else:
+            ret = cmd_run_shard(shard_args)
+        
+        if ret != 0:
+            return ret
+    
+    # Step 3: Aggregate
+    if not quiet:
+        print("mc_scale: aggregating results")
+    
+    agg_args = argparse.Namespace(plan=str(plan_path))
+    
+    if quiet:
+        with contextlib.redirect_stdout(io.StringIO()):
+            ret = cmd_aggregate(agg_args)
+    else:
+        ret = cmd_aggregate(agg_args)
+    
+    return ret
+
+
+# =============================================================================
 # Smoke command
 # =============================================================================
 
