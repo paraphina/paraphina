@@ -144,7 +144,7 @@ jobs:
               status_text = "FAIL"
               exit_code = "1"
           elif decision == "HOLD":
-              status_emoji = "⏸️"
+              status_emoji = "⏸"
               status_text = "HOLD"
               exit_code = "2"
           else:

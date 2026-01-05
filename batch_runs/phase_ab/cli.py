@@ -292,7 +292,7 @@ def write_github_step_summary(result: PhaseABResult, ci_mode: str = "smoke") -> 
             status_text = "CI PASS"
             detail = "Pipeline succeeded. HOLD means not enough evidence to prove superiority (expected for smoke tests)."
         else:
-            status_emoji = "⏸️"
+            status_emoji = "⏸"
             status_text = "CI HOLD"
             detail = "Insufficient evidence for promotion. Guardrails passed but confidence intervals overlap. Collect more data."
     elif decision == "REJECT":
@@ -333,7 +333,7 @@ def write_github_step_summary(result: PhaseABResult, ci_mode: str = "smoke") -> 
 | Check | Status |
 |-------|--------|
 | **Guardrails** | {'✅ Passed' if decision in ('PROMOTE', 'HOLD') else '❌ Failed'} |
-| **Promotion Criteria** | {'✅ Passed' if decision == 'PROMOTE' else ('⏸️ Insufficient evidence' if decision == 'HOLD' else '❌ Failed')} |
+| **Promotion Criteria** | {'✅ Passed' if decision == 'PROMOTE' else ('⏸ Insufficient evidence' if decision == 'HOLD' else '❌ Failed')} |
 
 ### Output Files
 

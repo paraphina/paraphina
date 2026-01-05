@@ -338,7 +338,7 @@ jobs:
 
           # Exit 1 = kill switch triggered, note but continue
           if [[ "${REPORT_EXIT}" -eq 1 ]]; then
-            echo "⚠️ Kill switch triggered in one or more runs (reports generated)"
+            echo "⚠ Kill switch triggered in one or more runs (reports generated)"
           fi
 
       # =========================================================================
@@ -374,7 +374,7 @@ jobs:
           if [[ -f "${REPORT_DIR}/research_report.md" ]]; then
             cat "${REPORT_DIR}/research_report.md" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "⚠️ No research report generated" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠ No research report generated" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # =========================================================================

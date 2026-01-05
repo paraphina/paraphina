@@ -104,7 +104,7 @@ The golden vectors cover critical edge cases:
 
 ### Updating Golden Vectors
 
-**⚠️ WARNING: Only update golden vectors when behavior changes are intentional!**
+**⚠ WARNING: Only update golden vectors when behavior changes are intentional!**
 
 To update golden vectors:
 

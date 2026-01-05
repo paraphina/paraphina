@@ -241,7 +241,7 @@ python3 -m batch_runs.phase_ab.cli gate \
 A **HOLD** decision indicates:
 
 1. ✅ All guardrails passed (candidate not provably worse)
-2. ⚠️ Promotion criteria failed (confidence intervals overlap)
+2. ⚠ Promotion criteria failed (confidence intervals overlap)
 3. 📊 More data needed to prove superiority
 
 **HOLD is normal for smoke runs.** With 3-10 trials, confidence intervals are wide and rarely achieve the statistical significance needed for PROMOTE.

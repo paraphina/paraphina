@@ -205,6 +205,57 @@ The STATUS marker values don't match between files. Either:
 
 ---
 
+## Forbidden Unicode Characters
+
+The repository enforces a strict ban on hidden and bidirectional Unicode characters to prevent
+Trojan-Source style attacks and eliminate GitHub's "hidden or bidirectional Unicode text" warnings.
+
+### Why These Characters Are Forbidden
+
+**Trojan Source attacks** exploit Unicode's bidirectional text features to make code appear
+different to humans than to compilers. A malicious actor can insert invisible characters that
+reverse text direction, causing code reviewers to see benign logic while the compiler executes
+malicious code.
+
+**Hidden/zero-width characters** can introduce invisible differences between identifiers,
+allowing attackers to define look-alike variables or functions that behave differently.
+
+GitHub flags files containing these characters with a warning banner, indicating potential
+security risks in code review.
+
+### Forbidden Character Categories
+
+| Category | Codepoints | Examples |
+|----------|------------|----------|
+| Bidirectional controls | U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069 | RLO, LRO, RLI |
+| Zero-width/format | U+200B, U+200C, U+200D, U+2060, U+FEFF, U+00AD, U+034F, U+180E | ZWSP, ZWJ, BOM, SOFT HYPHEN |
+| Variation selectors | U+FE00–U+FE0F, U+E0100–U+E01EF | VS1–VS16, VS17–VS256 |
+| ASCII controls | 0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F, 0x7F | NUL, BELL, ESC, DEL |
+
+**Allowed:** Tab (0x09), Line Feed (0x0A), Carriage Return (0x0D), and all standard printable
+Unicode (including emoji, CJK, accented characters, em dashes, etc.).
+
+### How to Remediate
+
+**Scan for violations:**
+
+```bash
+python3 tools/check_unicode_controls.py
+```
+
+This prints each violation with file path, line:column, codepoint, Unicode name, and context.
+
+**Auto-fix all violations:**
+
+```bash
+python3 tools/check_unicode_controls.py --fix
+```
+
+This removes forbidden characters in-place and reports which files were modified.
+Re-run without `--fix` to verify the fix succeeded.
+
+---
+
 ## Design Rationale
 
 This gate exists to:
