@@ -227,6 +227,7 @@ MM quotes are computed per venue based on:
 ---
 
 ## Hedging (current implementation)
+<!-- STATUS: MILESTONE_F = COMPLETE -->
 
 > **Implementation References:** See EVIDENCE_PACK.md §4 (Hedge allocator)
 
@@ -323,7 +324,7 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | Risk regimes | Implemented | Normal/Warning/HardLimit (Critical) |
 | Kill switch | Implemented (latching) | Milestone C: triggers on any hard breach, latches until reset |
 | MM quoting | Implemented | Stops on kill_switch OR HardLimit (Milestone C) |
-| Hedging | Partial | Cost model is simplified vs canonical; stops on kill_switch |
+| Hedging | Implemented (Milestone F) | Full allocator with margin constraints, multi-chunk allocation; stops on kill_switch |
 | Cross-venue exits | Implemented (Milestone E) | Full allocator with net edge, basis/funding, fragmentation; lot size + min notional enforcement |
 | RL-1: Gym-style env | Implemented | SimEnv/VecEnv with Python bindings via paraphina_env crate |
 | RL-2: BC baseline | Implemented | Action encoding, trajectory collection, Python BC training scripts |
@@ -630,6 +631,7 @@ cargo run -p paraphina --bin sim_eval -- verify-evidence-tree runs
 ---
 
 ## Phase A: Adversarial Search and Promotion Pipeline
+<!-- STATUS: CEM = IMPLEMENTED -->
 
 This section specifies the Phase A two-stage procedure for discovering adversarial failure scenarios and promoting verified candidates to stable regression suites.
 

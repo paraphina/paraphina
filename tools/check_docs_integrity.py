@@ -6,11 +6,12 @@ This tool provides institutional-grade enforcement of documentation integrity:
 1. Validates "Implemented:" references in docs/WHITEPAPER.md point to real files
    (and optionally validates referenced symbols exist via substring check).
 2. Locks the canonical spec appendix (Part II) behind a committed SHA256 baseline.
+3. Validates STATUS marker alignment between ROADMAP.md and WHITEPAPER.md Part I.
 
 Exit codes:
     0 - OK: all checks passed
     1 - Internal error (script bug, I/O error, etc.)
-    2 - Integrity violation (missing file, missing symbol, hash mismatch)
+    2 - Integrity violation (missing file, missing symbol, hash mismatch, status mismatch)
 
 Usage:
     python3 tools/check_docs_integrity.py
@@ -26,8 +27,15 @@ from typing import NamedTuple
 
 # Constants
 WHITEPAPER_PATH = Path("docs/WHITEPAPER.md")
+ROADMAP_PATH = Path("ROADMAP.md")
 BASELINE_HASH_PATH = Path("docs/CANONICAL_SPEC_V1_SHA256.txt")
 CANONICAL_MARKER = "<!-- CANONICAL_SPEC_V1_BEGIN -->"
+
+# Required STATUS markers that must be present and matching in both files
+REQUIRED_STATUS_KEYS = {"MILESTONE_F", "CEM"}
+
+# Regex for STATUS markers: <!-- STATUS: KEY = VALUE -->
+STATUS_MARKER_PATTERN = re.compile(r"<!--\s*STATUS:\s*(\w+)\s*=\s*(\w+)\s*-->")
 
 # Known file extensions for path detection
 KNOWN_EXTENSIONS = {".rs", ".py", ".md", ".yml", ".yaml", ".toml"}
@@ -244,6 +252,96 @@ def check_canonical_hash(
     return (True, "canonical hash OK", 0)
 
 
+def extract_status_markers(content: str, stop_at_marker: str | None = None) -> dict[str, tuple[int, str]]:
+    """
+    Extract STATUS markers from content.
+    
+    If stop_at_marker is provided, only scan content before that marker.
+    
+    Returns dict mapping key -> (line_number, value).
+    """
+    # If stop_at_marker specified, only scan content before it
+    if stop_at_marker:
+        marker_pos = content.find(stop_at_marker)
+        if marker_pos != -1:
+            content = content[:marker_pos]
+    
+    markers: dict[str, tuple[int, str]] = {}
+    lines = content.split('\n')
+    
+    for line_num, line in enumerate(lines, start=1):
+        match = STATUS_MARKER_PATTERN.search(line)
+        if match:
+            key = match.group(1).upper()
+            value = match.group(2).upper()
+            markers[key] = (line_num, value)
+    
+    return markers
+
+
+def validate_status_alignment(
+    roadmap_content: str,
+    whitepaper_content: str,
+    repo_root: Path,
+) -> list[RefError]:
+    """
+    Validate that required STATUS markers are present and match between files.
+    
+    - ROADMAP.md is scanned fully.
+    - WHITEPAPER.md is only scanned before CANONICAL_MARKER (Part I only).
+    
+    Returns list of errors sorted by (doc_path, line, message).
+    """
+    errors: list[RefError] = []
+    
+    # Extract markers from both files
+    roadmap_markers = extract_status_markers(roadmap_content, stop_at_marker=None)
+    whitepaper_markers = extract_status_markers(whitepaper_content, stop_at_marker=CANONICAL_MARKER)
+    
+    # Check each required key
+    for key in sorted(REQUIRED_STATUS_KEYS):
+        roadmap_entry = roadmap_markers.get(key)
+        whitepaper_entry = whitepaper_markers.get(key)
+        
+        # Check if marker is missing in ROADMAP.md
+        if roadmap_entry is None:
+            errors.append(RefError(
+                doc_path=str(ROADMAP_PATH),
+                line=0,
+                message=f"missing STATUS marker: {key}",
+            ))
+        
+        # Check if marker is missing in WHITEPAPER.md (Part I)
+        if whitepaper_entry is None:
+            errors.append(RefError(
+                doc_path=str(WHITEPAPER_PATH),
+                line=0,
+                message=f"missing STATUS marker: {key}",
+            ))
+        
+        # If both exist, check for mismatch
+        if roadmap_entry is not None and whitepaper_entry is not None:
+            roadmap_line, roadmap_value = roadmap_entry
+            whitepaper_line, whitepaper_value = whitepaper_entry
+            
+            if roadmap_value != whitepaper_value:
+                # Report mismatch on both files (deterministic: ROADMAP first, then WHITEPAPER)
+                errors.append(RefError(
+                    doc_path=str(ROADMAP_PATH),
+                    line=roadmap_line,
+                    message=f"STATUS mismatch for {key}: ROADMAP={roadmap_value} WHITEPAPER={whitepaper_value}",
+                ))
+                errors.append(RefError(
+                    doc_path=str(WHITEPAPER_PATH),
+                    line=whitepaper_line,
+                    message=f"STATUS mismatch for {key}: ROADMAP={roadmap_value} WHITEPAPER={whitepaper_value}",
+                ))
+    
+    # Sort errors for deterministic output
+    errors.sort(key=lambda e: (e.doc_path, e.line, e.message))
+    return errors
+
+
 def run_checks(repo_root: Path, update_mode: bool = False) -> int:
     """
     Run all integrity checks.
@@ -251,6 +349,7 @@ def run_checks(repo_root: Path, update_mode: bool = False) -> int:
     Returns exit code: 0=OK, 1=internal error, 2=integrity violation.
     """
     whitepaper_path = repo_root / WHITEPAPER_PATH
+    roadmap_path = repo_root / ROADMAP_PATH
     baseline_path = repo_root / BASELINE_HASH_PATH
     
     # Read whitepaper
@@ -261,6 +360,16 @@ def run_checks(repo_root: Path, update_mode: bool = False) -> int:
         return 1
     except OSError as e:
         print(f"ERROR: Failed to read {WHITEPAPER_PATH}: {e}", file=sys.stderr)
+        return 1
+    
+    # Read roadmap
+    try:
+        roadmap_content = roadmap_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"ERROR: {ROADMAP_PATH} not found", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"ERROR: Failed to read {ROADMAP_PATH}: {e}", file=sys.stderr)
         return 1
     
     errors: list[RefError] = []
@@ -278,17 +387,24 @@ def run_checks(repo_root: Path, update_mode: bool = False) -> int:
     # Check 2: Canonical spec hash
     hash_ok, hash_msg, _ = check_canonical_hash(whitepaper_content, baseline_path, update_mode)
     
+    # Check 3: STATUS marker alignment between ROADMAP.md and WHITEPAPER.md Part I
+    status_errors = validate_status_alignment(roadmap_content, whitepaper_content, repo_root)
+    if status_errors:
+        for err in status_errors:
+            print(f"{err.doc_path}:{err.line} {err.message}")
+        errors.extend(status_errors)
+    
     if update_mode:
         # In update mode, we report the update result
-        if ref_errors:
-            print(f"\nFAILED: {len(ref_errors)} reference error(s) found.")
-            print("Cannot update canonical hash with failing reference checks.")
+        if ref_errors or status_errors:
+            print(f"\nFAILED: {len(ref_errors)} reference error(s), {len(status_errors)} status alignment error(s) found.")
+            print("Cannot update canonical hash with failing checks.")
             return 2
         if not hash_ok:
             print(f"ERROR: {hash_msg}", file=sys.stderr)
             return 1
         print(hash_msg)
-        print(f"OK: docs integrity checks passed ({ref_count} references checked; canonical hash updated).")
+        print(f"OK: docs integrity checks passed ({ref_count} references checked; status alignment OK; canonical hash updated).")
         return 0
     
     # Normal check mode
@@ -299,7 +415,7 @@ def run_checks(repo_root: Path, update_mode: bool = False) -> int:
     if errors:
         return 2
     
-    print(f"OK: docs integrity checks passed ({ref_count} references checked; canonical hash OK).")
+    print(f"OK: docs integrity checks passed ({ref_count} references checked; status alignment OK; canonical hash OK).")
     return 0
 
 

@@ -17,14 +17,17 @@ from pathlib import Path
 from tools.check_docs_integrity import (
     CANONICAL_MARKER,
     KNOWN_EXTENSIONS,
+    REQUIRED_STATUS_KEYS,
     RefError,
     check_canonical_hash,
     compute_canonical_hash,
+    extract_status_markers,
     is_path_like,
     parse_implemented_refs,
     run_checks,
     validate_implemented_refs,
     validate_ref,
+    validate_status_alignment,
 )
 
 
@@ -369,6 +372,14 @@ class TestCheckCanonicalHash(unittest.TestCase):
 class TestRunChecks(unittest.TestCase):
     """Test the full run_checks function with exit code semantics."""
     
+    def _create_roadmap(self, repo_root: Path) -> None:
+        """Helper to create a valid ROADMAP.md with required status markers."""
+        roadmap = """# ROADMAP
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        (repo_root / "ROADMAP.md").write_text(roadmap)
+    
     def test_all_pass_returns_0(self):
         """Should return 0 when all checks pass."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -379,15 +390,21 @@ class TestRunChecks(unittest.TestCase):
             # Create valid file
             (repo_root / "src/test.rs").write_text("pub fn main() {}")
             
-            # Create whitepaper with valid ref and marker
+            # Create whitepaper with valid ref, status markers, and marker
             whitepaper = f"""# Part I
 - **Implemented: `src/test.rs::main`**
+
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
 
 {CANONICAL_MARKER}
 # Part II
 Canonical content
 """
             (repo_root / "docs/WHITEPAPER.md").write_text(whitepaper)
+            
+            # Create roadmap with matching status markers
+            self._create_roadmap(repo_root)
             
             # Create baseline hash
             expected = hashlib.sha256("# Part II\nCanonical content\n".encode('utf-8')).hexdigest()
@@ -410,11 +427,17 @@ Canonical content
             whitepaper = f"""# Part I
 - **Implemented: `src/missing.rs`**
 
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+
 {CANONICAL_MARKER}
 # Part II
 Canonical content
 """
             (repo_root / "docs/WHITEPAPER.md").write_text(whitepaper)
+            
+            # Create roadmap with matching status markers
+            self._create_roadmap(repo_root)
             
             # Create baseline hash (valid)
             expected = hashlib.sha256("# Part II\nCanonical content\n".encode('utf-8')).hexdigest()
@@ -434,11 +457,17 @@ Canonical content
             
             whitepaper = f"""# Part I
 
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+
 {CANONICAL_MARKER}
 # Part II
 Canonical content
 """
             (repo_root / "docs/WHITEPAPER.md").write_text(whitepaper)
+            
+            # Create roadmap with matching status markers
+            self._create_roadmap(repo_root)
             
             # Write wrong baseline hash
             (repo_root / "docs/CANONICAL_SPEC_V1_SHA256.txt").write_text("wronghash\n")
@@ -457,11 +486,17 @@ Canonical content
             
             whitepaper = f"""# Part I
 
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+
 {CANONICAL_MARKER}
 # Part II
 Canonical content
 """
             (repo_root / "docs/WHITEPAPER.md").write_text(whitepaper)
+            
+            # Create roadmap with matching status markers
+            self._create_roadmap(repo_root)
             
             # Capture stdout to avoid noisy output during tests
             stdout_capture = io.StringIO()
@@ -487,6 +522,304 @@ class TestRefErrorNamedTuple(unittest.TestCase):
         self.assertEqual(err.doc_path, "docs/WHITEPAPER.md")
         self.assertEqual(err.line, 42)
         self.assertEqual(err.message, "missing file: src/test.rs")
+
+
+class TestExtractStatusMarkers(unittest.TestCase):
+    """Test extraction of STATUS markers from content."""
+    
+    def test_extract_single_marker(self):
+        """Should extract a single STATUS marker."""
+        content = "# Test\n<!-- STATUS: MILESTONE_F = COMPLETE -->\nMore text"
+        markers = extract_status_markers(content)
+        
+        self.assertEqual(len(markers), 1)
+        self.assertIn("MILESTONE_F", markers)
+        self.assertEqual(markers["MILESTONE_F"], (2, "COMPLETE"))
+    
+    def test_extract_multiple_markers(self):
+        """Should extract multiple STATUS markers."""
+        content = """# Test
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+Some text
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        markers = extract_status_markers(content)
+        
+        self.assertEqual(len(markers), 2)
+        self.assertEqual(markers["MILESTONE_F"], (2, "COMPLETE"))
+        self.assertEqual(markers["CEM"], (4, "IMPLEMENTED"))
+    
+    def test_case_insensitive_key_normalization(self):
+        """Keys should be normalized to uppercase."""
+        content = "<!-- STATUS: milestone_f = complete -->"
+        markers = extract_status_markers(content)
+        
+        self.assertIn("MILESTONE_F", markers)
+        self.assertEqual(markers["MILESTONE_F"][1], "COMPLETE")
+    
+    def test_stop_at_marker(self):
+        """Should only extract markers before stop_at_marker."""
+        content = f"""# Part I
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+{CANONICAL_MARKER}
+# Part II
+<!-- STATUS: CEM = PARTIAL -->
+"""
+        markers = extract_status_markers(content, stop_at_marker=CANONICAL_MARKER)
+        
+        # Should only find MILESTONE_F, not CEM (which is after marker)
+        self.assertEqual(len(markers), 1)
+        self.assertIn("MILESTONE_F", markers)
+        self.assertNotIn("CEM", markers)
+    
+    def test_no_markers_returns_empty_dict(self):
+        """Content without markers should return empty dict."""
+        content = "# Test\nNo markers here"
+        markers = extract_status_markers(content)
+        
+        self.assertEqual(len(markers), 0)
+    
+    def test_whitespace_tolerance(self):
+        """Should handle various whitespace in markers."""
+        content = "<!--  STATUS:  KEY  =  VALUE  -->"
+        markers = extract_status_markers(content)
+        
+        self.assertIn("KEY", markers)
+        self.assertEqual(markers["KEY"][1], "VALUE")
+
+
+class TestValidateStatusAlignment(unittest.TestCase):
+    """Test STATUS marker alignment validation between ROADMAP and WHITEPAPER."""
+    
+    def test_matching_markers_pass(self):
+        """Should pass when markers match in both files."""
+        roadmap = """# ROADMAP
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        whitepaper = f"""# WHITEPAPER Part I
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+{CANONICAL_MARKER}
+# Part II
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            errors = validate_status_alignment(roadmap, whitepaper, repo_root)
+            self.assertEqual(len(errors), 0)
+    
+    def test_missing_marker_in_roadmap_fails(self):
+        """Should fail when a required marker is missing in ROADMAP."""
+        roadmap = """# ROADMAP
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        whitepaper = f"""# WHITEPAPER Part I
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+{CANONICAL_MARKER}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            errors = validate_status_alignment(roadmap, whitepaper, repo_root)
+            
+            self.assertGreater(len(errors), 0)
+            # Find the missing marker error for ROADMAP
+            roadmap_errors = [e for e in errors if "ROADMAP" in e.doc_path and "missing" in e.message]
+            self.assertGreater(len(roadmap_errors), 0)
+            self.assertIn("MILESTONE_F", roadmap_errors[0].message)
+    
+    def test_missing_marker_in_whitepaper_fails(self):
+        """Should fail when a required marker is missing in WHITEPAPER Part I."""
+        roadmap = """# ROADMAP
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        whitepaper = f"""# WHITEPAPER Part I
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+{CANONICAL_MARKER}
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            errors = validate_status_alignment(roadmap, whitepaper, repo_root)
+            
+            self.assertGreater(len(errors), 0)
+            # Should report missing CEM in WHITEPAPER (it's after canonical marker)
+            whitepaper_errors = [e for e in errors if "WHITEPAPER" in e.doc_path and "missing" in e.message]
+            self.assertGreater(len(whitepaper_errors), 0)
+            self.assertIn("CEM", whitepaper_errors[0].message)
+    
+    def test_mismatched_values_fail(self):
+        """Should fail when marker values don't match, with both values in message."""
+        roadmap = """# ROADMAP
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        whitepaper = f"""# WHITEPAPER Part I
+<!-- STATUS: MILESTONE_F = PARTIAL -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+{CANONICAL_MARKER}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            errors = validate_status_alignment(roadmap, whitepaper, repo_root)
+            
+            # Should have mismatch errors for MILESTONE_F
+            mismatch_errors = [e for e in errors if "mismatch" in e.message.lower()]
+            self.assertGreater(len(mismatch_errors), 0)
+            
+            # Message should include both values
+            for err in mismatch_errors:
+                self.assertIn("COMPLETE", err.message)
+                self.assertIn("PARTIAL", err.message)
+    
+    def test_case_insensitive_value_match(self):
+        """Values should be compared case-insensitively."""
+        roadmap = """# ROADMAP
+<!-- STATUS: MILESTONE_F = complete -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        whitepaper = f"""# WHITEPAPER Part I
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = implemented -->
+{CANONICAL_MARKER}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            errors = validate_status_alignment(roadmap, whitepaper, repo_root)
+            self.assertEqual(len(errors), 0)
+    
+    def test_errors_sorted_deterministically(self):
+        """Errors should be sorted by (doc_path, line, message)."""
+        roadmap = """# ROADMAP
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+        whitepaper = f"""# WHITEPAPER Part I
+{CANONICAL_MARKER}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            errors = validate_status_alignment(roadmap, whitepaper, repo_root)
+            
+            # Should have multiple errors (missing MILESTONE_F in both, missing CEM in whitepaper)
+            self.assertGreater(len(errors), 0)
+            
+            # Verify deterministic sorting
+            doc_paths = [e.doc_path for e in errors]
+            self.assertEqual(doc_paths, sorted(doc_paths))
+
+
+class TestRunChecksWithStatusAlignment(unittest.TestCase):
+    """Test the full run_checks function with STATUS alignment."""
+    
+    def test_all_pass_with_status_markers(self):
+        """Should return 0 when all checks pass including status alignment."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "docs").mkdir()
+            (repo_root / "src").mkdir()
+            
+            # Create valid file
+            (repo_root / "src/test.rs").write_text("pub fn main() {}")
+            
+            # Create whitepaper with valid ref, status markers, and canonical marker
+            whitepaper = f"""# Part I
+- **Implemented: `src/test.rs::main`**
+
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+
+{CANONICAL_MARKER}
+# Part II
+Canonical content
+"""
+            (repo_root / "docs/WHITEPAPER.md").write_text(whitepaper)
+            
+            # Create roadmap with matching status markers
+            roadmap = """# ROADMAP
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+            (repo_root / "ROADMAP.md").write_text(roadmap)
+            
+            # Create baseline hash
+            expected = hashlib.sha256("# Part II\nCanonical content\n".encode('utf-8')).hexdigest()
+            (repo_root / "docs/CANONICAL_SPEC_V1_SHA256.txt").write_text(expected + "\n")
+            
+            # Capture stdout to avoid noisy output during tests
+            stdout_capture = io.StringIO()
+            with contextlib.redirect_stdout(stdout_capture):
+                exit_code = run_checks(repo_root, update_mode=False)
+            self.assertEqual(exit_code, 0)
+    
+    def test_status_mismatch_returns_2(self):
+        """Should return 2 for integrity violation (status mismatch)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "docs").mkdir()
+            
+            # Create whitepaper with status markers
+            whitepaper = f"""# Part I
+
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+
+{CANONICAL_MARKER}
+# Part II
+Canonical content
+"""
+            (repo_root / "docs/WHITEPAPER.md").write_text(whitepaper)
+            
+            # Create roadmap with MISMATCHED status markers
+            roadmap = """# ROADMAP
+<!-- STATUS: MILESTONE_F = PARTIAL -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+            (repo_root / "ROADMAP.md").write_text(roadmap)
+            
+            # Create valid baseline hash
+            expected = hashlib.sha256("# Part II\nCanonical content\n".encode('utf-8')).hexdigest()
+            (repo_root / "docs/CANONICAL_SPEC_V1_SHA256.txt").write_text(expected + "\n")
+            
+            # Capture stdout to avoid noisy output during tests
+            stdout_capture = io.StringIO()
+            with contextlib.redirect_stdout(stdout_capture):
+                exit_code = run_checks(repo_root, update_mode=False)
+            self.assertEqual(exit_code, 2)
+    
+    def test_missing_status_marker_returns_2(self):
+        """Should return 2 for integrity violation (missing status marker)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            (repo_root / "docs").mkdir()
+            
+            # Create whitepaper with only one status marker
+            whitepaper = f"""# Part I
+
+<!-- STATUS: CEM = IMPLEMENTED -->
+
+{CANONICAL_MARKER}
+# Part II
+Canonical content
+"""
+            (repo_root / "docs/WHITEPAPER.md").write_text(whitepaper)
+            
+            # Create roadmap with both markers
+            roadmap = """# ROADMAP
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+<!-- STATUS: CEM = IMPLEMENTED -->
+"""
+            (repo_root / "ROADMAP.md").write_text(roadmap)
+            
+            # Create valid baseline hash
+            expected = hashlib.sha256("# Part II\nCanonical content\n".encode('utf-8')).hexdigest()
+            (repo_root / "docs/CANONICAL_SPEC_V1_SHA256.txt").write_text(expected + "\n")
+            
+            # Capture stdout to avoid noisy output during tests
+            stdout_capture = io.StringIO()
+            with contextlib.redirect_stdout(stdout_capture):
+                exit_code = run_checks(repo_root, update_mode=False)
+            self.assertEqual(exit_code, 2)
 
 
 if __name__ == '__main__':
