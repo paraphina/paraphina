@@ -5,15 +5,12 @@ Tests the scanner's ability to detect forbidden Unicode control characters
 (Trojan-Source style attacks) while allowing legitimate Unicode.
 """
 
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-# Add tools directory to path for import
-sys.path.insert(0, str(Path(__file__).parent.parent / 'tools'))
-
-from check_unicode_controls import (
+# Import from tools package (no sys.path manipulation)
+from tools.check_unicode_controls import (
     FORBIDDEN_CODEPOINTS,
     Finding,
     format_line_with_placeholder,

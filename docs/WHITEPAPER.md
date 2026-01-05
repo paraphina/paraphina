@@ -1470,6 +1470,8 @@ flowchart LR
 
 ---
 
+<!-- CANONICAL_SPEC_V1_BEGIN -->
+
 # Part II — Appendix: Canonical v1 target specification (VERBATIM)
 
 Everything below this heading is included exactly as provided (unedited), but **annotated with implementation status markers** in `[STATUS]` blocks at the start of each major section. The original spec text is preserved.

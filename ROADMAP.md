@@ -87,6 +87,7 @@ Deliverables:
 - `docs/WHITEPAPER.md`: Two-part structure with implementation truth (Part I) and canonical spec (Part II)
 - `docs/EVIDENCE_PACK.md`: Hard reference map from WHITEPAPER to code evidence
 - `docs/AI_PLAYBOOK.md`: Development guidelines
+- Docs Integrity Gate (Implemented refs + canonical spec hash lock) — COMPLETE
 
 **Evidence:** See `docs/EVIDENCE_PACK.md` §1 (Core loop), §8 (Research harness)
 
