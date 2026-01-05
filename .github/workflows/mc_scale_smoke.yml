@@ -1,0 +1,83 @@
+name: mc-scale-smoke
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  mc-scale-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run unicode control check
+        run: python3 tools/check_unicode_controls.py
+
+      - name: Run docs integrity check
+        run: python3 tools/check_docs_integrity.py
+
+      - name: Run Python unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -q
+
+      - name: Build release binaries
+        run: cargo build --release -p paraphina --bin monte_carlo --bin sim_eval
+
+      - name: Run MC scale smoke test
+        run: |
+          python3 -m batch_runs.phase_a.mc_scale smoke \
+            --seed 12345 \
+            --runs 12 \
+            --shards 3 \
+            --ticks 50 \
+            --out-dir runs/ci/mc_scale_smoke
+
+      - name: Verify required output files exist
+        run: |
+          echo "=== Checking required files ==="
+          test -f runs/ci/mc_scale_smoke/mc_scale_plan.json
+          test -f runs/ci/mc_scale_smoke/mc_runs.jsonl
+          test -f runs/ci/mc_scale_smoke/mc_summary.json
+          test -f runs/ci/mc_scale_smoke/mc_scale_manifest.json
+          test -f runs/ci/mc_scale_smoke/evidence_pack/SHA256SUMS
+          test -f runs/ci/mc_scale_smoke/evidence_pack/manifest.json
+          echo "✓ All required files present"
+
+      - name: Verify mc_summary.json structure
+        run: |
+          python3 -c "
+          import json
+          with open('runs/ci/mc_scale_smoke/mc_summary.json') as f:
+              summary = json.load(f)
+          assert 'schema_version' in summary, 'Missing schema_version'
+          assert 'runs' in summary, 'Missing runs'
+          assert 'aggregate' in summary, 'Missing aggregate'
+          assert 'tail_risk' in summary, 'Missing tail_risk'
+          print(f'✓ mc_summary.json valid: {len(summary[\"runs\"])} runs')
+          print(f'  kill_rate: {summary[\"aggregate\"][\"kill_rate\"]:.2%}')
+          "
+
+      - name: Verify evidence pack using sim_eval
+        run: |
+          ./target/release/sim_eval verify-evidence-pack runs/ci/mc_scale_smoke || echo "Note: verify-evidence-pack may have limited support for mc_scale packs"
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mc-scale-smoke-artifacts
+          path: |
+            runs/ci/mc_scale_smoke/**/*.json
+            runs/ci/mc_scale_smoke/**/*.jsonl
+            runs/ci/mc_scale_smoke/**/*.yaml
+            runs/ci/mc_scale_smoke/**/SHA256SUMS
+

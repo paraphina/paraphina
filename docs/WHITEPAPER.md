@@ -116,6 +116,22 @@ Where the canonical spec differs from current code, that difference must be trea
 - `batch_runs/orchestrator.py` provides a generic way to run the binary with env overlays and parse stdout.
 - `batch_runs/metrics.py` parses a human-readable end-of-run summary (`Daily PnL ...`, `Kill switch ...`) for older-style experiments.
 
+**Monte Carlo at Scale runner**
+- `batch_runs/phase_a/mc_scale.py` provides deterministic sharded Monte Carlo execution:
+  - `plan`: Generate `mc_scale_plan.json` with shard ranges
+  - `run-shard`: Execute a single shard using the `monte_carlo` binary
+  - `aggregate`: Concatenate shard JSONL files and produce `mc_summary.json`
+  - `smoke`: Run all steps sequentially for CI validation
+- **Implemented: `batch_runs/phase_a/mc_scale.py`** (stdlib only, no third-party deps)
+- `monte_carlo` binary supports:
+  - `--run-start-index` and `--run-count` for sharding
+  - JSONL output (`mc_runs.jsonl`) with per-run metrics
+  - `summarize` mode for aggregating JSONL into `mc_summary.json`
+- **Implemented: `paraphina/src/bin/monte_carlo.rs`**
+- **Seed contract**: `seed_i = base_seed + i` (u64 wrap, deterministic)
+- **CI gate**: `.github/workflows/mc_scale_smoke.yml`
+- **Documentation**: `docs/PHASE_A_MONTE_CARLO_SCALE.md`
+
 ---
 
 ## State and accounting model (current implementation)

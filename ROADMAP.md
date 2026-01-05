@@ -620,9 +620,15 @@ This repo evolves in three layers:
     - Risk-tier budget selection (kill_prob_ci_upper, drawdown_cvar, min_mean_pnl)
     - Promoted config output (env file + promotion record JSON)
   - Usage: `python3 batch_runs/exp_phase_a_pareto_mc.py --smoke`
-- [ ] Monte Carlo runner at scale
-  - generate thousands–millions of scenarios
-  - (foundation exists via monte_carlo binary; need advanced scenario generation)
+- [x] **Monte Carlo runner at scale** **IMPLEMENTED**
+  - Deterministic sharding with `--run-start-index` and `--run-count` flags
+  - JSONL output (`mc_runs.jsonl`) for per-run results
+  - `monte_carlo summarize` mode for aggregating sharded results
+  - `batch_runs/phase_a/mc_scale.py` Python harness with `plan`, `run-shard`, `aggregate`, `smoke` commands
+  - `.github/workflows/mc_scale_smoke.yml` CI gate
+  - Documentation: `docs/PHASE_A_MONTE_CARLO_SCALE.md`
+  - **Seed contract**: `seed_i = base_seed + i` (u64 wrap, deterministic)
+  - Evidence pack verification at shard and aggregate levels
 - [x] **Adversarial / worst-case search** (A2) **IMPLEMENTED**
 <!-- STATUS: CEM = IMPLEMENTED -->
   - `batch_runs/phase_a/adversarial_search_promote.py` provides:

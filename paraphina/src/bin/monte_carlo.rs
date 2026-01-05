@@ -20,13 +20,24 @@
 // Default output directory:
 //   cargo run --bin monte_carlo -- --output-dir runs/demo_step_7_1
 //
+// Sharded Monte Carlo (for scale):
+//   # Run shard 0 of a 10-shard run with 1000 total runs:
+//   cargo run --bin monte_carlo -- --runs 1000 --run-start-index 0 --run-count 100 --seed 42 --output-dir runs/shard_0
+//
+//   # Summarize aggregated JSONL:
+//   cargo run --bin monte_carlo -- summarize --input runs/aggregated/mc_runs.jsonl --out-dir runs/aggregated
+//
+// Deterministic seed mapping contract:
+//   For global run index i, seed_i = base_seed + i (u64 wrapping add).
+//   The Monte Carlo loop iterates global indices [run_start_index, run_start_index + run_count).
+//
 // Notes:
 // - This harness applies intents as immediate fills (no gateway), using venue taker fees.
 //   This keeps the harness dependency-free and deterministic.
 
 use std::env;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use paraphina::config::{resolve_effective_profile, Config, RiskProfile};
@@ -49,8 +60,18 @@ const DEFAULT_JITTER_MS: i64 = 0;
 const DEFAULT_PRINT_EVERY: usize = 1;
 const DEFAULT_OUTPUT_DIR: &str = "runs/demo_step_7_1";
 
+/// Command mode for the monte_carlo binary.
 #[derive(Debug, Clone)]
-struct Args {
+enum Command {
+    /// Default: run Monte Carlo simulation.
+    Run(RunArgs),
+    /// Summarize mode: aggregate JSONL into mc_summary.json.
+    Summarize(SummarizeArgs),
+}
+
+/// Arguments for the `run` command (default Monte Carlo simulation).
+#[derive(Debug, Clone)]
+struct RunArgs {
     runs: usize,
     ticks: usize,
     seed: u64,
@@ -61,26 +82,51 @@ struct Args {
     print_every: usize,
     csv_out: Option<PathBuf>,
     output_dir: PathBuf,
+    /// Start index for sharded runs (default: 0).
+    /// For global run index i, seed_i = seed + i.
+    run_start_index: usize,
+    /// Number of runs to execute in this shard (default: same as --runs).
+    /// The Monte Carlo loop iterates [run_start_index, run_start_index + run_count).
+    run_count: Option<usize>,
 }
 
-impl Args {
+/// Arguments for the `summarize` command.
+#[derive(Debug, Clone)]
+struct SummarizeArgs {
+    /// Path to the input mc_runs.jsonl file.
+    input: PathBuf,
+    /// Output directory for mc_summary.json and evidence pack.
+    out_dir: PathBuf,
+    /// Optional base seed for validation (if not provided, seed contract is not validated).
+    base_seed: Option<u64>,
+}
+
+
+impl RunArgs {
     fn usage() -> &'static str {
         "\
 paraphina Monte Carlo harness (Milestone B)
 
 USAGE:
   cargo run --bin monte_carlo -- [FLAGS]
+  cargo run --bin monte_carlo -- summarize --input <PATH> --out-dir <DIR>
+
+COMMANDS:
+  (default)            Run Monte Carlo simulation
+  summarize            Aggregate JSONL runs into mc_summary.json
 
 PROFILE PRECEDENCE:
   1) --profile overrides environment
   2) else PARAPHINA_RISK_PROFILE
   3) else Balanced
 
-FLAGS:
+RUN FLAGS:
   --profile NAME       Balanced | Conservative | Aggressive (alias: Loose)
-  --runs N             Number of runs (default: 50)
+  --runs N             Total runs in the full Monte Carlo (default: 50)
   --ticks N            Ticks per run (default: 600)
   --seed U64           Base seed (default: 1). Run i uses seed + i.
+  --run-start-index N  Start index for sharded runs (default: 0)
+  --run-count N        Number of runs in this shard (default: --runs)
   --tick-ms MS         Base tick duration in ms (default: 1000)
   --jitter-ms MS       Per-tick jitter added to tick-ms in [-MS, +MS] (default: 0)
   --print-every N      Print every N runs (default: 1). Ignored with --quiet.
@@ -89,16 +135,33 @@ FLAGS:
   --quiet              Suppress per-run lines; only print final summary
   --help               Show this help
 
+SUMMARIZE FLAGS:
+  --input PATH         Path to mc_runs.jsonl (required)
+  --out-dir DIR        Output directory (required)
+  --base-seed U64      Base seed for validation (optional)
+
 OUTPUT:
   The harness writes to <output-dir>/:
     - mc_summary.json     Per-run statistics and aggregate summary
+    - mc_runs.jsonl       JSONL of per-run metrics (always written)
     - mc_runs.csv         CSV of per-run metrics (if --csv specified)
     - monte_carlo.yaml    Configuration used for this run
     - evidence_pack/      Evidence Pack v1 for verification
 
+DETERMINISTIC SEED CONTRACT:
+  For global run index i, the scenario seed is: seed_i = base_seed + i (u64 wrap).
+  The Monte Carlo loop iterates global indices [run_start_index, run_start_index + run_count).
+
 EXAMPLES:
+  # Standard run
   cargo run --bin monte_carlo -- --runs 100 --ticks 1200 --seed 7 --jitter-ms 500 --profile Balanced
-  cargo run --bin monte_carlo -- --output-dir runs/my_experiment --runs 50
+
+  # Sharded run (shard 0 of 10 shards, 1000 total runs)
+  cargo run --bin monte_carlo -- --runs 1000 --run-start-index 0 --run-count 100 --seed 42 --output-dir runs/shard_0
+
+  # Summarize aggregated JSONL
+  cargo run --bin monte_carlo -- summarize --input runs/mc_runs.jsonl --out-dir runs/summary
+
   PARAPHINA_RISK_PROFILE=Conservative cargo run --bin monte_carlo -- --runs 200 --ticks 800 --seed 42 --csv mc_runs.csv
 "
     }
@@ -114,7 +177,7 @@ EXAMPLES:
     }
 
     fn parse() -> Result<Self, String> {
-        let mut out = Args {
+        let mut out = RunArgs {
             runs: DEFAULT_RUNS,
             ticks: DEFAULT_TICKS,
             seed: DEFAULT_SEED,
@@ -125,9 +188,11 @@ EXAMPLES:
             print_every: DEFAULT_PRINT_EVERY,
             csv_out: None,
             output_dir: PathBuf::from(DEFAULT_OUTPUT_DIR),
+            run_start_index: 0,
+            run_count: None,
         };
 
-        let mut it = env::args().skip(1);
+        let mut it = env::args().skip(1).peekable();
 
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -176,6 +241,26 @@ EXAMPLES:
                     out.seed = v
                         .parse::<u64>()
                         .map_err(|_| "Invalid --seed (expected u64)".to_string())?;
+                }
+                "--run-start-index" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "Missing value for --run-start-index".to_string())?;
+                    out.run_start_index = v
+                        .parse::<usize>()
+                        .map_err(|_| "Invalid --run-start-index (expected integer)".to_string())?;
+                }
+                "--run-count" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "Missing value for --run-count".to_string())?;
+                    let count = v
+                        .parse::<usize>()
+                        .map_err(|_| "Invalid --run-count (expected integer)".to_string())?;
+                    if count == 0 {
+                        return Err("--run-count must be >= 1".to_string());
+                    }
+                    out.run_count = Some(count);
                 }
                 "--tick-ms" => {
                     let v = it
@@ -256,6 +341,22 @@ EXAMPLES:
                         .parse::<u64>()
                         .map_err(|_| "Invalid --seed (expected u64)".to_string())?;
                 }
+                _ if arg.starts_with("--run-start-index=") => {
+                    let v = &arg["--run-start-index=".len()..];
+                    out.run_start_index = v
+                        .parse::<usize>()
+                        .map_err(|_| "Invalid --run-start-index (expected integer)".to_string())?;
+                }
+                _ if arg.starts_with("--run-count=") => {
+                    let v = &arg["--run-count=".len()..];
+                    let count = v
+                        .parse::<usize>()
+                        .map_err(|_| "Invalid --run-count (expected integer)".to_string())?;
+                    if count == 0 {
+                        return Err("--run-count must be >= 1".to_string());
+                    }
+                    out.run_count = Some(count);
+                }
                 _ if arg.starts_with("--tick-ms=") => {
                     let v = &arg["--tick-ms=".len()..];
                     out.tick_ms = v
@@ -297,6 +398,90 @@ EXAMPLES:
         }
 
         Ok(out)
+    }
+}
+
+impl SummarizeArgs {
+    fn parse() -> Result<Self, String> {
+        let mut input: Option<PathBuf> = None;
+        let mut out_dir: Option<PathBuf> = None;
+        let mut base_seed: Option<u64> = None;
+
+        let mut it = env::args().skip(2); // Skip binary name and "summarize"
+
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--help" | "-h" => {
+                    println!("{}", RunArgs::usage());
+                    std::process::exit(0);
+                }
+                "--input" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "Missing value for --input".to_string())?;
+                    input = Some(PathBuf::from(v));
+                }
+                "--out-dir" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "Missing value for --out-dir".to_string())?;
+                    out_dir = Some(PathBuf::from(v));
+                }
+                "--base-seed" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "Missing value for --base-seed".to_string())?;
+                    base_seed = Some(
+                        v.parse::<u64>()
+                            .map_err(|_| "Invalid --base-seed (expected u64)".to_string())?,
+                    );
+                }
+                _ if arg.starts_with("--input=") => {
+                    let v = &arg["--input=".len()..];
+                    input = Some(PathBuf::from(v));
+                }
+                _ if arg.starts_with("--out-dir=") => {
+                    let v = &arg["--out-dir=".len()..];
+                    out_dir = Some(PathBuf::from(v));
+                }
+                _ if arg.starts_with("--base-seed=") => {
+                    let v = &arg["--base-seed=".len()..];
+                    base_seed = Some(
+                        v.parse::<u64>()
+                            .map_err(|_| "Invalid --base-seed (expected u64)".to_string())?,
+                    );
+                }
+                other => return Err(format!("Unknown argument for summarize: {other}")),
+            }
+        }
+
+        let input = input.ok_or_else(|| "Missing required --input for summarize".to_string())?;
+        let out_dir =
+            out_dir.ok_or_else(|| "Missing required --out-dir for summarize".to_string())?;
+
+        Ok(Self {
+            input,
+            out_dir,
+            base_seed,
+        })
+    }
+}
+
+/// Parse command from arguments.
+fn parse_command() -> Command {
+    let args: Vec<String> = env::args().collect();
+
+    // Check if first non-binary arg is "summarize"
+    if args.len() > 1 && args[1] == "summarize" {
+        match SummarizeArgs::parse() {
+            Ok(s) => Command::Summarize(s),
+            Err(e) => {
+                eprintln!("{e}\n\n{}", RunArgs::usage());
+                std::process::exit(2);
+            }
+        }
+    } else {
+        Command::Run(RunArgs::parse_or_exit())
     }
 }
 
@@ -392,7 +577,7 @@ struct McConfig {
     profile: String,
 }
 
-/// Single run record for JSON output.
+/// Single run record for JSON output (mc_summary.json).
 #[derive(Debug, Clone, Serialize)]
 struct McRunRecord {
     run: usize,
@@ -406,6 +591,36 @@ struct McRunRecord {
     max_abs_delta_usd: f64,
     max_abs_basis_usd: f64,
     max_abs_q_tao: f64,
+    max_venue_toxicity: f64,
+}
+
+/// Single run record for JSONL output (mc_runs.jsonl).
+/// This is the canonical per-run output format for sharded Monte Carlo.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct McRunJsonlRecord {
+    /// Global run index (0-based, used for deterministic seed mapping).
+    run_index: usize,
+    /// Seed used for this run (should equal base_seed + run_index).
+    seed: u64,
+    /// Final PnL at end of run.
+    pnl_total: f64,
+    /// Maximum drawdown observed during run.
+    max_drawdown: f64,
+    /// Whether kill switch was triggered.
+    kill_switch: bool,
+    /// Tick at which kill switch was triggered (if any).
+    kill_tick: Option<usize>,
+    /// Kill reason (if kill switch triggered).
+    kill_reason: String,
+    /// Number of ticks executed.
+    ticks_executed: usize,
+    /// Maximum absolute delta in USD.
+    max_abs_delta_usd: f64,
+    /// Maximum absolute basis in USD.
+    max_abs_basis_usd: f64,
+    /// Maximum absolute q in TAO.
+    max_abs_q_tao: f64,
+    /// Maximum venue toxicity.
     max_venue_toxicity: f64,
 }
 
@@ -618,8 +833,14 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 fn main() {
-    let args = Args::parse_or_exit();
+    match parse_command() {
+        Command::Run(args) => run_monte_carlo(args),
+        Command::Summarize(args) => run_summarize(args),
+    }
+}
 
+/// Run the Monte Carlo simulation (default command).
+fn run_monte_carlo(args: RunArgs) {
     // Resolve profile with proper precedence: CLI > env > default
     // (No scenario profile for monte_carlo, so pass None)
     let effective = resolve_effective_profile(args.profile, None);
@@ -637,6 +858,11 @@ fn main() {
         );
         std::process::exit(2);
     }
+
+    // Determine effective run count: if --run-count is specified, use it; otherwise use --runs
+    let run_count = args.run_count.unwrap_or(args.runs);
+    let run_start_index = args.run_start_index;
+    let run_end_index = run_start_index + run_count;
 
     // Determine CSV path (in output directory)
     let csv_path = args.csv_out.as_ref().map(|p| {
@@ -666,12 +892,21 @@ fn main() {
         None => None,
     };
 
+    // Create JSONL output file
+    let jsonl_path = args.output_dir.join("mc_runs.jsonl");
+    let mut jsonl_file = File::create(&jsonl_path).unwrap_or_else(|e| {
+        eprintln!("Failed to create JSONL file {:?}: {e}", jsonl_path);
+        std::process::exit(2);
+    });
+
     println!(
-        "paraphina-mc v{} | profile={} ({}) runs={} ticks={} seed={} tick_ms={} jitter_ms={} print_every={} output_dir={} csv={}",
+        "paraphina-mc v{} | profile={} ({}) runs={} run_start={} run_count={} ticks={} seed={} tick_ms={} jitter_ms={} print_every={} output_dir={} csv={}",
         env!("CARGO_PKG_VERSION"),
         profile_name(profile),
         effective.source.as_str(),
         args.runs,
+        run_start_index,
+        run_count,
         args.ticks,
         args.seed,
         args.tick_ms,
@@ -691,17 +926,19 @@ fn main() {
     let mut max_abs_q_stats = OnlineStats::default();
     let mut max_tox_stats = OnlineStats::default();
 
-    let mut pnl_samples: Vec<f64> = Vec::with_capacity(args.runs);
-    let mut dd_samples: Vec<f64> = Vec::with_capacity(args.runs);
+    let mut pnl_samples: Vec<f64> = Vec::with_capacity(run_count);
+    let mut dd_samples: Vec<f64> = Vec::with_capacity(run_count);
 
     let mut kills: u64 = 0;
     let mut kill_tick_stats = OnlineStats::default();
 
     // Collect run records for JSON output
-    let mut run_records: Vec<McRunRecord> = Vec::with_capacity(args.runs);
+    let mut run_records: Vec<McRunRecord> = Vec::with_capacity(run_count);
 
-    for i in 0..args.runs {
-        let run_seed = args.seed.wrapping_add(i as u64);
+    // Iterate over global indices [run_start_index, run_start_index + run_count)
+    for global_idx in run_start_index..run_end_index {
+        // Deterministic seed mapping: seed_i = base_seed + i (u64 wrap)
+        let run_seed = args.seed.wrapping_add(global_idx as u64);
         let r = run_once(&cfg, run_seed, args.ticks, args.tick_ms, args.jitter_ms);
 
         pnl_stats.add(r.final_pnl);
@@ -721,9 +958,10 @@ fn main() {
 
         let kill_reason_str = format!("{:?}", r.kill_reason);
 
-        // Store run record
+        // Store run record for mc_summary.json (uses 1-based run number for display)
+        let local_idx = global_idx - run_start_index;
         run_records.push(McRunRecord {
-            run: i + 1,
+            run: local_idx + 1,
             seed: run_seed,
             ticks_executed: r.ticks_executed,
             kill_tick: r.kill_tick,
@@ -737,12 +975,31 @@ fn main() {
             max_venue_toxicity: r.max_venue_toxicity,
         });
 
+        // Write JSONL record (uses global run_index for aggregation)
+        let jsonl_record = McRunJsonlRecord {
+            run_index: global_idx,
+            seed: run_seed,
+            pnl_total: r.final_pnl,
+            max_drawdown: r.max_drawdown,
+            kill_switch: r.kill_switch,
+            kill_tick: r.kill_tick,
+            kill_reason: kill_reason_str.clone(),
+            ticks_executed: r.ticks_executed,
+            max_abs_delta_usd: r.max_abs_delta,
+            max_abs_basis_usd: r.max_abs_basis,
+            max_abs_q_tao: r.max_abs_q,
+            max_venue_toxicity: r.max_venue_toxicity,
+        };
+        let jsonl_line =
+            serde_json::to_string(&jsonl_record).expect("Failed to serialize JSONL record");
+        writeln!(jsonl_file, "{}", jsonl_line).expect("Failed to write JSONL record");
+
         if let Some(f) = csv.as_mut() {
             let kt = r.kill_tick.map(|x| x.to_string()).unwrap_or_default();
             writeln!(
                 f,
                 "{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-                i + 1,
+                global_idx,
                 run_seed,
                 r.ticks_executed,
                 kt,
@@ -759,7 +1016,9 @@ fn main() {
         }
 
         let should_print = !args.quiet
-            && (args.print_every == 1 || ((i + 1) % args.print_every == 0) || (i + 1 == args.runs));
+            && (args.print_every == 1
+                || ((local_idx + 1) % args.print_every == 0)
+                || (local_idx + 1 == run_count));
 
         if should_print {
             let kill_tick_str = r
@@ -772,9 +1031,10 @@ fn main() {
                 "-".to_string()
             };
             println!(
-                "run {:>4}/{:<4} seed={:<10} pnl={:>10.4} maxDD={:>10.4} |maxΔ|={:>10.4} |basis|={:>10.4} |q|={:>9.4} tox={:>6.3} kill={} kt={} reason={} ticks={}",
-                i + 1,
-                args.runs,
+                "run {:>4}/{:<4} (global={}) seed={:<10} pnl={:>10.4} maxDD={:>10.4} |maxΔ|={:>10.4} |basis|={:>10.4} |q|={:>9.4} tox={:>6.3} kill={} kt={} reason={} ticks={}",
+                local_idx + 1,
+                run_count,
+                global_idx,
                 run_seed,
                 r.final_pnl,
                 r.max_drawdown,
@@ -790,7 +1050,10 @@ fn main() {
         }
     }
 
-    let kill_rate = (kills as f64) / (args.runs as f64);
+    // Flush JSONL file
+    jsonl_file.sync_all().expect("Failed to sync JSONL file");
+
+    let kill_rate = (kills as f64) / (run_count as f64);
     // Clone samples before passing to p05_p50_p95 (which takes ownership)
     // so we can reuse them for tail_risk computation later
     let (pnl_p05, pnl_p50, pnl_p95) = p05_p50_p95(pnl_samples.clone());
@@ -798,12 +1061,12 @@ fn main() {
 
     println!();
     println!("SUMMARY");
-    println!("  runs:              {}", args.runs);
+    println!("  runs:              {} (global indices {}..{})", run_count, run_start_index, run_end_index);
     println!(
         "  kill_rate:         {:.2}% ({} / {})",
         100.0 * kill_rate,
         kills,
-        args.runs
+        run_count
     );
 
     if kills > 0 {
@@ -949,6 +1212,7 @@ fn main() {
     }
     println!();
     println!("Wrote: {}", summary_path.display());
+    println!("Wrote: {}", jsonl_path.display());
 
     // Write monte_carlo.yaml (suite file for evidence pack)
     // This is a synthetic suite file capturing the Monte Carlo parameters.
@@ -967,6 +1231,8 @@ config:
   runs: {}
   ticks: {}
   seed: {}
+  run_start_index: {}
+  run_count: {}
   tick_ms: {}
   jitter_ms: {}
   profile: {}
@@ -976,6 +1242,8 @@ paraphina_version: {}
         args.runs,
         args.ticks,
         args.seed,
+        run_start_index,
+        run_count,
         args.tick_ms,
         args.jitter_ms,
         profile_name(profile),
@@ -998,6 +1266,9 @@ paraphina_version: {}
 
     // Add mc_summary.json
     artifact_paths.push(PathBuf::from("mc_summary.json"));
+
+    // Add mc_runs.jsonl
+    artifact_paths.push(PathBuf::from("mc_runs.jsonl"));
 
     // Add CSV file if it was written to the output directory
     if let Some(csv_rel_path) = args.csv_out.as_ref() {
@@ -1024,4 +1295,279 @@ paraphina_version: {}
 
     println!();
     println!("Output written to: {}/", args.output_dir.display());
+}
+
+/// Run the summarize command: aggregate JSONL runs into mc_summary.json.
+fn run_summarize(args: SummarizeArgs) {
+    println!(
+        "paraphina-mc summarize v{} | input={} out_dir={}",
+        env!("CARGO_PKG_VERSION"),
+        args.input.display(),
+        args.out_dir.display()
+    );
+
+    // Read and parse JSONL
+    let file = File::open(&args.input).unwrap_or_else(|e| {
+        eprintln!("Failed to open input file {:?}: {e}", args.input);
+        std::process::exit(2);
+    });
+    let reader = BufReader::new(file);
+
+    let mut records: Vec<McRunJsonlRecord> = Vec::new();
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line.unwrap_or_else(|e| {
+            eprintln!("Failed to read line {} in {:?}: {e}", line_num + 1, args.input);
+            std::process::exit(2);
+        });
+        
+        // Skip empty lines
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let record: McRunJsonlRecord = serde_json::from_str(&line).unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to parse JSON at line {} in {:?}: {e}\nLine: {}",
+                line_num + 1,
+                args.input,
+                line
+            );
+            std::process::exit(2);
+        });
+        records.push(record);
+    }
+
+    if records.is_empty() {
+        eprintln!("Error: No records found in {:?}", args.input);
+        std::process::exit(2);
+    }
+
+    // Sort by run_index for determinism
+    records.sort_by_key(|r| r.run_index);
+
+    // Validate: check for duplicates and contiguity
+    let mut seen_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for record in &records {
+        if seen_indices.contains(&record.run_index) {
+            eprintln!(
+                "Error: Duplicate run_index {} found in {:?}",
+                record.run_index, args.input
+            );
+            std::process::exit(2);
+        }
+        seen_indices.insert(record.run_index);
+    }
+
+    // Check contiguity
+    let min_idx = records.first().unwrap().run_index;
+    let max_idx = records.last().unwrap().run_index;
+    let expected_count = max_idx - min_idx + 1;
+
+    if records.len() != expected_count {
+        eprintln!(
+            "Error: Non-contiguous run indices. Expected {} runs for indices {}..={}, found {}",
+            expected_count, min_idx, max_idx, records.len()
+        );
+        std::process::exit(2);
+    }
+
+    // Validate seed contract if base_seed provided
+    if let Some(base_seed) = args.base_seed {
+        for record in &records {
+            let expected_seed = base_seed.wrapping_add(record.run_index as u64);
+            if record.seed != expected_seed {
+                eprintln!(
+                    "Error: Seed mismatch at run_index {}. Expected {} (base_seed {} + {}), found {}",
+                    record.run_index, expected_seed, base_seed, record.run_index, record.seed
+                );
+                std::process::exit(2);
+            }
+        }
+        println!("✓ Seed contract validated for {} runs (base_seed={})", records.len(), base_seed);
+    }
+
+    println!(
+        "Loaded {} records (run indices {}..={})",
+        records.len(),
+        min_idx,
+        max_idx
+    );
+
+    // Create output directory
+    if let Err(e) = fs::create_dir_all(&args.out_dir) {
+        eprintln!("Failed to create output directory {:?}: {e}", args.out_dir);
+        std::process::exit(2);
+    }
+
+    // Compute statistics
+    let mut pnl_stats = OnlineStats::default();
+    let mut dd_stats = OnlineStats::default();
+    let mut max_abs_delta_stats = OnlineStats::default();
+    let mut max_abs_basis_stats = OnlineStats::default();
+    let mut max_abs_q_stats = OnlineStats::default();
+    let mut max_tox_stats = OnlineStats::default();
+
+    let mut pnl_samples: Vec<f64> = Vec::with_capacity(records.len());
+    let mut dd_samples: Vec<f64> = Vec::with_capacity(records.len());
+
+    let mut kills: u64 = 0;
+    let mut kill_tick_stats = OnlineStats::default();
+
+    let mut run_records: Vec<McRunRecord> = Vec::with_capacity(records.len());
+
+    for (local_idx, record) in records.iter().enumerate() {
+        pnl_stats.add(record.pnl_total);
+        dd_stats.add(record.max_drawdown);
+        max_abs_delta_stats.add(record.max_abs_delta_usd);
+        max_abs_basis_stats.add(record.max_abs_basis_usd);
+        max_abs_q_stats.add(record.max_abs_q_tao);
+        max_tox_stats.add(record.max_venue_toxicity);
+
+        pnl_samples.push(record.pnl_total);
+        dd_samples.push(record.max_drawdown);
+
+        if record.kill_switch {
+            kills += 1;
+            if let Some(kt) = record.kill_tick {
+                kill_tick_stats.add(kt as f64);
+            }
+        }
+
+        run_records.push(McRunRecord {
+            run: local_idx + 1,
+            seed: record.seed,
+            ticks_executed: record.ticks_executed,
+            kill_tick: record.kill_tick,
+            kill_switch: record.kill_switch,
+            kill_reason: record.kill_reason.clone(),
+            final_pnl: record.pnl_total,
+            max_drawdown: record.max_drawdown,
+            max_abs_delta_usd: record.max_abs_delta_usd,
+            max_abs_basis_usd: record.max_abs_basis_usd,
+            max_abs_q_tao: record.max_abs_q_tao,
+            max_venue_toxicity: record.max_venue_toxicity,
+        });
+    }
+
+    let kill_rate = (kills as f64) / (records.len() as f64);
+    let (pnl_p05, pnl_p50, pnl_p95) = p05_p50_p95(pnl_samples.clone());
+    let (dd_p05, dd_p50, dd_p95) = p05_p50_p95(dd_samples.clone());
+
+    // Compute tail risk metrics
+    let tail_risk = TailRiskMetrics::compute(
+        &pnl_samples,
+        &dd_samples,
+        kills,
+        DEFAULT_VAR_ALPHA,
+        0.95,
+    );
+
+    // Build summary (note: config comes from aggregated data, not args)
+    // We use defaults for config since we're aggregating shards
+    let first_seed = records.first().unwrap().seed;
+    let base_seed_inferred = first_seed.wrapping_sub(min_idx as u64);
+
+    let summary = McSummary {
+        schema_version: 2,
+        paraphina_version: env!("CARGO_PKG_VERSION").to_string(),
+        config: McConfig {
+            runs: records.len(),
+            ticks: records.first().unwrap().ticks_executed, // Use first record's ticks
+            seed: args.base_seed.unwrap_or(base_seed_inferred),
+            tick_ms: DEFAULT_TICK_MS,
+            jitter_ms: DEFAULT_JITTER_MS,
+            profile: "Unknown".to_string(), // Not available from JSONL
+        },
+        runs: run_records,
+        aggregate: McAggregateStats {
+            kill_rate,
+            kill_count: kills,
+            pnl: AggregateStats {
+                mean: pnl_stats.mean(),
+                std_pop: pnl_stats.stddev_population(),
+                min: pnl_stats.min(),
+                max: pnl_stats.max(),
+                p05: pnl_p05,
+                p50: pnl_p50,
+                p95: pnl_p95,
+            },
+            max_drawdown: AggregateStats {
+                mean: dd_stats.mean(),
+                std_pop: dd_stats.stddev_population(),
+                min: dd_stats.min(),
+                max: dd_stats.max(),
+                p05: dd_p05,
+                p50: dd_p50,
+                p95: dd_p95,
+            },
+            max_abs_delta_usd: SimpleStats {
+                mean: max_abs_delta_stats.mean(),
+                std_pop: max_abs_delta_stats.stddev_population(),
+                min: max_abs_delta_stats.min(),
+                max: max_abs_delta_stats.max(),
+            },
+            max_abs_basis_usd: SimpleStats {
+                mean: max_abs_basis_stats.mean(),
+                std_pop: max_abs_basis_stats.stddev_population(),
+                min: max_abs_basis_stats.min(),
+                max: max_abs_basis_stats.max(),
+            },
+            max_abs_q_tao: SimpleStats {
+                mean: max_abs_q_stats.mean(),
+                std_pop: max_abs_q_stats.stddev_population(),
+                min: max_abs_q_stats.min(),
+                max: max_abs_q_stats.max(),
+            },
+            max_venue_toxicity: SimpleStats {
+                mean: max_tox_stats.mean(),
+                std_pop: max_tox_stats.stddev_population(),
+                min: max_tox_stats.min(),
+                max: max_tox_stats.max(),
+            },
+        },
+        tail_risk,
+    };
+
+    // Write mc_summary.json
+    let summary_path = args.out_dir.join("mc_summary.json");
+    let summary_json =
+        serde_json::to_string_pretty(&summary).expect("Failed to serialize mc_summary.json");
+    if let Err(e) = atomic_write(&summary_path, summary_json.as_bytes()) {
+        eprintln!("Failed to write mc_summary.json: {e}");
+        std::process::exit(1);
+    }
+
+    println!();
+    println!("SUMMARY");
+    println!("  runs:              {}", records.len());
+    println!(
+        "  kill_rate:         {:.2}% ({} / {})",
+        100.0 * kill_rate,
+        kills,
+        records.len()
+    );
+    println!(
+        "  pnl:               mean={:.4}  std(pop)={:.4}  min={:.4}  max={:.4}  p05={:.4}  p50={:.4}  p95={:.4}",
+        pnl_stats.mean(),
+        pnl_stats.stddev_population(),
+        pnl_stats.min(),
+        pnl_stats.max(),
+        pnl_p05,
+        pnl_p50,
+        pnl_p95
+    );
+    println!(
+        "  max_drawdown:      mean={:.4}  std(pop)={:.4}  min={:.4}  max={:.4}  p05={:.4}  p50={:.4}  p95={:.4}",
+        dd_stats.mean(),
+        dd_stats.stddev_population(),
+        dd_stats.min(),
+        dd_stats.max(),
+        dd_p05,
+        dd_p50,
+        dd_p95
+    );
+
+    println!();
+    println!("Wrote: {}", summary_path.display());
+    println!("✓ Summarize complete");
 }
