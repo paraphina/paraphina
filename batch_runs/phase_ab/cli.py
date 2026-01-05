@@ -21,20 +21,43 @@ Usage:
     python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea \\
         --out-dir runs/ci/phase_ab_smoke --seed 12345
 
+    # Promotion gate (strict mode with mandatory evidence verification)
+    python3 -m batch_runs.phase_ab.cli gate \\
+        --out-dir runs/ci/phase_ab_gate \\
+        --seed 24680 \\
+        --n-bootstrap 1000 \\
+        --auto-generate-phasea
+
+    # Gate with explicit candidate/baseline runs
+    python3 -m batch_runs.phase_ab.cli gate \\
+        --candidate-run runs/phaseA_candidate \\
+        --baseline-run runs/phaseA_baseline \\
+        --out-dir runs/ci/phase_ab_gate \\
+        --seed 24680
+
     # Verify an existing evidence pack
     python3 -m batch_runs.phase_ab.cli verify-evidence runs/ci/phase_ab_smoke/evidence_pack
 
 Exit codes (institutional CI semantics):
-    0 = PROMOTE or HOLD (pipeline succeeded)
-    2 = REJECT (candidate fails guardrails) or verify-evidence failure
-    3 = ERROR (runtime/IO/parsing failure)
+
+    Smoke mode (default for smoke command):
+        0 = PROMOTE or HOLD (pipeline succeeded)
+        1 = (not used in smoke mode)
+        2 = REJECT (candidate fails guardrails) or verify-evidence failure
+        3 = ERROR (runtime/IO/parsing failure)
+
+    Strict/Gate mode (default for gate command):
+        0 = PROMOTE (candidate is provably better - PASS)
+        1 = REJECT (candidate fails guardrails - FAIL)
+        2 = HOLD (insufficient evidence - needs more data)
+        3 = ERROR (runtime/IO/parsing failure) or other unexpected states
 
 CI Mode:
     --ci-mode smoke : HOLD is CI pass (exit 0) with clear messaging
-    --ci-mode strict : HOLD is CI fail (exit 1) - promotion required
-    
+    --ci-mode strict : HOLD is CI fail (exit 2) - promotion required
+
     For smoke/integration tests, use --ci-mode smoke (the default for smoke command).
-    For promotion gates that require PROMOTE, use --ci-mode strict.
+    For promotion gates that require PROMOTE, use --ci-mode strict or the gate command.
 """
 
 from __future__ import annotations
@@ -87,6 +110,24 @@ def _get_git_commit() -> Optional[str]:
 
 
 # =============================================================================
+# Exit Code Constants (Institutional Grade)
+# =============================================================================
+
+# Smoke mode exit codes (default for smoke command)
+# Used for smoke tests where we only verify the pipeline runs correctly.
+SMOKE_EXIT_PASS = 0       # PROMOTE or HOLD - pipeline succeeded
+SMOKE_EXIT_REJECT = 2     # REJECT - candidate fails guardrails
+SMOKE_EXIT_ERROR = 3      # ERROR - runtime/IO/parsing failure
+
+# Strict/Gate mode exit codes (default for gate command)
+# Used for promotion gates that require definitive superiority.
+GATE_EXIT_PASS = 0        # PROMOTE - candidate is provably better
+GATE_EXIT_FAIL = 1        # REJECT - candidate fails guardrails
+GATE_EXIT_HOLD = 2        # HOLD - insufficient evidence (needs more data)
+GATE_EXIT_ERROR = 3       # ERROR - runtime/IO/parsing failure
+
+
+# =============================================================================
 # CI Exit Code Helper
 # =============================================================================
 
@@ -97,14 +138,20 @@ def ci_exit_code_for_decision(decision: str, ci_mode: str = "smoke") -> int:
     CI Mode semantics:
     - "smoke": HOLD is CI pass (exit 0), REJECT/ERROR are CI fail
               Used for smoke tests where we only verify the pipeline runs correctly.
-    - "strict": HOLD is CI fail (exit 1), only PROMOTE passes
-                Used for promotion gates that require definitive superiority.
+    - "strict": Deterministic exit codes for promotion gates:
+              PASS (PROMOTE) = 0, FAIL (REJECT) = 1, HOLD = 2, ERROR = 3
+              Used for promotion gates that require definitive superiority.
     
-    Exit codes:
-    - 0: CI pass (PROMOTE always, HOLD in smoke mode)
-    - 1: CI fail for HOLD in strict mode
-    - 2: CI fail for REJECT
-    - 3: CI fail for ERROR
+    Smoke mode exit codes:
+    - 0: CI pass (PROMOTE or HOLD - pipeline succeeded)
+    - 2: CI fail for REJECT (candidate fails guardrails)
+    - 3: CI fail for ERROR (runtime/IO/parsing failure)
+    
+    Strict/Gate mode exit codes:
+    - 0: PASS (PROMOTE - candidate is provably better)
+    - 1: FAIL (REJECT - candidate fails guardrails)
+    - 2: HOLD (insufficient evidence - needs more data)
+    - 3: ERROR (runtime/IO/parsing failure or unknown state)
     
     Args:
         decision: One of "PROMOTE", "HOLD", "REJECT", "ERROR"
@@ -115,19 +162,53 @@ def ci_exit_code_for_decision(decision: str, ci_mode: str = "smoke") -> int:
     """
     decision_upper = decision.upper()
     
-    if decision_upper == "PROMOTE":
-        return 0
-    elif decision_upper == "HOLD":
-        if ci_mode == "strict":
-            return 1  # Strict mode: HOLD is a failure
+    if ci_mode == "strict":
+        # Strict/Gate mode: deterministic institutional exit codes
+        if decision_upper == "PROMOTE":
+            return GATE_EXIT_PASS   # 0
+        elif decision_upper == "REJECT":
+            return GATE_EXIT_FAIL   # 1
+        elif decision_upper == "HOLD":
+            return GATE_EXIT_HOLD   # 2
+        elif decision_upper == "ERROR":
+            return GATE_EXIT_ERROR  # 3
         else:
-            return 0  # Smoke mode: HOLD is success (pipeline worked)
-    elif decision_upper == "REJECT":
-        return 2
-    elif decision_upper == "ERROR":
-        return 3
+            return GATE_EXIT_ERROR  # 3 - Unknown decision treated as error
     else:
-        return 3  # Unknown decision treated as error
+        # Smoke mode: HOLD is success (pipeline worked)
+        if decision_upper == "PROMOTE":
+            return SMOKE_EXIT_PASS   # 0
+        elif decision_upper == "HOLD":
+            return SMOKE_EXIT_PASS   # 0 - HOLD is success in smoke mode
+        elif decision_upper == "REJECT":
+            return SMOKE_EXIT_REJECT # 2
+        elif decision_upper == "ERROR":
+            return SMOKE_EXIT_ERROR  # 3
+        else:
+            return SMOKE_EXIT_ERROR  # 3 - Unknown decision treated as error
+
+
+def get_exit_code_description(ci_mode: str = "smoke") -> str:
+    """
+    Get human-readable exit code documentation for a CI mode.
+    
+    Args:
+        ci_mode: "smoke" or "strict"
+        
+    Returns:
+        Multi-line string describing exit codes
+    """
+    if ci_mode == "strict":
+        return """Exit codes (strict/gate mode):
+    0 = PASS (PROMOTE - candidate is provably better)
+    1 = FAIL (REJECT - candidate fails guardrails)
+    2 = HOLD (insufficient evidence - needs more data)
+    3 = ERROR (runtime/IO/parsing failure)"""
+    else:
+        return """Exit codes (smoke mode):
+    0 = PROMOTE or HOLD (pipeline succeeded)
+    2 = REJECT (candidate fails guardrails)
+    3 = ERROR (runtime/IO/parsing failure)"""
 
 
 def print_ci_summary(result: PhaseABResult, ci_mode: str = "smoke") -> None:
@@ -160,15 +241,19 @@ def print_ci_summary(result: PhaseABResult, ci_mode: str = "smoke") -> None:
             print("  → Guardrails passed (candidate not worse), but CIs overlap.")
             print("  → For promotion, collect more data to narrow confidence intervals.")
         else:
-            print("  ✗ CI FAIL: HOLD decision in strict mode.")
-            print("  → Strict mode requires PROMOTE for CI pass.")
+            print("  ⏸ CI HOLD: Insufficient evidence for promotion (exit code 2).")
+            print("  → Guardrails passed (candidate not worse).")
+            print("  → Strict mode requires PROMOTE (exit 0) for CI pass.")
             print("  → Collect more data to achieve statistical significance.")
     elif decision == "REJECT":
-        print("  ✗ CI FAIL: Candidate fails guardrails.")
+        if ci_mode == "strict":
+            print("  ✗ CI FAIL: Candidate fails guardrails (exit code 1).")
+        else:
+            print("  ✗ CI FAIL: Candidate fails guardrails.")
         print("  → Candidate is provably worse than baseline on at least one metric.")
         print("  → Review confidence_report.md for details.")
     elif decision == "ERROR":
-        print("  ✗ CI FAIL: Pipeline encountered an error.")
+        print("  ✗ CI ERROR: Pipeline encountered an error (exit code 3).")
         if result.manifest.errors:
             for err in result.manifest.errors:
                 print(f"  → {err}")
@@ -196,7 +281,7 @@ def write_github_step_summary(result: PhaseABResult, ci_mode: str = "smoke") -> 
     decision = result.manifest.decision
     exit_code = ci_exit_code_for_decision(decision, ci_mode)
     
-    # Determine status emoji and text
+    # Determine status emoji and text based on mode
     if decision == "PROMOTE":
         status_emoji = "✅"
         status_text = "CI PASS"
@@ -207,17 +292,23 @@ def write_github_step_summary(result: PhaseABResult, ci_mode: str = "smoke") -> 
             status_text = "CI PASS"
             detail = "Pipeline succeeded. HOLD means not enough evidence to prove superiority (expected for smoke tests)."
         else:
-            status_emoji = "❌"
-            status_text = "CI FAIL"
-            detail = "Strict mode requires PROMOTE. Candidate not provably better."
+            status_emoji = "⏸️"
+            status_text = "CI HOLD"
+            detail = "Insufficient evidence for promotion. Guardrails passed but confidence intervals overlap. Collect more data."
     elif decision == "REJECT":
         status_emoji = "❌"
         status_text = "CI FAIL"
         detail = "Candidate fails guardrails (provably worse)."
     else:
         status_emoji = "❌"
-        status_text = "CI FAIL"
+        status_text = "CI ERROR"
         detail = f"Pipeline error: {', '.join(result.manifest.errors) if result.manifest.errors else 'Unknown error'}"
+    
+    # Exit code documentation based on mode
+    if ci_mode == "strict":
+        exit_code_doc = "0=PASS, 1=FAIL, 2=HOLD, 3=ERROR"
+    else:
+        exit_code_doc = "0=PASS/HOLD, 2=REJECT, 3=ERROR"
     
     # Generate Markdown summary
     summary = f"""## Phase AB Confidence Gate Result
@@ -226,7 +317,7 @@ def write_github_step_summary(result: PhaseABResult, ci_mode: str = "smoke") -> 
 |-------|-------|
 | **Status** | {status_emoji} {status_text} |
 | **Decision** | `{decision}` |
-| **Exit Code** | `{exit_code}` |
+| **Exit Code** | `{exit_code}` ({exit_code_doc}) |
 | **CI Mode** | `{ci_mode}` |
 | **Alpha** | `{result.manifest.alpha}` |
 | **Bootstrap Samples** | `{result.manifest.bootstrap_samples}` |
@@ -637,6 +728,170 @@ def _populate_evidence_pack(out_dir: Path, evidence_pack_dir: Path, result: Phas
 
 
 # =============================================================================
+# Command: gate (Promotion Gate - Strict Mode)
+# =============================================================================
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """
+    Run Phase AB promotion gate in strict mode with mandatory evidence verification.
+    
+    This is the institutional-grade promotion gate that:
+    1. Runs Phase AB evaluation in STRICT mode
+    2. Writes all standard outputs to --out-dir
+    3. Immediately runs evidence verification
+    4. Enforces deterministic exit codes:
+       - PASS (PROMOTE) => 0
+       - FAIL (REJECT) => 1
+       - HOLD => 2
+       - ERROR => 3
+    
+    Args:
+        args: Parsed CLI arguments
+        
+    Returns:
+        Exit code per strict mode contract
+    """
+    verbose = not args.quiet
+    
+    # Seed RNG if provided
+    if args.seed is not None:
+        random.seed(args.seed)
+    
+    if verbose:
+        print("=" * 70)
+        print("Phase AB Promotion Gate (Strict Mode)")
+        print("=" * 70)
+        print()
+        print(get_exit_code_description("strict"))
+        print()
+    
+    # Determine candidate/baseline paths
+    use_auto_generate = getattr(args, 'auto_generate_phasea', False)
+    
+    if use_auto_generate:
+        # Auto-generate Phase A runs if needed
+        candidate_exists, baseline_exists = _check_phase_a_runs_exist()
+        
+        if not candidate_exists or not baseline_exists:
+            success = _generate_phase_a_runs(verbose=verbose, seed=args.seed)
+            if not success:
+                print("ERROR: Failed to auto-generate Phase A runs", file=sys.stderr)
+                return GATE_EXIT_ERROR
+        
+        candidate_run = DEFAULT_CANDIDATE_SMOKE
+        baseline_run = DEFAULT_BASELINE_SMOKE
+    else:
+        # Use explicit paths
+        if not args.candidate_run:
+            print("ERROR: --candidate-run is required when not using --auto-generate-phasea", file=sys.stderr)
+            return GATE_EXIT_ERROR
+        
+        candidate_run = Path(args.candidate_run)
+        baseline_run = Path(args.baseline_run) if args.baseline_run else None
+    
+    # Ensure output directory
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    if verbose:
+        print(f"  Candidate: {candidate_run}")
+        if baseline_run:
+            print(f"  Baseline: {baseline_run}")
+        print(f"  Output: {out_dir}")
+        print(f"  Seed: {args.seed}")
+        print(f"  Bootstrap samples: {args.n_bootstrap}")
+        print()
+    
+    # Run Phase AB (evidence verification is NOT skipped in gate mode)
+    result = run_phase_ab(
+        candidate_run=candidate_run,
+        baseline_run=baseline_run,
+        out_dir=out_dir,
+        alpha=args.alpha,
+        n_bootstrap=args.n_bootstrap,
+        seed=args.seed,
+        skip_evidence_verify=False,  # Never skip in gate mode
+        verbose=verbose,
+    )
+    
+    # Create evidence_pack directory and populate
+    evidence_pack_dir = out_dir / "evidence_pack"
+    evidence_pack_dir.mkdir(parents=True, exist_ok=True)
+    _populate_evidence_pack(out_dir, evidence_pack_dir, result)
+    
+    # Write evidence pack manifest
+    try:
+        cli_args = sys.argv[1:] if len(sys.argv) > 1 else []
+        manifest_path = _write_evidence_pack_manifest(
+            evidence_pack_dir,
+            cli_args,
+            args.seed,
+        )
+        if verbose:
+            print()
+            print(f"  Evidence pack: {evidence_pack_dir}")
+            print(f"  Evidence pack manifest: {manifest_path}")
+    except Exception as e:
+        print(f"ERROR: Failed to write evidence pack manifest: {e}", file=sys.stderr)
+        return GATE_EXIT_ERROR
+    
+    # MANDATORY: Run evidence verification on the output evidence pack
+    if verbose:
+        print()
+        print("[Gate] Verifying evidence pack integrity...")
+    
+    from batch_runs.evidence_pack import verify_manifest, ManifestError
+    
+    try:
+        verify_manifest(evidence_pack_dir)
+        if verbose:
+            print("  ✓ Evidence pack verified successfully")
+    except ManifestError as e:
+        print(f"ERROR: Evidence verification failed: {e}", file=sys.stderr)
+        return GATE_EXIT_ERROR
+    except Exception as e:
+        print(f"ERROR: Evidence verification error: {e}", file=sys.stderr)
+        return GATE_EXIT_ERROR
+    
+    # Write summary
+    try:
+        outcome = result.manifest.decision
+        summary_path = _write_phase_ab_summary(
+            out_dir,
+            outcome=outcome,
+            mode="gate",
+            evidence_pack_dir=evidence_pack_dir,
+            manifest_path=manifest_path,
+            seed=args.seed,
+        )
+        if verbose:
+            print(f"  Phase AB summary: {summary_path}")
+    except Exception as e:
+        print(f"WARNING: Failed to write summary: {e}", file=sys.stderr)
+    
+    # Gate mode always uses strict CI mode
+    ci_mode = "strict"
+    
+    # Print CI summary
+    if verbose:
+        print_ci_summary(result, ci_mode=ci_mode)
+    
+    # Write GitHub Actions step summary
+    write_github_step_summary(result, ci_mode=ci_mode)
+    
+    # Print final outcome
+    if verbose:
+        print()
+        print("=" * 70)
+        print(f"  Gating outcome: {result.manifest.decision}")
+        print(f"  Evidence pack path: {evidence_pack_dir.absolute()}")
+        print("=" * 70)
+    
+    # Return strict mode exit code
+    return ci_exit_code_for_decision(result.manifest.decision, ci_mode=ci_mode)
+
+
+# =============================================================================
 # Command: verify-evidence
 # =============================================================================
 
@@ -693,6 +948,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 Commands:
   run             Run PhaseAB with explicit candidate/baseline paths (default)
   smoke           Run deterministic smoke test with standard paths (CI-friendly)
+  gate            Run promotion gate (strict mode with mandatory evidence verification)
   verify-evidence Verify an evidence pack directory
 
 Examples:
@@ -712,25 +968,39 @@ Examples:
   python3 -m batch_runs.phase_ab.cli smoke --auto-generate-phasea \\
       --out-dir runs/ci/phase_ab_smoke --seed 12345
 
+  # Promotion gate with auto-generate (strict mode)
+  python3 -m batch_runs.phase_ab.cli gate \\
+      --auto-generate-phasea \\
+      --out-dir runs/ci/phase_ab_gate \\
+      --seed 24680 \\
+      --n-bootstrap 1000
+
+  # Promotion gate with explicit paths
+  python3 -m batch_runs.phase_ab.cli gate \\
+      --candidate-run runs/phaseA_candidate \\
+      --baseline-run runs/phaseA_baseline \\
+      --out-dir runs/ci/phase_ab_gate \\
+      --seed 24680
+
   # Verify an evidence pack
   python3 -m batch_runs.phase_ab.cli verify-evidence runs/ci/phase_ab_smoke/evidence_pack
 
-  # Strict mode for promotion gates (HOLD = CI fail)
+  # Strict mode for run command (HOLD = CI fail)
   python3 -m batch_runs.phase_ab.cli run --ci-mode strict ...
 
 CI Mode:
-  --ci-mode smoke  : HOLD is CI pass (exit 0) - default
-  --ci-mode strict : HOLD is CI fail (exit 1) - for promotion gates
+  --ci-mode smoke  : HOLD is CI pass (exit 0) - default for smoke command
+  --ci-mode strict : HOLD is CI fail (exit 2) - for promotion gates
 
-Exit codes (with --ci-mode smoke):
+Exit codes (smoke mode - default for smoke command):
   0 = PROMOTE or HOLD (pipeline succeeded)
-  2 = REJECT (candidate fails guardrails) or verify-evidence failure
+  2 = REJECT (candidate fails guardrails)
   3 = ERROR (runtime/IO/parsing failure)
 
-Exit codes (with --ci-mode strict):
-  0 = PROMOTE only (candidate provably better)
-  1 = HOLD (not enough evidence)
-  2 = REJECT (candidate fails guardrails)
+Exit codes (strict/gate mode - default for gate command):
+  0 = PASS (PROMOTE - candidate is provably better)
+  1 = FAIL (REJECT - candidate fails guardrails)
+  2 = HOLD (insufficient evidence - needs more data)
   3 = ERROR (runtime/IO/parsing failure)
 
 Outputs:
@@ -827,6 +1097,73 @@ Outputs:
     )
     add_common_args(smoke_parser)
     
+    # Command: gate (Promotion Gate - Strict Mode)
+    gate_parser = subparsers.add_parser(
+        "gate",
+        help="Run promotion gate (strict mode with mandatory evidence verification)",
+        description="""Run Phase AB promotion gate in strict mode.
+
+This is the institutional-grade promotion gate that:
+1. Runs Phase AB evaluation in STRICT mode (promotion semantics)
+2. Writes all standard outputs to --out-dir
+3. Immediately runs evidence verification (mandatory)
+4. Enforces deterministic exit codes:
+   - PASS (PROMOTE) => 0
+   - FAIL (REJECT) => 1
+   - HOLD => 2
+   - ERROR => 3
+
+Use --auto-generate-phasea to auto-generate Phase A runs (for CI smoke testing).
+Otherwise, --candidate-run is required.""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    gate_parser.add_argument(
+        "--out-dir",
+        type=Path,
+        required=True,
+        help="Output directory for Phase AB results (required)",
+    )
+    gate_parser.add_argument(
+        "--seed",
+        type=int,
+        required=True,
+        help="Random seed for reproducibility (required for determinism)",
+    )
+    gate_parser.add_argument(
+        "--n-bootstrap",
+        type=int,
+        default=1000,
+        help="Number of bootstrap samples (default: 1000)",
+    )
+    gate_parser.add_argument(
+        "--candidate-run",
+        type=Path,
+        default=None,
+        help="Path to candidate Phase A run directory (required unless --auto-generate-phasea)",
+    )
+    gate_parser.add_argument(
+        "--baseline-run",
+        type=Path,
+        default=None,
+        help="Path to baseline Phase A run directory (optional)",
+    )
+    gate_parser.add_argument(
+        "--auto-generate-phasea",
+        action="store_true",
+        help="Automatically generate Phase A runs if they don't exist",
+    )
+    gate_parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.05,
+        help="Significance level for confidence intervals (default: 0.05)",
+    )
+    gate_parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress verbose output",
+    )
+    
     # Command: verify-evidence
     verify_parser = subparsers.add_parser(
         "verify-evidence",
@@ -862,6 +1199,8 @@ Outputs:
         return cmd_run(args)
     elif args.command == "smoke":
         return cmd_smoke(args)
+    elif args.command == "gate":
+        return cmd_gate(args)
     elif args.command == "verify-evidence":
         return cmd_verify_evidence(args)
     else:

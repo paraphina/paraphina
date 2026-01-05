@@ -1,0 +1,194 @@
+name: phase-ab-promotion-gate
+
+# This workflow runs the institutional-grade Phase AB Promotion Gate.
+# It is manually triggered (workflow_dispatch) for controlled promotion decisions.
+#
+# Exit codes (strict mode):
+#   0 = PASS (PROMOTE - candidate is provably better)
+#   1 = FAIL (REJECT - candidate fails guardrails)
+#   2 = HOLD (insufficient evidence - needs more data)
+#   3 = ERROR (runtime/IO/parsing failure)
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'Random seed for reproducibility'
+        required: false
+        default: '24680'
+      n_bootstrap:
+        description: 'Number of bootstrap samples'
+        required: false
+        default: '1000'
+
+jobs:
+  phase-ab-promotion-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for forbidden Unicode control characters
+        run: python3 tools/check_unicode_controls.py
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build release binaries
+        run: cargo build --release -p paraphina --bin monte_carlo --bin sim_eval
+
+      - name: Configure sim_eval binary path
+        run: |
+          echo "SIM_EVAL_BIN=$GITHUB_WORKSPACE/target/release/sim_eval" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/target/release" >> $GITHUB_PATH
+          echo "Configured SIM_EVAL_BIN=$GITHUB_WORKSPACE/target/release/sim_eval"
+
+      - name: Verify sim_eval supports evidence-pack commands
+        run: |
+          $SIM_EVAL_BIN --help | grep -q "verify-evidence-pack" || (echo "ERROR: sim_eval missing verify-evidence-pack command" && exit 1)
+          $SIM_EVAL_BIN --help | grep -q "verify-evidence-tree" || (echo "ERROR: sim_eval missing verify-evidence-tree command" && exit 1)
+          echo "✓ sim_eval binary validated"
+
+      - name: Run Phase AB Promotion Gate
+        id: gate
+        run: |
+          set +e
+          python3 -m batch_runs.phase_ab.cli gate \
+            --auto-generate-phasea \
+            --out-dir runs/ci/phase_ab_gate \
+            --seed ${{ github.event.inputs.seed || '24680' }} \
+            --n-bootstrap ${{ github.event.inputs.n_bootstrap || '1000' }}
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          # Read decision from manifest
+          if [ -f runs/ci/phase_ab_gate/phase_ab_manifest.json ]; then
+            DECISION=$(python3 -c "import json; d=json.load(open('runs/ci/phase_ab_gate/phase_ab_manifest.json')); print(d['decision'])")
+            echo "decision=$DECISION" >> $GITHUB_OUTPUT
+          else
+            echo "decision=ERROR" >> $GITHUB_OUTPUT
+          fi
+          
+          # Exit with the gate's exit code
+          exit $EXIT_CODE
+
+      - name: Verify Phase AB outputs exist
+        if: always()
+        run: |
+          echo "Checking for required outputs..."
+          test -f runs/ci/phase_ab_gate/phase_ab_manifest.json && echo "✓ phase_ab_manifest.json"
+          test -f runs/ci/phase_ab_gate/confidence_report.json && echo "✓ confidence_report.json"
+          test -f runs/ci/phase_ab_gate/confidence_report.md && echo "✓ confidence_report.md"
+          test -f runs/ci/phase_ab_gate/evidence_pack/manifest.json && echo "✓ evidence_pack/manifest.json"
+          test -f runs/ci/phase_ab_gate/phase_ab_summary.json && echo "✓ phase_ab_summary.json"
+
+      - name: Upload Phase AB gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-ab-gate-artifacts
+          path: |
+            runs/ci/phase_ab_gate/phase_ab_manifest.json
+            runs/ci/phase_ab_gate/confidence_report.json
+            runs/ci/phase_ab_gate/confidence_report.md
+            runs/ci/phase_ab_gate/phase_ab_summary.json
+
+      - name: Upload Phase AB evidence pack
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-ab-gate-evidence-pack
+          path: runs/ci/phase_ab_gate/evidence_pack
+
+      - name: Generate job summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - << 'PYTHON_SCRIPT'
+          import json
+          import os
+          from pathlib import Path
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if not summary_file:
+              print("GITHUB_STEP_SUMMARY not set, skipping job summary")
+              exit(0)
+
+          # Read manifest
+          manifest_path = Path("runs/ci/phase_ab_gate/phase_ab_manifest.json")
+
+          decision = "UNKNOWN"
+          candidate_run = "N/A"
+          baseline_run = "N/A"
+          exit_code = "?"
+
+          if manifest_path.exists():
+              with open(manifest_path) as f:
+                  manifest = json.load(f)
+              decision = manifest.get("decision", "UNKNOWN")
+              candidate_run = manifest.get("candidate_run_resolved", "N/A")
+              baseline_run = manifest.get("baseline_run_resolved", "N/A")
+
+          # Determine status emoji
+          if decision == "PROMOTE":
+              status_emoji = "✅"
+              status_text = "PASS"
+              exit_code = "0"
+          elif decision == "REJECT":
+              status_emoji = "❌"
+              status_text = "FAIL"
+              exit_code = "1"
+          elif decision == "HOLD":
+              status_emoji = "⏸️"
+              status_text = "HOLD"
+              exit_code = "2"
+          else:
+              status_emoji = "❌"
+              status_text = "ERROR"
+              exit_code = "3"
+
+          # Build summary parts separately to avoid YAML parsing issues
+          header = "## Phase AB Promotion Gate Result\n\n"
+          field_table = "| Field | Value |\n|-------|-------|\n"
+          field_table += f"| **Status** | {status_emoji} {status_text} |\n"
+          field_table += f"| **Decision** | `{decision}` |\n"
+          field_table += f"| **Exit Code** | `{exit_code}` |\n\n"
+          
+          exit_codes = "### Exit Code Contract (Strict Mode)\n\n"
+          exit_codes += "| Exit Code | Meaning |\n|-----------|--------|\n"
+          exit_codes += "| 0 | PASS (PROMOTE - candidate is provably better) |\n"
+          exit_codes += "| 1 | FAIL (REJECT - candidate fails guardrails) |\n"
+          exit_codes += "| 2 | HOLD (insufficient evidence - needs more data) |\n"
+          exit_codes += "| 3 | ERROR (runtime/IO/parsing failure) |\n\n"
+          
+          paths = "### Resolved Paths\n\n"
+          paths += "| Run | Path |\n|-----|------|\n"
+          paths += f"| **Candidate** | `{candidate_run}` |\n"
+          paths += f"| **Baseline** | `{baseline_run}` |\n\n"
+          
+          artifacts = "### Artifacts\n\n"
+          artifacts += "- **phase-ab-gate-artifacts**: JSON/MD outputs (manifest, confidence reports, summary)\n"
+          artifacts += "- **phase-ab-gate-evidence-pack**: Cryptographically verifiable evidence pack\n\n"
+          
+          verify = "### Verification\n\n"
+          verify += "After downloading artifacts, verify evidence pack integrity:\n\n"
+          verify += "```bash\n"
+          verify += "unzip phase-ab-gate-evidence-pack.zip -d evidence\n"
+          verify += "python3 -m batch_runs.phase_ab.cli verify-evidence evidence/evidence_pack\n"
+          verify += "```\n\n"
+          
+          footer = "---\n*Generated by Phase AB Promotion Gate (strict mode)*\n"
+          
+          summary = header + field_table + exit_codes + paths + artifacts + verify + footer
+
+          with open(summary_file, "a") as f:
+              f.write(summary)
+
+          print("Job summary written successfully")
+          PYTHON_SCRIPT
+
