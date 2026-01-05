@@ -693,7 +693,7 @@ def write_markdown_report(report: ResearchReport, out_path: Path) -> None:
     
     # Kill switch summary
     if report.all_kill_switches:
-        lines.append(f"⚠️ **Kill Switches Triggered:** {len(report.all_kill_switches)}")
+        lines.append(f"⚠ **Kill Switches Triggered:** {len(report.all_kill_switches)}")
         lines.append("")
     else:
         lines.append("✓ **No Kill Switches Triggered**")
@@ -762,7 +762,7 @@ def write_markdown_report(report: ResearchReport, out_path: Path) -> None:
         
         # Missing baseline
         if vr.missing_baseline:
-            lines.append("### ⚠️ Missing Baseline")
+            lines.append("### ⚠ Missing Baseline")
             lines.append("")
             lines.append("The following variant runs have no matching baseline (excluded from delta aggregates):")
             lines.append("")
@@ -772,7 +772,7 @@ def write_markdown_report(report: ResearchReport, out_path: Path) -> None:
         
         # Missing variant
         if vr.missing_variant:
-            lines.append("### ⚠️ Missing Variant")
+            lines.append("### ⚠ Missing Variant")
             lines.append("")
             lines.append("The following baseline runs have no matching variant:")
             lines.append("")
@@ -796,7 +796,7 @@ def generate_github_summary(report: ResearchReport) -> str:
     lines.append("")
     
     if report.all_kill_switches:
-        lines.append(f"⚠️ **{len(report.all_kill_switches)} kill switch(es) triggered**")
+        lines.append(f"⚠ **{len(report.all_kill_switches)} kill switch(es) triggered**")
         lines.append("")
     
     if report.variant_reports:
@@ -998,7 +998,7 @@ def main() -> int:
     print(f"Variant groups: {report.metadata.get('variant_groups', 0)}")
     
     if report.all_kill_switches:
-        print(f"\n⚠️  {len(report.all_kill_switches)} kill switch(es) triggered:")
+        print(f"\n⚠  {len(report.all_kill_switches)} kill switch(es) triggered:")
         for ks in report.all_kill_switches[:5]:
             print(f"    - {ks[0]}/{ks[1]}@{ks[2]}: {ks[3]}")
         if len(report.all_kill_switches) > 5:
