@@ -1,12 +1,14 @@
 # Docs Integrity Gate
 
 The Docs Integrity Gate is an institutional-grade mechanism that mechanically prevents
-whitepaper drift by enforcing two invariants:
+whitepaper drift by enforcing three invariants:
 
 1. **Implemented References Validation** — All `Implemented:` annotations in the whitepaper
    must point to files that actually exist in the repository.
 2. **Canonical Spec Hash Lock** — The canonical specification appendix (Part II) is locked
    behind a committed SHA256 baseline, preventing unintended modifications.
+3. **Roadmap/Whitepaper Alignment** — Required STATUS markers must be present and match
+   between `ROADMAP.md` and `docs/WHITEPAPER.md` Part I.
 
 ---
 
@@ -52,6 +54,54 @@ If the hashes don't match, the check fails with instructions to either:
 - Revert the spec change, or
 - Intentionally update the baseline (see below)
 
+### 3. Roadmap/Whitepaper Alignment
+
+The tool enforces that critical status claims are consistent between `ROADMAP.md` and
+`docs/WHITEPAPER.md` (Part I only, before the canonical marker).
+
+**Required STATUS markers:**
+
+Both files must contain HTML comment markers for these keys:
+
+| Key | Description |
+|-----|-------------|
+| `MILESTONE_F` | Status of the global hedge allocator (Milestone F) |
+| `CEM` | Status of Cross-Entropy Method adversarial search implementation |
+
+**Marker format:**
+
+```
+<!-- STATUS: KEY = VALUE -->
+```
+
+- Keys and values are case-insensitive (normalized to uppercase)
+- Valid values depend on context: `COMPLETE`, `PARTIAL`, `IMPLEMENTED`, `PLANNED`
+- Whitespace around `=` is flexible
+
+**Example markers:**
+
+In `ROADMAP.md`:
+```markdown
+### Milestone F — Global hedge allocator
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+```
+
+In `docs/WHITEPAPER.md` Part I:
+```markdown
+## Hedging (current implementation)
+<!-- STATUS: MILESTONE_F = COMPLETE -->
+```
+
+**Error format:**
+
+```
+ROADMAP.md:<line> missing STATUS marker: MILESTONE_F
+docs/WHITEPAPER.md:<line> STATUS mismatch for CEM: ROADMAP=IMPLEMENTED WHITEPAPER=PLANNED
+```
+
+**Important:** Only Part I of `WHITEPAPER.md` (before `<!-- CANONICAL_SPEC_V1_BEGIN -->`) is
+scanned for status markers. Part II is hash-locked and cannot be modified.
+
 ---
 
 ## How to Run Locally
@@ -65,7 +115,7 @@ python3 tools/check_docs_integrity.py
 Exit codes:
 - `0` — OK: all checks passed
 - `1` — Internal error (script bug, I/O error)
-- `2` — Integrity violation (missing file, missing symbol, or hash mismatch)
+- `2` — Integrity violation (missing file, missing symbol, hash mismatch, or status mismatch)
 
 ### Update canonical hash
 
@@ -134,6 +184,25 @@ The baseline hash file `docs/CANONICAL_SPEC_V1_SHA256.txt` doesn't exist. Run:
 python3 tools/check_docs_integrity.py --update-canonical-hash
 ```
 
+### "missing STATUS marker: KEY"
+
+A required STATUS marker is missing from one of the files. Add the marker:
+
+```markdown
+<!-- STATUS: KEY = VALUE -->
+```
+
+Required markers (both files must have):
+- `MILESTONE_F` — Hedge allocator milestone status (COMPLETE/PARTIAL)
+- `CEM` — CEM implementation status (IMPLEMENTED/PARTIAL/PLANNED)
+
+### "STATUS mismatch for KEY: ROADMAP=X WHITEPAPER=Y"
+
+The STATUS marker values don't match between files. Either:
+- Update `ROADMAP.md` to use value `Y`
+- Update `docs/WHITEPAPER.md` Part I to use value `X`
+- Investigate which value is correct based on implementation evidence
+
 ---
 
 ## Design Rationale
@@ -142,6 +211,7 @@ This gate exists to:
 
 1. **Prevent documentation rot** — References to code must stay synchronized
 2. **Protect the spec** — The canonical specification is a contract; changes must be deliberate
-3. **Enable CI enforcement** — Failures are actionable with exact file/line/message
-4. **Maintain determinism** — All output is sorted and reproducible
+3. **Prevent status drift** — Milestone/feature status must be consistent across documents
+4. **Enable CI enforcement** — Failures are actionable with exact file/line/message
+5. **Maintain determinism** — All output is sorted and reproducible
 

@@ -245,12 +245,13 @@ Deliverables:
 ---
 
 ### Milestone F — Global hedge allocator (canonical Section 13)
+<!-- STATUS: MILESTONE_F = COMPLETE -->
 **Goal:** hedging is a *global* optimization over allowed venues:
 - LQ controller decides global step size with deadband,
 - allocation chooses cheapest/least-risk venues first,
 - constraints include funding/basis/margin/liquidation/fragmentation.
 
-**Status: PARTIAL (Core implemented, canonical depth pending)**
+**Status: COMPLETE**
 
 Deliverables:
 - Hedge allocator as a first-class component:
@@ -286,10 +287,6 @@ Deliverables:
 - Invariant: `|X| <= band_vol` implies no hedge orders
 - Invariant: Total hedge size <= `max_step_tao`
 - Invariant: Venues at `dist_liq_sigma <= liq_crit_sigma` are hard-skipped
-
-**Remaining work (canonical depth):**
-- Per-venue margin constraint enforcement in allocator
-- Multi-chunk allocation per venue (currently single chunk per venue)
 
 ---
 
@@ -609,8 +606,10 @@ This repo evolves in three layers:
   - generate thousands–millions of scenarios
   - (foundation exists via monte_carlo binary; need advanced scenario generation)
 - [x] **Adversarial / worst-case search** (A2) **IMPLEMENTED**
+<!-- STATUS: CEM = IMPLEMENTED -->
   - `batch_runs/phase_a/adversarial_search_promote.py` provides:
-    - Evolutionary-lite / hill-climb over seeds (per WHITEPAPER B2)
+    - **Cross-Entropy Method (CEM)** adversarial search (per WHITEPAPER B2)
+    - Maintains mean/std per continuous parameter with elite fraction update
     - Deterministic scenario generation with stable filenames
     - Adversarial scoring: maximize kill_switch, drawdown; minimize mean_pnl
     - Top-K failure scenario promotion to `scenarios/v1/adversarial/generated_v1/`
@@ -625,7 +624,7 @@ This repo evolves in three layers:
     - Verifies evidence packs for all scenarios
   - Usage: `python3 -m batch_runs.phase_a.adversarial_search_promote --smoke --out runs/adv_smoke`
   - Documentation: `docs/PHASE_A_ADVERSARIAL_SEARCH.md`
-  - **Remaining:** CEM/evolutionary optimizers, ADR integration, time-to-failure minimization
+  - **Remaining:** ADR integration, time-to-failure minimization
 - [x] **Multi-objective tuning of strategy knobs** (A2)
   - `batch_runs/phase_a/promote_pipeline.py` provides:
     - Deterministic candidate generation (seeded RNG + evolutionary mutation)
