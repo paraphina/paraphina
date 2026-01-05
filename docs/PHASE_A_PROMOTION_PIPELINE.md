@@ -152,6 +152,119 @@ ADR (Adversarial Delta Regression) Options:
   --adr-no-write-md                 Disable Markdown report output
   --adr-write-json                  Write ADR report in JSON (default: on)
   --adr-no-write-json               Disable JSON report output
+
+MC Sharding Options:
+  --mc-shards N                     Number of MC shards (1 = direct, >1 = sharded; default: 1)
+```
+
+## Sharded Monte Carlo Backend
+
+The promotion pipeline supports running Monte Carlo simulations across multiple shards
+for improved statistical power and deterministic reproducibility.
+
+### When to Use Sharding
+
+Use `--mc-shards > 1` when:
+- You need to scale MC runs beyond single-process execution
+- You want deterministic, reproducible sharded execution
+- You require audit-grade evidence packs for MC results
+
+For quick smoke tests and development, `--mc-shards 1` (direct mode) is faster.
+
+### Sharding Contract
+
+When `--mc-shards > 1`, the pipeline uses the `mc_scale` harness internally:
+
+1. **Deterministic seed mapping**: For global run index `i`, `seed_i = base_seed + i` (u64 wrap)
+2. **Contiguous shard ranges**: Each shard runs indices `[start, end)` with no gaps or overlaps
+3. **Aggregation**: All shard results are concatenated, sorted, validated, and summarized
+
+### Sharded MC Commands
+
+```bash
+# Run promotion pipeline with 3 shards
+python3 -m batch_runs.phase_a.promote_pipeline \
+  --smoke \
+  --mc-shards 3 \
+  --study-dir runs/phaseA_smoke_sharded
+
+# Production run with higher shard count
+python3 -m batch_runs.phase_a.promote_pipeline \
+  --trials 50 \
+  --mc-runs 200 \
+  --mc-shards 10 \
+  --study research_sharded
+```
+
+### Sharded MC Output Structure
+
+When sharding is enabled, each trial's MC directory contains:
+
+```
+<trial>/mc/
+├── mc_scale_plan.json          # Shard ranges and configuration
+├── shards/                     # Individual shard outputs
+│   ├── shard_0/
+│   │   ├── mc_runs.jsonl       # Per-run records
+│   │   └── evidence_pack/      # Shard-level evidence
+│   ├── shard_1/
+│   │   └── ...
+│   └── shard_N/
+│       └── ...
+├── mc_runs.jsonl               # Aggregated JSONL (sorted by run_index)
+├── mc_summary.json             # Summary (Rust single source of truth)
+├── mc_scale_manifest.json      # Hashes for audit trail
+└── evidence_pack/              # Root-level evidence pack
+    ├── SHA256SUMS
+    └── manifest.json
+```
+
+### Trial Record Metadata
+
+When sharding is used, trial records in `trials.jsonl` include MC backend metadata:
+
+```json
+{
+  "trial_id": "trial_0001_abc123",
+  "mc_backend": {
+    "backend": "sharded",
+    "shards": 3,
+    "runs": 12,
+    "dir": "trial_0001_abc123/mc",
+    "scale_manifest": "trial_0001_abc123/mc/mc_scale_manifest.json"
+  },
+  ...
+}
+```
+
+For direct mode (`--mc-shards 1`), the record shows:
+
+```json
+{
+  "mc_backend": {
+    "backend": "direct",
+    "shards": 1,
+    "runs": 10,
+    "dir": "trial_0000_def456/mc",
+    "scale_manifest": null
+  },
+  ...
+}
+```
+
+### Evidence Verification
+
+Sharded MC evidence is verified at multiple levels:
+1. Each shard's evidence pack is verified individually
+2. The aggregated root evidence pack is verified
+3. The pipeline fails if any verification fails (no warnings-only)
+
+```bash
+# Verify a sharded MC trial
+./target/release/sim_eval verify-evidence-pack runs/phaseA_study/trial_0001_abc123/mc
+
+# Verify entire study tree
+./target/release/sim_eval verify-evidence-tree runs/phaseA_study
 ```
 
 ## ADR (Adversarial Delta Regression) Gating

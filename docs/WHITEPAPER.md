@@ -132,6 +132,13 @@ Where the canonical spec differs from current code, that difference must be trea
 - **CI gate**: `.github/workflows/mc_scale_smoke.yml`
 - **Documentation**: `docs/PHASE_A_MONTE_CARLO_SCALE.md`
 
+**Promotion pipeline sharded MC integration**
+- `batch_runs/phase_a/promote_pipeline.py` supports `--mc-shards N` flag
+- When `--mc-shards > 1`, uses `mc_scale` harness internally for each trial
+- Trial records include `mc_backend` metadata (`backend`, `shards`, `runs`, `scale_manifest`)
+- Evidence verification enforced at shard and aggregate levels (fatal on failure)
+- **Implemented: `batch_runs/phase_a/promote_pipeline.py`** (`--mc-shards` option)
+
 ---
 
 ## State and accounting model (current implementation)

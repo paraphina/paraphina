@@ -629,6 +629,8 @@ This repo evolves in three layers:
   - Documentation: `docs/PHASE_A_MONTE_CARLO_SCALE.md`
   - **Seed contract**: `seed_i = base_seed + i` (u64 wrap, deterministic)
   - Evidence pack verification at shard and aggregate levels
+  - **Integrated into promotion pipeline**: `--mc-shards N` flag in `promote_pipeline.py`
+  - Trial records include `mc_backend` metadata for audit trail
 - [x] **Adversarial / worst-case search** (A2) **IMPLEMENTED**
 <!-- STATUS: CEM = IMPLEMENTED -->
   - `batch_runs/phase_a/adversarial_search_promote.py` provides:
