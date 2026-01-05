@@ -1239,6 +1239,67 @@ flowchart TD
 
 ---
 
+### Scenario Library v1 (Promotion-Critical OOS Evaluation)
+
+The **Scenario Library v1** provides a canonical, reproducible set of out-of-sample (OOS) evaluation scenarios for the Phase A promotion pipeline. All Phase A study artifacts used downstream by Phase AB necessarily include scenario-library suite results and verified evidence.
+
+#### Scenario Library Contents
+
+The library contains 10 deterministically-generated scenarios covering key shock types:
+
+| Category | Scenarios | Description |
+|----------|-----------|-------------|
+| Volatility Regimes | `slib_v1_vol_low`, `slib_v1_vol_medium`, `slib_v1_vol_high` | Low/medium/high σ regimes |
+| Liquidity Shocks | `slib_v1_liq_spread`, `slib_v1_liq_depth` | Spread widening (+50 bps), depth thinning (-60%) |
+| Venue Outage | `slib_v1_venue_outage` | Venue 0 disabled for 400 steps |
+| Funding Inversions | `slib_v1_fund_flip`, `slib_v1_fund_drift` | Sign flip at step 500, gradual drift |
+| Basis Spikes | `slib_v1_basis_pos`, `slib_v1_basis_neg` | ±100 bps mid divergence on venue 1 |
+
+**Implemented:**
+- Generator/check/smoke CLI: `batch_runs/phase_a/scenario_library_v1.py`
+- Manifest: `scenarios/v1/scenario_library_v1/manifest_sha256.json`
+- Full suite: `scenarios/suites/scenario_library_v1.yaml` (all 10 scenarios)
+- Smoke suite: `scenarios/suites/scenario_library_smoke_v1.yaml` (5 scenarios for CI)
+
+#### Integration with Phase A Promotion Pipeline
+
+The scenario library is **included by default** in the Phase A promotion pipeline:
+
+```bash
+# Full mode (10 scenarios)
+python3 -m batch_runs.phase_a.promote_pipeline --study my_study --study-dir runs/my_study
+
+# Smoke mode (5 scenarios for CI)
+python3 -m batch_runs.phase_a.promote_pipeline --smoke --study-dir runs/phaseA_smoke
+```
+
+**CLI Flags:**
+- `--skip-scenario-library` — Skip scenario library (institutional exception; prints warning)
+- `--scenario-library-suite PATH` — Override suite path (default: auto-select based on `--smoke`)
+
+#### Integrity Verification
+
+At pipeline start, the scenario library manifest is verified against disk contents. If mismatch is detected, the pipeline fails with actionable instructions:
+
+```bash
+# Regenerate scenario library (if files were modified)
+python3 -m batch_runs.phase_a.scenario_library_v1 generate --seed 20260105
+python3 -m batch_runs.phase_a.scenario_library_v1 check
+```
+
+#### Evidence and Promotion Record
+
+- Suite outputs stored under: `<trial>/suite/scenario_library_v1/` (or `scenario_library_smoke_v1/`)
+- Evidence pack verification includes scenario library artifacts (same standards as other suites)
+- `PROMOTION_RECORD.json` contains `scenario_library` section with:
+  - `ran`: bool — whether suite was executed
+  - `skipped`: bool — whether suite was skipped (with `skip_reason`)
+  - `suite_path`: path to suite YAML used
+  - `passed`: bool — whether suite passed
+  - `evidence_verified`: bool — whether evidence packs verified
+
+---
+
 ### What This Chapter Adds
 
 This section formally specifies the Phase A adversarial search and promotion pipeline:

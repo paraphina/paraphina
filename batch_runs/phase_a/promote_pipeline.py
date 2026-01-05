@@ -84,6 +84,12 @@ RESEARCH_SUITE = ROOT / "scenarios" / "suites" / "research_v1.yaml"
 ADVERSARIAL_SUITE_V2 = ROOT / "scenarios" / "suites" / "adversarial_regression_v2.yaml"
 ADVERSARIAL_SUITE_V1 = ROOT / "scenarios" / "suites" / "adversarial_regression_v1.yaml"
 
+# Scenario Library v1 paths (promotion-critical)
+SCENARIO_LIBRARY_FULL_SUITE = ROOT / "scenarios" / "suites" / "scenario_library_v1.yaml"
+SCENARIO_LIBRARY_SMOKE_SUITE = ROOT / "scenarios" / "suites" / "scenario_library_smoke_v1.yaml"
+SCENARIO_LIBRARY_DIR = ROOT / "scenarios" / "v1" / "scenario_library_v1"
+SCENARIO_LIBRARY_MANIFEST = SCENARIO_LIBRARY_DIR / "manifest_sha256.json"
+
 
 def get_adversarial_suite() -> Tuple[Path, str]:
     """
@@ -98,6 +104,154 @@ def get_adversarial_suite() -> Tuple[Path, str]:
     if ADVERSARIAL_SUITE_V2.exists():
         return ADVERSARIAL_SUITE_V2, "v2"
     return ADVERSARIAL_SUITE_V1, "v1"
+
+
+def get_scenario_library_suite(smoke: bool, override_path: Optional[Path] = None) -> Path:
+    """
+    Get the scenario library suite path.
+    
+    Args:
+        smoke: If True, use the smoke suite (5 scenarios); else use full suite (10 scenarios)
+        override_path: Optional path override for custom suite
+    
+    Returns: Path to the scenario library suite
+    """
+    if override_path is not None:
+        return override_path
+    if smoke:
+        return SCENARIO_LIBRARY_SMOKE_SUITE
+    return SCENARIO_LIBRARY_FULL_SUITE
+
+
+# ===========================================================================
+# Scenario Library Integrity Check
+# ===========================================================================
+
+def check_scenario_library_integrity(verbose: bool = True) -> Tuple[bool, List[str]]:
+    """
+    Verify scenario library manifest integrity.
+    
+    Recomputes SHA-256 hashes of all files in the scenario library and
+    validates them against the manifest. This ensures no tampering or
+    drift has occurred.
+    
+    Args:
+        verbose: Print progress messages
+    
+    Returns:
+        (success, list of error messages)
+    """
+    errors: List[str] = []
+    
+    if not SCENARIO_LIBRARY_MANIFEST.exists():
+        errors.append(f"Scenario library manifest not found: {SCENARIO_LIBRARY_MANIFEST}")
+        errors.append("Run: python3 -m batch_runs.phase_a.scenario_library_v1 generate --seed <seed>")
+        return False, errors
+    
+    try:
+        with open(SCENARIO_LIBRARY_MANIFEST, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        errors.append(f"Failed to read manifest: {e}")
+        return False, errors
+    
+    # Check schema version
+    if manifest.get("schema_version") != 1:
+        errors.append(f"Unknown manifest schema_version: {manifest.get('schema_version')}")
+    
+    # Check all files
+    expected_files = manifest.get("files", {})
+    
+    for filename, expected_hash in sorted(expected_files.items()):
+        filepath = SCENARIO_LIBRARY_DIR / filename
+        
+        if not filepath.exists():
+            errors.append(f"Missing file: {filename}")
+            continue
+        
+        # Compute hash
+        h = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        actual_hash = h.hexdigest()
+        
+        if actual_hash != expected_hash:
+            errors.append(
+                f"Hash mismatch for {filename}: "
+                f"expected {expected_hash[:16]}..., "
+                f"got {actual_hash[:16]}..."
+            )
+    
+    # Check for extra files (excluding manifest)
+    actual_files = set()
+    for p in SCENARIO_LIBRARY_DIR.iterdir():
+        if p.is_file() and p.name != "manifest_sha256.json":
+            actual_files.add(p.name)
+    
+    manifest_files = set(expected_files.keys())
+    extra = actual_files - manifest_files
+    if extra:
+        errors.append(f"Extra files not in manifest: {sorted(extra)}")
+    
+    if verbose:
+        if errors:
+            print(f"Scenario library integrity check FAILED ({len(errors)} errors):")
+            for e in errors:
+                print(f"  - {e}")
+        else:
+            print(f"Scenario library integrity check PASSED ({len(expected_files)} files verified)")
+    
+    return len(errors) == 0, errors
+
+
+def validate_scenario_library_suite(suite_path: Path, verbose: bool = True) -> Tuple[bool, List[str]]:
+    """
+    Validate that a scenario library suite file exists and references valid scenarios.
+    
+    Args:
+        suite_path: Path to the suite YAML file
+        verbose: Print progress messages
+    
+    Returns:
+        (success, list of error messages)
+    """
+    errors: List[str] = []
+    
+    if not suite_path.exists():
+        errors.append(f"Suite file not found: {suite_path}")
+        return False, errors
+    
+    # Read suite content
+    try:
+        content = suite_path.read_text()
+    except IOError as e:
+        errors.append(f"Failed to read suite file: {e}")
+        return False, errors
+    
+    # Find scenario paths (simple line-based parsing)
+    scenario_count = 0
+    for line in content.split("\n"):
+        line = line.strip()
+        if line.startswith("- path:"):
+            path_str = line.split(":", 1)[1].strip()
+            full_path = ROOT / path_str
+            if not full_path.exists():
+                errors.append(f"Referenced scenario not found: {path_str}")
+            scenario_count += 1
+    
+    if scenario_count == 0:
+        errors.append(f"Suite has 0 scenarios: {suite_path}")
+    
+    if verbose:
+        if errors:
+            print(f"Suite validation FAILED ({len(errors)} errors):")
+            for e in errors:
+                print(f"  - {e}")
+        else:
+            print(f"Suite validation PASSED ({scenario_count} scenarios)")
+    
+    return len(errors) == 0, errors
 
 
 DEFAULT_RUNS_DIR = ROOT / "runs"
@@ -175,6 +329,48 @@ def _verify_evidence_pack(out_dir: Path, verbose: bool = True) -> int:
     except Exception as e:
         print(f"    ERROR: Failed to run sim_eval verify-evidence-pack: {e}")
         return 1
+
+
+# ===========================================================================
+# Scenario Library Configuration
+# ===========================================================================
+
+@dataclass
+class ScenarioLibraryConfig:
+    """Configuration for Scenario Library v1 integration."""
+    enabled: bool = True  # Scenario library is INCLUDED BY DEFAULT
+    suite_path: Optional[Path] = None  # Override suite path; None uses default
+    smoke_mode: bool = False  # If True, use smoke suite; else use full suite
+    
+    def get_suite_path(self) -> Path:
+        """Get the effective suite path."""
+        return get_scenario_library_suite(self.smoke_mode, self.suite_path)
+
+
+@dataclass
+class ScenarioLibraryResult:
+    """Result from running scenario library suite."""
+    ran: bool = False
+    skipped: bool = False
+    skip_reason: Optional[str] = None
+    suite_path: Optional[str] = None
+    output_dir: Optional[str] = None
+    passed: bool = False
+    errors: List[str] = field(default_factory=list)
+    evidence_verified: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict for JSON serialization."""
+        return {
+            "ran": self.ran,
+            "skipped": self.skipped,
+            "skip_reason": self.skip_reason,
+            "suite_path": self.suite_path,
+            "output_dir": self.output_dir,
+            "passed": self.passed,
+            "errors": self.errors,
+            "evidence_verified": self.evidence_verified,
+        }
 
 
 # ===========================================================================
@@ -393,6 +589,9 @@ class TrialResult:
     adr_passed: bool = True  # Default True when ADR not enabled
     adr_results: List[Any] = field(default_factory=list)  # List[ADRResult]
     
+    # Scenario Library results (promotion-critical)
+    scenario_library_result: Optional[Any] = None  # ScenarioLibraryResult
+    
     # Evidence verification
     evidence_verified: bool = False
     evidence_errors: List[str] = field(default_factory=list)
@@ -492,6 +691,7 @@ class TrialResult:
             "adversarial_passed": self.adversarial_passed,
             "adr_passed": self.adr_passed,
             "adr_results": adr_results_serialized,
+            "scenario_library": self.scenario_library_result.to_dict() if self.scenario_library_result else None,
             "evidence_verified": self.evidence_verified,
             "evidence_errors": self.evidence_errors,
             "is_valid": self.is_valid,
@@ -1533,6 +1733,7 @@ def evaluate_trial(
     verbose: bool = True,
     adr_config: Optional[ADRConfig] = None,
     alpha: float = 0.05,
+    scenario_library_config: Optional[ScenarioLibraryConfig] = None,
 ) -> TrialResult:
     """
     Evaluate a single candidate trial.
@@ -1705,11 +1906,66 @@ def evaluate_trial(
             if verbose:
                 print(f"    ✓ ADR gating passed")
     
+    # Step 6: Scenario Library suite (promotion-critical, default enabled)
+    scenario_library_result = ScenarioLibraryResult()
+    
+    if scenario_library_config and scenario_library_config.enabled:
+        scenario_library_suite = scenario_library_config.get_suite_path()
+        scenario_library_suite_name = scenario_library_suite.stem
+        scenario_library_suite_dir = trial_dir / "suite" / scenario_library_suite_name
+        
+        if verbose:
+            print(f"    Running scenario library suite: {scenario_library_suite.name}")
+        
+        scenario_library_result.suite_path = str(scenario_library_suite)
+        scenario_library_result.output_dir = str(scenario_library_suite_dir)
+        
+        if not scenario_library_suite.exists():
+            scenario_library_result.ran = False
+            scenario_library_result.passed = False
+            scenario_library_result.errors.append(f"Scenario library suite not found: {scenario_library_suite}")
+            evidence_errors.append(f"Scenario library suite not found: {scenario_library_suite}")
+            if verbose:
+                print(f"    ✗ Scenario library suite file not found")
+        else:
+            passed, errors = run_suite(scenario_library_suite, scenario_library_suite_dir, env_overlay, verbose)
+            scenario_library_result.ran = True
+            scenario_library_result.passed = passed
+            
+            if not passed:
+                scenario_library_result.errors.extend(errors)
+                evidence_errors.extend(errors)
+                if verbose:
+                    print(f"    ✗ Scenario library suite FAILED")
+            else:
+                # Verify scenario library suite evidence
+                verified, errs = verify_evidence_tree(scenario_library_suite_dir, verbose)
+                scenario_library_result.evidence_verified = verified
+                if not verified:
+                    scenario_library_result.errors.extend(errs)
+                    evidence_errors.extend(errs)
+                    if verbose:
+                        print(f"    ✗ Scenario library suite evidence verification FAILED")
+                else:
+                    if verbose:
+                        print(f"    ✓ Scenario library suite passed")
+    elif scenario_library_config and not scenario_library_config.enabled:
+        scenario_library_result.skipped = True
+        scenario_library_result.skip_reason = "Scenario library skipped (--skip-scenario-library)"
+        if verbose:
+            print(f"    ⚠ WARNING: Scenario library SKIPPED (institutional exception)")
+    
     # Evidence is verified only if ALL verification steps passed
+    scenario_library_passed = (
+        scenario_library_result.skipped or  # Skipped is allowed (but recorded)
+        (scenario_library_result.ran and scenario_library_result.passed and scenario_library_result.evidence_verified)
+    ) if scenario_library_config and scenario_library_config.enabled else True
+    
     evidence_verified = (
         final_verified
         and research_passed
         and adversarial_passed
+        and scenario_library_passed
         and not error_message
     )
     
@@ -1734,6 +1990,7 @@ def evaluate_trial(
         adversarial_passed=adversarial_passed,
         adr_passed=adr_passed,
         adr_results=adr_results,
+        scenario_library_result=scenario_library_result,
         evidence_verified=evidence_verified,
         evidence_errors=evidence_errors,
         duration_sec=duration_sec,
@@ -2005,6 +2262,17 @@ def promote_winner(
             "adversarial": winner.adversarial_passed,
             "adr": winner.adr_passed,
         },
+        # Scenario Library v1 (promotion-critical)
+        "scenario_library": winner.scenario_library_result.to_dict() if winner.scenario_library_result else {
+            "ran": False,
+            "skipped": True,
+            "skip_reason": "Not configured",
+            "suite_path": None,
+            "output_dir": None,
+            "passed": False,
+            "errors": [],
+            "evidence_verified": False,
+        },
     }
     
     # Add ADR results if present
@@ -2171,6 +2439,7 @@ def run_pipeline(
     verbose: bool = True,
     adr_config: Optional[ADRConfig] = None,
     phase_b_config: Optional[PhaseBConfig] = None,
+    scenario_library_config: Optional[ScenarioLibraryConfig] = None,
 ) -> Tuple[List[TrialResult], List[TrialResult], Dict[str, Optional[Tuple[Path, Path]]]]:
     """
     Run the complete promotion pipeline.
@@ -2210,13 +2479,58 @@ def run_pipeline(
             print(f"  Phase B baseline: {phase_b_config.baseline_run_dir}")
     else:
         print(f"  Phase B enabled: False")
+    
+    # Scenario Library info
+    if scenario_library_config and scenario_library_config.enabled:
+        suite_path = scenario_library_config.get_suite_path()
+        print(f"  Scenario Library enabled: True")
+        print(f"  Scenario Library suite: {suite_path}")
+        if scenario_library_config.smoke_mode:
+            print(f"  Scenario Library mode: smoke (5 scenarios)")
+        else:
+            print(f"  Scenario Library mode: full (10 scenarios)")
+    elif scenario_library_config and not scenario_library_config.enabled:
+        print(f"  Scenario Library enabled: False (SKIPPED - institutional exception)")
+        print(f"  ⚠ WARNING: Scenario library is being skipped. Promotion artifacts may not meet full OOS evaluation requirements.")
+    else:
+        print(f"  Scenario Library enabled: True (default)")
+        # Create default config if not provided
+        scenario_library_config = ScenarioLibraryConfig(enabled=True, smoke_mode=smoke)
+        print(f"  Scenario Library suite: {scenario_library_config.get_suite_path()}")
     print()
+    
+    # [Pre-flight] Enforce scenario library integrity at pipeline start
+    if scenario_library_config and scenario_library_config.enabled:
+        print("[0/6] Verifying scenario library integrity...")
+        integrity_ok, integrity_errors = check_scenario_library_integrity(verbose=verbose)
+        if not integrity_ok:
+            print("=" * 70)
+            print("FATAL: Scenario library integrity check failed!")
+            print("=" * 70)
+            print("The scenario library manifest does not match the files on disk.")
+            print("This may indicate:")
+            print("  - Uncommitted modifications to scenario files")
+            print("  - Manifest was not regenerated after file changes")
+            print()
+            print("To fix:")
+            print("  python3 -m batch_runs.phase_a.scenario_library_v1 generate --seed <seed>")
+            print("  python3 -m batch_runs.phase_a.scenario_library_v1 check")
+            print("  git add scenarios/v1/scenario_library_v1/")
+            print("  git commit -m 'Regenerate scenario library'")
+            print()
+            raise RuntimeError(f"Scenario library integrity check failed: {integrity_errors}")
+        
+        # Validate suite file
+        suite_path = scenario_library_config.get_suite_path()
+        suite_ok, suite_errors = validate_scenario_library_suite(suite_path, verbose=verbose)
+        if not suite_ok:
+            raise RuntimeError(f"Scenario library suite validation failed: {suite_errors}")
     
     # Create study directory
     study_dir.mkdir(parents=True, exist_ok=True)
     
     # Generate candidates
-    print("[1/5] Generating candidates...")
+    print("[1/6] Generating candidates...")
     if smoke:
         candidates = generate_smoke_candidates()[:trials]
     else:
@@ -2225,7 +2539,7 @@ def run_pipeline(
     print(f"  Generated {len(candidates)} candidates")
     
     # Evaluate all candidates
-    print(f"\n[2/5] Evaluating candidates...")
+    print(f"\n[2/6] Evaluating candidates...")
     print(f"  Statistical confidence level: alpha={budgets.alpha}")
     results: List[TrialResult] = []
     
@@ -2242,11 +2556,12 @@ def run_pipeline(
             verbose=verbose,
             adr_config=adr_config,
             alpha=budgets.alpha,
+            scenario_library_config=scenario_library_config,
         )
         results.append(result)
     
     # Compute Pareto frontier
-    print(f"\n[3/5] Computing Pareto frontier...")
+    print(f"\n[3/6] Computing Pareto frontier...")
     pareto = compute_pareto_frontier(results)
     print(f"  Pareto size: {len(pareto)}")
     
@@ -2255,7 +2570,7 @@ def run_pipeline(
               f"kill_rate={r.mc_kill_prob_point:.3f} (ucb={r.mc_kill_ucb:.3f}), dd_cvar={r.mc_drawdown_cvar:.2f}")
     
     # Write outputs
-    print(f"\n[4/5] Writing outputs...")
+    print(f"\n[4/6] Writing outputs...")
     
     trials_jsonl = study_dir / "trials.jsonl"
     write_trials_jsonl(results, trials_jsonl)
@@ -2270,7 +2585,7 @@ def run_pipeline(
     print(f"  ✓ {pareto_csv}")
     
     # Promote winners
-    print(f"\n[5/5] Promoting winners...")
+    print(f"\n[5/6] Promoting winners...")
     promotions: Dict[str, Optional[Tuple[Path, Path]]] = {}
     
     for tier_name, budget in sorted(budgets.tiers.items()):
@@ -2559,6 +2874,22 @@ ADR Outputs (when --adr-enable):
         help="Don't require strict dominance (only non-inferiority) for Phase B",
     )
     
+    # Scenario Library v1 options (promotion-critical)
+    parser.add_argument(
+        "--skip-scenario-library",
+        action="store_true",
+        default=False,
+        help="Skip scenario library suite (INSTITUTIONAL EXCEPTION - promotion artifacts may not meet full OOS evaluation)",
+    )
+    
+    parser.add_argument(
+        "--scenario-library-suite",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Override scenario library suite path (default: auto-select based on --smoke mode)",
+    )
+    
     args = parser.parse_args(argv)
     
     # Handle smoke mode
@@ -2613,6 +2944,23 @@ ADR Outputs (when --adr-enable):
             baseline_run_dir=Path(args.phase_b_baseline) if args.phase_b_baseline else None,
         )
     
+    # Build Scenario Library config (ENABLED BY DEFAULT)
+    scenario_library_config = ScenarioLibraryConfig(
+        enabled=not args.skip_scenario_library,
+        suite_path=Path(args.scenario_library_suite) if args.scenario_library_suite else None,
+        smoke_mode=args.smoke,
+    )
+    
+    # Print warning if scenario library is skipped
+    if args.skip_scenario_library:
+        print("=" * 70)
+        print("⚠ WARNING: SCENARIO LIBRARY SKIPPED (--skip-scenario-library)")
+        print("=" * 70)
+        print("This is an INSTITUTIONAL EXCEPTION. Promotion artifacts may not")
+        print("meet full out-of-sample evaluation requirements.")
+        print("=" * 70)
+        print()
+    
     # Run pipeline
     try:
         results, pareto, promotions = run_pipeline(
@@ -2627,6 +2975,7 @@ ADR Outputs (when --adr-enable):
             verbose=not args.quiet,
             adr_config=adr_config,
             phase_b_config=phase_b_config,
+            scenario_library_config=scenario_library_config,
         )
     except Exception as e:
         print(f"\nERROR: Pipeline failed: {e}", file=sys.stderr)
