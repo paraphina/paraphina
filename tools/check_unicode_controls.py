@@ -72,6 +72,37 @@ ZERO_WIDTH_AND_FORMAT: set[int] = {
     0x180E,  # MONGOLIAN VOWEL SEPARATOR (deprecated but still appears)
 }
 
+# Problematic whitespace characters (look like spaces but aren't)
+# These can cause GitHub "hidden Unicode" warnings and confuse parsers
+PROBLEMATIC_WHITESPACE: set[int] = {
+    0x00A0,  # NO-BREAK SPACE (NBSP)
+    0x1680,  # OGHAM SPACE MARK
+    0x2000,  # EN QUAD
+    0x2001,  # EM QUAD
+    0x2002,  # EN SPACE
+    0x2003,  # EM SPACE
+    0x2004,  # THREE-PER-EM SPACE
+    0x2005,  # FOUR-PER-EM SPACE
+    0x2006,  # SIX-PER-EM SPACE
+    0x2007,  # FIGURE SPACE
+    0x2008,  # PUNCTUATION SPACE
+    0x2009,  # THIN SPACE
+    0x200A,  # HAIR SPACE
+    0x202F,  # NARROW NO-BREAK SPACE (NNBSP)
+    0x205F,  # MEDIUM MATHEMATICAL SPACE
+    0x3000,  # IDEOGRAPHIC SPACE
+}
+
+# Line/paragraph separators (can break YAML/code parsing)
+LINE_SEPARATORS: set[int] = {
+    0x2028,  # LINE SEPARATOR
+    0x2029,  # PARAGRAPH SEPARATOR
+    0x0085,  # NEXT LINE (NEL) - C1 control
+}
+
+# C1 control characters (U+0080..U+009F) - often indicate encoding issues
+C1_CONTROLS: set[int] = set(range(0x0080, 0x00A0))
+
 # Variation selectors: U+FE00..U+FE0F
 VARIATION_SELECTORS_1: set[int] = set(range(0xFE00, 0xFE10))
 
@@ -91,9 +122,19 @@ ASCII_CONTROLS: set[int] = (
 FORBIDDEN_CODEPOINTS: set[int] = (
     BIDI_CONTROLS |
     ZERO_WIDTH_AND_FORMAT |
+    PROBLEMATIC_WHITESPACE |
+    LINE_SEPARATORS |
+    C1_CONTROLS |
     VARIATION_SELECTORS_1 |
     VARIATION_SELECTORS_SUPPLEMENT |
     ASCII_CONTROLS
+)
+
+# Characters that should be replaced with ASCII space (preserve indentation)
+# rather than deleted
+WHITESPACE_REPLACEMENTS: set[int] = (
+    PROBLEMATIC_WHITESPACE |
+    {0x200B}  # ZWSP can also act as whitespace in some contexts
 )
 
 
@@ -219,12 +260,22 @@ def scan_file(path: Path) -> list[Finding]:
 
 
 def sanitize_content(content: str) -> str:
-    """Remove all forbidden Unicode characters from content."""
+    """
+    Sanitize content by handling forbidden Unicode characters.
+    
+    - Whitespace-like forbidden characters (NBSP, etc.) are replaced with ASCII space
+      to preserve indentation (important for YAML)
+    - Other forbidden characters (bidi controls, variation selectors, etc.) are removed
+    """
     result = []
     for char in content:
         codepoint = ord(char)
         if not is_forbidden(codepoint):
             result.append(char)
+        elif codepoint in WHITESPACE_REPLACEMENTS:
+            # Replace whitespace-like chars with ASCII space to preserve indentation
+            result.append(' ')
+        # else: remove the character (bidi controls, variation selectors, etc.)
     return ''.join(result)
 
 

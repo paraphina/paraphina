@@ -16,13 +16,18 @@ from pathlib import Path
 from tools.check_unicode_controls import (
     ASCII_CONTROLS,
     BIDI_CONTROLS,
+    C1_CONTROLS,
     FORBIDDEN_CODEPOINTS,
+    LINE_SEPARATORS,
+    PROBLEMATIC_WHITESPACE,
     VARIATION_SELECTORS_1,
     VARIATION_SELECTORS_SUPPLEMENT,
+    WHITESPACE_REPLACEMENTS,
     ZERO_WIDTH_AND_FORMAT,
     Finding,
     fix_file,
     format_line_with_placeholder,
+    get_tracked_files,
     get_unicode_info,
     is_forbidden,
     sanitize_content,
@@ -114,6 +119,38 @@ class TestForbiddenCodepoints(unittest.TestCase):
         for cp in allowed:
             self.assertNotIn(cp, FORBIDDEN_CODEPOINTS,
                             f"U+{cp:04X} should NOT be forbidden")
+
+    def test_problematic_whitespace_are_forbidden(self):
+        """Problematic whitespace characters (NBSP, etc.) should be forbidden."""
+        whitespace = [
+            0x00A0,  # NO-BREAK SPACE (NBSP)
+            0x202F,  # NARROW NO-BREAK SPACE (NNBSP)
+            0x2003,  # EM SPACE
+            0x3000,  # IDEOGRAPHIC SPACE
+        ]
+        for cp in whitespace:
+            self.assertIn(cp, FORBIDDEN_CODEPOINTS,
+                         f"U+{cp:04X} should be forbidden")
+            self.assertIn(cp, PROBLEMATIC_WHITESPACE,
+                         f"U+{cp:04X} should be in PROBLEMATIC_WHITESPACE")
+
+    def test_line_separators_are_forbidden(self):
+        """Line/paragraph separators should be forbidden."""
+        separators = [0x2028, 0x2029, 0x0085]
+        for cp in separators:
+            self.assertIn(cp, FORBIDDEN_CODEPOINTS,
+                         f"U+{cp:04X} should be forbidden")
+            self.assertIn(cp, LINE_SEPARATORS,
+                         f"U+{cp:04X} should be in LINE_SEPARATORS")
+
+    def test_c1_controls_are_forbidden(self):
+        """C1 control characters (U+0080..U+009F) should be forbidden."""
+        test_cps = [0x0080, 0x0085, 0x008D, 0x009F]
+        for cp in test_cps:
+            self.assertIn(cp, FORBIDDEN_CODEPOINTS,
+                         f"U+{cp:04X} should be forbidden")
+            self.assertIn(cp, C1_CONTROLS,
+                         f"U+{cp:04X} should be in C1_CONTROLS")
 
 
 class TestScanContent(unittest.TestCase):
@@ -232,6 +269,33 @@ class TestScanContent(unittest.TestCase):
         
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].codepoint, 0x180E)
+
+    def test_detect_nbsp(self):
+        """U+00A0 (NO-BREAK SPACE) should be detected."""
+        nbsp = chr(0x00A0)
+        content = f"text{nbsp}more\n"
+        findings = scan_content(content, "test.py")
+        
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].codepoint, 0x00A0)
+
+    def test_detect_line_separator(self):
+        """U+2028 (LINE SEPARATOR) should be detected."""
+        ls = chr(0x2028)
+        content = f"line1{ls}line2\n"
+        findings = scan_content(content, "test.py")
+        
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].codepoint, 0x2028)
+
+    def test_detect_c1_control(self):
+        """C1 control character (U+0085 NEL) should be detected."""
+        nel = chr(0x0085)
+        content = f"text{nel}more\n"
+        findings = scan_content(content, "test.py")
+        
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].codepoint, 0x0085)
     
     def test_detect_multiple_violations(self):
         """Multiple forbidden characters should all be detected."""
@@ -336,11 +400,12 @@ class TestSanitizeContent(unittest.TestCase):
         self.assertNotIn(rlo, result)
     
     def test_sanitize_removes_zero_width(self):
-        """Sanitize should remove zero-width characters."""
+        """Sanitize should remove/replace zero-width characters."""
         zws = chr(0x200B)
         content = f"hello{zws}world"
         result = sanitize_content(content)
-        self.assertEqual(result, "helloworld")
+        # ZWSP is in WHITESPACE_REPLACEMENTS, so it becomes a space
+        self.assertEqual(result, "hello world")
     
     def test_sanitize_removes_variation_selectors(self):
         """Sanitize should remove variation selectors."""
@@ -368,12 +433,39 @@ class TestSanitizeContent(unittest.TestCase):
         result = sanitize_content(content)
         self.assertEqual(result, content)
 
+    def test_sanitize_replaces_nbsp_with_space(self):
+        """Sanitize should replace NBSP with regular space (preserve indentation)."""
+        nbsp = chr(0x00A0)
+        content = f"  {nbsp}{nbsp}indented text"  # NBSP used for indentation
+        result = sanitize_content(content)
+        self.assertEqual(result, "    indented text")
+        self.assertNotIn(nbsp, result)
+        self.assertEqual(len(result), len(content))  # Same length preserved
+
+    def test_sanitize_replaces_nnbsp_with_space(self):
+        """Sanitize should replace NNBSP with regular space."""
+        nnbsp = chr(0x202F)
+        content = f"text{nnbsp}more"
+        result = sanitize_content(content)
+        self.assertEqual(result, "text more")
+        self.assertNotIn(nnbsp, result)
+
+    def test_sanitize_yaml_indentation_preserved(self):
+        """Sanitize should preserve YAML indentation when replacing NBSP."""
+        nbsp = chr(0x00A0)
+        # Simulated YAML with NBSP in indentation
+        yaml_content = f"key:\n{nbsp}{nbsp}value: test\n"
+        result = sanitize_content(yaml_content)
+        self.assertEqual(result, "key:\n  value: test\n")
+        # Verify it's still valid YAML-like structure
+        self.assertEqual(result.count('\n'), yaml_content.count('\n'))
+
 
 class TestFixFile(unittest.TestCase):
     """Test the --fix mode file fixing functionality."""
     
     def test_fix_removes_forbidden_chars(self):
-        """Fix should remove forbidden characters from file."""
+        """Fix should remove/replace forbidden characters from file."""
         rlo = chr(0x202E)
         zws = chr(0x200B)
         
@@ -389,8 +481,9 @@ class TestFixFile(unittest.TestCase):
             self.assertTrue(modified, "File should be modified")
             
             # Read back and verify
+            # RLO is removed, ZWS is replaced with space (it's in WHITESPACE_REPLACEMENTS)
             content = path.read_text(encoding='utf-8')
-            self.assertEqual(content, "texthiddenchars\n")
+            self.assertEqual(content, "texthidden chars\n")
             self.assertNotIn(rlo, content)
             self.assertNotIn(zws, content)
             
@@ -463,13 +556,13 @@ class TestFixFile(unittest.TestCase):
             path.unlink()
     
     def test_fix_multiple_forbidden_chars(self):
-        """Fix should remove all forbidden characters in one pass."""
+        """Fix should remove/replace all forbidden characters in one pass."""
+        # Use only chars that are removed (not replaced with space)
         chars = [
-            chr(0x202E),  # bidi
-            chr(0x200B),  # zero-width
-            chr(0x034F),  # CGJ
-            chr(0xFE0F),  # variation selector
-            chr(0x07),    # ASCII control
+            chr(0x202E),  # bidi - removed
+            chr(0x034F),  # CGJ - removed
+            chr(0xFE0F),  # variation selector - removed
+            chr(0x07),    # ASCII control - removed
         ]
         
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py',
@@ -598,6 +691,150 @@ class TestFindingNamedTuple(unittest.TestCase):
         self.assertEqual(finding.name, "RIGHT-TO-LEFT OVERRIDE")
         self.assertEqual(finding.category, "Cf")
         self.assertEqual(finding.line_content, "test line")
+
+
+class TestYAMLCoverage(unittest.TestCase):
+    """Test that YAML files are properly covered by the scanner."""
+    
+    def test_yml_files_included_in_scan(self):
+        """Scanner should include .yml files in its file list."""
+        # Create a temp .yml file and verify scan_file works on it
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml',
+                                          delete=False, encoding='utf-8') as f:
+            f.write("name: test\nsteps:\n  - run: echo hello\n")
+            f.flush()
+            path = Path(f.name)
+        
+        try:
+            findings = scan_file(path)
+            self.assertEqual(len(findings), 0,
+                           "Clean YAML file should have no findings")
+        finally:
+            path.unlink()
+    
+    def test_yaml_files_included_in_scan(self):
+        """Scanner should include .yaml files in its file list."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                          delete=False, encoding='utf-8') as f:
+            f.write("scenario_id: test\nversion: 1\n")
+            f.flush()
+            path = Path(f.name)
+        
+        try:
+            findings = scan_file(path)
+            self.assertEqual(len(findings), 0,
+                           "Clean YAML file should have no findings")
+        finally:
+            path.unlink()
+    
+    def test_yml_with_hidden_char_detected(self):
+        """A .yml file containing a hidden char should be detected."""
+        nbsp = chr(0x00A0)  # NBSP - common hidden char issue in YAML
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml',
+                                          delete=False, encoding='utf-8') as f:
+            # NBSP in indentation (common mistake from copy-paste)
+            f.write(f"name: test\nsteps:\n{nbsp}{nbsp}- run: echo\n")
+            f.flush()
+            path = Path(f.name)
+        
+        try:
+            findings = scan_file(path)
+            self.assertEqual(len(findings), 2,  # Two NBSP chars
+                           "NBSP in YAML should be detected")
+            self.assertEqual(findings[0].codepoint, 0x00A0)
+        finally:
+            path.unlink()
+    
+    def test_yml_fix_preserves_indentation(self):
+        """--fix on a .yml file should preserve indentation structure."""
+        nbsp = chr(0x00A0)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml',
+                                          delete=False, encoding='utf-8') as f:
+            original = f"name: test\nsteps:\n{nbsp}{nbsp}- run: echo\n"
+            f.write(original)
+            f.flush()
+            path = Path(f.name)
+        
+        try:
+            # Fix the file
+            modified = fix_file(path)
+            self.assertTrue(modified, "File should be modified")
+            
+            # Read back
+            content = path.read_text(encoding='utf-8')
+            expected = "name: test\nsteps:\n  - run: echo\n"
+            self.assertEqual(content, expected)
+            
+            # Subsequent scan should pass
+            findings = scan_file(path)
+            self.assertEqual(len(findings), 0,
+                           "Fixed file should have no findings")
+        finally:
+            path.unlink()
+    
+    def test_yml_with_bidi_in_string_detected(self):
+        """Bidi override in a YAML string value should be detected."""
+        rlo = chr(0x202E)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml',
+                                          delete=False, encoding='utf-8') as f:
+            f.write(f"name: test{rlo}name\n")
+            f.flush()
+            path = Path(f.name)
+        
+        try:
+            findings = scan_file(path)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].codepoint, 0x202E)
+        finally:
+            path.unlink()
+    
+    def test_allowed_unicode_in_yml_not_flagged(self):
+        """Allowed Unicode (emoji, checkmarks) in YAML should NOT be flagged."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml',
+                                          delete=False, encoding='utf-8') as f:
+            # These are legitimate and should not be flagged
+            f.write("name: test\nsteps:\n  - name: ✓ Check passed\n")
+            f.write("    run: echo '🚀 Deploying...'\n")
+            f.flush()
+            path = Path(f.name)
+        
+        try:
+            findings = scan_file(path)
+            self.assertEqual(len(findings), 0,
+                           "Legitimate Unicode in YAML should not be flagged")
+        finally:
+            path.unlink()
+
+
+class TestGitTrackedFilesIncludesYAML(unittest.TestCase):
+    """Test that get_tracked_files includes YAML files."""
+    
+    def test_tracked_files_includes_yml(self):
+        """get_tracked_files should include .yml files from .github/workflows/."""
+        try:
+            files = get_tracked_files()
+        except Exception:
+            self.skipTest("Not in a git repository")
+        
+        yml_files = [f for f in files if f.suffix == '.yml']
+        yaml_files = [f for f in files if f.suffix == '.yaml']
+        
+        # We should have some YAML files in this repo
+        self.assertTrue(len(yml_files) > 0 or len(yaml_files) > 0,
+                       "Should have at least one .yml or .yaml file tracked")
+    
+    def test_github_workflows_included(self):
+        """get_tracked_files should include .github/workflows/*.yml."""
+        try:
+            files = get_tracked_files()
+        except Exception:
+            self.skipTest("Not in a git repository")
+        
+        workflow_files = [f for f in files 
+                         if str(f).startswith('.github/workflows/') and f.suffix == '.yml']
+        
+        self.assertTrue(len(workflow_files) > 0,
+                       "Should have workflow files in .github/workflows/")
 
 
 if __name__ == '__main__':
