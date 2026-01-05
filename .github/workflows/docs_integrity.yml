@@ -1,0 +1,30 @@
+name: docs-integrity
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  docs-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Show Python version
+        run: python3 --version
+
+      - name: Run Unicode controls scanner
+        run: python3 tools/check_unicode_controls.py
+
+      - name: Run Docs Integrity Gate
+        run: python3 tools/check_docs_integrity.py
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -q
+
