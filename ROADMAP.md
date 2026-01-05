@@ -584,9 +584,18 @@ This repo evolves in three layers:
 
 **Status: COMPLETE (A1 + A2 fully implemented)**
 
-- [ ] Scenario library (seeded, reproducible)
-  - volatility regimes, spread/depth shocks, venue outages, funding inversions, basis spikes
-  - latency / partial fill / cancel storm modelling
+- [x] **Scenario library (seeded, reproducible)** (v1 PARTIAL)
+  - **v1 implemented (10 scenarios):**
+    - Volatility regimes: low/medium/high (3)
+    - Liquidity shocks: spread widening + depth thinning (2)
+    - Venue outage: disabled venue window (1)
+    - Funding inversions: sign flip + drift (2)
+    - Basis spikes: positive + negative (2)
+  - **Implemented:** `batch_runs/phase_a/scenario_library_v1.py` (generator/check/smoke CLI)
+  - **Manifest:** `scenarios/v1/scenario_library_v1/manifest_sha256.json` (SHA-256 verified)
+  - **Smoke suite:** `scenarios/suites/scenario_library_smoke_v1.yaml` (CI-friendly, 5 scenarios)
+  - **CI workflow:** `.github/workflows/scenario_library_smoke.yml`
+  - **Remaining for v2:** latency / partial fill / cancel storm modelling
 - [x] **Tail risk metrics emitted** (A1)
   - `mc_summary.json` schema_version=2 includes `tail_risk` section
   - PnL quantiles (p01, p05, p50, p95, p99)

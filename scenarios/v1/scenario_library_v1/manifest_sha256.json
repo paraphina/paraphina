@@ -1,0 +1,22 @@
+{
+  "files": {
+    "README.md": "804c785df4d737224aab1bfd2abe4a2871421ce29add3d6c9b7e8e3a91970e4a",
+    "slib_v1_basis_neg.yaml": "b1eead5143f45a2de4b3d5504d63c4bf0f3ce435d346f6ded3193e64f189376d",
+    "slib_v1_basis_pos.yaml": "88d36da4aa8f63c1a9a0832a3b6028fc48a8e97ceb686cd8863f40da9af9f31d",
+    "slib_v1_fund_drift.yaml": "eab55c4e81a8033dbf31193307c8864481e100baf0e263782e3a995d814c3340",
+    "slib_v1_fund_flip.yaml": "729a7c9484dbbf36e0605ec8ff7573b8df33ba47c6fbca2bea705e9f4829844e",
+    "slib_v1_liq_depth.yaml": "82db1c335c374a11e9adbd6588ac6fb5823d6a38010ef474fb73dcf3b1673118",
+    "slib_v1_liq_spread.yaml": "3b45e31d527de2b4534e064bb3e7974beb1eec9a973bd5cd460ecdc47fb75ef7",
+    "slib_v1_venue_outage.yaml": "e6e39831121c2c68083a35ab03f91c3481279572c6ea025fd99d956c79695b1d",
+    "slib_v1_vol_high.yaml": "4c697f7bedca92b6e2a18b8829575640d9936d2b3e91b4491ac4282ca8e29bbf",
+    "slib_v1_vol_low.yaml": "e4cec7f34e6baccfbcbccf32051930ba0d696f82046e104a30e318c99387ea4d",
+    "slib_v1_vol_medium.yaml": "87ecf2a308835d03068ed66a65b2ab0ab505a049d073a036bc88b6de22a05e51"
+  },
+  "generated_by": {
+    "module": "batch_runs.phase_a.scenario_library_v1",
+    "version": "1.0.0"
+  },
+  "scenario_count": 10,
+  "schema_version": 1,
+  "seed": 20260105
+}
