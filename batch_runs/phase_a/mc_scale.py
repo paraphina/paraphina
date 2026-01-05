@@ -378,65 +378,8 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
     summary_hash = sha256_file(summary_path)
     print(f"✓ Summary: {summary_path}")
     
-    # Create root evidence pack
-    evidence_pack_dir = out_dir / "evidence_pack"
-    evidence_pack_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Try to use sim_eval for proper evidence pack, fallback to simple one
-    try:
-        sim_eval_binary = find_sim_eval_binary()
-        # Use write-root-evidence-pack command if available, otherwise do manual
-        # For now, we'll create a manual evidence pack
-    except FileNotFoundError:
-        pass  # Will create manual evidence pack
-    
-    # Create SHA256SUMS for root evidence pack
-    files_to_hash = [
-        ("mc_scale_plan.json", plan_path),
-        ("mc_runs.jsonl", aggregated_jsonl_path),
-        ("mc_summary.json", summary_path),
-    ]
-    
-    sha256sums_lines = []
-    for name, path in files_to_hash:
-        if path.exists():
-            h = sha256_file(path)
-            rel_path = path.relative_to(out_dir) if path.is_relative_to(out_dir) else path.name
-            sha256sums_lines.append(f"{h}  {rel_path}")
-    
-    sha256sums_path = evidence_pack_dir / "SHA256SUMS"
-    with open(sha256sums_path, "w") as f:
-        f.write("\n".join(sha256sums_lines))
-        f.write("\n")
-    
-    # Create manifest
+    # Write mc_scale_manifest.json (root level, before evidence pack generation)
     plan_hash = sha256_file(plan_path)
-    manifest = {
-        "schema_version": "v1",
-        "type": "mc_scale_aggregation",
-        "plan_hash": plan_hash,
-        "shard_hashes": shard_hashes,
-        "aggregated_jsonl_hash": aggregated_jsonl_hash,
-        "mc_summary_hash": summary_hash,
-    }
-    
-    manifest_path = evidence_pack_dir / "manifest.json"
-    with open(manifest_path, "w") as f:
-        f.write(json_dumps_deterministic(manifest))
-        f.write("\n")
-    
-    # Create suite.yaml for verifier compatibility
-    suite_path = evidence_pack_dir / "suite.yaml"
-    with open(suite_path, "w") as f:
-        f.write("# Auto-generated MC scale evidence pack\n")
-        f.write(f"type: mc_scale_aggregation\n")
-        f.write(f"runs: {plan['runs']}\n")
-        f.write(f"shards: {len(plan['shard_ranges'])}\n")
-        f.write(f"seed: {plan['seed']}\n")
-    
-    print(f"✓ Evidence pack: {evidence_pack_dir}")
-    
-    # Write mc_scale_manifest.json (root level)
     mc_scale_manifest = {
         "plan_hash": f"sha256:{plan_hash}",
         "shard_directories": {str(k): f"sha256:{v}" for k, v in shard_hashes.items()},
@@ -451,19 +394,37 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
     
     print(f"✓ MC scale manifest: {mc_scale_manifest_path}")
     
-    # Verify evidence pack using sim_eval if available
+    # Generate root evidence pack using sim_eval (canonical format)
     try:
         sim_eval_binary = find_sim_eval_binary()
-        verify_cmd = [str(sim_eval_binary), "verify-evidence-pack", str(out_dir)]
-        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
-        if verify_result.returncode == 0:
-            print(f"✓ Evidence pack verified")
-        else:
-            print(f"Warning: Evidence verification returned {verify_result.returncode}")
-            if verify_result.stderr:
-                print(f"  stderr: {verify_result.stderr[:200]}")
-    except FileNotFoundError:
-        print("Note: sim_eval not found, skipping evidence verification")
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return 1
+    
+    # Use sim_eval write-evidence-pack to generate canonical evidence pack
+    write_ep_cmd = [str(sim_eval_binary), "write-evidence-pack", str(out_dir)]
+    print(f"Generating evidence pack: {' '.join(write_ep_cmd)}")
+    write_result = subprocess.run(write_ep_cmd, capture_output=True, text=True)
+    if write_result.returncode != 0:
+        print(f"Error: write-evidence-pack failed with exit code {write_result.returncode}")
+        if write_result.stderr:
+            print(f"  stderr: {write_result.stderr}")
+        return 1
+    
+    evidence_pack_dir = out_dir / "evidence_pack"
+    print(f"✓ Evidence pack: {evidence_pack_dir}")
+    
+    # Verify evidence pack using sim_eval (FATAL if fails)
+    verify_cmd = [str(sim_eval_binary), "verify-evidence-pack", str(out_dir)]
+    print(f"Verifying evidence pack: {' '.join(verify_cmd)}")
+    verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
+    if verify_result.returncode != 0:
+        print(f"Error: Evidence pack verification failed with exit code {verify_result.returncode}")
+        if verify_result.stderr:
+            print(f"  stderr: {verify_result.stderr}")
+        return 1
+    
+    print(f"✓ Evidence pack verified")
     
     return 0
 

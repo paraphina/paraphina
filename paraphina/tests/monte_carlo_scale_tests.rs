@@ -61,12 +61,13 @@ fn test_seed_mapping_shard_slicing() {
         let start = shard_idx * runs_per_shard;
         let end = start + runs_per_shard;
 
-        for i in start..end {
-            let shard_seed = base_seed.wrapping_add(i as u64);
+        for (i, &expected_seed) in full_seeds[start..end].iter().enumerate() {
+            let global_idx = start + i;
+            let shard_seed = base_seed.wrapping_add(global_idx as u64);
             assert_eq!(
-                shard_seed, full_seeds[i],
+                shard_seed, expected_seed,
                 "Shard {} index {} seed mismatch",
-                shard_idx, i
+                shard_idx, global_idx
             );
         }
     }

@@ -1017,7 +1017,7 @@ fn run_monte_carlo(args: RunArgs) {
 
         let should_print = !args.quiet
             && (args.print_every == 1
-                || ((local_idx + 1) % args.print_every == 0)
+                || (local_idx + 1).is_multiple_of(args.print_every)
                 || (local_idx + 1 == run_count));
 
         if should_print {

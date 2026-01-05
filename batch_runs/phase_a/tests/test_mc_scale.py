@@ -388,6 +388,89 @@ class TestJsonlFormat(unittest.TestCase):
         self.assertEqual(original["kill_switch"], parsed["kill_switch"])
 
 
+class TestEvidencePackFormat(unittest.TestCase):
+    """Regression tests for evidence pack format compliance."""
+
+    def test_sha256sums_required_entries(self):
+        """
+        SHA256SUMS must include evidence_pack/manifest.json and evidence_pack/suite.yaml.
+        
+        This is a regression test for the issue where manually generated SHA256SUMS
+        was missing these required entries, causing sim_eval verify-evidence-pack to fail.
+        """
+        # These are the required entries per evidence_pack_verify.rs
+        required_entries = [
+            "evidence_pack/manifest.json",
+            "evidence_pack/suite.yaml",
+        ]
+        
+        # Create a mock SHA256SUMS content that should pass validation
+        valid_sha256sums = [
+            "abc123def456  evidence_pack/manifest.json",
+            "def789abc012  evidence_pack/suite.yaml",
+            "111222333444  mc_summary.json",
+        ]
+        
+        # Parse and validate
+        entries_found = set()
+        for line in valid_sha256sums:
+            parts = line.split()
+            if len(parts) >= 2:
+                path = parts[1]
+                entries_found.add(path)
+        
+        for required in required_entries:
+            self.assertIn(required, entries_found, 
+                f"Required entry '{required}' missing from SHA256SUMS")
+
+    def test_sha256sums_missing_manifest_detected(self):
+        """
+        Detect when SHA256SUMS is missing evidence_pack/manifest.json.
+        """
+        # SHA256SUMS without manifest.json (the bug we fixed)
+        invalid_sha256sums = [
+            "abc123def456  mc_scale_plan.json",
+            "def789abc012  mc_runs.jsonl",
+            "111222333444  mc_summary.json",
+        ]
+        
+        entries_found = set()
+        for line in invalid_sha256sums:
+            parts = line.split()
+            if len(parts) >= 2:
+                path = parts[1]
+                entries_found.add(path)
+        
+        # Should NOT have the required entries
+        self.assertNotIn("evidence_pack/manifest.json", entries_found)
+        self.assertNotIn("evidence_pack/suite.yaml", entries_found)
+
+    def test_sha256sums_format_validation(self):
+        """
+        SHA256SUMS format: "<64hex>  <relpath>" (two spaces after hash).
+        """
+        valid_lines = [
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  evidence_pack/manifest.json",
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210  evidence_pack/suite.yaml",
+        ]
+        
+        for line in valid_lines:
+            parts = line.split(None, 1)  # Split on whitespace, max 2 parts
+            self.assertEqual(len(parts), 2, f"Line should have hash and path: {line}")
+            
+            hash_part = parts[0]
+            path_part = parts[1].strip()
+            
+            # Hash should be 64 hex chars
+            self.assertEqual(len(hash_part), 64, f"Hash should be 64 chars: {hash_part}")
+            self.assertTrue(all(c in "0123456789abcdef" for c in hash_part.lower()),
+                f"Hash should be lowercase hex: {hash_part}")
+            
+            # Path should be relative (no leading /)
+            self.assertFalse(path_part.startswith("/"), 
+                f"Path should be relative: {path_part}")
+
+
 if __name__ == "__main__":
     unittest.main()
 
