@@ -584,7 +584,7 @@ This repo evolves in three layers:
 
 **Status: COMPLETE (A1 + A2 fully implemented)**
 
-- [x] **Scenario library (seeded, reproducible)** (v1 PARTIAL)
+- [x] **Scenario library (seeded, reproducible)** (v1 COMPLETE, promotion-critical)
   - **v1 implemented (10 scenarios):**
     - Volatility regimes: low/medium/high (3)
     - Liquidity shocks: spread widening + depth thinning (2)
@@ -594,7 +594,16 @@ This repo evolves in three layers:
   - **Implemented:** `batch_runs/phase_a/scenario_library_v1.py` (generator/check/smoke CLI)
   - **Manifest:** `scenarios/v1/scenario_library_v1/manifest_sha256.json` (SHA-256 verified)
   - **Smoke suite:** `scenarios/suites/scenario_library_smoke_v1.yaml` (CI-friendly, 5 scenarios)
+  - **Full suite:** `scenarios/suites/scenario_library_v1.yaml` (all 10 scenarios, promotion-critical)
   - **CI workflow:** `.github/workflows/scenario_library_smoke.yml`
+  - **Integrated into Phase A Promotion Pipeline:**
+    - `batch_runs/phase_a/promote_pipeline.py` includes scenario library by default
+    - In `--smoke` mode: uses `scenario_library_smoke_v1.yaml` (5 scenarios)
+    - In full mode: uses `scenario_library_v1.yaml` (all 10 scenarios)
+    - CLI flags: `--skip-scenario-library`, `--scenario-library-suite PATH`
+    - Manifest integrity verified at pipeline start (fail-fast if mismatch)
+    - Results recorded in `PROMOTION_RECORD.json` (ran/skipped/passed/errors)
+    - Evidence verification includes scenario library suite artifacts
   - **Remaining for v2:** latency / partial fill / cancel storm modelling
 - [x] **Tail risk metrics emitted** (A1)
   - `mc_summary.json` schema_version=2 includes `tail_risk` section

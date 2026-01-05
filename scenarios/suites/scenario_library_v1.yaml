@@ -1,0 +1,40 @@
+# Scenario Library v1 Full Suite
+# PROMOTION-CRITICAL: This suite is mandatory for Phase A promotion pipeline.
+# Generated from scenarios/v1/scenario_library_v1/manifest_sha256.json
+# All scenarios listed in stable deterministic order (sorted by filename).
+#
+# Shock types covered:
+#   - Volatility regimes: low/medium/high (3)
+#   - Liquidity shocks: spread widening + depth thinning (2)
+#   - Venue outage: disabled venue window (1)
+#   - Funding inversions: sign flip + drift (2)
+#   - Basis spikes: positive + negative (2)
+#
+# Usage:
+#   cargo run --release -p paraphina --bin sim_eval -- suite scenarios/suites/scenario_library_v1.yaml
+#
+# Verification:
+#   python3 -m batch_runs.phase_a.scenario_library_v1 check
+
+suite_id: scenario_library_v1
+suite_version: 1
+
+# Minimal repeat for CI compatibility
+repeat_runs: 1
+
+# Default output directory (overridden by --output-dir in promotion pipeline)
+out_dir: runs/scenario_library_v1
+
+# All 10 scenarios in deterministic order (sorted by filename)
+scenarios:
+  - path: scenarios/v1/scenario_library_v1/slib_v1_basis_neg.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_basis_pos.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_fund_drift.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_fund_flip.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_liq_depth.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_liq_spread.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_venue_outage.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_vol_high.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_vol_low.yaml
+  - path: scenarios/v1/scenario_library_v1/slib_v1_vol_medium.yaml
+
