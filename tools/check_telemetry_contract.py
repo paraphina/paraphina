@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Telemetry Contract Gate: Validates telemetry JSONL files against schema v1.
+Telemetry Contract Gate: Validates telemetry JSONL files against their schemas.
 
-This tool enforces the telemetry schema contract defined in:
-- docs/TELEMETRY_SCHEMA_V1.md (human-readable)
-- schemas/telemetry_schema_v1.json (machine-readable)
+This tool enforces telemetry schema contracts defined in:
+- docs/TELEMETRY_SCHEMA_V1.md (human-readable documentation)
+- schemas/telemetry_schema_v1.json (per-tick telemetry)
+- schemas/mc_runs_schema_v1.json (Monte Carlo per-run records)
+
+File-to-schema mapping:
+  telemetry.jsonl    → telemetry_schema_v1.json
+  mc_runs.jsonl      → mc_runs_schema_v1.json
+  metrics.jsonl      → (unmapped - fails loudly)
+  trajectories.jsonl → (unmapped - fails loudly)
 
 Exit codes:
-    0 - OK: all records valid (or no telemetry files to validate)
+    0 - OK: all records valid
     1 - Contract violation (schema error, missing required fields, type mismatch, etc.)
-    2 - File not found or CLI usage error
-    3 - Internal error (schema file missing, JSON parse error in schema, etc.)
+    2 - File not found, CLI usage error, or unmapped file type
 
 Usage:
-    python3 tools/check_telemetry_contract.py                     # Check current directory
-    python3 tools/check_telemetry_contract.py path/to/file.jsonl  # Check specific file
-    python3 tools/check_telemetry_contract.py path/to/dir/        # Check directory
-    python3 tools/check_telemetry_contract.py --help              # Show help
+    python3 tools/check_telemetry_contract.py [PATH]
+    python3 tools/check_telemetry_contract.py --help
 """
 
 import argparse
@@ -30,13 +34,21 @@ from typing import Any, NamedTuple
 # Maximum number of errors to display before truncating
 MAX_ERRORS_DISPLAY = 10
 
-# Common telemetry filenames to auto-detect in a directory
-TELEMETRY_FILENAMES = [
-    "telemetry.jsonl",
-    "mc_runs.jsonl",
+# File-to-schema mapping: filename -> schema filename
+# Files not in this mapping will fail with a clear error
+FILE_SCHEMA_MAP: dict[str, str] = {
+    "telemetry.jsonl": "telemetry_schema_v1.json",
+    "mc_runs.jsonl": "mc_runs_schema_v1.json",
+}
+
+# Files that are recognized but have no schema yet
+UNMAPPED_FILES: set[str] = {
     "metrics.jsonl",
     "trajectories.jsonl",
-]
+}
+
+# All known telemetry filenames for directory scanning
+TELEMETRY_FILENAMES = list(FILE_SCHEMA_MAP.keys()) + list(UNMAPPED_FILES)
 
 
 class ValidationError(NamedTuple):
@@ -144,12 +156,20 @@ def validate_record(
     record: dict[str, Any],
     schema: dict[str, Any],
     line_num: int,
-    prev_tick: int | None,
+    prev_index: int | None,
+    index_field: str | None,
 ) -> tuple[list[ValidationError], int | None]:
     """
-    Validate a single telemetry record against the schema.
+    Validate a single record against the schema.
     
-    Returns (list of errors, current tick value or None).
+    Args:
+        record: The JSON record to validate
+        schema: The schema to validate against
+        line_num: Line number for error messages
+        prev_index: Previous index value (for monotonicity check)
+        index_field: Field name to check for monotonicity (e.g., "t" or "run_index")
+    
+    Returns (list of errors, current index value or None).
     """
     errors: list[ValidationError] = []
     
@@ -173,7 +193,6 @@ def validate_record(
             ))
     
     # Check types for all present fields
-    all_known_fields = set(required_fields) | set(optional_fields)
     for field, value in record.items():
         if field in field_types:
             type_error = check_type(value, field_types[field], field)
@@ -189,29 +208,38 @@ def validate_record(
                 f"field '{field}' has invalid value '{record[field]}', expected one of {allowed_values}"
             ))
     
-    # Check tick monotonicity
-    current_tick = None
-    if "t" in record:
-        t = record["t"]
-        if isinstance(t, (int, float)) and not isinstance(t, bool):
-            current_tick = int(t)
-            if prev_tick is not None and current_tick <= prev_tick:
+    # Check index monotonicity if applicable
+    current_index = None
+    if index_field and index_field in record:
+        idx_val = record[index_field]
+        if isinstance(idx_val, (int, float)) and not isinstance(idx_val, bool):
+            current_index = int(idx_val)
+            if prev_index is not None and current_index <= prev_index:
                 errors.append(ValidationError(
                     line_num,
-                    f"tick not monotonically increasing: t={current_tick} (prev={prev_tick})"
+                    f"{index_field} not monotonically increasing: {index_field}={current_index} (prev={prev_index})"
                 ))
     
-    return errors, current_tick
+    return errors, current_index
 
 
-def validate_file(file_path: Path, schema: dict[str, Any]) -> list[ValidationError]:
+def validate_file(
+    file_path: Path,
+    schema: dict[str, Any],
+    index_field: str | None = None,
+) -> list[ValidationError]:
     """
     Validate all records in a JSONL file against the schema.
+    
+    Args:
+        file_path: Path to the JSONL file
+        schema: Schema to validate against
+        index_field: Field to check for monotonicity (e.g., "t" for telemetry, "run_index" for mc_runs)
     
     Returns list of all validation errors.
     """
     errors: list[ValidationError] = []
-    prev_tick: int | None = None
+    prev_index: int | None = None
     
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -233,11 +261,13 @@ def validate_file(file_path: Path, schema: dict[str, Any]) -> list[ValidationErr
                     continue
                 
                 # Validate record
-                record_errors, current_tick = validate_record(record, schema, line_num, prev_tick)
+                record_errors, current_index = validate_record(
+                    record, schema, line_num, prev_index, index_field
+                )
                 errors.extend(record_errors)
                 
-                if current_tick is not None:
-                    prev_tick = current_tick
+                if current_index is not None:
+                    prev_index = current_index
     
     except OSError as e:
         errors.append(ValidationError(0, f"file read error: {e}"))
@@ -245,59 +275,79 @@ def validate_file(file_path: Path, schema: dict[str, Any]) -> list[ValidationErr
     return errors
 
 
-def find_telemetry_file(path: Path) -> Path | None:
+def get_schema_for_file(filename: str, repo_root: Path) -> tuple[dict[str, Any] | None, str | None, int]:
     """
-    Find a telemetry file given a path.
+    Get the appropriate schema for a given filename.
     
-    If path is a file, return it.
-    If path is a directory, look for common telemetry filenames.
-    Returns None if not found.
+    Returns (schema, index_field, exit_code).
+    - exit_code 0 means success
+    - exit_code 2 means unmapped file (fail loudly)
     """
-    if path.is_file():
-        return path
+    basename = Path(filename).name
     
-    if path.is_dir():
-        for name in TELEMETRY_FILENAMES:
-            candidate = path / name
-            if candidate.exists():
-                return candidate
-    
-    return None
-
-
-def validate_telemetry_path(input_path: Path, schema: dict[str, Any]) -> int:
-    """
-    Validate telemetry at the given path.
-    
-    Returns exit code: 0=OK, 1=contract violation, 2=not found.
-    """
-    # Find telemetry file
-    telemetry_file = find_telemetry_file(input_path)
-    if telemetry_file is None:
-        if input_path.is_dir():
-            print(f"ERROR: No telemetry file found in directory: {input_path}", file=sys.stderr)
-            print(f"  Looked for: {', '.join(TELEMETRY_FILENAMES)}", file=sys.stderr)
+    if basename in FILE_SCHEMA_MAP:
+        schema_file = FILE_SCHEMA_MAP[basename]
+        schema_path = repo_root / "schemas" / schema_file
+        schema = load_schema(schema_path)
+        if schema is None:
+            return None, None, 2
+        
+        # Determine index field for monotonicity check
+        if basename == "telemetry.jsonl":
+            index_field = "t"
+        elif basename == "mc_runs.jsonl":
+            index_field = "run_index"
         else:
-            print(f"ERROR: File not found: {input_path}", file=sys.stderr)
+            index_field = None
+        
+        return schema, index_field, 0
+    
+    if basename in UNMAPPED_FILES:
+        print(f"ERROR: No schema defined for '{basename}'", file=sys.stderr)
+        print(f"  To add schema support:", file=sys.stderr)
+        print(f"    1. Create schemas/{basename.replace('.jsonl', '_schema_v1.json')}", file=sys.stderr)
+        print(f"    2. Add mapping to FILE_SCHEMA_MAP in tools/check_telemetry_contract.py", file=sys.stderr)
+        print(f"  See docs/TELEMETRY_SCHEMA_V1.md for schema format.", file=sys.stderr)
+        return None, None, 2
+    
+    # Unknown file - treat as potential telemetry, try with telemetry schema
+    # This allows validating arbitrary .jsonl files against the default schema
+    schema_path = repo_root / "schemas" / "telemetry_schema_v1.json"
+    schema = load_schema(schema_path)
+    if schema is None:
+        return None, None, 2
+    return schema, "t", 0
+
+
+def validate_single_file(file_path: Path, repo_root: Path) -> int:
+    """
+    Validate a single file against its appropriate schema.
+    
+    Returns exit code: 0=OK, 1=contract violation, 2=error.
+    """
+    schema, index_field, exit_code = get_schema_for_file(file_path.name, repo_root)
+    if exit_code != 0:
+        return exit_code
+    
+    if schema is None:
         return 2
     
-    # Validate
-    errors = validate_file(telemetry_file, schema)
+    errors = validate_file(file_path, schema, index_field)
     
     if errors:
         # Count records (for summary)
         try:
-            with open(telemetry_file, "r", encoding="utf-8") as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 total_lines = sum(1 for line in f if line.strip())
         except OSError:
             total_lines = "?"
         
-        print(f"FAILED: {len(errors)} error(s) in {telemetry_file}")
+        print(f"FAILED: {len(errors)} error(s) in {file_path}")
         print(f"  (Total records scanned: {total_lines})")
         print()
         
         # Show first N errors
-        for i, err in enumerate(errors[:MAX_ERRORS_DISPLAY]):
+        for err in errors[:MAX_ERRORS_DISPLAY]:
             if err.line > 0:
                 print(f"  Line {err.line}: {err.message}")
             else:
@@ -310,14 +360,49 @@ def validate_telemetry_path(input_path: Path, schema: dict[str, Any]) -> int:
     
     # Success
     try:
-        with open(telemetry_file, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             total_lines = sum(1 for line in f if line.strip())
     except OSError:
         total_lines = "?"
     
     print(f"OK: {total_lines} record(s) validated against schema v{schema.get('schema_version', '?')}")
-    print(f"  File: {telemetry_file}")
+    print(f"  File: {file_path}")
     return 0
+
+
+def find_and_validate_directory(dir_path: Path, repo_root: Path) -> int:
+    """
+    Find and validate all telemetry files in a directory.
+    
+    Returns exit code: 0=all OK (or no files), 1=any contract violation, 2=any error.
+    """
+    validated_count = 0
+    worst_exit_code = 0
+    
+    for filename in TELEMETRY_FILENAMES:
+        file_path = dir_path / filename
+        if file_path.exists():
+            print(f"--- Validating {filename} ---")
+            exit_code = validate_single_file(file_path, repo_root)
+            validated_count += 1
+            
+            # Track worst exit code (1 > 2 > 0 for prioritizing contract violations)
+            if exit_code == 1:
+                worst_exit_code = 1
+            elif exit_code == 2 and worst_exit_code == 0:
+                worst_exit_code = 2
+            
+            print()
+    
+    if validated_count == 0:
+        print(f"OK: No telemetry files found to validate in {dir_path}")
+        print(f"  (Looked for: {', '.join(TELEMETRY_FILENAMES)})")
+        return 0
+    
+    if worst_exit_code == 0:
+        print(f"=== All {validated_count} file(s) validated successfully ===")
+    
+    return worst_exit_code
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -325,23 +410,27 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="check_telemetry_contract",
         description="""
-Telemetry Contract Gate: Validates telemetry JSONL files against schema v1.
+Telemetry Contract Gate: Validates telemetry JSONL files against their schemas.
 
-Enforces the telemetry schema contract defined in:
-  - docs/TELEMETRY_SCHEMA_V1.md (human-readable)
-  - schemas/telemetry_schema_v1.json (machine-readable)
+Supports multiple file types with per-file schema mapping:
+  telemetry.jsonl    → schemas/telemetry_schema_v1.json (per-tick data)
+  mc_runs.jsonl      → schemas/mc_runs_schema_v1.json (Monte Carlo runs)
+
+Unmapped files (metrics.jsonl, trajectories.jsonl) will fail with instructions
+on how to add schema support.
 """,
         epilog="""
 Exit codes:
-  0 - OK: all records valid (or no telemetry files to validate)
+  0 - OK: all records valid (or no telemetry files found)
   1 - Contract violation (schema error, missing required fields, etc.)
-  2 - File not found or CLI usage error
-  3 - Internal error (schema file missing, etc.)
+  2 - File not found, CLI usage error, or unmapped file type
 
 Examples:
-  %(prog)s                          # Check current directory for telemetry files
+  %(prog)s                          # Check current directory
   %(prog)s path/to/file.jsonl       # Check specific JSONL file
-  %(prog)s path/to/run_directory/   # Check directory for telemetry files
+  %(prog)s path/to/run_directory/   # Check all telemetry files in directory
+
+Schema documentation: docs/TELEMETRY_SCHEMA_V1.md
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -350,8 +439,8 @@ Examples:
         "path",
         nargs="?",
         default=None,
-        help="Path to telemetry JSONL file or directory. "
-             "If omitted, checks the current directory for telemetry files.",
+        help="Path to JSONL file or directory. "
+             "If omitted, checks the current directory.",
     )
     
     return parser
@@ -366,30 +455,20 @@ def main() -> int:
     script_dir = Path(__file__).parent
     repo_root = script_dir.parent
     
-    # Load schema
-    schema_path = repo_root / "schemas" / "telemetry_schema_v1.json"
-    schema = load_schema(schema_path)
-    if schema is None:
-        return 3
-    
     # Determine input path
     if args.path is not None:
         input_path = Path(args.path)
     else:
-        # Default to current directory
         input_path = Path.cwd()
     
-    # If path is a directory, look for telemetry files
-    if input_path.is_dir():
-        telemetry_file = find_telemetry_file(input_path)
-        if telemetry_file is None:
-            # No telemetry files found - this is OK (nothing to validate)
-            print(f"OK: No telemetry files found to validate in {input_path}")
-            print(f"  (Looked for: {', '.join(TELEMETRY_FILENAMES)})")
-            return 0
-    
-    # Validate the path
-    return validate_telemetry_path(input_path, schema)
+    # Validate based on path type
+    if input_path.is_file():
+        return validate_single_file(input_path, repo_root)
+    elif input_path.is_dir():
+        return find_and_validate_directory(input_path, repo_root)
+    else:
+        print(f"ERROR: Path not found: {input_path}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

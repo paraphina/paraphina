@@ -596,8 +596,11 @@ struct McRunRecord {
 
 /// Single run record for JSONL output (mc_runs.jsonl).
 /// This is the canonical per-run output format for sharded Monte Carlo.
+/// Schema: schemas/mc_runs_schema_v1.json
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct McRunJsonlRecord {
+    /// Schema version for telemetry contract validation. Always 1 for this version.
+    schema_version: u32,
     /// Global run index (0-based, used for deterministic seed mapping).
     run_index: usize,
     /// Seed used for this run (should equal base_seed + run_index).
@@ -976,7 +979,9 @@ fn run_monte_carlo(args: RunArgs) {
         });
 
         // Write JSONL record (uses global run_index for aggregation)
+        // schema_version=1 per schemas/mc_runs_schema_v1.json telemetry contract
         let jsonl_record = McRunJsonlRecord {
+            schema_version: 1,
             run_index: global_idx,
             seed: run_seed,
             pnl_total: r.final_pnl,

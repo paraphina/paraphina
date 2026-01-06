@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paraphina MC Runs Record Schema v1",
+  "description": "Schema for per-run Monte Carlo JSONL records (mc_runs.jsonl). See docs/TELEMETRY_SCHEMA_V1.md for full specification.",
+  "type": "object",
+  "schema_version": 1,
+  "required_fields": [
+    "schema_version",
+    "run_index",
+    "seed",
+    "pnl_total",
+    "max_drawdown",
+    "kill_switch",
+    "kill_reason",
+    "ticks_executed"
+  ],
+  "optional_fields": [
+    "kill_tick",
+    "max_abs_delta_usd",
+    "max_abs_basis_usd",
+    "max_abs_q_tao",
+    "max_venue_toxicity"
+  ],
+  "field_types": {
+    "schema_version": "integer",
+    "run_index": "integer",
+    "seed": "integer",
+    "pnl_total": "number",
+    "max_drawdown": "number",
+    "kill_switch": "boolean",
+    "kill_tick": ["integer", "null"],
+    "kill_reason": "string",
+    "ticks_executed": "integer",
+    "max_abs_delta_usd": "number",
+    "max_abs_basis_usd": "number",
+    "max_abs_q_tao": "number",
+    "max_venue_toxicity": "number"
+  },
+  "enums": {},
+  "invariants": {
+    "schema_version_value": 1,
+    "run_index_monotonic": true,
+    "numerics_finite": true
+  }
+}
+

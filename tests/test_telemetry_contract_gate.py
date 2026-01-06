@@ -4,6 +4,10 @@ Unit tests for the Telemetry Contract Gate.
 Tests the telemetry schema validation functionality using temp files
 and subprocess execution to ensure the validator tool works correctly
 as a standalone script.
+
+Supports multiple schemas:
+- telemetry.jsonl → telemetry_schema_v1.json
+- mc_runs.jsonl → mc_runs_schema_v1.json
 """
 
 import contextlib
@@ -168,9 +172,8 @@ class TestCheckType(unittest.TestCase):
 class TestLoadSchema(unittest.TestCase):
     """Test the load_schema function."""
     
-    def test_load_valid_schema(self):
-        """Should load a valid schema file."""
-        # Use the real schema file
+    def test_load_valid_telemetry_schema(self):
+        """Should load the telemetry schema file."""
         script_dir = Path(__file__).parent.parent
         schema_path = script_dir / "schemas" / "telemetry_schema_v1.json"
         
@@ -180,6 +183,19 @@ class TestLoadSchema(unittest.TestCase):
         self.assertIn("required_fields", schema)
         self.assertIn("field_types", schema)
         self.assertIn("schema_version", schema["required_fields"])
+    
+    def test_load_valid_mc_runs_schema(self):
+        """Should load the mc_runs schema file."""
+        script_dir = Path(__file__).parent.parent
+        schema_path = script_dir / "schemas" / "mc_runs_schema_v1.json"
+        
+        schema = load_schema(schema_path)
+        
+        self.assertIsNotNone(schema)
+        self.assertIn("required_fields", schema)
+        self.assertIn("field_types", schema)
+        self.assertIn("schema_version", schema["required_fields"])
+        self.assertIn("run_index", schema["required_fields"])
     
     def test_load_missing_file_returns_none(self):
         """Should return None for missing file."""
@@ -207,8 +223,8 @@ class TestLoadSchema(unittest.TestCase):
             temp_path.unlink()
 
 
-class TestValidateRecord(unittest.TestCase):
-    """Test the validate_record function."""
+class TestValidateTelemetryRecord(unittest.TestCase):
+    """Test the validate_record function for telemetry.jsonl schema."""
     
     def setUp(self):
         """Load the schema for tests."""
@@ -238,7 +254,7 @@ class TestValidateRecord(unittest.TestCase):
     def test_valid_record_passes(self):
         """A valid record should produce no errors."""
         record = self._make_valid_record()
-        errors, tick = validate_record(record, self.schema, 1, None)
+        errors, tick = validate_record(record, self.schema, 1, None, "t")
         
         self.assertEqual(len(errors), 0)
         self.assertEqual(tick, 0)
@@ -248,7 +264,7 @@ class TestValidateRecord(unittest.TestCase):
         record = self._make_valid_record()
         del record["schema_version"]
         
-        errors, _ = validate_record(record, self.schema, 1, None)
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
         
         self.assertGreater(len(errors), 0)
         self.assertTrue(any("schema_version" in e.message for e in errors))
@@ -257,7 +273,7 @@ class TestValidateRecord(unittest.TestCase):
         """Wrong schema_version should produce error."""
         record = self._make_valid_record(schema_version=999)
         
-        errors, _ = validate_record(record, self.schema, 1, None)
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
         
         self.assertGreater(len(errors), 0)
         self.assertTrue(any("schema_version mismatch" in e.message for e in errors))
@@ -266,7 +282,7 @@ class TestValidateRecord(unittest.TestCase):
         """Invalid risk_regime enum value should produce error."""
         record = self._make_valid_record(risk_regime="InvalidRegime")
         
-        errors, _ = validate_record(record, self.schema, 1, None)
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
         
         self.assertGreater(len(errors), 0)
         self.assertTrue(any("risk_regime" in e.message and "invalid value" in e.message for e in errors))
@@ -275,7 +291,7 @@ class TestValidateRecord(unittest.TestCase):
         """All valid risk_regime values should pass."""
         for regime in ["Normal", "Warning", "HardLimit"]:
             record = self._make_valid_record(risk_regime=regime)
-            errors, _ = validate_record(record, self.schema, 1, None)
+            errors, _ = validate_record(record, self.schema, 1, None, "t")
             self.assertEqual(len(errors), 0, f"regime '{regime}' should be valid")
     
     def test_tick_monotonicity_enforced(self):
@@ -283,7 +299,7 @@ class TestValidateRecord(unittest.TestCase):
         record = self._make_valid_record(t=5)
         
         # With prev_tick=10, t=5 should fail
-        errors, tick = validate_record(record, self.schema, 1, prev_tick=10)
+        errors, tick = validate_record(record, self.schema, 1, prev_index=10, index_field="t")
         
         self.assertGreater(len(errors), 0)
         self.assertTrue(any("monotonic" in e.message for e in errors))
@@ -292,7 +308,7 @@ class TestValidateRecord(unittest.TestCase):
         """Increasing tick should pass monotonicity check."""
         record = self._make_valid_record(t=11)
         
-        errors, tick = validate_record(record, self.schema, 1, prev_tick=10)
+        errors, tick = validate_record(record, self.schema, 1, prev_index=10, index_field="t")
         
         # Filter out monotonicity errors specifically
         mono_errors = [e for e in errors if "monotonic" in e.message]
@@ -309,14 +325,14 @@ class TestValidateRecord(unittest.TestCase):
             healthy_venues_used=[0, 1, 2],
         )
         
-        errors, _ = validate_record(record, self.schema, 1, None)
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
         self.assertEqual(len(errors), 0)
     
     def test_optional_field_wrong_type_fails(self):
         """Optional field with wrong type should produce error."""
         record = self._make_valid_record(fv_available="yes")  # Should be boolean
         
-        errors, _ = validate_record(record, self.schema, 1, None)
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
         
         self.assertGreater(len(errors), 0)
         self.assertTrue(any("fv_available" in e.message for e in errors))
@@ -325,7 +341,7 @@ class TestValidateRecord(unittest.TestCase):
         """fair_value can be null."""
         record = self._make_valid_record(fair_value=None)
         
-        errors, _ = validate_record(record, self.schema, 1, None)
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
         
         # Filter errors for fair_value specifically
         fv_errors = [e for e in errors if "fair_value" in e.message]
@@ -335,10 +351,108 @@ class TestValidateRecord(unittest.TestCase):
         """NaN value in numeric field should fail."""
         record = self._make_valid_record(pnl_total=float('nan'))
         
-        errors, _ = validate_record(record, self.schema, 1, None)
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
         
         self.assertGreater(len(errors), 0)
         self.assertTrue(any("not finite" in e.message or "NaN" in e.message for e in errors))
+
+
+class TestValidateMcRunsRecord(unittest.TestCase):
+    """Test the validate_record function for mc_runs.jsonl schema."""
+    
+    def setUp(self):
+        """Load the mc_runs schema for tests."""
+        script_dir = Path(__file__).parent.parent
+        schema_path = script_dir / "schemas" / "mc_runs_schema_v1.json"
+        self.schema = load_schema(schema_path)
+        self.assertIsNotNone(self.schema, "Failed to load mc_runs schema for tests")
+    
+    def _make_valid_mc_run_record(self, **overrides) -> dict:
+        """Create a valid mc_runs record with optional overrides."""
+        record = {
+            "schema_version": 1,
+            "run_index": 0,
+            "seed": 12345,
+            "pnl_total": -50.0,
+            "max_drawdown": 100.0,
+            "kill_switch": False,
+            "kill_tick": None,
+            "kill_reason": "None",
+            "ticks_executed": 100,
+            "max_abs_delta_usd": 1000.0,
+            "max_abs_basis_usd": 500.0,
+            "max_abs_q_tao": 10.0,
+            "max_venue_toxicity": 0.5,
+        }
+        record.update(overrides)
+        return record
+    
+    def test_valid_mc_run_record_passes(self):
+        """A valid mc_runs record should produce no errors."""
+        record = self._make_valid_mc_run_record()
+        errors, idx = validate_record(record, self.schema, 1, None, "run_index")
+        
+        self.assertEqual(len(errors), 0, f"Errors: {errors}")
+        self.assertEqual(idx, 0)
+    
+    def test_missing_required_field_fails(self):
+        """Missing required field in mc_runs should produce error."""
+        record = self._make_valid_mc_run_record()
+        del record["schema_version"]
+        
+        errors, _ = validate_record(record, self.schema, 1, None, "run_index")
+        
+        self.assertGreater(len(errors), 0)
+        self.assertTrue(any("schema_version" in e.message for e in errors))
+    
+    def test_missing_run_index_fails(self):
+        """Missing run_index should produce error."""
+        record = self._make_valid_mc_run_record()
+        del record["run_index"]
+        
+        errors, _ = validate_record(record, self.schema, 1, None, "run_index")
+        
+        self.assertGreater(len(errors), 0)
+        self.assertTrue(any("run_index" in e.message for e in errors))
+    
+    def test_run_index_monotonicity(self):
+        """run_index should be monotonically increasing."""
+        record = self._make_valid_mc_run_record(run_index=5)
+        
+        # With prev_index=10, run_index=5 should fail
+        errors, idx = validate_record(record, self.schema, 1, prev_index=10, index_field="run_index")
+        
+        self.assertGreater(len(errors), 0)
+        self.assertTrue(any("monotonic" in e.message for e in errors))
+    
+    def test_kill_tick_can_be_null(self):
+        """kill_tick can be null."""
+        record = self._make_valid_mc_run_record(kill_tick=None)
+        
+        errors, _ = validate_record(record, self.schema, 1, None, "run_index")
+        
+        kill_tick_errors = [e for e in errors if "kill_tick" in e.message]
+        self.assertEqual(len(kill_tick_errors), 0)
+    
+    def test_kill_tick_can_be_integer(self):
+        """kill_tick can be an integer."""
+        record = self._make_valid_mc_run_record(kill_tick=50)
+        
+        errors, _ = validate_record(record, self.schema, 1, None, "run_index")
+        
+        kill_tick_errors = [e for e in errors if "kill_tick" in e.message]
+        self.assertEqual(len(kill_tick_errors), 0)
+    
+    def test_extra_fields_allowed(self):
+        """Extra fields should be allowed (forward compatibility)."""
+        record = self._make_valid_mc_run_record(
+            extra_field="some_value",
+            another_extra=123,
+        )
+        
+        errors, _ = validate_record(record, self.schema, 1, None, "run_index")
+        
+        self.assertEqual(len(errors), 0, "Extra fields should not cause errors")
 
 
 class TestValidateFile(unittest.TestCase):
@@ -378,7 +492,7 @@ class TestValidateFile(unittest.TestCase):
             temp_path = Path(f.name)
         
         try:
-            errors = validate_file(temp_path, self.schema)
+            errors = validate_file(temp_path, self.schema, index_field="t")
             self.assertEqual(len(errors), 0)
         finally:
             temp_path.unlink()
@@ -392,7 +506,7 @@ class TestValidateFile(unittest.TestCase):
             temp_path = Path(f.name)
         
         try:
-            errors = validate_file(temp_path, self.schema)
+            errors = validate_file(temp_path, self.schema, index_field="t")
             self.assertGreater(len(errors), 0)
             self.assertTrue(any("invalid JSON" in e.message for e in errors))
         finally:
@@ -407,7 +521,7 @@ class TestValidateFile(unittest.TestCase):
             temp_path = Path(f.name)
         
         try:
-            errors = validate_file(temp_path, self.schema)
+            errors = validate_file(temp_path, self.schema, index_field="t")
             self.assertGreater(len(errors), 0)
             self.assertTrue(any("kill_switch" in e.message for e in errors))
         finally:
@@ -425,7 +539,7 @@ class TestValidateFile(unittest.TestCase):
             temp_path = Path(f.name)
         
         try:
-            errors = validate_file(temp_path, self.schema)
+            errors = validate_file(temp_path, self.schema, index_field="t")
             self.assertEqual(len(errors), 0)
         finally:
             temp_path.unlink()
@@ -439,8 +553,8 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "check_telemetry_contract.py"
     
-    def _make_valid_record(self, tick: int = 0, **overrides) -> dict:
-        """Create a valid record with optional overrides."""
+    def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
+        """Create a valid telemetry record."""
         record = {
             "schema_version": 1,
             "t": tick,
@@ -457,11 +571,31 @@ class TestValidatorSubprocess(unittest.TestCase):
         record.update(overrides)
         return record
     
-    def test_valid_file_exit_0(self):
-        """Valid file should exit with code 0."""
+    def _make_valid_mc_run_record(self, run_index: int = 0, **overrides) -> dict:
+        """Create a valid mc_runs record."""
+        record = {
+            "schema_version": 1,
+            "run_index": run_index,
+            "seed": 12345 + run_index,
+            "pnl_total": -50.0,
+            "max_drawdown": 100.0,
+            "kill_switch": False,
+            "kill_tick": None,
+            "kill_reason": "None",
+            "ticks_executed": 100,
+            "max_abs_delta_usd": 1000.0,
+            "max_abs_basis_usd": 500.0,
+            "max_abs_q_tao": 10.0,
+            "max_venue_toxicity": 0.5,
+        }
+        record.update(overrides)
+        return record
+    
+    def test_valid_telemetry_file_exit_0(self):
+        """Valid telemetry file should exit with code 0."""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
             for i in range(3):
-                record = self._make_valid_record(tick=i)
+                record = self._make_valid_telemetry_record(tick=i)
                 f.write(json.dumps(record) + "\n")
             temp_path = Path(f.name)
         
@@ -479,7 +613,7 @@ class TestValidatorSubprocess(unittest.TestCase):
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
-            record = self._make_valid_record(tick=0)
+            record = self._make_valid_telemetry_record(tick=0)
             del record["schema_version"]  # Remove required field
             f.write(json.dumps(record) + "\n")
             temp_path = Path(f.name)
@@ -528,12 +662,12 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertIn("OK", result.stdout)
             self.assertIn("No telemetry files found", result.stdout)
     
-    def test_no_args_with_valid_file_exit_0(self):
+    def test_no_args_with_valid_telemetry_file_exit_0(self):
         """No arguments with valid telemetry file in cwd should exit 0."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a valid telemetry file in the temp directory
             telemetry_path = Path(tmpdir) / "telemetry.jsonl"
-            record = self._make_valid_record(tick=0)
+            record = self._make_valid_telemetry_record(tick=0)
             with open(telemetry_path, "w") as f:
                 f.write(json.dumps(record) + "\n")
             
@@ -546,6 +680,75 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
             self.assertIn("OK", result.stdout)
             self.assertIn("1 record(s) validated", result.stdout)
+    
+    def test_valid_mc_runs_file_exit_0(self):
+        """Valid mc_runs.jsonl file should exit with code 0."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mc_runs_path = Path(tmpdir) / "mc_runs.jsonl"
+            with open(mc_runs_path, "w") as f:
+                for i in range(3):
+                    record = self._make_valid_mc_run_record(run_index=i)
+                    f.write(json.dumps(record) + "\n")
+            
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(mc_runs_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            self.assertIn("OK", result.stdout)
+            self.assertIn("3 record(s) validated", result.stdout)
+    
+    def test_invalid_mc_runs_missing_field_exit_1(self):
+        """mc_runs.jsonl with missing required field should exit with code 1."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mc_runs_path = Path(tmpdir) / "mc_runs.jsonl"
+            record = self._make_valid_mc_run_record()
+            del record["run_index"]  # Remove required field
+            with open(mc_runs_path, "w") as f:
+                f.write(json.dumps(record) + "\n")
+            
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(mc_runs_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            self.assertIn("FAILED", result.stdout)
+            self.assertIn("run_index", result.stdout)
+    
+    def test_directory_with_mc_runs_validates_correctly(self):
+        """Directory containing mc_runs.jsonl should validate it with correct schema."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mc_runs_path = Path(tmpdir) / "mc_runs.jsonl"
+            with open(mc_runs_path, "w") as f:
+                for i in range(3):
+                    record = self._make_valid_mc_run_record(run_index=i)
+                    f.write(json.dumps(record) + "\n")
+            
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), tmpdir],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            self.assertIn("mc_runs.jsonl", result.stdout)
+    
+    def test_unmapped_file_fails_loudly(self):
+        """Unmapped file type (e.g. metrics.jsonl) should exit 2 with instructions."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics_path = Path(tmpdir) / "metrics.jsonl"
+            with open(metrics_path, "w") as f:
+                f.write('{"some": "data"}\n')
+            
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(metrics_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            self.assertIn("No schema defined", result.stderr)
+            self.assertIn("metrics.jsonl", result.stderr)
 
 
 class TestSchemaGeneratedTelemetry(unittest.TestCase):
@@ -555,8 +758,8 @@ class TestSchemaGeneratedTelemetry(unittest.TestCase):
     This ensures the schema file itself is self-consistent.
     """
     
-    def test_schema_driven_record_validates(self):
-        """A record generated from schema required fields should validate."""
+    def test_schema_driven_telemetry_record_validates(self):
+        """A record generated from telemetry schema required fields should validate."""
         # Load schema
         script_dir = Path(__file__).parent.parent
         schema_path = script_dir / "schemas" / "telemetry_schema_v1.json"
@@ -599,11 +802,38 @@ class TestSchemaGeneratedTelemetry(unittest.TestCase):
         record["kill_reason"] = "None"
         
         # Validate
-        errors, _ = validate_record(record, schema, 1, None)
+        errors, _ = validate_record(record, schema, 1, None, "t")
         self.assertEqual(len(errors), 0, f"Schema-driven record should validate. Errors: {errors}")
     
-    def test_schema_file_has_all_required_keys(self):
-        """Schema file should have all expected top-level keys."""
+    def test_schema_driven_mc_runs_record_validates(self):
+        """A record generated from mc_runs schema required fields should validate."""
+        script_dir = Path(__file__).parent.parent
+        schema_path = script_dir / "schemas" / "mc_runs_schema_v1.json"
+        schema = load_schema(schema_path)
+        self.assertIsNotNone(schema)
+        
+        required_fields = schema["required_fields"]
+        field_types = schema["field_types"]
+        
+        record = {}
+        for field in required_fields:
+            ftype = field_types.get(field, "string")
+            if ftype == "integer":
+                record[field] = 0
+            elif ftype == "number":
+                record[field] = 0.0
+            elif ftype == "string":
+                record[field] = "None"
+            elif ftype == "boolean":
+                record[field] = False
+        
+        record["schema_version"] = 1
+        
+        errors, _ = validate_record(record, schema, 1, None, "run_index")
+        self.assertEqual(len(errors), 0, f"Schema-driven mc_runs record should validate. Errors: {errors}")
+    
+    def test_telemetry_schema_file_has_all_required_keys(self):
+        """Telemetry schema file should have all expected top-level keys."""
         script_dir = Path(__file__).parent.parent
         schema_path = script_dir / "schemas" / "telemetry_schema_v1.json"
         schema = load_schema(schema_path)
@@ -616,8 +846,20 @@ class TestSchemaGeneratedTelemetry(unittest.TestCase):
         self.assertIn("invariants", schema)
         self.assertIn("schema_version", schema)
         self.assertEqual(schema["schema_version"], 1)
+    
+    def test_mc_runs_schema_file_has_all_required_keys(self):
+        """mc_runs schema file should have all expected top-level keys."""
+        script_dir = Path(__file__).parent.parent
+        schema_path = script_dir / "schemas" / "mc_runs_schema_v1.json"
+        schema = load_schema(schema_path)
+        
+        self.assertIsNotNone(schema)
+        self.assertIn("required_fields", schema)
+        self.assertIn("optional_fields", schema)
+        self.assertIn("field_types", schema)
+        self.assertIn("schema_version", schema)
+        self.assertEqual(schema["schema_version"], 1)
 
 
 if __name__ == '__main__':
     unittest.main()
-
