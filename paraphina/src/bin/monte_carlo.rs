@@ -40,6 +40,8 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use paraphina::config::{resolve_effective_profile, Config, RiskProfile};
 use paraphina::engine::Engine;
 use paraphina::exit;
@@ -88,6 +90,9 @@ struct RunArgs {
     /// Number of runs to execute in this shard (default: same as --runs).
     /// The Monte Carlo loop iterates [run_start_index, run_start_index + run_count).
     run_count: Option<usize>,
+    /// Number of threads for parallel execution (default: 1).
+    /// When threads > 1, runs are executed in parallel using a rayon thread pool.
+    threads: usize,
 }
 
 /// Arguments for the `summarize` command.
@@ -132,6 +137,7 @@ RUN FLAGS:
   --print-every N      Print every N runs (default: 1). Ignored with --quiet.
   --csv PATH           Write per-run CSV rows to PATH (relative to output-dir)
   --output-dir DIR     Output directory (default: runs/demo_step_7_1)
+  --threads N          Number of threads for parallel execution (default: 1)
   --quiet              Suppress per-run lines; only print final summary
   --help               Show this help
 
@@ -190,6 +196,7 @@ EXAMPLES:
             output_dir: PathBuf::from(DEFAULT_OUTPUT_DIR),
             run_start_index: 0,
             run_count: None,
+            threads: 1,
         };
 
         let mut it = env::args().skip(1).peekable();
@@ -307,6 +314,17 @@ EXAMPLES:
                         .ok_or_else(|| "Missing value for --output-dir".to_string())?;
                     out.output_dir = PathBuf::from(v);
                 }
+                "--threads" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| "Missing value for --threads".to_string())?;
+                    out.threads = v
+                        .parse::<usize>()
+                        .map_err(|_| "Invalid --threads (expected integer)".to_string())?;
+                    if out.threads == 0 {
+                        return Err("--threads must be >= 1".to_string());
+                    }
+                }
 
                 // Support --flag=value style for convenience.
                 _ if arg.starts_with("--profile=") => {
@@ -391,6 +409,15 @@ EXAMPLES:
                 _ if arg.starts_with("--output-dir=") => {
                     let v = &arg["--output-dir=".len()..];
                     out.output_dir = PathBuf::from(v);
+                }
+                _ if arg.starts_with("--threads=") => {
+                    let v = &arg["--threads=".len()..];
+                    out.threads = v
+                        .parse::<usize>()
+                        .map_err(|_| "Invalid --threads (expected integer)".to_string())?;
+                    if out.threads == 0 {
+                        return Err("--threads must be >= 1".to_string());
+                    }
                 }
 
                 other => return Err(format!("Unknown argument: {other}")),
@@ -676,6 +703,10 @@ struct SimpleStats {
 
 #[derive(Debug, Clone)]
 struct RunResult {
+    /// Global run index (used for deterministic ordering).
+    global_idx: usize,
+    /// Seed used for this run.
+    seed: u64,
     final_pnl: f64,
     max_drawdown: f64,
     max_abs_delta: f64,
@@ -688,7 +719,14 @@ struct RunResult {
     ticks_executed: usize,
 }
 
-fn run_once(cfg: &Config, seed: u64, ticks: usize, tick_ms: i64, jitter_ms: i64) -> RunResult {
+fn run_once(
+    cfg: &Config,
+    global_idx: usize,
+    seed: u64,
+    ticks: usize,
+    tick_ms: i64,
+    jitter_ms: i64,
+) -> RunResult {
     let engine = Engine::new(cfg);
     let mut state = GlobalState::new(cfg);
 
@@ -777,6 +815,8 @@ fn run_once(cfg: &Config, seed: u64, ticks: usize, tick_ms: i64, jitter_ms: i64)
     }
 
     RunResult {
+        global_idx,
+        seed,
         final_pnl: state.daily_pnl_total,
         max_drawdown: dd.max_drawdown(),
         max_abs_delta,
@@ -903,7 +943,7 @@ fn run_monte_carlo(args: RunArgs) {
     });
 
     println!(
-        "paraphina-mc v{} | profile={} ({}) runs={} run_start={} run_count={} ticks={} seed={} tick_ms={} jitter_ms={} print_every={} output_dir={} csv={}",
+        "paraphina-mc v{} | profile={} ({}) runs={} run_start={} run_count={} ticks={} seed={} tick_ms={} jitter_ms={} threads={} print_every={} output_dir={} csv={}",
         env!("CARGO_PKG_VERSION"),
         profile_name(profile),
         effective.source.as_str(),
@@ -914,6 +954,7 @@ fn run_monte_carlo(args: RunArgs) {
         args.seed,
         args.tick_ms,
         args.jitter_ms,
+        args.threads,
         args.print_every,
         args.output_dir.display(),
         csv_path
@@ -921,6 +962,63 @@ fn run_monte_carlo(args: RunArgs) {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+
+    // =========================================================================
+    // Execute runs (parallel or sequential)
+    // =========================================================================
+
+    // Collect global indices for all runs
+    let global_indices: Vec<usize> = (run_start_index..run_end_index).collect();
+
+    // Execute runs in parallel if threads > 1, otherwise sequential
+    let mut results: Vec<RunResult> = if args.threads > 1 {
+        // Build a custom thread pool with the specified number of threads
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build()
+            .expect("Failed to create rayon thread pool");
+
+        pool.install(|| {
+            global_indices
+                .par_iter()
+                .map(|&global_idx| {
+                    // Deterministic seed mapping: seed_i = base_seed + i (u64 wrap)
+                    let run_seed = args.seed.wrapping_add(global_idx as u64);
+                    run_once(
+                        &cfg,
+                        global_idx,
+                        run_seed,
+                        args.ticks,
+                        args.tick_ms,
+                        args.jitter_ms,
+                    )
+                })
+                .collect()
+        })
+    } else {
+        // Sequential execution for threads=1 (default)
+        global_indices
+            .iter()
+            .map(|&global_idx| {
+                let run_seed = args.seed.wrapping_add(global_idx as u64);
+                run_once(
+                    &cfg,
+                    global_idx,
+                    run_seed,
+                    args.ticks,
+                    args.tick_ms,
+                    args.jitter_ms,
+                )
+            })
+            .collect()
+    };
+
+    // Sort results by global_idx to ensure deterministic output order
+    results.sort_by_key(|r| r.global_idx);
+
+    // =========================================================================
+    // Process results and write outputs (sequential for determinism)
+    // =========================================================================
 
     let mut pnl_stats = OnlineStats::default();
     let mut dd_stats = OnlineStats::default();
@@ -938,12 +1036,8 @@ fn run_monte_carlo(args: RunArgs) {
     // Collect run records for JSON output
     let mut run_records: Vec<McRunRecord> = Vec::with_capacity(run_count);
 
-    // Iterate over global indices [run_start_index, run_start_index + run_count)
-    for global_idx in run_start_index..run_end_index {
-        // Deterministic seed mapping: seed_i = base_seed + i (u64 wrap)
-        let run_seed = args.seed.wrapping_add(global_idx as u64);
-        let r = run_once(&cfg, run_seed, args.ticks, args.tick_ms, args.jitter_ms);
-
+    // Process results in sorted order
+    for r in &results {
         pnl_stats.add(r.final_pnl);
         dd_stats.add(r.max_drawdown);
         max_abs_delta_stats.add(r.max_abs_delta);
@@ -962,10 +1056,10 @@ fn run_monte_carlo(args: RunArgs) {
         let kill_reason_str = format!("{:?}", r.kill_reason);
 
         // Store run record for mc_summary.json (uses 1-based run number for display)
-        let local_idx = global_idx - run_start_index;
+        let local_idx = r.global_idx - run_start_index;
         run_records.push(McRunRecord {
             run: local_idx + 1,
-            seed: run_seed,
+            seed: r.seed,
             ticks_executed: r.ticks_executed,
             kill_tick: r.kill_tick,
             kill_switch: r.kill_switch,
@@ -982,8 +1076,8 @@ fn run_monte_carlo(args: RunArgs) {
         // schema_version=1 per schemas/mc_runs_schema_v1.json telemetry contract
         let jsonl_record = McRunJsonlRecord {
             schema_version: 1,
-            run_index: global_idx,
-            seed: run_seed,
+            run_index: r.global_idx,
+            seed: r.seed,
             pnl_total: r.final_pnl,
             max_drawdown: r.max_drawdown,
             kill_switch: r.kill_switch,
@@ -1004,8 +1098,8 @@ fn run_monte_carlo(args: RunArgs) {
             writeln!(
                 f,
                 "{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
-                global_idx,
-                run_seed,
+                r.global_idx,
+                r.seed,
                 r.ticks_executed,
                 kt,
                 r.kill_switch,
@@ -1020,6 +1114,7 @@ fn run_monte_carlo(args: RunArgs) {
             .unwrap();
         }
 
+        // Print progress (only after parallel execution completes, so no interleaving)
         let should_print = !args.quiet
             && (args.print_every == 1
                 || (local_idx + 1).is_multiple_of(args.print_every)
@@ -1039,8 +1134,8 @@ fn run_monte_carlo(args: RunArgs) {
                 "run {:>4}/{:<4} (global={}) seed={:<10} pnl={:>10.4} maxDD={:>10.4} |maxΔ|={:>10.4} |basis|={:>10.4} |q|={:>9.4} tox={:>6.3} kill={} kt={} reason={} ticks={}",
                 local_idx + 1,
                 run_count,
-                global_idx,
-                run_seed,
+                r.global_idx,
+                r.seed,
                 r.final_pnl,
                 r.max_drawdown,
                 r.max_abs_delta,
@@ -1240,6 +1335,7 @@ config:
   run_count: {}
   tick_ms: {}
   jitter_ms: {}
+  threads: {}
   profile: {}
 
 paraphina_version: {}
@@ -1251,6 +1347,7 @@ paraphina_version: {}
         run_count,
         args.tick_ms,
         args.jitter_ms,
+        args.threads,
         profile_name(profile),
         env!("CARGO_PKG_VERSION")
     );

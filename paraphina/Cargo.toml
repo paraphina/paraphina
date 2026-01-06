@@ -37,6 +37,9 @@ sha2 = { workspace = true }
 # For ergonomic error handling.
 anyhow = "1"
 
+# For parallel Monte Carlo execution.
+rayon = "1.10"
+
 [dev-dependencies]
 # For creating temporary directories in tests.
 tempfile = "3"
