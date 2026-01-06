@@ -1,18 +1,21 @@
 name: telemetry-contract-gate
 
 # Telemetry Contract Gate CI
-# Validates that telemetry schema and tooling are consistent.
+# Validates that telemetry schemas and tooling are consistent.
 #
 # Exit codes from check_telemetry_contract.py:
 #   0 = OK (all records valid)
 #   1 = Contract violation (schema error)
-#   2 = File not found
-#   3 = Internal error
+#   2 = File not found, CLI usage error, or unmapped file type
 
 on:
   pull_request:
   push:
     branches: [main]
+
+# Minimal permissions - read-only for contents
+permissions:
+  contents: read
 
 jobs:
   telemetry-contract-gate:
@@ -35,21 +38,27 @@ jobs:
       - name: Run Docs Integrity Gate
         run: python3 tools/check_docs_integrity.py
 
-      # Run telemetry contract gate (default invocation from repo root)
-      - name: Run Telemetry Contract Gate
-        run: python3 tools/check_telemetry_contract.py
-
-      # Validate schema file is valid JSON
-      - name: Validate schema file
+      # Validate schema files are valid JSON
+      - name: Validate schema files
         run: |
           python3 -c "
           import json
+          
+          # Validate telemetry_schema_v1.json
           with open('schemas/telemetry_schema_v1.json') as f:
               schema = json.load(f)
-          assert 'required_fields' in schema, 'Schema missing required_fields'
-          assert 'field_types' in schema, 'Schema missing field_types'
-          assert schema.get('schema_version') == 1, 'Schema version must be 1'
-          print('✓ Schema file is valid')
+          assert 'required_fields' in schema, 'Telemetry schema missing required_fields'
+          assert 'field_types' in schema, 'Telemetry schema missing field_types'
+          assert schema.get('schema_version') == 1, 'Telemetry schema version must be 1'
+          print('✓ schemas/telemetry_schema_v1.json is valid')
+          
+          # Validate mc_runs_schema_v1.json
+          with open('schemas/mc_runs_schema_v1.json') as f:
+              schema = json.load(f)
+          assert 'required_fields' in schema, 'MC runs schema missing required_fields'
+          assert 'field_types' in schema, 'MC runs schema missing field_types'
+          assert schema.get('schema_version') == 1, 'MC runs schema version must be 1'
+          print('✓ schemas/mc_runs_schema_v1.json is valid')
           "
 
       # Run Python unit tests for telemetry contract gate
@@ -69,64 +78,95 @@ jobs:
         run: |
           cargo test telemetry_schema --release -- --nocapture
 
-      # Generate a sample telemetry file and validate it
+      # Build paraphina binary
       - name: Build paraphina binary
         run: cargo build --release -p paraphina
 
-      - name: Generate sample telemetry and validate
+      # Generate per-tick telemetry via paraphina binary (non-vacuous validation)
+      - name: Generate per-tick telemetry
         run: |
-          # Create temp directory
-          mkdir -p runs/ci/telemetry_test
+          echo "=== Generating per-tick telemetry ==="
+          mkdir -p runs/ci/telemetry_smoke
           
-          # Run a short simulation with telemetry enabled
           PARAPHINA_TELEMETRY_MODE=jsonl \
-          PARAPHINA_TELEMETRY_PATH=runs/ci/telemetry_test/telemetry.jsonl \
-          ./target/release/paraphina --ticks 10 --profile balanced || true
+          PARAPHINA_TELEMETRY_PATH=runs/ci/telemetry_smoke/telemetry.jsonl \
+          ./target/release/paraphina --ticks 10 --profile balanced
           
-          # Check if telemetry file was created
-          if [ -f runs/ci/telemetry_test/telemetry.jsonl ]; then
-            echo "✓ Telemetry file generated"
-            echo "First 3 records:"
-            head -3 runs/ci/telemetry_test/telemetry.jsonl
-            
-            # Validate against schema
-            python3 tools/check_telemetry_contract.py runs/ci/telemetry_test/telemetry.jsonl
-          else
-            echo "⚠ Telemetry file not generated (may be expected in some configs)"
-            # Create a minimal valid test file to verify the validator works
-            python3 -c "
-          import json
-          record = {
-              'schema_version': 1,
-              't': 0,
-              'pnl_realised': 0.0,
-              'pnl_unrealised': 0.0,
-              'pnl_total': 0.0,
-              'risk_regime': 'Normal',
-              'kill_switch': False,
-              'kill_reason': 'None',
-              'q_global_tao': 0.0,
-              'dollar_delta_usd': 0.0,
-              'basis_usd': 0.0,
+          echo "✓ Per-tick telemetry generated"
+
+      # Hard assertion: expected telemetry file must exist
+      - name: Assert telemetry file exists
+        run: |
+          echo "=== Verifying telemetry artifact exists ==="
+          test -f runs/ci/telemetry_smoke/telemetry.jsonl || {
+            echo "ERROR: Expected file runs/ci/telemetry_smoke/telemetry.jsonl not found"
+            exit 1
           }
-          with open('runs/ci/telemetry_test/telemetry.jsonl', 'w') as f:
-              f.write(json.dumps(record) + '\n')
-          print('✓ Created synthetic test file')
-          "
-            python3 tools/check_telemetry_contract.py runs/ci/telemetry_test/telemetry.jsonl
-          fi
+          echo "✓ telemetry.jsonl exists"
+          echo "File size: $(wc -c < runs/ci/telemetry_smoke/telemetry.jsonl) bytes"
+          echo "Record count: $(wc -l < runs/ci/telemetry_smoke/telemetry.jsonl) lines"
+          echo "First record (formatted):"
+          head -1 runs/ci/telemetry_smoke/telemetry.jsonl | python3 -m json.tool
+
+      # Non-vacuous telemetry contract validation (per-tick)
+      - name: Validate per-tick telemetry contract
+        run: |
+          echo "=== Running Telemetry Contract Gate on per-tick telemetry ==="
+          python3 tools/check_telemetry_contract.py runs/ci/telemetry_smoke/telemetry.jsonl
+
+      # Generate MC runs via mc_scale smoke (tests mc_runs.jsonl schema)
+      - name: Generate MC runs telemetry
+        run: |
+          echo "=== Generating MC runs via mc_scale smoke ==="
+          rm -rf runs/ci/mc_smoke
+          python3 -m batch_runs.phase_a.mc_scale smoke \
+            --seed 12345 \
+            --runs 6 \
+            --shards 2 \
+            --ticks 20 \
+            --out-dir runs/ci/mc_smoke
+          
+          echo "✓ MC runs generated"
+
+      # Hard assertion: mc_runs.jsonl must exist
+      - name: Assert mc_runs.jsonl exists
+        run: |
+          echo "=== Verifying mc_runs.jsonl artifact exists ==="
+          test -f runs/ci/mc_smoke/mc_runs.jsonl || {
+            echo "ERROR: Expected file runs/ci/mc_smoke/mc_runs.jsonl not found"
+            exit 1
+          }
+          echo "✓ mc_runs.jsonl exists"
+          echo "File size: $(wc -c < runs/ci/mc_smoke/mc_runs.jsonl) bytes"
+          echo "Record count: $(wc -l < runs/ci/mc_smoke/mc_runs.jsonl) lines"
+          echo "First record (formatted):"
+          head -1 runs/ci/mc_smoke/mc_runs.jsonl | python3 -m json.tool
+
+      # Non-vacuous MC runs contract validation
+      - name: Validate MC runs telemetry contract
+        run: |
+          echo "=== Running Telemetry Contract Gate on MC runs ==="
+          python3 tools/check_telemetry_contract.py runs/ci/mc_smoke/mc_runs.jsonl
+
+      # Validate entire MC output directory (tests multi-file validation)
+      - name: Validate MC output directory
+        run: |
+          echo "=== Validating entire MC output directory ==="
+          python3 tools/check_telemetry_contract.py runs/ci/mc_smoke/
 
       # Summary
       - name: CI Summary
         if: always()
         run: |
           echo "=== Telemetry Contract Gate Summary ==="
-          echo "✓ Schema file validated"
+          echo "✓ Schema files validated"
           echo "✓ Python unit tests passed"
           echo "✓ Rust schema tests passed"
-          echo "✓ Telemetry validator functional"
+          echo "✓ Per-tick telemetry generated and validated (non-vacuous)"
+          echo "✓ MC runs generated and validated (non-vacuous)"
           echo ""
-          echo "Schema: schemas/telemetry_schema_v1.json"
+          echo "Schemas:"
+          echo "  - schemas/telemetry_schema_v1.json (per-tick telemetry)"
+          echo "  - schemas/mc_runs_schema_v1.json (MC runs)"
           echo "Docs:   docs/TELEMETRY_SCHEMA_V1.md"
           echo "Tool:   tools/check_telemetry_contract.py"
-
