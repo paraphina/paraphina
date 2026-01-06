@@ -189,10 +189,16 @@ where
             }
 
             // Telemetry snapshot (must keep schema stable for research tooling)
-            // Required fields: t, pnl_total, risk_regime, kill_switch (per research contract)
-            // Milestone D additions: fv_available, fair_value, sigma_eff,
-            //                        healthy_venues_used_count, healthy_venues_used
+            // Schema contract: see docs/TELEMETRY_SCHEMA_V1.md and schemas/telemetry_schema_v1.json
+            // Required fields: schema_version, t, pnl_realised, pnl_unrealised, pnl_total,
+            //                  risk_regime, kill_switch, kill_reason, q_global_tao,
+            //                  dollar_delta_usd, basis_usd
+            // Optional fields: fv_available, fair_value, sigma_eff,
+            //                  healthy_venues_used_count, healthy_venues_used
             self.telemetry.log_json(&json!({
+                // Schema version (required for contract validation)
+                "schema_version": 1,
+                // Required fields
                 "t": tick,
                 "pnl_realised": self.state.daily_realised_pnl,
                 "pnl_unrealised": self.state.daily_unrealised_pnl,
@@ -203,7 +209,7 @@ where
                 "q_global_tao": self.state.q_global_tao,
                 "dollar_delta_usd": self.state.dollar_delta_usd,
                 "basis_usd": self.state.basis_usd,
-                // Milestone D: FV gating & volatility telemetry
+                // Optional fields (Milestone D: FV gating & volatility telemetry)
                 "fv_available": self.state.fv_available,
                 "fair_value": self.state.fair_value,
                 "sigma_eff": self.state.sigma_eff,

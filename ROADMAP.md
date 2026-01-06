@@ -693,11 +693,28 @@ This repo evolves in three layers:
     - 1 = FAIL (REJECT - candidate fails guardrails)
     - 2 = HOLD (insufficient evidence - needs more data)
     - 3 = ERROR (runtime/IO/parsing failure)
+- [x] **Telemetry Contract Gate v1** **IMPLEMENTED**
+  - Prevents telemetry schema drift from breaking analytics / Phase B world-model training silently
+  - Schema v1 with versioned records (`schema_version: 1`)
+  - Required fields: `schema_version`, `t`, `pnl_realised`, `pnl_unrealised`, `pnl_total`, `risk_regime`, `kill_switch`, `kill_reason`, `q_global_tao`, `dollar_delta_usd`, `basis_usd`
+  - Optional fields: `fv_available`, `fair_value`, `sigma_eff`, `healthy_venues_used_count`, `healthy_venues_used`
+  - Schema files:
+    - `docs/TELEMETRY_SCHEMA_V1.md` (human-readable)
+    - `schemas/telemetry_schema_v1.json` (machine-readable)
+  - Validator: `tools/check_telemetry_contract.py`
+    - Exit codes: 0=OK, 1=contract violation, 2=file not found, 3=internal error
+  - Rust: `paraphina/src/strategy.rs` emits `schema_version: 1` in all telemetry records
+  - Tests:
+    - `tests/test_telemetry_contract_gate.py` (Python unit tests + subprocess integration)
+    - `paraphina/tests/telemetry_schema_tests.rs` (Rust schema compliance)
+  - CI: `.github/workflows/telemetry_contract_gate.yml`
+  - Invariants enforced: monotonic tick, finite numerics, valid enum values, backwards compatibility
 
 ### Phase B — World Model (Learned Simulator) on GPUs
 **Goal:** learn a high-fidelity dynamics model from telemetry so RL is sample-efficient.
 
-- [ ] Telemetry schema stabilisation (what the world model needs)
+- [x] Telemetry schema stabilisation (what the world model needs)
+  - **Implemented via Telemetry Contract Gate v1** (see above)
   - observations: books, spreads/depth, funding, basis, fills, latency proxies
   - actions: quotes, cancels, exits, hedges
   - outcomes: fills, slippage, markouts, pnl, risk events

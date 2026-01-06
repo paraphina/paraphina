@@ -89,10 +89,27 @@ Where the canonical spec differs from current code, that difference must be trea
 - `src/strategy.rs`
   - Runs the full loop: tick → MM quotes → hedge plan → intents → sim execution → recompute state.
   - Emits per-tick JSONL telemetry used by research tooling.
+  - Telemetry includes `schema_version: 1` for contract validation.
   - **Implemented: `paraphina/src/strategy.rs::StrategyRunner::run_simulation`** (see EVIDENCE_PACK.md §1)
 - `src/telemetry.rs`
   - JSONL sink controlled by env vars (mode/path).
   - **Implemented: `paraphina/src/telemetry.rs`**
+
+**Telemetry Contract Gate v1**
+- Prevents telemetry schema drift from breaking downstream consumers (analytics, Phase B world-model training).
+- Schema definition:
+  - Human-readable: `docs/TELEMETRY_SCHEMA_V1.md`
+  - Machine-readable: `schemas/telemetry_schema_v1.json`
+- Every telemetry record includes `"schema_version": 1`.
+- Required fields: `schema_version`, `t`, `pnl_realised`, `pnl_unrealised`, `pnl_total`, `risk_regime`, `kill_switch`, `kill_reason`, `q_global_tao`, `dollar_delta_usd`, `basis_usd`
+- Optional fields: `fv_available`, `fair_value`, `sigma_eff`, `healthy_venues_used_count`, `healthy_venues_used`
+- Invariants: monotonic tick, finite numerics, valid enum values
+- Validator: `tools/check_telemetry_contract.py` (exit: 0=OK, 1=violation, 2=not found, 3=error)
+- CI gate: `.github/workflows/telemetry_contract_gate.yml`
+- Tests:
+  - `tests/test_telemetry_contract_gate.py` (Python)
+  - `paraphina/tests/telemetry_schema_tests.rs` (Rust)
+- **Implemented: `paraphina/src/strategy.rs`, `schemas/telemetry_schema_v1.json`, `tools/check_telemetry_contract.py`**
 
 ---
 
@@ -367,7 +384,7 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 
 ## Invariants (must not be weakened)
 
-1) **Telemetry schema**: do not rename/remove `pnl_total`, `risk_regime`, `kill_switch`, `t` without updating research tooling and versioning.
+1) **Telemetry schema**: Telemetry Contract Gate v1 enforces schema stability. Required fields (`schema_version`, `t`, `pnl_realised`, `pnl_unrealised`, `pnl_total`, `risk_regime`, `kill_switch`, `kill_reason`, `q_global_tao`, `dollar_delta_usd`, `basis_usd`) must not be renamed/removed without incrementing `schema_version`. See `docs/TELEMETRY_SCHEMA_V1.md` and `schemas/telemetry_schema_v1.json`.
 2) **Loss limit semantics**: daily loss limit is stored as a positive magnitude; the hard threshold is `-abs(limit)`.
 3) **Kill switch disables new risk**: MM and hedge must not produce new intents once kill is active.
 4) **PnL correctness**: realised and unrealised PnL identities must remain true; extend tests if refactoring.

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Paraphina Telemetry Record Schema v1",
+  "description": "Schema for per-tick telemetry JSONL records. See docs/TELEMETRY_SCHEMA_V1.md for full specification.",
+  "type": "object",
+  "schema_version": 1,
+  "required_fields": [
+    "schema_version",
+    "t",
+    "pnl_realised",
+    "pnl_unrealised",
+    "pnl_total",
+    "risk_regime",
+    "kill_switch",
+    "kill_reason",
+    "q_global_tao",
+    "dollar_delta_usd",
+    "basis_usd"
+  ],
+  "optional_fields": [
+    "fv_available",
+    "fair_value",
+    "sigma_eff",
+    "healthy_venues_used_count",
+    "healthy_venues_used",
+    "basis_gross_usd"
+  ],
+  "field_types": {
+    "schema_version": "integer",
+    "t": "integer",
+    "pnl_realised": "number",
+    "pnl_unrealised": "number",
+    "pnl_total": "number",
+    "risk_regime": "string",
+    "kill_switch": "boolean",
+    "kill_reason": "string",
+    "q_global_tao": "number",
+    "dollar_delta_usd": "number",
+    "basis_usd": "number",
+    "fv_available": "boolean",
+    "fair_value": ["number", "null"],
+    "sigma_eff": "number",
+    "healthy_venues_used_count": "integer",
+    "healthy_venues_used": "array_of_integer",
+    "basis_gross_usd": "number"
+  },
+  "enums": {
+    "risk_regime": ["Normal", "Warning", "HardLimit"]
+  },
+  "invariants": {
+    "schema_version_value": 1,
+    "t_monotonic": true,
+    "numerics_finite": true
+  }
+}
+
