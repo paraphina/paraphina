@@ -30,11 +30,26 @@ impl<'a> Engine<'a> {
     ///
     /// Deterministic function of `now_ms` and venue index. This is for
     /// exercising the control loops / tests, not realism.
+    ///
+    /// Optimization notes:
+    /// - Alpha decay factors are precomputed outside the venue loop to avoid
+    ///   repeated config access and subtraction per venue.
+    /// - No heap allocations; all operations are in-place on VenueState.
+    /// - Explicit for-loop with index to maintain deterministic iteration order.
     pub fn seed_dummy_mids(&self, state: &mut GlobalState, now_ms: i64) {
         let base = 250.0 + (now_ms as f64) * 0.001;
-        let vol_cfg = &self.cfg.volatility;
 
-        for (idx, v) in state.venues.iter_mut().enumerate() {
+        // Precompute EWMA decay factors outside the loop to avoid per-venue
+        // repeated config access and (1.0 - alpha) computation.
+        let alpha_short = self.cfg.volatility.fv_vol_alpha_short;
+        let alpha_long = self.cfg.volatility.fv_vol_alpha_long;
+        let one_minus_alpha_short = 1.0 - alpha_short;
+        let one_minus_alpha_long = 1.0 - alpha_long;
+
+        // Explicit indexed loop for deterministic venue ordering.
+        for idx in 0..state.venues.len() {
+            let v = &mut state.venues[idx];
+
             let offset = idx as f64 * 0.4;
             let mid_prev = v.mid;
 
@@ -49,19 +64,17 @@ impl<'a> Engine<'a> {
             v.depth_near_mid = depth;
 
             // --- Local per-venue volatility (short / long EWMA of log returns) ---
+            // Only update if we have a valid previous mid for computing returns.
             if let Some(prev) = mid_prev {
                 if prev > 0.0 && mid > 0.0 {
                     let r = (mid / prev).ln();
                     let r2 = r * r;
 
-                    let alpha_short = vol_cfg.fv_vol_alpha_short;
-                    let alpha_long = vol_cfg.fv_vol_alpha_long;
-
                     let var_short_prev = v.local_vol_short * v.local_vol_short;
                     let var_long_prev = v.local_vol_long * v.local_vol_long;
 
-                    let var_short_new = (1.0 - alpha_short) * var_short_prev + alpha_short * r2;
-                    let var_long_new = (1.0 - alpha_long) * var_long_prev + alpha_long * r2;
+                    let var_short_new = one_minus_alpha_short * var_short_prev + alpha_short * r2;
+                    let var_long_new = one_minus_alpha_long * var_long_prev + alpha_long * r2;
 
                     v.local_vol_short = var_short_new.max(0.0).sqrt();
                     v.local_vol_long = var_long_new.max(0.0).sqrt();
@@ -116,6 +129,7 @@ impl<'a> Engine<'a> {
         // (or fall back to prev_fair or a constant).
         let kf_uninit = state.kf_last_update_ms == 0 || state.kf_x_hat == 0.0;
 
+        // Compute median mid using scratch buffer (no allocation).
         let init_mid_median = self.median_mid_from_books(state, now_ms);
 
         let mut x_hat = if !kf_uninit {
@@ -146,31 +160,37 @@ impl<'a> Engine<'a> {
             None
         };
 
-        let obs = self.collect_kf_observations(state, now_ms, gate_ref);
+        // Collect observations into scratch buffer (no allocation).
+        self.collect_kf_observations(state, now_ms, gate_ref);
 
         // Milestone D: min-healthy gating - require >= min_healthy_for_kf observations
         // to apply a measurement update; otherwise skip measurement update (time update only).
         let min_healthy = book_cfg.min_healthy_for_kf as usize;
-        let fv_available = obs.len() >= min_healthy;
+        let obs_len = state.scratch_kf_obs.len();
+        let fv_available = obs_len >= min_healthy;
 
-        // Track which venues were used for telemetry
-        let healthy_venues_used: Vec<usize> = if fv_available {
-            obs.iter().map(|(idx, _, _)| *idx).collect()
-        } else {
-            Vec::new()
-        };
+        // Track which venues were used for telemetry.
+        // Reuse healthy_venues_used Vec in state (clear and repopulate).
+        state.healthy_venues_used.clear();
+        if fv_available {
+            for (idx, _, _) in &state.scratch_kf_obs {
+                state.healthy_venues_used.push(*idx);
+            }
+        }
 
         if fv_available {
-            for (_, y, r) in &obs {
+            // Explicit indexed loop over scratch buffer for KF update.
+            for i in 0..state.scratch_kf_obs.len() {
+                let (_, y, r) = state.scratch_kf_obs[i];
                 // Standard scalar KF update:
                 //   S = P + R
                 //   K = P / S
                 //   x = x + K (y - x)
                 //   P = (1 - K) P
-                let s = p + *r;
+                let s = p + r;
                 if s.is_finite() && s > 0.0 {
                     let k_gain = p / s;
-                    x_hat += k_gain * (*y - x_hat);
+                    x_hat += k_gain * (y - x_hat);
                     p *= 1.0 - k_gain;
                 }
             }
@@ -218,17 +238,26 @@ impl<'a> Engine<'a> {
 
         // Milestone D: FV gating telemetry fields.
         state.fv_available = fv_available;
-        state.healthy_venues_used_count = healthy_venues_used.len();
-        state.healthy_venues_used = healthy_venues_used;
+        state.healthy_venues_used_count = state.healthy_venues_used.len();
     }
 
     /// Compute median mid across venues with fresh books (no outlier gating).
-    fn median_mid_from_books(&self, state: &GlobalState, now_ms: i64) -> Option<f64> {
+    ///
+    /// Optimization notes:
+    /// - Reuses `state.scratch_mids` buffer to avoid per-tick heap allocation.
+    /// - Buffer is cleared and repopulated each call; capacity is preserved.
+    /// - Explicit indexed loop maintains deterministic venue ordering.
+    fn median_mid_from_books(&self, state: &mut GlobalState, now_ms: i64) -> Option<f64> {
         let book_cfg = &self.cfg.book;
+        let stale_ms = book_cfg.stale_ms;
 
-        let mut mids: Vec<f64> = Vec::new();
+        // Reuse scratch buffer: clear but preserve capacity.
+        state.scratch_mids.clear();
 
-        for v in &state.venues {
+        // Explicit indexed loop for deterministic ordering.
+        for idx in 0..state.venues.len() {
+            let v = &state.venues[idx];
+
             if matches!(v.status, VenueStatus::Disabled) {
                 continue;
             }
@@ -236,7 +265,7 @@ impl<'a> Engine<'a> {
             let Some(ts) = v.last_mid_update_ms else {
                 continue;
             };
-            if now_ms - ts > book_cfg.stale_ms {
+            if now_ms - ts > stale_ms {
                 continue;
             }
 
@@ -247,19 +276,21 @@ impl<'a> Engine<'a> {
                 continue;
             }
 
-            mids.push(mid);
+            state.scratch_mids.push(mid);
         }
 
-        if mids.is_empty() {
+        if state.scratch_mids.is_empty() {
             return None;
         }
 
-        mids.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = mids.len();
+        state
+            .scratch_mids
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = state.scratch_mids.len();
         if n % 2 == 1 {
-            Some(mids[n / 2])
+            Some(state.scratch_mids[n / 2])
         } else {
-            Some(0.5 * (mids[n / 2 - 1] + mids[n / 2]))
+            Some(0.5 * (state.scratch_mids[n / 2 - 1] + state.scratch_mids[n / 2]))
         }
     }
 
@@ -272,19 +303,32 @@ impl<'a> Engine<'a> {
     ///  - valid mid/spread/depth,
     ///  - optional outlier gating vs gate_ref (outlier gating).
     ///
-    /// Returns venue indices along with observations for telemetry tracking.
-    fn collect_kf_observations(
-        &self,
-        state: &GlobalState,
-        now_ms: i64,
-        gate_ref: Option<f64>,
-    ) -> Vec<(usize, f64, f64)> {
+    /// Returns a slice reference to the scratch buffer containing observations.
+    /// The buffer is cleared and repopulated each call.
+    ///
+    /// Optimization notes:
+    /// - Reuses `state.scratch_kf_obs` buffer to avoid per-tick heap allocation.
+    /// - Config values are cached in locals to avoid repeated struct access.
+    /// - Explicit indexed loop maintains deterministic venue ordering.
+    fn collect_kf_observations(&self, state: &mut GlobalState, now_ms: i64, gate_ref: Option<f64>) {
         let book_cfg = &self.cfg.book;
         let k_cfg = &self.cfg.kalman;
 
-        let mut out: Vec<(usize, f64, f64)> = Vec::new();
+        // Cache config values to avoid repeated struct access in loop.
+        let stale_ms = book_cfg.stale_ms;
+        let max_mid_jump_pct = book_cfg.max_mid_jump_pct;
+        let r_min = k_cfg.r_min;
+        let r_max = k_cfg.r_max;
+        let r_a = k_cfg.r_a;
+        let r_b = k_cfg.r_b;
 
-        for (venue_idx, v) in state.venues.iter().enumerate() {
+        // Reuse scratch buffer: clear but preserve capacity.
+        state.scratch_kf_obs.clear();
+
+        // Explicit indexed loop for deterministic ordering.
+        for venue_idx in 0..state.venues.len() {
+            let v = &state.venues[venue_idx];
+
             // --- Disabled venue gating ---
             if matches!(v.status, VenueStatus::Disabled) {
                 continue;
@@ -298,7 +342,7 @@ impl<'a> Engine<'a> {
             let Some(ts) = v.last_mid_update_ms else {
                 continue;
             };
-            if now_ms - ts > book_cfg.stale_ms {
+            if now_ms - ts > stale_ms {
                 continue;
             }
 
@@ -323,7 +367,7 @@ impl<'a> Engine<'a> {
             if let Some(ref_price) = gate_ref {
                 if ref_price.is_finite() && ref_price > 0.0 {
                     let dev = ((mid - ref_price) / ref_price).abs();
-                    if dev > book_cfg.max_mid_jump_pct {
+                    if dev > max_mid_jump_pct {
                         continue;
                     }
                 }
@@ -332,19 +376,16 @@ impl<'a> Engine<'a> {
             // Observation noise model:
             // We observe y = log(mid). Use spread scaled to a relative measure.
             let spread_rel = (spread / mid).max(1e-9);
-            let mut r =
-                k_cfg.r_min + k_cfg.r_a * spread_rel * spread_rel + k_cfg.r_b / (depth + 1e-9);
+            let mut r = r_min + r_a * spread_rel * spread_rel + r_b / (depth + 1e-9);
 
             if !r.is_finite() || r <= 0.0 {
-                r = k_cfg.r_max;
+                r = r_max;
             }
-            r = r.clamp(k_cfg.r_min, k_cfg.r_max);
+            r = r.clamp(r_min, r_max);
 
             let y = mid.max(1e-6).ln();
-            out.push((venue_idx, y, r));
+            state.scratch_kf_obs.push((venue_idx, y, r));
         }
-
-        out
     }
 
     // ---------------------------------------------------------------------
