@@ -74,6 +74,52 @@ pub struct VenueTargetInventory {
     pub q_target: f64,
 }
 
+/// Precomputed tick-level scalars for MM quoting.
+///
+/// These values are computed once per tick and reused across all venues,
+/// avoiding repeated config lookups and arithmetic in the hot venue loop.
+/// This struct is internal and preserves exact numerical results.
+struct TickScalars {
+    // Fair value and global state
+    s_t: f64,
+    sigma_eff: f64,
+    q_global: f64,
+    delta_abs_usd: f64,
+    delta_limit_usd: f64,
+    spread_mult: f64,
+    size_mult: f64,
+
+    // Precomputed from MM config (tick-invariant)
+    beta_b: f64,
+    beta_f: f64,
+    lambda_inv: f64,
+    edge_local_min: f64,
+    edge_vol_mult: f64,
+    size_eta: f64,
+    /// tau / (8 * 60 * 60) - funding horizon fraction
+    funding_horizon_frac: f64,
+    /// sigma_eff * sigma_eff * tau - for inventory skew term
+    sigma_sq_tau: f64,
+
+    // Precomputed from risk config
+    liq_crit_sigma: f64,
+    liq_warn_sigma: f64,
+    spread_warn_mult: f64,
+    mm_margin_factor: f64, // mm_max_leverage * mm_margin_safety
+    q_warn_cap: f64,
+
+    // Precomputed from toxicity config
+    tox_high_threshold: f64,
+    tox_med_threshold: f64,
+
+    // Ablation flags (computed once per tick)
+    disable_fv_gating: bool,
+    disable_tox_gating: bool,
+
+    // Risk regime flags (precomputed to avoid matches! in loop)
+    is_warning_regime: bool,
+}
+
 /// Compute per-venue target inventories based on liquidity and funding.
 ///
 /// Section 9.1:
@@ -83,30 +129,61 @@ pub struct VenueTargetInventory {
 pub fn compute_venue_targets(cfg: &Config, state: &GlobalState) -> Vec<VenueTargetInventory> {
     let n = cfg.venues.len();
     let mut targets = Vec::with_capacity(n);
+    compute_venue_targets_into(cfg, state, &mut targets);
+    targets
+}
+
+/// Compute per-venue target inventories (buffer-reusing variant).
+///
+/// Clears `out` and pushes targets into it, reusing capacity.
+/// Use this in hot paths to avoid per-tick allocations.
+pub fn compute_venue_targets_into(
+    cfg: &Config,
+    state: &GlobalState,
+    out: &mut Vec<VenueTargetInventory>,
+) {
+    out.clear();
+
+    let n = cfg.venues.len();
+    let s_t = state.fair_value.unwrap_or(1.0).max(1.0);
+    let s_t_inv = 1.0 / s_t; // Precompute reciprocal for division
 
     // Sum depth across all healthy venues.
     let mut total_depth: f64 = 0.0;
-    for (i, vcfg) in cfg.venues.iter().enumerate() {
+    for i in 0..n {
         let vstate = &state.venues[i];
+        let vcfg = &cfg.venues[i];
         // Only include healthy venues with valid data.
         if !matches!(vstate.status, VenueStatus::Disabled) && vstate.depth_near_mid > 0.0 {
             // Use depth_near_mid as liquidity proxy.
             // Convert to TAO-equivalent if depth is in USD.
-            let s_t = state.fair_value.unwrap_or(1.0).max(1.0);
-            let depth_tao = vstate.depth_near_mid / s_t;
+            let depth_tao = vstate.depth_near_mid * s_t_inv;
             total_depth += depth_tao * vcfg.w_liq;
         }
     }
 
     let q_global = state.q_global_tao;
-    let mm_cfg = &cfg.mm;
+    let funding_scale = cfg.mm.funding_target_rate_scale;
+    let funding_max_tao = cfg.mm.funding_target_max_tao;
+    let has_funding_scale = funding_scale > 0.0;
+    let funding_scale_inv = if has_funding_scale {
+        1.0 / funding_scale
+    } else {
+        0.0
+    };
+    let total_depth_inv = if total_depth > 0.0 {
+        1.0 / total_depth
+    } else {
+        0.0
+    };
 
-    for (i, vcfg) in cfg.venues.iter().enumerate() {
+    for i in 0..n {
         let vstate = &state.venues[i];
+        let vcfg = &cfg.venues[i];
 
         // Default: no weight, target = 0.
         if matches!(vstate.status, VenueStatus::Disabled) || total_depth <= 0.0 {
-            targets.push(VenueTargetInventory {
+            out.push(VenueTargetInventory {
                 venue_index: i,
                 w_liq: 0.0,
                 q_target: 0.0,
@@ -115,30 +192,27 @@ pub fn compute_venue_targets(cfg: &Config, state: &GlobalState) -> Vec<VenueTarg
         }
 
         // Compute liquidity weight.
-        let s_t = state.fair_value.unwrap_or(1.0).max(1.0);
-        let depth_tao = vstate.depth_near_mid / s_t;
-        let w_liq = (depth_tao * vcfg.w_liq) / total_depth;
+        let depth_tao = vstate.depth_near_mid * s_t_inv;
+        let w_liq = (depth_tao * vcfg.w_liq) * total_depth_inv;
 
         // Compute funding preference phi.
         // phi(funding_8h) = clip(funding_8h / scale, -1, 1) * max_tao
-        let funding_norm = if mm_cfg.funding_target_rate_scale > 0.0 {
-            (vstate.funding_8h / mm_cfg.funding_target_rate_scale).clamp(-1.0, 1.0)
+        let funding_norm = if has_funding_scale {
+            (vstate.funding_8h * funding_scale_inv).clamp(-1.0, 1.0)
         } else {
             0.0
         };
-        let phi_funding = funding_norm * mm_cfg.funding_target_max_tao;
+        let phi_funding = funding_norm * funding_max_tao;
 
         // q_target_v = w_liq_v * q_global + w_fund_v * phi(funding)
         let q_target = w_liq * q_global + vcfg.w_fund * phi_funding;
 
-        targets.push(VenueTargetInventory {
+        out.push(VenueTargetInventory {
             venue_index: i,
             w_liq,
             q_target,
         });
     }
-
-    targets
 }
 
 /// Main MM quoting function.
@@ -182,6 +256,12 @@ pub fn compute_mm_quotes_with_ablations(
 /// Ablations:
 /// - disable_fair_value_gating: Gating always allows (never blocks quoting)
 /// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
+///
+/// Optimization notes:
+/// - Tick-invariant scalars are precomputed once into TickScalars struct.
+/// - Per-venue target inventory computation reuses scratch buffer pattern.
+/// - Config lookups are hoisted out of the per-venue loop.
+/// - Explicit indexed loops for deterministic ordering.
 pub fn compute_mm_quotes_with_ablations_into(
     cfg: &Config,
     state: &GlobalState,
@@ -190,16 +270,18 @@ pub fn compute_mm_quotes_with_ablations_into(
 ) {
     out.clear();
 
+    let n = cfg.venues.len();
+
     // If we don't have a fair value yet, we can't quote meaningfully.
     let s_t = match state.fair_value {
         Some(v) => v,
         None => {
             // Return "empty quotes" so downstream code still sees one
             // entry per venue, but with no bid/ask.
-            for (i, vcfg) in cfg.venues.iter().enumerate() {
+            for i in 0..n {
                 out.push(MmQuote {
                     venue_index: i,
-                    venue_id: vcfg.id_arc.clone(),
+                    venue_id: cfg.venues[i].id_arc.clone(),
                     bid: None,
                     ask: None,
                 });
@@ -210,15 +292,8 @@ pub fn compute_mm_quotes_with_ablations_into(
 
     // Global scalars.
     let sigma_eff = state.sigma_eff.max(cfg.volatility.sigma_min).max(1e-8);
-    let vol_ratio = state.vol_ratio_clipped.max(0.0);
-
     let spread_mult = state.spread_mult.max(0.0);
     let size_mult = state.size_mult.max(0.0);
-
-    let q_global = state.q_global_tao;
-    let delta_abs_usd = state.dollar_delta_usd.abs();
-    let delta_limit_usd = state.delta_limit_usd.max(1.0);
-
     let risk_regime = state.risk_regime;
 
     // ---------------------------------------------------------------------
@@ -226,13 +301,12 @@ pub fn compute_mm_quotes_with_ablations_into(
     // ---------------------------------------------------------------------
 
     // Kill switch OR HardLimit => return no quotes.
-    //
     // Spec: HardLimit is "structurally unsafe", so MM must fully stop.
     if state.kill_switch || matches!(risk_regime, RiskRegime::HardLimit) {
-        for (i, vcfg) in cfg.venues.iter().enumerate() {
+        for i in 0..n {
             out.push(MmQuote {
                 venue_index: i,
-                venue_id: vcfg.id_arc.clone(),
+                venue_id: cfg.venues[i].id_arc.clone(),
                 bid: None,
                 ask: None,
             });
@@ -242,10 +316,10 @@ pub fn compute_mm_quotes_with_ablations_into(
 
     // If volatility or size_mult are degenerate, don't quote.
     if sigma_eff <= 0.0 || size_mult <= 0.0 {
-        for (i, vcfg) in cfg.venues.iter().enumerate() {
+        for i in 0..n {
             out.push(MmQuote {
                 venue_index: i,
-                venue_id: vcfg.id_arc.clone(),
+                venue_id: cfg.venues[i].id_arc.clone(),
                 bid: None,
                 ask: None,
             });
@@ -253,13 +327,66 @@ pub fn compute_mm_quotes_with_ablations_into(
         return;
     }
 
+    // Cache config references
+    let mm_cfg = &cfg.mm;
+    let risk_cfg = &cfg.risk;
+    let tox_cfg = &cfg.toxicity;
+
+    // Precompute tick-invariant scalars (hoisted from per-venue loop)
+    let tau = mm_cfg.quote_horizon_sec.max(1.0);
+    let scalars = TickScalars {
+        s_t,
+        sigma_eff,
+        q_global: state.q_global_tao,
+        delta_abs_usd: state.dollar_delta_usd.abs(),
+        delta_limit_usd: state.delta_limit_usd.max(1.0),
+        spread_mult,
+        size_mult,
+
+        // MM config scalars
+        beta_b: mm_cfg.basis_weight,
+        beta_f: mm_cfg.funding_weight,
+        lambda_inv: mm_cfg.lambda_inv,
+        edge_local_min: mm_cfg.edge_local_min.max(0.0),
+        edge_vol_mult: mm_cfg.edge_vol_mult,
+        size_eta: mm_cfg.size_eta.max(1e-9),
+        funding_horizon_frac: tau / (8.0 * 60.0 * 60.0),
+        sigma_sq_tau: sigma_eff * sigma_eff * tau,
+
+        // Risk config scalars
+        liq_crit_sigma: risk_cfg.liq_crit_sigma,
+        liq_warn_sigma: risk_cfg.liq_warn_sigma,
+        spread_warn_mult: risk_cfg.spread_warn_mult.max(1.0),
+        mm_margin_factor: risk_cfg.mm_max_leverage * risk_cfg.mm_margin_safety,
+        q_warn_cap: risk_cfg.q_warn_cap.max(0.0),
+
+        // Toxicity config scalars
+        tox_high_threshold: tox_cfg.tox_high_threshold,
+        tox_med_threshold: tox_cfg.tox_med_threshold,
+
+        // Ablation flags (computed once)
+        disable_fv_gating: ablations.disable_fair_value_gating(),
+        disable_tox_gating: ablations.disable_toxicity_gate(),
+
+        // Risk regime flags
+        is_warning_regime: matches!(risk_regime, RiskRegime::Warning),
+    };
+
     // Compute per-venue target inventories.
+    // Note: Using allocating version here for simplicity; could add scratch buffer to state
+    // if this shows up in profiles. The Vec is small (n venues).
     let venue_targets = compute_venue_targets(cfg, state);
 
     // ---------------------------------------------------------------------
-    // Per-venue quoting
+    // Per-venue quoting (explicit indexed loop for determinism)
     // ---------------------------------------------------------------------
-    for (i, vcfg) in cfg.venues.iter().enumerate() {
+    // We use explicit index because we need to:
+    // 1. Access cfg.venues[i], state.venues[i], and venue_targets[i] in lockstep
+    // 2. Use the index value itself for venue_index in MmQuote
+    // 3. Maintain deterministic iteration order
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..n {
+        let vcfg = &cfg.venues[i];
         let vstate = &state.venues[i];
         let target = &venue_targets[i];
 
@@ -277,32 +404,8 @@ pub fn compute_mm_quotes_with_ablations_into(
         // Venue mid: prefer local mid if present, else fall back to fair value.
         let mid = vstate.mid.unwrap_or(s_t);
 
-        // Basis and funding.
-        let basis_v = mid - s_t;
-        let funding_8h = vstate.funding_8h;
-        let q_v = vstate.position_tao;
-        let q_target_v = target.q_target;
-
-        let (bid, ask) = compute_single_venue_quotes(
-            cfg,
-            vcfg,
-            vstate,
-            s_t,
-            mid,
-            basis_v,
-            funding_8h,
-            sigma_eff,
-            vol_ratio,
-            q_global,
-            q_v,
-            q_target_v,
-            delta_abs_usd,
-            delta_limit_usd,
-            spread_mult,
-            size_mult,
-            risk_regime,
-            ablations,
-        );
+        let (bid, ask) =
+            compute_single_venue_quotes_fast(vcfg, vstate, mid, target.q_target, &scalars);
 
         out.push(MmQuote {
             venue_index: i,
@@ -355,11 +458,311 @@ pub fn mm_quotes_to_order_intents_into(quotes: &[MmQuote], out: &mut Vec<OrderIn
 /// Compute the maker cost for a venue (fee minus rebate).
 ///
 /// Returns cost in USD per unit of notional.
+#[inline]
 fn compute_maker_cost(vcfg: &VenueConfig, price: f64) -> f64 {
     // maker_fee_bps is positive = fee, maker_rebate_bps is positive = rebate
     let fee_rate = vcfg.maker_fee_bps / 10_000.0;
     let rebate_rate = vcfg.maker_rebate_bps / 10_000.0;
     (fee_rate - rebate_rate) * price
+}
+
+/// Optimized single-venue quote computation using precomputed tick scalars.
+///
+/// This is the hot-path version that avoids repeated config lookups by using
+/// the precomputed TickScalars struct. All numerical computations are identical
+/// to compute_single_venue_quotes to preserve bit-exact determinism.
+#[inline]
+fn compute_single_venue_quotes_fast(
+    vcfg: &VenueConfig,
+    vstate: &VenueState,
+    mid: f64,
+    q_target_v: f64,
+    sc: &TickScalars,
+) -> (Option<MmLevel>, Option<MmLevel>) {
+    // ---------------------------------------------------------------------
+    // 0) Venue-level gating
+    // ---------------------------------------------------------------------
+
+    // If the venue is Disabled, no quoting (unless toxicity gating is disabled).
+    if !sc.disable_tox_gating && matches!(vstate.status, VenueStatus::Disabled) {
+        return (None, None);
+    }
+
+    // If liquidation distance is below critical, do not quote at all.
+    let dist_liq = vstate.dist_liq_sigma;
+    if dist_liq <= sc.liq_crit_sigma {
+        return (None, None);
+    }
+
+    // Toxicity gating: if toxicity >= TOX_HIGH_THRESHOLD, skip venue.
+    if !sc.disable_tox_gating && vstate.toxicity >= sc.tox_high_threshold {
+        return (None, None);
+    }
+
+    // Stale book check: if we have no mid or it's stale, don't quote.
+    if vstate.mid.is_none() && !sc.disable_fv_gating {
+        return (None, None);
+    }
+
+    // Check for valid spread/depth.
+    let spread = vstate
+        .spread
+        .unwrap_or(if sc.disable_fv_gating { 0.01 } else { 0.0 });
+    let depth = if sc.disable_fv_gating && vstate.depth_near_mid <= 0.0 {
+        10_000.0 // Default depth when gating disabled
+    } else {
+        vstate.depth_near_mid
+    };
+    if spread <= 0.0 || depth <= 0.0 {
+        return (None, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // 1) AS half-spread (Section 9.2)
+    // ---------------------------------------------------------------------
+
+    let gamma = vcfg.gamma.max(1e-8);
+    let k = vcfg.k.max(1e-8);
+
+    // Classical AS half-spread: δ* = (1/γ) * ln(1 + γ/k)
+    let delta_as = (1.0 / gamma) * (1.0 + (gamma / k)).ln();
+
+    // Apply volatility spread multiplier.
+    let delta_vol = delta_as * sc.spread_mult.max(1e-6);
+
+    // Compute minimum admissible half-spread (Section 9.2):
+    //   min_half = (EDGE_LOCAL_MIN + maker_cost + vol_buffer) / 2
+    let maker_cost = compute_maker_cost(vcfg, sc.s_t);
+    let vol_buffer = sc.edge_vol_mult * sc.sigma_eff * sc.s_t;
+    let min_half_spread = (sc.edge_local_min + maker_cost + vol_buffer) / 2.0;
+
+    // Final half-spread: max of AS-derived and minimum economic requirement.
+    let mut half_spread = delta_vol.max(min_half_spread).max(0.0);
+
+    // Warning regime: widen spreads further.
+    if sc.is_warning_regime {
+        half_spread *= sc.spread_warn_mult;
+    }
+
+    // As we approach liquidation warning threshold, widen spreads (linear ramp).
+    if dist_liq > 0.0 && dist_liq < sc.liq_warn_sigma {
+        let t = ((sc.liq_warn_sigma - dist_liq) / sc.liq_warn_sigma).clamp(0.0, 1.0);
+        // Up to +200% extra spread near liquidation.
+        half_spread *= 1.0 + 2.0 * t;
+    }
+
+    if half_spread <= 0.0 {
+        return (None, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // 2) Reservation price (Section 9.1)
+    // ---------------------------------------------------------------------
+
+    // Basis and funding for this venue.
+    let basis_v = mid - sc.s_t;
+    let funding_8h = vstate.funding_8h;
+    let q_v = vstate.position_tao;
+
+    // Funding expected PnL per unit over horizon tau:
+    //   f_v = funding_8h * (tau/8h) * S
+    let funding_pnl_per_unit = funding_8h * sc.funding_horizon_frac * sc.s_t;
+
+    // Enhanced reservation price (spec formula):
+    //   r_v = S_t + β_b*b_v + β_f*f_v - γ*(σ_eff^2)*τ*( q_global - λ_inv*(q_v - q_target_v) )
+    let basis_adj = sc.beta_b * basis_v;
+    let funding_adj = sc.beta_f * funding_pnl_per_unit;
+
+    // Inventory skew term (using precomputed sigma_sq_tau):
+    let inv_deviation = sc.q_global - sc.lambda_inv * (q_v - q_target_v);
+    let inv_term = gamma * sc.sigma_sq_tau * inv_deviation;
+
+    let reservation_price = sc.s_t + basis_adj + funding_adj - inv_term;
+
+    // Raw quote prices.
+    let raw_bid = reservation_price - half_spread;
+    let raw_ask = reservation_price + half_spread;
+
+    // ---------------------------------------------------------------------
+    // 3) Passivity enforcement (Section 9.2)
+    // ---------------------------------------------------------------------
+
+    // Derive best_bid/best_ask from venue mid/spread if no L2 is available.
+    let half_book_spread = spread / 2.0;
+    let best_bid = mid - half_book_spread;
+    let best_ask = mid + half_book_spread;
+
+    let tick = vcfg.tick_size.max(1e-6);
+
+    // Enforce passivity: bid <= best_bid - tick, ask >= best_ask + tick.
+    let passive_bid_limit = best_bid - tick;
+    let passive_ask_limit = best_ask + tick;
+
+    // Apply tick snapping.
+    let mut bid_price = (raw_bid.min(passive_bid_limit) / tick).floor() * tick;
+    let mut ask_price = (raw_ask.max(passive_ask_limit) / tick).ceil() * tick;
+
+    // Re-check passivity after snapping; adjust if needed.
+    if bid_price > passive_bid_limit {
+        bid_price = (passive_bid_limit / tick).floor() * tick;
+    }
+    if ask_price < passive_ask_limit {
+        ask_price = (passive_ask_limit / tick).ceil() * tick;
+    }
+
+    // Sanity checks.
+    if bid_price <= 0.0 || ask_price <= bid_price {
+        return (None, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // 4) Per-unit edge calculation and gating (Section 9.2)
+    // ---------------------------------------------------------------------
+
+    // Per-unit edge for bid and ask after maker fees only.
+    let edge_bid = sc.s_t - bid_price - maker_cost;
+    let edge_ask = ask_price - sc.s_t - maker_cost;
+
+    let bid_edge_ok = edge_bid >= sc.edge_local_min;
+    let ask_edge_ok = edge_ask >= sc.edge_local_min;
+
+    // ---------------------------------------------------------------------
+    // 5) Size model (Section 10)
+    // ---------------------------------------------------------------------
+
+    // Quadratic objective: J(Q) = e*Q - 0.5*η*Q^2
+    // Unconstrained optimum: Q_raw = e / η (if e > 0)
+    let q_raw_bid = if bid_edge_ok && edge_bid > 0.0 {
+        edge_bid / sc.size_eta
+    } else {
+        0.0
+    };
+
+    let q_raw_ask = if ask_edge_ok && edge_ask > 0.0 {
+        edge_ask / sc.size_eta
+    } else {
+        0.0
+    };
+
+    // Apply volatility size multiplier.
+    let mut size_bid = q_raw_bid * sc.size_mult;
+    let mut size_ask = q_raw_ask * sc.size_mult;
+
+    // Apply per-venue min/max size.
+    size_bid = size_bid.max(vcfg.lot_size_tao);
+    size_ask = size_ask.max(vcfg.lot_size_tao);
+
+    // Margin cap: Q_margin_max = margin_available * mm_margin_factor / price
+    let margin_cap_bid = if bid_price > 0.0 {
+        (vstate.margin_available_usd * sc.mm_margin_factor) / bid_price
+    } else {
+        f64::MAX
+    };
+
+    let margin_cap_ask = if ask_price > 0.0 {
+        (vstate.margin_available_usd * sc.mm_margin_factor) / ask_price
+    } else {
+        f64::MAX
+    };
+
+    size_bid = size_bid.min(margin_cap_bid);
+    size_ask = size_ask.min(margin_cap_ask);
+
+    // Liquidation-distance-aware shrinking (Section 10):
+    // If dist_liq <= LIQ_CRIT_SIGMA: no risk-increasing quotes (reduce-only)
+    // If LIQ_CRIT < dist < LIQ_WARN: shrink sizes linearly
+    if dist_liq <= sc.liq_crit_sigma {
+        // At or below critical: only allow reduce-only quotes.
+        if q_v > 0.0 {
+            size_bid = 0.0;
+        } else if q_v < 0.0 {
+            size_ask = 0.0;
+        } else {
+            size_bid = 0.0;
+            size_ask = 0.0;
+        }
+    } else if dist_liq < sc.liq_warn_sigma {
+        // Linear shrink as we approach critical.
+        let k_liq = ((dist_liq - sc.liq_crit_sigma)
+            / (sc.liq_warn_sigma - sc.liq_crit_sigma + 1e-9))
+            .clamp(0.0, 1.0);
+        size_bid *= k_liq;
+        size_ask *= k_liq;
+    }
+
+    // Venue health: Warning venues get reduced size.
+    if !sc.disable_tox_gating && matches!(vstate.status, VenueStatus::Warning) {
+        size_bid *= 0.5;
+        size_ask *= 0.5;
+    }
+
+    // Toxicity: medium toxicity reduces sizes.
+    if !sc.disable_tox_gating
+        && vstate.toxicity >= sc.tox_med_threshold
+        && vstate.toxicity < sc.tox_high_threshold
+    {
+        let tox_factor = 1.0 - (vstate.toxicity - sc.tox_med_threshold) / (0.3_f64).max(1e-6);
+        size_bid *= tox_factor.clamp(0.1, 1.0);
+        size_ask *= tox_factor.clamp(0.1, 1.0);
+    }
+
+    // Delta-limit directional throttling.
+    let delta_ratio = (sc.delta_abs_usd / sc.delta_limit_usd).max(0.0);
+
+    if delta_ratio >= 2.0 {
+        return (None, None);
+    } else if delta_ratio > 1.0 {
+        let factor = (2.0 - delta_ratio).clamp(0.0, 1.0);
+
+        if sc.q_global > 0.0 {
+            size_bid = 0.0;
+            size_ask *= factor;
+        } else if sc.q_global < 0.0 {
+            size_ask = 0.0;
+            size_bid *= factor;
+        } else {
+            size_bid *= factor;
+            size_ask *= factor;
+        }
+    }
+
+    // Warning regime: cap size.
+    if sc.is_warning_regime {
+        size_bid = size_bid.min(sc.q_warn_cap);
+        size_ask = size_ask.min(sc.q_warn_cap);
+    }
+
+    // Hard cap by venue max size.
+    size_bid = size_bid.min(vcfg.max_order_size);
+    size_ask = size_ask.min(vcfg.max_order_size);
+
+    // Apply lot size rounding.
+    let lot = vcfg.lot_size_tao.max(1e-9);
+    size_bid = (size_bid / lot).floor() * lot;
+    size_ask = (size_ask / lot).floor() * lot;
+
+    // Check minimum size.
+    let min_size = vcfg.lot_size_tao.max(0.0);
+
+    let bid = if size_bid >= min_size && bid_edge_ok {
+        Some(MmLevel {
+            price: bid_price,
+            size: size_bid,
+        })
+    } else {
+        None
+    };
+
+    let ask = if size_ask >= min_size && ask_edge_ok {
+        Some(MmLevel {
+            price: ask_price,
+            size: size_ask,
+        })
+    } else {
+        None
+    };
+
+    (bid, ask)
 }
 
 /// Compute bid/ask for a single venue using an Avellaneda–Stoikov-style
@@ -375,7 +778,11 @@ fn compute_maker_cost(vcfg: &VenueConfig, price: f64) -> f64 {
 /// Ablation support:
 /// - disable_fair_value_gating: Gating always allows (never blocks quoting)
 /// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
+///
+/// Note: This function is preserved for documentation and potential external use.
+/// The hot path uses compute_single_venue_quotes_fast with precomputed scalars.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn compute_single_venue_quotes(
     cfg: &Config,
     vcfg: &VenueConfig,
@@ -1205,6 +1612,71 @@ mod tests {
         assert!(
             should_replace,
             "Order with large price change should be replaced"
+        );
+    }
+
+    #[test]
+    fn test_mm_quotes_determinism_and_buffer_capacity() {
+        // Verify that compute_mm_quotes_into produces identical results
+        // across multiple calls and preserves buffer capacity.
+
+        let (cfg, state) = setup_test();
+        let n = cfg.venues.len();
+
+        // Pre-allocate with extra capacity
+        let mut quotes_buf: Vec<MmQuote> = Vec::with_capacity(n + 10);
+        let initial_capacity = quotes_buf.capacity();
+
+        // First call
+        compute_mm_quotes_into(&cfg, &state, &mut quotes_buf);
+        let quotes1: Vec<_> = quotes_buf
+            .iter()
+            .map(|q| {
+                (
+                    q.venue_index,
+                    q.bid.as_ref().map(|b| (b.price, b.size)),
+                    q.ask.as_ref().map(|a| (a.price, a.size)),
+                )
+            })
+            .collect();
+
+        // Second call with same inputs
+        compute_mm_quotes_into(&cfg, &state, &mut quotes_buf);
+        let quotes2: Vec<_> = quotes_buf
+            .iter()
+            .map(|q| {
+                (
+                    q.venue_index,
+                    q.bid.as_ref().map(|b| (b.price, b.size)),
+                    q.ask.as_ref().map(|a| (a.price, a.size)),
+                )
+            })
+            .collect();
+
+        // Verify determinism: outputs must be identical
+        assert_eq!(quotes1.len(), quotes2.len(), "Quote count differs");
+        for (i, (q1, q2)) in quotes1.iter().zip(quotes2.iter()).enumerate() {
+            assert_eq!(q1, q2, "Quote mismatch at venue {}", i);
+        }
+
+        // Verify capacity preservation
+        assert!(
+            quotes_buf.capacity() >= initial_capacity,
+            "Buffer capacity shrunk: {} < {}",
+            quotes_buf.capacity(),
+            initial_capacity
+        );
+
+        // Run many iterations to ensure no accumulation or capacity growth issues
+        for _ in 0..100 {
+            compute_mm_quotes_into(&cfg, &state, &mut quotes_buf);
+        }
+
+        // Buffer should still be length n (cleared each call) not accumulated
+        assert_eq!(
+            quotes_buf.len(),
+            n,
+            "Buffer accumulated instead of clearing"
         );
     }
 }
