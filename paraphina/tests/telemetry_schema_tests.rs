@@ -31,6 +31,7 @@ fn load_schema() -> Value {
 
 /// Build a telemetry record matching what strategy.rs emits.
 /// This mirrors the json! macro call in StrategyRunner::run_simulation.
+#[allow(clippy::too_many_arguments)]
 fn build_telemetry_record(
     tick: u64,
     pnl_realised: f64,

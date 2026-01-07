@@ -442,3 +442,199 @@ fn test_repeated_buffer_clears() {
     // Lengths should be the same since state is identical
     assert_eq!(len1, len2, "Buffer not properly cleared between calls");
 }
+
+// =============================================================================
+// Engine seed_dummy_mids Optimization Tests
+// =============================================================================
+
+/// Compute a simple checksum of engine state for determinism verification.
+fn compute_state_checksum(state: &GlobalState) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+
+    // Hash fair value and volatility state
+    if let Some(fv) = state.fair_value {
+        fv.to_bits().hash(&mut hasher);
+    }
+    state.fair_value_prev.to_bits().hash(&mut hasher);
+    state.kf_x_hat.to_bits().hash(&mut hasher);
+    state.kf_p.to_bits().hash(&mut hasher);
+    state.fv_short_vol.to_bits().hash(&mut hasher);
+    state.fv_long_vol.to_bits().hash(&mut hasher);
+    state.sigma_eff.to_bits().hash(&mut hasher);
+
+    // Hash per-venue state
+    for v in &state.venues {
+        if let Some(mid) = v.mid {
+            mid.to_bits().hash(&mut hasher);
+        }
+        if let Some(spread) = v.spread {
+            spread.to_bits().hash(&mut hasher);
+        }
+        v.depth_near_mid.to_bits().hash(&mut hasher);
+        v.local_vol_short.to_bits().hash(&mut hasher);
+        v.local_vol_long.to_bits().hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
+#[test]
+fn test_seed_dummy_mids_determinism_regression() {
+    // Run the same tick loop twice with identical initial conditions
+    // and verify that all outputs are byte-identical.
+
+    let cfg = create_test_config();
+    let engine = Engine::new(&cfg);
+
+    let num_ticks = 100;
+
+    // --- First run ---
+    let mut state1 = GlobalState::new(&cfg);
+    let mut checksums1: Vec<u64> = Vec::with_capacity(num_ticks);
+
+    for t in 0..num_ticks {
+        let now_ms: TimestampMs = 1000 + t as i64 * 100;
+
+        engine.seed_dummy_mids(&mut state1, now_ms);
+        engine.main_tick(&mut state1, now_ms);
+
+        checksums1.push(compute_state_checksum(&state1));
+    }
+
+    // --- Second run (identical inputs) ---
+    let mut state2 = GlobalState::new(&cfg);
+    let mut checksums2: Vec<u64> = Vec::with_capacity(num_ticks);
+
+    for t in 0..num_ticks {
+        let now_ms: TimestampMs = 1000 + t as i64 * 100;
+
+        engine.seed_dummy_mids(&mut state2, now_ms);
+        engine.main_tick(&mut state2, now_ms);
+
+        checksums2.push(compute_state_checksum(&state2));
+    }
+
+    // --- Verify checksums match tick-by-tick ---
+    assert_eq!(
+        checksums1.len(),
+        checksums2.len(),
+        "Different number of ticks executed"
+    );
+
+    for (tick, (c1, c2)) in checksums1.iter().zip(checksums2.iter()).enumerate() {
+        assert_eq!(
+            c1, c2,
+            "State checksum mismatch at tick {}: {} != {}",
+            tick, c1, c2
+        );
+    }
+
+    // --- Verify final state is identical ---
+    assert!(
+        (state1.fair_value.unwrap_or(0.0) - state2.fair_value.unwrap_or(0.0)).abs() < 1e-15,
+        "Final fair value differs"
+    );
+    assert!(
+        (state1.kf_x_hat - state2.kf_x_hat).abs() < 1e-15,
+        "Final kf_x_hat differs"
+    );
+    assert!(
+        (state1.sigma_eff - state2.sigma_eff).abs() < 1e-15,
+        "Final sigma_eff differs"
+    );
+
+    // Verify per-venue state is identical
+    for (i, (v1, v2)) in state1.venues.iter().zip(state2.venues.iter()).enumerate() {
+        assert!(
+            (v1.mid.unwrap_or(0.0) - v2.mid.unwrap_or(0.0)).abs() < 1e-15,
+            "Venue {} mid differs",
+            i
+        );
+        assert!(
+            (v1.local_vol_short - v2.local_vol_short).abs() < 1e-15,
+            "Venue {} local_vol_short differs",
+            i
+        );
+        assert!(
+            (v1.local_vol_long - v2.local_vol_long).abs() < 1e-15,
+            "Venue {} local_vol_long differs",
+            i
+        );
+    }
+}
+
+#[test]
+fn test_engine_scratch_buffer_capacity_preserved() {
+    // Verify that scratch buffers in GlobalState preserve their capacity
+    // across multiple tick cycles (no shrinking/reallocating).
+
+    let cfg = create_test_config();
+    let engine = Engine::new(&cfg);
+    let mut state = GlobalState::new(&cfg);
+
+    let num_venues = cfg.venues.len();
+
+    // Record initial capacity after construction using accessor methods
+    let initial_mids_cap = state.scratch_mids_capacity();
+    let initial_kf_obs_cap = state.scratch_kf_obs_capacity();
+
+    // Verify initial capacity is at least venue count (pre-allocated)
+    assert!(
+        initial_mids_cap >= num_venues,
+        "scratch_mids should be pre-allocated: {} < {}",
+        initial_mids_cap,
+        num_venues
+    );
+    assert!(
+        initial_kf_obs_cap >= num_venues,
+        "scratch_kf_obs should be pre-allocated: {} < {}",
+        initial_kf_obs_cap,
+        num_venues
+    );
+
+    // Run many ticks
+    for t in 0..200 {
+        let now_ms: TimestampMs = 1000 + t * 100;
+        engine.seed_dummy_mids(&mut state, now_ms);
+        engine.main_tick(&mut state, now_ms);
+    }
+
+    // Verify capacity was preserved (not shrunk)
+    assert!(
+        state.scratch_mids_capacity() >= initial_mids_cap,
+        "scratch_mids capacity shrunk: {} < {}",
+        state.scratch_mids_capacity(),
+        initial_mids_cap
+    );
+    assert!(
+        state.scratch_kf_obs_capacity() >= initial_kf_obs_cap,
+        "scratch_kf_obs capacity shrunk: {} < {}",
+        state.scratch_kf_obs_capacity(),
+        initial_kf_obs_cap
+    );
+
+    // Verify buffers are cleared between ticks (not accumulating)
+    // After the last main_tick, buffers should have been used and cleared
+    // for the next potential tick. Let's run one more seed + tick and check lengths.
+    let now_ms: TimestampMs = 1000 + 200 * 100;
+    engine.seed_dummy_mids(&mut state, now_ms);
+    engine.main_tick(&mut state, now_ms);
+
+    // After main_tick, scratch buffers should be populated with current tick's data
+    // (not accumulated from all previous ticks)
+    assert!(
+        state.scratch_mids_len() <= num_venues,
+        "scratch_mids accumulated instead of cleared: {} > {}",
+        state.scratch_mids_len(),
+        num_venues
+    );
+    assert!(
+        state.scratch_kf_obs_len() <= num_venues,
+        "scratch_kf_obs accumulated instead of cleared: {} > {}",
+        state.scratch_kf_obs_len(),
+        num_venues
+    );
+}

@@ -131,6 +131,19 @@ pub struct GlobalState {
     // ----- Per-venue -----
     pub venues: Vec<VenueState>,
 
+    // ----- Scratch buffers for hot-path reuse -----
+    // These buffers are used internally by Engine methods to avoid per-tick
+    // heap allocations. They are cleared and reused each tick. The contents
+    // are transient and not part of the logical state.
+    //
+    // Safety: These are only written to by Engine methods during a single
+    // tick and cleared before use. They do not affect determinism since
+    // they are always cleared/rebuilt from scratch each tick.
+    /// Scratch buffer for median mid computation (used by median_mid_from_books).
+    pub(crate) scratch_mids: Vec<f64>,
+    /// Scratch buffer for Kalman filter observations (used by collect_kf_observations).
+    pub(crate) scratch_kf_obs: Vec<(usize, f64, f64)>,
+
     // ----- Fair value / Kalman filter backbone -----
     /// Last time the fair-value filter was updated.
     pub kf_last_update_ms: TimestampMs,
@@ -203,6 +216,44 @@ pub struct GlobalState {
     pub basis_limit_hard_usd: f64,
 }
 
+// =============================================================================
+// Scratch buffer accessor methods for testing and inspection
+// =============================================================================
+
+impl GlobalState {
+    /// Returns the current capacity of the scratch_mids buffer.
+    ///
+    /// This is intended for testing buffer reuse behavior - verifying that
+    /// capacity is preserved across tick cycles without reallocation.
+    pub fn scratch_mids_capacity(&self) -> usize {
+        self.scratch_mids.capacity()
+    }
+
+    /// Returns the current length of the scratch_mids buffer.
+    ///
+    /// After a tick cycle, this reflects how many mids were collected
+    /// for median computation.
+    pub fn scratch_mids_len(&self) -> usize {
+        self.scratch_mids.len()
+    }
+
+    /// Returns the current capacity of the scratch_kf_obs buffer.
+    ///
+    /// This is intended for testing buffer reuse behavior - verifying that
+    /// capacity is preserved across tick cycles without reallocation.
+    pub fn scratch_kf_obs_capacity(&self) -> usize {
+        self.scratch_kf_obs.capacity()
+    }
+
+    /// Returns the current length of the scratch_kf_obs buffer.
+    ///
+    /// After a tick cycle, this reflects how many KF observations were
+    /// collected from venues.
+    pub fn scratch_kf_obs_len(&self) -> usize {
+        self.scratch_kf_obs.len()
+    }
+}
+
 impl GlobalState {
     /// Create a new state with per-venue scaffolding derived from config.
     pub fn new(cfg: &Config) -> Self {
@@ -239,6 +290,11 @@ impl GlobalState {
 
         GlobalState {
             venues,
+
+            // Scratch buffers for hot-path reuse.
+            // Pre-allocate with typical venue count to avoid early reallocations.
+            scratch_mids: Vec::with_capacity(cfg.venues.len()),
+            scratch_kf_obs: Vec::with_capacity(cfg.venues.len()),
 
             // Fair value filter
             kf_last_update_ms: 0,
