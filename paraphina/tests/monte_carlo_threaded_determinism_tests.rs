@@ -192,11 +192,7 @@ fn test_threaded_determinism_jsonl_identical() {
     let records1 = parse_jsonl_sorted(&jsonl1_path);
     let records4 = parse_jsonl_sorted(&jsonl4_path);
 
-    assert_eq!(
-        records1.len(),
-        records4.len(),
-        "JSONL record counts differ"
-    );
+    assert_eq!(records1.len(), records4.len(), "JSONL record counts differ");
 
     // Compare each record
     for (i, (r1, r4)) in records1.iter().zip(records4.iter()).enumerate() {
@@ -272,7 +268,10 @@ fn test_threaded_determinism_with_jitter() {
     let records1 = parse_jsonl_sorted(&jsonl1_path);
     let records4 = parse_jsonl_sorted(&jsonl4_path);
 
-    assert_eq!(records1, records4, "JSONL records differ with jitter enabled");
+    assert_eq!(
+        records1, records4,
+        "JSONL records differ with jitter enabled"
+    );
 }
 
 #[test]
@@ -543,4 +542,3 @@ fn test_single_thread_default() {
         "mc_runs.jsonl missing"
     );
 }
-

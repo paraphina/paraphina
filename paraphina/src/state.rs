@@ -16,6 +16,7 @@
 //    by the Engine (once set, it stays set until manual reset).
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -46,8 +47,9 @@ pub struct PendingMarkout {
 /// Per-venue state (one per perp venue / subaccount).
 #[derive(Debug, Clone)]
 pub struct VenueState {
-    /// Stable identifier matching Config.venues[i].id
-    pub id: String,
+    /// Stable identifier matching Config.venues[i].id.
+    /// Uses Arc<str> for cheap cloning in hot paths.
+    pub id: Arc<str>,
 
     // ----- Order book & local vols -----
     /// Current mid price from order book (if any).
@@ -208,7 +210,7 @@ impl GlobalState {
 
         for vcfg in &cfg.venues {
             venues.push(VenueState {
-                id: vcfg.id.clone(),
+                id: vcfg.id_arc.clone(),
 
                 mid: None,
                 spread: None,

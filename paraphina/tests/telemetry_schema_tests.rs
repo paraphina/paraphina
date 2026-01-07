@@ -26,8 +26,7 @@ fn load_schema() -> Value {
     let path = schema_path();
     let content = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Failed to read schema file {:?}: {}", path, e));
-    serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse schema JSON: {}", e))
+    serde_json::from_str(&content).unwrap_or_else(|e| panic!("Failed to parse schema JSON: {}", e))
 }
 
 /// Build a telemetry record matching what strategy.rs emits.
@@ -75,21 +74,21 @@ fn build_telemetry_record(
 /// Build a minimal telemetry record with defaults.
 fn build_minimal_telemetry_record() -> Value {
     build_telemetry_record(
-        0,                    // tick
-        0.0,                  // pnl_realised
-        0.0,                  // pnl_unrealised
-        0.0,                  // pnl_total
-        "Normal",             // risk_regime
-        false,                // kill_switch
-        "None",               // kill_reason
-        0.0,                  // q_global_tao
-        0.0,                  // dollar_delta_usd
-        0.0,                  // basis_usd
-        true,                 // fv_available
-        Some(250.0),          // fair_value
-        0.02,                 // sigma_eff
-        3,                    // healthy_venues_used_count
-        &[0, 1, 2],           // healthy_venues_used
+        0,           // tick
+        0.0,         // pnl_realised
+        0.0,         // pnl_unrealised
+        0.0,         // pnl_total
+        "Normal",    // risk_regime
+        false,       // kill_switch
+        "None",      // kill_reason
+        0.0,         // q_global_tao
+        0.0,         // dollar_delta_usd
+        0.0,         // basis_usd
+        true,        // fv_available
+        Some(250.0), // fair_value
+        0.02,        // sigma_eff
+        3,           // healthy_venues_used_count
+        &[0, 1, 2],  // healthy_venues_used
     )
 }
 
@@ -100,12 +99,12 @@ fn build_minimal_telemetry_record() -> Value {
 #[test]
 fn telemetry_record_includes_schema_version() {
     let record = build_minimal_telemetry_record();
-    
+
     assert!(
         record.get("schema_version").is_some(),
         "Telemetry record must include schema_version field"
     );
-    
+
     assert_eq!(
         record["schema_version"].as_i64(),
         Some(1),
@@ -117,19 +116,23 @@ fn telemetry_record_includes_schema_version() {
 fn telemetry_record_has_all_required_fields() {
     let schema = load_schema();
     let record = build_minimal_telemetry_record();
-    
+
     // Get required fields from schema
     let required_fields: Vec<String> = schema["required_fields"]
         .as_array()
         .expect("Schema must have required_fields array")
         .iter()
-        .map(|v| v.as_str().expect("required field must be string").to_string())
+        .map(|v| {
+            v.as_str()
+                .expect("required field must be string")
+                .to_string()
+        })
         .collect();
-    
+
     // Check each required field exists in record
     let record_obj = record.as_object().expect("Record must be an object");
     let record_keys: HashSet<&str> = record_obj.keys().map(|s| s.as_str()).collect();
-    
+
     for field in &required_fields {
         assert!(
             record_keys.contains(field.as_str()),
@@ -143,15 +146,15 @@ fn telemetry_record_has_all_required_fields() {
 fn telemetry_schema_version_matches_schema_invariant() {
     let schema = load_schema();
     let record = build_minimal_telemetry_record();
-    
+
     let expected_version = schema["invariants"]["schema_version_value"]
         .as_i64()
         .expect("Schema must specify schema_version_value invariant");
-    
+
     let actual_version = record["schema_version"]
         .as_i64()
         .expect("Record must have integer schema_version");
-    
+
     assert_eq!(
         actual_version, expected_version,
         "Telemetry schema_version must match schema invariant"
@@ -161,28 +164,38 @@ fn telemetry_schema_version_matches_schema_invariant() {
 #[test]
 fn telemetry_risk_regime_is_valid_enum() {
     let schema = load_schema();
-    
+
     let valid_regimes: Vec<String> = schema["enums"]["risk_regime"]
         .as_array()
         .expect("Schema must define risk_regime enum")
         .iter()
         .map(|v| v.as_str().expect("enum value must be string").to_string())
         .collect();
-    
+
     // Test each valid regime
     for regime in &valid_regimes {
         let record = build_telemetry_record(
-            0, 0.0, 0.0, 0.0,
+            0,
+            0.0,
+            0.0,
+            0.0,
             regime, // risk_regime
-            false, "None",
-            0.0, 0.0, 0.0,
-            true, Some(250.0), 0.02, 3, &[0, 1, 2],
+            false,
+            "None",
+            0.0,
+            0.0,
+            0.0,
+            true,
+            Some(250.0),
+            0.02,
+            3,
+            &[0, 1, 2],
         );
-        
+
         let record_regime = record["risk_regime"]
             .as_str()
             .expect("risk_regime must be string");
-        
+
         assert!(
             valid_regimes.contains(&record_regime.to_string()),
             "risk_regime '{}' should be in valid enum values: {:?}",
@@ -196,13 +209,13 @@ fn telemetry_risk_regime_is_valid_enum() {
 fn telemetry_numeric_fields_are_finite() {
     let record = build_minimal_telemetry_record();
     let schema = load_schema();
-    
+
     let field_types = schema["field_types"]
         .as_object()
         .expect("Schema must have field_types");
-    
+
     let record_obj = record.as_object().expect("Record must be object");
-    
+
     for (field, ftype) in field_types {
         let type_str = match ftype {
             Value::String(s) => s.as_str(),
@@ -216,14 +229,15 @@ fn telemetry_numeric_fields_are_finite() {
             }
             _ => continue,
         };
-        
+
         if type_str == "number" {
             if let Some(value) = record_obj.get(field) {
                 if let Some(n) = value.as_f64() {
                     assert!(
                         n.is_finite(),
                         "Numeric field '{}' must be finite, got: {}",
-                        field, n
+                        field,
+                        n
                     );
                 }
             }
@@ -234,7 +248,7 @@ fn telemetry_numeric_fields_are_finite() {
 #[test]
 fn telemetry_tick_is_non_negative_integer() {
     let record = build_minimal_telemetry_record();
-    
+
     let t = record["t"].as_i64().expect("t field must be integer");
     assert!(t >= 0, "tick must be non-negative");
 }
@@ -242,7 +256,7 @@ fn telemetry_tick_is_non_negative_integer() {
 #[test]
 fn telemetry_kill_switch_is_boolean() {
     let record = build_minimal_telemetry_record();
-    
+
     assert!(
         record["kill_switch"].is_boolean(),
         "kill_switch must be a boolean, not a number or string"
@@ -252,16 +266,17 @@ fn telemetry_kill_switch_is_boolean() {
 #[test]
 fn telemetry_healthy_venues_used_is_array_of_integers() {
     let record = build_minimal_telemetry_record();
-    
+
     let arr = record["healthy_venues_used"]
         .as_array()
         .expect("healthy_venues_used must be an array");
-    
+
     for (i, elem) in arr.iter().enumerate() {
         assert!(
             elem.is_i64() || elem.is_u64(),
             "healthy_venues_used[{}] must be an integer, got: {:?}",
-            i, elem
+            i,
+            elem
         );
     }
 }
@@ -270,15 +285,23 @@ fn telemetry_healthy_venues_used_is_array_of_integers() {
 fn telemetry_fair_value_can_be_null() {
     // Test that fair_value can be null (when FV is unavailable)
     let record = build_telemetry_record(
-        0, 0.0, 0.0, 0.0,
+        0,
+        0.0,
+        0.0,
+        0.0,
         "Normal",
-        false, "None",
-        0.0, 0.0, 0.0,
-        false,          // fv_available = false
-        None,           // fair_value = null
-        0.02, 0, &[],   // no healthy venues
+        false,
+        "None",
+        0.0,
+        0.0,
+        0.0,
+        false, // fv_available = false
+        None,  // fair_value = null
+        0.02,
+        0,
+        &[], // no healthy venues
     );
-    
+
     // fair_value should be null (serde_json represents None as null)
     assert!(
         record["fair_value"].is_null(),
@@ -293,12 +316,8 @@ fn telemetry_fair_value_can_be_null() {
 #[test]
 fn schema_file_exists_and_is_valid_json() {
     let path = schema_path();
-    assert!(
-        path.exists(),
-        "Schema file must exist at {:?}",
-        path
-    );
-    
+    assert!(path.exists(), "Schema file must exist at {:?}", path);
+
     let content = fs::read_to_string(&path).expect("Must be able to read schema file");
     let _: Value = serde_json::from_str(&content).expect("Schema must be valid JSON");
 }
@@ -307,7 +326,7 @@ fn schema_file_exists_and_is_valid_json() {
 fn schema_has_required_top_level_keys() {
     let schema = load_schema();
     let obj = schema.as_object().expect("Schema must be an object");
-    
+
     let required_keys = [
         "schema_version",
         "required_fields",
@@ -316,7 +335,7 @@ fn schema_has_required_top_level_keys() {
         "enums",
         "invariants",
     ];
-    
+
     for key in required_keys {
         assert!(
             obj.contains_key(key),
@@ -329,11 +348,10 @@ fn schema_has_required_top_level_keys() {
 #[test]
 fn schema_version_is_one() {
     let schema = load_schema();
-    
+
     assert_eq!(
         schema["schema_version"].as_i64(),
         Some(1),
         "Schema schema_version must be 1"
     );
 }
-

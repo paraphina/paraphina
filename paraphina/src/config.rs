@@ -8,6 +8,8 @@
 // It also carries a small number of "simulation environment"
 // parameters such as the initial global inventory q0 in TAO.
 
+use std::sync::Arc;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Human-readable config / release version.
@@ -186,6 +188,9 @@ pub fn resolve_effective_profile(
 pub struct VenueConfig {
     /// Stable identifier used in logs / routing (e.g. "extended").
     pub id: String,
+    /// Arc-wrapped identifier for cheap cloning in hot paths.
+    /// This is computed from `id` at construction time.
+    pub id_arc: Arc<str>,
     /// Human-readable venue name.
     pub name: String,
     /// Smallest price tick size for this venue.
@@ -555,6 +560,7 @@ impl Default for Config {
         let venues = vec![
             VenueConfig {
                 id: "extended".to_string(),
+                id_arc: Arc::from("extended"),
                 name: "Extended".to_string(),
                 tick_size: 0.01,
                 base_order_size: 1.0,
@@ -573,6 +579,7 @@ impl Default for Config {
             },
             VenueConfig {
                 id: "hyperliquid".to_string(),
+                id_arc: Arc::from("hyperliquid"),
                 name: "Hyperliquid".to_string(),
                 tick_size: 0.01,
                 base_order_size: 1.0,
@@ -591,6 +598,7 @@ impl Default for Config {
             },
             VenueConfig {
                 id: "aster".to_string(),
+                id_arc: Arc::from("aster"),
                 name: "Aster".to_string(),
                 tick_size: 0.01,
                 base_order_size: 1.0,
@@ -609,6 +617,7 @@ impl Default for Config {
             },
             VenueConfig {
                 id: "lighter".to_string(),
+                id_arc: Arc::from("lighter"),
                 name: "Lighter".to_string(),
                 tick_size: 0.01,
                 base_order_size: 1.0,
@@ -627,6 +636,7 @@ impl Default for Config {
             },
             VenueConfig {
                 id: "paradex".to_string(),
+                id_arc: Arc::from("paradex"),
                 name: "Paradex".to_string(),
                 tick_size: 0.01,
                 base_order_size: 1.0,

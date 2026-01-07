@@ -17,6 +17,8 @@
 //   - Multi-chunk: generate multiple chunk candidates per venue, aggregate into single order.
 //   - Respect constraints: total hedge ≤ max_step_tao (global) and ≤ per-venue caps.
 
+use std::sync::Arc;
+
 use crate::config::Config;
 use crate::state::GlobalState;
 use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
@@ -145,8 +147,8 @@ pub fn cap_dq_by_abs_limit(q_old: f64, desired_dq: f64, abs_limit_after_trade: f
 pub struct ChunkCandidate {
     /// Venue index.
     pub venue_index: usize,
-    /// Venue identifier (for deterministic tie-breaking).
-    pub venue_id: String,
+    /// Venue identifier (for deterministic tie-breaking). Uses Arc<str> for cheap cloning.
+    pub venue_id: Arc<str>,
     /// Chunk index within this venue (for deterministic tie-breaking).
     pub chunk_index: usize,
     /// Signed size of this chunk in TAO.
@@ -176,7 +178,7 @@ pub struct ChunkCandidate {
 #[allow(clippy::too_many_arguments)]
 pub fn build_chunk_candidates(
     venue_index: usize,
-    venue_id: String,
+    venue_id: Arc<str>,
     side: Side,
     guard_price: f64,
     max_dq_abs: f64,
@@ -303,10 +305,12 @@ pub fn greedy_allocate_chunks(
 // ============================================================================
 
 /// One venue-level hedge slice in TAO.
+///
+/// Note: `venue_id` uses `Arc<str>` for cheap cloning in hot paths.
 #[derive(Debug, Clone)]
 pub struct HedgeAllocation {
     pub venue_index: usize,
-    pub venue_id: String,
+    pub venue_id: Arc<str>,
     pub side: Side,
     pub size: f64,
     pub est_price: f64,
@@ -325,7 +329,7 @@ pub struct HedgePlan {
 #[derive(Debug, Clone)]
 struct HedgeCandidate {
     venue_index: usize,
-    venue_id: String,
+    venue_id: Arc<str>,
     /// Guard price (IOC limit).
     price: f64,
     /// Maximum size we can allocate to this venue.
@@ -671,7 +675,7 @@ fn build_candidates(
 
         candidates.push(HedgeCandidate {
             venue_index: j,
-            venue_id: vcfg.id.clone(),
+            venue_id: vcfg.id_arc.clone(),
             price: guard_px,
             max_size,
             total_cost,
@@ -764,7 +768,7 @@ fn finalize_allocations(
             .iter()
             .find(|c| c.venue_index == venue_index)
             .map(|c| c.venue_id.clone())
-            .unwrap_or_else(|| cfg.venues[venue_index].id.clone());
+            .unwrap_or_else(|| cfg.venues[venue_index].id_arc.clone());
 
         allocations.push(HedgeAllocation {
             venue_index,
@@ -784,6 +788,16 @@ fn finalize_allocations(
 /// Convert a hedge plan into abstract OrderIntents.
 pub fn hedge_plan_to_order_intents(plan: &HedgePlan) -> Vec<OrderIntent> {
     let mut out = Vec::new();
+    hedge_plan_to_order_intents_into(plan, &mut out);
+    out
+}
+
+/// Convert a hedge plan into abstract OrderIntents (buffer-reusing variant).
+///
+/// Clears `out` and pushes intents into it, reusing capacity.
+/// Use this in hot paths to avoid per-tick allocations.
+pub fn hedge_plan_to_order_intents_into(plan: &HedgePlan, out: &mut Vec<OrderIntent>) {
+    out.clear();
 
     for alloc in &plan.allocations {
         out.push(OrderIntent {
@@ -795,8 +809,6 @@ pub fn hedge_plan_to_order_intents(plan: &HedgePlan) -> Vec<OrderIntent> {
             purpose: OrderPurpose::Hedge,
         });
     }
-
-    out
 }
 
 /// Convenience function: compute hedge orders directly.
@@ -810,9 +822,39 @@ pub fn compute_hedge_orders(
     state: &GlobalState,
     now_ms: TimestampMs,
 ) -> Vec<OrderIntent> {
-    match compute_hedge_plan(cfg, state, now_ms) {
-        Some(plan) => hedge_plan_to_order_intents(&plan),
-        None => Vec::new(),
+    let mut out = Vec::new();
+    compute_hedge_orders_into(cfg, state, now_ms, &mut out);
+    out
+}
+
+/// Compute hedge orders directly (buffer-reusing variant).
+///
+/// Clears `out` and pushes intents into it, reusing capacity.
+/// Use this in hot paths to avoid per-tick allocations.
+///
+/// # Arguments
+/// * `cfg` - Strategy configuration
+/// * `state` - Current global state
+/// * `now_ms` - Current timestamp in milliseconds (required for staleness gating)
+/// * `out` - Output buffer for order intents
+pub fn compute_hedge_orders_into(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: TimestampMs,
+    out: &mut Vec<OrderIntent>,
+) {
+    out.clear();
+    if let Some(plan) = compute_hedge_plan(cfg, state, now_ms) {
+        for alloc in &plan.allocations {
+            out.push(OrderIntent {
+                venue_index: alloc.venue_index,
+                venue_id: alloc.venue_id.clone(),
+                side: alloc.side,
+                price: alloc.est_price,
+                size: alloc.size,
+                purpose: OrderPurpose::Hedge,
+            });
+        }
     }
 }
 
@@ -937,7 +979,7 @@ mod tests {
     fn test_build_chunk_candidates_single_chunk() {
         let chunks = build_chunk_candidates(
             0,
-            "venue_a".to_string(),
+            Arc::from("venue_a"),
             Side::Buy,
             100.0, // guard price
             5.0,   // max_dq_abs
@@ -956,7 +998,7 @@ mod tests {
     fn test_build_chunk_candidates_multiple_chunks() {
         let chunks = build_chunk_candidates(
             0,
-            "venue_a".to_string(),
+            Arc::from("venue_a"),
             Side::Sell,
             100.0, // guard price
             10.0,  // max_dq_abs
@@ -986,7 +1028,7 @@ mod tests {
         let chunks = vec![
             ChunkCandidate {
                 venue_index: 1,
-                venue_id: "b".to_string(),
+                venue_id: Arc::from("b"),
                 chunk_index: 0,
                 dq_signed: 5.0,
                 unit_cost: 1.0,
@@ -995,7 +1037,7 @@ mod tests {
             },
             ChunkCandidate {
                 venue_index: 0,
-                venue_id: "a".to_string(),
+                venue_id: Arc::from("a"),
                 chunk_index: 0,
                 dq_signed: 5.0,
                 unit_cost: 1.0, // Same cost
@@ -1020,7 +1062,7 @@ mod tests {
         let chunks = vec![
             ChunkCandidate {
                 venue_index: 0,
-                venue_id: "a".to_string(),
+                venue_id: Arc::from("a"),
                 chunk_index: 0,
                 dq_signed: 5.0,
                 unit_cost: 2.0, // Higher cost
@@ -1029,7 +1071,7 @@ mod tests {
             },
             ChunkCandidate {
                 venue_index: 1,
-                venue_id: "b".to_string(),
+                venue_id: Arc::from("b"),
                 chunk_index: 0,
                 dq_signed: 5.0,
                 unit_cost: 1.0, // Lower cost

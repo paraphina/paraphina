@@ -82,16 +82,17 @@ pub use actions::{
 pub use strategy_core::{compute_actions, StrategyInput, StrategyOutput};
 
 pub use hedge::{
-    compute_hedge_orders, compute_hedge_plan, hedge_plan_to_order_intents, HedgeAllocation,
-    HedgePlan,
+    compute_hedge_orders, compute_hedge_orders_into, compute_hedge_plan,
+    hedge_plan_to_order_intents, hedge_plan_to_order_intents_into, HedgeAllocation, HedgePlan,
 };
 
 pub use logging::{EventSink, FileSink, NoopSink};
 
 pub use mm::{
-    compute_mm_quotes, compute_mm_quotes_with_ablations, compute_order_actions,
-    compute_venue_targets, mm_quotes_to_order_intents, should_replace_order, ActiveMmOrder,
-    MmLevel, MmOrderAction, MmQuote, VenueTargetInventory,
+    compute_mm_quotes, compute_mm_quotes_into, compute_mm_quotes_with_ablations,
+    compute_mm_quotes_with_ablations_into, compute_order_actions, compute_venue_targets,
+    mm_quotes_to_order_intents, mm_quotes_to_order_intents_into, should_replace_order,
+    ActiveMmOrder, MmLevel, MmOrderAction, MmQuote, VenueTargetInventory,
 };
 
 pub use state::{GlobalState, KillReason, PendingMarkout, RiskRegime, VenueState};
