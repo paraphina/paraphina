@@ -29,6 +29,8 @@
 // - Deterministic tie-breaking: when two venues have similar edge, prefer actions that
 //   reduce fragmentation/basis risk (proven via unit tests).
 
+use std::sync::Arc;
+
 use crate::config::Config;
 use crate::state::{GlobalState, RiskRegime};
 use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
@@ -36,7 +38,7 @@ use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
 #[derive(Debug, Clone)]
 struct Candidate {
     venue_index: usize,
-    venue_id: String,
+    venue_id: Arc<str>,
     side: Side,
     price: f64,
     max_size: f64,
@@ -249,23 +251,40 @@ pub fn compute_exit_intents(
     state: &GlobalState,
     now_ms: TimestampMs,
 ) -> Vec<OrderIntent> {
+    let mut intents = Vec::new();
+    compute_exit_intents_into(cfg, state, now_ms, &mut intents);
+    intents
+}
+
+/// Compute exit intents (buffer-reusing variant).
+///
+/// Clears `out` and pushes intents into it, reusing capacity.
+/// Use this in hot paths to avoid per-tick allocations.
+pub fn compute_exit_intents_into(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: TimestampMs,
+    out: &mut Vec<OrderIntent>,
+) {
+    out.clear();
+
     if !cfg.exit.enabled {
-        return Vec::new();
+        return;
     }
 
     // Exit engine should not run when kill-switch is on or in HardLimit.
     if state.kill_switch || matches!(state.risk_regime, RiskRegime::HardLimit) {
-        return Vec::new();
+        return;
     }
 
     let fair = match state.fair_value {
         Some(v) if v.is_finite() && v > 0.0 => v,
-        _ => return Vec::new(),
+        _ => return,
     };
 
     let q = state.q_global_tao;
     if q.abs() < cfg.exit.min_global_abs_tao {
-        return Vec::new();
+        return;
     }
 
     // Global liquidation-aware mode.
@@ -276,7 +295,7 @@ pub fn compute_exit_intents(
         .abs()
         .min(cfg.exit.max_total_tao_per_tick * global_cap_mult);
     if remaining <= 0.0 {
-        return Vec::new();
+        return;
     }
 
     // We are always trying to reduce |q_global|.
@@ -476,7 +495,7 @@ pub fn compute_exit_intents(
 
         cands.push(Candidate {
             venue_index: j,
-            venue_id: vcfg.id.clone(),
+            venue_id: vcfg.id_arc.clone(),
             side: need_side,
             price: px,
             max_size,
@@ -493,7 +512,7 @@ pub fn compute_exit_intents(
     }
 
     if cands.is_empty() {
-        return Vec::new();
+        return;
     }
 
     // Deterministic sort: best score first, tie-break by:
@@ -526,8 +545,6 @@ pub fn compute_exit_intents(
         // Tie-break 3: stable ordering by venue index
         a.venue_index.cmp(&b.venue_index)
     });
-
-    let mut intents = Vec::new();
 
     // Greedy allocation (continuous knapsack-lite).
     for c in cands {
@@ -584,7 +601,7 @@ pub fn compute_exit_intents(
             continue;
         }
 
-        intents.push(OrderIntent {
+        out.push(OrderIntent {
             venue_index: c.venue_index,
             venue_id: c.venue_id,
             side: c.side,
@@ -595,8 +612,6 @@ pub fn compute_exit_intents(
 
         remaining -= rounded_size;
     }
-
-    intents
 }
 
 #[cfg(test)]

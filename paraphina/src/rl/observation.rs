@@ -226,7 +226,7 @@ impl Observation {
             let staleness_ms = v.last_mid_update_ms.map(|ts| now_ms - ts);
 
             venues.push(VenueObservation {
-                venue_id: v.id.clone(),
+                venue_id: v.id.to_string(),
                 venue_index: idx,
                 mid: v.mid,
                 spread: v.spread,

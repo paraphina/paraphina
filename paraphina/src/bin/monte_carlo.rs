@@ -106,7 +106,6 @@ struct SummarizeArgs {
     base_seed: Option<u64>,
 }
 
-
 impl RunArgs {
     fn usage() -> &'static str {
         "\
@@ -751,6 +750,14 @@ fn run_once(
     let mut kill_tick: Option<usize> = None;
     let mut ticks_executed: usize = 0;
 
+    // Pre-allocate scratch buffers for hot path (avoid per-tick allocations).
+    // Reasonable capacity estimates based on typical venue counts.
+    let num_venues = cfg.venues.len();
+    let mut mm_quotes_buf: Vec<mm::MmQuote> = Vec::with_capacity(num_venues);
+    let mut mm_intents_buf: Vec<OrderIntent> = Vec::with_capacity(num_venues * 2);
+    let mut exit_intents_buf: Vec<OrderIntent> = Vec::with_capacity(num_venues);
+    let mut hedge_intents_buf: Vec<OrderIntent> = Vec::with_capacity(num_venues);
+
     for t in 0..ticks {
         let mut dt = tick_ms;
         if jitter_ms > 0 {
@@ -772,10 +779,10 @@ fn run_once(
             break;
         }
 
-        // MM -> fills -> recompute
-        let mm_quotes = mm::compute_mm_quotes(cfg, &state);
-        let mm_intents = mm::mm_quotes_to_order_intents(&mm_quotes);
-        apply_intents_as_fills(cfg, &mut state, &mm_intents);
+        // MM -> fills -> recompute (using scratch buffers)
+        mm::compute_mm_quotes_into(cfg, &state, &mut mm_quotes_buf);
+        mm::mm_quotes_to_order_intents_into(&mm_quotes_buf, &mut mm_intents_buf);
+        apply_intents_as_fills(cfg, &mut state, &mm_intents_buf);
         state.recompute_after_fills(cfg);
         update_peaks(
             &state,
@@ -785,9 +792,9 @@ fn run_once(
             &mut max_venue_toxicity,
         );
 
-        // Exit -> fills -> recompute
-        let exit_intents = exit::compute_exit_intents(cfg, &state, now_ms);
-        apply_intents_as_fills(cfg, &mut state, &exit_intents);
+        // Exit -> fills -> recompute (using scratch buffer)
+        exit::compute_exit_intents_into(cfg, &state, now_ms, &mut exit_intents_buf);
+        apply_intents_as_fills(cfg, &mut state, &exit_intents_buf);
         state.recompute_after_fills(cfg);
         update_peaks(
             &state,
@@ -797,9 +804,9 @@ fn run_once(
             &mut max_venue_toxicity,
         );
 
-        // Hedge -> fills -> recompute
-        let hedge_intents = hedge::compute_hedge_orders(cfg, &state, now_ms);
-        apply_intents_as_fills(cfg, &mut state, &hedge_intents);
+        // Hedge -> fills -> recompute (using scratch buffer)
+        hedge::compute_hedge_orders_into(cfg, &state, now_ms, &mut hedge_intents_buf);
+        apply_intents_as_fills(cfg, &mut state, &hedge_intents_buf);
         state.recompute_after_fills(cfg);
         update_peaks(
             &state,
@@ -1161,7 +1168,10 @@ fn run_monte_carlo(args: RunArgs) {
 
     println!();
     println!("SUMMARY");
-    println!("  runs:              {} (global indices {}..{})", run_count, run_start_index, run_end_index);
+    println!(
+        "  runs:              {} (global indices {}..{})",
+        run_count, run_start_index, run_end_index
+    );
     println!(
         "  kill_rate:         {:.2}% ({} / {})",
         100.0 * kill_rate,
@@ -1418,10 +1428,14 @@ fn run_summarize(args: SummarizeArgs) {
     let mut records: Vec<McRunJsonlRecord> = Vec::new();
     for (line_num, line) in reader.lines().enumerate() {
         let line = line.unwrap_or_else(|e| {
-            eprintln!("Failed to read line {} in {:?}: {e}", line_num + 1, args.input);
+            eprintln!(
+                "Failed to read line {} in {:?}: {e}",
+                line_num + 1,
+                args.input
+            );
             std::process::exit(2);
         });
-        
+
         // Skip empty lines
         if line.trim().is_empty() {
             continue;
@@ -1468,7 +1482,10 @@ fn run_summarize(args: SummarizeArgs) {
     if records.len() != expected_count {
         eprintln!(
             "Error: Non-contiguous run indices. Expected {} runs for indices {}..={}, found {}",
-            expected_count, min_idx, max_idx, records.len()
+            expected_count,
+            min_idx,
+            max_idx,
+            records.len()
         );
         std::process::exit(2);
     }
@@ -1485,7 +1502,11 @@ fn run_summarize(args: SummarizeArgs) {
                 std::process::exit(2);
             }
         }
-        println!("✓ Seed contract validated for {} runs (base_seed={})", records.len(), base_seed);
+        println!(
+            "✓ Seed contract validated for {} runs (base_seed={})",
+            records.len(),
+            base_seed
+        );
     }
 
     println!(
@@ -1556,13 +1577,8 @@ fn run_summarize(args: SummarizeArgs) {
     let (dd_p05, dd_p50, dd_p95) = p05_p50_p95(dd_samples.clone());
 
     // Compute tail risk metrics
-    let tail_risk = TailRiskMetrics::compute(
-        &pnl_samples,
-        &dd_samples,
-        kills,
-        DEFAULT_VAR_ALPHA,
-        0.95,
-    );
+    let tail_risk =
+        TailRiskMetrics::compute(&pnl_samples, &dd_samples, kills, DEFAULT_VAR_ALPHA, 0.95);
 
     // Build summary (note: config comes from aggregated data, not args)
     // We use defaults for config since we're aggregating shards

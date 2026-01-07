@@ -29,6 +29,8 @@
 //   - Quote gating:
 //       Only quote if edge >= EDGE_LOCAL_MIN and venue passes gating
 
+use std::sync::Arc;
+
 use crate::config::{Config, VenueConfig};
 use crate::sim_eval::AblationSet;
 use crate::state::{GlobalState, RiskRegime, VenueState};
@@ -42,10 +44,12 @@ pub struct MmLevel {
 }
 
 /// Per-venue MM quote (bid/ask).
+///
+/// Note: `venue_id` uses `Arc<str>` for cheap cloning in hot paths.
 #[derive(Debug, Clone)]
 pub struct MmQuote {
     pub venue_index: usize,
-    pub venue_id: String,
+    pub venue_id: Arc<str>,
     pub bid: Option<MmLevel>,
     pub ask: Option<MmLevel>,
 }
@@ -146,6 +150,14 @@ pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
     compute_mm_quotes_with_ablations(cfg, state, &AblationSet::new())
 }
 
+/// Main MM quoting function (buffer-reusing variant).
+///
+/// Clears `out` and pushes quotes into it, reusing capacity.
+/// Use this in hot paths to avoid per-tick allocations.
+pub fn compute_mm_quotes_into(cfg: &Config, state: &GlobalState, out: &mut Vec<MmQuote>) {
+    compute_mm_quotes_with_ablations_into(cfg, state, &AblationSet::new(), out)
+}
+
 /// Main MM quoting function with ablation support.
 ///
 /// Ablations:
@@ -158,6 +170,25 @@ pub fn compute_mm_quotes_with_ablations(
 ) -> Vec<MmQuote> {
     let n = cfg.venues.len();
     let mut out = Vec::with_capacity(n);
+    compute_mm_quotes_with_ablations_into(cfg, state, ablations, &mut out);
+    out
+}
+
+/// Main MM quoting function with ablation support (buffer-reusing variant).
+///
+/// Clears `out` and pushes quotes into it, reusing capacity.
+/// Use this in hot paths to avoid per-tick allocations.
+///
+/// Ablations:
+/// - disable_fair_value_gating: Gating always allows (never blocks quoting)
+/// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
+pub fn compute_mm_quotes_with_ablations_into(
+    cfg: &Config,
+    state: &GlobalState,
+    ablations: &AblationSet,
+    out: &mut Vec<MmQuote>,
+) {
+    out.clear();
 
     // If we don't have a fair value yet, we can't quote meaningfully.
     let s_t = match state.fair_value {
@@ -168,12 +199,12 @@ pub fn compute_mm_quotes_with_ablations(
             for (i, vcfg) in cfg.venues.iter().enumerate() {
                 out.push(MmQuote {
                     venue_index: i,
-                    venue_id: vcfg.id.clone(),
+                    venue_id: vcfg.id_arc.clone(),
                     bid: None,
                     ask: None,
                 });
             }
-            return out;
+            return;
         }
     };
 
@@ -201,12 +232,12 @@ pub fn compute_mm_quotes_with_ablations(
         for (i, vcfg) in cfg.venues.iter().enumerate() {
             out.push(MmQuote {
                 venue_index: i,
-                venue_id: vcfg.id.clone(),
+                venue_id: vcfg.id_arc.clone(),
                 bid: None,
                 ask: None,
             });
         }
-        return out;
+        return;
     }
 
     // If volatility or size_mult are degenerate, don't quote.
@@ -214,12 +245,12 @@ pub fn compute_mm_quotes_with_ablations(
         for (i, vcfg) in cfg.venues.iter().enumerate() {
             out.push(MmQuote {
                 venue_index: i,
-                venue_id: vcfg.id.clone(),
+                venue_id: vcfg.id_arc.clone(),
                 bid: None,
                 ask: None,
             });
         }
-        return out;
+        return;
     }
 
     // Compute per-venue target inventories.
@@ -236,7 +267,7 @@ pub fn compute_mm_quotes_with_ablations(
         if matches!(vstate.status, VenueStatus::Disabled) {
             out.push(MmQuote {
                 venue_index: i,
-                venue_id: vcfg.id.clone(),
+                venue_id: vcfg.id_arc.clone(),
                 bid: None,
                 ask: None,
             });
@@ -275,22 +306,30 @@ pub fn compute_mm_quotes_with_ablations(
 
         out.push(MmQuote {
             venue_index: i,
-            venue_id: vcfg.id.clone(),
+            venue_id: vcfg.id_arc.clone(),
             bid,
             ask,
         });
     }
-
-    out
 }
 
 /// Convert MM quotes into abstract OrderIntents used by the rest of the engine.
 pub fn mm_quotes_to_order_intents(quotes: &[MmQuote]) -> Vec<OrderIntent> {
     let mut intents = Vec::new();
+    mm_quotes_to_order_intents_into(quotes, &mut intents);
+    intents
+}
+
+/// Convert MM quotes into abstract OrderIntents (buffer-reusing variant).
+///
+/// Clears `out` and pushes intents into it, reusing capacity.
+/// Use this in hot paths to avoid per-tick allocations.
+pub fn mm_quotes_to_order_intents_into(quotes: &[MmQuote], out: &mut Vec<OrderIntent>) {
+    out.clear();
 
     for q in quotes {
         if let Some(bid) = &q.bid {
-            intents.push(OrderIntent {
+            out.push(OrderIntent {
                 venue_index: q.venue_index,
                 venue_id: q.venue_id.clone(),
                 side: Side::Buy,
@@ -301,7 +340,7 @@ pub fn mm_quotes_to_order_intents(quotes: &[MmQuote]) -> Vec<OrderIntent> {
         }
 
         if let Some(ask) = &q.ask {
-            intents.push(OrderIntent {
+            out.push(OrderIntent {
                 venue_index: q.venue_index,
                 venue_id: q.venue_id.clone(),
                 side: Side::Sell,
@@ -311,8 +350,6 @@ pub fn mm_quotes_to_order_intents(quotes: &[MmQuote]) -> Vec<OrderIntent> {
             });
         }
     }
-
-    intents
 }
 
 /// Compute the maker cost for a venue (fee minus rebate).

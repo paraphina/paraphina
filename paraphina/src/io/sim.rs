@@ -106,7 +106,7 @@ impl VenueAdapter for SimAdapter {
         // Return fill event
         ActionResult::Filled(FillEvent {
             venue_index: action.venue_index,
-            venue_id: action.venue_id.clone(),
+            venue_id: action.venue_id.as_str().into(),
             side: action.side,
             price,
             size: size_tao,

@@ -3,6 +3,7 @@
 // Common shared types for the Paraphina MM engine.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Millisecond timestamp since Unix epoch.
 pub type TimestampMs = i64;
@@ -35,10 +36,13 @@ pub enum OrderPurpose {
 
 /// Abstract order intent: "we want to do X on venue Y".
 /// The execution / gateway layer will later turn this into real API calls.
+///
+/// Note: `venue_id` uses `Arc<str>` for cheap cloning in hot paths.
+/// The Arc points to the same string as `VenueConfig.id_arc`.
 #[derive(Debug, Clone)]
 pub struct OrderIntent {
     pub venue_index: usize,
-    pub venue_id: String,
+    pub venue_id: Arc<str>,
     pub side: Side,
     pub price: f64,
     pub size: f64,
@@ -46,10 +50,12 @@ pub struct OrderIntent {
 }
 
 /// A realised perp fill used for logging and PnL attribution.
+///
+/// Note: `venue_id` uses `Arc<str>` for cheap cloning in hot paths.
 #[derive(Debug, Clone)]
 pub struct FillEvent {
     pub venue_index: usize,
-    pub venue_id: String,
+    pub venue_id: Arc<str>,
     pub side: Side,
     pub price: f64,
     pub size: f64,

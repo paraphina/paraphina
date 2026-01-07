@@ -401,4 +401,3 @@ fn test_jsonl_round_trip() {
         assert_eq!(orig.kill_switch, parsed.kill_switch);
     }
 }
-

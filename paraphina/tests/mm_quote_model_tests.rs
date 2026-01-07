@@ -10,6 +10,8 @@
 // - Size model constraints
 // - Order lifetime + tolerance logic
 
+use std::sync::Arc;
+
 use paraphina::config::{Config, RiskProfile};
 use paraphina::engine::Engine;
 use paraphina::mm::{
@@ -835,7 +837,7 @@ fn compute_order_actions_place_new() {
     let vcfg = &cfg.venues[0];
 
     let vstate = paraphina::state::VenueState {
-        id: "test".to_string(),
+        id: Arc::from("test"),
         mid: Some(300.0),
         spread: Some(0.10),
         depth_near_mid: 10_000.0,
@@ -858,7 +860,7 @@ fn compute_order_actions_place_new() {
 
     let quote = paraphina::mm::MmQuote {
         venue_index: 0,
-        venue_id: "test".to_string(),
+        venue_id: Arc::from("test"),
         bid: Some(paraphina::mm::MmLevel {
             price: 299.90,
             size: 1.0,
@@ -907,7 +909,7 @@ fn compute_order_actions_cancel_when_no_desired() {
     let vcfg = &cfg.venues[0];
 
     let vstate = paraphina::state::VenueState {
-        id: "test".to_string(),
+        id: Arc::from("test"),
         mid: Some(300.0),
         spread: Some(0.10),
         depth_near_mid: 10_000.0,
@@ -931,7 +933,7 @@ fn compute_order_actions_cancel_when_no_desired() {
     // No desired quote.
     let quote = paraphina::mm::MmQuote {
         venue_index: 0,
-        venue_id: "test".to_string(),
+        venue_id: Arc::from("test"),
         bid: None,
         ask: None,
     };
