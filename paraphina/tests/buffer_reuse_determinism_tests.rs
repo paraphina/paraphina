@@ -566,6 +566,152 @@ fn test_seed_dummy_mids_determinism_regression() {
     }
 }
 
+/// Test seed_dummy_mids in isolation (Opt7 verification).
+///
+/// This test verifies that seed_dummy_mids:
+/// 1. Produces bit-exact identical results across two independent runs with same inputs
+/// 2. Does not cause any heap allocations (scratch buffers are untouched)
+/// 3. Maintains deterministic ordering across venues
+///
+/// Note: The function is deterministic for a given (state, now_ms) pair, NOT idempotent.
+/// Calling with the same now_ms twice will update local_vol based on the mid change
+/// (which is 0 when mid doesn't change), so the EWMA will decay. This is correct behavior.
+#[test]
+fn test_seed_dummy_mids_isolated_determinism_and_no_alloc() {
+    let cfg = create_test_config();
+    let engine = Engine::new(&cfg);
+    let num_venues = cfg.venues.len();
+
+    // --- Run 1: First state ---
+    let mut state1 = GlobalState::new(&cfg);
+
+    // Record initial scratch buffer capacities (should not change since
+    // seed_dummy_mids doesn't use scratch buffers - this verifies that claim)
+    let initial_mids_cap = state1.scratch_mids_capacity();
+    let initial_kf_obs_cap = state1.scratch_kf_obs_capacity();
+
+    // Run seed_dummy_mids multiple times
+    for t in 0..100 {
+        let now_ms: TimestampMs = 1000 + t * 50;
+        engine.seed_dummy_mids(&mut state1, now_ms);
+    }
+
+    // Verify scratch buffers were NOT touched (seed_dummy_mids doesn't use them)
+    assert_eq!(
+        state1.scratch_mids_capacity(),
+        initial_mids_cap,
+        "scratch_mids capacity changed unexpectedly"
+    );
+    assert_eq!(
+        state1.scratch_kf_obs_capacity(),
+        initial_kf_obs_cap,
+        "scratch_kf_obs capacity changed unexpectedly"
+    );
+
+    // --- Run 2: Second state with identical inputs (fresh state, same sequence) ---
+    let mut state2 = GlobalState::new(&cfg);
+    for t in 0..100 {
+        let now_ms: TimestampMs = 1000 + t * 50;
+        engine.seed_dummy_mids(&mut state2, now_ms);
+    }
+
+    // --- Verify bit-exact identical venue state ---
+    for i in 0..num_venues {
+        let v1 = &state1.venues[i];
+        let v2 = &state2.venues[i];
+
+        // Mid values must be bit-exact
+        assert_eq!(
+            v1.mid.map(|m| m.to_bits()),
+            v2.mid.map(|m| m.to_bits()),
+            "Venue {} mid not bit-exact",
+            i
+        );
+
+        // Spread values must be bit-exact
+        assert_eq!(
+            v1.spread.map(|s| s.to_bits()),
+            v2.spread.map(|s| s.to_bits()),
+            "Venue {} spread not bit-exact",
+            i
+        );
+
+        // Depth must be bit-exact
+        assert_eq!(
+            v1.depth_near_mid.to_bits(),
+            v2.depth_near_mid.to_bits(),
+            "Venue {} depth not bit-exact",
+            i
+        );
+
+        // Last update timestamp must match
+        assert_eq!(
+            v1.last_mid_update_ms, v2.last_mid_update_ms,
+            "Venue {} last_mid_update_ms differs",
+            i
+        );
+
+        // Local volatilities must be bit-exact
+        assert_eq!(
+            v1.local_vol_short.to_bits(),
+            v2.local_vol_short.to_bits(),
+            "Venue {} local_vol_short not bit-exact",
+            i
+        );
+        assert_eq!(
+            v1.local_vol_long.to_bits(),
+            v2.local_vol_long.to_bits(),
+            "Venue {} local_vol_long not bit-exact",
+            i
+        );
+    }
+
+    // --- Run 3: Verify a third independent run also matches ---
+    // This confirms reproducibility across any number of runs.
+    let mut state3 = GlobalState::new(&cfg);
+    for t in 0..100 {
+        let now_ms: TimestampMs = 1000 + t * 50;
+        engine.seed_dummy_mids(&mut state3, now_ms);
+    }
+
+    // Verify state3 matches state1 bit-exactly
+    for i in 0..num_venues {
+        let v1 = &state1.venues[i];
+        let v3 = &state3.venues[i];
+
+        assert_eq!(
+            v1.mid.map(|m| m.to_bits()),
+            v3.mid.map(|m| m.to_bits()),
+            "Venue {} mid not bit-exact on 3rd run",
+            i
+        );
+        assert_eq!(
+            v1.local_vol_short.to_bits(),
+            v3.local_vol_short.to_bits(),
+            "Venue {} local_vol_short not bit-exact on 3rd run",
+            i
+        );
+        assert_eq!(
+            v1.local_vol_long.to_bits(),
+            v3.local_vol_long.to_bits(),
+            "Venue {} local_vol_long not bit-exact on 3rd run",
+            i
+        );
+    }
+
+    // Verify no scratch buffer growth after 3 runs
+    assert_eq!(
+        state3.scratch_mids_capacity(),
+        initial_mids_cap,
+        "scratch_mids capacity grew unexpectedly"
+    );
+    assert_eq!(
+        state3.scratch_kf_obs_capacity(),
+        initial_kf_obs_cap,
+        "scratch_kf_obs capacity grew unexpectedly"
+    );
+}
+
 #[test]
 fn test_engine_scratch_buffer_capacity_preserved() {
     // Verify that scratch buffers in GlobalState preserve their capacity

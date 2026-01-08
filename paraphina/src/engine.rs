@@ -31,11 +31,26 @@ impl<'a> Engine<'a> {
     /// Deterministic function of `now_ms` and venue index. This is for
     /// exercising the control loops / tests, not realism.
     ///
-    /// Optimization notes:
-    /// - Alpha decay factors are precomputed outside the venue loop to avoid
-    ///   repeated config access and subtraction per venue.
-    /// - No heap allocations; all operations are in-place on VenueState.
-    /// - Explicit for-loop with index to maintain deterministic iteration order.
+    /// # Optimization Notes (Opt7)
+    ///
+    /// This function is already highly optimized for the hot path:
+    ///
+    /// - **Zero allocations**: All operations mutate VenueState fields in-place.
+    ///   No Vec, String, Arc, or other heap-allocating operations occur.
+    /// - **Precomputed decay factors**: EWMA alphas and (1-alpha) values are
+    ///   computed once before the venue loop, avoiding per-venue config lookups.
+    /// - **Explicit indexed loop**: Uses `for idx in 0..len` pattern to ensure
+    ///   deterministic venue ordering (no iterator-based nondeterminism).
+    /// - **No scratch buffers needed**: Unlike `main_tick` helpers, this function
+    ///   doesn't collect intermediate data—it directly mutates venue state.
+    /// - **Early exit not applicable**: Every tick requires updating all venue
+    ///   mids/spreads, so no early-exit optimization is possible.
+    ///
+    /// # Determinism Guarantees
+    ///
+    /// Given identical `now_ms` and initial state, this function produces
+    /// bit-exact identical results. The floating-point computation order is
+    /// fixed (venue-by-venue, short-vol then long-vol) to ensure reproducibility.
     pub fn seed_dummy_mids(&self, state: &mut GlobalState, now_ms: i64) {
         let base = 250.0 + (now_ms as f64) * 0.001;
 
