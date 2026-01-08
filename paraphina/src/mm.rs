@@ -409,41 +409,87 @@ pub fn compute_mm_quotes_with_ablations_into(
 
 /// Convert MM quotes into abstract OrderIntents used by the rest of the engine.
 pub fn mm_quotes_to_order_intents(quotes: &[MmQuote]) -> Vec<OrderIntent> {
-    let mut intents = Vec::new();
+    // Pre-allocate max capacity: each quote can produce at most 2 intents (bid + ask).
+    let mut intents = Vec::with_capacity(quotes.len() * 2);
     mm_quotes_to_order_intents_into(quotes, &mut intents);
     intents
 }
 
 /// Convert MM quotes into abstract OrderIntents (buffer-reusing variant).
 ///
-/// Clears `out` and pushes intents into it, reusing capacity.
-/// Use this in hot paths to avoid per-tick allocations.
+/// Reuses existing `out` entries in-place to avoid per-tick Arc<str> churn.
+/// Only reassigns `venue_id` if it actually differs (checked via `Arc::ptr_eq`).
+/// After processing, truncates any leftover tail entries from previous calls.
+///
+/// Use this in hot paths to avoid per-tick allocations. Once warmed up, this
+/// function performs no heap allocations.
+///
+/// Ordering: iterates quotes in order; for each quote, emits bid then ask.
+/// This is deterministic and matches the original implementation.
 pub fn mm_quotes_to_order_intents_into(quotes: &[MmQuote], out: &mut Vec<OrderIntent>) {
-    out.clear();
+    // We avoid out.clear() to preserve existing OrderIntent entries for in-place
+    // mutation, eliminating Arc<str> clone/drop overhead on venue_id each tick.
+
+    let mut write_idx = 0;
 
     for q in quotes {
         if let Some(bid) = &q.bid {
-            out.push(OrderIntent {
-                venue_index: q.venue_index,
-                venue_id: q.venue_id.clone(),
-                side: Side::Buy,
-                price: bid.price,
-                size: bid.size,
-                purpose: OrderPurpose::Mm,
-            });
+            if write_idx < out.len() {
+                // Mutate existing slot in place.
+                let slot = &mut out[write_idx];
+                slot.venue_index = q.venue_index;
+                // Only reassign venue_id if pointer differs (avoids Arc refcount churn).
+                if !Arc::ptr_eq(&slot.venue_id, &q.venue_id) {
+                    slot.venue_id = q.venue_id.clone();
+                }
+                slot.side = Side::Buy;
+                slot.price = bid.price;
+                slot.size = bid.size;
+                slot.purpose = OrderPurpose::Mm;
+            } else {
+                // Push new entry.
+                out.push(OrderIntent {
+                    venue_index: q.venue_index,
+                    venue_id: q.venue_id.clone(),
+                    side: Side::Buy,
+                    price: bid.price,
+                    size: bid.size,
+                    purpose: OrderPurpose::Mm,
+                });
+            }
+            write_idx += 1;
         }
 
         if let Some(ask) = &q.ask {
-            out.push(OrderIntent {
-                venue_index: q.venue_index,
-                venue_id: q.venue_id.clone(),
-                side: Side::Sell,
-                price: ask.price,
-                size: ask.size,
-                purpose: OrderPurpose::Mm,
-            });
+            if write_idx < out.len() {
+                // Mutate existing slot in place.
+                let slot = &mut out[write_idx];
+                slot.venue_index = q.venue_index;
+                // Only reassign venue_id if pointer differs (avoids Arc refcount churn).
+                if !Arc::ptr_eq(&slot.venue_id, &q.venue_id) {
+                    slot.venue_id = q.venue_id.clone();
+                }
+                slot.side = Side::Sell;
+                slot.price = ask.price;
+                slot.size = ask.size;
+                slot.purpose = OrderPurpose::Mm;
+            } else {
+                // Push new entry.
+                out.push(OrderIntent {
+                    venue_index: q.venue_index,
+                    venue_id: q.venue_id.clone(),
+                    side: Side::Sell,
+                    price: ask.price,
+                    size: ask.size,
+                    purpose: OrderPurpose::Mm,
+                });
+            }
+            write_idx += 1;
         }
     }
+
+    // Drop any leftover tail items from previous calls.
+    out.truncate(write_idx);
 }
 
 /// Compute the maker cost for a venue (fee minus rebate).
@@ -1668,6 +1714,95 @@ mod tests {
             quotes_buf.len(),
             n,
             "Buffer accumulated instead of clearing"
+        );
+    }
+
+    #[test]
+    fn test_mm_quotes_to_order_intents_into_determinism_and_capacity() {
+        // Verify that mm_quotes_to_order_intents_into:
+        // 1. Produces output identical to mm_quotes_to_order_intents
+        // 2. Produces identical results across multiple calls
+        // 3. Does not grow capacity on subsequent calls (once warmed up)
+
+        let (cfg, state) = setup_test();
+
+        // Get quotes to convert
+        let quotes = compute_mm_quotes(&cfg, &state);
+
+        // Get reference output from allocating version
+        let reference = mm_quotes_to_order_intents(&quotes);
+
+        // Use into() variant with pre-allocated buffer
+        let mut intents_buf: Vec<OrderIntent> = Vec::with_capacity(quotes.len() * 2);
+
+        // First call
+        mm_quotes_to_order_intents_into(&quotes, &mut intents_buf);
+        let cap_after_first = intents_buf.capacity();
+
+        // Verify output matches reference
+        assert_eq!(
+            intents_buf.len(),
+            reference.len(),
+            "Intent count differs from reference"
+        );
+        for (i, (got, want)) in intents_buf.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(
+                got.venue_index, want.venue_index,
+                "venue_index mismatch at {}",
+                i
+            );
+            assert!(
+                Arc::ptr_eq(&got.venue_id, &want.venue_id) || *got.venue_id == *want.venue_id,
+                "venue_id mismatch at {}",
+                i
+            );
+            assert_eq!(got.side, want.side, "side mismatch at {}", i);
+            assert_eq!(got.price, want.price, "price mismatch at {}", i);
+            assert_eq!(got.size, want.size, "size mismatch at {}", i);
+            assert_eq!(got.purpose, want.purpose, "purpose mismatch at {}", i);
+        }
+
+        // Second call with same inputs
+        mm_quotes_to_order_intents_into(&quotes, &mut intents_buf);
+        let cap_after_second = intents_buf.capacity();
+
+        // Verify capacity did not grow
+        assert_eq!(
+            cap_after_second, cap_after_first,
+            "Capacity grew on second call: {} -> {}",
+            cap_after_first, cap_after_second
+        );
+
+        // Verify output is still correct after second call
+        assert_eq!(
+            intents_buf.len(),
+            reference.len(),
+            "Intent count differs after second call"
+        );
+        for (i, (got, want)) in intents_buf.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(
+                got.venue_index, want.venue_index,
+                "venue_index mismatch at {} (2nd call)",
+                i
+            );
+            assert_eq!(got.side, want.side, "side mismatch at {} (2nd call)", i);
+            assert_eq!(got.price, want.price, "price mismatch at {} (2nd call)", i);
+            assert_eq!(got.size, want.size, "size mismatch at {} (2nd call)", i);
+            assert_eq!(
+                got.purpose, want.purpose,
+                "purpose mismatch at {} (2nd call)",
+                i
+            );
+        }
+
+        // Run many iterations to verify no capacity growth once warmed up
+        for _ in 0..100 {
+            mm_quotes_to_order_intents_into(&quotes, &mut intents_buf);
+        }
+        assert_eq!(
+            intents_buf.capacity(),
+            cap_after_first,
+            "Capacity grew after 100 iterations"
         );
     }
 }
