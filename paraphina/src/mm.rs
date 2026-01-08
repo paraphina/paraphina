@@ -250,14 +250,18 @@ pub fn compute_mm_quotes_with_ablations(
 
 /// Main MM quoting function with ablation support (buffer-reusing variant).
 ///
-/// Clears `out` and pushes quotes into it, reusing capacity.
-/// Use this in hot paths to avoid per-tick allocations.
+/// Uses stable quote slots to avoid per-tick Arc<str> clone/drop overhead.
+/// On first call (or if venue count changes), initializes `out` with N slots
+/// containing cloned venue_id Arc<str>. On subsequent calls, resets bid/ask
+/// to None and updates in place. This eliminates per-tick allocation and
+/// Arc reference count churn in the hot path.
 ///
 /// Ablations:
 /// - disable_fair_value_gating: Gating always allows (never blocks quoting)
 /// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
 ///
 /// Optimization notes:
+/// - Stable quote slots: venue_id cloned once, bid/ask reset to None each tick.
 /// - Tick-invariant scalars are precomputed once into TickScalars struct.
 /// - Per-venue target inventory computation reuses scratch buffer pattern.
 /// - Config lookups are hoisted out of the per-venue loop.
@@ -268,24 +272,34 @@ pub fn compute_mm_quotes_with_ablations_into(
     ablations: &AblationSet,
     out: &mut Vec<MmQuote>,
 ) {
-    out.clear();
-
     let n = cfg.venues.len();
 
+    // Initialize stable quote slots on first call or if venue count changed.
+    // This clones venue_id Arc<str> once; subsequent ticks only reset bid/ask.
+    if out.len() != n {
+        out.clear();
+        out.reserve(n);
+        for i in 0..n {
+            out.push(MmQuote {
+                venue_index: i,
+                venue_id: cfg.venues[i].id_arc.clone(),
+                bid: None,
+                ask: None,
+            });
+        }
+    } else {
+        // Reset bid/ask to None without dropping/recreating venue_id.
+        for q in out.iter_mut() {
+            q.bid = None;
+            q.ask = None;
+        }
+    }
+
     // If we don't have a fair value yet, we can't quote meaningfully.
+    // Slots already have bid/ask = None, so just return.
     let s_t = match state.fair_value {
         Some(v) => v,
         None => {
-            // Return "empty quotes" so downstream code still sees one
-            // entry per venue, but with no bid/ask.
-            for i in 0..n {
-                out.push(MmQuote {
-                    venue_index: i,
-                    venue_id: cfg.venues[i].id_arc.clone(),
-                    bid: None,
-                    ask: None,
-                });
-            }
             return;
         }
     };
@@ -302,28 +316,14 @@ pub fn compute_mm_quotes_with_ablations_into(
 
     // Kill switch OR HardLimit => return no quotes.
     // Spec: HardLimit is "structurally unsafe", so MM must fully stop.
+    // Slots already have bid/ask = None, so just return.
     if state.kill_switch || matches!(risk_regime, RiskRegime::HardLimit) {
-        for i in 0..n {
-            out.push(MmQuote {
-                venue_index: i,
-                venue_id: cfg.venues[i].id_arc.clone(),
-                bid: None,
-                ask: None,
-            });
-        }
         return;
     }
 
     // If volatility or size_mult are degenerate, don't quote.
+    // Slots already have bid/ask = None, so just return.
     if sigma_eff <= 0.0 || size_mult <= 0.0 {
-        for i in 0..n {
-            out.push(MmQuote {
-                venue_index: i,
-                venue_id: cfg.venues[i].id_arc.clone(),
-                bid: None,
-                ask: None,
-            });
-        }
         return;
     }
 
@@ -382,7 +382,7 @@ pub fn compute_mm_quotes_with_ablations_into(
     // ---------------------------------------------------------------------
     // We use explicit index because we need to:
     // 1. Access cfg.venues[i], state.venues[i], and venue_targets[i] in lockstep
-    // 2. Use the index value itself for venue_index in MmQuote
+    // 2. Update out[i] in place (stable slots optimization)
     // 3. Maintain deterministic iteration order
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
@@ -390,14 +390,8 @@ pub fn compute_mm_quotes_with_ablations_into(
         let vstate = &state.venues[i];
         let target = &venue_targets[i];
 
-        // Disabled venue => no quotes.
+        // Disabled venue => no quotes (bid/ask already None from reset).
         if matches!(vstate.status, VenueStatus::Disabled) {
-            out.push(MmQuote {
-                venue_index: i,
-                venue_id: vcfg.id_arc.clone(),
-                bid: None,
-                ask: None,
-            });
             continue;
         }
 
@@ -407,12 +401,9 @@ pub fn compute_mm_quotes_with_ablations_into(
         let (bid, ask) =
             compute_single_venue_quotes_fast(vcfg, vstate, mid, target.q_target, &scalars);
 
-        out.push(MmQuote {
-            venue_index: i,
-            venue_id: vcfg.id_arc.clone(),
-            bid,
-            ask,
-        });
+        // Update in place (stable slots: venue_id already set, just update bid/ask).
+        out[i].bid = bid;
+        out[i].ask = ask;
     }
 }
 
