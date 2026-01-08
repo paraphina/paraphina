@@ -784,3 +784,125 @@ fn test_engine_scratch_buffer_capacity_preserved() {
         num_venues
     );
 }
+
+// =============================================================================
+// Toxicity Determinism Tests
+// =============================================================================
+
+use paraphina::state::PendingMarkout;
+use paraphina::toxicity::update_toxicity_and_health;
+use paraphina::types::Side;
+
+/// Test that update_toxicity_and_health produces identical results across repeated calls.
+///
+/// This verifies determinism is preserved for toxicity calculations.
+#[test]
+fn test_toxicity_update_determinism() {
+    let cfg = create_test_config();
+    let num_venues = cfg.venues.len();
+
+    // --- Run 1: First state ---
+    let mut state1 = GlobalState::new(&cfg);
+
+    // Setup venues with valid market data
+    for (i, v) in state1.venues.iter_mut().enumerate() {
+        v.mid = Some(100.0 + i as f64 * 0.5);
+        v.spread = Some(0.1);
+        v.depth_near_mid = 10_000.0;
+        v.last_mid_update_ms = Some(0);
+        v.toxicity = 0.1;
+    }
+
+    // Add some pending markouts to process
+    for v in state1.venues.iter_mut() {
+        v.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 99.0,
+            fair_at_fill: 99.0,
+            mid_at_fill: 99.0,
+        });
+        v.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 100,
+            t_eval_ms: 1100,
+            side: Side::Sell,
+            size_tao: 0.5,
+            price: 101.0,
+            fair_at_fill: 101.0,
+            mid_at_fill: 101.0,
+        });
+    }
+
+    // Run toxicity update
+    state1.sigma_eff = 0.02;
+    update_toxicity_and_health(&mut state1, &cfg, 1500);
+
+    // Capture results
+    let tox1: Vec<f64> = state1.venues.iter().map(|v| v.toxicity).collect();
+    let status1: Vec<_> = state1.venues.iter().map(|v| v.status).collect();
+    let markout_ewma1: Vec<f64> = state1
+        .venues
+        .iter()
+        .map(|v| v.markout_ewma_usd_per_tao)
+        .collect();
+
+    // --- Run 2: Second state with identical inputs ---
+    let mut state2 = GlobalState::new(&cfg);
+
+    for (i, v) in state2.venues.iter_mut().enumerate() {
+        v.mid = Some(100.0 + i as f64 * 0.5);
+        v.spread = Some(0.1);
+        v.depth_near_mid = 10_000.0;
+        v.last_mid_update_ms = Some(0);
+        v.toxicity = 0.1;
+    }
+
+    for v in state2.venues.iter_mut() {
+        v.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 99.0,
+            fair_at_fill: 99.0,
+            mid_at_fill: 99.0,
+        });
+        v.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 100,
+            t_eval_ms: 1100,
+            side: Side::Sell,
+            size_tao: 0.5,
+            price: 101.0,
+            fair_at_fill: 101.0,
+            mid_at_fill: 101.0,
+        });
+    }
+
+    state2.sigma_eff = 0.02;
+    update_toxicity_and_health(&mut state2, &cfg, 1500);
+
+    // --- Verify bit-exact identical results ---
+    for i in 0..num_venues {
+        assert_eq!(
+            tox1[i].to_bits(),
+            state2.venues[i].toxicity.to_bits(),
+            "Venue {} toxicity not bit-exact: {} vs {}",
+            i,
+            tox1[i],
+            state2.venues[i].toxicity
+        );
+        assert_eq!(
+            status1[i], state2.venues[i].status,
+            "Venue {} status differs",
+            i
+        );
+        assert_eq!(
+            markout_ewma1[i].to_bits(),
+            state2.venues[i].markout_ewma_usd_per_tao.to_bits(),
+            "Venue {} markout_ewma not bit-exact",
+            i
+        );
+    }
+}
