@@ -49,6 +49,25 @@ pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config, now_ms:
 ///
 /// Same as update_toxicity_and_health, but with ablation support:
 /// - disable_toxicity_gate: All venues remain Healthy regardless of toxicity score
+///
+/// # Optimization Notes
+///
+/// This function is optimized for the hot path:
+///
+/// - **Single-pass processing**: Pending markouts are drained and processed inline,
+///   with no intermediate staging buffer. Each markout updates toxicity immediately
+///   after being popped.
+/// - **Hoisted config lookups**: Config values (alpha, scale, thresholds) are read once
+///   before the venue loop, avoiding repeated struct access in the hot path.
+/// - **Lazy mid resolution**: The venue.mid field is only checked/validated once per venue
+///   per tick, and only after the first ready markout is popped. This avoids hot-path
+///   overhead when no markouts are ready.
+///
+/// # Determinism Guarantees
+///
+/// Processing order is deterministic: venues are iterated in stable order, and for each
+/// venue, markouts are processed in FIFO order from the front of pending_markouts.
+/// Floating-point operations maintain identical evaluation order to preserve bit-exact results.
 pub fn update_toxicity_and_health_with_ablations(
     state: &mut GlobalState,
     cfg: &Config,
@@ -58,14 +77,28 @@ pub fn update_toxicity_and_health_with_ablations(
     let tox_cfg = &cfg.toxicity;
     let vol_cfg = &cfg.volatility;
 
+    // Hoist config lookups outside the venue loop to avoid repeated struct access.
+    let markout_scale = tox_cfg.markout_scale_usd_per_tao.max(1e-9);
+    let alpha = tox_cfg.markout_alpha.clamp(0.0, 1.0);
+    let one_minus_alpha = 1.0 - alpha;
+    let vol_tox_scale = tox_cfg.vol_tox_scale;
+    let tox_high_threshold = tox_cfg.tox_high_threshold;
+    let tox_med_threshold = tox_cfg.tox_med_threshold;
+    let sigma_min = vol_cfg.sigma_min;
+    let disable_tox_gate = ablations.disable_toxicity_gate();
+
     // Keep sigma_eff away from zero so ratios are well-defined.
-    let sigma_eff: f64 = state.sigma_eff.max(vol_cfg.sigma_min);
+    let sigma_eff: f64 = state.sigma_eff.max(sigma_min);
 
-    for venue in &mut state.venues {
-        // --- 1) Process pending markouts that have reached evaluation time ---
-        let mut markouts_to_process: Vec<(f64, f64)> = Vec::new(); // (markout_usd_per_tao, size)
+    for venue in state.venues.iter_mut() {
+        // --- 1) Process pending markouts in a single pass ---
+        // Lazy mid resolution: only check venue.mid once we pop the first ready markout.
+        let mut mid_checked = false;
+        let mut have_mid = false;
+        let mut mid: f64 = 0.0;
 
-        // Drain all markouts where t_eval_ms <= now_ms
+        // Drain and process all markouts where t_eval_ms <= now_ms in FIFO order.
+        // Each markout is processed inline - no intermediate staging buffer.
         while let Some(front) = venue.pending_markouts.front() {
             if front.t_eval_ms > now_ms {
                 break; // Not yet ready
@@ -73,56 +106,60 @@ pub fn update_toxicity_and_health_with_ablations(
 
             let pm = venue.pending_markouts.pop_front().unwrap();
 
-            // Get current mid for markout calculation
-            let mid_now = match venue.mid {
-                Some(m) if m.is_finite() && m > 0.0 => m,
-                _ => continue, // Skip if no valid mid
-            };
+            // Lazy mid resolution: only check venue.mid once per venue per tick
+            if !mid_checked {
+                mid_checked = true;
+                match venue.mid {
+                    Some(m) if m.is_finite() && m > 0.0 => {
+                        mid = m;
+                        have_mid = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Skip EWMA update if no valid mid, but still drain the markout
+            if !have_mid {
+                continue;
+            }
 
             // Compute markout in USD/TAO
             // Buy: we want price to go UP after buying, so markout = mid_now - fill_price
             // Sell: we want price to go DOWN after selling, so markout = fill_price - mid_now
             let markout = match pm.side {
-                Side::Buy => mid_now - pm.price,
-                Side::Sell => pm.price - mid_now,
+                Side::Buy => mid - pm.price,
+                Side::Sell => pm.price - mid,
             };
 
-            markouts_to_process.push((markout, pm.size_tao));
-        }
-
-        // --- 2) Update toxicity EWMA from markout results ---
-        for (markout, _size) in markouts_to_process {
             // Compute instantaneous toxicity from markout:
             // - markout >= 0: favorable fill, tox_instant = 0
             // - markout < 0: adverse fill, tox_instant = clamp(-markout / scale, 0, 1)
             let tox_instant: f64 = if markout >= 0.0 {
                 0.0
             } else {
-                let scale = tox_cfg.markout_scale_usd_per_tao.max(1e-9);
-                ((-markout) / scale).clamp(0.0, 1.0)
+                ((-markout) / markout_scale).clamp(0.0, 1.0)
             };
 
             // EWMA update: tox = (1 - alpha) * tox + alpha * tox_instant
-            let alpha = tox_cfg.markout_alpha.clamp(0.0, 1.0);
-            venue.toxicity = (1.0 - alpha) * venue.toxicity + alpha * tox_instant;
+            venue.toxicity = one_minus_alpha * venue.toxicity + alpha * tox_instant;
 
             // Also update markout EWMA for telemetry
             venue.markout_ewma_usd_per_tao =
-                (1.0 - alpha) * venue.markout_ewma_usd_per_tao + alpha * markout;
+                one_minus_alpha * venue.markout_ewma_usd_per_tao + alpha * markout;
         }
 
-        // --- 3) Fallback: if no mid or no depth, apply legacy vol-based toxicity ---
+        // --- 2) Fallback: if no mid or no depth, apply legacy vol-based toxicity ---
         // This ensures venues with missing book data are still penalized.
         if venue.mid.is_none() || venue.depth_near_mid <= 0.0 {
             // No valid book data -> treat as highly toxic
             venue.toxicity = 1.0;
-        } else if tox_cfg.vol_tox_scale > 0.0 && sigma_eff > 0.0 {
+        } else if vol_tox_scale > 0.0 && sigma_eff > 0.0 {
             // Optionally blend in volatility-based feature for extra signal
             // (only if local vol is significantly elevated)
-            let local: f64 = venue.local_vol_short.max(vol_cfg.sigma_min);
+            let local: f64 = venue.local_vol_short.max(sigma_min);
             let ratio: f64 = local / sigma_eff;
 
-            let raw: f64 = (ratio - 1.0) / tox_cfg.vol_tox_scale;
+            let raw: f64 = (ratio - 1.0) / vol_tox_scale;
             let f_vol: f64 = raw.clamp(0.0, 1.0);
 
             // Take max of current toxicity and vol-based feature
@@ -130,17 +167,17 @@ pub fn update_toxicity_and_health_with_ablations(
             venue.toxicity = venue.toxicity.max(f_vol);
         }
 
-        // --- 4) Clamp final toxicity to [0, 1] ---
+        // --- 3) Clamp final toxicity to [0, 1] ---
         venue.toxicity = venue.toxicity.clamp(0.0, 1.0);
 
-        // --- 5) Set venue health status based on toxicity thresholds ---
+        // --- 4) Set venue health status based on toxicity thresholds ---
         // If disable_toxicity_gate ablation is active, all venues remain Healthy
-        if ablations.disable_toxicity_gate() {
+        if disable_tox_gate {
             venue.status = VenueStatus::Healthy;
         } else {
-            venue.status = if venue.toxicity >= tox_cfg.tox_high_threshold {
+            venue.status = if venue.toxicity >= tox_high_threshold {
                 VenueStatus::Disabled
-            } else if venue.toxicity >= tox_cfg.tox_med_threshold {
+            } else if venue.toxicity >= tox_med_threshold {
                 VenueStatus::Warning
             } else {
                 VenueStatus::Healthy
