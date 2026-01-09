@@ -62,14 +62,26 @@ impl<'a> Engine<'a> {
         let one_minus_alpha_long = 1.0 - alpha_long;
 
         // Explicit indexed loop for deterministic venue ordering.
-        for idx in 0..state.venues.len() {
-            let v = &mut state.venues[idx];
+        //
+        // Opt9: Avoid repeated bounds checks by iterating over a fixed `len` and
+        // using `get_unchecked_mut`. This is safe because we never resize the
+        // venues Vec inside the loop.
+        let venues = &mut state.venues;
+        let len = venues.len();
 
-            let offset = idx as f64 * 0.4;
-            let mid_prev = v.mid;
+        for idx in 0..len {
+            // SAFETY: idx is in-bounds by construction (0..len), and we do not mutate
+            // `venues`' length within the loop.
+            let v = unsafe { venues.get_unchecked_mut(idx) };
+
+            let idx_f = idx as f64;
+            let offset = idx_f * 0.4;
+
+            // Capture previous mid before overwriting (None => 0.0 => no update).
+            let prev = v.mid.unwrap_or(0.0);
 
             let mid = base + offset;
-            let spread = 0.4 + idx as f64 * 0.02;
+            let spread = 0.4 + idx_f * 0.02;
             let depth = 10_000.0;
 
             // Update order-book snapshot.
@@ -80,20 +92,18 @@ impl<'a> Engine<'a> {
 
             // --- Local per-venue volatility (short / long EWMA of log returns) ---
             // Only update if we have a valid previous mid for computing returns.
-            if let Some(prev) = mid_prev {
-                if prev > 0.0 && mid > 0.0 {
-                    let r = (mid / prev).ln();
-                    let r2 = r * r;
+            if prev > 0.0 && mid > 0.0 {
+                let r = (mid / prev).ln();
+                let r2 = r * r;
 
-                    let var_short_prev = v.local_vol_short * v.local_vol_short;
-                    let var_long_prev = v.local_vol_long * v.local_vol_long;
+                let var_short_prev = v.local_vol_short * v.local_vol_short;
+                let var_long_prev = v.local_vol_long * v.local_vol_long;
 
-                    let var_short_new = one_minus_alpha_short * var_short_prev + alpha_short * r2;
-                    let var_long_new = one_minus_alpha_long * var_long_prev + alpha_long * r2;
+                let var_short_new = one_minus_alpha_short * var_short_prev + alpha_short * r2;
+                let var_long_new = one_minus_alpha_long * var_long_prev + alpha_long * r2;
 
-                    v.local_vol_short = var_short_new.max(0.0).sqrt();
-                    v.local_vol_long = var_long_new.max(0.0).sqrt();
-                }
+                v.local_vol_short = var_short_new.max(0.0).sqrt();
+                v.local_vol_long = var_long_new.max(0.0).sqrt();
             }
         }
     }
