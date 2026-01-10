@@ -42,7 +42,7 @@ use crate::types::{Side, TimestampMs, VenueStatus};
 /// 3. Falls back to volatility-based toxicity when no book data exists.
 /// 4. Sets venue health status based on toxicity thresholds.
 pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config, now_ms: TimestampMs) {
-    update_toxicity_and_health_with_ablations(state, cfg, now_ms, &AblationSet::new());
+    update_toxicity_and_health_impl::<false>(state, cfg, now_ms);
 }
 
 /// Update per-venue toxicity scores and health status with ablation support.
@@ -74,6 +74,18 @@ pub fn update_toxicity_and_health_with_ablations(
     now_ms: TimestampMs,
     ablations: &AblationSet,
 ) {
+    if ablations.disable_toxicity_gate() {
+        update_toxicity_and_health_impl::<true>(state, cfg, now_ms);
+    } else {
+        update_toxicity_and_health_impl::<false>(state, cfg, now_ms);
+    }
+}
+
+fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
+    state: &mut GlobalState,
+    cfg: &Config,
+    now_ms: TimestampMs,
+) {
     let tox_cfg = &cfg.toxicity;
     let vol_cfg = &cfg.volatility;
 
@@ -85,7 +97,6 @@ pub fn update_toxicity_and_health_with_ablations(
     let tox_high_threshold = tox_cfg.tox_high_threshold;
     let tox_med_threshold = tox_cfg.tox_med_threshold;
     let sigma_min = vol_cfg.sigma_min;
-    let disable_tox_gate = ablations.disable_toxicity_gate();
 
     // Keep sigma_eff away from zero so ratios are well-defined.
     let sigma_eff: f64 = state.sigma_eff.max(sigma_min);
@@ -172,7 +183,7 @@ pub fn update_toxicity_and_health_with_ablations(
 
         // --- 4) Set venue health status based on toxicity thresholds ---
         // If disable_toxicity_gate ablation is active, all venues remain Healthy
-        if disable_tox_gate {
+        if DISABLE_TOX_GATE {
             venue.status = VenueStatus::Healthy;
         } else {
             venue.status = if venue.toxicity >= tox_high_threshold {
