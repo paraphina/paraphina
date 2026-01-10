@@ -112,10 +112,6 @@ struct TickScalars {
     tox_high_threshold: f64,
     tox_med_threshold: f64,
 
-    // Ablation flags (computed once per tick)
-    disable_fv_gating: bool,
-    disable_tox_gating: bool,
-
     // Risk regime flags (precomputed to avoid matches! in loop)
     is_warning_regime: bool,
 }
@@ -220,16 +216,27 @@ pub fn compute_venue_targets_into(
 /// This reads the global state (fair value, volatility, risk scalars,
 /// inventory, etc.) and per-venue state, then produces local quotes
 /// for each venue.
+///
+/// This is the default hot path which does NOT construct an AblationSet
+/// or check ablation flags. It calls the specialized "no ablations"
+/// implementation directly.
 pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
-    compute_mm_quotes_with_ablations(cfg, state, &AblationSet::new())
+    let n = cfg.venues.len();
+    let mut out = Vec::with_capacity(n);
+    compute_mm_quotes_impl::<false, false>(cfg, state, &mut out);
+    out
 }
 
 /// Main MM quoting function (buffer-reusing variant).
 ///
 /// Clears `out` and pushes quotes into it, reusing capacity.
 /// Use this in hot paths to avoid per-tick allocations.
+///
+/// This is the default hot path which does NOT construct an AblationSet
+/// or check ablation flags. It calls the specialized "no ablations"
+/// implementation directly.
 pub fn compute_mm_quotes_into(cfg: &Config, state: &GlobalState, out: &mut Vec<MmQuote>) {
-    compute_mm_quotes_with_ablations_into(cfg, state, &AblationSet::new(), out)
+    compute_mm_quotes_impl::<false, false>(cfg, state, out)
 }
 
 /// Main MM quoting function with ablation support.
@@ -250,15 +257,40 @@ pub fn compute_mm_quotes_with_ablations(
 
 /// Main MM quoting function with ablation support (buffer-reusing variant).
 ///
+/// Dispatches once per tick based on the two MM-relevant ablation flags
+/// and calls specialized const-generic implementations for each combination.
+///
+/// Ablations:
+/// - disable_fair_value_gating: Gating always allows (never blocks quoting)
+/// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
+pub fn compute_mm_quotes_with_ablations_into(
+    cfg: &Config,
+    state: &GlobalState,
+    ablations: &AblationSet,
+    out: &mut Vec<MmQuote>,
+) {
+    let disable_fv = ablations.disable_fair_value_gating();
+    let disable_tox = ablations.disable_toxicity_gate();
+
+    match (disable_fv, disable_tox) {
+        (false, false) => compute_mm_quotes_impl::<false, false>(cfg, state, out),
+        (true, false) => compute_mm_quotes_impl::<true, false>(cfg, state, out),
+        (false, true) => compute_mm_quotes_impl::<false, true>(cfg, state, out),
+        (true, true) => compute_mm_quotes_impl::<true, true>(cfg, state, out),
+    }
+}
+
+/// Core MM quoting implementation with const-generic ablation flags.
+///
 /// Uses stable quote slots to avoid per-tick Arc<str> clone/drop overhead.
 /// On first call (or if venue count changes), initializes `out` with N slots
 /// containing cloned venue_id Arc<str>. On subsequent calls, resets bid/ask
 /// to None and updates in place. This eliminates per-tick allocation and
 /// Arc reference count churn in the hot path.
 ///
-/// Ablations:
-/// - disable_fair_value_gating: Gating always allows (never blocks quoting)
-/// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
+/// Const generics:
+/// - DISABLE_FV: If true, fair value gating is disabled (always allow quoting)
+/// - DISABLE_TOX: If true, toxicity gating is disabled (never block venues)
 ///
 /// Optimization notes:
 /// - Stable quote slots: venue_id cloned once, bid/ask reset to None each tick.
@@ -266,10 +298,10 @@ pub fn compute_mm_quotes_with_ablations(
 /// - Per-venue target inventory computation reuses scratch buffer pattern.
 /// - Config lookups are hoisted out of the per-venue loop.
 /// - Explicit indexed loops for deterministic ordering.
-pub fn compute_mm_quotes_with_ablations_into(
+/// - Const generics eliminate dead branches at compile time.
+fn compute_mm_quotes_impl<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
     cfg: &Config,
     state: &GlobalState,
-    ablations: &AblationSet,
     out: &mut Vec<MmQuote>,
 ) {
     let n = cfg.venues.len();
@@ -364,10 +396,6 @@ pub fn compute_mm_quotes_with_ablations_into(
         tox_high_threshold: tox_cfg.tox_high_threshold,
         tox_med_threshold: tox_cfg.tox_med_threshold,
 
-        // Ablation flags (computed once)
-        disable_fv_gating: ablations.disable_fair_value_gating(),
-        disable_tox_gating: ablations.disable_toxicity_gate(),
-
         // Risk regime flags
         is_warning_regime: matches!(risk_regime, RiskRegime::Warning),
     };
@@ -398,8 +426,13 @@ pub fn compute_mm_quotes_with_ablations_into(
         // Venue mid: prefer local mid if present, else fall back to fair value.
         let mid = vstate.mid.unwrap_or(s_t);
 
-        let (bid, ask) =
-            compute_single_venue_quotes_fast(vcfg, vstate, mid, target.q_target, &scalars);
+        let (bid, ask) = compute_single_venue_quotes_fast::<DISABLE_FV, DISABLE_TOX>(
+            vcfg,
+            vstate,
+            mid,
+            target.q_target,
+            &scalars,
+        );
 
         // Update in place (stable slots: venue_id already set, just update bid/ask).
         out[i].bid = bid;
@@ -508,8 +541,11 @@ fn compute_maker_cost(vcfg: &VenueConfig, price: f64) -> f64 {
 /// This is the hot-path version that avoids repeated config lookups by using
 /// the precomputed TickScalars struct. All numerical computations are identical
 /// to compute_single_venue_quotes to preserve bit-exact determinism.
+///
+/// Const generics DISABLE_FV and DISABLE_TOX allow the compiler to eliminate
+/// dead branches for each ablation combination.
 #[inline]
-fn compute_single_venue_quotes_fast(
+fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
     vcfg: &VenueConfig,
     vstate: &VenueState,
     mid: f64,
@@ -521,7 +557,7 @@ fn compute_single_venue_quotes_fast(
     // ---------------------------------------------------------------------
 
     // If the venue is Disabled, no quoting (unless toxicity gating is disabled).
-    if !sc.disable_tox_gating && matches!(vstate.status, VenueStatus::Disabled) {
+    if !DISABLE_TOX && matches!(vstate.status, VenueStatus::Disabled) {
         return (None, None);
     }
 
@@ -532,20 +568,18 @@ fn compute_single_venue_quotes_fast(
     }
 
     // Toxicity gating: if toxicity >= TOX_HIGH_THRESHOLD, skip venue.
-    if !sc.disable_tox_gating && vstate.toxicity >= sc.tox_high_threshold {
+    if !DISABLE_TOX && vstate.toxicity >= sc.tox_high_threshold {
         return (None, None);
     }
 
     // Stale book check: if we have no mid or it's stale, don't quote.
-    if vstate.mid.is_none() && !sc.disable_fv_gating {
+    if vstate.mid.is_none() && !DISABLE_FV {
         return (None, None);
     }
 
     // Check for valid spread/depth.
-    let spread = vstate
-        .spread
-        .unwrap_or(if sc.disable_fv_gating { 0.01 } else { 0.0 });
-    let depth = if sc.disable_fv_gating && vstate.depth_near_mid <= 0.0 {
+    let spread = vstate.spread.unwrap_or(if DISABLE_FV { 0.01 } else { 0.0 });
+    let depth = if DISABLE_FV && vstate.depth_near_mid <= 0.0 {
         10_000.0 // Default depth when gating disabled
     } else {
         vstate.depth_near_mid
@@ -728,13 +762,13 @@ fn compute_single_venue_quotes_fast(
     }
 
     // Venue health: Warning venues get reduced size.
-    if !sc.disable_tox_gating && matches!(vstate.status, VenueStatus::Warning) {
+    if !DISABLE_TOX && matches!(vstate.status, VenueStatus::Warning) {
         size_bid *= 0.5;
         size_ask *= 0.5;
     }
 
     // Toxicity: medium toxicity reduces sizes.
-    if !sc.disable_tox_gating
+    if !DISABLE_TOX
         && vstate.toxicity >= sc.tox_med_threshold
         && vstate.toxicity < sc.tox_high_threshold
     {
