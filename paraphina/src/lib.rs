@@ -89,10 +89,12 @@ pub use hedge::{
 pub use logging::{EventSink, FileSink, NoopSink};
 
 pub use mm::{
-    compute_mm_quotes, compute_mm_quotes_into, compute_mm_quotes_with_ablations,
-    compute_mm_quotes_with_ablations_into, compute_order_actions, compute_venue_targets,
-    mm_quotes_to_order_intents, mm_quotes_to_order_intents_into, should_replace_order,
-    ActiveMmOrder, MmLevel, MmOrderAction, MmQuote, VenueTargetInventory,
+    compute_mm_quotes, compute_mm_quotes_into, compute_mm_quotes_into_with_scratch,
+    compute_mm_quotes_with_ablations, compute_mm_quotes_with_ablations_into,
+    compute_mm_quotes_with_ablations_into_with_scratch, compute_order_actions,
+    compute_venue_targets, mm_quotes_to_order_intents, mm_quotes_to_order_intents_into,
+    should_replace_order, ActiveMmOrder, MmLevel, MmOrderAction, MmQuote, MmScratch,
+    VenueTargetInventory,
 };
 
 pub use state::{GlobalState, KillReason, PendingMarkout, RiskRegime, VenueState};

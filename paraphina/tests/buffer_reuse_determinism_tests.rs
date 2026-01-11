@@ -8,8 +8,8 @@ use paraphina::engine::Engine;
 use paraphina::exit::compute_exit_intents_into;
 use paraphina::hedge::compute_hedge_orders_into;
 use paraphina::mm::{
-    compute_mm_quotes, compute_mm_quotes_into, mm_quotes_to_order_intents,
-    mm_quotes_to_order_intents_into, MmQuote,
+    compute_mm_quotes, compute_mm_quotes_into, compute_mm_quotes_into_with_scratch,
+    mm_quotes_to_order_intents, mm_quotes_to_order_intents_into, MmQuote, MmScratch,
 };
 use paraphina::state::GlobalState;
 use paraphina::types::{OrderIntent, TimestampMs, VenueStatus};
@@ -168,6 +168,81 @@ fn test_mm_into_buffer_reuse_preserves_capacity() {
         intents_buf.capacity() >= 200,
         "Buffer capacity should be preserved"
     );
+}
+
+#[test]
+fn test_compute_mm_quotes_into_with_scratch_matches_allocating() {
+    let cfg = create_test_config();
+    let state = create_test_state(&cfg);
+
+    // Allocating version
+    let quotes_alloc = compute_mm_quotes(&cfg, &state);
+
+    // Buffer-reusing version with scratch
+    let mut quotes_buf: Vec<MmQuote> = Vec::new();
+    let mut scratch = MmScratch::new();
+    compute_mm_quotes_into_with_scratch(&cfg, &state, &mut quotes_buf, &mut scratch);
+
+    assert!(
+        mm_quotes_equal(&quotes_alloc, &quotes_buf),
+        "compute_mm_quotes_into_with_scratch produces different results than compute_mm_quotes"
+    );
+}
+
+#[test]
+fn test_mm_scratch_buffer_reuse_preserves_capacity() {
+    let cfg = create_test_config();
+    let state = create_test_state(&cfg);
+
+    // Pre-allocate with large capacity
+    let mut quotes_buf: Vec<MmQuote> = Vec::with_capacity(100);
+    let mut scratch = MmScratch::with_capacity(50);
+
+    let initial_scratch_capacity = scratch.venue_targets_capacity();
+    assert!(
+        initial_scratch_capacity >= 50,
+        "Initial scratch capacity should be >= 50"
+    );
+
+    // Run multiple times
+    for _ in 0..10 {
+        compute_mm_quotes_into_with_scratch(&cfg, &state, &mut quotes_buf, &mut scratch);
+    }
+
+    // Capacity should be preserved or increased, never reallocated smaller
+    assert!(
+        quotes_buf.capacity() >= 100,
+        "Quotes buffer capacity should be preserved"
+    );
+    assert!(
+        scratch.venue_targets_capacity() >= initial_scratch_capacity,
+        "Scratch buffer capacity should be preserved"
+    );
+}
+
+#[test]
+fn test_mm_scratch_determinism_across_ticks() {
+    let cfg = create_test_config();
+    let mut state = create_test_state(&cfg);
+
+    let mut quotes_buf_scratch: Vec<MmQuote> = Vec::new();
+    let mut scratch = MmScratch::new();
+
+    // Simulate multiple ticks and verify consistency with allocating version
+    for tick in 0..5 {
+        // Modify state slightly each tick
+        state.q_global_tao = tick as f64 * 0.5;
+        state.recompute_after_fills(&cfg);
+
+        let quotes_alloc = compute_mm_quotes(&cfg, &state);
+        compute_mm_quotes_into_with_scratch(&cfg, &state, &mut quotes_buf_scratch, &mut scratch);
+
+        assert!(
+            mm_quotes_equal(&quotes_alloc, &quotes_buf_scratch),
+            "Tick {}: scratch version diverges from allocating version",
+            tick
+        );
+    }
 }
 
 // =============================================================================
