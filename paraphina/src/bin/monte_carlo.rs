@@ -753,6 +753,7 @@ fn run_once(
     // Pre-allocate scratch buffers for hot path (avoid per-tick allocations).
     // Reasonable capacity estimates based on typical venue counts.
     let num_venues = cfg.venues.len();
+    let mut mm_scratch = mm::MmScratch::with_capacity(num_venues);
     let mut mm_quotes_buf: Vec<mm::MmQuote> = Vec::with_capacity(num_venues);
     let mut mm_intents_buf: Vec<OrderIntent> = Vec::with_capacity(num_venues * 2);
     let mut exit_intents_buf: Vec<OrderIntent> = Vec::with_capacity(num_venues);
@@ -780,7 +781,7 @@ fn run_once(
         }
 
         // MM -> fills -> recompute (using scratch buffers)
-        mm::compute_mm_quotes_into(cfg, &state, &mut mm_quotes_buf);
+        mm::compute_mm_quotes_into_with_scratch(cfg, &state, &mut mm_quotes_buf, &mut mm_scratch);
         mm::mm_quotes_to_order_intents_into(&mm_quotes_buf, &mut mm_intents_buf);
         apply_intents_as_fills(cfg, &mut state, &mm_intents_buf);
         state.recompute_after_fills(cfg);
