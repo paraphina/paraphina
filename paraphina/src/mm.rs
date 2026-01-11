@@ -74,6 +74,40 @@ pub struct VenueTargetInventory {
     pub q_target: f64,
 }
 
+/// Scratch buffers for MM quote computation.
+///
+/// Reusing this struct across ticks avoids per-tick heap allocations
+/// in the hot path. Create once, pass to `compute_mm_quotes_into_with_scratch`.
+#[derive(Debug, Clone, Default)]
+pub struct MmScratch {
+    /// Per-venue target inventory scratch buffer.
+    venue_targets: Vec<VenueTargetInventory>,
+}
+
+impl MmScratch {
+    /// Create a new empty scratch buffer.
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            venue_targets: Vec::new(),
+        }
+    }
+
+    /// Create a new scratch buffer with pre-allocated capacity.
+    #[inline]
+    pub fn with_capacity(venue_count: usize) -> Self {
+        Self {
+            venue_targets: Vec::with_capacity(venue_count),
+        }
+    }
+
+    /// Returns the current capacity of the venue_targets buffer.
+    #[inline]
+    pub fn venue_targets_capacity(&self) -> usize {
+        self.venue_targets.capacity()
+    }
+}
+
 /// Precomputed tick-level scalars for MM quoting.
 ///
 /// These values are computed once per tick and reused across all venues,
@@ -235,8 +269,31 @@ pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
 /// This is the default hot path which does NOT construct an AblationSet
 /// or check ablation flags. It calls the specialized "no ablations"
 /// implementation directly.
+///
+/// Note: This version still allocates an internal scratch buffer each call.
+/// For zero-allocation hot paths, use `compute_mm_quotes_into_with_scratch`.
 pub fn compute_mm_quotes_into(cfg: &Config, state: &GlobalState, out: &mut Vec<MmQuote>) {
     compute_mm_quotes_impl::<false, false>(cfg, state, out)
+}
+
+/// Main MM quoting function (fully buffer-reusing variant).
+///
+/// Reuses both the output buffer and internal scratch buffers to eliminate
+/// all per-tick heap allocations. This is the optimal hot-path variant.
+///
+/// Create an `MmScratch` once and pass it to each call. The scratch buffer's
+/// capacity is preserved across calls.
+///
+/// This is the default hot path which does NOT construct an AblationSet
+/// or check ablation flags. It calls the specialized "no ablations"
+/// implementation directly.
+pub fn compute_mm_quotes_into_with_scratch(
+    cfg: &Config,
+    state: &GlobalState,
+    out: &mut Vec<MmQuote>,
+    scratch: &mut MmScratch,
+) {
+    compute_mm_quotes_impl_with_scratch::<false, false>(cfg, state, out, scratch)
 }
 
 /// Main MM quoting function with ablation support.
@@ -263,6 +320,9 @@ pub fn compute_mm_quotes_with_ablations(
 /// Ablations:
 /// - disable_fair_value_gating: Gating always allows (never blocks quoting)
 /// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
+///
+/// Note: This version still allocates an internal scratch buffer each call.
+/// For zero-allocation hot paths, use `compute_mm_quotes_with_ablations_into_with_scratch`.
 pub fn compute_mm_quotes_with_ablations_into(
     cfg: &Config,
     state: &GlobalState,
@@ -277,6 +337,41 @@ pub fn compute_mm_quotes_with_ablations_into(
         (true, false) => compute_mm_quotes_impl::<true, false>(cfg, state, out),
         (false, true) => compute_mm_quotes_impl::<false, true>(cfg, state, out),
         (true, true) => compute_mm_quotes_impl::<true, true>(cfg, state, out),
+    }
+}
+
+/// Main MM quoting function with ablation support (fully buffer-reusing variant).
+///
+/// Reuses both the output buffer and internal scratch buffers to eliminate
+/// all per-tick heap allocations. This is the optimal hot-path variant.
+///
+/// Dispatches once per tick based on the two MM-relevant ablation flags
+/// and calls specialized const-generic implementations for each combination.
+///
+/// Ablations:
+/// - disable_fair_value_gating: Gating always allows (never blocks quoting)
+/// - disable_toxicity_gate: Toxicity gating never blocks/disables venues
+pub fn compute_mm_quotes_with_ablations_into_with_scratch(
+    cfg: &Config,
+    state: &GlobalState,
+    ablations: &AblationSet,
+    out: &mut Vec<MmQuote>,
+    scratch: &mut MmScratch,
+) {
+    let disable_fv = ablations.disable_fair_value_gating();
+    let disable_tox = ablations.disable_toxicity_gate();
+
+    match (disable_fv, disable_tox) {
+        (false, false) => {
+            compute_mm_quotes_impl_with_scratch::<false, false>(cfg, state, out, scratch)
+        }
+        (true, false) => {
+            compute_mm_quotes_impl_with_scratch::<true, false>(cfg, state, out, scratch)
+        }
+        (false, true) => {
+            compute_mm_quotes_impl_with_scratch::<false, true>(cfg, state, out, scratch)
+        }
+        (true, true) => compute_mm_quotes_impl_with_scratch::<true, true>(cfg, state, out, scratch),
     }
 }
 
@@ -299,10 +394,30 @@ pub fn compute_mm_quotes_with_ablations_into(
 /// - Config lookups are hoisted out of the per-venue loop.
 /// - Explicit indexed loops for deterministic ordering.
 /// - Const generics eliminate dead branches at compile time.
+///
+/// Note: This version allocates a temporary scratch buffer each call.
+/// For hot paths, use `compute_mm_quotes_into_with_scratch` to reuse buffers.
 fn compute_mm_quotes_impl<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
     cfg: &Config,
     state: &GlobalState,
     out: &mut Vec<MmQuote>,
+) {
+    let mut scratch = MmScratch::new();
+    compute_mm_quotes_impl_with_scratch::<DISABLE_FV, DISABLE_TOX>(cfg, state, out, &mut scratch)
+}
+
+/// Core MM quoting implementation with scratch buffer reuse.
+///
+/// Same as `compute_mm_quotes_impl` but reuses the provided scratch buffer
+/// to avoid per-tick heap allocations. Use this in hot paths.
+///
+/// The scratch buffer's capacity is preserved across calls; only the contents
+/// are cleared and repopulated each tick.
+fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
+    cfg: &Config,
+    state: &GlobalState,
+    out: &mut Vec<MmQuote>,
+    scratch: &mut MmScratch,
 ) {
     let n = cfg.venues.len();
 
@@ -400,10 +515,8 @@ fn compute_mm_quotes_impl<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
         is_warning_regime: matches!(risk_regime, RiskRegime::Warning),
     };
 
-    // Compute per-venue target inventories.
-    // Note: Using allocating version here for simplicity; could add scratch buffer to state
-    // if this shows up in profiles. The Vec is small (n venues).
-    let venue_targets = compute_venue_targets(cfg, state);
+    // Compute per-venue target inventories using scratch buffer (no allocation).
+    compute_venue_targets_into(cfg, state, &mut scratch.venue_targets);
 
     // ---------------------------------------------------------------------
     // Per-venue quoting (explicit indexed loop for determinism)
@@ -416,7 +529,7 @@ fn compute_mm_quotes_impl<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
     for i in 0..n {
         let vcfg = &cfg.venues[i];
         let vstate = &state.venues[i];
-        let target = &venue_targets[i];
+        let target = &scratch.venue_targets[i];
 
         // Disabled venue => no quotes (bid/ask already None from reset).
         if matches!(vstate.status, VenueStatus::Disabled) {
