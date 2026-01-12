@@ -64,6 +64,9 @@ pub struct VenueState {
     pub local_vol_short: f64,
     /// Long-horizon EWMA local vol of log mid.
     pub local_vol_long: f64,
+    /// Cached ln(mid) from the previous tick for log-return computation.
+    /// Stored to avoid repeated log() calls in the hot path.
+    pub prev_ln_mid: Option<f64>,
 
     // ----- Health / toxicity -----
     pub status: VenueStatus,
@@ -269,6 +272,7 @@ impl GlobalState {
                 last_mid_update_ms: None,
                 local_vol_short: 0.0,
                 local_vol_long: 0.0,
+                prev_ln_mid: None,
 
                 status: VenueStatus::Healthy,
                 toxicity: 0.0,

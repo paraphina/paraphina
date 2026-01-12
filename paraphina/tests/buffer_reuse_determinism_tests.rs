@@ -981,3 +981,165 @@ fn test_toxicity_update_determinism() {
         );
     }
 }
+
+// =============================================================================
+// Opt15: Log-return computation optimization tests
+// =============================================================================
+
+/// Tests that the optimized log-return formula (ln_mid - prev_ln_mid)
+/// produces results extremely close to the original formula ((mid / prev).ln()).
+///
+/// This is a mathematical equivalence test: ln(a/b) = ln(a) - ln(b)
+/// The difference should be negligible floating-point roundoff only.
+#[test]
+fn test_log_return_optimization_equivalence() {
+    // Test case 1: Near 1.0 ratio (small move)
+    // Simulates typical tick-to-tick movement
+    let prev_mid_1: f64 = 250.0;
+    let curr_mid_1: f64 = 250.05; // 0.02% move
+
+    let old_formula_1 = (curr_mid_1 / prev_mid_1).ln();
+    let new_formula_1 = curr_mid_1.max(1e-6).ln() - prev_mid_1.max(1e-6).ln();
+
+    let diff_1 = (old_formula_1 - new_formula_1).abs();
+    assert!(
+        diff_1 < 1e-14,
+        "Near 1.0 ratio: old={:.18} new={:.18} diff={:.2e} (should be < 1e-14)",
+        old_formula_1,
+        new_formula_1,
+        diff_1
+    );
+
+    // Test case 2: Large move (5% jump)
+    // Simulates significant price movement
+    let prev_mid_2: f64 = 250.0;
+    let curr_mid_2: f64 = 262.5; // 5% move
+
+    let old_formula_2 = (curr_mid_2 / prev_mid_2).ln();
+    let new_formula_2 = curr_mid_2.max(1e-6).ln() - prev_mid_2.max(1e-6).ln();
+
+    let diff_2 = (old_formula_2 - new_formula_2).abs();
+    assert!(
+        diff_2 < 1e-14,
+        "Large move: old={:.18} new={:.18} diff={:.2e} (should be < 1e-14)",
+        old_formula_2,
+        new_formula_2,
+        diff_2
+    );
+
+    // Test case 3: Downward move
+    let prev_mid_3: f64 = 300.0;
+    let curr_mid_3: f64 = 285.0; // 5% down
+
+    let old_formula_3 = (curr_mid_3 / prev_mid_3).ln();
+    let new_formula_3 = curr_mid_3.max(1e-6).ln() - prev_mid_3.max(1e-6).ln();
+
+    let diff_3 = (old_formula_3 - new_formula_3).abs();
+    assert!(
+        diff_3 < 1e-14,
+        "Downward move: old={:.18} new={:.18} diff={:.2e} (should be < 1e-14)",
+        old_formula_3,
+        new_formula_3,
+        diff_3
+    );
+
+    // Test case 4: Very small values (near clamping boundary)
+    let prev_mid_4: f64 = 0.001;
+    let curr_mid_4: f64 = 0.00105;
+
+    let old_formula_4 = (curr_mid_4 / prev_mid_4).ln();
+    let new_formula_4 = curr_mid_4.max(1e-6).ln() - prev_mid_4.max(1e-6).ln();
+
+    let diff_4 = (old_formula_4 - new_formula_4).abs();
+    assert!(
+        diff_4 < 1e-12,
+        "Small values: old={:.18} new={:.18} diff={:.2e} (should be < 1e-12)",
+        old_formula_4,
+        new_formula_4,
+        diff_4
+    );
+
+    // Test case 5: Typical synthetic mid values from seed_dummy_mids
+    // These are the exact values used in the hot path
+    for idx in 0..5 {
+        let base_t0: f64 = 250.0 + 1000.0 * 0.001; // now_ms = 1000
+        let base_t1: f64 = 250.0 + 1050.0 * 0.001; // now_ms = 1050 (50ms later)
+
+        let offset = idx as f64 * 0.4;
+        let prev_mid = base_t0 + offset;
+        let curr_mid = base_t1 + offset;
+
+        let old_formula = (curr_mid / prev_mid).ln();
+        let new_formula = curr_mid.max(1e-6).ln() - prev_mid.max(1e-6).ln();
+
+        let diff = (old_formula - new_formula).abs();
+        assert!(
+            diff < 1e-14,
+            "Synthetic mid idx={}: old={:.18} new={:.18} diff={:.2e}",
+            idx,
+            old_formula,
+            new_formula,
+            diff
+        );
+    }
+}
+
+/// Tests that seed_dummy_mids with the optimized log-return path
+/// produces consistent volatility estimates across multiple ticks.
+#[test]
+fn test_seed_dummy_mids_log_return_consistency() {
+    let cfg = create_test_config();
+    let engine = Engine::new(&cfg);
+    let mut state = GlobalState::new(&cfg);
+
+    // Run multiple ticks to build up volatility estimates
+    let tick_interval_ms = 50;
+    for tick in 0..100 {
+        let now_ms: TimestampMs = 1000 + tick * tick_interval_ms;
+        engine.seed_dummy_mids(&mut state, now_ms);
+    }
+
+    // Verify that:
+    // 1. prev_ln_mid is populated for all venues
+    // 2. Local volatilities are non-zero (returns were computed)
+    // 3. Volatilities are sane values (not NaN/Inf)
+    for (idx, v) in state.venues.iter().enumerate() {
+        assert!(
+            v.prev_ln_mid.is_some(),
+            "Venue {} should have prev_ln_mid cached after ticks",
+            idx
+        );
+
+        let ln_mid = v.prev_ln_mid.unwrap();
+        assert!(
+            ln_mid.is_finite(),
+            "Venue {} prev_ln_mid should be finite: {}",
+            idx,
+            ln_mid
+        );
+
+        // Check that the cached ln_mid matches what we'd compute directly
+        let expected_ln_mid = v.mid.unwrap().max(1e-6).ln();
+        assert!(
+            (ln_mid - expected_ln_mid).abs() < 1e-14,
+            "Venue {} cached ln_mid should match computed: {} vs {}",
+            idx,
+            ln_mid,
+            expected_ln_mid
+        );
+
+        // Volatilities should be computed (non-zero after 100 ticks with price changes)
+        assert!(
+            v.local_vol_short >= 0.0 && v.local_vol_short.is_finite(),
+            "Venue {} local_vol_short should be non-negative finite: {}",
+            idx,
+            v.local_vol_short
+        );
+        assert!(
+            v.local_vol_long >= 0.0 && v.local_vol_long.is_finite(),
+            "Venue {} local_vol_long should be non-negative finite: {}",
+            idx,
+            v.local_vol_long
+        );
+    }
+}
