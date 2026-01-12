@@ -400,4 +400,174 @@ mod tests {
             state.venues[0].toxicity
         );
     }
+
+    /// Test FIFO processing: markouts with increasing maturity times are popped
+    /// in order, and only those whose t_eval_ms <= now_ms are processed.
+    #[test]
+    fn test_fifo_pops_exactly_matured_subset() {
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+
+        // Setup venue with valid mid
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.0;
+
+        // Push 5 markouts with strictly increasing maturity times.
+        // These represent fills at t=0,100,200,300,400 with horizon=1000.
+        for i in 0..5 {
+            venue.pending_markouts.push_back(PendingMarkout {
+                t_fill_ms: i * 100,
+                t_eval_ms: (i * 100) + 1000, // t_eval = 1000, 1100, 1200, 1300, 1400
+                side: Side::Buy,
+                size_tao: 1.0,
+                price: 100.0,
+                fair_at_fill: 100.0,
+                mid_at_fill: 100.0,
+            });
+        }
+
+        assert_eq!(venue.pending_markouts.len(), 5);
+
+        // At t=1150, markouts with t_eval_ms <= 1150 should be processed.
+        // That's t_eval_ms = 1000 and 1100 (indices 0 and 1).
+        update_toxicity_and_health(&mut state, &cfg, 1150);
+
+        // Should have processed 2 markouts, leaving 3 pending.
+        assert_eq!(
+            state.venues[0].pending_markouts.len(),
+            3,
+            "Expected 3 pending markouts after processing at t=1150"
+        );
+
+        // Verify the remaining markouts are the correct ones (1200, 1300, 1400).
+        let remaining: Vec<i64> = state.venues[0]
+            .pending_markouts
+            .iter()
+            .map(|pm| pm.t_eval_ms)
+            .collect();
+        assert_eq!(remaining, vec![1200, 1300, 1400]);
+
+        // Process one more at t=1200 (exactly at deadline).
+        update_toxicity_and_health(&mut state, &cfg, 1200);
+        assert_eq!(
+            state.venues[0].pending_markouts.len(),
+            2,
+            "Expected 2 pending markouts after processing at t=1200"
+        );
+
+        // Process all remaining at t=2000.
+        update_toxicity_and_health(&mut state, &cfg, 2000);
+        assert_eq!(
+            state.venues[0].pending_markouts.len(),
+            0,
+            "Expected 0 pending markouts after processing at t=2000"
+        );
+    }
+
+    /// Test that multiple markouts with the same t_eval_ms are all processed
+    /// when that time arrives.
+    #[test]
+    fn test_fifo_processes_same_time_markouts() {
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.0;
+
+        // Push 3 markouts all with the same t_eval_ms (can happen if fills
+        // occur at the same timestamp).
+        for _ in 0..3 {
+            venue.pending_markouts.push_back(PendingMarkout {
+                t_fill_ms: 0,
+                t_eval_ms: 1000,
+                side: Side::Buy,
+                size_tao: 1.0,
+                price: 100.0,
+                fair_at_fill: 100.0,
+                mid_at_fill: 100.0,
+            });
+        }
+
+        // Add one more with a later time.
+        venue.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 100,
+            t_eval_ms: 1100,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 100.0,
+            fair_at_fill: 100.0,
+            mid_at_fill: 100.0,
+        });
+
+        assert_eq!(venue.pending_markouts.len(), 4);
+
+        // Process at t=1000: all 3 with t_eval_ms=1000 should be processed.
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        assert_eq!(
+            state.venues[0].pending_markouts.len(),
+            1,
+            "Expected 1 pending markout (t_eval=1100) after processing at t=1000"
+        );
+        assert_eq!(
+            state.venues[0].pending_markouts.front().unwrap().t_eval_ms,
+            1100
+        );
+    }
+
+    /// Test that FIFO order is preserved: earlier-added markouts are processed
+    /// before later-added ones, maintaining deterministic behavior.
+    #[test]
+    fn test_fifo_preserves_insertion_order() {
+        let mut cfg = make_test_config();
+        // Use alpha=1.0 so toxicity fully reflects the most recent markout.
+        cfg.toxicity.markout_alpha = 1.0;
+
+        let mut state = GlobalState::new(&cfg);
+
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.0;
+
+        // Push two markouts at same t_eval_ms but different prices.
+        // First: Buy at 100 (neutral, markout=0).
+        // Second: Buy at 101 (adverse, markout=-1).
+        venue.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 100.0, // markout = 100 - 100 = 0 → tox=0
+            fair_at_fill: 100.0,
+            mid_at_fill: 100.0,
+        });
+        venue.pending_markouts.push_back(PendingMarkout {
+            t_fill_ms: 0,
+            t_eval_ms: 1000,
+            side: Side::Buy,
+            size_tao: 1.0,
+            price: 101.0, // markout = 100 - 101 = -1 → tox=1
+            fair_at_fill: 101.0,
+            mid_at_fill: 101.0,
+        });
+
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        // With alpha=1.0, toxicity should reflect the LAST processed markout.
+        // FIFO order means first (price=100, tox=0) is processed, then
+        // second (price=101, tox=1). Final toxicity should be 1.0.
+        assert!(
+            (state.venues[0].toxicity - 1.0).abs() < 1e-9,
+            "Expected toxicity=1.0 (last markout), got {}",
+            state.venues[0].toxicity
+        );
+    }
 }

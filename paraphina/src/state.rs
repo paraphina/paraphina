@@ -513,9 +513,28 @@ impl GlobalState {
             return;
         };
 
+        let t_eval_ms = record.now_ms + record.horizon_ms;
+
+        // Monotonicity invariant: new t_eval_ms must be >= the last entry's t_eval_ms.
+        // This invariant holds because:
+        // 1. Fills are recorded in chronological order (now_ms monotonically increases).
+        // 2. The markout horizon is a fixed constant from config for all fills.
+        // Therefore t_eval_ms = now_ms + horizon_ms is monotonically non-decreasing.
+        // This allows O(1) FIFO processing in update_toxicity_and_health_impl instead
+        // of O(n) full scans - we simply pop_front while front().t_eval_ms <= now.
+        debug_assert!(
+            v.pending_markouts
+                .back()
+                .is_none_or(|last| t_eval_ms >= last.t_eval_ms),
+            "Pending markout monotonicity violated: new t_eval_ms={} < last t_eval_ms={}. \
+             This breaks the FIFO processing optimization.",
+            t_eval_ms,
+            v.pending_markouts.back().map_or(0, |last| last.t_eval_ms)
+        );
+
         let entry = PendingMarkout {
             t_fill_ms: record.now_ms,
-            t_eval_ms: record.now_ms + record.horizon_ms,
+            t_eval_ms,
             side: record.side,
             size_tao: record.size_tao,
             price: record.price,
