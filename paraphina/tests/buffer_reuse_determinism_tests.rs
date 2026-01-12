@@ -908,6 +908,7 @@ fn test_toxicity_update_determinism() {
             fair_at_fill: 101.0,
             mid_at_fill: 101.0,
         });
+        v.pending_markouts_next_eval_ms = 1000; // First entry's t_eval_ms
     }
 
     // Run toxicity update
@@ -953,6 +954,7 @@ fn test_toxicity_update_determinism() {
             fair_at_fill: 101.0,
             mid_at_fill: 101.0,
         });
+        v.pending_markouts_next_eval_ms = 1000; // First entry's t_eval_ms
     }
 
     state2.sigma_eff = 0.02;

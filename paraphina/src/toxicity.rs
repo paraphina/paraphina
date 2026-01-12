@@ -103,60 +103,69 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
 
     for venue in state.venues.iter_mut() {
         // --- 1) Process pending markouts in a single pass ---
-        // Lazy mid resolution: only check venue.mid once we pop the first ready markout.
-        let mut mid_checked = false;
-        let mut have_mid = false;
-        let mut mid: f64 = 0.0;
+        // Opt17: Use cached next_eval_ms to skip deque access when no markouts are ready.
+        if venue.pending_markouts_next_eval_ms <= now_ms {
+            // Lazy mid resolution: only check venue.mid once we pop the first ready markout.
+            let mut mid_checked = false;
+            let mut have_mid = false;
+            let mut mid: f64 = 0.0;
 
-        // Drain and process all markouts where t_eval_ms <= now_ms in FIFO order.
-        // Each markout is processed inline - no intermediate staging buffer.
-        while let Some(front) = venue.pending_markouts.front() {
-            if front.t_eval_ms > now_ms {
-                break; // Not yet ready
-            }
-
-            let pm = venue.pending_markouts.pop_front().unwrap();
-
-            // Lazy mid resolution: only check venue.mid once per venue per tick
-            if !mid_checked {
-                mid_checked = true;
-                match venue.mid {
-                    Some(m) if m.is_finite() && m > 0.0 => {
-                        mid = m;
-                        have_mid = true;
-                    }
-                    _ => {}
+            // Drain and process all markouts where t_eval_ms <= now_ms in FIFO order.
+            // Each markout is processed inline - no intermediate staging buffer.
+            while let Some(front) = venue.pending_markouts.front() {
+                if front.t_eval_ms > now_ms {
+                    break; // Not yet ready
                 }
+
+                let pm = venue.pending_markouts.pop_front().unwrap();
+
+                // Lazy mid resolution: only check venue.mid once per venue per tick
+                if !mid_checked {
+                    mid_checked = true;
+                    match venue.mid {
+                        Some(m) if m.is_finite() && m > 0.0 => {
+                            mid = m;
+                            have_mid = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Skip EWMA update if no valid mid, but still drain the markout
+                if !have_mid {
+                    continue;
+                }
+
+                // Compute markout in USD/TAO
+                // Buy: we want price to go UP after buying, so markout = mid_now - fill_price
+                // Sell: we want price to go DOWN after selling, so markout = fill_price - mid_now
+                let markout = match pm.side {
+                    Side::Buy => mid - pm.price,
+                    Side::Sell => pm.price - mid,
+                };
+
+                // Compute instantaneous toxicity from markout:
+                // - markout >= 0: favorable fill, tox_instant = 0
+                // - markout < 0: adverse fill, tox_instant = clamp(-markout / scale, 0, 1)
+                let tox_instant: f64 = if markout >= 0.0 {
+                    0.0
+                } else {
+                    ((-markout) / markout_scale).clamp(0.0, 1.0)
+                };
+
+                // EWMA update: tox = (1 - alpha) * tox + alpha * tox_instant
+                venue.toxicity = one_minus_alpha * venue.toxicity + alpha * tox_instant;
+
+                // Also update markout EWMA for telemetry
+                venue.markout_ewma_usd_per_tao =
+                    one_minus_alpha * venue.markout_ewma_usd_per_tao + alpha * markout;
             }
 
-            // Skip EWMA update if no valid mid, but still drain the markout
-            if !have_mid {
-                continue;
-            }
-
-            // Compute markout in USD/TAO
-            // Buy: we want price to go UP after buying, so markout = mid_now - fill_price
-            // Sell: we want price to go DOWN after selling, so markout = fill_price - mid_now
-            let markout = match pm.side {
-                Side::Buy => mid - pm.price,
-                Side::Sell => pm.price - mid,
-            };
-
-            // Compute instantaneous toxicity from markout:
-            // - markout >= 0: favorable fill, tox_instant = 0
-            // - markout < 0: adverse fill, tox_instant = clamp(-markout / scale, 0, 1)
-            let tox_instant: f64 = if markout >= 0.0 {
-                0.0
-            } else {
-                ((-markout) / markout_scale).clamp(0.0, 1.0)
-            };
-
-            // EWMA update: tox = (1 - alpha) * tox + alpha * tox_instant
-            venue.toxicity = one_minus_alpha * venue.toxicity + alpha * tox_instant;
-
-            // Also update markout EWMA for telemetry
-            venue.markout_ewma_usd_per_tao =
-                one_minus_alpha * venue.markout_ewma_usd_per_tao + alpha * markout;
+            // Opt17: Refresh cached next eval time after draining matured markouts.
+            venue.pending_markouts_next_eval_ms = venue
+                .pending_markouts
+                .front()
+                .map_or(i64::MAX, |pm| pm.t_eval_ms);
         }
 
         // --- 2) Fallback: if no mid or no depth, apply legacy vol-based toxicity ---
@@ -237,6 +246,7 @@ mod tests {
             fair_at_fill: 99.0,
             mid_at_fill: 99.0,
         });
+        venue.pending_markouts_next_eval_ms = 1000;
 
         // Run toxicity update at t=1000ms (markout should evaluate)
         update_toxicity_and_health(&mut state, &cfg, 1000);
@@ -273,6 +283,7 @@ mod tests {
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
         });
+        venue.pending_markouts_next_eval_ms = 1000;
 
         // Run toxicity update at t=1000ms
         update_toxicity_and_health(&mut state, &cfg, 1000);
@@ -309,6 +320,7 @@ mod tests {
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
         });
+        venue.pending_markouts_next_eval_ms = 1000;
 
         // Run at t=500 (before horizon)
         update_toxicity_and_health(&mut state, &cfg, 500);
@@ -359,6 +371,7 @@ mod tests {
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
         });
+        venue.pending_markouts_next_eval_ms = 1000;
 
         update_toxicity_and_health(&mut state, &cfg, 1000);
 
@@ -389,6 +402,7 @@ mod tests {
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
         });
+        venue.pending_markouts_next_eval_ms = 1000;
 
         update_toxicity_and_health(&mut state, &cfg, 1000);
 
@@ -428,6 +442,7 @@ mod tests {
                 mid_at_fill: 100.0,
             });
         }
+        venue.pending_markouts_next_eval_ms = 1000; // First entry's t_eval_ms
 
         assert_eq!(venue.pending_markouts.len(), 5);
 
@@ -504,6 +519,7 @@ mod tests {
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
         });
+        venue.pending_markouts_next_eval_ms = 1000; // First entry's t_eval_ms
 
         assert_eq!(venue.pending_markouts.len(), 4);
 
@@ -558,6 +574,7 @@ mod tests {
             fair_at_fill: 101.0,
             mid_at_fill: 101.0,
         });
+        venue.pending_markouts_next_eval_ms = 1000;
 
         update_toxicity_and_health(&mut state, &cfg, 1000);
 

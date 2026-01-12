@@ -59,6 +59,7 @@ fn test_adverse_buy_markout_increases_toxicity() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 1000;
 
     update_toxicity_and_health(&mut state, &cfg, 1000);
 
@@ -90,6 +91,7 @@ fn test_severe_adverse_markout_disables_venue() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 1000;
 
     update_toxicity_and_health(&mut state, &cfg, 1000);
 
@@ -128,6 +130,7 @@ fn test_favorable_buy_markout_decreases_toxicity() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 1000;
 
     update_toxicity_and_health(&mut state, &cfg, 1000);
 
@@ -164,6 +167,7 @@ fn test_favorable_sell_markout_keeps_toxicity_low() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 1000;
 
     update_toxicity_and_health(&mut state, &cfg, 1000);
 
@@ -198,6 +202,7 @@ fn test_markout_not_applied_before_horizon() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 1000;
 
     // Run at t=500 (before horizon)
     update_toxicity_and_health(&mut state, &cfg, 500);
@@ -234,6 +239,7 @@ fn test_markout_applied_at_exact_horizon() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 1000;
 
     // Run at exactly t=1000
     update_toxicity_and_health(&mut state, &cfg, 1000);
@@ -267,6 +273,7 @@ fn test_markout_applied_after_horizon() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 1000;
 
     // Run at t=2000 (well after horizon)
     update_toxicity_and_health(&mut state, &cfg, 2000);
@@ -384,6 +391,7 @@ fn test_health_status_warning() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 0;
 
     update_toxicity_and_health(&mut state, &cfg, 0);
 
@@ -413,6 +421,7 @@ fn test_health_status_disabled() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 0;
 
     update_toxicity_and_health(&mut state, &cfg, 0);
 
@@ -445,6 +454,7 @@ fn test_adverse_sell_markout() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 1000;
 
     update_toxicity_and_health(&mut state, &cfg, 1000);
 
@@ -482,6 +492,7 @@ fn test_multiple_markouts_ewma_accumulation() {
             mid_at_fill: 100.0,
         });
     }
+    state.venues[0].pending_markouts_next_eval_ms = 0;
 
     update_toxicity_and_health(&mut state, &cfg, 0);
 
@@ -525,6 +536,7 @@ fn test_mixed_markouts_balance_out() {
         fair_at_fill: 98.0,
         mid_at_fill: 98.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 0;
 
     update_toxicity_and_health(&mut state, &cfg, 0);
 
@@ -563,6 +575,7 @@ fn test_markout_ewma_telemetry_updated() {
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
     });
+    state.venues[0].pending_markouts_next_eval_ms = 0;
 
     update_toxicity_and_health(&mut state, &cfg, 0);
 

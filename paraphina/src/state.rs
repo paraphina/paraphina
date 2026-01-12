@@ -74,6 +74,9 @@ pub struct VenueState {
     pub toxicity: f64,
     /// Pending markout evaluations (ring buffer, bounded by config).
     pub pending_markouts: VecDeque<PendingMarkout>,
+    /// Opt17: Cached t_eval_ms of pending_markouts.front() to avoid VecDeque access.
+    /// Invariant: i64::MAX if pending_markouts is empty, else front().unwrap().t_eval_ms.
+    pub pending_markouts_next_eval_ms: TimestampMs,
     /// Running EWMA of markout in USD/TAO for telemetry/debugging.
     pub markout_ewma_usd_per_tao: f64,
 
@@ -277,6 +280,7 @@ impl GlobalState {
                 status: VenueStatus::Healthy,
                 toxicity: 0.0,
                 pending_markouts: VecDeque::new(),
+                pending_markouts_next_eval_ms: i64::MAX,
                 markout_ewma_usd_per_tao: 0.0,
 
                 position_tao: 0.0,
@@ -552,6 +556,12 @@ impl GlobalState {
         while v.pending_markouts.len() > record.max_pending {
             v.pending_markouts.pop_front();
         }
+
+        // Opt17: Refresh cached next eval time after push and any trimming.
+        v.pending_markouts_next_eval_ms = v
+            .pending_markouts
+            .front()
+            .map_or(i64::MAX, |pm| pm.t_eval_ms);
     }
 }
 
