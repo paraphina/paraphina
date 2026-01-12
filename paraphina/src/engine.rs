@@ -159,12 +159,10 @@ impl<'a> Engine<'a> {
         // (or fall back to prev_fair or a constant).
         let kf_uninit = state.kf_last_update_ms == 0 || state.kf_x_hat == 0.0;
 
-        // Compute median mid using scratch buffer (no allocation).
-        let init_mid_median = self.median_mid_from_books(state, now_ms);
-
+        // Opt16: Only compute median when KF needs initialization.
         let mut x_hat = if !kf_uninit {
             state.kf_x_hat
-        } else if let Some(med) = init_mid_median {
+        } else if let Some(med) = self.median_mid_from_books(state, now_ms) {
             med.max(1e-6).ln()
         } else if prev_fair > 0.0 {
             prev_fair.max(1e-6).ln()
