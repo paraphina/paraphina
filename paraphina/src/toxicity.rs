@@ -62,6 +62,12 @@ pub fn update_toxicity_and_health(state: &mut GlobalState, cfg: &Config, now_ms:
 /// - **Lazy mid resolution**: The venue.mid field is only checked/validated once per venue
 ///   per tick, and only after the first ready markout is popped. This avoids hot-path
 ///   overhead when no markouts are ready.
+/// - **Markout tox_instant fastpath** (Opt19): Branchy logic avoids division/clamp when
+///   the result is known: markout >= 0 yields 0, adverse >= scale yields 1, otherwise
+///   a single division suffices (no clamp needed).
+/// - **Vol fallback fastpath** (Opt19): When local_vol <= sigma_eff, f_vol is 0 and we
+///   skip the ratio division entirely. When local_vol > sigma_eff, the raw value is
+///   guaranteed non-negative so only the upper bound (min 1) is applied.
 ///
 /// # Determinism Guarantees
 ///
@@ -146,11 +152,18 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
 
                 // Compute instantaneous toxicity from markout:
                 // - markout >= 0: favorable fill, tox_instant = 0
-                // - markout < 0: adverse fill, tox_instant = clamp(-markout / scale, 0, 1)
+                // - markout < 0: adverse fill, tox_instant in (0, 1]
+                // Opt19: Branchy fastpath avoids division/clamp when result is known.
                 let tox_instant: f64 = if markout >= 0.0 {
                     0.0
                 } else {
-                    ((-markout) / markout_scale).clamp(0.0, 1.0)
+                    let adverse = -markout;
+                    if adverse >= markout_scale {
+                        1.0
+                    } else {
+                        // 0 < adverse < markout_scale, so 0 < result < 1; no clamp needed.
+                        adverse / markout_scale
+                    }
                 };
 
                 // EWMA update: tox = (1 - alpha) * tox + alpha * tox_instant
@@ -177,10 +190,17 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
             // Optionally blend in volatility-based feature for extra signal
             // (only if local vol is significantly elevated)
             let local: f64 = venue.local_vol_short.max(sigma_min);
-            let ratio: f64 = local / sigma_eff;
 
-            let raw: f64 = (ratio - 1.0) / vol_tox_scale;
-            let f_vol: f64 = raw.clamp(0.0, 1.0);
+            // Opt19: Fastpath - if local <= sigma_eff, ratio <= 1, so raw <= 0, so f_vol = 0.
+            // Skip division entirely in this case.
+            let f_vol: f64 = if local <= sigma_eff {
+                0.0
+            } else {
+                let ratio: f64 = local / sigma_eff;
+                let raw: f64 = (ratio - 1.0) / vol_tox_scale;
+                // ratio > 1 implies raw > 0, so only upper bound needed.
+                raw.min(1.0)
+            };
 
             // Take max of current toxicity and vol-based feature
             // This provides a floor when markout data is sparse
@@ -584,6 +604,84 @@ mod tests {
         assert!(
             (state.venues[0].toxicity - 1.0).abs() < 1e-9,
             "Expected toxicity=1.0 (last markout), got {}",
+            state.venues[0].toxicity
+        );
+    }
+
+    /// Test Opt19 vol fallback fastpath: when local_vol <= sigma_eff, f_vol = 0
+    /// and toxicity is not increased by the volatility feature.
+    #[test]
+    fn vol_fallback_local_le_sigma_eff_is_zero() {
+        let mut cfg = make_test_config();
+        // Ensure vol_tox_scale > 0 so the vol fallback branch is active.
+        cfg.toxicity.vol_tox_scale = 0.5;
+        cfg.volatility.sigma_min = 0.001;
+
+        let mut state = GlobalState::new(&cfg);
+
+        // Setup venue with valid mid and depth so it doesn't hit the missing-book fallback.
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.3; // Start with some toxicity
+
+        // Set sigma_eff and local_vol_short such that local <= sigma_eff.
+        state.sigma_eff = 0.2;
+        state.venues[0].local_vol_short = 0.1; // 0.1 <= 0.2
+
+        // No pending markouts, so only the vol fallback path runs.
+        // pending_markouts_next_eval_ms defaults to i64::MAX, so the markout loop is skipped.
+
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        // With local <= sigma_eff, f_vol = 0 (Opt19 fastpath).
+        // toxicity = max(0.3, 0.0) = 0.3 (unchanged).
+        assert!(
+            (state.venues[0].toxicity - 0.3).abs() < 1e-9,
+            "Expected toxicity to remain 0.3 when local_vol <= sigma_eff, got {}",
+            state.venues[0].toxicity
+        );
+    }
+
+    /// Test Opt19 vol fallback: when local_vol > sigma_eff, f_vol > 0
+    /// and toxicity is raised to at least f_vol.
+    #[test]
+    fn vol_fallback_local_gt_sigma_eff_increases_toxicity_floor() {
+        let mut cfg = make_test_config();
+        // Ensure vol_tox_scale > 0 so the vol fallback branch is active.
+        cfg.toxicity.vol_tox_scale = 0.5;
+        cfg.volatility.sigma_min = 0.001;
+
+        let mut state = GlobalState::new(&cfg);
+
+        // Setup venue with valid mid and depth so it doesn't hit the missing-book fallback.
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10000.0;
+        venue.toxicity = 0.1; // Start with low toxicity
+
+        // Set sigma_eff and local_vol_short such that local > sigma_eff.
+        state.sigma_eff = 0.2;
+        state.venues[0].local_vol_short = 0.25; // 0.25 > 0.2
+
+        // No pending markouts, so only the vol fallback path runs.
+
+        // Expected f_vol calculation:
+        // local = max(0.25, 0.001) = 0.25
+        // ratio = 0.25 / 0.2 = 1.25
+        // raw = (1.25 - 1.0) / 0.5 = 0.5
+        // f_vol = min(0.5, 1.0) = 0.5
+        let expected_f_vol = 0.5;
+
+        update_toxicity_and_health(&mut state, &cfg, 1000);
+
+        // toxicity = max(0.1, 0.5) = 0.5
+        assert!(
+            (state.venues[0].toxicity - expected_f_vol).abs() < 1e-9,
+            "Expected toxicity to be raised to {} when local_vol > sigma_eff, got {}",
+            expected_f_vol,
             state.venues[0].toxicity
         );
     }
