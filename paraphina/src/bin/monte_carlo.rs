@@ -552,9 +552,16 @@ fn profile_name(p: RiskProfile) -> &'static str {
     }
 }
 
-/// Apply intents as immediate fills using taker fees.
+/// Apply order intents as immediate fills and return the number of fills applied.
+///
+/// Iterates intents in stable order, applies each valid fill via `apply_perp_fill`,
+/// and returns the count. Used by Opt18 to conditionally skip `recompute_after_fills`
+/// when no fills occurred.
+///
 /// This keeps the harness dependency-free and does not require gateway internals.
-fn apply_intents_as_fills(cfg: &Config, state: &mut GlobalState, intents: &[OrderIntent]) {
+/// Pragmatically treats all fills as taker.
+fn apply_intents_as_fills(cfg: &Config, state: &mut GlobalState, intents: &[OrderIntent]) -> usize {
+    let mut fill_count = 0;
     for it in intents {
         if it.venue_index >= cfg.venues.len() {
             continue;
@@ -570,7 +577,9 @@ fn apply_intents_as_fills(cfg: &Config, state: &mut GlobalState, intents: &[Orde
         // (If you later want maker-vs-taker modeling, switch on it.purpose here.)
         let fee_bps = cfg.venues[it.venue_index].taker_fee_bps;
         state.apply_perp_fill(it.venue_index, it.side, it.size, it.price, fee_bps);
+        fill_count += 1;
     }
+    fill_count
 }
 
 fn update_peaks(
@@ -780,11 +789,16 @@ fn run_once(
             break;
         }
 
-        // MM -> fills -> recompute (using scratch buffers)
+        // MM -> fills -> conditional recompute (using scratch buffers)
         mm::compute_mm_quotes_into_with_scratch(cfg, &state, &mut mm_quotes_buf, &mut mm_scratch);
         mm::mm_quotes_to_order_intents_into(&mm_quotes_buf, &mut mm_intents_buf);
-        apply_intents_as_fills(cfg, &mut state, &mm_intents_buf);
-        state.recompute_after_fills(cfg);
+        let mm_fills = apply_intents_as_fills(cfg, &mut state, &mm_intents_buf);
+        // Opt18: recompute_after_fills is deterministic and pure w.r.t. state.
+        // If no fills occurred since the last recompute (in main_tick), results would be
+        // identical, so skipping is safe and preserves determinism.
+        if mm_fills > 0 {
+            state.recompute_after_fills(cfg);
+        }
         update_peaks(
             &state,
             &mut max_abs_delta,
@@ -793,10 +807,13 @@ fn run_once(
             &mut max_venue_toxicity,
         );
 
-        // Exit -> fills -> recompute (using scratch buffer)
+        // Exit -> fills -> conditional recompute (using scratch buffer)
         exit::compute_exit_intents_into(cfg, &state, now_ms, &mut exit_intents_buf);
-        apply_intents_as_fills(cfg, &mut state, &exit_intents_buf);
-        state.recompute_after_fills(cfg);
+        let exit_fills = apply_intents_as_fills(cfg, &mut state, &exit_intents_buf);
+        // Opt18: Skip recompute if no exit fills applied.
+        if exit_fills > 0 {
+            state.recompute_after_fills(cfg);
+        }
         update_peaks(
             &state,
             &mut max_abs_delta,
@@ -805,10 +822,13 @@ fn run_once(
             &mut max_venue_toxicity,
         );
 
-        // Hedge -> fills -> recompute (using scratch buffer)
+        // Hedge -> fills -> conditional recompute (using scratch buffer)
         hedge::compute_hedge_orders_into(cfg, &state, now_ms, &mut hedge_intents_buf);
-        apply_intents_as_fills(cfg, &mut state, &hedge_intents_buf);
-        state.recompute_after_fills(cfg);
+        let hedge_fills = apply_intents_as_fills(cfg, &mut state, &hedge_intents_buf);
+        // Opt18: Skip recompute if no hedge fills applied.
+        if hedge_fills > 0 {
+            state.recompute_after_fills(cfg);
+        }
         update_peaks(
             &state,
             &mut max_abs_delta,
