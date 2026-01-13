@@ -65,7 +65,7 @@ pub struct ActiveMmOrder {
 }
 
 /// Per-venue target inventory computed each tick.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VenueTargetInventory {
     pub venue_index: usize,
     /// Liquidity weight w_liq_v (from depth proportion).
@@ -165,24 +165,29 @@ pub fn compute_venue_targets(cfg: &Config, state: &GlobalState) -> Vec<VenueTarg
 
 /// Compute per-venue target inventories (buffer-reusing variant).
 ///
-/// Clears `out` and pushes targets into it, reusing capacity.
+/// Opt22A: Uses stable in-place overwrite strategy. On steady-state calls
+/// (when `out.len() == n`), the `resize_with` becomes a no-op and all
+/// writes are direct index assignments with no capacity checks.
+///
 /// Use this in hot paths to avoid per-tick allocations.
 pub fn compute_venue_targets_into(
     cfg: &Config,
     state: &GlobalState,
     out: &mut Vec<VenueTargetInventory>,
 ) {
-    out.clear();
-
     let n = cfg.venues.len();
+
+    // Opt22A: Ensure buffer has exactly n elements. On steady-state calls
+    // (len already == n), this is a no-op. Only the first call allocates.
+    out.resize_with(n, Default::default);
+    debug_assert_eq!(out.len(), n, "Opt22A: resize_with failed to set len == n");
+
     let s_t = state.fair_value.unwrap_or(1.0).max(1.0);
     let s_t_inv = 1.0 / s_t; // Precompute reciprocal for division
 
     // Sum depth across all healthy venues.
     let mut total_depth: f64 = 0.0;
-    for i in 0..n {
-        let vstate = &state.venues[i];
-        let vcfg = &cfg.venues[i];
+    for (vstate, vcfg) in state.venues.iter().zip(cfg.venues.iter()) {
         // Only include healthy venues with valid data.
         if !matches!(vstate.status, VenueStatus::Disabled) && vstate.depth_near_mid > 0.0 {
             // Use depth_near_mid as liquidity proxy.
@@ -207,17 +212,18 @@ pub fn compute_venue_targets_into(
         0.0
     };
 
-    for i in 0..n {
+    // Opt22A: Iterator-based in-place assignment - no index bounds checks.
+    for (i, slot) in out.iter_mut().enumerate() {
         let vstate = &state.venues[i];
         let vcfg = &cfg.venues[i];
 
         // Default: no weight, target = 0.
         if matches!(vstate.status, VenueStatus::Disabled) || total_depth <= 0.0 {
-            out.push(VenueTargetInventory {
+            *slot = VenueTargetInventory {
                 venue_index: i,
                 w_liq: 0.0,
                 q_target: 0.0,
-            });
+            };
             continue;
         }
 
@@ -237,11 +243,11 @@ pub fn compute_venue_targets_into(
         // q_target_v = w_liq_v * q_global + w_fund_v * phi(funding)
         let q_target = w_liq * q_global + vcfg.w_fund * phi_funding;
 
-        out.push(VenueTargetInventory {
+        *slot = VenueTargetInventory {
             venue_index: i,
             w_liq,
             q_target,
-        });
+        };
     }
 }
 
@@ -1951,5 +1957,120 @@ mod tests {
             cap_after_first,
             "Capacity grew after 100 iterations"
         );
+    }
+
+    /// Opt22A: Verify compute_venue_targets_into produces bit-exact results
+    /// regardless of buffer state, and capacity remains stable after warm-up.
+    #[test]
+    fn compute_venue_targets_into_reuse_matches_fresh_alloc_and_capacity_stable() {
+        // Deterministic config + state setup
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        // Set fair value and venue data so the function produces meaningful numbers
+        state.fair_value = Some(100.0);
+        state.fair_value_prev = 100.0;
+        state.q_global_tao = 5.0;
+
+        for (i, v) in state.venues.iter_mut().enumerate() {
+            v.mid = Some(100.0 + i as f64 * 0.1);
+            v.spread = Some(0.5);
+            v.depth_near_mid = 10_000.0 + (i as f64) * 1000.0;
+            v.status = VenueStatus::Healthy;
+            v.funding_8h = 0.001 * (i as f64 - 2.0); // Varying funding rates
+        }
+
+        let n = cfg.venues.len();
+
+        // Run with fresh buffer (starts empty)
+        let mut fresh: Vec<VenueTargetInventory> = Vec::new();
+        compute_venue_targets_into(&cfg, &state, &mut fresh);
+
+        // Run with "dirty" reuse buffer (pre-sized with extra capacity)
+        let mut reuse: Vec<VenueTargetInventory> = Vec::with_capacity(n * 2);
+        // Pre-fill with garbage values to ensure they get overwritten
+        for i in 0..n {
+            reuse.push(VenueTargetInventory {
+                venue_index: 999 - i,
+                w_liq: 999.999,
+                q_target: -999.999,
+            });
+        }
+        let cap_before = reuse.capacity();
+        compute_venue_targets_into(&cfg, &state, &mut reuse);
+
+        // Assert lengths match
+        assert_eq!(fresh.len(), n, "fresh.len() should equal cfg.venues.len()");
+        assert_eq!(reuse.len(), n, "reuse.len() should equal cfg.venues.len()");
+
+        // Compare values bit-exact
+        for i in 0..n {
+            assert_eq!(
+                fresh[i].venue_index, reuse[i].venue_index,
+                "venue_index mismatch at index {i}"
+            );
+            assert_eq!(
+                fresh[i].w_liq.to_bits(),
+                reuse[i].w_liq.to_bits(),
+                "w_liq not bit-exact at index {i}: fresh={} reuse={}",
+                fresh[i].w_liq,
+                reuse[i].w_liq
+            );
+            assert_eq!(
+                fresh[i].q_target.to_bits(),
+                reuse[i].q_target.to_bits(),
+                "q_target not bit-exact at index {i}: fresh={} reuse={}",
+                fresh[i].q_target,
+                reuse[i].q_target
+            );
+        }
+
+        // Record capacity after first call
+        let cap_after_first = reuse.capacity();
+
+        // Capacity should not have grown (was already >= n)
+        assert!(
+            cap_after_first <= cap_before,
+            "Capacity grew unexpectedly: {} -> {}",
+            cap_before,
+            cap_after_first
+        );
+
+        // Run 100 iterations and verify capacity stability
+        for iter in 0..100 {
+            // Vary state slightly each iteration to ensure computation runs
+            state.q_global_tao = 5.0 + (iter as f64) * 0.01;
+
+            compute_venue_targets_into(&cfg, &state, &mut reuse);
+
+            assert_eq!(
+                reuse.capacity(),
+                cap_after_first,
+                "Capacity changed at iteration {iter}: {} -> {}",
+                cap_after_first,
+                reuse.capacity()
+            );
+            assert_eq!(
+                reuse.len(),
+                n,
+                "Length changed at iteration {iter}: expected {n}, got {}",
+                reuse.len()
+            );
+        }
+
+        // Final bit-exact check: run fresh again with updated state and compare
+        compute_venue_targets_into(&cfg, &state, &mut fresh);
+        for i in 0..n {
+            assert_eq!(
+                fresh[i].w_liq.to_bits(),
+                reuse[i].w_liq.to_bits(),
+                "Final w_liq not bit-exact at index {i}"
+            );
+            assert_eq!(
+                fresh[i].q_target.to_bits(),
+                reuse[i].q_target.to_bits(),
+                "Final q_target not bit-exact at index {i}"
+            );
+        }
     }
 }
