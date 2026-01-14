@@ -412,6 +412,17 @@ fn compute_mm_quotes_impl<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
     compute_mm_quotes_impl_with_scratch::<DISABLE_FV, DISABLE_TOX>(cfg, state, out, &mut scratch)
 }
 
+/// Opt23: Clear bid/ask levels without touching venue_id (stable slots).
+///
+/// Called before early returns to ensure stale quotes cannot leak.
+#[inline]
+fn clear_mm_quote_levels(out: &mut [MmQuote]) {
+    for q in out {
+        q.bid = None;
+        q.ask = None;
+    }
+}
+
 /// Core MM quoting implementation with scratch buffer reuse.
 ///
 /// Same as `compute_mm_quotes_impl` but reuses the provided scratch buffer
@@ -440,19 +451,15 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
                 ask: None,
             });
         }
-    } else {
-        // Reset bid/ask to None without dropping/recreating venue_id.
-        for q in out.iter_mut() {
-            q.bid = None;
-            q.ask = None;
-        }
     }
+    // Opt23: No unconditional reset loop here. We clear only on early returns
+    // or for disabled venues. The per-venue loop overwrites active slots.
 
     // If we don't have a fair value yet, we can't quote meaningfully.
-    // Slots already have bid/ask = None, so just return.
     let s_t = match state.fair_value {
         Some(v) => v,
         None => {
+            clear_mm_quote_levels(out);
             return;
         }
     };
@@ -469,14 +476,14 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
 
     // Kill switch OR HardLimit => return no quotes.
     // Spec: HardLimit is "structurally unsafe", so MM must fully stop.
-    // Slots already have bid/ask = None, so just return.
     if state.kill_switch || matches!(risk_regime, RiskRegime::HardLimit) {
+        clear_mm_quote_levels(out);
         return;
     }
 
     // If volatility or size_mult are degenerate, don't quote.
-    // Slots already have bid/ask = None, so just return.
     if sigma_eff <= 0.0 || size_mult <= 0.0 {
+        clear_mm_quote_levels(out);
         return;
     }
 
@@ -537,8 +544,10 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
         let vstate = &state.venues[i];
         let target = &scratch.venue_targets[i];
 
-        // Disabled venue => no quotes (bid/ask already None from reset).
+        // Disabled venue => no quotes. Opt23: Explicitly clear since no pre-loop reset.
         if matches!(vstate.status, VenueStatus::Disabled) {
+            out[i].bid = None;
+            out[i].ask = None;
             continue;
         }
 
@@ -2072,5 +2081,133 @@ mod tests {
                 "Final q_target not bit-exact at index {i}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Opt23: Tests for "no stale quotes" on early returns and disabled venues
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn mm_quotes_cleared_when_no_fair_value() {
+        let (cfg, mut state) = setup_test();
+        let n = cfg.venues.len();
+
+        // Initialize output buffer with correct length (simulating warm path).
+        let mut out: Vec<MmQuote> = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(MmQuote {
+                venue_index: i,
+                venue_id: cfg.venues[i].id_arc.clone(),
+                bid: None,
+                ask: None,
+            });
+        }
+
+        // First, run with valid fair_value to populate quotes.
+        let mut scratch = MmScratch::new();
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+
+        // Verify we have some quotes after valid run.
+        let has_quotes = out.iter().any(|q| q.bid.is_some() || q.ask.is_some());
+        assert!(has_quotes, "Should have quotes with valid state");
+
+        // Now set fair_value to None and call again.
+        state.fair_value = None;
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+
+        // All bids/asks must be None (Opt23: no stale quotes leak).
+        for (i, q) in out.iter().enumerate() {
+            assert!(
+                q.bid.is_none(),
+                "Venue {i}: bid should be None when fair_value is None"
+            );
+            assert!(
+                q.ask.is_none(),
+                "Venue {i}: ask should be None when fair_value is None"
+            );
+        }
+    }
+
+    #[test]
+    fn mm_quotes_cleared_on_kill_switch() {
+        let (cfg, mut state) = setup_test();
+        let n = cfg.venues.len();
+
+        // Initialize output buffer with correct length (simulating warm path).
+        let mut out: Vec<MmQuote> = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(MmQuote {
+                venue_index: i,
+                venue_id: cfg.venues[i].id_arc.clone(),
+                bid: None,
+                ask: None,
+            });
+        }
+
+        // First, run with valid state to populate quotes.
+        let mut scratch = MmScratch::new();
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+
+        // Verify we have some quotes after valid run.
+        let has_quotes = out.iter().any(|q| q.bid.is_some() || q.ask.is_some());
+        assert!(has_quotes, "Should have quotes with valid state");
+
+        // Now set kill_switch and call again.
+        state.kill_switch = true;
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+
+        // All bids/asks must be None (Opt23: no stale quotes leak).
+        for (i, q) in out.iter().enumerate() {
+            assert!(
+                q.bid.is_none(),
+                "Venue {i}: bid should be None when kill_switch is active"
+            );
+            assert!(
+                q.ask.is_none(),
+                "Venue {i}: ask should be None when kill_switch is active"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_venue_clears_stale_quote() {
+        let (cfg, mut state) = setup_test();
+        let n = cfg.venues.len();
+
+        // Initialize output buffer with correct length (simulating warm path).
+        let mut out: Vec<MmQuote> = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(MmQuote {
+                venue_index: i,
+                venue_id: cfg.venues[i].id_arc.clone(),
+                bid: None,
+                ask: None,
+            });
+        }
+
+        // First, run with all venues healthy to populate quotes.
+        let mut scratch = MmScratch::new();
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+
+        // Verify venue 0 has quotes after valid run.
+        assert!(
+            out[0].bid.is_some() || out[0].ask.is_some(),
+            "Venue 0 should have quotes when healthy"
+        );
+
+        // Now disable venue 0 and call again.
+        state.venues[0].status = VenueStatus::Disabled;
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+
+        // Venue 0 must have bid/ask cleared (Opt23: no stale quotes leak).
+        assert!(out[0].bid.is_none(), "Disabled venue 0: bid should be None");
+        assert!(out[0].ask.is_none(), "Disabled venue 0: ask should be None");
+
+        // Other venues should still have quotes.
+        let other_has_quotes = out[1..].iter().any(|q| q.bid.is_some() || q.ask.is_some());
+        assert!(
+            other_has_quotes,
+            "Other venues should still have quotes after disabling venue 0"
+        );
     }
 }
