@@ -4520,6 +4520,8 @@ hard limits, risk regime escalates.
 
 ### 14.3 Risk regimes 
 
+> **Terminology note:** This specification uses "Critical" for the circuit-breaker regime. In the Rust implementation (`paraphina/src/state.rs`), this maps to `RiskRegime::HardLimit`. The behavior is identical; only the naming differs.
+
   
 
 - **Normal**: 

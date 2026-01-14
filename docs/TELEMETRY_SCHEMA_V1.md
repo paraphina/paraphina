@@ -41,6 +41,14 @@ Every telemetry record **MUST** include:
 
 The `schema_version` field is a required integer that identifies the schema contract in use. Consumers MUST check this field and fail fast if they encounter an unexpected version.
 
+### Producer Responsibility
+
+The `TelemetrySink` in `paraphina/src/telemetry.rs` is a **generic JSONL writer** and does **not** auto-inject `schema_version`. Producers (callers of `log_json`) are responsible for including `"schema_version": 1` in each record.
+
+For reference implementations, see:
+- `paraphina/src/strategy.rs` — per-tick telemetry with all required fields
+- Helper: `ensure_schema_v1()` in `telemetry.rs` to validate/insert schema version
+
 ---
 
 # Per-Tick Telemetry Schema (`telemetry.jsonl`)

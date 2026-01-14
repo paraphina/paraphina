@@ -16,6 +16,15 @@
 //! - `PARAPHINA_TELEMETRY_PATH`: Path to the JSONL file. Required when
 //!   mode is `"jsonl"`.
 //!
+//! # Schema Version Contract
+//!
+//! **Important:** This module is a generic JSONL writer and does **not**
+//! auto-inject `schema_version`. Producers are responsible for including
+//! `"schema_version": 1` in each record per the telemetry contract
+//! (`docs/TELEMETRY_SCHEMA_V1.md`).
+//!
+//! Use [`ensure_schema_v1`] to validate/insert schema version on records.
+//!
 //! # Usage (conceptual)
 //!
 //! In your main / engine loop, once per tick:
@@ -29,16 +38,14 @@
 //!
 //!     // inside tick loop:
 //!     telemetry.log_json(&json!({
+//!         "schema_version": 1,  // REQUIRED by telemetry contract
 //!         "t": tick_index,
-//!         "fair": global_state.fair_value,
-//!         "sigma_eff": global_state.sigma_eff,
-//!         "inventory_tao": global_state.inventory_tao,
-//!         "basis_usd": global_state.basis_usd,
 //!         "pnl_realised": global_state.pnl_realised,
 //!         "pnl_unrealised": global_state.pnl_unrealised,
 //!         "pnl_total": global_state.pnl_total(),
 //!         "risk_regime": format!("{:?}", global_state.risk_regime),
 //!         "kill_switch": global_state.kill_switch,
+//!         // ... other required fields per docs/TELEMETRY_SCHEMA_V1.md
 //!     }));
 //!
 //!     Ok(())
@@ -55,6 +62,50 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use serde_json::{self, Value as JsonValue};
+
+/// Current telemetry schema version.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// Ensure a JSON record has `schema_version: 1`.
+///
+/// This is a non-breaking helper to reduce mistakes when producing telemetry.
+/// It is **not** automatically called by `TelemetrySink::log_json` to preserve
+/// backwards compatibility and avoid overhead in hot paths.
+///
+/// # Behavior
+///
+/// - If `record` is a JSON Object:
+///   - If `schema_version` is missing, inserts `"schema_version": 1`.
+///   - If `schema_version` exists, leaves it unchanged.
+/// - If `record` is not a JSON Object:
+///   - In debug builds, panics with an assertion.
+///   - In release builds, returns without modification.
+///
+/// # Example
+///
+/// ```ignore
+/// use serde_json::json;
+/// use paraphina::telemetry::ensure_schema_v1;
+///
+/// let mut record = json!({"t": 0, "pnl_total": 100.0});
+/// ensure_schema_v1(&mut record);
+/// assert_eq!(record["schema_version"], 1);
+/// ```
+pub fn ensure_schema_v1(record: &mut JsonValue) {
+    match record {
+        JsonValue::Object(map) => {
+            map.entry("schema_version")
+                .or_insert_with(|| JsonValue::Number(SCHEMA_VERSION.into()));
+        }
+        _ => {
+            debug_assert!(
+                false,
+                "ensure_schema_v1: telemetry records should be JSON objects, got {:?}",
+                record
+            );
+        }
+    }
+}
 
 /// Telemetry mode, controlled by PARAPHINA_TELEMETRY_MODE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,5 +279,46 @@ impl TelemetrySink {
 impl Drop for TelemetrySink {
     fn drop(&mut self) {
         self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ensure_schema_v1_inserts_when_missing() {
+        let mut record = json!({"t": 0, "pnl_total": 100.0});
+        ensure_schema_v1(&mut record);
+        assert_eq!(record["schema_version"], 1);
+        // Other fields preserved
+        assert_eq!(record["t"], 0);
+        assert_eq!(record["pnl_total"], 100.0);
+    }
+
+    #[test]
+    fn ensure_schema_v1_preserves_existing() {
+        let mut record = json!({"schema_version": 1, "t": 5});
+        ensure_schema_v1(&mut record);
+        assert_eq!(record["schema_version"], 1);
+        assert_eq!(record["t"], 5);
+    }
+
+    #[test]
+    fn ensure_schema_v1_does_not_overwrite_version() {
+        // Even if someone puts a different version, we don't overwrite
+        let mut record = json!({"schema_version": 2, "t": 0});
+        ensure_schema_v1(&mut record);
+        // Existing value preserved (we only insert if missing)
+        assert_eq!(record["schema_version"], 2);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "telemetry records should be JSON objects")]
+    fn ensure_schema_v1_panics_on_non_object_debug() {
+        let mut record = json!([1, 2, 3]);
+        ensure_schema_v1(&mut record);
     }
 }
