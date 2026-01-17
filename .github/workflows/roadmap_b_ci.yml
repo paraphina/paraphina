@@ -1,0 +1,54 @@
+name: roadmap-b-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pr-gate:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo test (all)
+        run: cargo test --all
+      - name: Cargo test (live)
+        working-directory: paraphina
+        run: cargo test -p paraphina --features live
+      - name: Fixture-driven roadmap_b_fixture
+        working-directory: paraphina
+        run: cargo test -p paraphina --features live,live_hyperliquid roadmap_b_fixture
+      - name: Python tests
+        run: python3 -m pytest -q
+
+  nightly-matrix:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "live,live_hyperliquid"
+          - "live,live_lighter"
+          - "live,live_paradex"
+          - "live,live_aster"
+          - "live,live_extended"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo test (all)
+        run: cargo test --all
+      - name: Cargo test (connector matrix)
+        working-directory: paraphina
+        run: cargo test -p paraphina --features ${{ matrix.features }}

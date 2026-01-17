@@ -5,8 +5,11 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
+use serde::Deserialize;
+use std::path::PathBuf;
 use paraphina::config::{resolve_effective_profile, Config};
 use paraphina::live::ops::{
     default_audit_dir, format_startup_log, start_metrics_server, EnvSecretProvider,
@@ -17,6 +20,7 @@ use paraphina::live::orderbook_l2::BookLevel;
 use paraphina::live::runner::{run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRuntimeHooks};
 use paraphina::io::GatewayPolicy;
 use paraphina::live::gateway::{LiveGateway, LiveRestClient};
+use paraphina::live::paper_adapter::{PaperExecutionAdapter, PaperFillMode, PaperMarketUpdate};
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
 use paraphina::live::types::L2Snapshot;
@@ -44,7 +48,7 @@ impl From<TradeModeArg> for TradeMode {
     }
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 enum ConnectorArg {
     Mock,
     Hyperliquid,
@@ -128,6 +132,15 @@ struct Args {
     /// Connector to use: mock (default), hyperliquid, hyperliquid_fixture, lighter, extended, aster, paradex.
     #[arg(long, value_enum)]
     connector: Option<ConnectorArg>,
+    /// Explicitly allow live execution (only applies to trade-mode=live).
+    #[arg(long)]
+    enable_live_execution: bool,
+    /// Canary profile name or path (required for trade-mode=live).
+    #[arg(long)]
+    canary_profile: Option<String>,
+    /// Run configuration checks and exit with PASS/FAIL status.
+    #[arg(long)]
+    preflight: bool,
     /// Output directory for telemetry/audit artifacts.
     #[arg(long)]
     out_dir: Option<String>,
@@ -165,6 +178,169 @@ fn resolve_out_dir(cli: Option<String>) -> Option<std::path::PathBuf> {
     None
 }
 
+#[derive(Debug, Deserialize)]
+struct CanaryVenueConfig {
+    base_order_size: Option<f64>,
+    max_order_size: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanaryLimitsConfig {
+    max_position_tao: Option<f64>,
+    max_open_orders: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanaryRateLimitConfig {
+    enabled: Option<bool>,
+    rps: Option<f64>,
+    burst: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanaryEnforcementConfig {
+    post_only: Option<bool>,
+    reduce_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanaryKillConfig {
+    stale_max_ticks: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanaryConfig {
+    venue: Option<CanaryVenueConfig>,
+    limits: Option<CanaryLimitsConfig>,
+    rate_limit: Option<CanaryRateLimitConfig>,
+    enforcement: Option<CanaryEnforcementConfig>,
+    kill: Option<CanaryKillConfig>,
+}
+
+#[derive(Debug, Default)]
+struct CanarySettings {
+    max_position_tao: Option<f64>,
+    max_open_orders: Option<usize>,
+    stale_max_ticks: Option<u64>,
+    enforce_post_only: bool,
+    enforce_reduce_only: bool,
+    rate_limit_enabled: Option<bool>,
+    rate_limit_rps: Option<f64>,
+    rate_limit_burst: Option<u32>,
+}
+
+fn resolve_canary_profile(cli: Option<String>) -> Option<PathBuf> {
+    let val = cli.or_else(|| std::env::var("PARAPHINA_LIVE_CANARY_PROFILE").ok())?;
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "prod_canary" {
+        return Some(PathBuf::from("configs").join("prod_canary.toml"));
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn load_canary_config(path: &PathBuf) -> Result<CanaryConfig, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|err| format!("canary_profile_read_error path={} err={}", path.display(), err))?;
+    toml::from_str::<CanaryConfig>(&raw)
+        .map_err(|err| format!("canary_profile_parse_error path={} err={}", path.display(), err))
+}
+
+fn apply_canary_config(cfg: &mut Config, canary: &CanaryConfig) -> CanarySettings {
+    let mut settings = CanarySettings::default();
+    if let Some(venue) = &canary.venue {
+        for v in &mut cfg.venues {
+            if let Some(size) = venue.base_order_size {
+                v.base_order_size = size.max(0.0);
+            }
+            if let Some(size) = venue.max_order_size {
+                v.max_order_size = size.max(0.0);
+            }
+        }
+    }
+    if let Some(limits) = &canary.limits {
+        settings.max_position_tao = limits.max_position_tao;
+        settings.max_open_orders = limits.max_open_orders;
+    }
+    if let Some(rate) = &canary.rate_limit {
+        settings.rate_limit_enabled = rate.enabled;
+        settings.rate_limit_rps = rate.rps;
+        settings.rate_limit_burst = rate.burst;
+    }
+    if let Some(enforce) = &canary.enforcement {
+        settings.enforce_post_only = enforce.post_only.unwrap_or(false);
+        settings.enforce_reduce_only = enforce.reduce_only.unwrap_or(false);
+    }
+    if let Some(kill) = &canary.kill {
+        settings.stale_max_ticks = kill.stale_max_ticks;
+    }
+    settings
+}
+
+fn apply_canary_env(settings: &CanarySettings) {
+    std::env::set_var("PARAPHINA_CANARY_MODE", "1");
+    if let Some(val) = settings.max_position_tao {
+        std::env::set_var("PARAPHINA_CANARY_MAX_POSITION_TAO", val.to_string());
+    }
+    if let Some(val) = settings.max_open_orders {
+        std::env::set_var("PARAPHINA_CANARY_MAX_OPEN_ORDERS", val.to_string());
+    }
+    if let Some(val) = settings.stale_max_ticks {
+        std::env::set_var("PARAPHINA_CANARY_STALE_MAX_TICKS", val.to_string());
+    }
+    std::env::set_var(
+        "PARAPHINA_CANARY_ENFORCE_POST_ONLY",
+        if settings.enforce_post_only { "1" } else { "0" },
+    );
+    std::env::set_var(
+        "PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY",
+        if settings.enforce_reduce_only { "1" } else { "0" },
+    );
+    if let Some(val) = settings.rate_limit_enabled {
+        std::env::set_var("PARAPHINA_RATE_LIMIT_ENABLED", if val { "1" } else { "0" });
+    }
+    if let Some(val) = settings.rate_limit_rps {
+        std::env::set_var("PARAPHINA_RATE_LIMIT_RPS", val.to_string());
+    }
+    if let Some(val) = settings.rate_limit_burst {
+        std::env::set_var("PARAPHINA_RATE_LIMIT_BURST", val.to_string());
+    }
+}
+
+fn resolve_canary_settings(
+    trade_mode: TradeMode,
+    cfg: &mut Config,
+    canary_profile: Option<&PathBuf>,
+    apply_env: bool,
+) -> Result<Option<CanarySettings>, String> {
+    if trade_mode != TradeMode::Live {
+        return Ok(None);
+    }
+    let Some(path) = canary_profile else {
+        return Err("canary profile not set".to_string());
+    };
+    let canary = load_canary_config(path)?;
+    let settings = apply_canary_config(cfg, &canary);
+    if apply_env {
+        apply_canary_env(&settings);
+    }
+    Ok(Some(settings))
+}
+
+fn resolve_telemetry_path(out_dir: Option<&std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let mut telemetry_path = std::env::var("PARAPHINA_TELEMETRY_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+    if telemetry_path.is_none() {
+        if let Some(out_dir) = out_dir {
+            telemetry_path = Some(out_dir.join("telemetry.jsonl"));
+        }
+    }
+    telemetry_path
+}
+
 fn enforce_roadmap_b_gate() {
     if !roadmap_b_enabled() {
         return;
@@ -185,18 +361,383 @@ fn enforce_roadmap_b_gate() {
     }
 }
 
+fn env_is_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
+
+fn env_is_yes(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v.trim().eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
+
+fn env_present(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn live_connector_supported(connector: ConnectorArg) -> bool {
+    match connector {
+        ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => cfg!(feature = "live_hyperliquid"),
+        ConnectorArg::Lighter => cfg!(feature = "live_lighter"),
+        ConnectorArg::Mock => true,
+        ConnectorArg::Extended | ConnectorArg::Aster | ConnectorArg::Paradex => false,
+    }
+}
+
+fn live_connector_allowed_for_live_mode(connector: ConnectorArg) -> bool {
+    matches!(connector, ConnectorArg::Hyperliquid | ConnectorArg::Lighter)
+}
+
+fn paper_market_update_from_event(
+    event: &paraphina::live::types::MarketDataEvent,
+) -> Option<PaperMarketUpdate> {
+    match event {
+        paraphina::live::types::MarketDataEvent::L2Snapshot(snapshot) => {
+            let best_bid = snapshot.bids.first().map(|level| level.price);
+            let best_ask = snapshot.asks.first().map(|level| level.price);
+            Some(PaperMarketUpdate {
+                venue_index: snapshot.venue_index,
+                best_bid,
+                best_ask,
+                timestamp_ms: snapshot.timestamp_ms,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn override_market_timestamp(
+    event: paraphina::live::types::MarketDataEvent,
+    timestamp_ms: i64,
+) -> paraphina::live::types::MarketDataEvent {
+    match event {
+        paraphina::live::types::MarketDataEvent::L2Snapshot(mut snapshot) => {
+            snapshot.timestamp_ms = timestamp_ms;
+            paraphina::live::types::MarketDataEvent::L2Snapshot(snapshot)
+        }
+        paraphina::live::types::MarketDataEvent::L2Delta(mut delta) => {
+            delta.timestamp_ms = timestamp_ms;
+            paraphina::live::types::MarketDataEvent::L2Delta(delta)
+        }
+        paraphina::live::types::MarketDataEvent::Trade(mut trade) => {
+            trade.timestamp_ms = timestamp_ms;
+            paraphina::live::types::MarketDataEvent::Trade(trade)
+        }
+        paraphina::live::types::MarketDataEvent::FundingUpdate(mut update) => {
+            update.timestamp_ms = timestamp_ms;
+            paraphina::live::types::MarketDataEvent::FundingUpdate(update)
+        }
+    }
+}
+
+fn enforce_live_execution_guardrails(
+    args: &Args,
+    trade_mode: TradeMode,
+    connector: ConnectorArg,
+    canary_profile: Option<&PathBuf>,
+    canary_settings: Option<&CanarySettings>,
+) {
+    if trade_mode != TradeMode::Live {
+        return;
+    }
+
+    let exec_enable_env = env_is_true("PARAPHINA_LIVE_EXEC_ENABLE");
+    let exec_confirm_env = env_is_yes("PARAPHINA_LIVE_EXECUTION_CONFIRM");
+    let live_flag = args.enable_live_execution;
+
+    if !live_connector_allowed_for_live_mode(connector) {
+        eprintln!(
+            "paraphina_live | error=live_mode_connector_invalid connector={} (use --trade-mode shadow for safe runs)",
+            connector.as_str()
+        );
+        std::process::exit(2);
+    }
+
+    let preflight_ok = env_is_true("PARAPHINA_LIVE_PREFLIGHT_OK");
+    if !preflight_ok {
+        eprintln!(
+            "paraphina_live | error=live_mode_preflight_missing (set PARAPHINA_LIVE_PREFLIGHT_OK=1 after preflight)"
+        );
+        std::process::exit(2);
+    }
+    let reconcile_enabled = std::env::var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v > 0)
+        .unwrap_or(false);
+    if !reconcile_enabled {
+        eprintln!(
+            "paraphina_live | error=live_mode_reconcile_missing (set PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS)"
+        );
+        std::process::exit(2);
+    }
+    if canary_profile.is_none() {
+        eprintln!(
+            "paraphina_live | error=live_mode_canary_profile_missing (set --canary-profile or PARAPHINA_LIVE_CANARY_PROFILE)"
+        );
+        std::process::exit(2);
+    }
+    if let Some(settings) = canary_settings {
+        if settings.max_position_tao.is_none() || settings.max_open_orders.is_none() {
+            eprintln!(
+                "paraphina_live | error=live_mode_canary_caps_missing (max_position_tao and max_open_orders required)"
+            );
+            std::process::exit(2);
+        }
+    }
+    if !live_flag || !exec_enable_env || !exec_confirm_env {
+        eprintln!(
+            "paraphina_live | error=live_mode_guardrails_missing enable_flag={} exec_env={} confirm_env={} (use --trade-mode shadow for safe runs)",
+            live_flag, exec_enable_env, exec_confirm_env
+        );
+        std::process::exit(2);
+    }
+}
+
+struct PreflightCheck {
+    label: &'static str,
+    ok: bool,
+    details: String,
+}
+
+fn run_preflight(
+    args: &Args,
+    trade_mode: TradeMode,
+    connector: ConnectorArg,
+    out_dir: Option<std::path::PathBuf>,
+    canary_error: Option<&str>,
+    canary_settings: Option<&CanarySettings>,
+) -> bool {
+    let mut checks: Vec<PreflightCheck> = Vec::new();
+
+    let trade_mode_detail = format!("selected={}", trade_mode.as_str());
+    checks.push(PreflightCheck {
+        label: "trade_mode",
+        ok: true,
+        details: trade_mode_detail,
+    });
+
+    let connector_ok = live_connector_supported(connector);
+    let connector_detail = format!("selected={} supported={}", connector.as_str(), connector_ok);
+    checks.push(PreflightCheck {
+        label: "connector",
+        ok: connector_ok,
+        details: connector_detail,
+    });
+
+    if trade_mode == TradeMode::Live {
+        let canary_ok = canary_error.is_none()
+            && canary_settings
+                .map(|settings| {
+                    settings.max_position_tao.is_some() && settings.max_open_orders.is_some()
+                })
+                .unwrap_or(false);
+        checks.push(PreflightCheck {
+            label: "canary_profile",
+            ok: canary_ok,
+            details: canary_error.unwrap_or("loaded").to_string(),
+        });
+        let reconcile_ok = std::env::var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|v| v > 0)
+            .unwrap_or(false);
+        checks.push(PreflightCheck {
+            label: "reconciliation",
+            ok: reconcile_ok,
+            details: if reconcile_ok { "enabled" } else { "missing" }.to_string(),
+        });
+    }
+
+    let audit_dir = out_dir.clone().unwrap_or_else(default_audit_dir);
+    let out_dir_ok = std::fs::create_dir_all(&audit_dir).is_ok()
+        && std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(audit_dir.join(".preflight_write_test"))
+            .is_ok();
+    let _ = std::fs::remove_file(audit_dir.join(".preflight_write_test"));
+    checks.push(PreflightCheck {
+        label: "out_dir",
+        ok: out_dir_ok,
+        details: format!("path={}", audit_dir.display()),
+    });
+
+    let telemetry_path = resolve_telemetry_path(out_dir.as_ref());
+    let telemetry_mode = TelemetryMode::from_env();
+    let telemetry_ok = match telemetry_mode {
+        TelemetryMode::Off => true,
+        TelemetryMode::Jsonl => telemetry_path.as_ref().is_some_and(|path| {
+            path.parent().map(|p| std::fs::create_dir_all(p).is_ok()).unwrap_or(true)
+                && std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(path)
+                    .is_ok()
+        }),
+    };
+    checks.push(PreflightCheck {
+        label: "telemetry",
+        ok: telemetry_ok,
+        details: match telemetry_mode {
+            TelemetryMode::Off => "mode=off".to_string(),
+            TelemetryMode::Jsonl => format!(
+                "mode=jsonl path={}",
+                telemetry_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<missing>".to_string())
+            ),
+        },
+    });
+
+    let mut creds_ok = true;
+    let mut creds_detail = String::new();
+    match connector {
+        ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => {
+            let key_present = env_present("HL_PRIVATE_KEY");
+            let vault_present = env_present("HL_VAULT_ADDRESS");
+            if trade_mode == TradeMode::Live {
+                creds_ok = key_present && vault_present;
+            }
+            creds_detail = format!(
+                "hl_private_key={} hl_vault_address={}",
+                key_present, vault_present
+            );
+            if connector == ConnectorArg::HyperliquidFixture {
+                let fixture_dir = std::env::var("HL_FIXTURE_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("./tests/fixtures/hyperliquid"));
+                let fixture_ok = fixture_dir.is_dir();
+                creds_ok = creds_ok && fixture_ok;
+                creds_detail.push_str(&format!(" fixture_dir_ok={}", fixture_ok));
+            }
+        }
+        ConnectorArg::Lighter => {
+            creds_ok = true;
+            creds_detail = "no_key_required=true".to_string();
+        }
+        ConnectorArg::Mock | ConnectorArg::Extended | ConnectorArg::Aster | ConnectorArg::Paradex => {
+            creds_ok = trade_mode != TradeMode::Live;
+            creds_detail = "no_live_keys".to_string();
+        }
+    }
+    checks.push(PreflightCheck {
+        label: "credentials",
+        ok: creds_ok,
+        details: creds_detail,
+    });
+
+    let live_guard_ok = if trade_mode == TradeMode::Live {
+        live_connector_allowed_for_live_mode(connector)
+            && args.enable_live_execution
+            && env_is_true("PARAPHINA_LIVE_EXEC_ENABLE")
+            && env_is_yes("PARAPHINA_LIVE_EXECUTION_CONFIRM")
+    } else {
+        true
+    };
+    checks.push(PreflightCheck {
+        label: "live_guardrails",
+        ok: live_guard_ok,
+        details: if trade_mode == TradeMode::Live {
+            format!(
+                "enable_flag={} exec_env={} confirm_env={}",
+                args.enable_live_execution,
+                env_is_true("PARAPHINA_LIVE_EXEC_ENABLE"),
+                env_is_yes("PARAPHINA_LIVE_EXECUTION_CONFIRM")
+            )
+        } else {
+            "not_required".to_string()
+        },
+    });
+
+    println!("paraphina_live preflight:");
+    let mut failed = false;
+    for check in &checks {
+        let status = if check.ok { "PASS" } else { "FAIL" };
+        println!("- {} {} {}", status, check.label, check.details);
+        if !check.ok {
+            failed = true;
+        }
+    }
+    !failed
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     enforce_roadmap_b_gate();
     let effective = resolve_effective_profile(None, None);
     effective.log_startup();
-    let cfg = Config::from_env_or_profile(effective.profile);
+    let mut cfg = Config::from_env_or_profile(effective.profile);
     let build_info = paraphina::BuildInfo::capture();
     let trade_mode = resolve_effective_trade_mode(args.trade_mode.map(TradeMode::from));
     trade_mode.log_startup();
     let connector = resolve_connector(args.connector);
-    let out_dir = resolve_out_dir(args.out_dir);
+    let out_dir = resolve_out_dir(args.out_dir.clone());
+    let paper_mode = trade_mode.trade_mode == TradeMode::Paper;
+    let paper_route_sandbox = env_is_true("PARAPHINA_PAPER_ROUTE_SANDBOX");
+    let canary_profile = resolve_canary_profile(args.canary_profile.clone());
+    let mut canary_error: Option<String> = None;
+    let mut canary_settings: Option<CanarySettings> = None;
+    match resolve_canary_settings(
+        trade_mode.trade_mode,
+        &mut cfg,
+        canary_profile.as_ref(),
+        !args.preflight,
+    ) {
+        Ok(settings) => {
+            canary_settings = settings;
+        }
+        Err(err) => {
+            canary_error = Some(err.clone());
+            if !args.preflight && trade_mode.trade_mode == TradeMode::Live {
+                eprintln!("paraphina_live | error=canary_profile_load_failed {err}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if paper_mode {
+        if let Ok(raw) = std::env::var("PARAPHINA_PAPER_MIN_HEALTHY_FOR_KF") {
+            if let Ok(val) = raw.parse::<u32>() {
+                let clamped = val.max(1);
+                cfg.book.min_healthy_for_kf = clamped;
+                eprintln!(
+                    "paraphina_live | paper_mode_min_healthy_for_kf_override={}",
+                    clamped
+                );
+            }
+        }
+    }
+    if args.preflight {
+        let ok = run_preflight(
+            &args,
+            trade_mode.trade_mode,
+            connector,
+            out_dir.clone(),
+            canary_error.as_deref(),
+            canary_settings.as_ref(),
+        );
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    enforce_live_execution_guardrails(
+        &args,
+        trade_mode.trade_mode,
+        connector,
+        canary_profile.as_ref(),
+        canary_settings.as_ref(),
+    );
     let metrics_addr = std::env::var("PARAPHINA_LIVE_METRICS_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9898".to_string());
     let startup_log = format_startup_log(
@@ -236,9 +777,29 @@ async fn main() {
         // Secret provider is wired for future use.
     }
 
+    let (market_ingest_tx, mut market_ingest_rx) =
+        mpsc::channel::<paraphina::live::types::MarketDataEvent>(1024);
     let (market_tx, market_rx) = mpsc::channel::<paraphina::live::types::MarketDataEvent>(1024);
+    let (paper_market_tx, paper_market_rx) = mpsc::channel::<PaperMarketUpdate>(1024);
+    let paper_market_tx = if paper_mode { Some(paper_market_tx) } else { None };
+    let override_market_ts = paper_mode && env_is_true("PARAPHINA_PAPER_USE_WALLCLOCK_TS");
+    tokio::spawn(async move {
+        while let Some(event) = market_ingest_rx.recv().await {
+            let event = if override_market_ts {
+                override_market_timestamp(event, now_ms())
+            } else {
+                event
+            };
+            if let Some(tx) = paper_market_tx.as_ref() {
+                if let Some(update) = paper_market_update_from_event(&event) {
+                    let _ = tx.send(update).await;
+                }
+            }
+            let _ = market_tx.send(event).await;
+        }
+    });
     let (_account_tx, account_rx) = mpsc::channel::<paraphina::live::types::AccountEvent>(256);
-    let (_exec_tx, exec_rx) = mpsc::channel::<paraphina::live::types::ExecutionEvent>(512);
+    let (exec_tx, exec_rx) = mpsc::channel::<paraphina::live::types::ExecutionEvent>(512);
     let (_order_snapshot_tx, order_snapshot_rx) =
         mpsc::channel::<paraphina::live::types::OrderSnapshot>(128);
 
@@ -258,7 +819,7 @@ async fn main() {
     let (order_tx, mut order_rx) = mpsc::channel::<LiveOrderRequest>(256);
 
     if matches!(connector, ConnectorArg::Mock) {
-        let market_tx_clone = market_tx.clone();
+        let market_tx_clone = market_ingest_tx.clone();
         tokio::spawn(async move {
             let mut seq: u64 = 0;
             let mut mid = 100.0;
@@ -290,9 +851,10 @@ async fn main() {
         });
     }
 
-    let exec_enabled = std::env::var("PARAPHINA_LIVE_EXEC_ENABLE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let exec_enable_env = env_is_true("PARAPHINA_LIVE_EXEC_ENABLE");
+    let allow_live_gateway = exec_enable_env
+        && trade_mode.trade_mode != TradeMode::Shadow
+        && (!paper_mode || paper_route_sandbox);
     let mut exec_client: Option<std::sync::Arc<dyn LiveRestClient>> = None;
     let mut exec_supported = false;
 
@@ -303,8 +865,8 @@ async fn main() {
                 let hl_cfg = paraphina::live::connectors::hyperliquid::HyperliquidConfig::from_env();
                 let mut hl = paraphina::live::connectors::hyperliquid::HyperliquidConnector::new(
                     hl_cfg.clone(),
-                    market_tx.clone(),
-                    _exec_tx.clone(),
+                    market_ingest_tx.clone(),
+                    exec_tx.clone(),
                 );
                 if trade_mode.trade_mode != TradeMode::Shadow {
                     if hl_cfg.vault_address.is_some() {
@@ -321,7 +883,7 @@ async fn main() {
                 }
                 let hl_arc = Arc::new(hl);
                 exec_supported = true;
-                if exec_enabled && trade_mode.trade_mode != TradeMode::Shadow {
+                if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
                     if hl_cfg.private_key_hex.is_some() {
                         exec_client = Some(hl_arc.clone());
                     } else {
@@ -368,7 +930,7 @@ async fn main() {
                 ) {
                     Ok(feed) => {
                         tokio::spawn(async move {
-                            feed.run_ticks(market_tx.clone(), 1_000, 250, 200).await;
+                            feed.run_ticks(market_ingest_tx.clone(), 1_000, 250, 200).await;
                         });
                     }
                     Err(err) => {
@@ -399,8 +961,8 @@ async fn main() {
                 let lighter_cfg = paraphina::live::connectors::lighter::LighterConfig::from_env();
                 let mut lighter = paraphina::live::connectors::lighter::LighterConnector::new(
                     lighter_cfg.clone(),
-                    market_tx.clone(),
-                    _exec_tx.clone(),
+                    market_ingest_tx.clone(),
+                    exec_tx.clone(),
                 );
                 if trade_mode.trade_mode != TradeMode::Shadow {
                     if lighter_cfg.paper_mode {
@@ -416,7 +978,7 @@ async fn main() {
                 }
                 let lighter_arc = Arc::new(lighter);
                 exec_supported = true;
-                if exec_enabled && trade_mode.trade_mode != TradeMode::Shadow {
+                if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
                     if lighter_cfg.paper_mode {
                         eprintln!("paraphina_live | exec_disabled=true reason=lighter_paper_mode");
                     } else {
@@ -454,24 +1016,36 @@ async fn main() {
         ConnectorArg::Mock => {}
     }
 
-    let exec_enabled = exec_enabled
-        && trade_mode.trade_mode != TradeMode::Shadow
-        && exec_supported
-        && exec_client.is_some();
+    let exec_enabled = allow_live_gateway && exec_supported && exec_client.is_some();
     if trade_mode.trade_mode != TradeMode::Shadow && !exec_enabled {
-        eprintln!(
-            "paraphina_live | trade_mode={} | exec_disabled=true | falling_back=shadow (set PARAPHINA_LIVE_EXEC_ENABLE=1 and provide keys)",
-            trade_mode.trade_mode.as_str()
-        );
+        if paper_mode && !paper_route_sandbox {
+            eprintln!(
+                "paraphina_live | trade_mode=paper | paper_execution=internal | exec_disabled=true"
+            );
+        } else {
+            eprintln!(
+                "paraphina_live | trade_mode={} | exec_disabled=true | falling_back=shadow (set PARAPHINA_LIVE_EXEC_ENABLE=1 and provide keys)",
+                trade_mode.trade_mode.as_str()
+            );
+        }
     }
 
     let exec_trade_mode = trade_mode.trade_mode;
     let exec_cfg = cfg.clone();
+    let venue_id_lookup: Vec<String> = cfg.venues.iter().map(|v| v.id.clone()).collect();
     let exec_enabled_flag = exec_enabled;
     let exec_client = exec_client.clone();
     let exec_metrics = metrics.clone();
+    let exec_tx = exec_tx.clone();
+    let account_tx = _account_tx.clone();
+    let use_paper_adapter = paper_mode && !exec_enabled_flag;
     tokio::spawn(async move {
         let mut shadow = ShadowAckAdapter::new(&exec_cfg);
+        let mut paper_adapter = if use_paper_adapter {
+            Some(PaperExecutionAdapter::new(&exec_cfg))
+        } else {
+            None
+        };
         let mut live_gateway = if exec_enabled_flag {
             match LiveGateway::new(
                 &exec_cfg,
@@ -489,27 +1063,80 @@ async fn main() {
         } else {
             None
         };
-        let mut exec_seq: u64 = 0;
-        while let Some(req) = order_rx.recv().await {
-            let LiveOrderRequest {
-                intents,
-                action_batch,
-                now_ms,
-                response,
-            } = req;
-            let events = if let Some(gateway) = live_gateway.as_mut() {
-                handle_live_gateway_intents(
-                    gateway,
-                    intents,
-                    action_batch.tick_index,
-                    now_ms,
-                    &mut exec_seq,
-                )
-                .await
-            } else {
-                shadow.handle_intents(intents, action_batch.tick_index, now_ms)
+        if let Some(adapter) = paper_adapter.as_ref() {
+            let mode_label = match adapter.config().fill_mode {
+                PaperFillMode::None => "none",
+                PaperFillMode::Marketable => "marketable",
+                PaperFillMode::Mid => "mid",
+                PaperFillMode::Always => "always",
             };
-            let _ = response.send(events);
+            eprintln!(
+                "paraphina_live | paper_execution=internal fill_mode={} slippage_bps={}",
+                mode_label,
+                adapter.config().slippage_bps
+            );
+        }
+        let mut exec_seq: u64 = 0;
+        let mut paper_market_rx = if use_paper_adapter {
+            Some(paper_market_rx)
+        } else {
+            None
+        };
+        loop {
+            tokio::select! {
+                Some(update) = async {
+                    if let Some(rx) = paper_market_rx.as_mut() {
+                        rx.recv().await
+                    } else {
+                        None
+                    }
+                } => {
+                    if let Some(adapter) = paper_adapter.as_mut() {
+                        let events = adapter.update_best_bid_ask(update);
+                        for event in events {
+                            let _ = exec_tx.try_send(event);
+                        }
+                    }
+                }
+                Some(req) = order_rx.recv() => {
+                    let LiveOrderRequest {
+                        intents,
+                        action_batch,
+                        now_ms,
+                        response,
+                    } = req;
+                    let events = if let Some(gateway) = live_gateway.as_mut() {
+                        handle_live_gateway_intents(
+                            gateway,
+                            intents,
+                            action_batch.tick_index,
+                            now_ms,
+                            &mut exec_seq,
+                        )
+                        .await
+                    } else if let Some(adapter) = paper_adapter.as_mut() {
+                        let events = adapter.handle_intents(intents, action_batch.tick_index, now_ms);
+                        let mut response_events = Vec::new();
+                        for event in events {
+                            match &event {
+                                paraphina::live::types::ExecutionEvent::Filled(_) => {
+                                    let _ = exec_tx.try_send(event);
+                                }
+                                _ => response_events.push(event),
+                            }
+                        }
+                        let snapshots = adapter.drain_account_snapshots(&venue_id_lookup, now_ms + 1);
+                        for snapshot in snapshots {
+                            let _ = account_tx.try_send(paraphina::live::types::AccountEvent::Snapshot(snapshot));
+                        }
+                        response_events
+                    } else {
+                        shadow.handle_intents(intents, action_batch.tick_index, now_ms)
+                    };
+                    let _ = response.send(events);
+                }
+                else => break,
+            }
         }
     });
 
@@ -525,14 +1152,7 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(200);
-    let mut telemetry_path = std::env::var("PARAPHINA_TELEMETRY_PATH")
-        .ok()
-        .map(std::path::PathBuf::from);
-    if telemetry_path.is_none() {
-        if let Some(out_dir) = out_dir.as_ref() {
-            telemetry_path = Some(out_dir.join("telemetry.jsonl"));
-        }
-    }
+    let telemetry_path = resolve_telemetry_path(out_dir.as_ref());
     let telemetry_cfg = TelemetryConfig {
         mode: TelemetryMode::from_env(),
         path: telemetry_path,
@@ -541,6 +1161,7 @@ async fn main() {
     let telemetry = LiveTelemetry {
         sink: Arc::new(Mutex::new(TelemetrySink::from_config(telemetry_cfg))),
         shadow_mode: trade_mode.trade_mode == TradeMode::Shadow,
+        execution_mode: trade_mode.trade_mode.as_str(),
         max_orders_per_tick,
         stats: Arc::new(Mutex::new(LiveTelemetryStats::default())),
     };
@@ -815,6 +1436,7 @@ fn write_summary(
     };
     let payload = serde_json::json!({
         "trade_mode": trade_mode.as_str(),
+        "execution_mode": trade_mode.as_str(),
         "connector": connector,
         "venues": cfg.venues.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(),
         "ticks_run": summary.ticks_run,
