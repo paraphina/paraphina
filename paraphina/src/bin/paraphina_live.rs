@@ -8,9 +8,6 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use paraphina::config::{resolve_effective_profile, Config};
-use paraphina::connector_registry::{
-    roadmap_b_gate_enabled, validate_roadmap_b_connector_coverage, ConnectorArg,
-};
 use paraphina::live::ops::{
     default_audit_dir, format_startup_log, start_metrics_server, EnvSecretProvider,
     HealthState, LiveMetrics, SecretProvider, write_audit_files,
@@ -23,6 +20,7 @@ use paraphina::live::gateway::{LiveGateway, LiveRestClient};
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
 use paraphina::live::types::L2Snapshot;
+use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
 use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
 
 use tokio::sync::mpsc;
@@ -46,13 +44,88 @@ impl From<TradeModeArg> for TradeMode {
     }
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ConnectorArg {
+    Mock,
+    Hyperliquid,
+    HyperliquidFixture,
+    Lighter,
+    Extended,
+    Aster,
+    Paradex,
+}
+
+impl ConnectorArg {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ConnectorArg::Mock => "mock",
+            ConnectorArg::Hyperliquid => "hyperliquid",
+            ConnectorArg::HyperliquidFixture => "hyperliquid_fixture",
+            ConnectorArg::Lighter => "lighter",
+            ConnectorArg::Extended => "extended",
+            ConnectorArg::Aster => "aster",
+            ConnectorArg::Paradex => "paradex",
+        }
+    }
+
+    fn parse_env(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mock" => Some(ConnectorArg::Mock),
+            "hyperliquid" | "hl" => Some(ConnectorArg::Hyperliquid),
+            "hyperliquid_fixture" | "hl_fixture" | "fixture" => Some(ConnectorArg::HyperliquidFixture),
+            "lighter" => Some(ConnectorArg::Lighter),
+            "extended" => Some(ConnectorArg::Extended),
+            "aster" => Some(ConnectorArg::Aster),
+            "paradex" => Some(ConnectorArg::Paradex),
+            _ => None,
+        }
+    }
+
+    fn all() -> &'static [ConnectorArg] {
+        &[
+            ConnectorArg::Mock,
+            ConnectorArg::Hyperliquid,
+            ConnectorArg::HyperliquidFixture,
+            ConnectorArg::Lighter,
+            ConnectorArg::Extended,
+            ConnectorArg::Aster,
+            ConnectorArg::Paradex,
+        ]
+    }
+
+    fn roadmap_b_venue_id(&self) -> Option<&'static str> {
+        match self {
+            ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => Some("hyperliquid"),
+            ConnectorArg::Lighter => Some("lighter"),
+            ConnectorArg::Extended => Some("extended"),
+            ConnectorArg::Aster => Some("aster"),
+            ConnectorArg::Paradex => Some("paradex"),
+            ConnectorArg::Mock => None,
+        }
+    }
+
+    fn roadmap_b_selectable_venues() -> Vec<&'static str> {
+        let mut available = std::collections::BTreeSet::new();
+        for connector in Self::all() {
+            if let Some(venue_id) = connector.roadmap_b_venue_id() {
+                available.insert(venue_id);
+            }
+        }
+        canonical_venue_ids()
+            .iter()
+            .filter(|venue_id| available.contains(*venue_id))
+            .copied()
+            .collect()
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "paraphina_live", about = "Paraphina live runner (shadow-safe by default)", version)]
 struct Args {
     /// Trade mode: shadow (default), paper, testnet, live.
     #[arg(long, value_enum)]
     trade_mode: Option<TradeModeArg>,
-    /// Connector to use: mock (default), extended, hyperliquid, aster, lighter, paradex, hyperliquid_fixture.
+    /// Connector to use: mock (default), hyperliquid, hyperliquid_fixture, lighter, extended, aster, paradex.
     #[arg(long, value_enum)]
     connector: Option<ConnectorArg>,
     /// Output directory for telemetry/audit artifacts.
@@ -92,9 +165,30 @@ fn resolve_out_dir(cli: Option<String>) -> Option<std::path::PathBuf> {
     None
 }
 
+fn enforce_roadmap_b_gate() {
+    if !roadmap_b_enabled() {
+        return;
+    }
+    let selectable = ConnectorArg::roadmap_b_selectable_venues();
+    let required = canonical_venue_ids();
+    if selectable.len() < required.len() {
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|venue_id| !selectable.contains(venue_id))
+            .copied()
+            .collect();
+        eprintln!(
+            "paraphina_live | error=roadmap_b_gate_failed missing={:?} selectable={:?}",
+            missing, selectable
+        );
+        std::process::exit(2);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    enforce_roadmap_b_gate();
     let effective = resolve_effective_profile(None, None);
     effective.log_startup();
     let cfg = Config::from_env_or_profile(effective.profile);
@@ -102,12 +196,6 @@ async fn main() {
     let trade_mode = resolve_effective_trade_mode(args.trade_mode.map(TradeMode::from));
     trade_mode.log_startup();
     let connector = resolve_connector(args.connector);
-    if roadmap_b_gate_enabled() {
-        if let Err(err) = validate_roadmap_b_connector_coverage() {
-            eprintln!("paraphina_live | error=roadmap_b_gate_failed reason={err}");
-            std::process::exit(2);
-        }
-    }
     let out_dir = resolve_out_dir(args.out_dir);
     let metrics_addr = std::env::var("PARAPHINA_LIVE_METRICS_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9898".to_string());
@@ -358,7 +446,7 @@ async fn main() {
         }
         ConnectorArg::Extended | ConnectorArg::Aster | ConnectorArg::Paradex => {
             eprintln!(
-                "paraphina_live | error=connector_unavailable connector={} reason=stubbed",
+                "paraphina_live | error=connector_unavailable connector={}",
                 connector.as_str()
             );
             return;
@@ -742,5 +830,18 @@ fn write_summary(
     let path = out_dir.join("summary.json");
     if let Ok(text) = serde_json::to_string_pretty(&payload) {
         let _ = std::fs::write(path, text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectorArg;
+    use paraphina::live::venues::ROADMAP_B_VENUES;
+
+    #[test]
+    fn roadmap_b_registry_is_complete() {
+        assert_eq!(ROADMAP_B_VENUES.len(), 5);
+        let selectable = ConnectorArg::roadmap_b_selectable_venues();
+        assert_eq!(selectable, ROADMAP_B_VENUES.to_vec());
     }
 }

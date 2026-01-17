@@ -1,45 +1,7 @@
-//! Canonical venue registry and ordering helpers.
+use std::env;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum VenueId {
-    Extended,
-    Hyperliquid,
-    Aster,
-    Lighter,
-    Paradex,
-}
-
-impl VenueId {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            VenueId::Extended => "extended",
-            VenueId::Hyperliquid => "hyperliquid",
-            VenueId::Aster => "aster",
-            VenueId::Lighter => "lighter",
-            VenueId::Paradex => "paradex",
-        }
-    }
-
-    pub const fn name(&self) -> &'static str {
-        match self {
-            VenueId::Extended => "Extended",
-            VenueId::Hyperliquid => "Hyperliquid",
-            VenueId::Aster => "Aster",
-            VenueId::Lighter => "Lighter",
-            VenueId::Paradex => "Paradex",
-        }
-    }
-}
-
-pub const CANONICAL_VENUES: [VenueId; 5] = [
-    VenueId::Extended,
-    VenueId::Hyperliquid,
-    VenueId::Aster,
-    VenueId::Lighter,
-    VenueId::Paradex,
-];
-
-pub const CANONICAL_VENUE_IDS: [&str; 5] = [
+/// Canonical Roadmap-B venue registry (stable order).
+pub const ROADMAP_B_VENUES: [&str; 5] = [
     "extended",
     "hyperliquid",
     "aster",
@@ -47,40 +9,30 @@ pub const CANONICAL_VENUE_IDS: [&str; 5] = [
     "paradex",
 ];
 
-pub const ROADMAP_B_VENUES: [VenueId; 5] = CANONICAL_VENUES;
-pub const ROADMAP_B_VENUE_IDS: [&str; 5] = CANONICAL_VENUE_IDS;
+/// Stable venue ordering used across live telemetry + connector selection + gating.
+pub const CANONICAL_VENUE_ORDER: [&str; 5] = ROADMAP_B_VENUES;
 
-pub fn canonical_venue_count(config_len: usize) -> usize {
-    if config_len == CANONICAL_VENUE_IDS.len() {
-        CANONICAL_VENUE_IDS.len()
-    } else {
-        config_len
+pub fn canonical_venue_ids() -> &'static [&'static str] {
+    &CANONICAL_VENUE_ORDER
+}
+
+pub fn roadmap_b_enabled() -> bool {
+    match env::var("PARAPHINA_ROADMAP_B") {
+        Ok(val) => matches!(
+            val.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "enabled"
+        ),
+        Err(_) => false,
     }
 }
 
-pub fn canonical_order_indices<T, F>(items: &[T], id_fn: F) -> Vec<usize>
-where
-    F: Fn(&T) -> &str,
-{
-    if items.is_empty() {
-        return Vec::new();
+pub fn warn_if_noncanonical_venue_order(venue_ids: &[&str], context: &str) {
+    if venue_ids != CANONICAL_VENUE_ORDER {
+        eprintln!(
+            "paraphina | warn=noncanonical_venue_order context={} expected={:?} actual={:?}",
+            context,
+            CANONICAL_VENUE_ORDER,
+            venue_ids
+        );
     }
-    let mut indices = Vec::with_capacity(items.len());
-    let mut seen = vec![false; items.len()];
-    for id in CANONICAL_VENUE_IDS {
-        if let Some((idx, _)) = items
-            .iter()
-            .enumerate()
-            .find(|(_, item)| id_fn(item).eq_ignore_ascii_case(id))
-        {
-            indices.push(idx);
-            seen[idx] = true;
-        }
-    }
-    for idx in 0..items.len() {
-        if !seen[idx] {
-            indices.push(idx);
-        }
-    }
-    indices
 }

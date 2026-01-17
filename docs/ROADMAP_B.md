@@ -1,7 +1,8 @@
-# ROADMAP_B: Live Venue Registry & Rollout
+# Roadmap B (Live Venues)
 
 ## Canonical venues (single source of truth)
-Roadmap-B targets exactly five venues, in canonical order:
+
+Roadmap-B targets exactly five venues, in stable order:
 
 1. Extended
 2. Hyperliquid
@@ -9,18 +10,18 @@ Roadmap-B targets exactly five venues, in canonical order:
 4. Lighter
 5. Paradex
 
-This ordering is codified in `paraphina/src/live/venues.rs` and is the reference
-for per-venue telemetry arrays, connector selection, and readiness gates.
+Canonical registry: `paraphina/src/live/venues.rs`
 
 ## Intended rollout
-1. **Shadow**: validate market data and account snapshots without execution.
-2. **Paper/Testnet**: enable execution in paper/testnet environments, with live keys still disabled.
-3. **Live**: enable real execution only after hard gates pass and allowlists are explicit.
 
-## Safety gates (explicit)
-- **Execution enable gate**: execution requires `PARAPHINA_LIVE_EXEC_ENABLE=1`.
-- **Trade mode gate**: execution requires `trade_mode != shadow`.
-- **Per-venue allowlist**: connectors must be explicitly selectable in `paraphina_live` for each
-  Roadmap-B venue; stub connectors are allowed while implementations are pending.
-- **Roadmap-B gate**: when `PARAPHINA_ROADMAP_B=1`, the registry must expose all five
-  canonical venues or the process/test must fail.
+1. **Shadow**: shadow-only traffic, no live execution.
+2. **Paper/Testnet**: paper and testnet execution, keep live execution disabled.
+3. **Live**: enable live execution only after the safety gates below pass.
+
+## Explicit safety gates
+
+- `PARAPHINA_LIVE_EXEC_ENABLE=1` is required for any live execution.
+- `trade_mode != shadow` is required for account polling/execution.
+- Per-venue allowlist must be explicitly approved before live execution on that venue.
+
+These gates are additive and must remain intact as Roadmap-B progresses.

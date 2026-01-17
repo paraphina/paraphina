@@ -339,6 +339,11 @@ pub struct TelemetryInputs<'a> {
 
 impl TelemetryBuilder {
     pub fn new(cfg: &Config) -> Self {
+        #[cfg(feature = "live")]
+        {
+            let venue_ids: Vec<&str> = cfg.venues.iter().map(|v| v.id.as_str()).collect();
+            crate::live::venues::warn_if_noncanonical_venue_order(&venue_ids, "telemetry");
+        }
         Self {
             prev_risk_regime: None,
             prev_kill_switch: false,
@@ -622,9 +627,7 @@ fn build_quote_levels(cfg: &Config, state: &GlobalState, fair: f64) -> Vec<JsonV
     }
 
     let mut out = Vec::new();
-    let order = crate::venues::canonical_order_indices(&state.venues, |v| v.id.as_ref());
-    for idx in order {
-        let v = &state.venues[idx];
+    for (idx, v) in state.venues.iter().enumerate() {
         let (bid_price, bid_size, ask_price, ask_size) = quote_by_venue[idx];
         let basis_adj = components.basis_adj_usd.get(idx).copied().unwrap_or(0.0);
         let funding_adj = components.funding_adj_usd.get(idx).copied().unwrap_or(0.0);
@@ -1227,9 +1230,7 @@ fn build_venue_metrics(state: &GlobalState, now_ms: TimestampMs) -> Vec<(String,
     let mut venue_fill_rate = Vec::new();
     let mut venue_markout_ewma = Vec::new();
 
-    let order = crate::venues::canonical_order_indices(&state.venues, |v| v.id.as_ref());
-    for idx in order {
-        let venue = &state.venues[idx];
+    for venue in &state.venues {
         venue_mid.push(venue.mid.unwrap_or(0.0));
         venue_spread.push(venue.spread.unwrap_or(0.0));
         venue_depth.push(venue.depth_near_mid);
