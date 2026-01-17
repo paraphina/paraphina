@@ -40,27 +40,43 @@
 pub mod actions;
 pub mod config;
 pub mod engine;
+pub mod event_log;
+pub mod execution_events;
 pub mod exit;
+pub mod fill_batcher;
 pub mod gateway;
 pub mod hedge;
 pub mod io;
+pub mod loop_scheduler;
+#[path = "live/venues.rs"]
+pub mod venues;
+#[path = "live/connector_registry.rs"]
+pub mod connector_registry;
+#[cfg(feature = "live")]
+pub mod live;
 pub mod logging;
 pub mod metrics;
 pub mod mm;
+pub mod orderbook_l2;
+pub mod order_management;
 pub mod rl;
 pub mod sim_eval;
 pub mod state;
-pub mod strategy;
+pub mod strategy_action;
 pub mod strategy_core;
 pub mod tail_risk;
 pub mod telemetry;
+pub mod treasury;
 pub mod toxicity;
 pub mod types;
 
 // --- Re-exports for ergonomic external use ---------------------------------
 
 pub use config::{resolve_effective_profile, Config, EffectiveProfile, ProfileSource, RiskProfile};
+pub use execution_events::apply_execution_events;
 pub use engine::Engine;
+pub use fill_batcher::FillBatcher;
+pub use loop_scheduler::LoopScheduler;
 
 // Legacy gateway (preserved for backwards compatibility)
 pub use gateway::{ExecutionGateway, SimGateway};
@@ -96,10 +112,19 @@ pub use mm::{
     should_replace_order, ActiveMmOrder, MmLevel, MmOrderAction, MmQuote, MmScratch,
     VenueTargetInventory,
 };
+pub use order_management::{plan_mm_order_actions, MmOrderManagementPlan};
 
 pub use state::{GlobalState, KillReason, PendingMarkout, RiskRegime, VenueState};
 
-pub use strategy::StrategyRunner;
+pub use strategy_action::StrategyRunner;
+
+// Legacy StrategyRunner (pre-action-batch execution path).
+// Enabled only when the legacy_runner feature is set.
+#[cfg(feature = "legacy_runner")]
+#[path = "strategy.rs"]
+pub mod legacy_strategy;
+#[cfg(feature = "legacy_runner")]
+pub use legacy_strategy::StrategyRunner as LegacyStrategyRunner;
 
 pub use toxicity::{update_toxicity_and_health, update_toxicity_and_health_with_ablations};
 
