@@ -1,0 +1,1146 @@
+{
+  "source": "docs/WHITEPAPER.md",
+  "generated_at": "2026-01-17T16:24:57+00:00",
+  "requirements": [
+    {
+      "id": "WP-4.1-OB-BOOK-UPDATE",
+      "section": "4.1",
+      "description": "Update bids/asks on incremental L2 updates",
+      "whitepaper_line_ranges": [
+        "L2473-L2479"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "data-ingestion",
+        "orderbook"
+      ]
+    },
+    {
+      "id": "WP-4.1-OB-LAST-UPDATE",
+      "section": "4.1",
+      "description": "Set last_update_ms on book update",
+      "whitepaper_line_ranges": [
+        "L2477-L2479"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "data-ingestion",
+        "timestamps"
+      ]
+    },
+    {
+      "id": "WP-4.1-OB-MID-SPREAD-DEPTH",
+      "section": "4.1",
+      "description": "Compute mid, spread, depth near mid",
+      "whitepaper_line_ranges": [
+        "L2481-L2488"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "data-ingestion",
+        "orderbook"
+      ]
+    },
+    {
+      "id": "WP-4.1-OB-LOCAL-VOL",
+      "section": "4.1",
+      "description": "Update local vol EWMA from log mid returns",
+      "whitepaper_line_ranges": [
+        "L2491-L2513"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "data-ingestion",
+        "volatility"
+      ]
+    },
+    {
+      "id": "WP-4.2-BALANCE-POLL",
+      "section": "4.2",
+      "description": "Poll positions/balances/funding",
+      "whitepaper_line_ranges": [
+        "L2527-L2538"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "data-ingestion",
+        "balances"
+      ]
+    },
+    {
+      "id": "WP-4.2-LIQ-ESTIMATE",
+      "section": "4.2",
+      "description": "Compute price_liq and dist_liq_sigma",
+      "whitepaper_line_ranges": [
+        "L2541-L2561"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "data-ingestion",
+        "liquidation"
+      ]
+    },
+    {
+      "id": "WP-4.3-FILL-QUEUE",
+      "section": "4.3",
+      "description": "Fill queue batched every FILL_AGG_INTERVAL_MS",
+      "whitepaper_line_ranges": [
+        "L2569-L2572"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "fills"
+      ]
+    },
+    {
+      "id": "WP-4.3-FILL-APPLY",
+      "section": "4.3",
+      "description": "Apply fills to positions/PnL",
+      "whitepaper_line_ranges": [
+        "L2575-L2601"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "fills",
+        "pnl"
+      ]
+    },
+    {
+      "id": "WP-4.3-OPEN-ORDERS",
+      "section": "4.3",
+      "description": "Update open_orders map keyed by order_id",
+      "whitepaper_line_ranges": [
+        "L2605-L2606"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "orders"
+      ]
+    },
+    {
+      "id": "WP-4.3-RECENT-FILLS",
+      "section": "4.3",
+      "description": "Record recent fills with markout unset",
+      "whitepaper_line_ranges": [
+        "L2609-L2609"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "fills",
+        "markout"
+      ]
+    },
+    {
+      "id": "WP-4.3-POST-FILL-RECOMPUTE",
+      "section": "4.3",
+      "description": "Recompute inventory/basis and run exit+hedge after batch",
+      "whitepaper_line_ranges": [
+        "L2613-L2647"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "fills",
+        "exit",
+        "hedge"
+      ]
+    },
+    {
+      "id": "WP-4.4-MARKOUT",
+      "section": "4.4",
+      "description": "Compute markout after horizon and store on fill",
+      "whitepaper_line_ranges": [
+        "L2655-L2688"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-4",
+        "markout",
+        "toxicity"
+      ]
+    },
+    {
+      "id": "WP-11-MM-ONE-PER-SIDE",
+      "section": "11",
+      "description": "At most one active MM order per venue/side",
+      "whitepaper_line_ranges": [
+        "L3685-L3689"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-11",
+        "order-management"
+      ]
+    },
+    {
+      "id": "WP-11-CANCEL-IF-NOT-QUOTED",
+      "section": "11",
+      "description": "Cancel existing order when side not quoted",
+      "whitepaper_line_ranges": [
+        "L3693-L3695"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-11",
+        "order-management"
+      ]
+    },
+    {
+      "id": "WP-11-MIN-LIFETIME-TOL",
+      "section": "11",
+      "description": "MIN_QUOTE_LIFETIME + price/size tolerance replace",
+      "whitepaper_line_ranges": [
+        "L3703-L3731"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-11",
+        "order-management"
+      ]
+    },
+    {
+      "id": "WP-11-MAKER-TIF-POSTONLY",
+      "section": "11",
+      "description": "Maker TIF + post_only enforcement",
+      "whitepaper_line_ranges": [
+        "L3733-L3741"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-11",
+        "execution-semantics"
+      ]
+    },
+    {
+      "id": "WP-11-EXIT-HEDGE-IOC",
+      "section": "11",
+      "description": "Exit/Hedge orders are IOC and not gated by min lifetime",
+      "whitepaper_line_ranges": [
+        "L3753-L3755"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-11",
+        "execution-semantics"
+      ]
+    },
+    {
+      "id": "WP-14.5-KILL-CANCEL-ALL",
+      "section": "14.5",
+      "description": "Cancel all open orders on kill",
+      "whitepaper_line_ranges": [
+        "L4689-L4694"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-14.5",
+        "kill-switch"
+      ]
+    },
+    {
+      "id": "WP-14.5-KILL-BEST-EFFORT",
+      "section": "14.5",
+      "description": "Best-effort hedge/exit on dangerous liquidation distance",
+      "whitepaper_line_ranges": [
+        "L4696-L4701"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-14.5",
+        "kill-switch"
+      ]
+    },
+    {
+      "id": "WP-14.5-KILL-STOP-NEW",
+      "section": "14.5",
+      "description": "Stop new MM/EXIT/HEDGE placements on kill",
+      "whitepaper_line_ranges": [
+        "L4704-L4706"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-14.5",
+        "kill-switch"
+      ]
+    },
+    {
+      "id": "WP-14.5-KILL-LOG",
+      "section": "14.5",
+      "description": "Emit detailed kill log with per-venue metrics",
+      "whitepaper_line_ranges": [
+        "L4708-L4726"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-14.5",
+        "kill-switch",
+        "telemetry"
+      ]
+    },
+    {
+      "id": "WP-14.5-KILL-LATCH",
+      "section": "14.5",
+      "description": "Kill switch latched until manual reset",
+      "whitepaper_line_ranges": [
+        "L4728-L4729"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-14.5",
+        "kill-switch"
+      ]
+    },
+    {
+      "id": "WP-15-LOG-FV-VOL",
+      "section": "15",
+      "description": "Log KF state, FV/vol terms, contributing venues, config version",
+      "whitepaper_line_ranges": [
+        "L4791-L4804"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "telemetry"
+      ]
+    },
+    {
+      "id": "WP-15-LOG-QUOTES-SIZES",
+      "section": "15",
+      "description": "Log per-venue quote components and sizes",
+      "whitepaper_line_ranges": [
+        "L4807-L4828"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "telemetry",
+        "mm"
+      ]
+    },
+    {
+      "id": "WP-15-LOG-ORDERS",
+      "section": "15",
+      "description": "Log orders with tif/post_only/purpose",
+      "whitepaper_line_ranges": [
+        "L4831-L4847"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "telemetry",
+        "orders"
+      ]
+    },
+    {
+      "id": "WP-15-LOG-FILLS",
+      "section": "15",
+      "description": "Log fills with pre/post positions and realised PnL",
+      "whitepaper_line_ranges": [
+        "L4851-L4864"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "telemetry",
+        "fills"
+      ]
+    },
+    {
+      "id": "WP-15-LOG-EXITS",
+      "section": "15",
+      "description": "Log exits with entry mapping and edge components",
+      "whitepaper_line_ranges": [
+        "L4867-L4879"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "telemetry",
+        "exit"
+      ]
+    },
+    {
+      "id": "WP-15-LOG-HEDGE",
+      "section": "15",
+      "description": "Log hedge actions and per-venue cost components",
+      "whitepaper_line_ranges": [
+        "L4883-L4899"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "telemetry",
+        "hedge"
+      ]
+    },
+    {
+      "id": "WP-15-RISK-EVENTS",
+      "section": "15",
+      "description": "Log risk transitions, breaches, venue disables, kill switch",
+      "whitepaper_line_ranges": [
+        "L4903-L4923"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "telemetry",
+        "risk"
+      ]
+    },
+    {
+      "id": "WP-15-METRICS-GLOBAL-PER-VENUE",
+      "section": "15",
+      "description": "Log global and per-venue metrics set",
+      "whitepaper_line_ranges": [
+        "L4931-L4979"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "metrics"
+      ]
+    },
+    {
+      "id": "WP-15-TREASURY-GUIDANCE",
+      "section": "15",
+      "description": "Treasury guidance outputs",
+      "whitepaper_line_ranges": [
+        "L4983-L5019"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "section-15",
+        "treasury"
+      ]
+    },
+    {
+      "id": "WP-17-IO-LAYER",
+      "section": "17",
+      "description": "Async WS/REST I/O for books/trades/funding/private feeds",
+      "whitepaper_line_ranges": [
+        "L5303-L5316"
+      ],
+      "priority": "P0",
+      "applies_to": "live",
+      "tags": [
+        "section-17",
+        "live-io"
+      ]
+    },
+    {
+      "id": "WP-17-STATE-CACHE",
+      "section": "17",
+      "description": "Canonical state cache with order books, margin, funding, dist_liq_sigma",
+      "whitepaper_line_ranges": [
+        "L5322-L5343"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-17",
+        "state-cache"
+      ]
+    },
+    {
+      "id": "WP-17-STRATEGY-ACTIONS",
+      "section": "17",
+      "description": "Strategy outputs action list (place/cancel/log)",
+      "whitepaper_line_ranges": [
+        "L5355-L5376"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-17",
+        "actions"
+      ]
+    },
+    {
+      "id": "WP-17-GATEWAY-POLICY",
+      "section": "17",
+      "description": "Rate limiting/retries + execution semantics enforcement",
+      "whitepaper_line_ranges": [
+        "L5399-L5439"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "section-17",
+        "gateway"
+      ]
+    },
+    {
+      "id": "WP-17-DETERMINISM-REPLAY",
+      "section": "17",
+      "description": "Determinism + replay capability",
+      "whitepaper_line_ranges": [
+        "L5443-L5479"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "section-17",
+        "determinism",
+        "replay"
+      ]
+    },
+    {
+      "id": "WP-CI-PHASEA-SMOKE",
+      "section": "CI",
+      "description": "CI smoke mode completes without error",
+      "whitepaper_line_ranges": [
+        "L1221-L1224"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "ci",
+        "phase-a"
+      ]
+    },
+    {
+      "id": "WP-CI-PHASEA-EVIDENCE-VERIFY",
+      "section": "CI",
+      "description": "CI enforces evidence verification before upload",
+      "whitepaper_line_ranges": [
+        "L1221-L1224"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "ci",
+        "evidence"
+      ]
+    },
+    {
+      "id": "WP-CI-PHASEA-NO-PROMOTION-WITHOUT-GATES",
+      "section": "CI",
+      "description": "No promotion without passing gates",
+      "whitepaper_line_ranges": [
+        "L1221-L1226"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "ci",
+        "phase-a"
+      ]
+    },
+    {
+      "id": "WP-CI-PHASEA-REPRODUCIBILITY",
+      "section": "CI",
+      "description": "Reproducibility from artifacts",
+      "whitepaper_line_ranges": [
+        "L1221-L1226"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "ci",
+        "phase-a"
+      ]
+    },
+    {
+      "id": "WP-EVIDENCE-STRUCTURE",
+      "section": "Evidence",
+      "description": "Evidence packs follow mandated directory structure",
+      "whitepaper_line_ranges": [
+        "L1426-L1439"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "evidence",
+        "integrity"
+      ]
+    },
+    {
+      "id": "WP-CI-EVIDENCE-GATE",
+      "section": "CI",
+      "description": "Evidence verification mandatory CI gate",
+      "whitepaper_line_ranges": [
+        "L1578-L1586"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "ci",
+        "evidence"
+      ]
+    },
+    {
+      "id": "WP-CI-VERIFY-MANDATORY",
+      "section": "CI",
+      "description": "CI runs verify-evidence-tree before upload",
+      "whitepaper_line_ranges": [
+        "L1582-L1585"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "ci",
+        "evidence"
+      ]
+    },
+    {
+      "id": "WP-CI-FAILURE-BLOCKS-UPLOAD",
+      "section": "CI",
+      "description": "Verification failure blocks artifact upload",
+      "whitepaper_line_ranges": [
+        "L1584-L1586"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "ci",
+        "evidence"
+      ]
+    },
+    {
+      "id": "WP-EVIDENCE-VERIFY-MUST-PASS",
+      "section": "Evidence",
+      "description": "Evidence verification must pass before artifacts are valid",
+      "whitepaper_line_ranges": [
+        "L1612-L1612"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "evidence",
+        "integrity"
+      ]
+    },
+    {
+      "id": "WP-RL-SAFETY-NO-BYPASS",
+      "section": "Appendix A",
+      "description": "RL agent must not bypass hard risk controls",
+      "whitepaper_line_ranges": [
+        "L5625-L5634"
+      ],
+      "priority": "P0",
+      "applies_to": "sim",
+      "tags": [
+        "rl",
+        "safety"
+      ]
+    },
+    {
+      "id": "WP-RL-REWARD-BUDGETS",
+      "section": "Appendix A",
+      "description": "Reward must reflect research alignment budgets",
+      "whitepaper_line_ranges": [
+        "L5724-L5725"
+      ],
+      "priority": "P2",
+      "applies_to": "sim",
+      "tags": [
+        "rl",
+        "reward"
+      ]
+    },
+    {
+      "id": "WP-TELEM-SCHEMA-VERSION",
+      "section": "Telemetry",
+      "description": "Telemetry records include schema_version=1",
+      "whitepaper_line_ranges": [
+        "L120-L120"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "telemetry",
+        "contract"
+      ]
+    },
+    {
+      "id": "WP-TELEM-REQUIRED-FIELDS",
+      "section": "Telemetry",
+      "description": "Telemetry required fields present",
+      "whitepaper_line_ranges": [
+        "L121-L121"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "telemetry",
+        "contract"
+      ]
+    },
+    {
+      "id": "WP-TELEM-INVARIANTS",
+      "section": "Telemetry",
+      "description": "Telemetry invariants: monotonic tick, finite numerics, valid enums",
+      "whitepaper_line_ranges": [
+        "L123-L123"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "telemetry",
+        "contract"
+      ]
+    },
+    {
+      "id": "WP-TELEM-VALIDATOR",
+      "section": "Telemetry",
+      "description": "Telemetry validator CLI and exit codes",
+      "whitepaper_line_ranges": [
+        "L124-L124"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "telemetry",
+        "tools"
+      ]
+    },
+    {
+      "id": "WP-TELEM-CI-GATE",
+      "section": "Telemetry",
+      "description": "Telemetry contract CI gate",
+      "whitepaper_line_ranges": [
+        "L125-L125"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "telemetry",
+        "ci"
+      ]
+    },
+    {
+      "id": "WP-MILESTONE-C",
+      "section": "Milestone",
+      "description": "Milestone C risk + kill",
+      "whitepaper_line_ranges": [
+        "L24-L30"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "milestone",
+        "risk"
+      ]
+    },
+    {
+      "id": "WP-MILESTONE-D",
+      "section": "Milestone",
+      "description": "Milestone D fair value gating + telemetry",
+      "whitepaper_line_ranges": [
+        "L24-L28"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "milestone",
+        "fv"
+      ]
+    },
+    {
+      "id": "WP-MILESTONE-E",
+      "section": "Milestone",
+      "description": "Milestone E exit allocator",
+      "whitepaper_line_ranges": [
+        "L24-L29"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "milestone",
+        "exit"
+      ]
+    },
+    {
+      "id": "WP-MILESTONE-F",
+      "section": "Milestone",
+      "description": "Milestone F hedge allocator",
+      "whitepaper_line_ranges": [
+        "L24-L29"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "milestone",
+        "hedge"
+      ]
+    },
+    {
+      "id": "WP-MILESTONE-H",
+      "section": "Milestone",
+      "description": "Milestone H execution spine (sim path)",
+      "whitepaper_line_ranges": [
+        "L24-L30"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "milestone",
+        "execution"
+      ]
+    },
+    {
+      "id": "WP-STATUS-CORE-LOOP",
+      "section": "Status",
+      "description": "Core loop order implemented",
+      "whitepaper_line_ranges": [
+        "L1801-L1801"
+      ],
+      "priority": "P1",
+      "applies_to": "sim",
+      "tags": [
+        "status",
+        "core-loop"
+      ]
+    },
+    {
+      "id": "WP-STATUS-CONFIG",
+      "section": "Status",
+      "description": "Config struct implemented",
+      "whitepaper_line_ranges": [
+        "L1891-L1891"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "config"
+      ]
+    },
+    {
+      "id": "WP-STATUS-STATE",
+      "section": "Status",
+      "description": "GlobalState and VenueState implemented",
+      "whitepaper_line_ranges": [
+        "L2321-L2321"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "state"
+      ]
+    },
+    {
+      "id": "WP-STATUS-DATA-INGESTION",
+      "section": "Status",
+      "description": "Data ingestion partial (sim + replay)",
+      "whitepaper_line_ranges": [
+        "L2465-L2465"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "data-ingestion"
+      ]
+    },
+    {
+      "id": "WP-STATUS-KF",
+      "section": "Status",
+      "description": "Kalman filter fair value implemented",
+      "whitepaper_line_ranges": [
+        "L2697-L2697"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "fv"
+      ]
+    },
+    {
+      "id": "WP-STATUS-VOL-SCALARS",
+      "section": "Status",
+      "description": "Volatility scalars implemented",
+      "whitepaper_line_ranges": [
+        "L2917-L2917"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "volatility"
+      ]
+    },
+    {
+      "id": "WP-STATUS-TOXICITY",
+      "section": "Status",
+      "description": "Toxicity implemented",
+      "whitepaper_line_ranges": [
+        "L2997-L2997"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "toxicity"
+      ]
+    },
+    {
+      "id": "WP-STATUS-INVENTORY",
+      "section": "Status",
+      "description": "Inventory/basis computed",
+      "whitepaper_line_ranges": [
+        "L3125-L3125"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "inventory"
+      ]
+    },
+    {
+      "id": "WP-STATUS-MM-MODEL",
+      "section": "Status",
+      "description": "Avellaneda\u2013Stoikov MM model implemented",
+      "whitepaper_line_ranges": [
+        "L3177-L3177"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "mm"
+      ]
+    },
+    {
+      "id": "WP-STATUS-MM-SIZE",
+      "section": "Status",
+      "description": "Quadratic size objective implemented",
+      "whitepaper_line_ranges": [
+        "L3489-L3489"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "mm"
+      ]
+    },
+    {
+      "id": "WP-STATUS-ORDER-MGMT",
+      "section": "Status",
+      "description": "Order management partial",
+      "whitepaper_line_ranges": [
+        "L3681-L3681"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "order-management"
+      ]
+    },
+    {
+      "id": "WP-STATUS-EXIT-ALLOCATOR",
+      "section": "Status",
+      "description": "Exit allocator implemented",
+      "whitepaper_line_ranges": [
+        "L3765-L3765"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "exit"
+      ]
+    },
+    {
+      "id": "WP-STATUS-HEDGE-ALLOCATOR",
+      "section": "Status",
+      "description": "Hedge allocator implemented",
+      "whitepaper_line_ranges": [
+        "L4129-L4129"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "hedge"
+      ]
+    },
+    {
+      "id": "WP-STATUS-RISK-KILL",
+      "section": "Status",
+      "description": "Risk regime + kill switch implemented",
+      "whitepaper_line_ranges": [
+        "L4445-L4445"
+      ],
+      "priority": "P0",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "risk"
+      ]
+    },
+    {
+      "id": "WP-STATUS-TELEMETRY",
+      "section": "Status",
+      "description": "Telemetry partial (per-venue logs planned)",
+      "whitepaper_line_ranges": [
+        "L4783-L4783"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "telemetry"
+      ]
+    },
+    {
+      "id": "WP-STATUS-MAIN-LOOP",
+      "section": "Status",
+      "description": "Deterministic main loop implemented",
+      "whitepaper_line_ranges": [
+        "L5029-L5029"
+      ],
+      "priority": "P1",
+      "applies_to": "sim",
+      "tags": [
+        "status",
+        "core-loop"
+      ]
+    },
+    {
+      "id": "WP-STATUS-STRATEGY-CORE",
+      "section": "Status",
+      "description": "Strategy core partial; live I/O planned",
+      "whitepaper_line_ranges": [
+        "L5295-L5295"
+      ],
+      "priority": "P1",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "strategy-core"
+      ]
+    },
+    {
+      "id": "WP-STATUS-RL-0-2",
+      "section": "Status",
+      "description": "RL-0/1/2 implemented; RL-3+ planned",
+      "whitepaper_line_ranges": [
+        "L5615-L5615"
+      ],
+      "priority": "P2",
+      "applies_to": "sim",
+      "tags": [
+        "status",
+        "rl"
+      ]
+    },
+    {
+      "id": "WP-STATUS-OPTIMIZATION",
+      "section": "Status",
+      "description": "Optimization partial (deterministic baseline implemented)",
+      "whitepaper_line_ranges": [
+        "L5805-L5805"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "optimization"
+      ]
+    },
+    {
+      "id": "WP-STATUS-PHASE-A-B",
+      "section": "Status",
+      "description": "Phase A/B pipeline partial",
+      "whitepaper_line_ranges": [
+        "L5846-L5846"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "phase-a",
+        "phase-b"
+      ]
+    },
+    {
+      "id": "WP-STATUS-CEM",
+      "section": "Status",
+      "description": "CEM adversarial search implemented",
+      "whitepaper_line_ranges": [
+        "L5864-L5864"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "phase-a"
+      ]
+    },
+    {
+      "id": "WP-STATUS-PHASE-B",
+      "section": "Status",
+      "description": "Phase B tri-state gating implemented",
+      "whitepaper_line_ranges": [
+        "L5888-L5888"
+      ],
+      "priority": "P2",
+      "applies_to": "both",
+      "tags": [
+        "status",
+        "phase-b"
+      ]
+    },
+    {
+      "id": "WP-STATUS-POLICY-SURFACES",
+      "section": "Status",
+      "description": "Policy surfaces implemented; safe RL planned",
+      "whitepaper_line_ranges": [
+        "L5921-L5921"
+      ],
+      "priority": "P2",
+      "applies_to": "sim",
+      "tags": [
+        "status",
+        "rl"
+      ]
+    }
+  ]
+}

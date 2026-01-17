@@ -1,0 +1,21 @@
+warning: field `schema_version` is never read
+  --> paraphina/src/rl/research_budgets.rs:22:5
+   |
+21 | struct ResearchAlignmentBudgetFile {
+   |        --------------------------- field in this struct
+22 |     schema_version: i64,
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `ResearchAlignmentBudgetFile` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `paraphina` (lib) generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running `target/debug/paraphina --ticks 300 --seed 42`
+effective_risk_profile=balanced source=default
+paraphina | cfg=v0.1.6-worldmodel-exp08-presets | cfg_hash=0x1fbd63cb42909d6a | profile=Balanced | ticks=300 | seed=42 | intervals_ms=main:1000 hedge:1000 risk:1000
+
+=== Daily Summary ===
+Daily PnL (realised / unrealised / total): +6.55 / +30.65 / +37.21
+Kill switch: false
+Risk regime: Normal
