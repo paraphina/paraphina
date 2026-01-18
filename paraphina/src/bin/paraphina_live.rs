@@ -1466,4 +1466,71 @@ mod tests {
         let selectable = ConnectorArg::roadmap_b_selectable_venues();
         assert_eq!(selectable, ROADMAP_B_VENUES.to_vec());
     }
+
+    #[test]
+    fn roadmap_b_cli_selection_recognizes_all() {
+        let connectors = [
+            ConnectorArg::Extended,
+            ConnectorArg::Hyperliquid,
+            ConnectorArg::Aster,
+            ConnectorArg::Lighter,
+            ConnectorArg::Paradex,
+        ];
+        let parsed: Vec<&str> = connectors
+            .iter()
+            .map(|connector| ConnectorArg::parse_env(connector.as_str()).expect("parse env"))
+            .map(|connector| connector.roadmap_b_venue_id().expect("venue id"))
+            .collect();
+        assert_eq!(parsed, ROADMAP_B_VENUES.to_vec());
+    }
+
+    #[cfg(feature = "live_hyperliquid")]
+    #[test]
+    fn roadmap_b_feature_live_hyperliquid_enabled() {
+        assert!(cfg!(feature = "live_hyperliquid"));
+        assert_eq!(
+            connector_support(ConnectorArg::Hyperliquid),
+            ConnectorSupport::MarketAccountExec
+        );
+    }
+
+    #[cfg(feature = "live_lighter")]
+    #[test]
+    fn roadmap_b_feature_live_lighter_enabled() {
+        assert!(cfg!(feature = "live_lighter"));
+        assert_eq!(
+            connector_support(ConnectorArg::Lighter),
+            ConnectorSupport::MarketAccountExec
+        );
+    }
+
+    #[cfg(feature = "live_extended")]
+    #[test]
+    fn roadmap_b_feature_live_extended_enabled() {
+        assert!(cfg!(feature = "live_extended"));
+        assert_eq!(
+            connector_support(ConnectorArg::Extended),
+            ConnectorSupport::MarketAccount
+        );
+    }
+
+    #[cfg(feature = "live_aster")]
+    #[test]
+    fn roadmap_b_feature_live_aster_enabled() {
+        assert!(cfg!(feature = "live_aster"));
+        assert_eq!(
+            connector_support(ConnectorArg::Aster),
+            ConnectorSupport::MarketAccount
+        );
+    }
+
+    #[cfg(feature = "live_paradex")]
+    #[test]
+    fn roadmap_b_feature_live_paradex_enabled() {
+        assert!(cfg!(feature = "live_paradex"));
+        assert_eq!(
+            connector_support(ConnectorArg::Paradex),
+            ConnectorSupport::MarketAccount
+        );
+    }
 }
