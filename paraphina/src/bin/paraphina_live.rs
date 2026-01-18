@@ -3,6 +3,7 @@
 //! This binary wires the live cache, event model, and strategy loop together
 //! without any external network connectors.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +20,7 @@ use paraphina::live::instrument::{InstrumentSpec, validate_specs};
 use paraphina::live::orderbook_l2::BookLevel;
 use paraphina::live::runner::{run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRuntimeHooks};
 use paraphina::io::GatewayPolicy;
-use paraphina::live::gateway::{LiveGateway, LiveRestClient};
+use paraphina::live::gateway::{GatewayMux, LiveGateway, LiveRestClient};
 use paraphina::live::paper_adapter::{PaperExecutionAdapter, PaperFillMode, PaperMarketUpdate};
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
@@ -48,7 +49,7 @@ impl From<TradeModeArg> for TradeMode {
     }
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq, Hash)]
 enum ConnectorArg {
     Mock,
     Hyperliquid,
@@ -76,7 +77,9 @@ impl ConnectorArg {
         match value.trim().to_ascii_lowercase().as_str() {
             "mock" => Some(ConnectorArg::Mock),
             "hyperliquid" | "hl" => Some(ConnectorArg::Hyperliquid),
-            "hyperliquid_fixture" | "hl_fixture" | "fixture" => Some(ConnectorArg::HyperliquidFixture),
+            "hyperliquid_fixture" | "hyperliquid-fixture" | "hl_fixture" | "hl-fixture" | "fixture" => {
+                Some(ConnectorArg::HyperliquidFixture)
+            }
             "lighter" => Some(ConnectorArg::Lighter),
             "extended" => Some(ConnectorArg::Extended),
             "aster" => Some(ConnectorArg::Aster),
@@ -132,6 +135,9 @@ struct Args {
     /// Connector to use: mock (default), hyperliquid, hyperliquid_fixture, lighter, extended, aster, paradex.
     #[arg(long, value_enum)]
     connector: Option<ConnectorArg>,
+    /// Connectors to use (comma-separated list).
+    #[arg(long)]
+    connectors: Option<String>,
     /// Explicitly allow live execution (only applies to trade-mode=live).
     #[arg(long)]
     enable_live_execution: bool,
@@ -144,6 +150,18 @@ struct Args {
     /// Output directory for telemetry/audit artifacts.
     #[arg(long)]
     out_dir: Option<String>,
+    /// Force Extended to use fixture feed (disables live WS).
+    #[arg(long)]
+    extended_fixture: bool,
+    /// Force Paradex to use fixture feed (disables live WS).
+    #[arg(long)]
+    paradex_fixture: bool,
+    /// Force Aster to use fixture feed (disables live WS).
+    #[arg(long)]
+    aster_fixture: bool,
+    /// Record live WS frames to fixtures dir (Aster/Extended/Paradex, manual runs).
+    #[arg(long)]
+    record_fixtures: bool,
 }
 
 fn resolve_connector(cli: Option<ConnectorArg>) -> ConnectorArg {
@@ -162,6 +180,128 @@ fn resolve_connector(cli: Option<ConnectorArg>) -> ConnectorArg {
         }
     }
     ConnectorArg::Mock
+}
+
+#[derive(Debug, Clone)]
+struct ConnectorSelection {
+    connectors: Vec<ConnectorArg>,
+    explicit_list: bool,
+}
+
+fn parse_connectors_list(raw: &str) -> Result<Vec<ConnectorArg>, String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut invalid = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match ConnectorArg::parse_env(trimmed) {
+            Some(connector) => {
+                if seen.insert(connector) {
+                    out.push(connector);
+                }
+            }
+            None => invalid.push(trimmed.to_string()),
+        }
+    }
+    if !invalid.is_empty() {
+        return Err(format!("invalid connectors: {:?}", invalid));
+    }
+    if out.is_empty() {
+        return Err("no connectors specified".to_string());
+    }
+    Ok(out)
+}
+
+fn resolve_connectors(args: &Args) -> ConnectorSelection {
+    if let Some(raw) = args.connectors.as_ref() {
+        if args.connector.is_some() {
+            eprintln!("paraphina_live | warn=connector_ignored reason=connectors_list_set");
+        }
+        let connectors = parse_connectors_list(raw).unwrap_or_else(|err| {
+            eprintln!("paraphina_live | error=invalid_connectors source=cli detail={err}");
+            std::process::exit(2);
+        });
+        return ConnectorSelection {
+            connectors,
+            explicit_list: true,
+        };
+    }
+    if let Ok(raw) = std::env::var("PARAPHINA_LIVE_CONNECTORS") {
+        if !raw.trim().is_empty() {
+            let connectors = parse_connectors_list(&raw).unwrap_or_else(|err| {
+                eprintln!("paraphina_live | error=invalid_connectors source=env detail={err}");
+                std::process::exit(2);
+            });
+            return ConnectorSelection {
+                connectors,
+                explicit_list: true,
+            };
+        }
+    }
+    ConnectorSelection {
+        connectors: vec![resolve_connector(args.connector)],
+        explicit_list: false,
+    }
+}
+
+fn connector_venue_id(connector: ConnectorArg) -> &'static str {
+    match connector {
+        ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => "hyperliquid",
+        ConnectorArg::Lighter => "lighter",
+        ConnectorArg::Extended => "extended",
+        ConnectorArg::Aster => "aster",
+        ConnectorArg::Paradex => "paradex",
+        ConnectorArg::Mock => "mock",
+    }
+}
+
+fn resolve_venue_index(cfg: &Config, venue_id: &str) -> Option<usize> {
+    cfg.venues.iter().position(|venue| venue.id == venue_id)
+}
+
+fn resolve_connector_venue(
+    cfg: &Config,
+    connector: ConnectorArg,
+) -> Result<(String, usize), String> {
+    let venue_id = connector_venue_id(connector).to_string();
+    if let Some(index) = resolve_venue_index(cfg, &venue_id) {
+        return Ok((venue_id, index));
+    }
+    if connector == ConnectorArg::Mock {
+        if let Some((index, venue)) = cfg.venues.iter().enumerate().next() {
+            return Ok((venue.id.clone(), index));
+        }
+    }
+    Err(format!(
+        "connector_venue_missing connector={} venue_id={}",
+        connector.as_str(),
+        venue_id
+    ))
+}
+
+fn resolve_fixture_dir(connector: ConnectorArg) -> Option<std::path::PathBuf> {
+    let env_key = match connector {
+        ConnectorArg::Paradex => "PARADEX_FIXTURE_DIR",
+        ConnectorArg::Aster => "ASTER_FIXTURE_DIR",
+        ConnectorArg::Extended => "EXTENDED_FIXTURE_DIR",
+        _ => return None,
+    };
+    if let Ok(val) = std::env::var(env_key) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(std::path::PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(root) = std::env::var("ROADMAP_B_FIXTURE_DIR") {
+        let trimmed = root.trim();
+        if !trimmed.is_empty() {
+            return Some(std::path::PathBuf::from(trimmed).join(connector_venue_id(connector)));
+        }
+    }
+    None
 }
 
 fn resolve_out_dir(cli: Option<String>) -> Option<std::path::PathBuf> {
@@ -379,6 +519,85 @@ fn env_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn paradex_fixture_mode(args: &Args) -> bool {
+    args.paradex_fixture || env_is_true("PARADEX_FIXTURE_MODE")
+}
+
+fn aster_fixture_mode(args: &Args) -> bool {
+    args.aster_fixture || env_is_true("ASTER_FIXTURE_MODE")
+}
+
+fn extended_fixture_mode(args: &Args) -> bool {
+    args.extended_fixture || env_is_true("EXTENDED_FIXTURE_MODE")
+}
+
+fn paradex_record_enabled(args: &Args) -> bool {
+    args.record_fixtures || env_is_true("PARADEX_RECORD_FIXTURES")
+}
+
+fn aster_record_enabled(args: &Args) -> bool {
+    args.record_fixtures || env_is_true("ASTER_RECORD_FIXTURES")
+}
+
+fn extended_record_enabled(args: &Args) -> bool {
+    args.record_fixtures || env_is_true("EXTENDED_RECORD_FIXTURES")
+}
+
+fn resolve_paradex_record_dir() -> PathBuf {
+    std::env::var("PARADEX_RECORD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./tests/fixtures/roadmap_b/paradex_live_recording"))
+}
+
+fn resolve_aster_record_dir() -> PathBuf {
+    std::env::var("ASTER_RECORD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./tests/fixtures/roadmap_b/aster_live_recording"))
+}
+
+fn resolve_extended_record_dir() -> PathBuf {
+    std::env::var("EXTENDED_RECORD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./tests/fixtures/roadmap_b/extended_live_recording"))
+}
+
+fn aster_ws_url() -> String {
+    std::env::var("ASTER_WS_URL").unwrap_or_else(|_| "wss://fstream.asterdex.com/ws".to_string())
+}
+
+fn extended_ws_url() -> String {
+    std::env::var("EXTENDED_WS_URL")
+        .unwrap_or_else(|_| "wss://stream.extended.exchange/ws".to_string())
+}
+
+fn paradex_ws_url() -> String {
+    std::env::var("PARADEX_WS_URL")
+        .unwrap_or_else(|_| "wss://ws.api.prod.paradex.trade/v1".to_string())
+}
+
+fn aster_market_symbol() -> String {
+    std::env::var("ASTER_MARKET").unwrap_or_else(|_| "BTCUSDT".to_string())
+}
+
+fn extended_market_symbol() -> String {
+    std::env::var("EXTENDED_MARKET").unwrap_or_else(|_| "BTCUSDT".to_string())
+}
+
+fn paradex_market_symbol() -> String {
+    std::env::var("PARADEX_MARKET").unwrap_or_else(|_| "BTC-USD-PERP".to_string())
+}
+
+fn is_valid_ws_url(url: &str) -> bool {
+    url.starts_with("wss://") || url.starts_with("ws://")
+}
+
+fn is_valid_symbol(symbol: &str) -> bool {
+    !symbol.trim().is_empty()
+        && symbol
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -386,17 +605,65 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn live_connector_supported(connector: ConnectorArg) -> bool {
-    match connector {
-        ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => cfg!(feature = "live_hyperliquid"),
-        ConnectorArg::Lighter => cfg!(feature = "live_lighter"),
-        ConnectorArg::Mock => true,
-        ConnectorArg::Extended | ConnectorArg::Aster | ConnectorArg::Paradex => false,
-    }
+fn live_connector_allowed_for_live_mode(connector: ConnectorArg) -> bool {
+    matches!(
+        connector,
+        ConnectorArg::Hyperliquid | ConnectorArg::Lighter | ConnectorArg::Aster | ConnectorArg::Extended
+    )
 }
 
-fn live_connector_allowed_for_live_mode(connector: ConnectorArg) -> bool {
-    matches!(connector, ConnectorArg::Hyperliquid | ConnectorArg::Lighter)
+fn connectors_allowed_for_live_mode(connectors: &[ConnectorArg]) -> bool {
+    connectors
+        .iter()
+        .copied()
+        .all(live_connector_allowed_for_live_mode)
+}
+
+fn connectors_label(connectors: &[ConnectorArg]) -> String {
+    connectors
+        .iter()
+        .map(ConnectorArg::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ConnectorSupport {
+    MissingFeature,
+    Stub,
+    MarketOnly,
+    MarketAccount,
+    MarketAccountExec,
+}
+
+fn connector_support(connector: ConnectorArg) -> ConnectorSupport {
+    match connector {
+        ConnectorArg::Mock => ConnectorSupport::MarketOnly,
+        ConnectorArg::Hyperliquid => ConnectorSupport::MarketAccountExec,
+        ConnectorArg::HyperliquidFixture => ConnectorSupport::MarketAccount,
+        ConnectorArg::Lighter => ConnectorSupport::MarketAccountExec,
+        ConnectorArg::Extended => {
+            if cfg!(feature = "live_extended") {
+                ConnectorSupport::MarketAccountExec
+            } else {
+                ConnectorSupport::MissingFeature
+            }
+        }
+        ConnectorArg::Aster => {
+            if cfg!(feature = "live_aster") {
+                ConnectorSupport::MarketAccountExec
+            } else {
+                ConnectorSupport::MissingFeature
+            }
+        }
+        ConnectorArg::Paradex => {
+            if cfg!(feature = "live_paradex") {
+                ConnectorSupport::MarketAccount
+            } else {
+                ConnectorSupport::MissingFeature
+            }
+        }
+    }
 }
 
 fn paper_market_update_from_event(
@@ -441,10 +708,144 @@ fn override_market_timestamp(
     }
 }
 
+fn rewrite_market_event(
+    event: paraphina::live::types::MarketDataEvent,
+    venue_id: &str,
+    venue_index: usize,
+) -> paraphina::live::types::MarketDataEvent {
+    match event {
+        paraphina::live::types::MarketDataEvent::L2Snapshot(mut snapshot) => {
+            snapshot.venue_id = venue_id.to_string();
+            snapshot.venue_index = venue_index;
+            paraphina::live::types::MarketDataEvent::L2Snapshot(snapshot)
+        }
+        paraphina::live::types::MarketDataEvent::L2Delta(mut delta) => {
+            delta.venue_id = venue_id.to_string();
+            delta.venue_index = venue_index;
+            paraphina::live::types::MarketDataEvent::L2Delta(delta)
+        }
+        paraphina::live::types::MarketDataEvent::Trade(mut trade) => {
+            trade.venue_id = venue_id.to_string();
+            trade.venue_index = venue_index;
+            paraphina::live::types::MarketDataEvent::Trade(trade)
+        }
+        paraphina::live::types::MarketDataEvent::FundingUpdate(mut update) => {
+            update.venue_id = venue_id.to_string();
+            update.venue_index = venue_index;
+            paraphina::live::types::MarketDataEvent::FundingUpdate(update)
+        }
+    }
+}
+
+fn rewrite_account_event(
+    event: paraphina::live::types::AccountEvent,
+    venue_id: &str,
+    venue_index: usize,
+) -> paraphina::live::types::AccountEvent {
+    match event {
+        paraphina::live::types::AccountEvent::Snapshot(mut snapshot) => {
+            snapshot.venue_id = venue_id.to_string();
+            snapshot.venue_index = venue_index;
+            paraphina::live::types::AccountEvent::Snapshot(snapshot)
+        }
+    }
+}
+
+fn rewrite_execution_event(
+    event: paraphina::live::types::ExecutionEvent,
+    venue_id: &str,
+    venue_index: usize,
+) -> paraphina::live::types::ExecutionEvent {
+    match event {
+        paraphina::live::types::ExecutionEvent::OrderAccepted(mut ack) => {
+            ack.venue_id = venue_id.to_string();
+            ack.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::OrderAccepted(ack)
+        }
+        paraphina::live::types::ExecutionEvent::OrderRejected(mut rej) => {
+            rej.venue_id = venue_id.to_string();
+            rej.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::OrderRejected(rej)
+        }
+        paraphina::live::types::ExecutionEvent::Filled(mut fill) => {
+            fill.venue_id = venue_id.to_string();
+            fill.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::Filled(fill)
+        }
+        paraphina::live::types::ExecutionEvent::CancelAccepted(mut ack) => {
+            ack.venue_id = venue_id.to_string();
+            ack.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::CancelAccepted(ack)
+        }
+        paraphina::live::types::ExecutionEvent::CancelRejected(mut rej) => {
+            rej.venue_id = venue_id.to_string();
+            rej.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::CancelRejected(rej)
+        }
+        paraphina::live::types::ExecutionEvent::CancelAllAccepted(mut ack) => {
+            ack.venue_id = venue_id.to_string();
+            ack.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::CancelAllAccepted(ack)
+        }
+        paraphina::live::types::ExecutionEvent::CancelAllRejected(mut rej) => {
+            rej.venue_id = venue_id.to_string();
+            rej.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::CancelAllRejected(rej)
+        }
+        paraphina::live::types::ExecutionEvent::OrderSnapshot(mut snapshot) => {
+            snapshot.venue_id = venue_id.to_string();
+            snapshot.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::OrderSnapshot(snapshot)
+        }
+    }
+}
+
+struct ConnectorChannels {
+    market_tx: mpsc::Sender<paraphina::live::types::MarketDataEvent>,
+    account_tx: mpsc::Sender<paraphina::live::types::AccountEvent>,
+    exec_tx: mpsc::Sender<paraphina::live::types::ExecutionEvent>,
+}
+
+fn spawn_connector_forwarders(
+    venue_id: String,
+    venue_index: usize,
+    market_rx: mpsc::Receiver<paraphina::live::types::MarketDataEvent>,
+    account_rx: mpsc::Receiver<paraphina::live::types::AccountEvent>,
+    exec_rx: mpsc::Receiver<paraphina::live::types::ExecutionEvent>,
+    market_ingest_tx: mpsc::Sender<paraphina::live::types::MarketDataEvent>,
+    account_tx: mpsc::Sender<paraphina::live::types::AccountEvent>,
+    exec_tx: mpsc::Sender<paraphina::live::types::ExecutionEvent>,
+) {
+    let venue_id_market = venue_id.clone();
+    let venue_id_account = venue_id.clone();
+    let venue_id_exec = venue_id.clone();
+    tokio::spawn(async move {
+        let mut rx = market_rx;
+        while let Some(event) = rx.recv().await {
+            let event = rewrite_market_event(event, &venue_id_market, venue_index);
+            let _ = market_ingest_tx.send(event).await;
+        }
+    });
+    tokio::spawn(async move {
+        let mut rx = account_rx;
+        while let Some(event) = rx.recv().await {
+            let event = rewrite_account_event(event, &venue_id_account, venue_index);
+            let _ = account_tx.send(event).await;
+        }
+    });
+    tokio::spawn(async move {
+        let mut rx = exec_rx;
+        while let Some(event) = rx.recv().await {
+            let event = rewrite_execution_event(event, &venue_id_exec, venue_index);
+            let _ = exec_tx.send(event).await;
+        }
+    });
+}
+
 fn enforce_live_execution_guardrails(
     args: &Args,
     trade_mode: TradeMode,
-    connector: ConnectorArg,
+    connectors: &[ConnectorArg],
     canary_profile: Option<&PathBuf>,
     canary_settings: Option<&CanarySettings>,
 ) {
@@ -456,10 +857,10 @@ fn enforce_live_execution_guardrails(
     let exec_confirm_env = env_is_yes("PARAPHINA_LIVE_EXECUTION_CONFIRM");
     let live_flag = args.enable_live_execution;
 
-    if !live_connector_allowed_for_live_mode(connector) {
+    if !connectors_allowed_for_live_mode(connectors) {
         eprintln!(
-            "paraphina_live | error=live_mode_connector_invalid connector={} (use --trade-mode shadow for safe runs)",
-            connector.as_str()
+            "paraphina_live | error=live_mode_connector_invalid connectors={} (use --trade-mode shadow for safe runs)",
+            connectors_label(connectors)
         );
         std::process::exit(2);
     }
@@ -514,7 +915,8 @@ struct PreflightCheck {
 fn run_preflight(
     args: &Args,
     trade_mode: TradeMode,
-    connector: ConnectorArg,
+    connectors: &[ConnectorArg],
+    cfg: &Config,
     out_dir: Option<std::path::PathBuf>,
     canary_error: Option<&str>,
     canary_settings: Option<&CanarySettings>,
@@ -528,13 +930,124 @@ fn run_preflight(
         details: trade_mode_detail,
     });
 
-    let connector_ok = live_connector_supported(connector);
-    let connector_detail = format!("selected={} supported={}", connector.as_str(), connector_ok);
+    let mut connector_ok = true;
+    let mut connector_details = Vec::new();
+    for connector in connectors {
+        let support = connector_support(*connector);
+        let supported = matches!(
+            support,
+            ConnectorSupport::MarketOnly
+                | ConnectorSupport::MarketAccount
+                | ConnectorSupport::MarketAccountExec
+        );
+        if !supported {
+            connector_ok = false;
+        }
+        connector_details.push(format!(
+            "{}:{:?}",
+            connector.as_str(),
+            support
+        ));
+    }
     checks.push(PreflightCheck {
-        label: "connector",
+        label: "connectors",
         ok: connector_ok,
-        details: connector_detail,
+        details: connector_details.join(","),
     });
+
+    let mut venue_ok = true;
+    let mut venue_details = Vec::new();
+    for connector in connectors {
+        match resolve_connector_venue(cfg, *connector) {
+            Ok((venue_id, index)) => {
+                venue_details.push(format!("{}:{}", venue_id, index));
+            }
+            Err(err) => {
+                venue_ok = false;
+                venue_details.push(err);
+            }
+        }
+    }
+    checks.push(PreflightCheck {
+        label: "venues",
+        ok: venue_ok,
+        details: venue_details.join(","),
+    });
+
+    if connectors.iter().any(|c| *c == ConnectorArg::Extended) && !extended_fixture_mode(args) {
+        let ws_url = extended_ws_url();
+        let market = extended_market_symbol();
+        let ws_ok = is_valid_ws_url(&ws_url);
+        let market_ok = is_valid_symbol(&market);
+        checks.push(PreflightCheck {
+            label: "extended_ws_url",
+            ok: ws_ok,
+            details: if ws_ok {
+                "ok".to_string()
+            } else {
+                format!("invalid url={}", ws_url)
+            },
+        });
+        checks.push(PreflightCheck {
+            label: "extended_market",
+            ok: market_ok,
+            details: if market_ok {
+                format!("symbol={}", market)
+            } else {
+                format!("invalid symbol={}", market)
+            },
+        });
+    }
+
+    if connectors.iter().any(|c| *c == ConnectorArg::Paradex) && !paradex_fixture_mode(args) {
+        let ws_url = paradex_ws_url();
+        let market = paradex_market_symbol();
+        let ws_ok = is_valid_ws_url(&ws_url);
+        let market_ok = is_valid_symbol(&market);
+        checks.push(PreflightCheck {
+            label: "paradex_ws_url",
+            ok: ws_ok,
+            details: if ws_ok {
+                "ok".to_string()
+            } else {
+                format!("invalid url={}", ws_url)
+            },
+        });
+        checks.push(PreflightCheck {
+            label: "paradex_market",
+            ok: market_ok,
+            details: if market_ok {
+                format!("symbol={}", market)
+            } else {
+                format!("invalid symbol={}", market)
+            },
+        });
+    }
+
+    if connectors.iter().any(|c| *c == ConnectorArg::Aster) && !aster_fixture_mode(args) {
+        let ws_url = aster_ws_url();
+        let market = aster_market_symbol();
+        let ws_ok = is_valid_ws_url(&ws_url);
+        let market_ok = is_valid_symbol(&market);
+        checks.push(PreflightCheck {
+            label: "aster_ws_url",
+            ok: ws_ok,
+            details: if ws_ok {
+                "ok".to_string()
+            } else {
+                format!("invalid url={}", ws_url)
+            },
+        });
+        checks.push(PreflightCheck {
+            label: "aster_market",
+            ok: market_ok,
+            details: if market_ok {
+                format!("symbol={}", market)
+            } else {
+                format!("invalid symbol={}", market)
+            },
+        });
+    }
 
     if trade_mode == TradeMode::Live {
         let canary_ok = canary_error.is_none()
@@ -604,35 +1117,155 @@ fn run_preflight(
 
     let mut creds_ok = true;
     let mut creds_detail = String::new();
-    match connector {
-        ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => {
-            let key_present = env_present("HL_PRIVATE_KEY");
-            let vault_present = env_present("HL_VAULT_ADDRESS");
-            if trade_mode == TradeMode::Live {
-                creds_ok = key_present && vault_present;
+    for connector in connectors {
+        match connector {
+            ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => {
+                let key_present = env_present("HL_PRIVATE_KEY");
+                let vault_present = env_present("HL_VAULT_ADDRESS");
+                if trade_mode == TradeMode::Live {
+                    creds_ok = creds_ok && key_present && vault_present;
+                }
+                let mut detail = format!(
+                    "{}:hl_private_key={} hl_vault_address={}",
+                    connector.as_str(),
+                    key_present,
+                    vault_present
+                );
+                if *connector == ConnectorArg::HyperliquidFixture {
+                    let fixture_dir = std::env::var("HL_FIXTURE_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| std::path::PathBuf::from("./tests/fixtures/hyperliquid"));
+                    let fixture_ok = fixture_dir.is_dir();
+                    creds_ok = creds_ok && fixture_ok;
+                    detail.push_str(&format!(" fixture_dir_ok={}", fixture_ok));
+                }
+                creds_detail.push_str(&detail);
             }
-            creds_detail = format!(
-                "hl_private_key={} hl_vault_address={}",
-                key_present, vault_present
-            );
-            if connector == ConnectorArg::HyperliquidFixture {
-                let fixture_dir = std::env::var("HL_FIXTURE_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from("./tests/fixtures/hyperliquid"));
-                let fixture_ok = fixture_dir.is_dir();
-                creds_ok = creds_ok && fixture_ok;
-                creds_detail.push_str(&format!(" fixture_dir_ok={}", fixture_ok));
+            ConnectorArg::Lighter => {
+                let fixture_dir = std::env::var("LIGHTER_FIXTURE_DIR").ok();
+                let fixture_ok = fixture_dir
+                    .as_ref()
+                    .map(|dir| std::path::Path::new(dir).is_dir())
+                    .unwrap_or(false);
+                if trade_mode == TradeMode::Live {
+                    creds_ok = creds_ok && true;
+                }
+                let detail = format!(
+                    "{}:no_key_required=true fixture_dir_ok={}",
+                    connector.as_str(),
+                    fixture_ok
+                );
+                creds_detail.push_str(&detail);
+            }
+            ConnectorArg::Mock => {
+                creds_ok = creds_ok && trade_mode != TradeMode::Live;
+                let detail = format!("{}:no_live_keys", connector.as_str());
+                creds_detail.push_str(&detail);
+            }
+            ConnectorArg::Paradex => {
+                let use_fixture = paradex_fixture_mode(args);
+                if use_fixture {
+                    let fixture_dir = resolve_fixture_dir(*connector);
+                    let fixture_ok = fixture_dir
+                        .as_ref()
+                        .map(|dir| dir.is_dir())
+                        .unwrap_or(false);
+                    creds_ok = creds_ok && fixture_ok;
+                    let detail = format!(
+                        "{}:fixture_dir_ok={} fixture_mode=true",
+                        connector.as_str(),
+                        fixture_ok
+                    );
+                    creds_detail.push_str(&detail);
+                } else {
+                    let ws_ok = is_valid_ws_url(&paradex_ws_url());
+                    let market_ok = is_valid_symbol(&paradex_market_symbol());
+                    creds_ok = creds_ok && ws_ok && market_ok;
+                    let detail = format!(
+                        "{}:public_ws=true ws_url_ok={} market_ok={}",
+                        connector.as_str(),
+                        ws_ok,
+                        market_ok
+                    );
+                    creds_detail.push_str(&detail);
+                }
+            }
+            ConnectorArg::Extended => {
+                let use_fixture = extended_fixture_mode(args);
+                if use_fixture {
+                    let fixture_dir = resolve_fixture_dir(*connector);
+                    let fixture_ok = fixture_dir
+                        .as_ref()
+                        .map(|dir| dir.is_dir())
+                        .unwrap_or(false);
+                    creds_ok = creds_ok && fixture_ok;
+                    let detail = format!(
+                        "{}:fixture_dir_ok={} fixture_mode=true",
+                        connector.as_str(),
+                        fixture_ok
+                    );
+                    creds_detail.push_str(&detail);
+                } else {
+                    let ws_ok = is_valid_ws_url(&extended_ws_url());
+                    let market_ok = is_valid_symbol(&extended_market_symbol());
+                    let key_present = env_present("EXTENDED_API_KEY");
+                    let secret_present = env_present("EXTENDED_API_SECRET");
+                    let needs_keys = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
+                    if needs_keys {
+                        creds_ok = creds_ok && key_present && secret_present;
+                    }
+                    creds_ok = creds_ok && ws_ok && market_ok;
+                    let detail = format!(
+                        "{}:public_ws=true ws_url_ok={} market_ok={} api_key={} api_secret={}",
+                        connector.as_str(),
+                        ws_ok,
+                        market_ok,
+                        key_present,
+                        secret_present
+                    );
+                    creds_detail.push_str(&detail);
+                }
+            }
+            ConnectorArg::Aster => {
+                let use_fixture = aster_fixture_mode(args);
+                if use_fixture {
+                    let fixture_dir = resolve_fixture_dir(*connector);
+                    let fixture_ok = fixture_dir
+                        .as_ref()
+                        .map(|dir| dir.is_dir())
+                        .unwrap_or(false);
+                    creds_ok = creds_ok && fixture_ok;
+                    let detail = format!(
+                        "{}:fixture_dir_ok={} fixture_mode=true",
+                        connector.as_str(),
+                        fixture_ok
+                    );
+                    creds_detail.push_str(&detail);
+                } else {
+                    let ws_ok = is_valid_ws_url(&aster_ws_url());
+                    let market_ok = is_valid_symbol(&aster_market_symbol());
+                    let key_present = env_present("ASTER_API_KEY");
+                    let secret_present = env_present("ASTER_API_SECRET");
+                    let needs_keys = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
+                    if needs_keys {
+                        creds_ok = creds_ok && key_present && secret_present;
+                    }
+                    creds_ok = creds_ok && ws_ok && market_ok;
+                    let detail = format!(
+                        "{}:public_ws=true ws_url_ok={} market_ok={} api_key={} api_secret={}",
+                        connector.as_str(),
+                        ws_ok,
+                        market_ok,
+                        key_present,
+                        secret_present
+                    );
+                    creds_detail.push_str(&detail);
+                }
             }
         }
-        ConnectorArg::Lighter => {
-            creds_ok = true;
-            creds_detail = "no_key_required=true".to_string();
-        }
-        ConnectorArg::Mock | ConnectorArg::Extended | ConnectorArg::Aster | ConnectorArg::Paradex => {
-            creds_ok = trade_mode != TradeMode::Live;
-            creds_detail = "no_live_keys".to_string();
-        }
+        creds_detail.push(' ');
     }
+    creds_detail = creds_detail.trim_end().to_string();
     checks.push(PreflightCheck {
         label: "credentials",
         ok: creds_ok,
@@ -640,7 +1273,7 @@ fn run_preflight(
     });
 
     let live_guard_ok = if trade_mode == TradeMode::Live {
-        live_connector_allowed_for_live_mode(connector)
+        connectors_allowed_for_live_mode(connectors)
             && args.enable_live_execution
             && env_is_true("PARAPHINA_LIVE_EXEC_ENABLE")
             && env_is_yes("PARAPHINA_LIVE_EXECUTION_CONFIRM")
@@ -684,7 +1317,8 @@ async fn main() {
     let build_info = paraphina::BuildInfo::capture();
     let trade_mode = resolve_effective_trade_mode(args.trade_mode.map(TradeMode::from));
     trade_mode.log_startup();
-    let connector = resolve_connector(args.connector);
+    let connector_selection = resolve_connectors(&args);
+    let connectors = connector_selection.connectors.clone();
     let out_dir = resolve_out_dir(args.out_dir.clone());
     let paper_mode = trade_mode.trade_mode == TradeMode::Paper;
     let paper_route_sandbox = env_is_true("PARAPHINA_PAPER_ROUTE_SANDBOX");
@@ -720,11 +1354,19 @@ async fn main() {
             }
         }
     }
+    if connector_selection.explicit_list {
+        let selected: HashSet<&str> = connectors
+            .iter()
+            .map(|connector| connector_venue_id(*connector))
+            .collect();
+        cfg.venues.retain(|venue| selected.contains(venue.id.as_str()));
+    }
     if args.preflight {
         let ok = run_preflight(
             &args,
             trade_mode.trade_mode,
-            connector,
+            &connectors,
+            &cfg,
             out_dir.clone(),
             canary_error.as_deref(),
             canary_settings.as_ref(),
@@ -734,7 +1376,7 @@ async fn main() {
     enforce_live_execution_guardrails(
         &args,
         trade_mode.trade_mode,
-        connector,
+        &connectors,
         canary_profile.as_ref(),
         canary_settings.as_ref(),
     );
@@ -744,14 +1386,14 @@ async fn main() {
         &cfg,
         &build_info,
         trade_mode.trade_mode,
-        connector.as_str(),
+        &connectors_label(&connectors),
         &metrics_addr,
     );
     println!("{startup_log}");
     eprintln!(
-        "paraphina_live | trade_mode={} connector={}",
+        "paraphina_live | trade_mode={} connectors={}",
         trade_mode.trade_mode.as_str(),
-        connector.as_str()
+        connectors_label(&connectors)
     );
 
     let audit_dir = out_dir.clone().unwrap_or_else(default_audit_dir);
@@ -818,205 +1460,508 @@ async fn main() {
     }
     let (order_tx, mut order_rx) = mpsc::channel::<LiveOrderRequest>(256);
 
-    if matches!(connector, ConnectorArg::Mock) {
-        let market_tx_clone = market_ingest_tx.clone();
-        tokio::spawn(async move {
-            let mut seq: u64 = 0;
-            let mut mid = 100.0;
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-                seq += 1;
-                mid += if seq % 2 == 0 { 0.1 } else { -0.1 };
-                let bids = vec![
-                    BookLevel { price: mid - 0.5, size: 5.0 },
-                    BookLevel { price: mid - 1.0, size: 5.0 },
-                ];
-                let asks = vec![
-                    BookLevel { price: mid + 0.5, size: 5.0 },
-                    BookLevel { price: mid + 1.0, size: 5.0 },
-                ];
-                let snapshot = L2Snapshot {
-                    venue_index: 0,
-                    venue_id: "mock".to_string(),
-                    seq,
-                    timestamp_ms: 0,
-                    bids,
-                    asks,
-                };
-                let _ = market_tx_clone
-                    .send(paraphina::live::types::MarketDataEvent::L2Snapshot(snapshot))
-                    .await;
-            }
-        });
-    }
-
     let exec_enable_env = env_is_true("PARAPHINA_LIVE_EXEC_ENABLE");
     let allow_live_gateway = exec_enable_env
         && trade_mode.trade_mode != TradeMode::Shadow
         && (!paper_mode || paper_route_sandbox);
-    let mut exec_client: Option<std::sync::Arc<dyn LiveRestClient>> = None;
-    let mut exec_supported = false;
+    let mut connector_channels: HashMap<ConnectorArg, ConnectorChannels> = HashMap::new();
+    let mut connector_venues: HashMap<ConnectorArg, (String, usize)> = HashMap::new();
+    for connector in &connectors {
+        let (venue_id, venue_index) = match resolve_connector_venue(&cfg, *connector) {
+            Ok((venue_id, venue_index)) => (venue_id, venue_index),
+            Err(err) => {
+                eprintln!("paraphina_live | error={err}");
+                return;
+            }
+        };
+        let (market_tx, market_rx) = mpsc::channel(1024);
+        let (account_tx, account_rx) = mpsc::channel(256);
+        let (exec_tx_local, exec_rx_local) = mpsc::channel(512);
+        spawn_connector_forwarders(
+            venue_id.clone(),
+            venue_index,
+            market_rx,
+            account_rx,
+            exec_rx_local,
+            market_ingest_tx.clone(),
+            _account_tx.clone(),
+            exec_tx.clone(),
+        );
+        connector_channels.insert(
+            *connector,
+            ConnectorChannels {
+                market_tx,
+                account_tx,
+                exec_tx: exec_tx_local,
+            },
+        );
+        connector_venues.insert(*connector, (venue_id, venue_index));
+    }
 
-    match connector {
-        ConnectorArg::Hyperliquid => {
-            #[cfg(feature = "live_hyperliquid")]
-            {
-                let hl_cfg = paraphina::live::connectors::hyperliquid::HyperliquidConfig::from_env();
-                let mut hl = paraphina::live::connectors::hyperliquid::HyperliquidConnector::new(
-                    hl_cfg.clone(),
-                    market_ingest_tx.clone(),
-                    exec_tx.clone(),
-                );
-                if trade_mode.trade_mode != TradeMode::Shadow {
-                    if hl_cfg.vault_address.is_some() {
-                        let account_tx = _account_tx.clone();
-                        hl = hl.with_account_tx(account_tx);
-                        // account_tx wired below
-                    } else {
-                        eprintln!("paraphina_live | account_snapshots_disabled=true reason=missing_hl_vault_address");
-                        send_unavailable_account_snapshot(&_account_tx, &cfg);
-                    }
-                } else {
-                    eprintln!("paraphina_live | account_snapshots_disabled=true reason=trade_mode_shadow");
-                    send_unavailable_account_snapshot(&_account_tx, &cfg);
-                }
-                let hl_arc = Arc::new(hl);
-                exec_supported = true;
-                if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
-                    if hl_cfg.private_key_hex.is_some() {
-                        exec_client = Some(hl_arc.clone());
-                    } else {
-                        eprintln!("paraphina_live | exec_disabled=true reason=missing_hl_private_key");
-                    }
-                }
-                if trade_mode.trade_mode != TradeMode::Shadow && hl_cfg.vault_address.is_some() {
-                    let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(5_000);
-                    let hl_poll = hl_arc.clone();
-                    tokio::spawn(async move {
-                        hl_poll.run_account_polling(poll_ms).await;
-                    });
-                    if hl_cfg.private_key_hex.is_some() {
-                        let hl_private = hl_arc.clone();
-                        tokio::spawn(async move {
-                            hl_private.run_private_ws().await;
-                        });
-                    } else {
-                        eprintln!("paraphina_live | private_ws_disabled=true reason=missing_hl_private_key");
-                    }
-                }
-                let hl_public = hl_arc.clone();
-                tokio::spawn(async move {
-                    hl_public.run_public_ws().await;
-                });
-            }
-            #[cfg(not(feature = "live_hyperliquid"))]
-            {
-                eprintln!("paraphina_live | error=connector_unavailable connector=hyperliquid");
-                return;
-            }
-        }
-        ConnectorArg::HyperliquidFixture => {
-            #[cfg(feature = "live_hyperliquid")]
-            {
-                let fixture_dir = std::env::var("HL_FIXTURE_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|_| std::path::PathBuf::from("./tests/fixtures/hyperliquid"));
-                match paraphina::live::connectors::hyperliquid::HyperliquidFixtureFeed::from_dir(
-                    &fixture_dir,
-                ) {
-                    Ok(feed) => {
-                        tokio::spawn(async move {
-                            feed.run_ticks(market_ingest_tx.clone(), 1_000, 250, 200).await;
-                        });
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "paraphina_live | error=fixture_dir_unreadable dir={} err={}",
-                            fixture_dir.display(),
-                            err
-                        );
-                    }
-                }
-                if let Ok(feed) = paraphina::live::connectors::hyperliquid::HyperliquidAccountFixtureFeed::from_dir(&fixture_dir) {
-                    let account_tx = _account_tx.clone();
-                    tokio::spawn(async move {
-                        feed.run_ticks(account_tx, 1_000, 250, 200).await;
-                    });
-                }
-                exec_supported = true;
-            }
-            #[cfg(not(feature = "live_hyperliquid"))]
-            {
-                eprintln!("paraphina_live | error=connector_unavailable connector=hyperliquid_fixture");
-                return;
-            }
-        }
-        ConnectorArg::Lighter => {
-            #[cfg(feature = "live_lighter")]
-            {
-                let lighter_cfg = paraphina::live::connectors::lighter::LighterConfig::from_env();
-                let mut lighter = paraphina::live::connectors::lighter::LighterConnector::new(
-                    lighter_cfg.clone(),
-                    market_ingest_tx.clone(),
-                    exec_tx.clone(),
-                );
-                if trade_mode.trade_mode != TradeMode::Shadow {
-                    if lighter_cfg.paper_mode {
-                        eprintln!("paraphina_live | account_snapshots_disabled=true reason=lighter_paper_mode");
-                        send_unavailable_account_snapshot(&_account_tx, &cfg);
-                    } else {
-                        lighter = lighter.with_account_tx(_account_tx.clone());
-                        // account_tx wired below
-                    }
-                } else {
-                    eprintln!("paraphina_live | account_snapshots_disabled=true reason=trade_mode_shadow");
-                    send_unavailable_account_snapshot(&_account_tx, &cfg);
-                }
-                let lighter_arc = Arc::new(lighter);
-                exec_supported = true;
-                if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
-                    if lighter_cfg.paper_mode {
-                        eprintln!("paraphina_live | exec_disabled=true reason=lighter_paper_mode");
-                    } else {
-                        exec_client = Some(lighter_arc.clone());
-                    }
-                }
-                if trade_mode.trade_mode != TradeMode::Shadow && !lighter_cfg.paper_mode {
-                    let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(5_000);
-                    let lighter_poll = lighter_arc.clone();
-                    tokio::spawn(async move {
-                        lighter_poll.run_account_polling(poll_ms).await;
-                    });
-                }
-                let lighter_public = lighter_arc.clone();
-                tokio::spawn(async move {
-                    lighter_public.run_public_ws().await;
-                });
-            }
-            #[cfg(not(feature = "live_lighter"))]
-            {
-                eprintln!("paraphina_live | error=connector_unavailable connector=lighter");
-                return;
-            }
-        }
-        ConnectorArg::Extended | ConnectorArg::Aster | ConnectorArg::Paradex => {
+    let mut exec_clients: BTreeMap<String, Arc<dyn LiveRestClient>> = BTreeMap::new();
+    for connector in &connectors {
+        let support = connector_support(*connector);
+        if matches!(support, ConnectorSupport::MissingFeature) {
             eprintln!(
                 "paraphina_live | error=connector_unavailable connector={}",
                 connector.as_str()
             );
             return;
         }
-        ConnectorArg::Mock => {}
+        if matches!(support, ConnectorSupport::Stub) {
+            eprintln!(
+                "paraphina_live | error=connector_stub connector={}",
+                connector.as_str()
+            );
+            return;
+        }
+        let Some(channels) = connector_channels.get(connector) else {
+            continue;
+        };
+        let (venue_id, venue_index) = connector_venues
+            .get(connector)
+            .cloned()
+            .unwrap_or_else(|| (connector.as_str().to_string(), 0));
+        match connector {
+            ConnectorArg::Mock => {
+                let market_tx_clone = channels.market_tx.clone();
+                tokio::spawn(async move {
+                    let mut seq: u64 = 0;
+                    let mut mid = 100.0;
+                    let mut interval = tokio::time::interval(Duration::from_millis(500));
+                    loop {
+                        interval.tick().await;
+                        seq += 1;
+                        mid += if seq % 2 == 0 { 0.1 } else { -0.1 };
+                        let bids = vec![
+                            BookLevel { price: mid - 0.5, size: 5.0 },
+                            BookLevel { price: mid - 1.0, size: 5.0 },
+                        ];
+                        let asks = vec![
+                            BookLevel { price: mid + 0.5, size: 5.0 },
+                            BookLevel { price: mid + 1.0, size: 5.0 },
+                        ];
+                        let snapshot = L2Snapshot {
+                            venue_index: 0,
+                            venue_id: "mock".to_string(),
+                            seq,
+                            timestamp_ms: 0,
+                            bids,
+                            asks,
+                        };
+                        let _ = market_tx_clone
+                            .send(paraphina::live::types::MarketDataEvent::L2Snapshot(snapshot))
+                            .await;
+                    }
+                });
+            }
+            ConnectorArg::Hyperliquid => {
+                #[cfg(feature = "live_hyperliquid")]
+                {
+                    let hl_cfg =
+                        paraphina::live::connectors::hyperliquid::HyperliquidConfig::from_env();
+                    let mut hl = paraphina::live::connectors::hyperliquid::HyperliquidConnector::new(
+                        hl_cfg.clone(),
+                        channels.market_tx.clone(),
+                        channels.exec_tx.clone(),
+                    );
+                    if trade_mode.trade_mode != TradeMode::Shadow {
+                        if hl_cfg.vault_address.is_some() {
+                            let account_tx = channels.account_tx.clone();
+                            hl = hl.with_account_tx(account_tx);
+                        } else {
+                            eprintln!(
+                                "paraphina_live | account_snapshots_disabled=true reason=missing_hl_vault_address connector=hyperliquid"
+                            );
+                            if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
+                                send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "paraphina_live | account_snapshots_disabled=true reason=trade_mode_shadow connector=hyperliquid"
+                        );
+                        if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
+                            send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                        }
+                    }
+                    let hl_arc = Arc::new(hl);
+                    if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
+                        if hl_cfg.private_key_hex.is_some() {
+                            exec_clients.insert(venue_id.clone(), hl_arc.clone());
+                        } else {
+                            eprintln!("paraphina_live | exec_disabled=true reason=missing_hl_private_key connector=hyperliquid");
+                        }
+                    }
+                    if trade_mode.trade_mode != TradeMode::Shadow && hl_cfg.vault_address.is_some() {
+                        let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(5_000);
+                        let hl_poll = hl_arc.clone();
+                        tokio::spawn(async move {
+                            hl_poll.run_account_polling(poll_ms).await;
+                        });
+                        if hl_cfg.private_key_hex.is_some() {
+                            let hl_private = hl_arc.clone();
+                            tokio::spawn(async move {
+                                hl_private.run_private_ws().await;
+                            });
+                        } else {
+                            eprintln!("paraphina_live | private_ws_disabled=true reason=missing_hl_private_key connector=hyperliquid");
+                        }
+                    }
+                    let hl_public = hl_arc.clone();
+                    tokio::spawn(async move {
+                        hl_public.run_public_ws().await;
+                    });
+                }
+                #[cfg(not(feature = "live_hyperliquid"))]
+                {
+                    eprintln!("paraphina_live | error=connector_unavailable connector=hyperliquid");
+                    return;
+                }
+            }
+            ConnectorArg::HyperliquidFixture => {
+                #[cfg(feature = "live_hyperliquid")]
+                {
+                    let fixture_dir = std::env::var("HL_FIXTURE_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|_| std::path::PathBuf::from("./tests/fixtures/hyperliquid"));
+                    match paraphina::live::connectors::hyperliquid::HyperliquidFixtureFeed::from_dir(
+                        &fixture_dir,
+                    ) {
+                        Ok(feed) => {
+                            let market_tx = channels.market_tx.clone();
+                            tokio::spawn(async move {
+                                feed.run_ticks(market_tx, 1_000, 250, 200).await;
+                            });
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "paraphina_live | error=fixture_dir_unreadable dir={} err={}",
+                                fixture_dir.display(),
+                                err
+                            );
+                        }
+                    }
+                    if let Ok(feed) = paraphina::live::connectors::hyperliquid::HyperliquidAccountFixtureFeed::from_dir(&fixture_dir) {
+                        let account_tx = channels.account_tx.clone();
+                        tokio::spawn(async move {
+                            feed.run_ticks(account_tx, 1_000, 250, 200).await;
+                        });
+                    }
+                }
+                #[cfg(not(feature = "live_hyperliquid"))]
+                {
+                    eprintln!("paraphina_live | error=connector_unavailable connector=hyperliquid_fixture");
+                    return;
+                }
+            }
+            ConnectorArg::Lighter => {
+                #[cfg(feature = "live_lighter")]
+                {
+                    let lighter_cfg = paraphina::live::connectors::lighter::LighterConfig::from_env();
+                    let mut lighter = paraphina::live::connectors::lighter::LighterConnector::new(
+                        lighter_cfg.clone(),
+                        channels.market_tx.clone(),
+                        channels.exec_tx.clone(),
+                    );
+                    if trade_mode.trade_mode != TradeMode::Shadow {
+                        if lighter_cfg.paper_mode {
+                            eprintln!("paraphina_live | account_snapshots_disabled=true reason=lighter_paper_mode connector=lighter");
+                            if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
+                                send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                            }
+                        } else {
+                            lighter = lighter.with_account_tx(channels.account_tx.clone());
+                        }
+                    } else {
+                        eprintln!("paraphina_live | account_snapshots_disabled=true reason=trade_mode_shadow connector=lighter");
+                        if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
+                            send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                        }
+                    }
+                    let lighter_arc = Arc::new(lighter);
+                    let fixture_dir = std::env::var("LIGHTER_FIXTURE_DIR")
+                        .ok()
+                        .map(std::path::PathBuf::from);
+                    if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
+                        if lighter_cfg.paper_mode {
+                            eprintln!("paraphina_live | exec_disabled=true reason=lighter_paper_mode connector=lighter");
+                        } else {
+                            exec_clients.insert(venue_id.clone(), lighter_arc.clone());
+                        }
+                    }
+                    if let Some(fixture_dir) = fixture_dir {
+                        if trade_mode.trade_mode != TradeMode::Shadow {
+                            let fixture_dir_clone = fixture_dir.clone();
+                            let lighter_fixture = lighter_arc.clone();
+                            tokio::spawn(async move {
+                                lighter_fixture
+                                    .run_account_fixture(&fixture_dir_clone, 1_000, 250, 200)
+                                    .await;
+                            });
+                        }
+                        if let Ok(feed) =
+                            paraphina::live::connectors::lighter::LighterFixtureFeed::from_dir(
+                                &fixture_dir,
+                            )
+                        {
+                            let market_tx = channels.market_tx.clone();
+                            tokio::spawn(async move {
+                                feed.run_ticks(market_tx, 1_000, 250, 200).await;
+                            });
+                        } else {
+                            eprintln!(
+                                "paraphina_live | warn=lighter_fixture_missing dir={}",
+                                fixture_dir.display()
+                            );
+                        }
+                    } else {
+                        if trade_mode.trade_mode != TradeMode::Shadow && !lighter_cfg.paper_mode {
+                            let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+                                .ok()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(5_000);
+                            let lighter_poll = lighter_arc.clone();
+                            tokio::spawn(async move {
+                                lighter_poll.run_account_polling(poll_ms).await;
+                            });
+                        }
+                        let lighter_public = lighter_arc.clone();
+                        tokio::spawn(async move {
+                            lighter_public.run_public_ws().await;
+                        });
+                    }
+                }
+                #[cfg(not(feature = "live_lighter"))]
+                {
+                    eprintln!("paraphina_live | error=connector_unavailable connector=lighter");
+                    return;
+                }
+            }
+            ConnectorArg::Extended => {
+                #[cfg(feature = "live_extended")]
+                {
+                    if extended_fixture_mode(&args) {
+                        let Some(fixture_dir) = resolve_fixture_dir(*connector) else {
+                            eprintln!("paraphina_live | error=fixture_dir_missing connector=extended");
+                            return;
+                        };
+                        match paraphina::live::connectors::extended::ExtendedFixtureFeed::from_dir(&fixture_dir) {
+                            Ok(feed) => {
+                                let market_tx = channels.market_tx.clone();
+                                let account_tx = channels.account_tx.clone();
+                                let venue_id = venue_id.clone();
+                                tokio::spawn(async move {
+                                    feed.run_ticks(market_tx, account_tx, &venue_id, venue_index, 1_000, 250, 200).await;
+                                });
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "paraphina_live | error=fixture_dir_unreadable connector=extended dir={} err={}",
+                                    fixture_dir.display(),
+                                    err
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        let mut extended_cfg =
+                            paraphina::live::connectors::extended::ExtendedConfig::from_env();
+                        if extended_record_enabled(&args) {
+                            extended_cfg = extended_cfg.with_record_dir(resolve_extended_record_dir());
+                        }
+                        let rest_client = Arc::new(
+                            paraphina::live::connectors::extended::ExtendedRestClient::new(
+                                extended_cfg.clone(),
+                            ),
+                        );
+                        let extended = paraphina::live::connectors::extended::ExtendedConnector::new(
+                            extended_cfg,
+                            channels.market_tx.clone(),
+                        );
+                        let extended_arc = Arc::new(extended);
+                        let extended_public = extended_arc.clone();
+                        tokio::spawn(async move {
+                            extended_public.run_public_ws().await;
+                        });
+                        if trade_mode.trade_mode != TradeMode::Shadow {
+                            if rest_client.has_auth() {
+                                let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .unwrap_or(5_000);
+                                let account_tx = channels.account_tx.clone();
+                                let venue_id = venue_id.clone();
+                                let rest_client_clone = rest_client.clone();
+                                tokio::spawn(async move {
+                                    rest_client_clone
+                                        .run_account_polling(account_tx, venue_id, venue_index, poll_ms)
+                                        .await;
+                                });
+                            } else {
+                                eprintln!(
+                                    "paraphina_live | account_snapshots_disabled=true reason=missing_extended_api_keys connector=extended"
+                                );
+                                if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
+                                    send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                                }
+                            }
+                        }
+                        if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
+                            if rest_client.has_auth() {
+                                exec_clients.insert(venue_id.clone(), rest_client.clone());
+                            } else {
+                                eprintln!(
+                                    "paraphina_live | exec_disabled=true reason=missing_extended_api_keys connector=extended"
+                                );
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "live_extended"))]
+                {
+                    eprintln!("paraphina_live | error=connector_unavailable connector=extended feature=live_extended");
+                    return;
+                }
+            }
+            ConnectorArg::Aster => {
+                #[cfg(feature = "live_aster")]
+                {
+                    if aster_fixture_mode(&args) {
+                        let Some(fixture_dir) = resolve_fixture_dir(*connector) else {
+                            eprintln!("paraphina_live | error=fixture_dir_missing connector=aster");
+                            return;
+                        };
+                        match paraphina::live::connectors::aster::AsterFixtureFeed::from_dir(&fixture_dir) {
+                            Ok(feed) => {
+                                let market_tx = channels.market_tx.clone();
+                                let account_tx = channels.account_tx.clone();
+                                let venue_id = venue_id.clone();
+                                tokio::spawn(async move {
+                                    feed.run_ticks(market_tx, account_tx, &venue_id, venue_index, 1_000, 250, 200).await;
+                                });
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "paraphina_live | error=fixture_dir_unreadable connector=aster dir={} err={}",
+                                    fixture_dir.display(),
+                                    err
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        let mut aster_cfg = paraphina::live::connectors::aster::AsterConfig::from_env();
+                        if aster_record_enabled(&args) {
+                            aster_cfg = aster_cfg.with_record_dir(resolve_aster_record_dir());
+                        }
+                        let rest_client = Arc::new(
+                            paraphina::live::connectors::aster::AsterRestClient::new(aster_cfg.clone()),
+                        );
+                        let aster = paraphina::live::connectors::aster::AsterConnector::new(
+                            aster_cfg,
+                            channels.market_tx.clone(),
+                        );
+                        let aster_arc = Arc::new(aster);
+                        let aster_public = aster_arc.clone();
+                        tokio::spawn(async move {
+                            aster_public.run_public_ws().await;
+                        });
+                        if trade_mode.trade_mode != TradeMode::Shadow {
+                            if rest_client.has_auth() {
+                                let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .unwrap_or(5_000);
+                                let account_tx = channels.account_tx.clone();
+                                let venue_id = venue_id.clone();
+                                let rest_client_clone = rest_client.clone();
+                                tokio::spawn(async move {
+                                    rest_client_clone
+                                        .run_account_polling(account_tx, venue_id, venue_index, poll_ms)
+                                        .await;
+                                });
+                            } else {
+                                eprintln!(
+                                    "paraphina_live | account_snapshots_disabled=true reason=missing_aster_api_keys connector=aster"
+                                );
+                                if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
+                                    send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                                }
+                            }
+                        }
+                        if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
+                            if rest_client.has_auth() {
+                                exec_clients.insert(venue_id.clone(), rest_client.clone());
+                            } else {
+                                eprintln!(
+                                    "paraphina_live | exec_disabled=true reason=missing_aster_api_keys connector=aster"
+                                );
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "live_aster"))]
+                {
+                    eprintln!("paraphina_live | error=connector_unavailable connector=aster feature=live_aster");
+                    return;
+                }
+            }
+            ConnectorArg::Paradex => {
+                #[cfg(feature = "live_paradex")]
+                {
+                    if paradex_fixture_mode(&args) {
+                        let Some(fixture_dir) = resolve_fixture_dir(*connector) else {
+                            eprintln!("paraphina_live | error=fixture_dir_missing connector=paradex");
+                            return;
+                        };
+                        match paraphina::live::connectors::paradex::ParadexFixtureFeed::from_dir(&fixture_dir) {
+                            Ok(feed) => {
+                                let market_tx = channels.market_tx.clone();
+                                let account_tx = channels.account_tx.clone();
+                                let venue_id = venue_id.clone();
+                                tokio::spawn(async move {
+                                    feed.run_ticks(market_tx, account_tx, &venue_id, venue_index, 1_000, 250, 200).await;
+                                });
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "paraphina_live | error=fixture_dir_unreadable connector=paradex dir={} err={}",
+                                    fixture_dir.display(),
+                                    err
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        let mut cfg = paraphina::live::connectors::paradex::ParadexConfig::from_env();
+                        if paradex_record_enabled(&args) {
+                            cfg = cfg.with_record_dir(resolve_paradex_record_dir());
+                        }
+                        let paradex = paraphina::live::connectors::paradex::ParadexConnector::new(
+                            cfg,
+                            channels.market_tx.clone(),
+                        );
+                        let paradex_arc = Arc::new(paradex);
+                        let paradex_public = paradex_arc.clone();
+                        tokio::spawn(async move {
+                            paradex_public.run_public_ws().await;
+                        });
+                    }
+                }
+                #[cfg(not(feature = "live_paradex"))]
+                {
+                    eprintln!("paraphina_live | error=connector_unavailable connector=paradex feature=live_paradex");
+                    return;
+                }
+            }
+        }
     }
 
-    let exec_enabled = allow_live_gateway && exec_supported && exec_client.is_some();
+    let exec_enabled = allow_live_gateway && !exec_clients.is_empty();
     if trade_mode.trade_mode != TradeMode::Shadow && !exec_enabled {
         if paper_mode && !paper_route_sandbox {
             eprintln!(
@@ -1034,7 +1979,11 @@ async fn main() {
     let exec_cfg = cfg.clone();
     let venue_id_lookup: Vec<String> = cfg.venues.iter().map(|v| v.id.clone()).collect();
     let exec_enabled_flag = exec_enabled;
-    let exec_client = exec_client.clone();
+    let exec_client: Option<Arc<dyn LiveRestClient>> = if exec_enabled_flag {
+        Some(Arc::new(GatewayMux::new(exec_clients)))
+    } else {
+        None
+    };
     let exec_metrics = metrics.clone();
     let exec_tx = exec_tx.clone();
     let account_tx = _account_tx.clone();
@@ -1189,7 +2138,7 @@ async fn main() {
             &out_dir,
             &cfg,
             trade_mode.trade_mode,
-            connector.as_str(),
+            &connectors_label(&connectors),
             &summary,
             telemetry.stats.clone(),
         );
@@ -1390,31 +2339,33 @@ async fn handle_live_gateway_cancel_all<C: LiveRestClient>(
     events
 }
 
-fn send_unavailable_account_snapshot(
+fn send_unavailable_account_snapshot_for(
     account_tx: &mpsc::Sender<paraphina::live::types::AccountEvent>,
     cfg: &Config,
+    venue_index: usize,
 ) {
-    for (venue_index, venue) in cfg.venues.iter().enumerate() {
-        let snapshot = paraphina::live::types::AccountSnapshot {
-            venue_index,
-            venue_id: venue.id.clone(),
-            seq: 0,
-            timestamp_ms: 0,
-            positions: Vec::new(),
-            balances: Vec::new(),
-            funding_8h: None,
-            margin: paraphina::live::types::MarginSnapshot {
-                balance_usd: 0.0,
-                used_usd: 0.0,
-                available_usd: 0.0,
-            },
-            liquidation: paraphina::live::types::LiquidationSnapshot {
-                price_liq: None,
-                dist_liq_sigma: None,
-            },
-        };
-        let _ = account_tx.try_send(paraphina::live::types::AccountEvent::Snapshot(snapshot));
-    }
+    let Some(venue) = cfg.venues.get(venue_index) else {
+        return;
+    };
+    let snapshot = paraphina::live::types::AccountSnapshot {
+        venue_index,
+        venue_id: venue.id.clone(),
+        seq: 0,
+        timestamp_ms: 0,
+        positions: Vec::new(),
+        balances: Vec::new(),
+        funding_8h: None,
+        margin: paraphina::live::types::MarginSnapshot {
+            balance_usd: 0.0,
+            used_usd: 0.0,
+            available_usd: 0.0,
+        },
+        liquidation: paraphina::live::types::LiquidationSnapshot {
+            price_liq: None,
+            dist_liq_sigma: None,
+        },
+    };
+    let _ = account_tx.try_send(paraphina::live::types::AccountEvent::Snapshot(snapshot));
 }
 
 fn write_summary(
@@ -1457,7 +2408,7 @@ fn write_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::ConnectorArg;
+    use super::{connector_support, ConnectorArg, ConnectorSupport};
     use paraphina::live::venues::ROADMAP_B_VENUES;
 
     #[test]
@@ -1510,7 +2461,7 @@ mod tests {
         assert!(cfg!(feature = "live_extended"));
         assert_eq!(
             connector_support(ConnectorArg::Extended),
-            ConnectorSupport::MarketAccount
+            ConnectorSupport::MarketAccountExec
         );
     }
 
@@ -1520,7 +2471,7 @@ mod tests {
         assert!(cfg!(feature = "live_aster"));
         assert_eq!(
             connector_support(ConnectorArg::Aster),
-            ConnectorSupport::MarketAccount
+            ConnectorSupport::MarketAccountExec
         );
     }
 
