@@ -23,14 +23,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Cargo test (all)
         run: cargo test --all
-      - name: Cargo test (live)
-        working-directory: paraphina
-        run: cargo test -p paraphina --features live
-      - name: Fixture-driven roadmap_b_fixture
-        working-directory: paraphina
-        run: cargo test -p paraphina --features live,live_hyperliquid roadmap_b_fixture
+      - name: Cargo test (live hyperliquid)
+        run: cargo test -p paraphina --features live,live_hyperliquid
+      - name: Cargo test (live lighter)
+        run: cargo test -p paraphina --features live,live_lighter
+      - name: Cargo test (live paradex)
+        run: cargo test -p paraphina --features live,live_paradex
+      - name: Cargo test (live aster)
+        run: cargo test -p paraphina --features live,live_aster
+      - name: Cargo test (live extended)
+        run: cargo test -p paraphina --features live,live_extended
+      - name: Cargo test (live all five)
+        run: cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_aster,live_extended,live_paradex
+      - name: Fixture-driven multi-connector smoke
+        run: cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_paradex,live_aster,live_extended live_five_connector_fixture_tests
       - name: Python tests
         run: python3 -m pytest -q
+      - name: Connector matrix
+        run: python3 tools/print_live_connector_matrix.py
+      - name: Readiness report
+        run: python3 tools/generate_roadmap_b_readiness_report.py
 
   nightly-matrix:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
