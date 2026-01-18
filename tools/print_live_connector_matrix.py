@@ -202,12 +202,12 @@ def main():
             "feature": "live_paradex",
             "module": CONNECTOR_DIR / "paradex.rs",
             "market_detail": "public WS",
-            "account_detail": "not wired (fixtures only)",
-            "exec_detail": "not wired",
-            "cancel_all": "No",
-            "trade_modes": "Shadow, Paper",
+            "account_detail": "REST account snapshot (JWT)",
+            "exec_detail": "REST place/cancel + cancel-all",
+            "cancel_all": "Yes",
+            "trade_modes": "Shadow, Paper, Testnet, Live",
             "cli": "--connector paradex | PARAPHINA_LIVE_CONNECTOR=paradex",
-            "notes": "Roadmap-B venue; public WS market data + fixture replay; account/execution pending.",
+            "notes": "Roadmap-B venue; JWT auth + signed payloads with strict live gating.",
         },
     ]
     rows = []

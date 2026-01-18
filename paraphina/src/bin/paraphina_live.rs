@@ -608,7 +608,11 @@ fn now_ms() -> i64 {
 fn live_connector_allowed_for_live_mode(connector: ConnectorArg) -> bool {
     matches!(
         connector,
-        ConnectorArg::Hyperliquid | ConnectorArg::Lighter | ConnectorArg::Aster | ConnectorArg::Extended
+        ConnectorArg::Hyperliquid
+            | ConnectorArg::Lighter
+            | ConnectorArg::Aster
+            | ConnectorArg::Extended
+            | ConnectorArg::Paradex
     )
 }
 
@@ -658,7 +662,7 @@ fn connector_support(connector: ConnectorArg) -> ConnectorSupport {
         }
         ConnectorArg::Paradex => {
             if cfg!(feature = "live_paradex") {
-                ConnectorSupport::MarketAccount
+                ConnectorSupport::MarketAccountExec
             } else {
                 ConnectorSupport::MissingFeature
             }
@@ -1180,12 +1184,20 @@ fn run_preflight(
                 } else {
                     let ws_ok = is_valid_ws_url(&paradex_ws_url());
                     let market_ok = is_valid_symbol(&paradex_market_symbol());
+                    let jwt_present = env_present("PARADEX_JWT");
+                    let payload_present = env_present("PARADEX_AUTH_PAYLOAD_JSON");
+                    let needs_auth = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
+                    if needs_auth {
+                        creds_ok = creds_ok && (jwt_present || payload_present);
+                    }
                     creds_ok = creds_ok && ws_ok && market_ok;
                     let detail = format!(
-                        "{}:public_ws=true ws_url_ok={} market_ok={}",
+                        "{}:public_ws=true ws_url_ok={} market_ok={} jwt={} auth_payload={}",
                         connector.as_str(),
                         ws_ok,
-                        market_ok
+                        market_ok,
+                        jwt_present,
+                        payload_present
                     );
                     creds_detail.push_str(&detail);
                 }
@@ -1937,12 +1949,18 @@ async fn main() {
                             }
                         }
                     } else {
-                        let mut cfg = paraphina::live::connectors::paradex::ParadexConfig::from_env();
+                        let mut paradex_cfg =
+                            paraphina::live::connectors::paradex::ParadexConfig::from_env();
                         if paradex_record_enabled(&args) {
-                            cfg = cfg.with_record_dir(resolve_paradex_record_dir());
+                            paradex_cfg = paradex_cfg.with_record_dir(resolve_paradex_record_dir());
                         }
+                        let rest_client = Arc::new(
+                            paraphina::live::connectors::paradex::ParadexRestClient::new(
+                                paradex_cfg.clone(),
+                            ),
+                        );
                         let paradex = paraphina::live::connectors::paradex::ParadexConnector::new(
-                            cfg,
+                            paradex_cfg,
                             channels.market_tx.clone(),
                         );
                         let paradex_arc = Arc::new(paradex);
@@ -1950,6 +1968,38 @@ async fn main() {
                         tokio::spawn(async move {
                             paradex_public.run_public_ws().await;
                         });
+                        if trade_mode.trade_mode != TradeMode::Shadow {
+                            if rest_client.has_auth() {
+                                let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .unwrap_or(5_000);
+                                let account_tx = channels.account_tx.clone();
+                                let venue_id = venue_id.clone();
+                                let rest_client_clone = rest_client.clone();
+                                tokio::spawn(async move {
+                                    rest_client_clone
+                                        .run_account_polling(account_tx, venue_id, venue_index, poll_ms)
+                                        .await;
+                                });
+                            } else {
+                                eprintln!(
+                                    "paraphina_live | account_snapshots_disabled=true reason=missing_paradex_auth connector=paradex"
+                                );
+                                if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
+                                    send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                                }
+                            }
+                        }
+                        if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
+                            if rest_client.has_auth() {
+                                exec_clients.insert(venue_id.clone(), rest_client.clone());
+                            } else {
+                                eprintln!(
+                                    "paraphina_live | exec_disabled=true reason=missing_paradex_auth connector=paradex"
+                                );
+                            }
+                        }
                     }
                 }
                 #[cfg(not(feature = "live_paradex"))]
@@ -2481,7 +2531,7 @@ mod tests {
         assert!(cfg!(feature = "live_paradex"));
         assert_eq!(
             connector_support(ConnectorArg::Paradex),
-            ConnectorSupport::MarketAccount
+            ConnectorSupport::MarketAccountExec
         );
     }
 }

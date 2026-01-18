@@ -66,7 +66,7 @@ legacy_runner = []
 live = ["tokio", "tokio-tungstenite", "futures-util", "prometheus", "tiny_http", "event_log"]
 live_hyperliquid = ["live", "reqwest", "rmp-serde", "k256", "sha3", "hex"]
 live_lighter = ["live", "reqwest"]
-live_paradex = ["live"]
+live_paradex = ["live", "reqwest"]
 live_aster = ["live", "reqwest", "hex", "hmac"]
 live_extended = ["live", "reqwest", "hex", "hmac"]
 
