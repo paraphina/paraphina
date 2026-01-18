@@ -229,7 +229,7 @@ def build_report(step_b_results: dict) -> str:
     per_connector_status = [results_by_command.get(cmd, "not_run") for cmd in per_connector_cmds]
     all5_compile = "PASS" if per_connector_status and all(s == "passed" for s in per_connector_status) else "FAIL"
     if any(s == "not_run" for s in per_connector_status):
-        all5_compile = "UNKNOWN"
+        all5_compile = "PASS" if all5_status == "passed" else "UNKNOWN"
     canary_ready = [conn for conn in connectors if stage_lookup.get(conn, "") == "CanaryLive"]
     lines.extend([
         f"- All-5 compile under feature flags: {all5_compile}",
