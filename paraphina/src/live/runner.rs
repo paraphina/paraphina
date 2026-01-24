@@ -14,12 +14,15 @@ use crate::exit;
 use crate::fill_batcher::FillBatcher;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::loop_scheduler::LoopScheduler;
-use crate::mm::compute_mm_quotes;
+use crate::mm::{compute_mm_quotes, compute_mm_quotes_with_ablations};
 use crate::order_management::plan_mm_order_actions;
 use crate::state::GlobalState;
 use crate::state::VenueState;
-use crate::telemetry::{ensure_schema_v1, TelemetryBuilder, TelemetryInputs, TelemetrySink};
-use crate::types::{ExecutionEvent, OrderAck, OrderIntent, OrderReject, TimestampMs};
+use crate::sim_eval::AblationSet;
+use crate::telemetry::{ensure_schema_v1, ReconcileDriftRecord, TelemetryBuilder, TelemetryInputs, TelemetrySink};
+use crate::types::{
+    ExecutionEvent, OrderAck, OrderIntent, OrderPurpose, OrderReject, TimestampMs, VenueStatus,
+};
 use crate::actions::{intents_to_actions, ActionBatch, ActionIdGenerator};
 #[cfg(feature = "event_log")]
 use crate::event_log::{EventLogPayload, EventLogRecord, EventLogWriter};
@@ -27,7 +30,10 @@ use crate::event_log::{EventLogPayload, EventLogRecord, EventLogWriter};
 use crate::event_log::read_event_log;
 #[cfg(feature = "event_log")]
 use crate::telemetry::{TelemetryConfig, TelemetryMode};
-use super::ops::{append_account_reconcile_audit, default_audit_dir, HealthState, LiveMetrics};
+use super::ops::{
+    append_account_reconcile_audit, append_reconcile_drift_audit, default_audit_dir, HealthState,
+    LiveMetrics,
+};
 use super::venue_health::VenueHealthManager;
 
 use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache};
@@ -71,6 +77,7 @@ pub struct LiveRuntimeHooks {
 pub struct LiveTelemetry {
     pub sink: Arc<Mutex<TelemetrySink>>,
     pub shadow_mode: bool,
+    pub execution_mode: &'static str,
     pub max_orders_per_tick: usize,
     pub stats: Arc<Mutex<LiveTelemetryStats>>,
 }
@@ -85,6 +92,29 @@ pub struct LiveTelemetryStats {
     pub would_place_by_purpose: std::collections::HashMap<String, u64>,
     pub would_cancel_by_purpose: std::collections::HashMap<String, u64>,
     pub would_replace_by_purpose: std::collections::HashMap<String, u64>,
+}
+
+fn parse_reconcile_interval_ms() -> Option<i64> {
+    let raw = std::env::var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS").ok()?;
+    let normalized = raw.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "false" | "off" | "no") {
+        return None;
+    }
+    if let Ok(ms) = raw.parse::<i64>() {
+        return (ms > 0).then_some(ms);
+    }
+    None
+}
+
+fn account_snapshot_available(
+    snapshot: &super::types::AccountSnapshot,
+    now_ms: TimestampMs,
+    max_age_ms: i64,
+) -> bool {
+    if snapshot.timestamp_ms <= 0 {
+        return false;
+    }
+    now_ms.saturating_sub(snapshot.timestamp_ms) <= max_age_ms
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -399,6 +429,54 @@ fn ordered_event_for_execution(
     })
 }
 
+fn derive_position_tao(positions: &[super::types::PositionSnapshot]) -> f64 {
+    positions.iter().map(|p| p.size).sum()
+}
+
+fn push_reconcile_drift(
+    pending: &mut Vec<ReconcileDriftRecord>,
+    audit_dir: &std::path::Path,
+    record: ReconcileDriftRecord,
+) {
+    let _ = append_reconcile_drift_audit(audit_dir, &record);
+    pending.push(record);
+}
+
+fn diff_exceeds(lhs: f64, rhs: f64, tol: f64) -> bool {
+    (lhs - rhs).abs() > tol
+}
+
+fn apply_canary_intent_overrides(
+    intents: &mut [OrderIntent],
+    enforce_post_only: bool,
+    enforce_reduce_only: bool,
+) {
+    if !enforce_post_only && !enforce_reduce_only {
+        return;
+    }
+    for intent in intents {
+        match intent {
+            OrderIntent::Place(place) => {
+                if enforce_post_only && place.purpose == OrderPurpose::Mm {
+                    place.post_only = true;
+                }
+                if enforce_reduce_only && place.purpose != OrderPurpose::Mm {
+                    place.reduce_only = true;
+                }
+            }
+            OrderIntent::Replace(replace) => {
+                if enforce_post_only && replace.purpose == OrderPurpose::Mm {
+                    replace.post_only = true;
+                }
+                if enforce_reduce_only && replace.purpose != OrderPurpose::Mm {
+                    replace.reduce_only = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub async fn run_live_loop(
     cfg: &Config,
     channels: LiveChannels,
@@ -427,11 +505,17 @@ pub async fn run_live_loop(
     let mut fill_batcher = FillBatcher::new(cfg.fill_agg_interval_ms);
     fill_batcher.set_last_flush_ms(scheduler.next_main_ms() - cfg.fill_agg_interval_ms);
 
-    let account_reconcile_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
+    let account_reconcile_ms = parse_reconcile_interval_ms();
+    let account_poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .filter(|v| *v > 0);
+        .filter(|v| *v > 0)
+        .unwrap_or(5_000);
+    let account_snapshot_max_age_ms = account_poll_ms
+        .saturating_mul(2)
+        .max(cfg.main_loop_interval_ms.saturating_mul(2));
     let mut last_account_reconcile_ms: Option<TimestampMs> = None;
+    let mut last_account_snapshot_ms: Vec<Option<TimestampMs>> = vec![None; cfg.venues.len()];
 
     let mut tick: u64 = 0;
     #[cfg(feature = "event_log")]
@@ -440,6 +524,53 @@ pub async fn run_live_loop(
         .or_else(|_| std::env::var("PARAPHINA_LIVE_KILL_FLATTEN"))
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let disable_fv_gate = std::env::var("PARAPHINA_PAPER_DISABLE_FV_GATE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let disable_health_gates = std::env::var("PARAPHINA_PAPER_DISABLE_HEALTH_GATES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let smoke_intents = std::env::var("PARAPHINA_PAPER_SMOKE_INTENTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let canary_enabled = std::env::var("PARAPHINA_CANARY_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let canary_max_position_tao = std::env::var("PARAPHINA_CANARY_MAX_POSITION_TAO")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let canary_max_open_orders = std::env::var("PARAPHINA_CANARY_MAX_OPEN_ORDERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let canary_stale_max_ticks = std::env::var("PARAPHINA_CANARY_STALE_MAX_TICKS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let canary_enforce_post_only = std::env::var("PARAPHINA_CANARY_ENFORCE_POST_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let canary_enforce_reduce_only = std::env::var("PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut canary_stale_ticks: u64 = 0;
+    let pos_tol = std::env::var("PARAPHINA_RECONCILE_POS_TAO_TOL")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.01);
+    let bal_tol = std::env::var("PARAPHINA_RECONCILE_BALANCE_USD_TOL")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    let order_tol = std::env::var("PARAPHINA_RECONCILE_ORDER_COUNT_TOL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut pending_drift_events: Vec<ReconcileDriftRecord> = Vec::new();
+    let fv_ablations = if disable_fv_gate {
+        AblationSet::from_ids(&vec!["disable_fair_value_gating".to_string()]).unwrap_or_default()
+    } else {
+        AblationSet::new()
+    };
     let mut interval = match mode {
         LiveRunMode::Realtime { interval_ms, .. } => Some(tokio::time::interval(Duration::from_millis(interval_ms))),
         LiveRunMode::Step { .. } => None,
@@ -501,6 +632,13 @@ pub async fn run_live_loop(
                         for _ in 0..1_000 {
                             match response_rx.try_recv() {
                                 Ok(snapshot) => {
+                                    if snapshot.timestamp_ms > 0 {
+                                        if let Some(last) =
+                                            last_account_snapshot_ms.get_mut(snapshot.venue_index)
+                                        {
+                                            *last = Some(snapshot.timestamp_ms);
+                                        }
+                                    }
                                     let (report, diff) =
                                         cache.reconcile_account_snapshot_with_diff(&snapshot);
                                     if let Some(diff) = diff {
@@ -522,6 +660,34 @@ pub async fn run_live_loop(
                             }
                         }
                     }
+                }
+            }
+        } else if let Some(interval_ms) = account_reconcile_ms {
+            let should_reconcile = last_account_reconcile_ms
+                .map(|prev| now_ms.saturating_sub(prev) >= interval_ms)
+                .unwrap_or(true);
+            if should_reconcile {
+                last_account_reconcile_ms = Some(now_ms);
+                let has_fresh_snapshot = last_account_snapshot_ms.iter().flatten().any(|ts| {
+                    now_ms.saturating_sub(*ts) <= account_snapshot_max_age_ms
+                });
+                if has_fresh_snapshot {
+                    push_reconcile_drift(
+                        &mut pending_drift_events,
+                        &audit_dir,
+                        ReconcileDriftRecord {
+                            timestamp_ms: now_ms,
+                            venue_index: 0,
+                            venue_id: "all".to_string(),
+                            kind: "account_unavailable".to_string(),
+                            internal: None,
+                            venue: None,
+                            diff: None,
+                            tolerance: None,
+                            source: "account_snapshot".to_string(),
+                            available: false,
+                        },
+                    );
                 }
             }
         }
@@ -600,6 +766,115 @@ pub async fn run_live_loop(
                             super::types::AccountEvent::Snapshot(s) => s.venue_index,
                         });
                     }
+                    let snapshot = match &event {
+                        super::types::AccountEvent::Snapshot(snapshot) => snapshot,
+                    };
+                    if snapshot.timestamp_ms > 0 {
+                        if let Some(last) = last_account_snapshot_ms.get_mut(snapshot.venue_index) {
+                            *last = Some(snapshot.timestamp_ms);
+                        }
+                    }
+                    if !account_snapshot_available(snapshot, now_ms, account_snapshot_max_age_ms) {
+                        continue;
+                    }
+                    if let Some(vstate) = state.venues.get(snapshot.venue_index) {
+                        let pos_internal = vstate.position_tao;
+                        let pos_venue = derive_position_tao(&snapshot.positions);
+                            if diff_exceeds(pos_internal, pos_venue, pos_tol) {
+                                push_reconcile_drift(
+                                    &mut pending_drift_events,
+                                    &audit_dir,
+                                    ReconcileDriftRecord {
+                                        timestamp_ms: snapshot.timestamp_ms,
+                                        venue_index: snapshot.venue_index,
+                                        venue_id: snapshot.venue_id.clone(),
+                                        kind: "position_tao".to_string(),
+                                        internal: Some(pos_internal),
+                                        venue: Some(pos_venue),
+                                        diff: Some(pos_internal - pos_venue),
+                                        tolerance: Some(pos_tol),
+                                        source: "account_snapshot".to_string(),
+                                        available: true,
+                                    },
+                                );
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
+                            }
+                            let bal_internal = vstate.margin_balance_usd;
+                            let bal_venue = snapshot.margin.balance_usd;
+                            if diff_exceeds(bal_internal, bal_venue, bal_tol) {
+                                push_reconcile_drift(
+                                    &mut pending_drift_events,
+                                    &audit_dir,
+                                    ReconcileDriftRecord {
+                                        timestamp_ms: snapshot.timestamp_ms,
+                                        venue_index: snapshot.venue_index,
+                                        venue_id: snapshot.venue_id.clone(),
+                                        kind: "margin_balance_usd".to_string(),
+                                        internal: Some(bal_internal),
+                                        venue: Some(bal_venue),
+                                        diff: Some(bal_internal - bal_venue),
+                                        tolerance: Some(bal_tol),
+                                        source: "account_snapshot".to_string(),
+                                        available: true,
+                                    },
+                                );
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
+                            }
+                            let used_internal = vstate.margin_used_usd;
+                            let used_venue = snapshot.margin.used_usd;
+                            if diff_exceeds(used_internal, used_venue, bal_tol) {
+                                push_reconcile_drift(
+                                    &mut pending_drift_events,
+                                    &audit_dir,
+                                    ReconcileDriftRecord {
+                                        timestamp_ms: snapshot.timestamp_ms,
+                                        venue_index: snapshot.venue_index,
+                                        venue_id: snapshot.venue_id.clone(),
+                                        kind: "margin_used_usd".to_string(),
+                                        internal: Some(used_internal),
+                                        venue: Some(used_venue),
+                                        diff: Some(used_internal - used_venue),
+                                        tolerance: Some(bal_tol),
+                                        source: "account_snapshot".to_string(),
+                                        available: true,
+                                    },
+                                );
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
+                            }
+                            let avail_internal = vstate.margin_available_usd;
+                            let avail_venue = snapshot.margin.available_usd;
+                            if diff_exceeds(avail_internal, avail_venue, bal_tol) {
+                                push_reconcile_drift(
+                                    &mut pending_drift_events,
+                                    &audit_dir,
+                                    ReconcileDriftRecord {
+                                        timestamp_ms: snapshot.timestamp_ms,
+                                        venue_index: snapshot.venue_index,
+                                        venue_id: snapshot.venue_id.clone(),
+                                        kind: "margin_available_usd".to_string(),
+                                        internal: Some(avail_internal),
+                                        venue: Some(avail_venue),
+                                        diff: Some(avail_internal - avail_venue),
+                                        tolerance: Some(bal_tol),
+                                        source: "account_snapshot".to_string(),
+                                        available: true,
+                                    },
+                                );
+                        if !state.kill_switch {
+                            state.kill_switch = true;
+                            state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                        }
+                    }
+                    }
                 }
                 CanonicalEvent::Execution(event) => {
                     if deduper.is_duplicate(&event) {
@@ -614,6 +889,45 @@ pub async fn run_live_loop(
                                 phase: "order_snapshot".to_string(),
                                 event: EventLogPayload::OrderSnapshot(snapshot.clone()),
                             });
+                        }
+                        let internal = state
+                            .live_order_state
+                            .open_order_ids_by_venue(snapshot.venue_index);
+                        let mut venue_orders = snapshot
+                            .open_orders
+                            .iter()
+                            .map(|o| o.order_id.clone())
+                            .collect::<Vec<_>>();
+                        venue_orders.sort();
+                        let diff_count = internal
+                            .iter()
+                            .filter(|id| !venue_orders.contains(*id))
+                            .count()
+                            + venue_orders
+                                .iter()
+                                .filter(|id| !internal.contains(*id))
+                                .count();
+                        if diff_count > order_tol {
+                            push_reconcile_drift(
+                                &mut pending_drift_events,
+                                &audit_dir,
+                                ReconcileDriftRecord {
+                                    timestamp_ms: snapshot.timestamp_ms,
+                                    venue_index: snapshot.venue_index,
+                                    venue_id: snapshot.venue_id.clone(),
+                                    kind: "open_orders".to_string(),
+                                    internal: Some(internal.len() as f64),
+                                    venue: Some(venue_orders.len() as f64),
+                                    diff: Some(internal.len() as f64 - venue_orders.len() as f64),
+                                    tolerance: Some(order_tol as f64),
+                                    source: "order_snapshot".to_string(),
+                                    available: true,
+                                },
+                            );
+                            if !state.kill_switch {
+                                state.kill_switch = true;
+                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            }
                         }
                         state.live_order_state.reconcile(&snapshot, now_ms);
                     } else {
@@ -654,45 +968,75 @@ pub async fn run_live_loop(
 
         let snapshot = cache.snapshot(now_ms, cfg.main_loop_interval_ms * 2);
         last_snapshot = Some(snapshot.clone());
-        let disabled = health_manager.update_from_snapshot(cfg, &mut state, &snapshot);
+        let mut disabled = health_manager.update_from_snapshot(cfg, &mut state, &snapshot);
+        if disable_health_gates {
+            for venue in &mut state.venues {
+                venue.status = VenueStatus::Healthy;
+            }
+            disabled.clear();
+        }
         let stale_count = snapshot.market.iter().filter(|m| m.is_stale).count() as u64;
         if !disabled.is_empty() {
             for venue_index in &disabled {
-                let (response_tx, _response_rx) = oneshot::channel();
                 let intent = crate::types::OrderIntent::CancelAll(
                     crate::types::CancelAllOrderIntent {
                         venue_index: Some(*venue_index),
                         venue_id: Some(cfg.venues[*venue_index].id_arc.clone()),
                     },
                 );
-                let mut action_id_gen = ActionIdGenerator::new(now_ms.max(0) as u64);
-                let actions = intents_to_actions(&[intent.clone()], &mut action_id_gen);
-                let mut action_batch =
-                    ActionBatch::new(now_ms, now_ms.max(0) as u64, &cfg.version).with_seed(None);
-                for action in actions {
-                    action_batch.push(action);
-                }
-                let request = LiveOrderRequest {
-                    intents: vec![intent.clone()],
-                    action_batch,
+                would_send_intents.push(intent.clone());
+                dispatch_cancel_all_and_apply(
+                    cfg,
+                    &mut state,
+                    &order_tx,
                     now_ms,
-                    response: response_tx,
-                };
-                let _ = order_tx.try_send(request);
-                would_send_intents.push(intent);
-                if let Some(hooks) = hooks.as_ref() {
-                    hooks.metrics.inc_cancel_all();
-                }
+                    now_ms.max(0) as u64,
+                    intent,
+                    hooks.as_ref(),
+                    &audit_dir,
+                )
+                .await;
             }
         }
         if let Some(hooks) = hooks.as_ref() {
             let ready_count = snapshot.ready_market_count();
-            let ready = ready_count == crate::venues::canonical_venue_count(cfg.venues.len());
+            let ready = ready_count == cfg.venues.len();
             hooks.health.set_ready(ready);
         }
         let cache_events = snapshot_to_core_events(&snapshot, &state);
         let _ = apply_execution_events(&mut state, &cache_events, now_ms);
         apply_account_snapshot_to_state(cfg, &snapshot, &mut state, now_ms);
+
+        if canary_enabled && !state.kill_switch {
+            if let Some(max_pos) = canary_max_position_tao {
+                if state.q_global_tao.abs() > max_pos {
+                    state.kill_switch = true;
+                    state.kill_reason = crate::state::KillReason::CanaryLimitBreach;
+                }
+            }
+            if let Some(max_orders) = canary_max_open_orders {
+                let open_orders = state
+                    .venues
+                    .iter()
+                    .map(|v| v.open_orders.len())
+                    .sum::<usize>();
+                if open_orders > max_orders {
+                    state.kill_switch = true;
+                    state.kill_reason = crate::state::KillReason::CanaryLimitBreach;
+                }
+            }
+            if canary_stale_max_ticks > 0 {
+                if stale_count > 0 {
+                    canary_stale_ticks = canary_stale_ticks.saturating_add(1);
+                } else {
+                    canary_stale_ticks = 0;
+                }
+                if canary_stale_ticks >= canary_stale_max_ticks {
+                    state.kill_switch = true;
+                    state.kill_reason = crate::state::KillReason::StaleMarket;
+                }
+            }
+        }
 
         engine.main_tick_without_risk(&mut state, now_ms);
         if scheduler.risk_due(now_ms) {
@@ -734,6 +1078,9 @@ pub async fn run_live_loop(
                     kill_transition,
                     &would_send_intents,
                 );
+                pending_drift_events.sort_by(|a, b| {
+                    (a.venue_index, &a.kind, &a.source).cmp(&(b.venue_index, &b.kind, &b.source))
+                });
                 emit_live_telemetry(
                     &mut telemetry_builder,
                     telemetry,
@@ -746,7 +1093,9 @@ pub async fn run_live_loop(
                     &tick_fills,
                     None,
                     None,
+                    &pending_drift_events,
                 );
+                pending_drift_events.clear();
             }
         }
 
@@ -754,15 +1103,40 @@ pub async fn run_live_loop(
             break;
         }
 
-        if snapshot.ready_market_count() == 0 {
+        if snapshot.ready_market_count() == 0 && !smoke_intents {
             tick += 1;
             continue;
         }
 
-        let mm_quotes = compute_mm_quotes(cfg, &state);
+        let mm_quotes = if disable_fv_gate {
+            compute_mm_quotes_with_ablations(cfg, &state, &fv_ablations)
+        } else {
+            compute_mm_quotes(cfg, &state)
+        };
         let mut action_id_gen = crate::actions::ActionIdGenerator::new(tick);
         let mm_plan = plan_mm_order_actions(cfg, &state, &mm_quotes, now_ms, &mut action_id_gen);
-        let intents = mm_plan.intents.clone();
+        let mut intents = mm_plan.intents.clone();
+        apply_canary_intent_overrides(
+            &mut intents,
+            canary_enforce_post_only,
+            canary_enforce_reduce_only,
+        );
+        if intents.is_empty() && smoke_intents {
+            let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
+            let vcfg = &cfg.venues[0];
+            intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: 0,
+                venue_id: vcfg.id_arc.clone(),
+                side: crate::types::Side::Buy,
+                price: fair,
+                size: vcfg.base_order_size,
+                purpose: crate::types::OrderPurpose::Mm,
+                time_in_force: crate::types::TimeInForce::Gtc,
+                post_only: false,
+                reduce_only: false,
+                client_order_id: None,
+            }));
+        }
         if !intents.is_empty() {
             would_send_intents.extend(intents.iter().cloned());
         }
@@ -805,6 +1179,45 @@ pub async fn run_live_loop(
                             continue;
                         }
                         if let super::types::ExecutionEvent::OrderSnapshot(snapshot) = event {
+                            let internal = state
+                                .live_order_state
+                                .open_order_ids_by_venue(snapshot.venue_index);
+                            let mut venue_orders = snapshot
+                                .open_orders
+                                .iter()
+                                .map(|o| o.order_id.clone())
+                                .collect::<Vec<_>>();
+                            venue_orders.sort();
+                            let diff_count = internal
+                                .iter()
+                                .filter(|id| !venue_orders.contains(*id))
+                                .count()
+                                + venue_orders
+                                    .iter()
+                                    .filter(|id| !internal.contains(*id))
+                                    .count();
+                            if diff_count > order_tol {
+                                push_reconcile_drift(
+                                    &mut pending_drift_events,
+                                    &audit_dir,
+                                    ReconcileDriftRecord {
+                                        timestamp_ms: snapshot.timestamp_ms,
+                                        venue_index: snapshot.venue_index,
+                                        venue_id: snapshot.venue_id.clone(),
+                                        kind: "open_orders".to_string(),
+                                        internal: Some(internal.len() as f64),
+                                        venue: Some(venue_orders.len() as f64),
+                                        diff: Some(internal.len() as f64 - venue_orders.len() as f64),
+                                        tolerance: Some(order_tol as f64),
+                                        source: "order_snapshot".to_string(),
+                                        available: true,
+                                    },
+                                );
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
+                            }
                             state.live_order_state.reconcile(&snapshot, now_ms);
                             continue;
                         }
@@ -828,7 +1241,12 @@ pub async fn run_live_loop(
 
         if did_flush {
             if cfg.exit.enabled {
-                let exit_intents = exit::compute_exit_intents(cfg, &state, now_ms);
+                let mut exit_intents = exit::compute_exit_intents(cfg, &state, now_ms);
+                apply_canary_intent_overrides(
+                    &mut exit_intents,
+                    canary_enforce_post_only,
+                    canary_enforce_reduce_only,
+                );
                 if !exit_intents.is_empty() {
                     would_send_intents.extend(exit_intents.iter().cloned());
                     if let Some(hooks) = hooks.as_ref() {
@@ -893,7 +1311,12 @@ pub async fn run_live_loop(
 
             if scheduler.hedge_due(now_ms) {
                 if let Some(plan) = compute_hedge_plan(cfg, &state, now_ms) {
-                    let hedge_intents = hedge_plan_to_order_intents(&plan);
+                    let mut hedge_intents = hedge_plan_to_order_intents(&plan);
+                    apply_canary_intent_overrides(
+                        &mut hedge_intents,
+                        canary_enforce_post_only,
+                        canary_enforce_reduce_only,
+                    );
                     if !hedge_intents.is_empty() {
                         would_send_intents.extend(hedge_intents.iter().cloned());
                         if let Some(hooks) = hooks.as_ref() {
@@ -1017,52 +1440,22 @@ pub async fn handle_kill_switch(
         }
     }
 
-    let cancel_intents: Vec<OrderIntent> = cfg
-        .venues
-        .iter()
-        .enumerate()
-        .map(|(venue_index, venue)| {
-            OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
-                venue_index: Some(venue_index),
-                venue_id: Some(venue.id_arc.clone()),
-            })
-        })
-        .collect();
-    if !cancel_intents.is_empty() {
-        let mut action_id_gen = ActionIdGenerator::new(tick);
-        let actions = intents_to_actions(&cancel_intents, &mut action_id_gen);
-        let mut action_batch = ActionBatch::new(now_ms, tick, &cfg.version).with_seed(None);
-        for action in actions {
-            action_batch.push(action);
-        }
-        let (response_tx, mut response_rx) = oneshot::channel();
-        let request = LiveOrderRequest {
-            intents: cancel_intents,
-            action_batch,
+    for (venue_index, venue) in cfg.venues.iter().enumerate() {
+        let intent = OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
+            venue_index: Some(venue_index),
+            venue_id: Some(venue.id_arc.clone()),
+        });
+        dispatch_cancel_all_and_apply(
+            cfg,
+            state,
+            order_tx,
             now_ms,
-            response: response_tx,
-        };
-        let _ = order_tx.try_send(request);
-        if let Some(hooks) = hooks {
-            hooks.metrics.inc_cancel_all();
-        }
-        for _ in 0..1_000 {
-            match response_rx.try_recv() {
-                Ok(events) => {
-                    #[cfg(feature = "event_log")]
-                    log_live_execution_events_env(tick, now_ms, "gateway", &events);
-                    let core_events = live_events_to_core(&events);
-                    let fills = apply_execution_events(state, &core_events, now_ms);
-                    if !fills.is_empty() {
-                        apply_live_fills(cfg, state, &fills, now_ms);
-                        state.recompute_after_fills(cfg);
-                    }
-                    break;
-                }
-                Err(oneshot::error::TryRecvError::Closed) => break,
-                Err(oneshot::error::TryRecvError::Empty) => tokio::task::yield_now().await,
-            }
-        }
+            tick,
+            intent,
+            hooks,
+            audit_dir,
+        )
+        .await;
     }
 
     if best_effort_flatten {
@@ -1098,6 +1491,52 @@ pub async fn handle_kill_switch(
                     Err(oneshot::error::TryRecvError::Empty) => tokio::task::yield_now().await,
                 }
             }
+        }
+    }
+}
+
+async fn dispatch_cancel_all_and_apply(
+    cfg: &Config,
+    state: &mut GlobalState,
+    order_tx: &mpsc::Sender<LiveOrderRequest>,
+    now_ms: TimestampMs,
+    tick: u64,
+    intent: OrderIntent,
+    hooks: Option<&LiveRuntimeHooks>,
+    _audit_dir: &PathBuf,
+) {
+    let mut action_id_gen = ActionIdGenerator::new(tick);
+    let actions = intents_to_actions(&[intent.clone()], &mut action_id_gen);
+    let mut action_batch = ActionBatch::new(now_ms, tick, &cfg.version).with_seed(None);
+    for action in actions {
+        action_batch.push(action);
+    }
+    let (response_tx, mut response_rx) = oneshot::channel();
+    let request = LiveOrderRequest {
+        intents: vec![intent],
+        action_batch,
+        now_ms,
+        response: response_tx,
+    };
+    let _ = order_tx.try_send(request);
+    if let Some(hooks) = hooks {
+        hooks.metrics.inc_cancel_all();
+    }
+    for _ in 0..1_000 {
+        match response_rx.try_recv() {
+            Ok(events) => {
+                #[cfg(feature = "event_log")]
+                log_live_execution_events_env(tick, now_ms, "gateway", &events);
+                let core_events = live_events_to_core(&events);
+                let fills = apply_execution_events(state, &core_events, now_ms);
+                if !fills.is_empty() {
+                    apply_live_fills(cfg, state, &fills, now_ms);
+                    state.recompute_after_fills(cfg);
+                }
+                break;
+            }
+            Err(oneshot::error::TryRecvError::Closed) => break,
+            Err(oneshot::error::TryRecvError::Empty) => tokio::task::yield_now().await,
         }
     }
 }
@@ -1239,6 +1678,7 @@ fn emit_live_telemetry(
     fills: &[crate::types::FillEvent],
     last_exit_intent: Option<&OrderIntent>,
     last_hedge_intent: Option<&OrderIntent>,
+    reconcile_drift: &[ReconcileDriftRecord],
 ) {
     let mut record = builder.build_record(TelemetryInputs {
         cfg,
@@ -1252,6 +1692,8 @@ fn emit_live_telemetry(
         last_hedge_intent,
         kill_event: None,
         shadow_mode: telemetry.shadow_mode,
+        execution_mode: telemetry.execution_mode,
+        reconcile_drift,
         max_orders_per_tick: telemetry.max_orders_per_tick,
     });
     ensure_schema_v1(&mut record);
@@ -1503,6 +1945,7 @@ pub fn replay_event_log(
     let telemetry = LiveTelemetry {
         sink: Arc::new(Mutex::new(telemetry_sink)),
         shadow_mode: false,
+        execution_mode: "replay",
         max_orders_per_tick: 200,
         stats: Arc::new(Mutex::new(LiveTelemetryStats::default())),
     };
@@ -1678,6 +2121,7 @@ fn flush_replay_tick(
         fills,
         None,
         None,
+        &[],
     );
     let _ = flush_batched_fills(fill_batcher, cfg, state, now_ms, true);
     snapshot

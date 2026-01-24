@@ -1,4 +1,4 @@
-//! Extended connector (public WS market data + fixtures, feature-gated).
+//! Aster connector (public WS market data + fixtures, feature-gated).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,17 +26,17 @@ use super::super::types::{
 };
 use crate::types::{Side, TimeInForce, TimestampMs};
 
-#[cfg(feature = "live_extended")]
+#[cfg(feature = "live_aster")]
 pub const STUB_CONNECTOR: bool = false;
-#[cfg(feature = "live_extended")]
+#[cfg(feature = "live_aster")]
 pub const SUPPORTS_MARKET: bool = true;
-#[cfg(feature = "live_extended")]
+#[cfg(feature = "live_aster")]
 pub const SUPPORTS_ACCOUNT: bool = true;
-#[cfg(feature = "live_extended")]
+#[cfg(feature = "live_aster")]
 pub const SUPPORTS_EXECUTION: bool = true;
 
 #[derive(Debug, Clone)]
-pub struct ExtendedConfig {
+pub struct AsterConfig {
     pub ws_url: String,
     pub rest_url: String,
     pub market: String,
@@ -47,20 +47,20 @@ pub struct ExtendedConfig {
     pub record_dir: Option<PathBuf>,
 }
 
-impl ExtendedConfig {
+impl AsterConfig {
     pub fn from_env() -> Self {
-        let ws_url = std::env::var("EXTENDED_WS_URL")
-            .unwrap_or_else(|_| "wss://stream.extended.exchange/ws".to_string());
-        let rest_url = std::env::var("EXTENDED_REST_URL")
-            .unwrap_or_else(|_| "https://api.extended.exchange".to_string());
-        let market = std::env::var("EXTENDED_MARKET").unwrap_or_else(|_| "BTCUSDT".to_string());
-        let depth_limit = std::env::var("EXTENDED_DEPTH_LIMIT")
+        let ws_url = std::env::var("ASTER_WS_URL")
+            .unwrap_or_else(|_| "wss://fstream.asterdex.com/ws".to_string());
+        let rest_url = std::env::var("ASTER_REST_URL")
+            .unwrap_or_else(|_| "https://fapi.asterdex.com".to_string());
+        let market = std::env::var("ASTER_MARKET").unwrap_or_else(|_| "BTCUSDT".to_string());
+        let depth_limit = std::env::var("ASTER_DEPTH_LIMIT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(100);
-        let api_key = std::env::var("EXTENDED_API_KEY").ok();
-        let api_secret = std::env::var("EXTENDED_API_SECRET").ok();
-        let recv_window = std::env::var("EXTENDED_RECV_WINDOW")
+        let api_key = std::env::var("ASTER_API_KEY").ok();
+        let api_secret = std::env::var("ASTER_API_SECRET").ok();
+        let recv_window = std::env::var("ASTER_RECV_WINDOW")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .or(Some(5_000));
@@ -91,19 +91,19 @@ impl ExtendedConfig {
 }
 
 #[derive(Debug)]
-pub struct ExtendedConnector {
-    cfg: ExtendedConfig,
+pub struct AsterConnector {
+    cfg: AsterConfig,
     http: Client,
     market_tx: mpsc::Sender<MarketDataEvent>,
-    recorder: Option<Mutex<ExtendedRecorder>>,
+    recorder: Option<Mutex<AsterRecorder>>,
 }
 
-impl ExtendedConnector {
-    pub fn new(cfg: ExtendedConfig, market_tx: mpsc::Sender<MarketDataEvent>) -> Self {
+impl AsterConnector {
+    pub fn new(cfg: AsterConfig, market_tx: mpsc::Sender<MarketDataEvent>) -> Self {
         let recorder = cfg
             .record_dir
             .as_ref()
-            .and_then(|dir| ExtendedRecorder::new(dir).ok())
+            .and_then(|dir| AsterRecorder::new(dir).ok())
             .map(Mutex::new);
         Self {
             cfg,
@@ -117,7 +117,7 @@ impl ExtendedConnector {
         let mut backoff = Duration::from_secs(1);
         loop {
             if let Err(err) = self.public_ws_once().await {
-                eprintln!("Extended public WS error: {err}");
+                eprintln!("Aster public WS error: {err}");
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -130,7 +130,7 @@ impl ExtendedConnector {
             let mut guard = recorder.lock().await;
             guard.record_snapshot(&snapshot_raw)?;
         }
-        let mut seq_state = ExtendedSeqState::new(snapshot.last_update_id);
+        let mut seq_state = AsterSeqState::new(snapshot.last_update_id);
         let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
             venue_index: 0,
             venue_id: self.cfg.market.clone(),
@@ -172,7 +172,7 @@ impl ExtendedConnector {
         Ok(())
     }
 
-    async fn fetch_snapshot(&self) -> anyhow::Result<(String, ExtendedDepthSnapshot)> {
+    async fn fetch_snapshot(&self) -> anyhow::Result<(String, AsterDepthSnapshot)> {
         let url = format!(
             "{}/fapi/v1/depth?symbol={}&limit={}",
             self.cfg.rest_url, self.cfg.market, self.cfg.depth_limit
@@ -181,7 +181,7 @@ impl ExtendedConnector {
         let raw = resp.text().await?;
         let value: Value = serde_json::from_str(&raw)?;
         let snapshot = parse_depth_snapshot(&value)
-            .ok_or_else(|| anyhow::anyhow!("extended snapshot parse failed"))?;
+            .ok_or_else(|| anyhow::anyhow!("aster snapshot parse failed"))?;
         Ok((raw, snapshot))
     }
 }
@@ -189,14 +189,14 @@ impl ExtendedConnector {
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
-pub struct ExtendedRestClient {
-    cfg: ExtendedConfig,
+pub struct AsterRestClient {
+    cfg: AsterConfig,
     http: Client,
     timestamp_fn: Arc<dyn Fn() -> TimestampMs + Send + Sync>,
 }
 
-impl ExtendedRestClient {
-    pub fn new(cfg: ExtendedConfig) -> Self {
+impl AsterRestClient {
+    pub fn new(cfg: AsterConfig) -> Self {
         Self {
             cfg,
             http: Client::new(),
@@ -221,7 +221,7 @@ impl ExtendedRestClient {
             .cfg
             .api_secret
             .as_ref()
-            .ok_or_else(|| LiveGatewayError::fatal("extended api secret missing"))?;
+            .ok_or_else(|| LiveGatewayError::fatal("aster api secret missing"))?;
         let timestamp = (self.timestamp_fn)();
         params.push(("timestamp".to_string(), timestamp.to_string()));
         if let Some(recv_window) = self.cfg.recv_window {
@@ -229,7 +229,7 @@ impl ExtendedRestClient {
         }
         params.sort_by(|a, b| a.0.cmp(&b.0));
         let canonical = canonical_query(&params);
-        // Signing per Extended API docs: https://docs.extended.exchange (HMAC SHA256 + X-MBX-APIKEY + timestamp/signature).
+        // Signing per Aster REST API docs: https://asterdex.org/docs (HMAC SHA256 + X-MBX-APIKEY + timestamp/signature).
         let signature = sign_query(api_secret, &canonical);
         Ok(format!("{canonical}&signature={signature}"))
     }
@@ -244,7 +244,7 @@ impl ExtendedRestClient {
             .cfg
             .api_key
             .as_ref()
-            .ok_or_else(|| LiveGatewayError::fatal("extended api key missing"))?;
+            .ok_or_else(|| LiveGatewayError::fatal("aster api key missing"))?;
         let query = self.signed_query(params)?;
         let url = format!("{}{}?{}", self.cfg.rest_url, path, query);
         let resp = self
@@ -271,9 +271,9 @@ impl ExtendedRestClient {
             return Err(map_rest_error(status.as_u16(), &body));
         }
         let value: Value = serde_json::from_str(&body)
-            .map_err(|err| LiveGatewayError::fatal(format!("extended account parse error: {err}")))?;
+            .map_err(|err| LiveGatewayError::fatal(format!("aster account parse error: {err}")))?;
         parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
-            LiveGatewayError::fatal("extended account snapshot missing required fields")
+            LiveGatewayError::fatal("aster account snapshot missing required fields")
         })
     }
 
@@ -292,18 +292,15 @@ impl ExtendedRestClient {
                     let _ = account_tx.send(AccountEvent::Snapshot(snapshot)).await;
                 }
                 Err(err) => {
-                    eprintln!("Extended account snapshot error: {}", err.message);
+                    eprintln!("Aster account snapshot error: {}", err.message);
                 }
             }
         }
     }
 }
 
-impl LiveRestClient for ExtendedRestClient {
-    fn place_order(
-        &self,
-        req: LiveRestPlaceRequest,
-    ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
+impl LiveRestClient for AsterRestClient {
+    fn place_order(&self, req: LiveRestPlaceRequest) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
             let mut params = vec![
                 ("symbol".to_string(), self.cfg.market.clone()),
@@ -537,14 +534,14 @@ fn map_rest_error(status: u16, body: &str) -> LiveGatewayError {
 }
 
 #[derive(Debug, Clone)]
-struct ExtendedDepthSnapshot {
+struct AsterDepthSnapshot {
     last_update_id: u64,
     bids: Vec<BookLevel>,
     asks: Vec<BookLevel>,
 }
 
 #[derive(Debug, Clone)]
-struct ExtendedDepthUpdate {
+struct AsterDepthUpdate {
     symbol: String,
     event_time: Option<TimestampMs>,
     start_id: u64,
@@ -555,23 +552,20 @@ struct ExtendedDepthUpdate {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ExtendedSeqState {
+struct AsterSeqState {
     last_update_id: u64,
 }
 
-impl ExtendedSeqState {
+impl AsterSeqState {
     fn new(last_update_id: u64) -> Self {
         Self { last_update_id }
     }
 
-    fn apply_update(
-        &mut self,
-        update: &ExtendedDepthUpdate,
-    ) -> anyhow::Result<Option<MarketDataEvent>> {
+    fn apply_update(&mut self, update: &AsterDepthUpdate) -> anyhow::Result<Option<MarketDataEvent>> {
         if let Some(prev) = update.prev_id {
             if prev != self.last_update_id {
                 return Err(anyhow::anyhow!(
-                    "extended seq mismatch prev_id={} last={}",
+                    "aster seq mismatch prev_id={} last={}",
                     prev,
                     self.last_update_id
                 ));
@@ -582,7 +576,7 @@ impl ExtendedSeqState {
         }
         if update.start_id > self.last_update_id + 1 {
             return Err(anyhow::anyhow!(
-                "extended seq gap last={} next_start={}",
+                "aster seq gap last={} next_start={}",
                 self.last_update_id,
                 update.start_id
             ));
@@ -603,11 +597,11 @@ impl ExtendedSeqState {
 }
 
 #[derive(Debug)]
-struct ExtendedRecorder {
+struct AsterRecorder {
     dir: PathBuf,
 }
 
-impl ExtendedRecorder {
+impl AsterRecorder {
     fn new(dir: &PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         Ok(Self { dir: dir.clone() })
@@ -631,18 +625,18 @@ impl ExtendedRecorder {
     }
 }
 
-fn parse_depth_snapshot(value: &Value) -> Option<ExtendedDepthSnapshot> {
+fn parse_depth_snapshot(value: &Value) -> Option<AsterDepthSnapshot> {
     let last_update_id = value.get("lastUpdateId")?.as_u64()?;
     let bids = parse_levels_from_value(value.get("bids")?)?;
     let asks = parse_levels_from_value(value.get("asks")?)?;
-    Some(ExtendedDepthSnapshot {
+    Some(AsterDepthSnapshot {
         last_update_id,
         bids,
         asks,
     })
 }
 
-fn parse_depth_update(text: &str) -> Option<ExtendedDepthUpdate> {
+fn parse_depth_update(text: &str) -> Option<AsterDepthUpdate> {
     let value: Value = serde_json::from_str(text).ok()?;
     let payload = value.get("data").unwrap_or(&value);
     let event = payload.get("e").and_then(|v| v.as_str()).unwrap_or("");
@@ -659,7 +653,7 @@ fn parse_depth_update(text: &str) -> Option<ExtendedDepthUpdate> {
         .map(|v| v as TimestampMs);
     let bids = parse_deltas_from_value(payload.get("b")?, BookSide::Bid)?;
     let asks = parse_deltas_from_value(payload.get("a")?, BookSide::Ask)?;
-    Some(ExtendedDepthUpdate {
+    Some(AsterDepthUpdate {
         symbol,
         event_time,
         start_id,
@@ -778,13 +772,13 @@ struct FixtureAccountSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct ExtendedFixtureFeed {
+pub struct AsterFixtureFeed {
     snapshot: FixtureSnapshot,
     deltas: Vec<FixtureDelta>,
     account: FixtureAccountSnapshot,
 }
 
-impl ExtendedFixtureFeed {
+impl AsterFixtureFeed {
     pub fn from_dir(dir: &Path) -> Result<Self, String> {
         let snapshot_path = dir.join("snapshot.json");
         let deltas_path = dir.join("deltas.jsonl");
@@ -969,8 +963,8 @@ mod tests {
     #[test]
     fn fixture_snapshot_parses() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/extended");
-        let feed = ExtendedFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
+            .join("../tests/fixtures/roadmap_b/aster");
+        let feed = AsterFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         assert!(!feed.snapshot.bids.is_empty());
         assert!(!feed.snapshot.asks.is_empty());
     }
@@ -978,8 +972,8 @@ mod tests {
     #[test]
     fn delta_applies_to_snapshot_levels() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/extended");
-        let feed = ExtendedFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
+            .join("../tests/fixtures/roadmap_b/aster");
+        let feed = AsterFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         let mut bids = feed.snapshot.bids.clone();
         let delta = feed.deltas.first().expect("delta");
         let side = delta.side.to_lowercase();
@@ -996,16 +990,16 @@ mod tests {
     #[test]
     fn seq_gap_triggers_refresh_marker() {
         let gap = FixtureDelta {
-            seq: 2,
+            seq: 7,
             timestamp_ms: 1_000,
-            side: "bid".to_string(),
+            side: "ask".to_string(),
             price: 100.0,
             size: 1.0,
         };
         let next = FixtureDelta {
-            seq: 4,
+            seq: 9,
             timestamp_ms: 1_010,
-            side: "bid".to_string(),
+            side: "ask".to_string(),
             price: 100.0,
             size: 1.0,
         };
@@ -1013,14 +1007,14 @@ mod tests {
         let gap_detected = next.seq > last_seq + 1;
         last_seq = next.seq;
         assert!(gap_detected);
-        assert_eq!(last_seq, 4);
+        assert_eq!(last_seq, 9);
     }
 
     #[test]
     fn deterministic_serialization_roundtrip() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/extended");
-        let feed = ExtendedFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
+            .join("../tests/fixtures/roadmap_b/aster");
+        let feed = AsterFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         let raw = serde_json::to_string(&feed.snapshot).expect("serialize");
         let reparsed: FixtureSnapshot = serde_json::from_str(&raw).expect("reparse");
         assert_eq!(feed.snapshot.seq, reparsed.seq);
@@ -1030,7 +1024,7 @@ mod tests {
     #[test]
     fn live_snapshot_fixture_parses() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/extended_live_recording");
+            .join("../tests/fixtures/roadmap_b/aster_live_recording");
         let raw = std::fs::read_to_string(fixture_dir.join("rest_snapshot.json"))
             .expect("snapshot raw");
         let value: Value = serde_json::from_str(&raw).expect("snapshot json");
@@ -1043,7 +1037,7 @@ mod tests {
     #[test]
     fn live_ws_replay_is_deterministic_and_monotonic() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/extended_live_recording");
+            .join("../tests/fixtures/roadmap_b/aster_live_recording");
         let snapshot_raw = std::fs::read_to_string(fixture_dir.join("rest_snapshot.json"))
             .expect("snapshot raw");
         let snapshot_value: Value = serde_json::from_str(&snapshot_raw).expect("snapshot json");
@@ -1052,7 +1046,7 @@ mod tests {
             .expect("ws frames");
 
         let collect_events = |snapshot_id: u64| -> Vec<MarketDataEvent> {
-            let mut state = ExtendedSeqState::new(snapshot_id);
+            let mut state = AsterSeqState::new(snapshot_id);
             let mut events = Vec::new();
             for line in frames.lines() {
                 let trimmed = line.trim();
@@ -1101,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn rest_place_order_post_only_is_signed() {
         let server = MockServer::start_async().await;
-        let cfg = ExtendedConfig {
+        let cfg = AsterConfig {
             ws_url: "wss://example.invalid".to_string(),
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
@@ -1111,7 +1105,7 @@ mod tests {
             recv_window: Some(5000),
             record_dir: None,
         };
-        let client = ExtendedRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
 
         let expected_signature = "4b0927aa17b493de48e207d2e891485c491aefb6c6ed0bd374259b42a21a1284";
         let mock = server
@@ -1136,7 +1130,7 @@ mod tests {
         let _ = client
             .place_order(LiveRestPlaceRequest {
                 venue_index: 0,
-                venue_id: "extended".to_string(),
+                venue_id: "aster".to_string(),
                 side: Side::Buy,
                 price: 100.0,
                 size: 0.1,
@@ -1155,7 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn rest_place_order_ioc_reduce_only_is_signed() {
         let server = MockServer::start_async().await;
-        let cfg = ExtendedConfig {
+        let cfg = AsterConfig {
             ws_url: "wss://example.invalid".to_string(),
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
@@ -1165,7 +1159,7 @@ mod tests {
             recv_window: Some(5000),
             record_dir: None,
         };
-        let client = ExtendedRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
 
         let expected_signature = "fb231bb1595dd627ceab277d9d9b6f9ff238ad515830ba44ea5717e01ff578ad";
         let mock = server
@@ -1191,7 +1185,7 @@ mod tests {
         let _ = client
             .place_order(LiveRestPlaceRequest {
                 venue_index: 0,
-                venue_id: "extended".to_string(),
+                venue_id: "aster".to_string(),
                 side: Side::Sell,
                 price: 101.0,
                 size: 0.2,
@@ -1210,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn rest_cancel_all_is_signed() {
         let server = MockServer::start_async().await;
-        let cfg = ExtendedConfig {
+        let cfg = AsterConfig {
             ws_url: "wss://example.invalid".to_string(),
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
@@ -1220,7 +1214,7 @@ mod tests {
             recv_window: Some(5000),
             record_dir: None,
         };
-        let client = ExtendedRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
 
         let expected_signature = "c848f23c14e1e39ab9b87af2e2b433ebc78ab2393952b62660e5229c0c979fdf";
         let mock = server
@@ -1239,7 +1233,7 @@ mod tests {
         let _ = client
             .cancel_all(LiveRestCancelAllRequest {
                 venue_index: 0,
-                venue_id: "extended".to_string(),
+                venue_id: "aster".to_string(),
             })
             .await
             .expect("cancel_all");

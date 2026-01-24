@@ -4,11 +4,13 @@
 //! without any external network connectors.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
+use reqwest::Url;
 use serde::Deserialize;
 use std::path::PathBuf;
 use paraphina::config::{resolve_effective_profile, Config};
@@ -519,6 +521,96 @@ fn env_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone)]
+struct ReconcileEnvState {
+    enabled: bool,
+    detail: String,
+}
+
+fn parse_reconcile_env() -> ReconcileEnvState {
+    let raw = match std::env::var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS") {
+        Ok(val) => val,
+        Err(_) => {
+            return ReconcileEnvState {
+                enabled: false,
+                detail: "missing".to_string(),
+            }
+        }
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "false" | "off" | "no") {
+        return ReconcileEnvState {
+            enabled: false,
+            detail: "disabled (explicit)".to_string(),
+        };
+    }
+    if let Ok(ms) = raw.parse::<i64>() {
+        if ms > 0 {
+            return ReconcileEnvState {
+                enabled: true,
+                detail: format!("enabled ms={}", ms),
+            };
+        }
+        return ReconcileEnvState {
+            enabled: false,
+            detail: format!("disabled value={}", ms),
+        };
+    }
+    ReconcileEnvState {
+        enabled: false,
+        detail: format!("invalid value={}", raw),
+    }
+}
+
+fn endpoint_dns_status(url: &str) -> (bool, String) {
+    let parsed = match Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(err) => return (false, format!("invalid_url err={err} url={url}")),
+    };
+    let Some(host) = parsed.host_str() else {
+        return (false, format!("invalid_host url={url}"));
+    };
+    let Some(port) = parsed.port_or_known_default() else {
+        return (false, format!("invalid_port url={url}"));
+    };
+    let addr = format!("{host}:{port}");
+    match addr.to_socket_addrs() {
+        Ok(mut resolved) => {
+            if resolved.next().is_some() {
+                (true, format!("dns_ok host={host} port={port}"))
+            } else {
+                (false, format!("dns_empty host={host} port={port}"))
+            }
+        }
+        Err(err) => (false, format!("dns_fail host={host} port={port} err={err}")),
+    }
+}
+
+fn append_endpoint_details(
+    endpoint_details: &mut Vec<String>,
+    endpoint_ok: &mut bool,
+    label: &str,
+    ws_url: Option<&str>,
+    http_url: Option<&str>,
+) {
+    let mut parts = Vec::new();
+    if let Some(ws) = ws_url {
+        let (ok, status) = endpoint_dns_status(ws);
+        *endpoint_ok &= ok;
+        parts.push(format!("ws={ws} {status}"));
+    }
+    if let Some(http) = http_url {
+        let (ok, status) = endpoint_dns_status(http);
+        *endpoint_ok &= ok;
+        parts.push(format!("http={http} {status}"));
+    }
+    if parts.is_empty() {
+        endpoint_details.push(format!("{label}:n/a"));
+    } else {
+        endpoint_details.push(format!("{label} {}", parts.join(" ")));
+    }
+}
+
 fn paradex_fixture_mode(args: &Args) -> bool {
     args.paradex_fixture || env_is_true("PARADEX_FIXTURE_MODE")
 }
@@ -876,12 +968,8 @@ fn enforce_live_execution_guardrails(
         );
         std::process::exit(2);
     }
-    let reconcile_enabled = std::env::var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .map(|v| v > 0)
-        .unwrap_or(false);
-    if !reconcile_enabled {
+    let reconcile_state = parse_reconcile_env();
+    if !reconcile_state.enabled {
         eprintln!(
             "paraphina_live | error=live_mode_reconcile_missing (set PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS)"
         );
@@ -957,6 +1045,122 @@ fn run_preflight(
         label: "connectors",
         ok: connector_ok,
         details: connector_details.join(","),
+    });
+
+    let mut endpoint_ok = true;
+    let mut endpoint_details = Vec::new();
+    for connector in connectors {
+        match connector {
+            ConnectorArg::Mock => append_endpoint_details(&mut endpoint_details, &mut endpoint_ok, "mock", None, None),
+            ConnectorArg::HyperliquidFixture => {
+                endpoint_details.push("hyperliquid_fixture:fixture_mode".to_string());
+            }
+            ConnectorArg::Hyperliquid => {
+                #[cfg(feature = "live_hyperliquid")]
+                {
+                    let cfg =
+                        paraphina::live::connectors::hyperliquid::HyperliquidConfig::from_env();
+                    append_endpoint_details(
+                        &mut endpoint_details,
+                        &mut endpoint_ok,
+                        "hyperliquid",
+                        Some(cfg.ws_url.as_str()),
+                        Some(cfg.rest_url.as_str()),
+                    );
+                    let (ok, status) = endpoint_dns_status(cfg.info_url.as_str());
+                    endpoint_ok &= ok;
+                    endpoint_details.push(format!(
+                        "hyperliquid_info http={} {status}",
+                        cfg.info_url
+                    ));
+                }
+                #[cfg(not(feature = "live_hyperliquid"))]
+                {
+                    endpoint_ok = false;
+                    endpoint_details.push("hyperliquid:feature_disabled".to_string());
+                }
+            }
+            ConnectorArg::Lighter => {
+                #[cfg(feature = "live_lighter")]
+                {
+                    let cfg =
+                        paraphina::live::connectors::lighter::LighterConfig::from_env();
+                    append_endpoint_details(
+                        &mut endpoint_details,
+                        &mut endpoint_ok,
+                        "lighter",
+                        Some(cfg.ws_url.as_str()),
+                        Some(cfg.rest_url.as_str()),
+                    );
+                }
+                #[cfg(not(feature = "live_lighter"))]
+                {
+                    endpoint_ok = false;
+                    endpoint_details.push("lighter:feature_disabled".to_string());
+                }
+            }
+            ConnectorArg::Extended => {
+                #[cfg(feature = "live_extended")]
+                {
+                    let cfg =
+                        paraphina::live::connectors::extended::ExtendedConfig::from_env();
+                    append_endpoint_details(
+                        &mut endpoint_details,
+                        &mut endpoint_ok,
+                        "extended",
+                        Some(cfg.ws_url.as_str()),
+                        Some(cfg.rest_url.as_str()),
+                    );
+                }
+                #[cfg(not(feature = "live_extended"))]
+                {
+                    endpoint_ok = false;
+                    endpoint_details.push("extended:feature_disabled".to_string());
+                }
+            }
+            ConnectorArg::Aster => {
+                #[cfg(feature = "live_aster")]
+                {
+                    let cfg = paraphina::live::connectors::aster::AsterConfig::from_env();
+                    append_endpoint_details(
+                        &mut endpoint_details,
+                        &mut endpoint_ok,
+                        "aster",
+                        Some(cfg.ws_url.as_str()),
+                        Some(cfg.rest_url.as_str()),
+                    );
+                }
+                #[cfg(not(feature = "live_aster"))]
+                {
+                    endpoint_ok = false;
+                    endpoint_details.push("aster:feature_disabled".to_string());
+                }
+            }
+            ConnectorArg::Paradex => {
+                #[cfg(feature = "live_paradex")]
+                {
+                    let cfg =
+                        paraphina::live::connectors::paradex::ParadexConfig::from_env();
+                    append_endpoint_details(
+                        &mut endpoint_details,
+                        &mut endpoint_ok,
+                        "paradex",
+                        Some(cfg.ws_url.as_str()),
+                        Some(cfg.rest_url.as_str()),
+                    );
+                }
+                #[cfg(not(feature = "live_paradex"))]
+                {
+                    endpoint_ok = false;
+                    endpoint_details.push("paradex:feature_disabled".to_string());
+                }
+            }
+        }
+    }
+    checks.push(PreflightCheck {
+        label: "connector_endpoints",
+        ok: endpoint_ok,
+        details: endpoint_details.join(" | "),
     });
 
     let mut venue_ok = true;
@@ -1065,15 +1269,11 @@ fn run_preflight(
             ok: canary_ok,
             details: canary_error.unwrap_or("loaded").to_string(),
         });
-        let reconcile_ok = std::env::var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .map(|v| v > 0)
-            .unwrap_or(false);
+        let reconcile_state = parse_reconcile_env();
         checks.push(PreflightCheck {
             label: "reconciliation",
-            ok: reconcile_ok,
-            details: if reconcile_ok { "enabled" } else { "missing" }.to_string(),
+            ok: reconcile_state.enabled,
+            details: reconcile_state.detail.clone(),
         });
     }
 

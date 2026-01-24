@@ -3,7 +3,8 @@ mod tests {
     use std::sync::Mutex;
 
     use paraphina::config::Config;
-    use paraphina::live::runner::{run_live_loop, LiveChannels, LiveRunMode, LiveTelemetry, LiveTelemetryStats};
+    use paraphina::live::ops::{HealthState, LiveMetrics};
+    use paraphina::live::runner::{run_live_loop, LiveChannels, LiveRunMode, LiveTelemetry, LiveTelemetryStats, LiveRuntimeHooks};
     use paraphina::live::types::{AccountEvent, AccountSnapshot, BalanceSnapshot, L2Snapshot, LiquidationSnapshot, MarginSnapshot, MarketDataEvent, PositionSnapshot};
     use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
     use paraphina::types::TimestampMs;
@@ -183,6 +184,114 @@ mod tests {
         )
         .await;
         assert!(!summary.kill_switch, "did not expect kill switch");
+
+        std::env::remove_var("PARAPHINA_RECONCILE_POS_TAO_TOL");
+        std::env::remove_var("PARAPHINA_RECONCILE_BALANCE_USD_TOL");
+    }
+
+    #[tokio::test]
+    async fn unavailable_account_snapshot_does_not_trigger_drift() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_RECONCILE_POS_TAO_TOL", "0.01");
+        std::env::set_var("PARAPHINA_RECONCILE_BALANCE_USD_TOL", "0.5");
+
+        let mut cfg = Config::default();
+        cfg.venues = vec![cfg.venues[0].clone()];
+
+        let temp = tempdir().expect("tempdir");
+        let telemetry_path = temp.path().join("telemetry.jsonl");
+        let telemetry = LiveTelemetry {
+            sink: std::sync::Arc::new(std::sync::Mutex::new(TelemetrySink::from_config(
+                TelemetryConfig {
+                    mode: TelemetryMode::Jsonl,
+                    path: Some(telemetry_path.clone()),
+                    append: false,
+                },
+            ))),
+            shadow_mode: true,
+            execution_mode: "shadow",
+            max_orders_per_tick: 200,
+            stats: std::sync::Arc::new(std::sync::Mutex::new(LiveTelemetryStats::default())),
+        };
+        let hooks = LiveRuntimeHooks {
+            metrics: LiveMetrics::new(),
+            health: HealthState::new(),
+            telemetry: Some(telemetry),
+        };
+
+        let (market_tx, market_rx) = mpsc::channel::<MarketDataEvent>(32);
+        let (account_tx, account_rx) = mpsc::channel::<AccountEvent>(32);
+        let (order_tx, _order_rx) = mpsc::channel::<paraphina::live::runner::LiveOrderRequest>(32);
+
+        let start_ms = 1_000;
+        let step_ms = 100;
+        let ticks = 2_u64;
+        let venue_id = cfg.venues[0].id.clone();
+        let snapshot = L2Snapshot {
+            venue_index: 0,
+            venue_id,
+            seq: 1,
+            timestamp_ms: start_ms,
+            bids: vec![paraphina::live::orderbook_l2::BookLevel { price: 100.0, size: 1.0 }],
+            asks: vec![paraphina::live::orderbook_l2::BookLevel { price: 101.0, size: 1.0 }],
+        };
+        let _ = market_tx.send(MarketDataEvent::L2Snapshot(snapshot)).await;
+
+        let venue_id = cfg.venues[0].id.clone();
+        let snapshot = AccountSnapshot {
+            venue_index: 0,
+            venue_id,
+            seq: 0,
+            timestamp_ms: 0,
+            positions: Vec::new(),
+            balances: Vec::new(),
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: 0.0,
+                used_usd: 0.0,
+                available_usd: 0.0,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+        let _ = account_tx.send(AccountEvent::Snapshot(snapshot)).await;
+
+        let channels = LiveChannels {
+            market_rx,
+            account_rx,
+            exec_rx: None,
+            account_reconcile_tx: None,
+            order_tx,
+            order_snapshot_rx: None,
+        };
+
+        let summary = run_live_loop(
+            &cfg,
+            channels,
+            LiveRunMode::Step {
+                start_ms,
+                step_ms,
+                ticks,
+            },
+            Some(hooks),
+        )
+        .await;
+        assert!(!summary.kill_switch, "did not expect kill switch");
+
+        let data = std::fs::read_to_string(&telemetry_path).expect("read telemetry");
+        for line in data.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("parse telemetry JSON");
+            if value.get("t").and_then(|v| v.as_u64()) == Some(0) {
+                let drift = value.get("reconcile_drift").and_then(|v| v.as_array());
+                assert!(drift.map(|d| d.is_empty()).unwrap_or(true));
+            }
+        }
 
         std::env::remove_var("PARAPHINA_RECONCILE_POS_TAO_TOL");
         std::env::remove_var("PARAPHINA_RECONCILE_BALANCE_USD_TOL");

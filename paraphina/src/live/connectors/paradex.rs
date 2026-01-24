@@ -873,6 +873,10 @@ impl ParadexFixtureFeed {
         step_ms: i64,
         ticks: u64,
     ) {
+        let pace_ticks = std::env::var("PARAPHINA_PAPER_USE_WALLCLOCK_TS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let sleep_duration = Duration::from_millis(step_ms.max(1) as u64);
         let mut seq: u64 = 1;
         for tick in 0..ticks {
             let now_ms = start_ms + step_ms.saturating_mul(tick as i64);
@@ -887,7 +891,11 @@ impl ParadexFixtureFeed {
             let account = account_event(&self.account, venue_id, venue_index, seq, now_ms);
             seq = seq.wrapping_add(1);
             let _ = account_tx.send(account).await;
-            tokio::task::yield_now().await;
+            if pace_ticks {
+                tokio::time::sleep(sleep_duration).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
         }
     }
 }
