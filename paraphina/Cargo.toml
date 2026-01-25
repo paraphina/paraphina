@@ -43,7 +43,7 @@ rayon = "1.10"
 
 # Tokio runtime (live trading skeleton, feature-gated).
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
-tokio-tungstenite = { version = "0.23", optional = true }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
 prometheus = { version = "0.13", optional = true }
 tiny_http = { version = "0.12", optional = true }
