@@ -27,6 +27,15 @@
 //!
 //! Use [`ensure_schema_v1`] to validate/insert schema version on records.
 //!
+//! # Schema Version Contract
+//!
+//! **Important:** This module is a generic JSONL writer and does **not**
+//! auto-inject `schema_version`. Producers are responsible for including
+//! `"schema_version": 1` in each record per the telemetry contract
+//! (`docs/TELEMETRY_SCHEMA_V1.md`).
+//!
+//! Use [`ensure_schema_v1`] to validate/insert schema version on records.
+//!
 //! # Usage (conceptual)
 //!
 //! In your main / engine loop, once per tick:
