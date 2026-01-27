@@ -1,6 +1,6 @@
 # Roadmap‑B Readiness Report
 
-- Generated (UTC): 2026-01-18T22:35:12Z
+- Generated (UTC): 2026-01-27T19:28:05Z
 
 ## Connector Matrix
 
@@ -31,8 +31,8 @@ Connector stages:
 
 ## All-5 Readiness Gates
 
-- All-5 compile under feature flags: PASS
-- All-5 PaperExec (offline deterministic): PASS
+- All-5 compile under feature flags: UNKNOWN
+- All-5 PaperExec (offline deterministic): UNKNOWN
 - CanaryLive-ready connectors: hyperliquid, lighter, extended, aster, paradex
 
 
@@ -69,13 +69,13 @@ Connector stages:
 
 ## Last Known Test Results
 
-- `cargo test --all` → passed
-- `cargo test -p paraphina --features live` → not_run
-- `cargo test -p paraphina --features live,live_hyperliquid` → not_run
-- `cargo test -p paraphina --features live,live_lighter` → not_run
+- `cargo test --all` → passed (test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s)
+- `cargo test -p paraphina --features live` → passed (test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s)
+- `cargo test -p paraphina --features live,live_hyperliquid` → passed (test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s)
+- `cargo test -p paraphina --features live,live_lighter` → passed (test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s)
 - `cargo test -p paraphina --features live,live_paradex` → not_run
 - `cargo test -p paraphina --features live,live_aster` → not_run
 - `cargo test -p paraphina --features live,live_extended` → not_run
-- `cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_aster,live_extended,live_paradex` → passed
-- `python3 -m pytest -q` → passed
-- `python3 tools/print_live_connector_matrix.py` → passed
+- `cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_aster,live_extended,live_paradex` → not_run
+- `python3 -m pytest -q` → passed (647 passed in 3.38s)
+- `python3 tools/print_live_connector_matrix.py` → not_run

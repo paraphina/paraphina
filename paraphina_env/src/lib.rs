@@ -232,6 +232,7 @@ impl Env {
             reward_weights: Default::default(),
             apply_domain_rand,
             ablations: AblationSet::new(),
+            ..SimEnvConfig::default()
         };
 
         let inner = RustSimEnv::new(base_config, env_config);
@@ -367,6 +368,7 @@ impl VecEnv {
             reward_weights: Default::default(),
             apply_domain_rand,
             ablations: AblationSet::new(),
+            ..SimEnvConfig::default()
         };
 
         let inner = RustVecEnv::new(n, base_config, env_config);
