@@ -19,6 +19,7 @@ pub struct ResearchAlignmentBudget {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ResearchAlignmentBudgetFile {
+    #[allow(dead_code)]
     schema_version: i64,
     risk_tiers: Vec<ResearchAlignmentBudget>,
 }

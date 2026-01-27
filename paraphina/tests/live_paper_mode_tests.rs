@@ -1,6 +1,9 @@
+#[cfg(feature = "live_hyperliquid")]
 use std::path::PathBuf;
+#[cfg(feature = "live_hyperliquid")]
 use std::process::Command;
 
+#[cfg(feature = "live_hyperliquid")]
 use tempfile::TempDir;
 
 #[cfg(feature = "live_hyperliquid")]

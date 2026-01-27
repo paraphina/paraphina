@@ -31,7 +31,10 @@ mod tests {
             .arg("shadow")
             .arg("--connector")
             .arg("hyperliquid-fixture")
-            .env("PARAPHINA_LIVE_OUT_DIR", out_dir.to_string_lossy().to_string())
+            .env(
+                "PARAPHINA_LIVE_OUT_DIR",
+                out_dir.to_string_lossy().to_string(),
+            )
             .env("PARAPHINA_TELEMETRY_MODE", "jsonl")
             .env(
                 "PARAPHINA_TELEMETRY_PATH",

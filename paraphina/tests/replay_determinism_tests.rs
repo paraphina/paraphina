@@ -128,12 +128,19 @@ fn test_replay_determinism_single_tick() {
     let output_b = compute_actions(input_b);
 
     // Compare outputs (intents + logs)
-    assert_eq!(output_a.mm_intents, output_b.mm_intents, "MM intents should match");
-    assert_eq!(output_a.exit_intents, output_b.exit_intents, "Exit intents should match");
-    assert_eq!(output_a.hedge_intents, output_b.hedge_intents, "Hedge intents should match");
+    assert_eq!(
+        output_a.mm_intents, output_b.mm_intents,
+        "MM intents should match"
+    );
+    assert_eq!(
+        output_a.exit_intents, output_b.exit_intents,
+        "Exit intents should match"
+    );
+    assert_eq!(
+        output_a.hedge_intents, output_b.hedge_intents,
+        "Hedge intents should match"
+    );
     assert_eq!(output_a.logs, output_b.logs, "Logs should match");
-
-
 }
 
 #[test]
@@ -156,9 +163,21 @@ fn test_replay_determinism_multi_tick() {
     );
 
     for (tick, (a, b)) in outputs_a.iter().zip(outputs_b.iter()).enumerate() {
-        assert_eq!(a.mm_intents, b.mm_intents, "Tick {} MM intents differ", tick);
-        assert_eq!(a.exit_intents, b.exit_intents, "Tick {} Exit intents differ", tick);
-        assert_eq!(a.hedge_intents, b.hedge_intents, "Tick {} Hedge intents differ", tick);
+        assert_eq!(
+            a.mm_intents, b.mm_intents,
+            "Tick {} MM intents differ",
+            tick
+        );
+        assert_eq!(
+            a.exit_intents, b.exit_intents,
+            "Tick {} Exit intents differ",
+            tick
+        );
+        assert_eq!(
+            a.hedge_intents, b.hedge_intents,
+            "Tick {} Hedge intents differ",
+            tick
+        );
         assert_eq!(a.logs, b.logs, "Tick {} Logs differ", tick);
     }
 }
@@ -198,8 +217,6 @@ fn test_replay_determinism_with_inventory() {
     assert_eq!(output_a.hedge_intents, output_b.hedge_intents);
     assert_eq!(output_a.logs, output_b.logs);
 }
-
-
 
 #[test]
 fn test_strategy_output_intents_are_well_formed() {

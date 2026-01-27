@@ -1,9 +1,8 @@
 use paraphina::config::Config;
 use paraphina::exit;
 use paraphina::state::GlobalState;
-use paraphina::types::{Side, VenueStatus};
 use paraphina::types::OrderIntent;
-
+use paraphina::types::{Side, VenueStatus};
 
 /// Extractors for OrderIntent enum used in exit-engine tests.
 /// Exit intents are expected to be Place/Replace; panic on other variants so the test
@@ -32,7 +31,6 @@ fn intent_side(intent: &OrderIntent) -> Side {
         other => panic!("Expected Place/Replace for side, got: {:?}", other),
     }
 }
-
 
 #[test]
 fn exit_noops_without_fair_value() {
@@ -92,7 +90,8 @@ fn exit_respects_lot_size_and_min_notional() {
     // and min notional constraints (3 * 104.75 = ~314 < 1000)
     for it in &intents {
         assert_ne!(
-            intent_venue_index(&it), 1,
+            intent_venue_index(it),
+            1,
             "Should not use venue 1 due to lot size/min notional constraints"
         );
     }
@@ -153,7 +152,8 @@ fn exit_respects_min_notional() {
     // Should skip venue 1 due to min notional (2 * ~104.75 = ~210 < 500)
     for it in &intents {
         assert_ne!(
-            intent_venue_index(&it), 1,
+            intent_venue_index(it),
+            1,
             "Should not use venue 1 due to min notional constraint"
         );
     }
@@ -225,7 +225,7 @@ fn exit_splits_across_best_venues_when_capped_per_venue() {
         assert_eq!(intent_side(it), Side::Sell);
     }
 
-    let total: f64 = intents.iter().map(|i| intent_size(i)).sum();
+    let total: f64 = intents.iter().map(intent_size).sum();
     assert!(
         (total - 10.0).abs() < 1e-6 || total <= 10.0,
         "total exit should be <= max_total_tao_per_tick"
@@ -355,7 +355,8 @@ fn exit_prefers_less_fragmentation_when_edges_similar() {
         // At least verify deterministic ordering - same inputs should produce same outputs
         let intents2 = exit::compute_exit_intents(&cfg, &state, 0);
         assert_eq!(
-            intent_venue_index(&intents[0]), intent_venue_index(&intents2[0]),
+            intent_venue_index(&intents[0]),
+            intent_venue_index(&intents2[0]),
             "Exit ordering must be deterministic"
         );
         assert!(
@@ -427,7 +428,8 @@ fn exit_prefers_less_basis_risk_when_edges_similar() {
     );
     for (a, b) in intents2.iter().zip(intents2_copy.iter()) {
         assert_eq!(
-            intent_venue_index(a), intent_venue_index(b),
+            intent_venue_index(a),
+            intent_venue_index(b),
             "Venue ordering must be deterministic"
         );
         assert!(
@@ -491,11 +493,13 @@ fn exit_deterministic_ordering_with_identical_edges() {
 
     for i in 0..intents1.len() {
         assert_eq!(
-            intent_venue_index(&intents1[i]), intent_venue_index(&intents2[i]),
+            intent_venue_index(&intents1[i]),
+            intent_venue_index(&intents2[i]),
             "Venue order must be deterministic at position {i}"
         );
         assert_eq!(
-            intent_venue_index(&intents1[i]), intent_venue_index(&intents3[i]),
+            intent_venue_index(&intents1[i]),
+            intent_venue_index(&intents3[i]),
             "Venue order must be deterministic at position {i}"
         );
         assert!(

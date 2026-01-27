@@ -125,6 +125,7 @@ impl SafetyLayer {
     }
 }
 
+#[allow(clippy::ptr_arg)]
 fn normalize_len(
     vec: &mut Vec<f64>,
     len: usize,
@@ -140,7 +141,7 @@ fn normalize_len(
 }
 
 fn clamp_vec(
-    vec: &mut Vec<f64>,
+    vec: &mut [f64],
     min: f64,
     max: f64,
     name: &str,

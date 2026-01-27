@@ -20,9 +20,8 @@ mod hedge_testkit;
 
 use hedge_testkit::{approx_eq, is_finite, HedgeTestCase, Xorshift64};
 use paraphina::hedge::{compute_abs_limit_after_trade, compute_hedge_orders, compute_hedge_plan};
-use paraphina::types::Side;
 use paraphina::types::OrderIntent;
-
+use paraphina::types::Side;
 
 /// Extractors for OrderIntent enum used in hedge allocator invariants.
 /// Hedge allocator should emit Place/Replace intents only in these invariants.
@@ -33,11 +32,18 @@ fn intent_place_like_fields(intent: &OrderIntent) -> (usize, Side, f64, f64) {
         other => panic!("Expected Place/Replace OrderIntent, got: {:?}", other),
     }
 }
-fn intent_venue_index(intent: &OrderIntent) -> usize { intent_place_like_fields(intent).0 }
-fn intent_side(intent: &OrderIntent) -> Side { intent_place_like_fields(intent).1 }
-fn intent_size(intent: &OrderIntent) -> f64 { intent_place_like_fields(intent).2 }
-fn intent_price(intent: &OrderIntent) -> f64 { intent_place_like_fields(intent).3 }
-
+fn intent_venue_index(intent: &OrderIntent) -> usize {
+    intent_place_like_fields(intent).0
+}
+fn intent_side(intent: &OrderIntent) -> Side {
+    intent_place_like_fields(intent).1
+}
+fn intent_size(intent: &OrderIntent) -> f64 {
+    intent_place_like_fields(intent).2
+}
+fn intent_price(intent: &OrderIntent) -> f64 {
+    intent_place_like_fields(intent).3
+}
 
 // ============================================================================
 // CONSTANTS
@@ -115,7 +121,7 @@ fn invariant_total_hedge_bounded_by_max_step() {
         let state = test_case.build_state(&cfg);
 
         let intents = compute_hedge_orders(&cfg, &state, 0);
-        let total_size: f64 = intents.iter().map(|i| intent_size(i)).sum();
+        let total_size: f64 = intents.iter().map(intent_size).sum();
 
         // Allow small floating-point tolerance
         let tolerance = 1e-6;
@@ -260,10 +266,13 @@ fn invariant_hedge_direction_reduces_exposure() {
 
         for intent in &intents {
             assert_eq!(
-                intent_side(intent), expected_side,
+                intent_side(intent),
+                expected_side,
                 "Case {case_id}: Hedge direction wrong. Global q={}, expected {:?}, got {:?}\n\
                  Test case: {test_case:?}",
-                state.q_global_tao, expected_side, intent_side(intent)
+                state.q_global_tao,
+                expected_side,
+                intent_side(intent)
             );
         }
     }
@@ -309,12 +318,14 @@ fn invariant_output_determinism() {
         // Verify identical contents
         for i in 0..intents1.len() {
             assert_eq!(
-                intent_venue_index(&intents1[i]), intent_venue_index(&intents2[i]),
+                intent_venue_index(&intents1[i]),
+                intent_venue_index(&intents2[i]),
                 "Case {case_id}: Non-deterministic venue order at position {i}\n\
                  Test case: {test_case:?}"
             );
             assert_eq!(
-                intent_side(&intents1[i]), intent_side(&intents2[i]),
+                intent_side(&intents1[i]),
+                intent_side(&intents2[i]),
                 "Case {case_id}: Non-deterministic side at position {i}\n\
                  Test case: {test_case:?}"
             );
@@ -326,7 +337,11 @@ fn invariant_output_determinism() {
                 intent_size(&intents2[i])
             );
             assert!(
-                approx_eq(intent_price(&intents1[i]), intent_price(&intents2[i]), 1e-12),
+                approx_eq(
+                    intent_price(&intents1[i]),
+                    intent_price(&intents2[i]),
+                    1e-12
+                ),
                 "Case {case_id}: Non-deterministic price at position {i}: {} vs {}\n\
                  Test case: {test_case:?}",
                 intent_price(&intents1[i]),
@@ -405,7 +420,7 @@ fn run_systematic_case(case_id: u64, q: f64, fair: f64, margin: f64, leverage: f
     let intents = compute_hedge_orders(&cfg, &state, 0);
 
     // Check all invariants
-    let total_size: f64 = intents.iter().map(|i| intent_size(i)).sum();
+    let total_size: f64 = intents.iter().map(intent_size).sum();
     assert!(
         total_size <= cfg.hedge.max_step_tao + 1e-6,
         "Systematic case {case_id} (q={q}, fair={fair}, margin={margin}, leverage={leverage}): \
@@ -435,7 +450,8 @@ fn run_systematic_case(case_id: u64, q: f64, fair: f64, margin: f64, leverage: f
         let expected_side = if q > 0.0 { Side::Sell } else { Side::Buy };
         for intent in &intents {
             assert_eq!(
-                intent_side(intent), expected_side,
+                intent_side(intent),
+                expected_side,
                 "Systematic case {case_id}: Wrong hedge direction for q={q}"
             );
         }
@@ -576,7 +592,7 @@ fn edge_case_very_large_inventory() {
     state.recompute_after_fills(&cfg);
 
     let intents = compute_hedge_orders(&cfg, &state, 0);
-    let total: f64 = intents.iter().map(|i| intent_size(i)).sum();
+    let total: f64 = intents.iter().map(intent_size).sum();
 
     assert!(
         total <= cfg.hedge.max_step_tao + 1e-6,

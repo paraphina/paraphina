@@ -36,9 +36,7 @@ pub fn plan_mm_order_actions(
     // Hard guard: if kill switch is active, allow only cancels (no place/replace).
     // This ensures no new risk after a hard breach while clearing existing quotes.
     if state.kill_switch {
-        let venue_count = state.venues.len();
-        for venue_index in 0..venue_count {
-            let vstate = &state.venues[venue_index];
+        for (venue_index, vstate) in state.venues.iter().enumerate() {
             if let Some(cur) = &vstate.mm_open_bid {
                 intents.push(OrderIntent::Cancel(CancelOrderIntent {
                     venue_index,
@@ -65,8 +63,7 @@ pub fn plan_mm_order_actions(
         }
     }
 
-    for venue_index in 0..venue_count {
-        let vstate = &state.venues[venue_index];
+    for (venue_index, vstate) in state.venues.iter().enumerate() {
         let vcfg = &cfg.venues[venue_index];
         let tick = vcfg.tick_size.max(1e-6);
 
@@ -116,6 +113,7 @@ pub fn plan_mm_order_actions(
     MmOrderManagementPlan { intents }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_side(
     cfg: &Config,
     gen: &mut ActionIdGenerator,

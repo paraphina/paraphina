@@ -233,6 +233,12 @@ fn top_levels_depth(levels: &[BookLevel], count: usize) -> f64 {
         .sum()
 }
 
+impl Default for OrderBookL2 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

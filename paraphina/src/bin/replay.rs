@@ -47,6 +47,7 @@ fn apply_fill_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_telemetry(
     builder: &mut TelemetryBuilder,
     telemetry: &mut TelemetrySink,
@@ -149,6 +150,7 @@ fn main() -> Result<(), String> {
     let mut exit_events: Vec<ExecutionEvent> = Vec::new();
     let mut hedge_events: Vec<ExecutionEvent> = Vec::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn flush_tick(
         cfg: &Config,
         engine: &Engine,

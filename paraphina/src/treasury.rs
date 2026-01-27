@@ -56,7 +56,7 @@ impl TreasuryGuidanceEngine {
 
     pub fn build_guidance(&self, state: &GlobalState, tick: u64, now_ms: i64) -> JsonValue {
         let samples = self.samples.max(1) as f64;
-        let emit = tick % self.cadence_ticks == 0;
+        let emit = tick.is_multiple_of(self.cadence_ticks);
         let mut venues = Vec::with_capacity(self.venues.len());
         let mut recommendations = Vec::new();
 

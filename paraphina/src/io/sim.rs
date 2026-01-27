@@ -177,8 +177,8 @@ impl VenueAdapter for SimAdapter {
 
 fn crosses_book(side: Side, price: f64, best_bid: Option<f64>, best_ask: Option<f64>) -> bool {
     match side {
-        Side::Buy => best_ask.map_or(false, |ask| price >= ask),
-        Side::Sell => best_bid.map_or(false, |bid| price <= bid),
+        Side::Buy => best_ask.is_some_and(|ask| price >= ask),
+        Side::Sell => best_bid.is_some_and(|bid| price <= bid),
     }
 }
 

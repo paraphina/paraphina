@@ -1,7 +1,9 @@
 #![cfg(feature = "roadmap_b")]
 
-use paraphina::connector_registry::{roadmap_b_selectable_venues, validate_roadmap_b_connector_coverage};
-use paraphina::venues::{ROADMAP_B_VENUE_IDS, VenueId};
+use paraphina::connector_registry::{
+    roadmap_b_selectable_venues, validate_roadmap_b_connector_coverage,
+};
+use paraphina::venues::{VenueId, ROADMAP_B_VENUE_IDS};
 
 #[test]
 fn roadmap_b_registry_has_five_venues() {
@@ -29,5 +31,8 @@ fn roadmap_b_venue_id_names_are_stable() {
         VenueId::Paradex,
     ];
     let names = ids.iter().map(|v| v.name()).collect::<Vec<_>>();
-    assert_eq!(names, ["Extended", "Hyperliquid", "Aster", "Lighter", "Paradex"]);
+    assert_eq!(
+        names,
+        ["Extended", "Hyperliquid", "Aster", "Lighter", "Paradex"]
+    );
 }

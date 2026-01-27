@@ -1,12 +1,10 @@
 // CLI integration tests for paraphina_live startup log.
 
-use std::process::Command;
-
 #[test]
 #[cfg(feature = "live")]
 fn live_startup_log_includes_required_fields() {
     let bin = env!("CARGO_BIN_EXE_paraphina_live");
-    let output = Command::new(bin)
+    let output = std::process::Command::new(bin)
         .env("PARAPHINA_TRADE_MODE", "shadow")
         .env("PARAPHINA_LIVE_CONNECTOR", "hyperliquid_fixture")
         .env("HL_FIXTURE_DIR", "../tests/fixtures/hyperliquid")

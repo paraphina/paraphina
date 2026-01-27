@@ -471,7 +471,7 @@ where
                     if !cancel_intents.is_empty() {
                         all_intents.extend(cancel_intents.iter().cloned());
                         let mut cancel_batch =
-                            ActionBatch::new(now_ms, tick, &self.cfg.version).with_seed(self.seed);
+                            ActionBatch::new(now_ms, tick, self.cfg.version).with_seed(self.seed);
                         for action in intents_to_actions(&cancel_intents, &mut action_id_gen) {
                             cancel_batch.push(action);
                         }
@@ -493,7 +493,7 @@ where
                             .best_effort_kill_intent_exit_first(self.cfg, tick)
                         {
                             all_intents.push(intent.clone());
-                            let mut best_batch = ActionBatch::new(now_ms, tick, &self.cfg.version)
+                            let mut best_batch = ActionBatch::new(now_ms, tick, self.cfg.version)
                                 .with_seed(self.seed);
                             for action in intents_to_actions(&[intent], &mut action_id_gen) {
                                 best_batch.push(action);
@@ -532,7 +532,7 @@ where
                 all_intents.extend(mm_plan.intents.iter().cloned());
 
                 let mut mm_batch =
-                    ActionBatch::new(now_ms, tick, &self.cfg.version).with_seed(self.seed);
+                    ActionBatch::new(now_ms, tick, self.cfg.version).with_seed(self.seed);
                 for action in intents_to_actions(&mm_plan.intents, &mut action_id_gen) {
                     mm_batch.push(action);
                 }
@@ -562,7 +562,7 @@ where
                         all_intents.extend(exit_intents.iter().cloned());
 
                         let mut exit_batch =
-                            ActionBatch::new(now_ms, tick, &self.cfg.version).with_seed(self.seed);
+                            ActionBatch::new(now_ms, tick, self.cfg.version).with_seed(self.seed);
                         for action in intents_to_actions(&exit_intents, &mut action_id_gen) {
                             exit_batch.push(action);
                         }
@@ -597,7 +597,7 @@ where
                         all_intents.extend(hedge_intents.iter().cloned());
 
                         let mut hedge_batch =
-                            ActionBatch::new(now_ms, tick, &self.cfg.version).with_seed(self.seed);
+                            ActionBatch::new(now_ms, tick, self.cfg.version).with_seed(self.seed);
                         for action in intents_to_actions(&hedge_intents, &mut action_id_gen) {
                             hedge_batch.push(action);
                         }

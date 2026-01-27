@@ -78,7 +78,7 @@ impl<'a> Engine<'a> {
 
             let mid = base + offset;
             let spread = 0.4 + idx_f * 0.02;
-            let max_levels = self.cfg.book.depth_levels.max(1) as usize;
+            let max_levels = self.cfg.book.depth_levels.max(1);
             let tick = self.cfg.venues[idx].tick_size.max(1e-6);
             let base_size = self.cfg.venues[idx].base_order_size.max(1e-6);
             let best_bid = mid - spread / 2.0;

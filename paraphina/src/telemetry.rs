@@ -622,6 +622,7 @@ impl TelemetryBuilder {
         }
 
         for (idx, v) in state.venues.iter().enumerate() {
+            #[allow(clippy::collapsible_if)]
             if self.prev_venue_status.get(idx).map(|s| s.as_str())
                 != Some(&format!("{:?}", v.status))
             {
@@ -699,6 +700,7 @@ fn compute_healthy_venues_used(state: &GlobalState, now_ms: TimestampMs) -> Vec<
 fn build_quote_levels(cfg: &Config, state: &GlobalState, fair: f64) -> Vec<JsonValue> {
     let components = compute_mm_reservation_components(cfg, state);
     let quotes = compute_mm_quotes(cfg, state);
+    #[allow(clippy::type_complexity)]
     let mut quote_by_venue: Vec<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> =
         vec![(None, None, None, None); cfg.venues.len()];
     for quote in quotes {
@@ -1021,14 +1023,14 @@ fn build_order_records(
         }
     }
 
-    orders.sort_by(|a, b| order_sort_key(a).cmp(&order_sort_key(b)));
+    orders.sort_by_key(order_sort_key);
 
     let mut truncated = false;
     if would_send.len() > max_orders_per_tick {
         would_send.truncate(max_orders_per_tick);
         truncated = true;
     }
-    would_send.sort_by(|a, b| order_sort_key(a).cmp(&order_sort_key(b)));
+    would_send.sort_by_key(order_sort_key);
 
     (orders, would_send, truncated)
 }
@@ -1120,7 +1122,7 @@ fn build_fill_records(
             "markout_pnl_short": record.as_ref().and_then(|r| r.markout_pnl_short),
         }));
     }
-    out.sort_by(|a, b| fill_sort_key(a).cmp(&fill_sort_key(b)));
+    out.sort_by_key(fill_sort_key);
     out
 }
 

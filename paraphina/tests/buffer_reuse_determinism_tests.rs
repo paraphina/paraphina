@@ -79,7 +79,10 @@ fn intents_equal(a: &[OrderIntent], b: &[OrderIntent]) -> bool {
                 }
             }
             (OrderIntent::Cancel(a), OrderIntent::Cancel(b)) => {
-                if a.venue_index != b.venue_index || a.venue_id != b.venue_id || a.order_id != b.order_id {
+                if a.venue_index != b.venue_index
+                    || a.venue_id != b.venue_id
+                    || a.order_id != b.order_id
+                {
                     return false;
                 }
             }
@@ -479,13 +482,7 @@ fn test_full_tick_loop_determinism() {
                 OrderIntent::Replace(ri) => (ri.venue_index, ri.side, ri.size, ri.price),
                 OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => continue,
             };
-            state_buf.apply_perp_fill(
-                venue_index,
-                side,
-                size,
-                price,
-                5.0,
-            );
+            state_buf.apply_perp_fill(venue_index, side, size, price, 5.0);
         }
         state_buf.recompute_after_fills(&cfg);
     }

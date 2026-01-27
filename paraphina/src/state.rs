@@ -208,6 +208,7 @@ impl VenueState {
         self.prev_ln_mid = Some(ln_mid);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_l2_snapshot(
         &mut self,
         bids: &[BookLevel],
@@ -1061,6 +1062,7 @@ impl GlobalState {
             .map_or(i64::MAX, |pm| pm.t_eval_ms);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_fill_ledger(
         &mut self,
         fill: &FillEvent,

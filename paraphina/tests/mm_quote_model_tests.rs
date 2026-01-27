@@ -866,7 +866,6 @@ fn compute_order_actions_place_new() {
         dist_liq_sigma: 10.0,
         mm_open_bid: None,
         mm_open_ask: None,
-
     };
 
     let quote = paraphina::mm::MmQuote {
@@ -949,7 +948,6 @@ fn compute_order_actions_cancel_when_no_desired() {
         dist_liq_sigma: 10.0,
         mm_open_bid: None,
         mm_open_ask: None,
-
     };
 
     // No desired quote.
