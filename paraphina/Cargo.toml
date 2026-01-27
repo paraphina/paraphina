@@ -60,6 +60,7 @@ tempfile = "3"
 httpmock = "0.7"
 
 [features]
+roadmap_b = []
 # Feature-flagged event log writer (JSONL of normalized execution events).
 event_log = []
 legacy_runner = []
