@@ -58,6 +58,7 @@ fn test_adverse_buy_markout_increases_toxicity() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 1000;
 
@@ -90,6 +91,7 @@ fn test_severe_adverse_markout_disables_venue() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 1000;
 
@@ -129,6 +131,7 @@ fn test_favorable_buy_markout_decreases_toxicity() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 1000;
 
@@ -166,6 +169,7 @@ fn test_favorable_sell_markout_keeps_toxicity_low() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 1000;
 
@@ -201,6 +205,7 @@ fn test_markout_not_applied_before_horizon() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 1000;
 
@@ -238,6 +243,7 @@ fn test_markout_applied_at_exact_horizon() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 1000;
 
@@ -272,6 +278,7 @@ fn test_markout_applied_after_horizon() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 1000;
 
@@ -306,6 +313,7 @@ fn test_max_pending_cap_enforced() {
             mid: 100.0,
             horizon_ms: cfg.toxicity.markout_horizon_ms,
             max_pending: cfg.toxicity.max_pending_per_venue,
+            fill_seq: 0,
         });
     }
 
@@ -344,6 +352,7 @@ fn test_bounded_deque_fifo_order() {
             mid: 100.0,
             horizon_ms: cfg.toxicity.markout_horizon_ms,
             max_pending: cfg.toxicity.max_pending_per_venue,
+            fill_seq: 0,
         });
     }
 
@@ -390,6 +399,7 @@ fn test_health_status_warning() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 0;
 
@@ -420,6 +430,7 @@ fn test_health_status_disabled() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 0;
 
@@ -453,6 +464,7 @@ fn test_adverse_sell_markout() {
         price: 100.0, // Sold at 100
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 1000;
 
@@ -490,6 +502,7 @@ fn test_multiple_markouts_ewma_accumulation() {
             price: 100.0,
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
+            fill_seq: 0,
         });
     }
     state.venues[0].pending_markouts_next_eval_ms = 0;
@@ -525,6 +538,7 @@ fn test_mixed_markouts_balance_out() {
         price: 102.0, // Adverse: bought at 102, now at 100
         fair_at_fill: 102.0,
         mid_at_fill: 102.0,
+        fill_seq: 0,
     });
 
     state.venues[0].pending_markouts.push_back(PendingMarkout {
@@ -535,6 +549,7 @@ fn test_mixed_markouts_balance_out() {
         price: 98.0, // Favorable: bought at 98, now at 100
         fair_at_fill: 98.0,
         mid_at_fill: 98.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 0;
 
@@ -574,6 +589,7 @@ fn test_markout_ewma_telemetry_updated() {
         price: 100.0,
         fair_at_fill: 100.0,
         mid_at_fill: 100.0,
+        fill_seq: 0,
     });
     state.venues[0].pending_markouts_next_eval_ms = 0;
 
@@ -642,6 +658,7 @@ fn test_invalid_fill_not_recorded() {
         mid: 100.0,
         horizon_ms: cfg.toxicity.markout_horizon_ms,
         max_pending: cfg.toxicity.max_pending_per_venue,
+        fill_seq: 0,
     });
 
     state.record_pending_markout(PendingMarkoutRecord {
@@ -654,6 +671,7 @@ fn test_invalid_fill_not_recorded() {
         mid: 100.0,
         horizon_ms: cfg.toxicity.markout_horizon_ms,
         max_pending: cfg.toxicity.max_pending_per_venue,
+        fill_seq: 0,
     });
 
     state.record_pending_markout(PendingMarkoutRecord {
@@ -666,6 +684,7 @@ fn test_invalid_fill_not_recorded() {
         mid: 100.0,
         horizon_ms: cfg.toxicity.markout_horizon_ms,
         max_pending: cfg.toxicity.max_pending_per_venue,
+        fill_seq: 0,
     });
 
     // No markouts should have been recorded
@@ -695,6 +714,7 @@ fn test_record_pending_markout_basic() {
         mid: 100.0,
         horizon_ms: cfg.toxicity.markout_horizon_ms,
         max_pending: cfg.toxicity.max_pending_per_venue,
+        fill_seq: 0,
     });
 
     assert_eq!(state.venues[0].pending_markouts.len(), 1);

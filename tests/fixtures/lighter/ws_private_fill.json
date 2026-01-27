@@ -1,0 +1,13 @@
+{
+  "type": "fill",
+  "seq": 7,
+  "ts": 1700000000500,
+  "order_id": "order_1",
+  "client_order_id": "co_1",
+  "fill_id": "fill_1",
+  "side": "buy",
+  "price": 100.5,
+  "size": 0.5,
+  "purpose": "Mm",
+  "fee_bps": 1.0
+}

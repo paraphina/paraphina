@@ -1,0 +1,13 @@
+{
+  "seq": 20,
+  "ts": 1700000000200,
+  "positions": [
+    { "symbol": "TAO", "size": 2.0, "entry_px": 100.0 }
+  ],
+  "balances": [
+    { "asset": "USD", "total": 10000.0, "available": 9500.0 }
+  ],
+  "margin": { "balance": 10000.0, "used": 500.0, "available": 9500.0 },
+  "liquidation": { "price_liq": 80.0, "dist_liq_sigma": 4.0 },
+  "funding_8h": 0.001
+}

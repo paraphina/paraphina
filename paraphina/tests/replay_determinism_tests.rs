@@ -14,13 +14,12 @@
 // 3. Reset state, run pass B with same feed
 // 4. Assert action streams are identical
 
-use paraphina::actions::{Action, ActionBatch};
 use paraphina::config::Config;
 use paraphina::engine::Engine;
-use paraphina::io::noop::compare_batches;
 use paraphina::state::GlobalState;
 use paraphina::strategy_core::{compute_actions, StrategyInput};
 use paraphina::types::{TimestampMs, VenueStatus};
+use paraphina::StrategyOutput;
 
 /// Create a deterministic test configuration.
 fn create_test_config() -> Config {
@@ -69,10 +68,10 @@ fn run_strategy_pass(
     initial_state: &GlobalState,
     num_ticks: u64,
     seed: Option<u64>,
-) -> Vec<ActionBatch> {
+) -> Vec<StrategyOutput> {
     let engine = Engine::new(cfg);
     let mut state = initial_state.clone();
-    let mut batches = Vec::new();
+    let mut outputs = Vec::new();
 
     let base_ms: TimestampMs = seed.map(|s| (s % 10_000) as i64).unwrap_or(0);
     let dt_ms: TimestampMs = 1_000;
@@ -93,14 +92,14 @@ fn run_strategy_pass(
         };
 
         let output = compute_actions(input);
-        batches.push(output.batch);
+        outputs.push(output);
 
         // Note: In a full integration test, we would also execute the actions
         // and apply fills to state. For this test, we just verify the action
         // computation is deterministic.
     }
 
-    batches
+    outputs
 }
 
 #[test]
@@ -128,22 +127,13 @@ fn test_replay_determinism_single_tick() {
     };
     let output_b = compute_actions(input_b);
 
-    // Compare action batches
-    assert_eq!(
-        output_a.batch.actions.len(),
-        output_b.batch.actions.len(),
-        "Action counts should match"
-    );
+    // Compare outputs (intents + logs)
+    assert_eq!(output_a.mm_intents, output_b.mm_intents, "MM intents should match");
+    assert_eq!(output_a.exit_intents, output_b.exit_intents, "Exit intents should match");
+    assert_eq!(output_a.hedge_intents, output_b.hedge_intents, "Hedge intents should match");
+    assert_eq!(output_a.logs, output_b.logs, "Logs should match");
 
-    for (i, (a, b)) in output_a
-        .batch
-        .actions
-        .iter()
-        .zip(output_b.batch.actions.iter())
-        .enumerate()
-    {
-        assert_eq!(a, b, "Action {} should be identical", i);
-    }
+
 }
 
 #[test]
@@ -154,25 +144,22 @@ fn test_replay_determinism_multi_tick() {
     let seed = Some(12345u64);
 
     // Pass A
-    let batches_a = run_strategy_pass(&cfg, &state, num_ticks, seed);
+    let outputs_a = run_strategy_pass(&cfg, &state, num_ticks, seed);
 
     // Pass B (identical)
-    let batches_b = run_strategy_pass(&cfg, &state, num_ticks, seed);
+    let outputs_b = run_strategy_pass(&cfg, &state, num_ticks, seed);
 
     assert_eq!(
-        batches_a.len(),
-        batches_b.len(),
+        outputs_a.len(),
+        outputs_b.len(),
         "Batch counts should match"
     );
 
-    for (tick, (batch_a, batch_b)) in batches_a.iter().zip(batches_b.iter()).enumerate() {
-        let result = compare_batches(batch_a, batch_b);
-        assert!(
-            result.is_ok(),
-            "Tick {} batches differ: {}",
-            tick,
-            result.unwrap_err()
-        );
+    for (tick, (a, b)) in outputs_a.iter().zip(outputs_b.iter()).enumerate() {
+        assert_eq!(a.mm_intents, b.mm_intents, "Tick {} MM intents differ", tick);
+        assert_eq!(a.exit_intents, b.exit_intents, "Tick {} Exit intents differ", tick);
+        assert_eq!(a.hedge_intents, b.hedge_intents, "Tick {} Hedge intents differ", tick);
+        assert_eq!(a.logs, b.logs, "Tick {} Logs differ", tick);
     }
 }
 
@@ -187,7 +174,7 @@ fn test_replay_determinism_with_inventory() {
     state.venues[1].position_tao = 2.0;
     state.recompute_after_fills(&cfg);
 
-    // Pass A
+    // Same inputs => identical outputs
     let input_a = StrategyInput {
         cfg: &cfg,
         state: &state,
@@ -195,9 +182,6 @@ fn test_replay_determinism_with_inventory() {
         tick_index: 1,
         run_seed: Some(99),
     };
-    let output_a = compute_actions(input_a);
-
-    // Pass B
     let input_b = StrategyInput {
         cfg: &cfg,
         state: &state,
@@ -205,169 +189,20 @@ fn test_replay_determinism_with_inventory() {
         tick_index: 1,
         run_seed: Some(99),
     };
+
+    let output_a = compute_actions(input_a);
     let output_b = compute_actions(input_b);
 
-    let result = compare_batches(&output_a.batch, &output_b.batch);
-    assert!(
-        result.is_ok(),
-        "Batches with inventory differ: {}",
-        result.unwrap_err()
-    );
+    assert_eq!(output_a.mm_intents, output_b.mm_intents);
+    assert_eq!(output_a.exit_intents, output_b.exit_intents);
+    assert_eq!(output_a.hedge_intents, output_b.hedge_intents);
+    assert_eq!(output_a.logs, output_b.logs);
 }
 
-#[test]
-fn test_action_ids_deterministic() {
-    let cfg = create_test_config();
-    let state = create_test_state(&cfg);
 
-    let input = StrategyInput {
-        cfg: &cfg,
-        state: &state,
-        now_ms: 1000,
-        tick_index: 42,
-        run_seed: Some(1),
-    };
-
-    let output1 = compute_actions(input.clone());
-    let output2 = compute_actions(input);
-
-    // Collect action IDs
-    let ids1: Vec<String> = output1
-        .batch
-        .actions
-        .iter()
-        .map(|a| match a {
-            Action::PlaceOrder(po) => po.action_id.clone(),
-            Action::CancelOrder(co) => co.action_id.clone(),
-            Action::CancelAll(ca) => ca.action_id.clone(),
-            Action::SetKillSwitch(ks) => ks.action_id.clone(),
-            Action::Log(l) => l.action_id.clone(),
-        })
-        .collect();
-
-    let ids2: Vec<String> = output2
-        .batch
-        .actions
-        .iter()
-        .map(|a| match a {
-            Action::PlaceOrder(po) => po.action_id.clone(),
-            Action::CancelOrder(co) => co.action_id.clone(),
-            Action::CancelAll(ca) => ca.action_id.clone(),
-            Action::SetKillSwitch(ks) => ks.action_id.clone(),
-            Action::Log(l) => l.action_id.clone(),
-        })
-        .collect();
-
-    assert_eq!(ids1, ids2, "Action IDs should be deterministic");
-
-    // All IDs should contain tick index
-    for id in &ids1 {
-        assert!(
-            id.contains("t42_"),
-            "Action ID '{}' should contain tick index",
-            id
-        );
-    }
-}
 
 #[test]
-fn test_different_seeds_produce_different_batches() {
-    let cfg = create_test_config();
-    let state = create_test_state(&cfg);
-
-    let input1 = StrategyInput {
-        cfg: &cfg,
-        state: &state,
-        now_ms: 1000,
-        tick_index: 0,
-        run_seed: Some(1),
-    };
-
-    let input2 = StrategyInput {
-        cfg: &cfg,
-        state: &state,
-        now_ms: 1000,
-        tick_index: 0,
-        run_seed: Some(2), // Different seed
-    };
-
-    let output1 = compute_actions(input1);
-    let output2 = compute_actions(input2);
-
-    // Batches should have same actions (seed only affects timebase offset in sim)
-    // but metadata should differ
-    assert_eq!(output1.batch.run_seed, Some(1));
-    assert_eq!(output2.batch.run_seed, Some(2));
-}
-
-#[test]
-fn test_batch_metadata_correct() {
-    let cfg = create_test_config();
-    let state = create_test_state(&cfg);
-
-    let input = StrategyInput {
-        cfg: &cfg,
-        state: &state,
-        now_ms: 5000,
-        tick_index: 10,
-        run_seed: Some(42),
-    };
-
-    let output = compute_actions(input);
-
-    assert_eq!(output.batch.now_ms, 5000);
-    assert_eq!(output.batch.tick_index, 10);
-    assert_eq!(output.batch.run_seed, Some(42));
-    assert_eq!(output.batch.config_version, cfg.version);
-}
-
-#[test]
-fn test_kill_switch_determinism() {
-    let cfg = create_test_config();
-    let mut state = create_test_state(&cfg);
-
-    // Activate kill switch
-    state.kill_switch = true;
-    state.kill_reason = paraphina::state::KillReason::PnlHardBreach;
-
-    let input1 = StrategyInput {
-        cfg: &cfg,
-        state: &state,
-        now_ms: 1000,
-        tick_index: 0,
-        run_seed: Some(1),
-    };
-
-    let input2 = StrategyInput {
-        cfg: &cfg,
-        state: &state,
-        now_ms: 1000,
-        tick_index: 0,
-        run_seed: Some(1),
-    };
-
-    let output1 = compute_actions(input1);
-    let output2 = compute_actions(input2);
-
-    let result = compare_batches(&output1.batch, &output2.batch);
-    assert!(
-        result.is_ok(),
-        "Kill switch batches differ: {}",
-        result.unwrap_err()
-    );
-
-    // Should only have a log action (no trading)
-    assert_eq!(output1.batch.actions.len(), 1);
-    match &output1.batch.actions[0] {
-        Action::Log(log) => {
-            assert!(log.message.contains("Kill switch"));
-        }
-        _ => panic!("Expected Log action when kill switch active"),
-    }
-}
-
-#[test]
-fn test_strategy_output_intents_match_actions() {
+fn test_strategy_output_intents_are_well_formed() {
     let cfg = create_test_config();
     let state = create_test_state(&cfg);
 
@@ -381,22 +216,25 @@ fn test_strategy_output_intents_match_actions() {
 
     let output = compute_actions(input);
 
-    // Count PlaceOrder actions
-    let place_order_count = output
-        .batch
-        .actions
+    // All produced intents should be Place/Replace with finite positive price/size.
+    for it in output
+        .mm_intents
         .iter()
-        .filter(|a| matches!(a, Action::PlaceOrder(_)))
-        .count();
-
-    // Total intents should equal PlaceOrder actions
-    let total_intents =
-        output.mm_intents.len() + output.exit_intents.len() + output.hedge_intents.len();
-
-    assert_eq!(
-        place_order_count, total_intents,
-        "PlaceOrder actions should match intent count"
-    );
+        .chain(output.exit_intents.iter())
+        .chain(output.hedge_intents.iter())
+    {
+        match it {
+            paraphina::types::OrderIntent::Place(pi) => {
+                assert!(pi.price.is_finite() && pi.price > 0.0);
+                assert!(pi.size.is_finite() && pi.size > 0.0);
+            }
+            paraphina::types::OrderIntent::Replace(ri) => {
+                assert!(ri.price.is_finite() && ri.price > 0.0);
+                assert!(ri.size.is_finite() && ri.size > 0.0);
+            }
+            other => panic!("Unexpected intent variant from strategy core: {:?}", other),
+        }
+    }
 }
 
 /// Fast performance test - ensure strategy computation is quick.

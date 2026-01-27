@@ -19,6 +19,7 @@ fn run_all5_fixture(
     roadmap_b_fixture_dir: &PathBuf,
     paper_mode: bool,
 ) {
+    std::fs::create_dir_all(out_dir).expect("create out_dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_paraphina_live"));
     cmd.env("PARAPHINA_TRADE_MODE", trade_mode)
         .env(
@@ -44,6 +45,10 @@ fn run_all5_fixture(
     }
 
     let output = cmd.output().expect("run paraphina_live");
+    let run_log = out_dir.join("run.log");
+    let mut combined = output.stdout.clone();
+    combined.extend_from_slice(&output.stderr);
+    std::fs::write(&run_log, combined).expect("write run.log");
     assert!(
         output.status.success(),
         "all-5 run failed: {}",
@@ -61,10 +66,7 @@ fn assert_all5_telemetry(telemetry_path: &PathBuf, require_readiness: bool) {
             continue;
         }
         let value: serde_json::Value = serde_json::from_str(line).expect("parse telemetry JSON");
-        let tick = value
-            .get("t")
-            .and_then(|v| v.as_u64())
-            .expect("tick");
+        let tick = value.get("t").and_then(|v| v.as_u64()).expect("tick");
         assert_eq!(tick, expected_tick, "expected deterministic tick order");
         expected_tick += 1;
 
@@ -90,10 +92,7 @@ fn assert_all5_telemetry(telemetry_path: &PathBuf, require_readiness: bool) {
         if healthy_count == 5 {
             saw_ready = true;
         } else {
-            assert!(
-                !saw_ready,
-                "healthy venue count dropped after readiness"
-            );
+            assert!(!saw_ready, "healthy venue count dropped after readiness");
         }
 
         let fv_available = value
@@ -124,8 +123,14 @@ fn all5_shadow_and_paper_fixture_runs_are_healthy() {
         .parent()
         .expect("workspace root")
         .to_path_buf();
-    let hl_fixture_dir = workspace_root.join("tests").join("fixtures").join("hyperliquid");
-    let lighter_fixture_dir = workspace_root.join("tests").join("fixtures").join("lighter");
+    let hl_fixture_dir = workspace_root
+        .join("tests")
+        .join("fixtures")
+        .join("hyperliquid");
+    let lighter_fixture_dir = workspace_root
+        .join("tests")
+        .join("fixtures")
+        .join("lighter");
     let roadmap_b_fixture_dir = workspace_root
         .join("tests")
         .join("fixtures")
@@ -138,6 +143,20 @@ fn all5_shadow_and_paper_fixture_runs_are_healthy() {
         &lighter_fixture_dir,
         &roadmap_b_fixture_dir,
         false,
+    );
+    let verifier = workspace_root
+        .join("tools")
+        .join("verify_live_shadow_outdir.py");
+    let verify_output = Command::new("python3")
+        .arg(&verifier)
+        .arg(&shadow_out)
+        .output()
+        .expect("verify live shadow outdir");
+    assert!(
+        verify_output.status.success(),
+        "verify_live_shadow_outdir failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&verify_output.stdout),
+        String::from_utf8_lossy(&verify_output.stderr)
     );
     run_all5_fixture(
         "paper",

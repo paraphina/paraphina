@@ -32,8 +32,14 @@ mod tests {
             .arg("--connector")
             .arg("paradex")
             .env("PARADEX_FIXTURE_MODE", "1")
-            .env("PARADEX_FIXTURE_DIR", fixture_dir.to_string_lossy().to_string())
-            .env("PARAPHINA_LIVE_OUT_DIR", out_dir.to_string_lossy().to_string())
+            .env(
+                "PARADEX_FIXTURE_DIR",
+                fixture_dir.to_string_lossy().to_string(),
+            )
+            .env(
+                "PARAPHINA_LIVE_OUT_DIR",
+                out_dir.to_string_lossy().to_string(),
+            )
             .env("PARAPHINA_TELEMETRY_MODE", "jsonl")
             .env(
                 "PARAPHINA_TELEMETRY_PATH",

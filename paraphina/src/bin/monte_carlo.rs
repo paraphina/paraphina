@@ -563,20 +563,27 @@ fn profile_name(p: RiskProfile) -> &'static str {
 fn apply_intents_as_fills(cfg: &Config, state: &mut GlobalState, intents: &[OrderIntent]) -> usize {
     let mut fill_count = 0;
     for it in intents {
-        if it.venue_index >= cfg.venues.len() {
+        // Only intents with (side, price, size) can be treated as synthetic fills.
+        let (venue_index, side, size, price) = match it {
+            OrderIntent::Place(pi) => (pi.venue_index, pi.side, pi.size, pi.price),
+            OrderIntent::Replace(ri) => (ri.venue_index, ri.side, ri.size, ri.price),
+            OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => continue,
+        };
+
+        if venue_index >= cfg.venues.len() {
             continue;
         }
-        if !it.price.is_finite() || it.price <= 0.0 {
+        if !price.is_finite() || price <= 0.0 {
             continue;
         }
-        if !it.size.is_finite() || it.size <= 0.0 {
+        if !size.is_finite() || size <= 0.0 {
             continue;
         }
 
         // Pragmatic: treat everything as taker for now.
-        // (If you later want maker-vs-taker modeling, switch on it.purpose here.)
-        let fee_bps = cfg.venues[it.venue_index].taker_fee_bps;
-        state.apply_perp_fill(it.venue_index, it.side, it.size, it.price, fee_bps);
+        // (If you later want maker-vs-taker modeling, switch on purpose here.)
+        let fee_bps = cfg.venues[venue_index].taker_fee_bps;
+        state.apply_perp_fill(venue_index, side, size, price, fee_bps);
         fill_count += 1;
     }
     fill_count

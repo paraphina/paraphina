@@ -24,7 +24,7 @@ use crate::types::{OrderIntent, OrderPurpose, Side, TimeInForce, TimestampMs};
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, LiquidationSnapshot,
-    MarginSnapshot, MarketDataEvent, PositionSnapshot,
+    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::live::gateway::{
     BoxFuture, LiveGatewayError, LiveRestCancelAllRequest, LiveRestCancelRequest, LiveRestClient,
@@ -46,6 +46,7 @@ pub struct HyperliquidConfig {
     pub coin: String,
     pub n_sig_figs: u32,
     pub n_levels: u32,
+    pub venue_index: usize,
     pub paper_mode: bool,
     pub private_key_hex: Option<String>,
     pub vault_address: Option<String>,
@@ -98,6 +99,7 @@ impl HyperliquidConfig {
             coin,
             n_sig_figs,
             n_levels,
+            venue_index: 0,
             paper_mode,
             private_key_hex,
             vault_address,
@@ -148,7 +150,15 @@ impl HyperliquidConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
+        eprintln!(
+            "INFO: Hyperliquid public WS connecting url={}",
+            self.cfg.ws_url
+        );
         let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        eprintln!(
+            "INFO: Hyperliquid public WS connected url={}",
+            self.cfg.ws_url
+        );
         let (mut write, mut read) = ws_stream.split();
         let sub = json!({
             "method": "subscribe",
@@ -160,18 +170,97 @@ impl HyperliquidConnector {
             }
         });
         write.send(Message::Text(sub.to_string())).await?;
+        eprintln!(
+            "INFO: Hyperliquid public WS subscribed coin={} nSigFigs={} nLevels={}",
+            self.cfg.coin, self.cfg.n_sig_figs, self.cfg.n_levels
+        );
         let mut tracker = L2SeqTracker::new();
+        let mut l2_seq_fallback: u64 = 0;
+        let mut first_book_update_logged = false;
+        let mut first_message_logged = false;
+        let mut logged_non_utf8_binary = false;
+        let mut first_decoded_top_logged = false;
+        let mut decode_miss_count = 0usize;
         while let Some(msg) = read.next().await {
             let msg = msg?;
-            if let Message::Text(text) = msg {
-                if let Some(parsed) = parse_l2_message(&text) {
-                    let outcome = tracker.on_message(parsed);
-                    if let Some(seq) = outcome.refresh_snapshot {
-                        self.refresh_snapshot(seq).await;
+            let payload = match msg {
+                Message::Text(text) => text,
+                Message::Binary(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        if !logged_non_utf8_binary {
+                            eprintln!(
+                                "WARN: Hyperliquid public WS non-utf8 binary frame url={}",
+                                self.cfg.ws_url
+                            );
+                            logged_non_utf8_binary = true;
+                        }
+                        continue;
                     }
-                    if let Some(event) = outcome.event {
-                        let _ = self.market_tx.send(event).await;
+                },
+                _ => continue,
+            };
+            if !first_message_logged {
+                eprintln!("INFO: Hyperliquid public WS first message received");
+                first_message_logged = true;
+            }
+            let value = match serde_json::from_str::<serde_json::Value>(&payload) {
+                Ok(value) => value,
+                Err(err) => {
+                    let snippet: String = payload.chars().take(160).collect();
+                    eprintln!(
+                        "WARN: Hyperliquid public WS parse error: {err} url={} snippet={}",
+                        self.cfg.ws_url, snippet
+                    );
+                    continue;
+                }
+            };
+            let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+            if channel == "subscriptionResponse" {
+                continue;
+            }
+            if channel == "l2Book" {
+                if let Some(top) = decode_l2book_top(&value) {
+                    if !first_decoded_top_logged {
+                        eprintln!(
+                            "FIRST_DECODED_TOP venue=hyperliquid bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                            top.best_bid_px, top.best_bid_sz, top.best_ask_px, top.best_ask_sz
+                        );
+                        first_decoded_top_logged = true;
                     }
+                } else if decode_miss_count < 3 {
+                    decode_miss_count += 1;
+                    log_decode_miss(
+                        "Hyperliquid",
+                        &value,
+                        &payload,
+                        decode_miss_count,
+                        self.cfg.ws_url.as_str(),
+                    );
+                }
+                if let Some(snapshot) = decode_l2book_snapshot(
+                    &value,
+                    self.cfg.venue_index,
+                    self.cfg.coin.as_str(),
+                    &mut l2_seq_fallback,
+                ) {
+                    if let Err(err) = self.market_tx.send(snapshot).await {
+                        eprintln!("Hyperliquid public WS market send failed: {err}");
+                    }
+                }
+                continue;
+            }
+            if let Some(parsed) = parse_l2_message_value(&value, self.cfg.venue_index) {
+                let outcome = tracker.on_message(parsed);
+                if let Some(seq) = outcome.refresh_snapshot {
+                    self.refresh_snapshot(seq).await;
+                }
+                if let Some(event) = outcome.event {
+                    if !first_book_update_logged {
+                        eprintln!("INFO: Hyperliquid public WS first book update");
+                        first_book_update_logged = true;
+                    }
+                    let _ = self.market_tx.send(event).await;
                 }
             }
         }
@@ -240,7 +329,6 @@ impl HyperliquidConnector {
         }
     }
 
-
     async fn refresh_snapshot(&self, seq: u64) {
         if let Ok(snapshot) = fetch_l2_snapshot(&self.http, &self.cfg).await {
             let _ = self.market_tx.send(snapshot).await;
@@ -249,7 +337,11 @@ impl HyperliquidConnector {
         }
     }
 
-    pub async fn place_order(&self, intent: &OrderIntent, now_ms: TimestampMs) -> anyhow::Result<()> {
+    pub async fn place_order(
+        &self,
+        intent: &OrderIntent,
+        now_ms: TimestampMs,
+    ) -> anyhow::Result<()> {
         if self.cfg.paper_mode {
             eprintln!("Hyperliquid paper mode: {:?}", intent);
             return Ok(());
@@ -264,7 +356,12 @@ impl HyperliquidConnector {
             "signature": signature,
             "vaultAddress": self.cfg.vault_address,
         });
-        let resp = self.http.post(self.cfg.rest_url.as_str()).json(&payload).send().await?;
+        let resp = self
+            .http
+            .post(self.cfg.rest_url.as_str())
+            .json(&payload)
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -273,7 +370,11 @@ impl HyperliquidConnector {
         Ok(())
     }
 
-    pub async fn cancel_order(&self, intent: &OrderIntent, now_ms: TimestampMs) -> anyhow::Result<()> {
+    pub async fn cancel_order(
+        &self,
+        intent: &OrderIntent,
+        now_ms: TimestampMs,
+    ) -> anyhow::Result<()> {
         if self.cfg.paper_mode {
             eprintln!("Hyperliquid paper mode cancel: {:?}", intent);
             return Ok(());
@@ -288,7 +389,12 @@ impl HyperliquidConnector {
             "signature": signature,
             "vaultAddress": self.cfg.vault_address,
         });
-        let resp = self.http.post(self.cfg.rest_url.as_str()).json(&payload).send().await?;
+        let resp = self
+            .http
+            .post(self.cfg.rest_url.as_str())
+            .json(&payload)
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -312,7 +418,12 @@ impl HyperliquidConnector {
             "signature": signature,
             "vaultAddress": self.cfg.vault_address,
         });
-        let resp = self.http.post(self.cfg.rest_url.as_str()).json(&payload).send().await?;
+        let resp = self
+            .http
+            .post(self.cfg.rest_url.as_str())
+            .json(&payload)
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -450,21 +561,27 @@ impl L2SeqTracker {
     }
 }
 
-pub fn parse_l2_message(text: &str) -> Option<ParsedL2Message> {
+pub fn parse_l2_message(text: &str, venue_index: usize) -> Option<ParsedL2Message> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    parse_l2_message_value(&value, venue_index)
+}
+
+fn parse_l2_message_value(
+    value: &serde_json::Value,
+    venue_index: usize,
+) -> Option<ParsedL2Message> {
     let channel = value.get("channel")?.as_str()?;
     if channel != "l2Book" {
         return None;
     }
     let data = value.get("data")?;
     let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-    let coin = data.get("coin").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+    let coin = data
+        .get("coin")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
     let venue_id = coin.to_string();
-    let venue_index = 0;
-    let timestamp_ms = data
-        .get("time")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let timestamp_ms = data.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
     if let Some(levels) = data.get("levels") {
         let bids = parse_levels(levels.get(0)?)?;
         let asks = parse_levels(levels.get(1)?)?;
@@ -521,6 +638,7 @@ impl HyperliquidFixtureFeed {
     pub async fn run_ticks(
         &self,
         market_tx: mpsc::Sender<MarketDataEvent>,
+        venue_index: usize,
         start_ms: TimestampMs,
         step_ms: i64,
         ticks: u64,
@@ -533,7 +651,7 @@ impl HyperliquidFixtureFeed {
         for tick in 0..ticks {
             let now_ms = start_ms + step_ms.saturating_mul(tick as i64);
             for raw in &self.messages {
-                if let Some(parsed) = parse_l2_message(raw) {
+                if let Some(parsed) = parse_l2_message(raw, venue_index) {
                     let event = override_market_event(parsed.event, seq, now_ms);
                     let event = apply_fixture_tick_variation(event, tick);
                     seq = seq.wrapping_add(1);
@@ -581,9 +699,7 @@ impl HyperliquidAccountFixtureFeed {
                         snapshot.seq = seq;
                         snapshot.timestamp_ms = now_ms;
                         seq = seq.wrapping_add(1);
-                        let _ = account_tx
-                            .send(AccountEvent::Snapshot(snapshot))
-                            .await;
+                        let _ = account_tx.send(AccountEvent::Snapshot(snapshot)).await;
                     }
                 }
             }
@@ -596,7 +712,11 @@ impl HyperliquidAccountFixtureFeed {
     }
 }
 
-fn override_market_event(event: MarketDataEvent, seq: u64, timestamp_ms: TimestampMs) -> MarketDataEvent {
+fn override_market_event(
+    event: MarketDataEvent,
+    seq: u64,
+    timestamp_ms: TimestampMs,
+) -> MarketDataEvent {
     match event {
         MarketDataEvent::L2Snapshot(mut snap) => {
             snap.seq = seq;
@@ -641,11 +761,22 @@ fn apply_fixture_tick_variation(event: MarketDataEvent, tick: u64) -> MarketData
 fn parse_levels(levels: &serde_json::Value) -> Option<Vec<BookLevel>> {
     let mut out = Vec::new();
     for level in levels.as_array()? {
-        let price = level.get(0)?.as_str()?.parse::<f64>().ok()?;
-        let size = level.get(1)?.as_str()?.parse::<f64>().ok()?;
-        out.push(BookLevel { price, size });
+        let level = parse_level_entry(level)?;
+        out.push(level);
     }
     Some(out)
+}
+
+fn parse_level_entry(level: &serde_json::Value) -> Option<BookLevel> {
+    if let Some(items) = level.as_array() {
+        let price = parse_f64_value(items.get(0)?)?;
+        let size = parse_f64_value(items.get(1)?)?;
+        return Some(BookLevel { price, size });
+    }
+    let obj = level.as_object()?;
+    let price = parse_f64_value(obj.get("px")?)?;
+    let size = parse_f64_value(obj.get("sz")?)?;
+    Some(BookLevel { price, size })
 }
 
 fn parse_deltas(changes: &serde_json::Value) -> Option<Vec<BookLevelDelta>> {
@@ -657,21 +788,143 @@ fn parse_deltas(changes: &serde_json::Value) -> Option<Vec<BookLevelDelta>> {
             "a" | "ask" | "Ask" => BookSide::Ask,
             _ => return None,
         };
-        let price = change.get(1)?.as_str()?.parse::<f64>().ok()?;
-        let size = change.get(2)?.as_str()?.parse::<f64>().ok()?;
+        let price = parse_f64_value(change.get(1)?)?;
+        let size = parse_f64_value(change.get(2)?)?;
         out.push(BookLevelDelta { side, price, size });
     }
     Some(out)
 }
 
-async fn fetch_l2_snapshot(client: &Client, cfg: &HyperliquidConfig) -> anyhow::Result<MarketDataEvent> {
+fn parse_f64_value(value: &serde_json::Value) -> Option<f64> {
+    if let Some(raw) = value.as_f64() {
+        return Some(raw);
+    }
+    if let Some(raw) = value.as_str() {
+        return raw.parse::<f64>().ok();
+    }
+    None
+}
+
+fn decode_top_of_book(value: &serde_json::Value, _coin: &str) -> Option<TopOfBook> {
+    let channel = value.get("channel").and_then(|v| v.as_str())?;
+    if channel != "l2Book" {
+        return None;
+    }
+    let data = value.get("data")?;
+    let levels = data.get("levels")?;
+    let bids = parse_levels(levels.get(0)?)?;
+    let asks = parse_levels(levels.get(1)?)?;
+    let timestamp_ms = data.get("time").and_then(|v| v.as_i64());
+    let bid = bids.first()?;
+    let ask = asks.first()?;
+    if bid.size <= 0.0 || ask.size <= 0.0 {
+        return None;
+    }
+    if !bid.price.is_finite()
+        || !ask.price.is_finite()
+        || !bid.size.is_finite()
+        || !ask.size.is_finite()
+    {
+        return None;
+    }
+    Some(TopOfBook {
+        best_bid_px: bid.price,
+        best_bid_sz: bid.size,
+        best_ask_px: ask.price,
+        best_ask_sz: ask.size,
+        timestamp_ms,
+    })
+}
+
+fn decode_l2book_top(value: &serde_json::Value) -> Option<TopOfBook> {
+    let data = value.get("data")?;
+    let levels = data.get("levels")?;
+    let bids = levels.get(0)?.as_array()?;
+    let asks = levels.get(1)?.as_array()?;
+    let bid = bids.first()?.as_object()?;
+    let ask = asks.first()?.as_object()?;
+    let bid_px = parse_f64_value(bid.get("px")?)?;
+    let bid_sz = parse_f64_value(bid.get("sz")?)?;
+    let ask_px = parse_f64_value(ask.get("px")?)?;
+    let ask_sz = parse_f64_value(ask.get("sz")?)?;
+    if bid_sz <= 0.0 || ask_sz <= 0.0 {
+        return None;
+    }
+    if !bid_px.is_finite() || !bid_sz.is_finite() || !ask_px.is_finite() || !ask_sz.is_finite() {
+        return None;
+    }
+    let timestamp_ms = data.get("time").and_then(|v| v.as_i64());
+    Some(TopOfBook {
+        best_bid_px: bid_px,
+        best_bid_sz: bid_sz,
+        best_ask_px: ask_px,
+        best_ask_sz: ask_sz,
+        timestamp_ms,
+    })
+}
+
+fn decode_l2book_snapshot(
+    value: &serde_json::Value,
+    venue_index: usize,
+    default_coin: &str,
+    fallback_seq: &mut u64,
+) -> Option<MarketDataEvent> {
+    let data = value.get("data")?;
+    let levels = data.get("levels")?;
+    let bids = parse_levels(levels.get(0)?)?;
+    let asks = parse_levels(levels.get(1)?)?;
+    let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or_else(|| {
+        *fallback_seq = fallback_seq.wrapping_add(1);
+        *fallback_seq
+    });
+    let timestamp_ms = data.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
+    let venue_id = data
+        .get("coin")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_coin)
+        .to_string();
+    Some(MarketDataEvent::L2Snapshot(
+        super::super::types::L2Snapshot {
+            venue_index,
+            venue_id,
+            seq,
+            timestamp_ms,
+            bids,
+            asks,
+        },
+    ))
+}
+
+fn log_decode_miss(venue: &str, value: &serde_json::Value, payload: &str, count: usize, url: &str) {
+    let keys = value
+        .as_object()
+        .map(|obj| {
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            format!("[{}]", keys.join(","))
+        })
+        .unwrap_or_else(|| "[non-object]".to_string());
+    let snippet: String = payload.chars().take(160).collect();
+    eprintln!(
+        "WARN: {venue} WS decode miss keys={keys} snippet={snippet} (count={count}) url={url}",
+    );
+}
+
+async fn fetch_l2_snapshot(
+    client: &Client,
+    cfg: &HyperliquidConfig,
+) -> anyhow::Result<MarketDataEvent> {
     let payload = json!({
         "type": "l2Book",
         "coin": cfg.coin,
         "nSigFigs": cfg.n_sig_figs,
         "nLevels": cfg.n_levels
     });
-    let resp = client.post(cfg.info_url.as_str()).json(&payload).send().await?;
+    let resp = client
+        .post(cfg.info_url.as_str())
+        .json(&payload)
+        .send()
+        .await?;
     let value: serde_json::Value = resp.json().await?;
     let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
     let timestamp_ms = value.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -686,7 +939,7 @@ async fn fetch_l2_snapshot(client: &Client, cfg: &HyperliquidConfig) -> anyhow::
     let bids = parse_levels(bids_value).ok_or_else(|| anyhow::anyhow!("invalid bids"))?;
     let asks = parse_levels(asks_value).ok_or_else(|| anyhow::anyhow!("invalid asks"))?;
     let snapshot = super::super::types::L2Snapshot {
-        venue_index: 0,
+        venue_index: cfg.venue_index,
         venue_id: cfg.coin.clone(),
         seq,
         timestamp_ms,
@@ -698,7 +951,11 @@ async fn fetch_l2_snapshot(client: &Client, cfg: &HyperliquidConfig) -> anyhow::
 
 async fn fetch_asset_index(client: &Client, cfg: &HyperliquidConfig) -> anyhow::Result<u32> {
     let payload = json!({ "type": "meta" });
-    let resp = client.post(cfg.info_url.as_str()).json(&payload).send().await?;
+    let resp = client
+        .post(cfg.info_url.as_str())
+        .json(&payload)
+        .send()
+        .await?;
     let value: serde_json::Value = resp.json().await?;
     let universe = value
         .get("universe")
@@ -726,7 +983,11 @@ async fn fetch_account_snapshot(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("HL_VAULT_ADDRESS is required for account polling"))?;
     let payload = json!({ "type": "userState", "user": user });
-    let resp = client.post(cfg.info_url.as_str()).json(&payload).send().await?;
+    let resp = client
+        .post(cfg.info_url.as_str())
+        .json(&payload)
+        .send()
+        .await?;
     let value: serde_json::Value = resp.json().await?;
     let snapshot = parse_account_snapshot(&value)
         .ok_or_else(|| anyhow::anyhow!("invalid account snapshot response"))?;
@@ -761,7 +1022,10 @@ fn build_action(intent: &OrderIntent, asset_index: u32) -> anyhow::Result<serde_
     }))
 }
 
-fn build_cancel_action(intent: &OrderIntent, asset_index: u32) -> anyhow::Result<serde_json::Value> {
+fn build_cancel_action(
+    intent: &OrderIntent,
+    asset_index: u32,
+) -> anyhow::Result<serde_json::Value> {
     let OrderIntent::Cancel(cancel) = intent else {
         anyhow::bail!("intent not a cancel order");
     };
@@ -816,10 +1080,10 @@ mod tests {
             coin: "TAO".to_string(),
             n_sig_figs: 5,
             n_levels: 5,
+            venue_index: 0,
             paper_mode: false,
             private_key_hex: Some(
-                "0000000000000000000000000000000000000000000000000000000000000001"
-                    .to_string(),
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
             ),
             vault_address: Some("0xdeadbeef".to_string()),
         };
@@ -907,7 +1171,10 @@ fn parse_user_event(data: &serde_json::Value, seq: u64) -> Option<ExecutionEvent
     let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let order = data.get("order")?;
     let order_id = order.get("oid")?.as_str()?.to_string();
-    let client_order_id = order.get("cloid").and_then(|v| v.as_str()).map(|v| v.to_string());
+    let client_order_id = order
+        .get("cloid")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
     let timestamp_ms = order
         .get("timestamp")
         .and_then(|v| v.as_i64())
@@ -922,13 +1189,15 @@ fn parse_user_event(data: &serde_json::Value, seq: u64) -> Option<ExecutionEvent
     let venue_index = 0;
 
     if matches!(event_type, "cancel") || matches!(status, "canceled" | "cancelled") {
-        return Some(ExecutionEvent::CancelAccepted(super::super::types::CancelAccepted {
-            venue_index,
-            venue_id,
-            seq,
-            timestamp_ms,
-            order_id,
-        }));
+        return Some(ExecutionEvent::CancelAccepted(
+            super::super::types::CancelAccepted {
+                venue_index,
+                venue_id,
+                seq,
+                timestamp_ms,
+                order_id,
+            },
+        ));
     }
 
     if matches!(status, "rejected") {
@@ -937,14 +1206,16 @@ fn parse_user_event(data: &serde_json::Value, seq: u64) -> Option<ExecutionEvent
             .and_then(|v| v.as_str())
             .unwrap_or("rejected")
             .to_string();
-        return Some(ExecutionEvent::OrderRejected(super::super::types::OrderRejected {
-            venue_index,
-            venue_id,
-            seq,
-            timestamp_ms,
-            order_id: Some(order_id),
-            reason,
-        }));
+        return Some(ExecutionEvent::OrderRejected(
+            super::super::types::OrderRejected {
+                venue_index,
+                venue_id,
+                seq,
+                timestamp_ms,
+                order_id: Some(order_id),
+                reason,
+            },
+        ));
     }
 
     let side = parse_side(order.get("side")?)?;
@@ -961,18 +1232,20 @@ fn parse_user_event(data: &serde_json::Value, seq: u64) -> Option<ExecutionEvent
         .unwrap_or(0.0);
     let purpose = parse_purpose(order.get("purpose")).unwrap_or(OrderPurpose::Mm);
 
-    Some(ExecutionEvent::OrderAccepted(super::super::types::OrderAccepted {
-        venue_index,
-        venue_id,
-        seq,
-        timestamp_ms,
-        order_id,
-        client_order_id,
-        side,
-        price,
-        size,
-        purpose,
-    }))
+    Some(ExecutionEvent::OrderAccepted(
+        super::super::types::OrderAccepted {
+            venue_index,
+            venue_id,
+            seq,
+            timestamp_ms,
+            order_id,
+            client_order_id,
+            side,
+            price,
+            size,
+            purpose,
+        },
+    ))
 }
 
 fn parse_user_fill(
@@ -980,9 +1253,18 @@ fn parse_user_fill(
     data: &serde_json::Value,
     seq: u64,
 ) -> Option<ExecutionEvent> {
-    let order_id = fill.get("oid").and_then(|v| v.as_str()).map(|v| v.to_string());
-    let client_order_id = fill.get("cloid").and_then(|v| v.as_str()).map(|v| v.to_string());
-    let fill_id = fill.get("tid").and_then(|v| v.as_str()).map(|v| v.to_string());
+    let order_id = fill
+        .get("oid")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let client_order_id = fill
+        .get("cloid")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let fill_id = fill
+        .get("tid")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
     let timestamp_ms = fill
         .get("timestamp")
         .and_then(|v| v.as_i64())

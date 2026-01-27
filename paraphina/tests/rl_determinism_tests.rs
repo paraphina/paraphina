@@ -93,7 +93,7 @@ fn test_episode_determinism() {
     let cfg = Config::default();
 
     // Run episode 1
-    let gateway1 = SimGateway;
+    let gateway1 = SimGateway::default();
     let sink1 = NoopSink;
     let mut runner1 = ShadowRunner::new(&cfg, gateway1, sink1);
     let config1 = EpisodeConfig::default()
@@ -103,7 +103,7 @@ fn test_episode_determinism() {
     let summary1 = runner1.run_episode(config1);
 
     // Run episode 2 with same seed
-    let gateway2 = SimGateway;
+    let gateway2 = SimGateway::default();
     let sink2 = NoopSink;
     let mut runner2 = ShadowRunner::new(&cfg, gateway2, sink2);
     let config2 = EpisodeConfig::default()
@@ -149,7 +149,7 @@ fn test_different_seeds_produce_different_results() {
     let cfg = Config::default();
 
     // Run with seed 42
-    let gateway1 = SimGateway;
+    let gateway1 = SimGateway::default();
     let sink1 = NoopSink;
     let mut runner1 = ShadowRunner::new(&cfg, gateway1, sink1);
     let config1 = EpisodeConfig::default()
@@ -159,7 +159,7 @@ fn test_different_seeds_produce_different_results() {
     let summary1 = runner1.run_episode(config1);
 
     // Run with seed 123
-    let gateway2 = SimGateway;
+    let gateway2 = SimGateway::default();
     let sink2 = NoopSink;
     let mut runner2 = ShadowRunner::new(&cfg, gateway2, sink2);
     let config2 = EpisodeConfig::default()
@@ -179,7 +179,7 @@ fn test_shadow_mode_no_execution_impact() {
     let cfg = Config::default();
 
     // Run WITHOUT shadow mode
-    let gateway1 = SimGateway;
+    let gateway1 = SimGateway::default();
     let sink1 = NoopSink;
     let mut runner1 = ShadowRunner::new(&cfg, gateway1, sink1);
     let config1 = EpisodeConfig::default()
@@ -190,7 +190,7 @@ fn test_shadow_mode_no_execution_impact() {
     let summary_no_shadow = runner1.run_episode(config1);
 
     // Run WITH shadow mode (using NoopPolicy as shadow)
-    let gateway2 = SimGateway;
+    let gateway2 = SimGateway::default();
     let sink2 = NoopSink;
     let shadow_policy = Box::new(NoopPolicy::new());
     let mut runner2 = ShadowRunner::new(&cfg, gateway2, sink2).with_shadow_policy(shadow_policy);
@@ -338,7 +338,7 @@ fn test_policy_action_clamp() {
 #[test]
 fn test_multiple_episodes_with_reset() {
     let cfg = Config::default();
-    let gateway = SimGateway;
+    let gateway = SimGateway::default();
     let sink = NoopSink;
     let mut runner = ShadowRunner::new(&cfg, gateway, sink);
 

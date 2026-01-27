@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
@@ -13,16 +13,19 @@ use serde_json::Value;
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::USER_AGENT;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::super::gateway::{
-    BoxFuture, LiveGatewayError, LiveGatewayErrorKind, LiveRestCancelAllRequest, LiveRestCancelRequest,
-    LiveRestClient, LiveRestPlaceRequest, LiveRestResponse, LiveResult,
+    BoxFuture, LiveGatewayError, LiveGatewayErrorKind, LiveRestCancelAllRequest,
+    LiveRestCancelRequest, LiveRestClient, LiveRestPlaceRequest, LiveRestResponse, LiveResult,
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, LiquidationSnapshot, MarginSnapshot,
-    MarketDataEvent, PositionSnapshot,
+    MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::types::{Side, TimeInForce, TimestampMs};
 
@@ -41,6 +44,7 @@ pub struct ExtendedConfig {
     pub rest_url: String,
     pub market: String,
     pub depth_limit: usize,
+    pub venue_index: usize,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub recv_window: Option<u64>,
@@ -49,11 +53,13 @@ pub struct ExtendedConfig {
 
 impl ExtendedConfig {
     pub fn from_env() -> Self {
-        let ws_url = std::env::var("EXTENDED_WS_URL")
-            .unwrap_or_else(|_| "wss://stream.extended.exchange/ws".to_string());
+        let ws_url = std::env::var("EXTENDED_WS_URL").unwrap_or_else(|_| {
+            "wss://api.starknet.extended.exchange/stream.extended.exchange/v1".to_string()
+        });
         let rest_url = std::env::var("EXTENDED_REST_URL")
             .unwrap_or_else(|_| "https://api.extended.exchange".to_string());
         let market = std::env::var("EXTENDED_MARKET").unwrap_or_else(|_| "BTCUSDT".to_string());
+        let market = normalize_extended_market(&market);
         let depth_limit = std::env::var("EXTENDED_DEPTH_LIMIT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -69,6 +75,7 @@ impl ExtendedConfig {
             rest_url,
             market,
             depth_limit,
+            venue_index: 0,
             api_key,
             api_secret,
             recv_window,
@@ -85,8 +92,12 @@ impl ExtendedConfig {
         self.api_key.is_some() && self.api_secret.is_some()
     }
 
-    fn stream_symbol(&self) -> String {
-        self.market.to_ascii_lowercase()
+    pub fn orderbook_ws_url(&self) -> String {
+        format!(
+            "{}/orderbooks/{}?depth=1",
+            self.ws_url.trim_end_matches('/'),
+            self.market
+        )
     }
 }
 
@@ -105,9 +116,13 @@ impl ExtendedConnector {
             .as_ref()
             .and_then(|dir| ExtendedRecorder::new(dir).ok())
             .map(Mutex::new);
+        let http = Client::builder()
+            .user_agent("paraphina")
+            .build()
+            .expect("extended http client build");
         Self {
             cfg,
-            http: Client::new(),
+            http,
             market_tx,
             recorder,
         }
@@ -115,8 +130,9 @@ impl ExtendedConnector {
 
     pub async fn run_public_ws(&self) {
         let mut backoff = Duration::from_secs(1);
+        let mut last_snapshot_warn: Option<Instant> = None;
         loop {
-            if let Err(err) = self.public_ws_once().await {
+            if let Err(err) = self.public_ws_once(&mut last_snapshot_warn).await {
                 eprintln!("Extended public WS error: {err}");
             }
             tokio::time::sleep(backoff).await;
@@ -124,49 +140,396 @@ impl ExtendedConnector {
         }
     }
 
-    async fn public_ws_once(&self) -> anyhow::Result<()> {
-        let (snapshot_raw, snapshot) = self.fetch_snapshot().await?;
-        if let Some(recorder) = self.recorder.as_ref() {
-            let mut guard = recorder.lock().await;
-            guard.record_snapshot(&snapshot_raw)?;
-        }
-        let mut seq_state = ExtendedSeqState::new(snapshot.last_update_id);
-        let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
-            venue_index: 0,
-            venue_id: self.cfg.market.clone(),
-            seq: snapshot.last_update_id,
-            timestamp_ms: now_ms(),
-            bids: snapshot.bids,
-            asks: snapshot.asks,
-        });
-        let _ = self.market_tx.send(snapshot_event).await;
-
-        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
-        let (mut write, mut read) = ws_stream.split();
-        let stream = format!("{}@depth@100ms", self.cfg.stream_symbol());
-        let sub = serde_json::json!({
-            "method": "SUBSCRIBE",
-            "params": [stream],
-            "id": 1
-        });
-        write.send(Message::Text(sub.to_string())).await?;
-
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
-            if let Message::Text(text) = msg {
-                if let Some(recorder) = self.recorder.as_ref() {
-                    let mut guard = recorder.lock().await;
-                    let _ = guard.record_ws_frame(&text);
+    async fn public_ws_once(&self, last_snapshot_warn: &mut Option<Instant>) -> anyhow::Result<()> {
+        let mut first_decoded_top_logged = false;
+        let mut decode_miss_count = 0usize;
+        let mut first_ws_message_logged = false;
+        let mut first_book_update_logged = false;
+        let mut ws_snapshot_seq: u64 = 0;
+        let mut snapshot_state: Option<ExtendedDepthSnapshot> = None;
+        if let Ok((snapshot_raw, snapshot)) = self.fetch_snapshot().await {
+            if let Some(recorder) = self.recorder.as_ref() {
+                let mut guard = recorder.lock().await;
+                guard.record_snapshot(&snapshot_raw)?;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&snapshot_raw) {
+                if let Some(top) =
+                    TopOfBook::from_levels(&snapshot.bids, &snapshot.asks, Some(now_ms()))
+                {
+                    eprintln!(
+                        "FIRST_DECODED_TOP venue=extended bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                        top.best_bid_px, top.best_bid_sz, top.best_ask_px, top.best_ask_sz
+                    );
+                    first_decoded_top_logged = true;
+                } else if decode_miss_count < 3 {
+                    decode_miss_count += 1;
+                    log_decode_miss(
+                        "Extended",
+                        &value,
+                        &snapshot_raw,
+                        decode_miss_count,
+                        self.cfg.ws_url.as_str(),
+                    );
                 }
-                if let Some(update) = parse_depth_update(&text) {
+            }
+            snapshot_state = Some(snapshot);
+        } else if last_snapshot_warn
+            .map(|last| last.elapsed() >= Duration::from_secs(30))
+            .unwrap_or(true)
+        {
+            *last_snapshot_warn = Some(Instant::now());
+            eprintln!("WARN: Extended REST snapshot skipped; relying on WS depth=1");
+        }
+        let mut seq_state = ExtendedSeqState::new(
+            snapshot_state
+                .as_ref()
+                .map(|snapshot| snapshot.last_update_id),
+            self.cfg.venue_index,
+        );
+        if let Some(snapshot) = snapshot_state {
+            let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
+                venue_index: self.cfg.venue_index,
+                venue_id: self.cfg.market.clone(),
+                seq: snapshot.last_update_id,
+                timestamp_ms: now_ms(),
+                bids: snapshot.bids,
+                asks: snapshot.asks,
+            });
+            let _ = self.market_tx.send(snapshot_event).await;
+        }
+
+        let ws_url = self.cfg.orderbook_ws_url();
+        eprintln!("INFO: Extended public WS connecting url={}", ws_url);
+        let mut request = ws_url.as_str().into_client_request()?;
+        request
+            .headers_mut()
+            .insert(USER_AGENT, HeaderValue::from_static("paraphina"));
+        let (ws_stream, _) = connect_async(request).await?;
+        eprintln!("INFO: Extended public WS connected url={}", ws_url);
+        let (mut write, mut read) = ws_stream.split();
+
+        const MAX_PARSE_ERRORS: usize = 25;
+        let mut consecutive_parse_errors = 0usize;
+        let mut first_message_logged = false;
+        let ws_start = Instant::now();
+        let mut no_book_warned = false;
+        let mut first_ws_keys: Option<String> = None;
+        let mut first_ws_snippet: Option<String> = None;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(10), read.next()).await;
+            let msg = match next {
+                Ok(Some(msg)) => msg?,
+                Ok(None) => break,
+                Err(_) => {
+                    if !first_message_logged {
+                        eprintln!(
+                            "WARN: Extended WS received no messages after 10s url={}",
+                            ws_url
+                        );
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match msg {
+                Message::Text(text) => {
+                    if !first_message_logged {
+                        eprintln!("INFO: Extended public WS first message received");
+                        first_message_logged = true;
+                    }
+                    let Some(cleaned) = clean_ws_payload(&text) else {
+                        continue;
+                    };
+                    if !first_ws_message_logged {
+                        if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+                            let keys = value
+                                .as_object()
+                                .map(|obj| {
+                                    let mut keys: Vec<&str> =
+                                        obj.keys().map(|k| k.as_str()).collect();
+                                    keys.sort();
+                                    format!("[{}]", keys.join(","))
+                                })
+                                .unwrap_or_else(|| "[non-object]".to_string());
+                            let snippet: String = cleaned.chars().take(160).collect();
+                            eprintln!(
+                                "INFO: Extended public WS first message keys={} snippet={}",
+                                keys, snippet
+                            );
+                            first_ws_keys = Some(keys);
+                            first_ws_snippet = Some(snippet);
+                            first_ws_message_logged = true;
+                        }
+                    }
+                    if let Some(recorder) = self.recorder.as_ref() {
+                        let mut guard = recorder.lock().await;
+                        let _ = guard.record_ws_frame(cleaned);
+                    }
+                    let update = match parse_depth_update(cleaned) {
+                        Ok(update) => update,
+                        Err(err) => {
+                            consecutive_parse_errors += 1;
+                            if consecutive_parse_errors == 1 || consecutive_parse_errors % 10 == 0 {
+                                let snippet: String = cleaned.chars().take(160).collect();
+                                eprintln!(
+                                    "WARN: Extended public WS parse error: {err} url={} snippet={}",
+                                    ws_url, snippet
+                                );
+                            }
+                            if consecutive_parse_errors > MAX_PARSE_ERRORS {
+                                eprintln!(
+                                    "Extended public WS too many parse errors; reconnecting url={}",
+                                    ws_url
+                                );
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let Some(update) = update else {
+                        if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+                            if let Some(event) = parse_depth_snapshot_from_ws(
+                                &value,
+                                &self.cfg.market,
+                                self.cfg.venue_index,
+                                &mut ws_snapshot_seq,
+                            ) {
+                                if !first_book_update_logged {
+                                    eprintln!("INFO: Extended public WS first book update");
+                                    first_book_update_logged = true;
+                                }
+                                if let Err(err) = self.market_tx.send(event).await {
+                                    eprintln!("Extended public WS market send failed: {err}");
+                                }
+                            }
+                            if !first_decoded_top_logged {
+                                if let Some(top) = decode_top_from_value(&value) {
+                                    eprintln!(
+                                        "FIRST_DECODED_TOP venue=extended bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                                        top.best_bid_px,
+                                        top.best_bid_sz,
+                                        top.best_ask_px,
+                                        top.best_ask_sz
+                                    );
+                                    first_decoded_top_logged = true;
+                                }
+                            }
+                        }
+                        continue;
+                    };
+                    if !first_decoded_top_logged {
+                        if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+                            if let Some(top) = decode_top_from_value(&value) {
+                                eprintln!(
+                                    "FIRST_DECODED_TOP venue=extended bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                                    top.best_bid_px,
+                                    top.best_bid_sz,
+                                    top.best_ask_px,
+                                    top.best_ask_sz
+                                );
+                                first_decoded_top_logged = true;
+                            }
+                        }
+                        if !first_decoded_top_logged {
+                            if let Some(top) = decode_top_from_update(&update, update.event_time) {
+                                eprintln!(
+                                "FIRST_DECODED_TOP venue=extended bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                                top.best_bid_px,
+                                top.best_bid_sz,
+                                top.best_ask_px,
+                                top.best_ask_sz
+                            );
+                                first_decoded_top_logged = true;
+                            }
+                        }
+                        if !first_decoded_top_logged && decode_miss_count < 3 {
+                            decode_miss_count += 1;
+                            if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+                                log_decode_miss(
+                                    "Extended",
+                                    &value,
+                                    cleaned,
+                                    decode_miss_count,
+                                    ws_url.as_str(),
+                                );
+                            }
+                        }
+                    }
                     if !symbol_matches(&update.symbol, &self.cfg.market) {
                         continue;
                     }
                     let outcome = seq_state.apply_update(&update)?;
                     if let Some(event) = outcome {
-                        let _ = self.market_tx.send(event).await;
+                        consecutive_parse_errors = 0;
+                        if !first_book_update_logged {
+                            eprintln!("INFO: Extended public WS first book update");
+                            first_book_update_logged = true;
+                        }
+                        if let Err(err) = self.market_tx.send(event).await {
+                            eprintln!("Extended public WS market send failed: {err}");
+                        }
                     }
                 }
+                Message::Binary(bytes) => {
+                    if !first_message_logged {
+                        eprintln!("INFO: Extended public WS first message received");
+                        first_message_logged = true;
+                    }
+                    let text = String::from_utf8_lossy(&bytes);
+                    let Some(cleaned) = clean_ws_payload(&text) else {
+                        continue;
+                    };
+                    if !first_ws_message_logged {
+                        if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+                            let keys = value
+                                .as_object()
+                                .map(|obj| {
+                                    let mut keys: Vec<&str> =
+                                        obj.keys().map(|k| k.as_str()).collect();
+                                    keys.sort();
+                                    format!("[{}]", keys.join(","))
+                                })
+                                .unwrap_or_else(|| "[non-object]".to_string());
+                            let snippet: String = cleaned.chars().take(160).collect();
+                            eprintln!(
+                                "INFO: Extended public WS first message keys={} snippet={}",
+                                keys, snippet
+                            );
+                            first_ws_keys = Some(keys);
+                            first_ws_snippet = Some(snippet);
+                            first_ws_message_logged = true;
+                        }
+                    }
+                    if let Some(recorder) = self.recorder.as_ref() {
+                        let mut guard = recorder.lock().await;
+                        let _ = guard.record_ws_frame(cleaned);
+                    }
+                    let update = match parse_depth_update(cleaned) {
+                        Ok(update) => update,
+                        Err(err) => {
+                            consecutive_parse_errors += 1;
+                            if consecutive_parse_errors == 1 || consecutive_parse_errors % 10 == 0 {
+                                let snippet: String = cleaned.chars().take(160).collect();
+                                eprintln!(
+                                    "WARN: Extended public WS parse error: {err} url={} snippet={}",
+                                    ws_url, snippet
+                                );
+                            }
+                            if consecutive_parse_errors > MAX_PARSE_ERRORS {
+                                eprintln!(
+                                    "Extended public WS too many parse errors; reconnecting url={}",
+                                    ws_url
+                                );
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let Some(update) = update else {
+                        if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+                            if let Some(event) = parse_depth_snapshot_from_ws(
+                                &value,
+                                &self.cfg.market,
+                                self.cfg.venue_index,
+                                &mut ws_snapshot_seq,
+                            ) {
+                                if !first_book_update_logged {
+                                    eprintln!("INFO: Extended public WS first book update");
+                                    first_book_update_logged = true;
+                                }
+                                if let Err(err) = self.market_tx.send(event).await {
+                                    eprintln!("Extended public WS market send failed: {err}");
+                                }
+                            }
+                            if !first_decoded_top_logged {
+                                if let Some(top) = decode_top_from_value(&value) {
+                                    eprintln!(
+                                        "FIRST_DECODED_TOP venue=extended bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                                        top.best_bid_px,
+                                        top.best_bid_sz,
+                                        top.best_ask_px,
+                                        top.best_ask_sz
+                                    );
+                                    first_decoded_top_logged = true;
+                                }
+                            }
+                        }
+                        continue;
+                    };
+                    if !first_decoded_top_logged {
+                        if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+                            if let Some(top) = decode_top_from_value(&value) {
+                                eprintln!(
+                                    "FIRST_DECODED_TOP venue=extended bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                                    top.best_bid_px,
+                                    top.best_bid_sz,
+                                    top.best_ask_px,
+                                    top.best_ask_sz
+                                );
+                                first_decoded_top_logged = true;
+                            }
+                        }
+                        if !first_decoded_top_logged {
+                            if let Some(top) = decode_top_from_update(&update, update.event_time) {
+                                eprintln!(
+                                "FIRST_DECODED_TOP venue=extended bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                                top.best_bid_px,
+                                top.best_bid_sz,
+                                top.best_ask_px,
+                                top.best_ask_sz
+                            );
+                                first_decoded_top_logged = true;
+                            }
+                        }
+                        if !first_decoded_top_logged && decode_miss_count < 3 {
+                            decode_miss_count += 1;
+                            if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
+                                log_decode_miss(
+                                    "Extended",
+                                    &value,
+                                    cleaned,
+                                    decode_miss_count,
+                                    ws_url.as_str(),
+                                );
+                            }
+                        }
+                    }
+                    if !symbol_matches(&update.symbol, &self.cfg.market) {
+                        continue;
+                    }
+                    let outcome = seq_state.apply_update(&update)?;
+                    if let Some(event) = outcome {
+                        consecutive_parse_errors = 0;
+                        if !first_book_update_logged {
+                            eprintln!("INFO: Extended public WS first book update");
+                            first_book_update_logged = true;
+                        }
+                        if let Err(err) = self.market_tx.send(event).await {
+                            eprintln!("Extended public WS market send failed: {err}");
+                        }
+                    }
+                }
+                Message::Ping(payload) => {
+                    write.send(Message::Pong(payload)).await?;
+                }
+                Message::Pong(_) => {}
+                Message::Close(_) => {
+                    eprintln!("Extended WS closed; reconnecting url={}", ws_url);
+                    break;
+                }
+                _ => {}
+            }
+            if !first_decoded_top_logged
+                && !no_book_warned
+                && ws_start.elapsed() >= Duration::from_secs(10)
+            {
+                let keys = first_ws_keys.as_deref().unwrap_or("unknown");
+                let snippet = first_ws_snippet.as_deref().unwrap_or("unknown");
+                eprintln!(
+                    "WARN: Extended WS no book decoded after 10s url={} keys={} snippet={}",
+                    ws_url, keys, snippet
+                );
+                no_book_warned = true;
             }
         }
         Ok(())
@@ -179,7 +542,9 @@ impl ExtendedConnector {
         );
         let resp = self.http.get(url).send().await?;
         let raw = resp.text().await?;
-        let value: Value = serde_json::from_str(&raw)?;
+        let cleaned =
+            clean_ws_payload(&raw).ok_or_else(|| anyhow::anyhow!("extended snapshot empty"))?;
+        let value: Value = serde_json::from_str(cleaned)?;
         let snapshot = parse_depth_snapshot(&value)
             .ok_or_else(|| anyhow::anyhow!("extended snapshot parse failed"))?;
         Ok((raw, snapshot))
@@ -199,7 +564,10 @@ impl ExtendedRestClient {
     pub fn new(cfg: ExtendedConfig) -> Self {
         Self {
             cfg,
-            http: Client::new(),
+            http: Client::builder()
+                .user_agent("paraphina")
+                .build()
+                .expect("extended rest http client build"),
             timestamp_fn: Arc::new(now_ms),
         }
     }
@@ -270,8 +638,9 @@ impl ExtendedRestClient {
         if !status.is_success() {
             return Err(map_rest_error(status.as_u16(), &body));
         }
-        let value: Value = serde_json::from_str(&body)
-            .map_err(|err| LiveGatewayError::fatal(format!("extended account parse error: {err}")))?;
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("extended account parse error: {err}"))
+        })?;
         parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
             LiveGatewayError::fatal("extended account snapshot missing required fields")
         })
@@ -309,7 +678,10 @@ impl LiveRestClient for ExtendedRestClient {
                 ("symbol".to_string(), self.cfg.market.clone()),
                 ("side".to_string(), map_side(req.side).to_string()),
                 ("type".to_string(), "LIMIT".to_string()),
-                ("timeInForce".to_string(), map_time_in_force(req.time_in_force, req.post_only).to_string()),
+                (
+                    "timeInForce".to_string(),
+                    map_time_in_force(req.time_in_force, req.post_only).to_string(),
+                ),
                 ("price".to_string(), format_f64(req.price)),
                 ("quantity".to_string(), format_f64(req.size)),
                 ("newClientOrderId".to_string(), req.client_order_id.clone()),
@@ -442,9 +814,19 @@ fn parse_order_id(body: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn parse_account_snapshot(value: &Value, venue_id: &str, venue_index: usize) -> Option<AccountSnapshot> {
-    let seq = value.get("updateTime").and_then(|v| v.as_u64()).unwrap_or(0);
-    let timestamp_ms = value.get("updateTime").and_then(|v| v.as_i64()).unwrap_or(0);
+fn parse_account_snapshot(
+    value: &Value,
+    venue_id: &str,
+    venue_index: usize,
+) -> Option<AccountSnapshot> {
+    let seq = value
+        .get("updateTime")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let timestamp_ms = value
+        .get("updateTime")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     let positions = value
         .get("positions")
@@ -556,43 +938,49 @@ struct ExtendedDepthUpdate {
 
 #[derive(Debug, Clone, Copy)]
 struct ExtendedSeqState {
-    last_update_id: u64,
+    last_update_id: Option<u64>,
+    venue_index: usize,
 }
 
 impl ExtendedSeqState {
-    fn new(last_update_id: u64) -> Self {
-        Self { last_update_id }
+    fn new(last_update_id: Option<u64>, venue_index: usize) -> Self {
+        Self {
+            last_update_id,
+            venue_index,
+        }
     }
 
     fn apply_update(
         &mut self,
         update: &ExtendedDepthUpdate,
     ) -> anyhow::Result<Option<MarketDataEvent>> {
-        if let Some(prev) = update.prev_id {
-            if prev != self.last_update_id {
+        if let Some(last_update_id) = self.last_update_id {
+            if let Some(prev) = update.prev_id {
+                if prev != last_update_id {
+                    return Err(anyhow::anyhow!(
+                        "extended seq mismatch prev_id={} last={}",
+                        prev,
+                        last_update_id
+                    ));
+                }
+            }
+            if update.end_id <= last_update_id {
+                return Ok(None);
+            }
+            if update.start_id > last_update_id + 1 {
                 return Err(anyhow::anyhow!(
-                    "extended seq mismatch prev_id={} last={}",
-                    prev,
-                    self.last_update_id
+                    "extended seq gap last={} next_start={}",
+                    last_update_id,
+                    update.start_id
                 ));
             }
         }
-        if update.end_id <= self.last_update_id {
-            return Ok(None);
-        }
-        if update.start_id > self.last_update_id + 1 {
-            return Err(anyhow::anyhow!(
-                "extended seq gap last={} next_start={}",
-                self.last_update_id,
-                update.start_id
-            ));
-        }
-        self.last_update_id = update.end_id;
+        self.last_update_id = Some(update.end_id);
         let mut changes = Vec::with_capacity(update.bids.len() + update.asks.len());
         changes.extend(update.bids.iter().cloned());
         changes.extend(update.asks.iter().cloned());
         let event = MarketDataEvent::L2Delta(super::super::types::L2Delta {
-            venue_index: 0,
+            venue_index: self.venue_index,
             venue_id: update.symbol.clone(),
             seq: update.end_id,
             timestamp_ms: update.event_time.unwrap_or_else(now_ms),
@@ -642,24 +1030,43 @@ fn parse_depth_snapshot(value: &Value) -> Option<ExtendedDepthSnapshot> {
     })
 }
 
-fn parse_depth_update(text: &str) -> Option<ExtendedDepthUpdate> {
-    let value: Value = serde_json::from_str(text).ok()?;
+fn parse_depth_update(text: &str) -> Result<Option<ExtendedDepthUpdate>, serde_json::Error> {
+    let value: Value = serde_json::from_str(text)?;
     let payload = value.get("data").unwrap_or(&value);
     let event = payload.get("e").and_then(|v| v.as_str()).unwrap_or("");
     if event != "depthUpdate" {
-        return None;
+        return Ok(None);
     }
-    let symbol = payload.get("s")?.as_str()?.to_string();
-    let start_id = payload.get("U")?.as_u64()?;
-    let end_id = payload.get("u")?.as_u64()?;
+    let symbol = payload
+        .get("s")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let start_id = payload.get("U").and_then(|v| v.as_u64());
+    let end_id = payload.get("u").and_then(|v| v.as_u64());
+    let (symbol, start_id, end_id) = match (symbol, start_id, end_id) {
+        (Some(symbol), Some(start_id), Some(end_id)) => (symbol, start_id, end_id),
+        _ => return Ok(None),
+    };
     let prev_id = payload.get("pu").and_then(|v| v.as_u64());
     let event_time = payload
         .get("E")
         .and_then(|v| v.as_i64())
         .map(|v| v as TimestampMs);
-    let bids = parse_deltas_from_value(payload.get("b")?, BookSide::Bid)?;
-    let asks = parse_deltas_from_value(payload.get("a")?, BookSide::Ask)?;
-    Some(ExtendedDepthUpdate {
+    let bids = match payload
+        .get("b")
+        .and_then(|v| parse_deltas_from_value(v, BookSide::Bid))
+    {
+        Some(bids) => bids,
+        None => return Ok(None),
+    };
+    let asks = match payload
+        .get("a")
+        .and_then(|v| parse_deltas_from_value(v, BookSide::Ask))
+    {
+        Some(asks) => asks,
+        None => return Ok(None),
+    };
+    Ok(Some(ExtendedDepthUpdate {
         symbol,
         event_time,
         start_id,
@@ -667,7 +1074,166 @@ fn parse_depth_update(text: &str) -> Option<ExtendedDepthUpdate> {
         prev_id,
         bids,
         asks,
-    })
+    }))
+}
+
+fn clean_ws_payload(text: &str) -> Option<&str> {
+    let cleaned = text.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn decode_top_from_update(
+    update: &ExtendedDepthUpdate,
+    timestamp_ms: Option<TimestampMs>,
+) -> Option<TopOfBook> {
+    let bid = update
+        .bids
+        .iter()
+        .filter(|lvl| lvl.size > 0.0)
+        .max_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    let ask = update
+        .asks
+        .iter()
+        .filter(|lvl| lvl.size > 0.0)
+        .min_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+    TopOfBook::from_levels(
+        &[BookLevel {
+            price: bid.price,
+            size: bid.size,
+        }],
+        &[BookLevel {
+            price: ask.price,
+            size: ask.size,
+        }],
+        timestamp_ms,
+    )
+}
+
+fn decode_top_from_value(value: &Value) -> Option<TopOfBook> {
+    let payload = value
+        .get("data")
+        .or_else(|| value.get("order_book"))
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+    let bids = payload.get("b").or_else(|| payload.get("bids"))?;
+    let asks = payload.get("a").or_else(|| payload.get("asks"))?;
+    let bid = best_level_from_value(bids, true)?;
+    let ask = best_level_from_value(asks, false)?;
+    let timestamp_ms = payload
+        .get("E")
+        .or_else(|| payload.get("ts"))
+        .and_then(|v| v.as_i64());
+    TopOfBook::from_levels(
+        &[BookLevel {
+            price: bid.price,
+            size: bid.size,
+        }],
+        &[BookLevel {
+            price: ask.price,
+            size: ask.size,
+        }],
+        timestamp_ms,
+    )
+}
+
+fn parse_depth_snapshot_from_ws(
+    value: &Value,
+    market: &str,
+    venue_index: usize,
+    fallback_seq: &mut u64,
+) -> Option<MarketDataEvent> {
+    let payload = value
+        .get("data")
+        .or_else(|| value.get("order_book"))
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+    let bids_value = payload.get("bids").or_else(|| payload.get("b"))?;
+    let asks_value = payload.get("asks").or_else(|| payload.get("a"))?;
+    let bids = parse_levels_from_value(bids_value)?;
+    let asks = parse_levels_from_value(asks_value)?;
+    let seq = payload
+        .get("lastUpdateId")
+        .or_else(|| payload.get("u"))
+        .or_else(|| value.get("seq"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| {
+            *fallback_seq = fallback_seq.wrapping_add(1);
+            *fallback_seq
+        });
+    let timestamp_ms = payload
+        .get("E")
+        .or_else(|| payload.get("ts"))
+        .or_else(|| value.get("ts"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(now_ms);
+    let venue_id = payload
+        .get("m")
+        .or_else(|| payload.get("symbol"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(market)
+        .to_string();
+    Some(MarketDataEvent::L2Snapshot(
+        super::super::types::L2Snapshot {
+            venue_index,
+            venue_id,
+            seq,
+            timestamp_ms,
+            bids,
+            asks,
+        },
+    ))
+}
+
+fn best_level_from_value(value: &Value, is_bid: bool) -> Option<BookLevel> {
+    let entries = value.as_array()?;
+    let mut best: Option<BookLevel> = None;
+    for entry in entries {
+        let (price, size) = parse_level_pair(entry)?;
+        if size <= 0.0 {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some(prev) => {
+                if is_bid {
+                    price > prev.price
+                } else {
+                    price < prev.price
+                }
+            }
+        };
+        if replace {
+            best = Some(BookLevel { price, size });
+        }
+    }
+    best
+}
+
+fn log_decode_miss(venue: &str, value: &Value, payload: &str, count: usize, url: &str) {
+    let keys = value
+        .as_object()
+        .map(|obj| {
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            format!("[{}]", keys.join(","))
+        })
+        .unwrap_or_else(|| "[non-object]".to_string());
+    let snippet: String = payload.chars().take(160).collect();
+    eprintln!(
+        "WARN: {venue} WS decode miss keys={keys} snippet={snippet} (count={count}) url={url}",
+    );
 }
 
 fn parse_levels_from_value(value: &Value) -> Option<Vec<BookLevel>> {
@@ -691,13 +1257,49 @@ fn parse_deltas_from_value(value: &Value, side: BookSide) -> Option<Vec<BookLeve
 }
 
 fn parse_level_pair(value: &Value) -> Option<(f64, f64)> {
-    let items = value.as_array()?;
-    if items.len() < 2 {
-        return None;
+    if let Some(items) = value.as_array() {
+        if items.len() < 2 {
+            return None;
+        }
+        let price = parse_f64(&items[0])?;
+        let size = parse_f64(&items[1])?;
+        return Some((price, size));
     }
-    let price = parse_f64(&items[0])?;
-    let size = parse_f64(&items[1])?;
-    Some((price, size))
+    if let Some(obj) = value.as_object() {
+        let price = obj
+            .get("price")
+            .or_else(|| obj.get("px"))
+            .or_else(|| obj.get("p"))
+            .and_then(parse_f64)?;
+        let size = obj
+            .get("size")
+            .or_else(|| obj.get("sz"))
+            .or_else(|| obj.get("qty"))
+            .or_else(|| obj.get("q"))
+            .and_then(parse_f64)?;
+        return Some((price, size));
+    }
+    None
+}
+
+fn normalize_extended_market(raw: &str) -> String {
+    let mut upper = raw.trim().to_uppercase();
+    if let Some(stripped) = upper.strip_suffix("-USD-PERP") {
+        upper = stripped.to_string();
+    } else if let Some(stripped) = upper.strip_suffix("-PERP") {
+        upper = stripped.to_string();
+    }
+    if upper.contains("-USD") {
+        let base = upper.split("-USD").next().unwrap_or(&upper);
+        return format!("{base}-USD");
+    }
+    if let Some(stripped) = upper.strip_suffix("USDT") {
+        return format!("{stripped}-USD");
+    }
+    if let Some(stripped) = upper.strip_suffix("USD") {
+        return format!("{stripped}-USD");
+    }
+    format!("{upper}-USD")
 }
 
 fn parse_f64(value: &Value) -> Option<f64> {
@@ -951,9 +1553,8 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
         if line.trim().is_empty() {
             continue;
         }
-        let item: T = serde_json::from_str(line).map_err(|err| {
-            format!("fixture_parse_error path={} err={}", path.display(), err)
-        })?;
+        let item: T = serde_json::from_str(line)
+            .map_err(|err| format!("fixture_parse_error path={} err={}", path.display(), err))?;
         out.push(item);
     }
     Ok(out)
@@ -968,8 +1569,8 @@ mod tests {
 
     #[test]
     fn fixture_snapshot_parses() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/extended");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/extended");
         let feed = ExtendedFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         assert!(!feed.snapshot.bids.is_empty());
         assert!(!feed.snapshot.asks.is_empty());
@@ -977,8 +1578,8 @@ mod tests {
 
     #[test]
     fn delta_applies_to_snapshot_levels() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/extended");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/extended");
         let feed = ExtendedFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         let mut bids = feed.snapshot.bids.clone();
         let delta = feed.deltas.first().expect("delta");
@@ -1018,8 +1619,8 @@ mod tests {
 
     #[test]
     fn deterministic_serialization_roundtrip() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/extended");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/extended");
         let feed = ExtendedFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         let raw = serde_json::to_string(&feed.snapshot).expect("serialize");
         let reparsed: FixtureSnapshot = serde_json::from_str(&raw).expect("reparse");
@@ -1031,8 +1632,8 @@ mod tests {
     fn live_snapshot_fixture_parses() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/roadmap_b/extended_live_recording");
-        let raw = std::fs::read_to_string(fixture_dir.join("rest_snapshot.json"))
-            .expect("snapshot raw");
+        let raw =
+            std::fs::read_to_string(fixture_dir.join("rest_snapshot.json")).expect("snapshot raw");
         let value: Value = serde_json::from_str(&raw).expect("snapshot json");
         let snapshot = parse_depth_snapshot(&value).expect("parse snapshot");
         assert!(snapshot.last_update_id > 0);
@@ -1044,22 +1645,22 @@ mod tests {
     fn live_ws_replay_is_deterministic_and_monotonic() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/roadmap_b/extended_live_recording");
-        let snapshot_raw = std::fs::read_to_string(fixture_dir.join("rest_snapshot.json"))
-            .expect("snapshot raw");
+        let snapshot_raw =
+            std::fs::read_to_string(fixture_dir.join("rest_snapshot.json")).expect("snapshot raw");
         let snapshot_value: Value = serde_json::from_str(&snapshot_raw).expect("snapshot json");
         let snapshot = parse_depth_snapshot(&snapshot_value).expect("parse snapshot");
-        let frames = std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl"))
-            .expect("ws frames");
+        let frames =
+            std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl")).expect("ws frames");
 
         let collect_events = |snapshot_id: u64| -> Vec<MarketDataEvent> {
-            let mut state = ExtendedSeqState::new(snapshot_id);
+            let mut state = ExtendedSeqState::new(Some(snapshot_id), 0);
             let mut events = Vec::new();
             for line in frames.lines() {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Some(update) = parse_depth_update(trimmed) {
+                if let Ok(Some(update)) = parse_depth_update(trimmed) {
                     let outcome = state.apply_update(&update).expect("seq ok");
                     if let Some(event) = outcome {
                         events.push(event);
@@ -1106,6 +1707,7 @@ mod tests {
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
+            venue_index: 0,
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1160,6 +1762,7 @@ mod tests {
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
+            venue_index: 0,
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1215,6 +1818,7 @@ mod tests {
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
+            venue_index: 0,
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1245,5 +1849,52 @@ mod tests {
             .expect("cancel_all");
 
         mock.assert_async().await;
+    }
+
+    #[test]
+    fn ws_frame_whitespace_is_ignored_and_json_parses() {
+        assert!(clean_ws_payload("").is_none());
+        assert!(clean_ws_payload("   \n\t ").is_none());
+        assert!(clean_ws_payload("\0\0").is_none());
+        let raw =
+            r#"{"e":"depthUpdate","s":"BTCUSDT","U":1,"u":1,"b":[["100","1"]],"a":[["101","2"]]}"#;
+        let cleaned = clean_ws_payload(raw).expect("cleaned");
+        let update = parse_depth_update(cleaned).expect("parse").expect("update");
+        assert_eq!(update.symbol, "BTCUSDT");
+        assert_eq!(update.start_id, 1);
+        assert_eq!(update.end_id, 1);
+        assert_eq!(update.bids.len(), 1);
+        assert_eq!(update.asks.len(), 1);
+    }
+
+    #[test]
+    fn ws_frame_empty_json_is_non_fatal() {
+        let cleaned = clean_ws_payload("{}").expect("cleaned");
+        let parsed = parse_depth_update(cleaned).expect("parse");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn ws_value_decode_handles_object_levels() {
+        let value = serde_json::json!({
+            "data": {
+                "bids": [{"price":"100","size":"2"}],
+                "asks": [{"price":"101","size":"3"}],
+                "ts": 1700000000000i64
+            }
+        });
+        let top = decode_top_from_value(&value).expect("top");
+        assert_eq!(top.best_bid_px, 100.0);
+        assert_eq!(top.best_bid_sz, 2.0);
+        assert_eq!(top.best_ask_px, 101.0);
+        assert_eq!(top.best_ask_sz, 3.0);
+    }
+
+    #[test]
+    fn normalize_extended_market_variants() {
+        assert_eq!(normalize_extended_market("BTCUSDT"), "BTC-USD");
+        assert_eq!(normalize_extended_market("BTCUSD"), "BTC-USD");
+        assert_eq!(normalize_extended_market("BTC-USD"), "BTC-USD");
+        assert_eq!(normalize_extended_market("btc-usd-perp"), "BTC-USD");
     }
 }

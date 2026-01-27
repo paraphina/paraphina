@@ -339,6 +339,17 @@ pub fn write_evidence_pack(
         }
     }
 
+    // Ensure output_root exists and is a directory
+    if output_root.exists() && !output_root.is_dir() {
+        bail!("Output root is not a directory: {}", output_root.display());
+    }
+    fs::create_dir_all(output_root).with_context(|| {
+        format!(
+            "Failed to create output root dir: {}",
+            output_root.display()
+        )
+    })?;
+
     // Create evidence_pack directory
     let evidence_pack_dir = output_root.join("evidence_pack");
     fs::create_dir_all(&evidence_pack_dir).with_context(|| {

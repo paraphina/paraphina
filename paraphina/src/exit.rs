@@ -33,7 +33,9 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::state::{GlobalState, RiskRegime};
-use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
+use crate::types::{
+    OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs, VenueStatus,
+};
 
 #[derive(Debug, Clone)]
 struct Candidate {
@@ -60,6 +62,101 @@ struct Candidate {
     size_step: f64,
     /// Min notional for this venue.
     min_notional: f64,
+}
+
+/// Exit edge component breakdown (telemetry).
+#[derive(Debug, Clone)]
+pub struct ExitEdgeComponents {
+    pub edge_threshold: f64,
+    pub fee_per_tao: f64,
+    pub slippage_buffer: f64,
+    pub vol_buffer: f64,
+    pub basis_term: f64,
+    pub funding_benefit_per_tao: f64,
+    pub frag_penalty: f64,
+    pub basis_risk_penalty: f64,
+}
+
+/// Compute exit edge components for a given exit intent.
+pub fn compute_exit_edge_components(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: TimestampMs,
+    intent: &OrderIntent,
+) -> Option<ExitEdgeComponents> {
+    let intent = match intent {
+        OrderIntent::Place(pi) if matches!(pi.purpose, OrderPurpose::Exit) => pi,
+        _ => return None,
+    };
+
+    let vcfg = cfg.venues.get(intent.venue_index)?;
+    let v = state.venues.get(intent.venue_index)?;
+    let fair = state.fair_value.unwrap_or(1.0).max(1.0);
+    let mid = v.mid.unwrap_or(fair);
+    let spread = v.spread.unwrap_or(0.0).max(0.0);
+    let depth_usd = v.depth_near_mid.max(0.0);
+
+    let edge_threshold =
+        cfg.exit.edge_min_usd + cfg.exit.edge_vol_mult * state.vol_ratio_clipped.max(0.0);
+    let vol_buffer = compute_vol_buffer(cfg, state, fair);
+    let fee_per_tao = (vcfg.taker_fee_bps / 10_000.0) * intent.price;
+    let slippage_buffer = compute_slippage_buffer(cfg, fair, spread, depth_usd, intent.size);
+
+    let basis_term = match intent.side {
+        Side::Sell => intent.price - fair,
+        Side::Buy => fair - intent.price,
+    };
+
+    let horizon_frac = cfg.exit.funding_horizon_sec / (8.0 * 60.0 * 60.0);
+    let funding_benefit_per_tao = match intent.side {
+        Side::Sell => v.funding_8h * horizon_frac * fair,
+        Side::Buy => -v.funding_8h * horizon_frac * fair,
+    };
+
+    let trade_sign = match intent.side {
+        Side::Sell => -1.0,
+        Side::Buy => 1.0,
+    };
+    let basis_risk_change = compute_basis_risk_change(state, mid, fair, trade_sign);
+    let basis_risk_penalty = if basis_risk_change > 0.0 {
+        cfg.exit.basis_risk_penalty_weight * basis_risk_change
+    } else {
+        cfg.exit.basis_risk_penalty_weight * basis_risk_change * 0.5
+    };
+
+    let small = cfg.exit.min_intent_size_tao.max(1e-9);
+    let reduces_venue_abs = (v.position_tao * trade_sign) < 0.0;
+    let opens_new_leg = v.position_tao.abs() < small && !reduces_venue_abs;
+    let increases_venue_abs = (v.position_tao * trade_sign) > 0.0;
+    let frag_penalty = if opens_new_leg || increases_venue_abs {
+        cfg.exit.fragmentation_penalty_per_tao
+    } else {
+        0.0
+    };
+
+    if !edge_threshold.is_finite()
+        || !fee_per_tao.is_finite()
+        || !slippage_buffer.is_finite()
+        || !vol_buffer.is_finite()
+        || !basis_term.is_finite()
+        || !funding_benefit_per_tao.is_finite()
+        || !frag_penalty.is_finite()
+        || !basis_risk_penalty.is_finite()
+    {
+        return None;
+    }
+
+    let _ = now_ms;
+    Some(ExitEdgeComponents {
+        edge_threshold,
+        fee_per_tao,
+        slippage_buffer,
+        vol_buffer,
+        basis_term,
+        funding_benefit_per_tao,
+        frag_penalty,
+        basis_risk_penalty,
+    })
 }
 
 fn tick_floor(px: f64, tick: f64) -> f64 {
@@ -492,6 +589,9 @@ pub fn compute_exit_intents_into(
             - frag_pen
             + frag_bonus
             - basis_risk_pen;
+        if !score_per_tao.is_finite() {
+            continue;
+        }
 
         cands.push(Candidate {
             venue_index: j,
@@ -601,14 +701,18 @@ pub fn compute_exit_intents_into(
             continue;
         }
 
-        out.push(OrderIntent {
+        out.push(OrderIntent::Place(PlaceOrderIntent {
             venue_index: c.venue_index,
             venue_id: c.venue_id,
             side: c.side,
             price: c.price,
             size: rounded_size,
             purpose: OrderPurpose::Exit,
-        });
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: None,
+        }));
 
         remaining -= rounded_size;
     }

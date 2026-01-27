@@ -99,6 +99,9 @@ fn make_test_scenario() -> ScenarioSpec {
         },
         market_model: MarketModel::default(),
         microstructure_model: MicrostructureModel::default(),
+        latency_spike: None,
+        partial_fill: paraphina::sim_eval::PartialFillModel::default(),
+        cancel_storm: None,
         invariants: Invariants::default(),
     }
 }

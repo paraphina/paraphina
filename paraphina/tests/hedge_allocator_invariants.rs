@@ -21,6 +21,23 @@ mod hedge_testkit;
 use hedge_testkit::{approx_eq, is_finite, HedgeTestCase, Xorshift64};
 use paraphina::hedge::{compute_abs_limit_after_trade, compute_hedge_orders, compute_hedge_plan};
 use paraphina::types::Side;
+use paraphina::types::OrderIntent;
+
+
+/// Extractors for OrderIntent enum used in hedge allocator invariants.
+/// Hedge allocator should emit Place/Replace intents only in these invariants.
+fn intent_place_like_fields(intent: &OrderIntent) -> (usize, Side, f64, f64) {
+    match intent {
+        OrderIntent::Place(pi) => (pi.venue_index, pi.side, pi.size, pi.price),
+        OrderIntent::Replace(ri) => (ri.venue_index, ri.side, ri.size, ri.price),
+        other => panic!("Expected Place/Replace OrderIntent, got: {:?}", other),
+    }
+}
+fn intent_venue_index(intent: &OrderIntent) -> usize { intent_place_like_fields(intent).0 }
+fn intent_side(intent: &OrderIntent) -> Side { intent_place_like_fields(intent).1 }
+fn intent_size(intent: &OrderIntent) -> f64 { intent_place_like_fields(intent).2 }
+fn intent_price(intent: &OrderIntent) -> f64 { intent_place_like_fields(intent).3 }
+
 
 // ============================================================================
 // CONSTANTS
@@ -51,24 +68,24 @@ fn invariant_no_nans_or_infs_in_outputs() {
 
         for intent in &intents {
             assert!(
-                is_finite(intent.size),
+                is_finite(intent_size(intent)),
                 "Case {case_id}: Intent size is NaN/inf: {:?}\nTest case: {test_case:?}",
-                intent.size
+                intent_size(intent)
             );
             assert!(
-                is_finite(intent.price),
+                is_finite(intent_price(intent)),
                 "Case {case_id}: Intent price is NaN/inf: {:?}\nTest case: {test_case:?}",
-                intent.price
+                intent_price(intent)
             );
             assert!(
-                intent.size >= 0.0,
+                intent_size(intent) >= 0.0,
                 "Case {case_id}: Intent size is negative: {}\nTest case: {test_case:?}",
-                intent.size
+                intent_size(intent)
             );
             assert!(
-                intent.price > 0.0,
+                intent_price(intent) > 0.0,
                 "Case {case_id}: Intent price is non-positive: {}\nTest case: {test_case:?}",
-                intent.price
+                intent_price(intent)
             );
         }
 
@@ -98,7 +115,7 @@ fn invariant_total_hedge_bounded_by_max_step() {
         let state = test_case.build_state(&cfg);
 
         let intents = compute_hedge_orders(&cfg, &state, 0);
-        let total_size: f64 = intents.iter().map(|i| i.size).sum();
+        let total_size: f64 = intents.iter().map(|i| intent_size(i)).sum();
 
         // Allow small floating-point tolerance
         let tolerance = 1e-6;
@@ -128,8 +145,8 @@ fn invariant_per_venue_cap_respected() {
         let intents = compute_hedge_orders(&cfg, &state, 0);
 
         for intent in &intents {
-            let vcfg = &cfg.venues[intent.venue_index];
-            let v = &state.venues[intent.venue_index];
+            let vcfg = &cfg.venues[intent_venue_index(intent)];
+            let v = &state.venues[intent_venue_index(intent)];
 
             // Compute the per-venue cap
             let fair = state.fair_value.unwrap_or(100.0);
@@ -141,12 +158,12 @@ fn invariant_per_venue_cap_respected() {
             // Allow tolerance for floating-point and lot-size rounding
             let tolerance = 1e-6;
             assert!(
-                intent.size <= expected_cap + tolerance,
+                intent_size(intent) <= expected_cap + tolerance,
                 "Case {case_id}: Venue {} allocation ({}) exceeds per-venue cap ({})\n\
                  max_venue={max_venue}, max_order={max_order}, depth_cap={depth_cap}\n\
                  Test case: {test_case:?}",
-                intent.venue_index,
-                intent.size,
+                intent_venue_index(intent),
+                intent_size(intent),
                 expected_cap
             );
         }
@@ -170,7 +187,7 @@ fn invariant_margin_constraint_respected() {
         let intents = compute_hedge_orders(&cfg, &state, 0);
 
         for intent in &intents {
-            let v = &state.venues[intent.venue_index];
+            let v = &state.venues[intent_venue_index(intent)];
             let fair = state.fair_value.unwrap_or(100.0);
 
             // Compute the margin-based abs limit
@@ -183,9 +200,9 @@ fn invariant_margin_constraint_respected() {
             );
 
             // Compute the new position after this intent
-            let dq = match intent.side {
-                Side::Buy => intent.size,
-                Side::Sell => -intent.size,
+            let dq = match intent_side(intent) {
+                Side::Buy => intent_size(intent),
+                Side::Sell => -intent_size(intent),
             };
             let new_position = v.position_tao + dq;
 
@@ -201,7 +218,7 @@ fn invariant_margin_constraint_respected() {
                     "Case {case_id}: Venue {} new abs position ({new_abs}) exceeds margin limit ({abs_limit})\n\
                      old_position={}, dq={dq}, margin_available={}, leverage={}, safety={}\n\
                      Test case: {test_case:?}",
-                    intent.venue_index,
+                    intent_venue_index(intent),
                     v.position_tao,
                     v.margin_available_usd,
                     cfg.hedge.max_leverage,
@@ -243,10 +260,10 @@ fn invariant_hedge_direction_reduces_exposure() {
 
         for intent in &intents {
             assert_eq!(
-                intent.side, expected_side,
+                intent_side(intent), expected_side,
                 "Case {case_id}: Hedge direction wrong. Global q={}, expected {:?}, got {:?}\n\
                  Test case: {test_case:?}",
-                state.q_global_tao, expected_side, intent.side
+                state.q_global_tao, expected_side, intent_side(intent)
             );
         }
     }
@@ -292,28 +309,28 @@ fn invariant_output_determinism() {
         // Verify identical contents
         for i in 0..intents1.len() {
             assert_eq!(
-                intents1[i].venue_index, intents2[i].venue_index,
+                intent_venue_index(&intents1[i]), intent_venue_index(&intents2[i]),
                 "Case {case_id}: Non-deterministic venue order at position {i}\n\
                  Test case: {test_case:?}"
             );
             assert_eq!(
-                intents1[i].side, intents2[i].side,
+                intent_side(&intents1[i]), intent_side(&intents2[i]),
                 "Case {case_id}: Non-deterministic side at position {i}\n\
                  Test case: {test_case:?}"
             );
             assert!(
-                approx_eq(intents1[i].size, intents2[i].size, 1e-12),
+                approx_eq(intent_size(&intents1[i]), intent_size(&intents2[i]), 1e-12),
                 "Case {case_id}: Non-deterministic size at position {i}: {} vs {}\n\
                  Test case: {test_case:?}",
-                intents1[i].size,
-                intents2[i].size
+                intent_size(&intents1[i]),
+                intent_size(&intents2[i])
             );
             assert!(
-                approx_eq(intents1[i].price, intents2[i].price, 1e-12),
+                approx_eq(intent_price(&intents1[i]), intent_price(&intents2[i]), 1e-12),
                 "Case {case_id}: Non-deterministic price at position {i}: {} vs {}\n\
                  Test case: {test_case:?}",
-                intents1[i].price,
-                intents2[i].price
+                intent_price(&intents1[i]),
+                intent_price(&intents2[i])
             );
         }
     }
@@ -388,7 +405,7 @@ fn run_systematic_case(case_id: u64, q: f64, fair: f64, margin: f64, leverage: f
     let intents = compute_hedge_orders(&cfg, &state, 0);
 
     // Check all invariants
-    let total_size: f64 = intents.iter().map(|i| i.size).sum();
+    let total_size: f64 = intents.iter().map(|i| intent_size(i)).sum();
     assert!(
         total_size <= cfg.hedge.max_step_tao + 1e-6,
         "Systematic case {case_id} (q={q}, fair={fair}, margin={margin}, leverage={leverage}): \
@@ -398,17 +415,17 @@ fn run_systematic_case(case_id: u64, q: f64, fair: f64, margin: f64, leverage: f
 
     for intent in &intents {
         assert!(
-            is_finite(intent.size) && is_finite(intent.price),
+            is_finite(intent_size(intent)) && is_finite(intent_price(intent)),
             "Systematic case {case_id}: NaN/inf in output"
         );
         assert!(
-            intent.size >= 0.0 && intent.price > 0.0,
+            intent_size(intent) >= 0.0 && intent_price(intent) > 0.0,
             "Systematic case {case_id}: Invalid size/price"
         );
 
         let expected_cap = cfg.hedge.max_venue_tao_per_tick;
         assert!(
-            intent.size <= expected_cap + 1e-6,
+            intent_size(intent) <= expected_cap + 1e-6,
             "Systematic case {case_id}: Per-venue cap violated"
         );
     }
@@ -418,7 +435,7 @@ fn run_systematic_case(case_id: u64, q: f64, fair: f64, margin: f64, leverage: f
         let expected_side = if q > 0.0 { Side::Sell } else { Side::Buy };
         for intent in &intents {
             assert_eq!(
-                intent.side, expected_side,
+                intent_side(intent), expected_side,
                 "Systematic case {case_id}: Wrong hedge direction for q={q}"
             );
         }
@@ -469,7 +486,7 @@ fn edge_case_zero_margin() {
     // and be blocked by margin constraint.
     for intent in &intents {
         assert!(
-            is_finite(intent.size),
+            is_finite(intent_size(intent)),
             "Output should be finite even with zero margin"
         );
         // With zero margin, the margin cap should limit allocation significantly
@@ -559,7 +576,7 @@ fn edge_case_very_large_inventory() {
     state.recompute_after_fills(&cfg);
 
     let intents = compute_hedge_orders(&cfg, &state, 0);
-    let total: f64 = intents.iter().map(|i| i.size).sum();
+    let total: f64 = intents.iter().map(|i| intent_size(i)).sum();
 
     assert!(
         total <= cfg.hedge.max_step_tao + 1e-6,
@@ -631,7 +648,7 @@ fn edge_case_single_venue() {
         "Single enabled venue should produce intents"
     );
     assert!(
-        intents.iter().all(|i| i.venue_index == 0),
+        intents.iter().all(|i| intent_venue_index(i) == 0),
         "All intents should be for venue 0"
     );
 }
@@ -656,10 +673,10 @@ fn invariant_single_order_per_venue() {
         let mut seen = std::collections::HashSet::new();
         for intent in &intents {
             assert!(
-                seen.insert(intent.venue_index),
+                seen.insert(intent_venue_index(intent)),
                 "Case {case_id}: Venue {} appears multiple times - not properly aggregated\n\
                  Test case: {test_case:?}",
-                intent.venue_index
+                intent_venue_index(intent)
             );
         }
     }
@@ -680,7 +697,7 @@ fn invariant_venue_ordering_consistent() {
         // Check that intents are sorted by venue_index
         for i in 1..intents.len() {
             assert!(
-                intents[i - 1].venue_index <= intents[i].venue_index,
+                intent_venue_index(&intents[i - 1]) <= intent_venue_index(&intents[i]),
                 "Case {case_id}: Intents not sorted by venue_index\n\
                  Test case: {test_case:?}"
             );

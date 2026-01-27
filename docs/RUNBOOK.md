@@ -7,7 +7,7 @@ See `docs/DEPLOYMENT_CHAIN.md` for the end-to-end release → VPS → canary cha
 
 ## Trade Modes
 
-- **shadow**: run live ingestion + strategy, but do not place orders (no order placement).
+- **shadow**: run live ingestion + strategy, but do not place orders.
 - **paper**: run full pipeline, emit intent logs, no exchange orders.
 - **testnet**: run full pipeline against testnet venues.
 - **live**: place real orders (requires keys).
@@ -35,13 +35,38 @@ See "Migration to new VPS" for the concrete checklist.
   support it (currently Hyperliquid + Lighter), with market connectivity for
   the remaining venues.
 
-## Venue Health States
+## All-5 Live Shadow Market Data
 
-- **Healthy**: market data is fresh and the venue passes health gates, so it is
-  eligible for price discovery and quoting.
-- **Disabled**: market data is stale or connector errors exceed thresholds, so the
-  venue is excluded from pricing/quoting and will be cancel-all'd if needed, but
-  the process continues running for other venues.
+Shadow mode ingests live market data and runs the strategy loop but never places
+orders.
+
+Venue health interpretation:
+
+- **Healthy**: venue market feed is fresh and within health gates.
+- **Disabled**: venue is marked unhealthy (stale or repeated errors) and is excluded
+  from trading intents/cancel flows.
+
+Primary helper (runner):
+
+```
+bash tools/run_all5_shadow.sh
+python3 tools/paraphina_watch.py --telemetry "$(cat /tmp/paraphina_last_outdir.txt)/telemetry.jsonl"
+```
+
+Right pane (watch telemetry):
+
+```
+python3 tools/paraphina_watch.py --telemetry "$(cat /tmp/paraphina_last_outdir.txt)/telemetry.jsonl" --refresh-ms 1000
+```
+
+Endpoint overrides (optional):
+- `LIGHTER_WS_URL` and `LIGHTER_HTTP_BASE_URL` override Lighter public endpoints.
+
+Verification helper (checks run.log + telemetry contract + health alignment):
+
+```
+python3 tools/verify_live_shadow_outdir.py
+```
 
 ## All-5 Connected Smoke (Manual-Only)
 
@@ -60,24 +85,6 @@ PARAPHINA_LIVE_CONNECTORS=hyperliquid,lighter,extended,aster,paradex \
 PARAPHINA_LIVE_OUT_DIR=./live_runs/all5_shadow_live \
 PARAPHINA_TELEMETRY_MODE=jsonl \
 cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex
-```
-
-## All-5 Live Shadow Market Data (Live Feeds)
-
-Left pane (market data + telemetry):
-
-```
-PARAPHINA_TRADE_MODE=shadow \
-PARAPHINA_LIVE_CONNECTORS=hyperliquid,lighter,extended,aster,paradex \
-PARAPHINA_LIVE_OUT_DIR=./live_runs/all5_shadow_live \
-PARAPHINA_TELEMETRY_MODE=jsonl \
-cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex
-```
-
-Right pane (terminal watch, 1000ms refresh):
-
-```
-python3 tools/paraphina_watch.py --telemetry ./live_runs/all5_shadow_live/telemetry.jsonl --refresh-ms 1000
 ```
 
 ## All-5 PaperExec (Offline)
@@ -128,7 +135,6 @@ Live mode requires all of the following to start:
 - `PARAPHINA_LIVE_EXEC_ENABLE=1` (or `true`)
 - `PARAPHINA_LIVE_EXECUTION_CONFIRM=YES`
 - Required venue credentials are present
- - `PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS=<ms>` must be a positive integer (set to `0`, `-1`, or `false` to disable)
 
 If any requirement is missing, the binary refuses to start and suggests running
 in shadow mode instead.
@@ -306,6 +312,10 @@ Actions:
 2. Confirm account snapshot seq monotonicity.
 3. If mismatch persists, halt trading and re‑sync account snapshot.
 4. Verify funding/margin/liquidation fields are populated.
+
+Reconcile control:
+- `PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS`: positive integer enables reconcile; `0`,
+  `-1`, or `false` disables it explicitly.
 
 ### Stuck Cancel‑All
 

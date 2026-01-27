@@ -22,7 +22,30 @@ use paraphina::hedge::{
     increases_abs_exposure,
 };
 use paraphina::state::GlobalState;
-use paraphina::types::{Side, VenueStatus};
+use paraphina::types::{OrderIntent, Side, VenueStatus};
+
+/// Extract (venue_index, side, size, price) from hedge intents.
+/// Hedge allocator should emit Place/Replace intents only; panic otherwise.
+fn intent_place_like_fields(intent: &OrderIntent) -> (usize, Side, f64, f64) {
+    match intent {
+        OrderIntent::Place(pi) => (pi.venue_index, pi.side, pi.size, pi.price),
+        OrderIntent::Replace(ri) => (ri.venue_index, ri.side, ri.size, ri.price),
+        other => panic!("Expected Place/Replace OrderIntent, got: {:?}", other),
+    }
+}
+
+fn intent_venue_index(intent: &OrderIntent) -> usize {
+    intent_place_like_fields(intent).0
+}
+fn intent_side(intent: &OrderIntent) -> Side {
+    intent_place_like_fields(intent).1
+}
+fn intent_size(intent: &OrderIntent) -> f64 {
+    intent_place_like_fields(intent).2
+}
+fn intent_price(intent: &OrderIntent) -> f64 {
+    intent_place_like_fields(intent).3
+}
 
 /// Helper to set up a venue with book data.
 fn setup_venue_book(
@@ -120,7 +143,7 @@ fn hedge_outside_deadband_generates_orders() {
 
     // Should be selling to reduce long position
     for intent in &intents {
-        assert_eq!(intent.side, Side::Sell);
+        assert_eq!(intent_side(intent), Side::Sell);
     }
 }
 
@@ -157,7 +180,7 @@ fn hedge_respects_global_max_step() {
     state.recompute_after_fills(&cfg);
 
     let intents = compute_hedge_orders(&cfg, &state, 0);
-    let total_size: f64 = intents.iter().map(|i| i.size).sum();
+    let total_size: f64 = intents.iter().map(|i| intent_size(i)).sum();
 
     assert!(
         total_size <= cfg.hedge.max_step_tao + 1e-6,
@@ -210,8 +233,8 @@ fn hedge_respects_per_venue_caps() {
     let intents = compute_hedge_orders(&cfg, &state, 0);
 
     for intent in &intents {
-        let vcfg = &cfg.venues[intent.venue_index];
-        let depth_usd = state.venues[intent.venue_index].depth_near_mid;
+        let vcfg = &cfg.venues[intent_venue_index(intent)];
+        let depth_usd = state.venues[intent_venue_index(intent)].depth_near_mid;
         let fair = state.fair_value.unwrap();
 
         let max_venue = cfg.hedge.max_venue_tao_per_tick;
@@ -221,29 +244,29 @@ fn hedge_respects_per_venue_caps() {
         let expected_cap = max_venue.min(max_order).min(depth_cap);
 
         assert!(
-            intent.size <= expected_cap + 1e-6,
+            intent_size(intent) <= expected_cap + 1e-6,
             "Intent size ({}) at venue {} should be <= per-venue cap ({})",
-            intent.size,
-            intent.venue_index,
+            intent_size(intent),
+            intent_venue_index(intent),
             expected_cap
         );
     }
 
     // Specifically check venue 1 (max_order_size = 2.0 is most restrictive)
-    if let Some(v1_intent) = intents.iter().find(|i| i.venue_index == 1) {
+    if let Some(v1_intent) = intents.iter().find(|i| intent_venue_index(i) == 1) {
         assert!(
-            v1_intent.size <= 2.0 + 1e-6,
+            intent_size(v1_intent) <= 2.0 + 1e-6,
             "Venue 1 intent ({}) should respect max_order_size cap (2.0)",
-            v1_intent.size
+            intent_size(v1_intent)
         );
     }
 
     // Specifically check venue 2 (depth_cap = 2.0 is most restrictive)
-    if let Some(v2_intent) = intents.iter().find(|i| i.venue_index == 2) {
+    if let Some(v2_intent) = intents.iter().find(|i| intent_venue_index(i) == 2) {
         assert!(
-            v2_intent.size <= 2.0 + 1e-6,
+            intent_size(v2_intent) <= 2.0 + 1e-6,
             "Venue 2 intent ({}) should respect depth cap (2.0)",
-            v2_intent.size
+            intent_size(v2_intent)
         );
     }
 }
@@ -300,7 +323,7 @@ fn hedge_avoids_near_liquidation() {
 
     // Venue 2 (at crit) should be completely skipped
     assert!(
-        !intents.iter().any(|i| i.venue_index == 2),
+        !intents.iter().any(|i| intent_venue_index(i) == 2),
         "Venue at dist_liq_sigma == liq_crit_sigma should be hard-skipped"
     );
 
@@ -309,13 +332,13 @@ fn hedge_avoids_near_liquidation() {
     if intents.len() >= 2 {
         let v0_size: f64 = intents
             .iter()
-            .filter(|i| i.venue_index == 0)
-            .map(|i| i.size)
+            .filter(|i| intent_venue_index(i) == 0)
+            .map(|i| intent_size(i))
             .sum();
         let v1_size: f64 = intents
             .iter()
-            .filter(|i| i.venue_index == 1)
-            .map(|i| i.size)
+            .filter(|i| intent_venue_index(i) == 1)
+            .map(|i| intent_size(i))
             .sum();
 
         // With strong liq_penalty, venue 1 should be preferred
@@ -457,9 +480,9 @@ fn hedge_prefers_funding_or_basis_when_exec_equal() {
     // With strong funding_weight, venue 2 (best funding for sell) should be first
     if let Some(first) = intents.first() {
         assert_eq!(
-            first.venue_index, 2,
+            intent_venue_index(first), 2,
             "Venue with best funding for sell direction should be first (got venue {})",
-            first.venue_index
+            intent_venue_index(first)
         );
     }
 
@@ -468,11 +491,11 @@ fn hedge_prefers_funding_or_basis_when_exec_equal() {
     assert_eq!(intents.len(), intents2.len(), "Must be deterministic");
     for (a, b) in intents.iter().zip(intents2.iter()) {
         assert_eq!(
-            a.venue_index, b.venue_index,
+            intent_venue_index(a), intent_venue_index(b),
             "Venue order must be deterministic"
         );
         assert!(
-            (a.size - b.size).abs() < 0.001,
+            (intent_size(a) - intent_size(b)).abs() < 0.001,
             "Size must be deterministic"
         );
     }
@@ -543,9 +566,9 @@ fn hedge_prefers_basis_when_funding_equal() {
     // Venue 2 has best basis for selling (bid above fair)
     if let Some(first) = intents.first() {
         assert_eq!(
-            first.venue_index, 2,
+            intent_venue_index(first), 2,
             "Venue with best basis for sell direction should be first (got venue {})",
-            first.venue_index
+            intent_venue_index(first)
         );
     }
 }
@@ -616,11 +639,11 @@ fn hedge_deterministic_tiebreak_by_venue_index() {
 
     for i in 0..intents1.len() {
         assert_eq!(
-            intents1[i].venue_index, intents2[i].venue_index,
+            intent_venue_index(&intents1[i]), intent_venue_index(&intents2[i]),
             "Venue order must be deterministic at position {i}"
         );
         assert_eq!(
-            intents1[i].venue_index, intents3[i].venue_index,
+            intent_venue_index(&intents1[i]), intent_venue_index(&intents3[i]),
             "Venue order must be deterministic at position {i}"
         );
     }
@@ -629,7 +652,7 @@ fn hedge_deterministic_tiebreak_by_venue_index() {
     if intents1.len() >= 2 {
         for i in 0..intents1.len() - 1 {
             assert!(
-                intents1[i].venue_index <= intents1[i + 1].venue_index,
+                intent_venue_index(&intents1[i]) <= intent_venue_index(&intents1[i + 1]),
                 "With identical costs, lower venue index should come first"
             );
         }
@@ -686,10 +709,10 @@ fn hedge_skips_disabled_stale_toxic_venues() {
 
     // Should not use venues 0-2, 4
     for intent in &intents {
-        assert_ne!(intent.venue_index, 0, "Disabled venue should be skipped");
-        assert_ne!(intent.venue_index, 1, "Toxic venue should be skipped");
-        assert_ne!(intent.venue_index, 2, "Stale venue should be skipped");
-        assert_ne!(intent.venue_index, 4, "Low depth venue should be skipped");
+        assert_ne!(intent_venue_index(intent), 0, "Disabled venue should be skipped");
+        assert_ne!(intent_venue_index(intent), 1, "Toxic venue should be skipped");
+        assert_ne!(intent_venue_index(intent), 2, "Stale venue should be skipped");
+        assert_ne!(intent_venue_index(intent), 4, "Low depth venue should be skipped");
     }
 }
 
@@ -729,7 +752,7 @@ fn hedge_covers_short_position() {
 
     // Should be BUYING to cover short position
     for intent in &intents {
-        assert_eq!(intent.side, Side::Buy, "Should buy to cover short position");
+        assert_eq!(intent_side(intent), Side::Buy, "Should buy to cover short position");
     }
 }
 
@@ -840,7 +863,7 @@ fn hedge_respects_margin_available_cap() {
     );
 
     // Check that total allocated is reasonable
-    let total: f64 = intents.iter().map(|i| i.size).sum();
+    let total: f64 = intents.iter().map(|i| intent_size(i)).sum();
     assert!(
         total <= cfg.hedge.max_step_tao + 0.01,
         "Total allocation should respect max_step_tao"
@@ -904,8 +927,8 @@ fn hedge_margin_cap_limits_new_position_opening() {
     // Venue 0 should be capped at ~5 TAO (margin limit)
     let v0_total: f64 = intents
         .iter()
-        .filter(|i| i.venue_index == 0)
-        .map(|i| i.size)
+        .filter(|i| intent_venue_index(i) == 0)
+        .map(|i| intent_size(i))
         .sum();
 
     // Allow some tolerance for lot-size rounding
@@ -975,23 +998,23 @@ fn hedge_multi_chunk_allocation_is_deterministic_and_aggregated() {
     );
 
     for (a, b) in intents1.iter().zip(intents2.iter()) {
-        assert_eq!(a.venue_index, b.venue_index, "Venue indices must match");
+        assert_eq!(intent_venue_index(a), intent_venue_index(b), "Venue indices must match");
         assert!(
-            (a.size - b.size).abs() < 1e-9,
+            (intent_size(a) - intent_size(b)).abs() < 1e-9,
             "Sizes must be identical: {} vs {}",
-            a.size,
-            b.size
+            intent_size(a),
+            intent_size(b)
         );
-        assert_eq!(a.side, b.side, "Sides must match");
+        assert_eq!(intent_side(a), intent_side(b), "Sides must match");
     }
 
     // Verify aggregation: at most one order per venue
     let mut seen_venues = std::collections::HashSet::new();
     for intent in &intents1 {
         assert!(
-            seen_venues.insert(intent.venue_index),
+            seen_venues.insert(intent_venue_index(intent)),
             "Venue {} appears multiple times - not properly aggregated",
-            intent.venue_index
+            intent_venue_index(intent)
         );
     }
 }
@@ -1060,13 +1083,13 @@ fn hedge_convexity_spreads_flow() {
     // the first chunk on venue 1.
     let v0_size: f64 = intents
         .iter()
-        .filter(|i| i.venue_index == 0)
-        .map(|i| i.size)
+        .filter(|i| intent_venue_index(i) == 0)
+        .map(|i| intent_size(i))
         .sum();
     let v1_size: f64 = intents
         .iter()
-        .filter(|i| i.venue_index == 1)
-        .map(|i| i.size)
+        .filter(|i| intent_venue_index(i) == 1)
+        .map(|i| intent_size(i))
         .sum();
 
     // With high convexity, should be reasonably balanced

@@ -23,7 +23,10 @@ pub mod action_encoding;
 pub mod domain_rand;
 pub mod observation;
 pub mod policy;
+pub mod research_budgets;
 pub mod runner;
+pub mod safe_pipeline;
+pub mod safety;
 pub mod sim_env;
 pub mod telemetry;
 pub mod trajectory;
@@ -33,7 +36,10 @@ pub use action_encoding::{decode_action, encode_action, ActionEncodingSpec, ACTI
 pub use domain_rand::{DomainRandConfig, DomainRandSample, DomainRandSampler};
 pub use observation::{Observation, VenueObservation, OBS_VERSION};
 pub use policy::{HeuristicPolicy, NoopPolicy, Policy, PolicyAction, HEURISTIC_POLICY_VERSION};
+pub use research_budgets::{alignment_budget_for_profile, ResearchAlignmentBudget};
 pub use runner::{EpisodeConfig, EpisodeSummary, ShadowRunner, TerminationReason};
+pub use safe_pipeline::{run_safe_pipeline, SafePipelineSummary};
+pub use safety::{SafetyLayer, SafetyResult};
 pub use sim_env::{SimEnv, StepResult, VecEnv};
 pub use telemetry::{RLTelemetry, RewardComponents, RewardWeights, TickRecord};
 pub use trajectory::{

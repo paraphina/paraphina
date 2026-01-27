@@ -1,0 +1,11 @@
+{
+  "seq": 1,
+  "timestamp_ms": 1000,
+  "positions": [],
+  "balances": [
+    { "asset": "USD", "total": 1000.0, "available": 1000.0 }
+  ],
+  "funding_8h": 0.0,
+  "margin": { "balance_usd": 1000.0, "used_usd": 0.0, "available_usd": 1000.0 },
+  "liquidation": { "price_liq": null, "dist_liq_sigma": null }
+}

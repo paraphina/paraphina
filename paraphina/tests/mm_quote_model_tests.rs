@@ -842,6 +842,8 @@ fn compute_order_actions_place_new() {
         spread: Some(0.10),
         depth_near_mid: 10_000.0,
         last_mid_update_ms: Some(0),
+        last_book_update_ms: Some(0),
+        orderbook_l2: paraphina::orderbook_l2::OrderBookL2::new(),
         local_vol_short: 0.0,
         local_vol_long: 0.0,
         prev_ln_mid: None,
@@ -850,6 +852,10 @@ fn compute_order_actions_place_new() {
         pending_markouts: std::collections::VecDeque::new(),
         pending_markouts_next_eval_ms: i64::MAX,
         markout_ewma_usd_per_tao: 0.0,
+        open_orders: std::collections::BTreeMap::new(),
+        recent_fills: std::collections::VecDeque::new(),
+        recent_fills_cap: 0,
+        next_fill_seq: 0,
         position_tao: 0.0,
         funding_8h: 0.0,
         avg_entry_price: 0.0,
@@ -858,6 +864,9 @@ fn compute_order_actions_place_new() {
         margin_available_usd: 10_000.0,
         price_liq: None,
         dist_liq_sigma: 10.0,
+        mm_open_bid: None,
+        mm_open_ask: None,
+
     };
 
     let quote = paraphina::mm::MmQuote {
@@ -916,6 +925,8 @@ fn compute_order_actions_cancel_when_no_desired() {
         spread: Some(0.10),
         depth_near_mid: 10_000.0,
         last_mid_update_ms: Some(0),
+        last_book_update_ms: Some(0),
+        orderbook_l2: paraphina::orderbook_l2::OrderBookL2::new(),
         local_vol_short: 0.0,
         local_vol_long: 0.0,
         prev_ln_mid: None,
@@ -924,6 +935,10 @@ fn compute_order_actions_cancel_when_no_desired() {
         pending_markouts: std::collections::VecDeque::new(),
         pending_markouts_next_eval_ms: i64::MAX,
         markout_ewma_usd_per_tao: 0.0,
+        open_orders: std::collections::BTreeMap::new(),
+        recent_fills: std::collections::VecDeque::new(),
+        recent_fills_cap: 0,
+        next_fill_seq: 0,
         position_tao: 0.0,
         funding_8h: 0.0,
         avg_entry_price: 0.0,
@@ -932,6 +947,9 @@ fn compute_order_actions_cancel_when_no_desired() {
         margin_available_usd: 10_000.0,
         price_liq: None,
         dist_liq_sigma: 10.0,
+        mm_open_bid: None,
+        mm_open_ask: None,
+
     };
 
     // No desired quote.

@@ -25,8 +25,14 @@ fn five_connector_fixture_run_is_healthy_and_deterministic() {
         .parent()
         .expect("workspace root")
         .to_path_buf();
-    let hl_fixture_dir = workspace_root.join("tests").join("fixtures").join("hyperliquid");
-    let lighter_fixture_dir = workspace_root.join("tests").join("fixtures").join("lighter");
+    let hl_fixture_dir = workspace_root
+        .join("tests")
+        .join("fixtures")
+        .join("hyperliquid");
+    let lighter_fixture_dir = workspace_root
+        .join("tests")
+        .join("fixtures")
+        .join("lighter");
     let roadmap_b_fixture_dir = workspace_root
         .join("tests")
         .join("fixtures")
@@ -50,7 +56,10 @@ fn five_connector_fixture_run_is_healthy_and_deterministic() {
     assert!(stats.fills_total > 0, "expected paper fills in telemetry");
     assert_eq!(stats.reconcile_drift, 0, "expected no reconcile drift");
     assert_eq!(stats.ticks_total, replay_stats.ticks_total);
-    assert!(replay_stats.fills_total > 0, "expected paper fills in replay");
+    assert!(
+        replay_stats.fills_total > 0,
+        "expected paper fills in replay"
+    );
     assert_eq!(stats.reconcile_drift, replay_stats.reconcile_drift);
 
     let _summary = read_summary_json(&summary_path);
@@ -117,12 +126,8 @@ fn assert_all5_telemetry(telemetry_path: &PathBuf) -> TelemetryStats {
         if line.trim().is_empty() {
             continue;
         }
-        let value: serde_json::Value =
-            serde_json::from_str(line).expect("parse telemetry JSON");
-        let tick = value
-            .get("t")
-            .and_then(|v| v.as_u64())
-            .expect("tick");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse telemetry JSON");
+        let tick = value.get("t").and_then(|v| v.as_u64()).expect("tick");
         assert_eq!(tick, expected_tick, "expected deterministic tick order");
         expected_tick += 1;
         ticks_total = tick;

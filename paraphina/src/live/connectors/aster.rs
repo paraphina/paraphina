@@ -1,8 +1,10 @@
 //! Aster connector (public WS market data + fixtures, feature-gated).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
@@ -16,13 +18,13 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::super::gateway::{
-    BoxFuture, LiveGatewayError, LiveGatewayErrorKind, LiveRestCancelAllRequest, LiveRestCancelRequest,
-    LiveRestClient, LiveRestPlaceRequest, LiveRestResponse, LiveResult,
+    BoxFuture, LiveGatewayError, LiveGatewayErrorKind, LiveRestCancelAllRequest,
+    LiveRestCancelRequest, LiveRestClient, LiveRestPlaceRequest, LiveRestResponse, LiveResult,
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, LiquidationSnapshot, MarginSnapshot,
-    MarketDataEvent, PositionSnapshot,
+    MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::types::{Side, TimeInForce, TimestampMs};
 
@@ -41,6 +43,7 @@ pub struct AsterConfig {
     pub rest_url: String,
     pub market: String,
     pub depth_limit: usize,
+    pub venue_index: usize,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub recv_window: Option<u64>,
@@ -69,6 +72,7 @@ impl AsterConfig {
             rest_url,
             market,
             depth_limit,
+            venue_index: 0,
             api_key,
             api_secret,
             recv_window,
@@ -125,22 +129,6 @@ impl AsterConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
-        let (snapshot_raw, snapshot) = self.fetch_snapshot().await?;
-        if let Some(recorder) = self.recorder.as_ref() {
-            let mut guard = recorder.lock().await;
-            guard.record_snapshot(&snapshot_raw)?;
-        }
-        let mut seq_state = AsterSeqState::new(snapshot.last_update_id);
-        let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
-            venue_index: 0,
-            venue_id: self.cfg.market.clone(),
-            seq: snapshot.last_update_id,
-            timestamp_ms: now_ms(),
-            bids: snapshot.bids,
-            asks: snapshot.asks,
-        });
-        let _ = self.market_tx.send(snapshot_event).await;
-
         let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
         let (mut write, mut read) = ws_stream.split();
         let stream = format!("{}@depth@100ms", self.cfg.stream_symbol());
@@ -151,25 +139,194 @@ impl AsterConnector {
         });
         write.send(Message::Text(sub.to_string())).await?;
 
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
-            if let Message::Text(text) = msg {
-                if let Some(recorder) = self.recorder.as_ref() {
-                    let mut guard = recorder.lock().await;
-                    let _ = guard.record_ws_frame(&text);
+        const MAX_BUFFERED_UPDATES: usize = 1024;
+        let mut buffered_updates: Vec<AsterDepthUpdate> = Vec::new();
+        let mut last_update_id: Option<u64> = None;
+        let mut snapshot_future: Option<SnapshotFuture<'_>> = Some(Box::pin(self.fetch_snapshot()));
+        let mut last_gap_log = Instant::now() - Duration::from_secs(60);
+        let mut first_decoded_top_logged = false;
+        let mut first_size_raw_logged = false;
+        let mut decode_miss_count = 0usize;
+
+        loop {
+            if last_update_id.is_none() {
+                let future = snapshot_future.get_or_insert_with(|| Box::pin(self.fetch_snapshot()));
+                tokio::select! {
+                    snapshot = future => {
+                        let (snapshot_raw, snapshot) = snapshot?;
+                        snapshot_future = None;
+                        if let Some(recorder) = self.recorder.as_ref() {
+                            let mut guard = recorder.lock().await;
+                            guard.record_snapshot(&snapshot_raw)?;
+                        }
+                        if let Ok(value) = serde_json::from_str::<Value>(&snapshot_raw) {
+                            if let Some((top, bid_raw, ask_raw)) =
+                                decode_top_of_book_with_raw(&value)
+                            {
+                                if !first_decoded_top_logged {
+                                    eprintln!(
+                                        "FIRST_DECODED_TOP venue=aster bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                                        top.best_bid_px,
+                                        top.best_bid_sz,
+                                        top.best_ask_px,
+                                        top.best_ask_sz
+                                    );
+                                    first_decoded_top_logged = true;
+                                }
+                                if !first_size_raw_logged {
+                                    eprintln!(
+                                        "ASTER_SIZE_RAW bid_sz_raw={} ask_sz_raw={} parsed_bid_sz={} parsed_ask_sz={}",
+                                        bid_raw,
+                                        ask_raw,
+                                        top.best_bid_sz,
+                                        top.best_ask_sz
+                                    );
+                                    first_size_raw_logged = true;
+                                }
+                            } else if decode_miss_count < 3 {
+                                decode_miss_count += 1;
+                                log_decode_miss(
+                                    "Aster",
+                                    &value,
+                                    &snapshot_raw,
+                                    decode_miss_count,
+                                    self.cfg.ws_url.as_str(),
+                                );
+                            }
+                        }
+                        let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
+                            venue_index: self.cfg.venue_index,
+                            venue_id: self.cfg.market.clone(),
+                            seq: snapshot.last_update_id,
+                            timestamp_ms: now_ms(),
+                            bids: snapshot.bids,
+                            asks: snapshot.asks,
+                        });
+                        let _ = self.market_tx.send(snapshot_event).await;
+
+                        let mut next_last = snapshot.last_update_id;
+                        let mut gap = false;
+                        for update in buffered_updates.drain(..) {
+                            if !symbol_matches(&update.symbol, &self.cfg.market) {
+                                continue;
+                            }
+                            match seq_decision_lenient(next_last, &update) {
+                                SeqDecision::Apply => {
+                                    next_last = update.end_id;
+                                    let _ = self
+                                        .market_tx
+                                        .send(delta_event_from_update(
+                                            &update,
+                                            self.cfg.venue_index,
+                                        ))
+                                        .await;
+                                }
+                                SeqDecision::Stale => {}
+                                SeqDecision::Gap => {
+                                    gap = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if gap {
+                            buffered_updates.clear();
+                            last_update_id = None;
+                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                            continue;
+                        }
+                        last_update_id = Some(next_last);
+                    }
+                    msg = read.next() => {
+                        let Some(msg) = msg else {
+                            return Ok(());
+                        };
+                        let msg = msg?;
+                        match msg {
+                            Message::Text(text) => {
+                                if let Some(recorder) = self.recorder.as_ref() {
+                                    let mut guard = recorder.lock().await;
+                                    let _ = guard.record_ws_frame(&text);
+                                }
+                                if let Some(update) = parse_depth_update(&text) {
+                                    buffered_updates.push(update);
+                                    if buffered_updates.len() > MAX_BUFFERED_UPDATES {
+                                        eprintln!(
+                                            "Aster WS buffer overflow; resyncing url={}",
+                                            self.cfg.ws_url
+                                        );
+                                        buffered_updates.clear();
+                                        snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                    }
+                                }
+                            }
+                            Message::Ping(payload) => {
+                                write.send(Message::Pong(payload)).await?;
+                            }
+                            Message::Close(_) => {
+                                eprintln!("Aster WS closed; reconnecting url={}", self.cfg.ws_url);
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                if let Some(update) = parse_depth_update(&text) {
+                continue;
+            }
+
+            let Some(msg) = read.next().await else {
+                return Ok(());
+            };
+            let msg = msg?;
+            match msg {
+                Message::Text(text) => {
+                    if let Some(recorder) = self.recorder.as_ref() {
+                        let mut guard = recorder.lock().await;
+                        let _ = guard.record_ws_frame(&text);
+                    }
+                    let Some(update) = parse_depth_update(&text) else {
+                        continue;
+                    };
                     if !symbol_matches(&update.symbol, &self.cfg.market) {
                         continue;
                     }
-                    let outcome = seq_state.apply_update(&update)?;
-                    if let Some(event) = outcome {
-                        let _ = self.market_tx.send(event).await;
+                    let current_last = last_update_id.unwrap_or_default();
+                    match seq_decision_lenient(current_last, &update) {
+                        SeqDecision::Apply => {
+                            last_update_id = Some(update.end_id);
+                            let _ = self
+                                .market_tx
+                                .send(delta_event_from_update(&update, self.cfg.venue_index))
+                                .await;
+                        }
+                        SeqDecision::Stale => {}
+                        SeqDecision::Gap => {
+                            if last_gap_log.elapsed() > Duration::from_secs(30) {
+                                eprintln!(
+                                    "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
+                                    current_last,
+                                    update.prev_id,
+                                    update.start_id,
+                                    update.end_id,
+                                    self.cfg.ws_url
+                                );
+                                last_gap_log = Instant::now();
+                            }
+                            buffered_updates.clear();
+                            last_update_id = None;
+                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                        }
                     }
                 }
+                Message::Ping(payload) => {
+                    write.send(Message::Pong(payload)).await?;
+                }
+                Message::Close(_) => {
+                    eprintln!("Aster WS closed; reconnecting url={}", self.cfg.ws_url);
+                    return Ok(());
+                }
+                _ => {}
             }
         }
-        Ok(())
     }
 
     async fn fetch_snapshot(&self) -> anyhow::Result<(String, AsterDepthSnapshot)> {
@@ -300,13 +457,19 @@ impl AsterRestClient {
 }
 
 impl LiveRestClient for AsterRestClient {
-    fn place_order(&self, req: LiveRestPlaceRequest) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
+    fn place_order(
+        &self,
+        req: LiveRestPlaceRequest,
+    ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
             let mut params = vec![
                 ("symbol".to_string(), self.cfg.market.clone()),
                 ("side".to_string(), map_side(req.side).to_string()),
                 ("type".to_string(), "LIMIT".to_string()),
-                ("timeInForce".to_string(), map_time_in_force(req.time_in_force, req.post_only).to_string()),
+                (
+                    "timeInForce".to_string(),
+                    map_time_in_force(req.time_in_force, req.post_only).to_string(),
+                ),
                 ("price".to_string(), format_f64(req.price)),
                 ("quantity".to_string(), format_f64(req.size)),
                 ("newClientOrderId".to_string(), req.client_order_id.clone()),
@@ -439,9 +602,19 @@ fn parse_order_id(body: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn parse_account_snapshot(value: &Value, venue_id: &str, venue_index: usize) -> Option<AccountSnapshot> {
-    let seq = value.get("updateTime").and_then(|v| v.as_u64()).unwrap_or(0);
-    let timestamp_ms = value.get("updateTime").and_then(|v| v.as_i64()).unwrap_or(0);
+fn parse_account_snapshot(
+    value: &Value,
+    venue_id: &str,
+    venue_index: usize,
+) -> Option<AccountSnapshot> {
+    let seq = value
+        .get("updateTime")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let timestamp_ms = value
+        .get("updateTime")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     let positions = value
         .get("positions")
@@ -554,14 +727,21 @@ struct AsterDepthUpdate {
 #[derive(Debug, Clone, Copy)]
 struct AsterSeqState {
     last_update_id: u64,
+    venue_index: usize,
 }
 
 impl AsterSeqState {
-    fn new(last_update_id: u64) -> Self {
-        Self { last_update_id }
+    fn new(last_update_id: u64, venue_index: usize) -> Self {
+        Self {
+            last_update_id,
+            venue_index,
+        }
     }
 
-    fn apply_update(&mut self, update: &AsterDepthUpdate) -> anyhow::Result<Option<MarketDataEvent>> {
+    fn apply_update(
+        &mut self,
+        update: &AsterDepthUpdate,
+    ) -> anyhow::Result<Option<MarketDataEvent>> {
         if let Some(prev) = update.prev_id {
             if prev != self.last_update_id {
                 return Err(anyhow::anyhow!(
@@ -586,7 +766,7 @@ impl AsterSeqState {
         changes.extend(update.bids.iter().cloned());
         changes.extend(update.asks.iter().cloned());
         let event = MarketDataEvent::L2Delta(super::super::types::L2Delta {
-            venue_index: 0,
+            venue_index: self.venue_index,
             venue_id: update.symbol.clone(),
             seq: update.end_id,
             timestamp_ms: update.event_time.unwrap_or_else(now_ms),
@@ -594,6 +774,48 @@ impl AsterSeqState {
         });
         Ok(Some(event))
     }
+}
+
+type SnapshotFuture<'a> =
+    Pin<Box<dyn Future<Output = anyhow::Result<(String, AsterDepthSnapshot)>> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqDecision {
+    Apply,
+    Stale,
+    Gap,
+}
+
+fn seq_decision_lenient(last_update_id: u64, update: &AsterDepthUpdate) -> SeqDecision {
+    if let Some(prev) = update.prev_id {
+        if prev == last_update_id {
+            return SeqDecision::Apply;
+        }
+        if prev < last_update_id {
+            return SeqDecision::Stale;
+        }
+        return SeqDecision::Gap;
+    }
+    if update.end_id <= last_update_id {
+        SeqDecision::Stale
+    } else if update.start_id > last_update_id + 1 {
+        SeqDecision::Gap
+    } else {
+        SeqDecision::Apply
+    }
+}
+
+fn delta_event_from_update(update: &AsterDepthUpdate, venue_index: usize) -> MarketDataEvent {
+    let mut changes = Vec::with_capacity(update.bids.len() + update.asks.len());
+    changes.extend(update.bids.iter().cloned());
+    changes.extend(update.asks.iter().cloned());
+    MarketDataEvent::L2Delta(super::super::types::L2Delta {
+        venue_index,
+        venue_id: update.symbol.clone(),
+        seq: update.end_id,
+        timestamp_ms: update.event_time.unwrap_or_else(now_ms),
+        changes,
+    })
 }
 
 #[derive(Debug)]
@@ -634,6 +856,37 @@ fn parse_depth_snapshot(value: &Value) -> Option<AsterDepthSnapshot> {
         bids,
         asks,
     })
+}
+
+fn decode_top_of_book_with_raw(value: &Value) -> Option<(TopOfBook, String, String)> {
+    let bids_raw = value.get("bids")?.as_array()?;
+    let asks_raw = value.get("asks")?.as_array()?;
+    let bid_entry = bids_raw.first()?;
+    let ask_entry = asks_raw.first()?;
+    let bid_items = bid_entry.as_array()?;
+    let ask_items = ask_entry.as_array()?;
+    let bid_sz_raw = bid_items.get(1)?.to_string();
+    let ask_sz_raw = ask_items.get(1)?.to_string();
+    let bids = parse_levels_from_value(value.get("bids")?)?;
+    let asks = parse_levels_from_value(value.get("asks")?)?;
+    let timestamp_ms = value.get("E").and_then(|v| v.as_i64());
+    let top = TopOfBook::from_levels(&bids, &asks, timestamp_ms)?;
+    Some((top, bid_sz_raw, ask_sz_raw))
+}
+
+fn log_decode_miss(venue: &str, value: &Value, payload: &str, count: usize, url: &str) {
+    let keys = value
+        .as_object()
+        .map(|obj| {
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            format!("[{}]", keys.join(","))
+        })
+        .unwrap_or_else(|| "[non-object]".to_string());
+    let snippet: String = payload.chars().take(160).collect();
+    eprintln!(
+        "WARN: {venue} WS decode miss keys={keys} snippet={snippet} (count={count}) url={url}",
+    );
 }
 
 fn parse_depth_update(text: &str) -> Option<AsterDepthUpdate> {
@@ -945,9 +1198,8 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
         if line.trim().is_empty() {
             continue;
         }
-        let item: T = serde_json::from_str(line).map_err(|err| {
-            format!("fixture_parse_error path={} err={}", path.display(), err)
-        })?;
+        let item: T = serde_json::from_str(line)
+            .map_err(|err| format!("fixture_parse_error path={} err={}", path.display(), err))?;
         out.push(item);
     }
     Ok(out)
@@ -962,8 +1214,8 @@ mod tests {
 
     #[test]
     fn fixture_snapshot_parses() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/aster");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/aster");
         let feed = AsterFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         assert!(!feed.snapshot.bids.is_empty());
         assert!(!feed.snapshot.asks.is_empty());
@@ -971,8 +1223,8 @@ mod tests {
 
     #[test]
     fn delta_applies_to_snapshot_levels() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/aster");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/aster");
         let feed = AsterFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         let mut bids = feed.snapshot.bids.clone();
         let delta = feed.deltas.first().expect("delta");
@@ -1012,8 +1264,8 @@ mod tests {
 
     #[test]
     fn deterministic_serialization_roundtrip() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/aster");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/aster");
         let feed = AsterFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         let raw = serde_json::to_string(&feed.snapshot).expect("serialize");
         let reparsed: FixtureSnapshot = serde_json::from_str(&raw).expect("reparse");
@@ -1025,8 +1277,8 @@ mod tests {
     fn live_snapshot_fixture_parses() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/roadmap_b/aster_live_recording");
-        let raw = std::fs::read_to_string(fixture_dir.join("rest_snapshot.json"))
-            .expect("snapshot raw");
+        let raw =
+            std::fs::read_to_string(fixture_dir.join("rest_snapshot.json")).expect("snapshot raw");
         let value: Value = serde_json::from_str(&raw).expect("snapshot json");
         let snapshot = parse_depth_snapshot(&value).expect("parse snapshot");
         assert!(snapshot.last_update_id > 0);
@@ -1038,15 +1290,15 @@ mod tests {
     fn live_ws_replay_is_deterministic_and_monotonic() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/roadmap_b/aster_live_recording");
-        let snapshot_raw = std::fs::read_to_string(fixture_dir.join("rest_snapshot.json"))
-            .expect("snapshot raw");
+        let snapshot_raw =
+            std::fs::read_to_string(fixture_dir.join("rest_snapshot.json")).expect("snapshot raw");
         let snapshot_value: Value = serde_json::from_str(&snapshot_raw).expect("snapshot json");
         let snapshot = parse_depth_snapshot(&snapshot_value).expect("parse snapshot");
-        let frames = std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl"))
-            .expect("ws frames");
+        let frames =
+            std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl")).expect("ws frames");
 
         let collect_events = |snapshot_id: u64| -> Vec<MarketDataEvent> {
-            let mut state = AsterSeqState::new(snapshot_id);
+            let mut state = AsterSeqState::new(snapshot_id, 0);
             let mut events = Vec::new();
             for line in frames.lines() {
                 let trimmed = line.trim();
@@ -1092,6 +1344,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn seq_gap_triggers_resync_decision() {
+        let update = AsterDepthUpdate {
+            symbol: "BTCUSDT".to_string(),
+            event_time: None,
+            start_id: 110,
+            end_id: 111,
+            prev_id: Some(109),
+            bids: vec![BookLevelDelta {
+                side: BookSide::Bid,
+                price: 100.0,
+                size: 1.0,
+            }],
+            asks: vec![BookLevelDelta {
+                side: BookSide::Ask,
+                price: 101.0,
+                size: 1.0,
+            }],
+        };
+        let decision = seq_decision_lenient(100, &update);
+        assert_eq!(decision, SeqDecision::Gap);
+    }
+
     #[tokio::test]
     async fn rest_place_order_post_only_is_signed() {
         let server = MockServer::start_async().await;
@@ -1100,6 +1375,7 @@ mod tests {
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
+            venue_index: 0,
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1154,6 +1430,7 @@ mod tests {
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
+            venue_index: 0,
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1209,6 +1486,7 @@ mod tests {
             rest_url: server.base_url(),
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
+            venue_index: 0,
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),

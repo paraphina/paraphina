@@ -14,7 +14,10 @@ fn paper_mode_fixture_run_produces_fills_and_valid_telemetry() {
         .parent()
         .expect("workspace root")
         .to_path_buf();
-    let fixture_dir = workspace_root.join("tests").join("fixtures").join("hyperliquid");
+    let fixture_dir = workspace_root
+        .join("tests")
+        .join("fixtures")
+        .join("hyperliquid");
 
     let output = Command::new(env!("CARGO_BIN_EXE_paraphina_live"))
         .arg("--trade-mode")
@@ -70,8 +73,7 @@ fn paper_mode_fixture_run_produces_fills_and_valid_telemetry() {
         if line.trim().is_empty() {
             continue;
         }
-        let value: serde_json::Value =
-            serde_json::from_str(line).expect("parse telemetry JSON");
+        let value: serde_json::Value = serde_json::from_str(line).expect("parse telemetry JSON");
         if value.get("execution_mode").and_then(|v| v.as_str()) == Some("paper") {
             has_paper_mode = true;
         }

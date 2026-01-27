@@ -10,25 +10,27 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
+use paraphina::config::{resolve_effective_profile, Config};
+use paraphina::io::GatewayPolicy;
+use paraphina::live::gateway::{GatewayMux, LiveGateway, LiveRestClient};
+use paraphina::live::instrument::{validate_specs, InstrumentSpec};
+use paraphina::live::ops::{
+    default_audit_dir, format_startup_log, start_metrics_server, write_audit_files,
+    EnvSecretProvider, HealthState, LiveMetrics, SecretProvider,
+};
+use paraphina::live::orderbook_l2::BookLevel;
+use paraphina::live::paper_adapter::{PaperExecutionAdapter, PaperFillMode, PaperMarketUpdate};
+use paraphina::live::runner::{
+    run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRuntimeHooks,
+};
+use paraphina::live::shadow_adapter::ShadowAckAdapter;
+use paraphina::live::types::L2Snapshot;
+use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
+use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
+use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
 use reqwest::Url;
 use serde::Deserialize;
 use std::path::PathBuf;
-use paraphina::config::{resolve_effective_profile, Config};
-use paraphina::live::ops::{
-    default_audit_dir, format_startup_log, start_metrics_server, EnvSecretProvider,
-    HealthState, LiveMetrics, SecretProvider, write_audit_files,
-};
-use paraphina::live::instrument::{InstrumentSpec, validate_specs};
-use paraphina::live::orderbook_l2::BookLevel;
-use paraphina::live::runner::{run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRuntimeHooks};
-use paraphina::io::GatewayPolicy;
-use paraphina::live::gateway::{GatewayMux, LiveGateway, LiveRestClient};
-use paraphina::live::paper_adapter::{PaperExecutionAdapter, PaperFillMode, PaperMarketUpdate};
-use paraphina::live::shadow_adapter::ShadowAckAdapter;
-use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
-use paraphina::live::types::L2Snapshot;
-use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
-use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
 
 use tokio::sync::mpsc;
 
@@ -79,9 +81,11 @@ impl ConnectorArg {
         match value.trim().to_ascii_lowercase().as_str() {
             "mock" => Some(ConnectorArg::Mock),
             "hyperliquid" | "hl" => Some(ConnectorArg::Hyperliquid),
-            "hyperliquid_fixture" | "hyperliquid-fixture" | "hl_fixture" | "hl-fixture" | "fixture" => {
-                Some(ConnectorArg::HyperliquidFixture)
-            }
+            "hyperliquid_fixture"
+            | "hyperliquid-fixture"
+            | "hl_fixture"
+            | "hl-fixture"
+            | "fixture" => Some(ConnectorArg::HyperliquidFixture),
             "lighter" => Some(ConnectorArg::Lighter),
             "extended" => Some(ConnectorArg::Extended),
             "aster" => Some(ConnectorArg::Aster),
@@ -129,7 +133,11 @@ impl ConnectorArg {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "paraphina_live", about = "Paraphina live runner (shadow-safe by default)", version)]
+#[command(
+    name = "paraphina_live",
+    about = "Paraphina live runner (shadow-safe by default)",
+    version
+)]
 struct Args {
     /// Trade mode: shadow (default), paper, testnet, live.
     #[arg(long, value_enum)]
@@ -384,10 +392,20 @@ fn resolve_canary_profile(cli: Option<String>) -> Option<PathBuf> {
 }
 
 fn load_canary_config(path: &PathBuf) -> Result<CanaryConfig, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|err| format!("canary_profile_read_error path={} err={}", path.display(), err))?;
-    toml::from_str::<CanaryConfig>(&raw)
-        .map_err(|err| format!("canary_profile_parse_error path={} err={}", path.display(), err))
+    let raw = std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "canary_profile_read_error path={} err={}",
+            path.display(),
+            err
+        )
+    })?;
+    toml::from_str::<CanaryConfig>(&raw).map_err(|err| {
+        format!(
+            "canary_profile_parse_error path={} err={}",
+            path.display(),
+            err
+        )
+    })
 }
 
 fn apply_canary_config(cfg: &mut Config, canary: &CanaryConfig) -> CanarySettings {
@@ -438,7 +456,11 @@ fn apply_canary_env(settings: &CanarySettings) {
     );
     std::env::set_var(
         "PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY",
-        if settings.enforce_reduce_only { "1" } else { "0" },
+        if settings.enforce_reduce_only {
+            "1"
+        } else {
+            "0"
+        },
     );
     if let Some(val) = settings.rate_limit_enabled {
         std::env::set_var("PARAPHINA_RATE_LIMIT_ENABLED", if val { "1" } else { "0" });
@@ -1035,11 +1057,7 @@ fn run_preflight(
         if !supported {
             connector_ok = false;
         }
-        connector_details.push(format!(
-            "{}:{:?}",
-            connector.as_str(),
-            support
-        ));
+        connector_details.push(format!("{}:{:?}", connector.as_str(), support));
     }
     checks.push(PreflightCheck {
         label: "connectors",
@@ -1051,7 +1069,9 @@ fn run_preflight(
     let mut endpoint_details = Vec::new();
     for connector in connectors {
         match connector {
-            ConnectorArg::Mock => append_endpoint_details(&mut endpoint_details, &mut endpoint_ok, "mock", None, None),
+            ConnectorArg::Mock => {
+                append_endpoint_details(&mut endpoint_details, &mut endpoint_ok, "mock", None, None)
+            }
             ConnectorArg::HyperliquidFixture => {
                 endpoint_details.push("hyperliquid_fixture:fixture_mode".to_string());
             }
@@ -1069,10 +1089,8 @@ fn run_preflight(
                     );
                     let (ok, status) = endpoint_dns_status(cfg.info_url.as_str());
                     endpoint_ok &= ok;
-                    endpoint_details.push(format!(
-                        "hyperliquid_info http={} {status}",
-                        cfg.info_url
-                    ));
+                    endpoint_details
+                        .push(format!("hyperliquid_info http={} {status}", cfg.info_url));
                 }
                 #[cfg(not(feature = "live_hyperliquid"))]
                 {
@@ -1083,8 +1101,7 @@ fn run_preflight(
             ConnectorArg::Lighter => {
                 #[cfg(feature = "live_lighter")]
                 {
-                    let cfg =
-                        paraphina::live::connectors::lighter::LighterConfig::from_env();
+                    let cfg = paraphina::live::connectors::lighter::LighterConfig::from_env();
                     append_endpoint_details(
                         &mut endpoint_details,
                         &mut endpoint_ok,
@@ -1102,8 +1119,7 @@ fn run_preflight(
             ConnectorArg::Extended => {
                 #[cfg(feature = "live_extended")]
                 {
-                    let cfg =
-                        paraphina::live::connectors::extended::ExtendedConfig::from_env();
+                    let cfg = paraphina::live::connectors::extended::ExtendedConfig::from_env();
                     append_endpoint_details(
                         &mut endpoint_details,
                         &mut endpoint_ok,
@@ -1139,8 +1155,7 @@ fn run_preflight(
             ConnectorArg::Paradex => {
                 #[cfg(feature = "live_paradex")]
                 {
-                    let cfg =
-                        paraphina::live::connectors::paradex::ParadexConfig::from_env();
+                    let cfg = paraphina::live::connectors::paradex::ParadexConfig::from_env();
                     append_endpoint_details(
                         &mut endpoint_details,
                         &mut endpoint_ok,
@@ -1296,7 +1311,9 @@ fn run_preflight(
     let telemetry_ok = match telemetry_mode {
         TelemetryMode::Off => true,
         TelemetryMode::Jsonl => telemetry_path.as_ref().is_some_and(|path| {
-            path.parent().map(|p| std::fs::create_dir_all(p).is_ok()).unwrap_or(true)
+            path.parent()
+                .map(|p| std::fs::create_dir_all(p).is_ok())
+                .unwrap_or(true)
                 && std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -1338,7 +1355,9 @@ fn run_preflight(
                 if *connector == ConnectorArg::HyperliquidFixture {
                     let fixture_dir = std::env::var("HL_FIXTURE_DIR")
                         .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|_| std::path::PathBuf::from("./tests/fixtures/hyperliquid"));
+                        .unwrap_or_else(|_| {
+                            std::path::PathBuf::from("./tests/fixtures/hyperliquid")
+                        });
                     let fixture_ok = fixture_dir.is_dir();
                     creds_ok = creds_ok && fixture_ok;
                     detail.push_str(&format!(" fixture_dir_ok={}", fixture_ok));
@@ -1571,7 +1590,8 @@ async fn main() {
             .iter()
             .map(|connector| connector_venue_id(*connector))
             .collect();
-        cfg.venues.retain(|venue| selected.contains(venue.id.as_str()));
+        cfg.venues
+            .retain(|venue| selected.contains(venue.id.as_str()));
     }
     if args.preflight {
         let ok = run_preflight(
@@ -1624,7 +1644,12 @@ async fn main() {
 
     let metrics = LiveMetrics::new();
     let health = HealthState::new();
-    start_metrics_server(&metrics_addr, metrics.clone(), health.clone(), audit_dir.clone());
+    start_metrics_server(
+        &metrics_addr,
+        metrics.clone(),
+        health.clone(),
+        audit_dir.clone(),
+    );
 
     let secrets = EnvSecretProvider::default();
     if secrets.get("PARAPHINA_LIVE_MODE").is_some() {
@@ -1635,7 +1660,11 @@ async fn main() {
         mpsc::channel::<paraphina::live::types::MarketDataEvent>(1024);
     let (market_tx, market_rx) = mpsc::channel::<paraphina::live::types::MarketDataEvent>(1024);
     let (paper_market_tx, paper_market_rx) = mpsc::channel::<PaperMarketUpdate>(1024);
-    let paper_market_tx = if paper_mode { Some(paper_market_tx) } else { None };
+    let paper_market_tx = if paper_mode {
+        Some(paper_market_tx)
+    } else {
+        None
+    };
     let override_market_ts = paper_mode && env_is_true("PARAPHINA_PAPER_USE_WALLCLOCK_TS");
     tokio::spawn(async move {
         while let Some(event) = market_ingest_rx.recv().await {
@@ -1746,12 +1775,24 @@ async fn main() {
                         seq += 1;
                         mid += if seq % 2 == 0 { 0.1 } else { -0.1 };
                         let bids = vec![
-                            BookLevel { price: mid - 0.5, size: 5.0 },
-                            BookLevel { price: mid - 1.0, size: 5.0 },
+                            BookLevel {
+                                price: mid - 0.5,
+                                size: 5.0,
+                            },
+                            BookLevel {
+                                price: mid - 1.0,
+                                size: 5.0,
+                            },
                         ];
                         let asks = vec![
-                            BookLevel { price: mid + 0.5, size: 5.0 },
-                            BookLevel { price: mid + 1.0, size: 5.0 },
+                            BookLevel {
+                                price: mid + 0.5,
+                                size: 5.0,
+                            },
+                            BookLevel {
+                                price: mid + 1.0,
+                                size: 5.0,
+                            },
                         ];
                         let snapshot = L2Snapshot {
                             venue_index: 0,
@@ -1762,7 +1803,9 @@ async fn main() {
                             asks,
                         };
                         let _ = market_tx_clone
-                            .send(paraphina::live::types::MarketDataEvent::L2Snapshot(snapshot))
+                            .send(paraphina::live::types::MarketDataEvent::L2Snapshot(
+                                snapshot,
+                            ))
                             .await;
                     }
                 });
@@ -1770,13 +1813,15 @@ async fn main() {
             ConnectorArg::Hyperliquid => {
                 #[cfg(feature = "live_hyperliquid")]
                 {
-                    let hl_cfg =
+                    let mut hl_cfg =
                         paraphina::live::connectors::hyperliquid::HyperliquidConfig::from_env();
-                    let mut hl = paraphina::live::connectors::hyperliquid::HyperliquidConnector::new(
-                        hl_cfg.clone(),
-                        channels.market_tx.clone(),
-                        channels.exec_tx.clone(),
-                    );
+                    hl_cfg.venue_index = venue_index;
+                    let mut hl =
+                        paraphina::live::connectors::hyperliquid::HyperliquidConnector::new(
+                            hl_cfg.clone(),
+                            channels.market_tx.clone(),
+                            channels.exec_tx.clone(),
+                        );
                     if trade_mode.trade_mode != TradeMode::Shadow {
                         if hl_cfg.vault_address.is_some() {
                             let account_tx = channels.account_tx.clone();
@@ -1805,7 +1850,8 @@ async fn main() {
                             eprintln!("paraphina_live | exec_disabled=true reason=missing_hl_private_key connector=hyperliquid");
                         }
                     }
-                    if trade_mode.trade_mode != TradeMode::Shadow && hl_cfg.vault_address.is_some() {
+                    if trade_mode.trade_mode != TradeMode::Shadow && hl_cfg.vault_address.is_some()
+                    {
                         let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
                             .ok()
                             .and_then(|v| v.parse::<u64>().ok())
@@ -1839,14 +1885,17 @@ async fn main() {
                 {
                     let fixture_dir = std::env::var("HL_FIXTURE_DIR")
                         .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|_| std::path::PathBuf::from("./tests/fixtures/hyperliquid"));
+                        .unwrap_or_else(|_| {
+                            std::path::PathBuf::from("./tests/fixtures/hyperliquid")
+                        });
                     match paraphina::live::connectors::hyperliquid::HyperliquidFixtureFeed::from_dir(
                         &fixture_dir,
                     ) {
                         Ok(feed) => {
                             let market_tx = channels.market_tx.clone();
                             tokio::spawn(async move {
-                                feed.run_ticks(market_tx, 1_000, 250, 200).await;
+                                feed.run_ticks(market_tx, venue_index, 1_000, 250, 200)
+                                    .await;
                             });
                         }
                         Err(err) => {
@@ -1873,7 +1922,9 @@ async fn main() {
             ConnectorArg::Lighter => {
                 #[cfg(feature = "live_lighter")]
                 {
-                    let lighter_cfg = paraphina::live::connectors::lighter::LighterConfig::from_env();
+                    let mut lighter_cfg =
+                        paraphina::live::connectors::lighter::LighterConfig::from_env();
+                    lighter_cfg.venue_index = venue_index;
                     let mut lighter = paraphina::live::connectors::lighter::LighterConnector::new(
                         lighter_cfg.clone(),
                         channels.market_tx.clone(),
@@ -1922,7 +1973,8 @@ async fn main() {
                         {
                             let market_tx = channels.market_tx.clone();
                             tokio::spawn(async move {
-                                feed.run_ticks(market_tx, 1_000, 250, 200).await;
+                                feed.run_ticks(market_tx, venue_index, 1_000, 250, 200)
+                                    .await;
                             });
                         } else {
                             eprintln!(
@@ -1958,16 +2010,29 @@ async fn main() {
                 {
                     if extended_fixture_mode(&args) {
                         let Some(fixture_dir) = resolve_fixture_dir(*connector) else {
-                            eprintln!("paraphina_live | error=fixture_dir_missing connector=extended");
+                            eprintln!(
+                                "paraphina_live | error=fixture_dir_missing connector=extended"
+                            );
                             return;
                         };
-                        match paraphina::live::connectors::extended::ExtendedFixtureFeed::from_dir(&fixture_dir) {
+                        match paraphina::live::connectors::extended::ExtendedFixtureFeed::from_dir(
+                            &fixture_dir,
+                        ) {
                             Ok(feed) => {
                                 let market_tx = channels.market_tx.clone();
                                 let account_tx = channels.account_tx.clone();
                                 let venue_id = venue_id.clone();
                                 tokio::spawn(async move {
-                                    feed.run_ticks(market_tx, account_tx, &venue_id, venue_index, 1_000, 250, 200).await;
+                                    feed.run_ticks(
+                                        market_tx,
+                                        account_tx,
+                                        &venue_id,
+                                        venue_index,
+                                        1_000,
+                                        250,
+                                        200,
+                                    )
+                                    .await;
                                 });
                             }
                             Err(err) => {
@@ -1982,18 +2047,21 @@ async fn main() {
                     } else {
                         let mut extended_cfg =
                             paraphina::live::connectors::extended::ExtendedConfig::from_env();
+                        extended_cfg.venue_index = venue_index;
                         if extended_record_enabled(&args) {
-                            extended_cfg = extended_cfg.with_record_dir(resolve_extended_record_dir());
+                            extended_cfg =
+                                extended_cfg.with_record_dir(resolve_extended_record_dir());
                         }
                         let rest_client = Arc::new(
                             paraphina::live::connectors::extended::ExtendedRestClient::new(
                                 extended_cfg.clone(),
                             ),
                         );
-                        let extended = paraphina::live::connectors::extended::ExtendedConnector::new(
-                            extended_cfg,
-                            channels.market_tx.clone(),
-                        );
+                        let extended =
+                            paraphina::live::connectors::extended::ExtendedConnector::new(
+                                extended_cfg,
+                                channels.market_tx.clone(),
+                            );
                         let extended_arc = Arc::new(extended);
                         let extended_public = extended_arc.clone();
                         tokio::spawn(async move {
@@ -2010,7 +2078,12 @@ async fn main() {
                                 let rest_client_clone = rest_client.clone();
                                 tokio::spawn(async move {
                                     rest_client_clone
-                                        .run_account_polling(account_tx, venue_id, venue_index, poll_ms)
+                                        .run_account_polling(
+                                            account_tx,
+                                            venue_id,
+                                            venue_index,
+                                            poll_ms,
+                                        )
                                         .await;
                                 });
                             } else {
@@ -2018,7 +2091,11 @@ async fn main() {
                                     "paraphina_live | account_snapshots_disabled=true reason=missing_extended_api_keys connector=extended"
                                 );
                                 if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
-                                    send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                                    send_unavailable_account_snapshot_for(
+                                        &_account_tx,
+                                        &cfg,
+                                        index,
+                                    );
                                 }
                             }
                         }
@@ -2047,13 +2124,24 @@ async fn main() {
                             eprintln!("paraphina_live | error=fixture_dir_missing connector=aster");
                             return;
                         };
-                        match paraphina::live::connectors::aster::AsterFixtureFeed::from_dir(&fixture_dir) {
+                        match paraphina::live::connectors::aster::AsterFixtureFeed::from_dir(
+                            &fixture_dir,
+                        ) {
                             Ok(feed) => {
                                 let market_tx = channels.market_tx.clone();
                                 let account_tx = channels.account_tx.clone();
                                 let venue_id = venue_id.clone();
                                 tokio::spawn(async move {
-                                    feed.run_ticks(market_tx, account_tx, &venue_id, venue_index, 1_000, 250, 200).await;
+                                    feed.run_ticks(
+                                        market_tx,
+                                        account_tx,
+                                        &venue_id,
+                                        venue_index,
+                                        1_000,
+                                        250,
+                                        200,
+                                    )
+                                    .await;
                                 });
                             }
                             Err(err) => {
@@ -2066,13 +2154,16 @@ async fn main() {
                             }
                         }
                     } else {
-                        let mut aster_cfg = paraphina::live::connectors::aster::AsterConfig::from_env();
+                        let mut aster_cfg =
+                            paraphina::live::connectors::aster::AsterConfig::from_env();
+                        aster_cfg.venue_index = venue_index;
                         if aster_record_enabled(&args) {
                             aster_cfg = aster_cfg.with_record_dir(resolve_aster_record_dir());
                         }
-                        let rest_client = Arc::new(
-                            paraphina::live::connectors::aster::AsterRestClient::new(aster_cfg.clone()),
-                        );
+                        let rest_client =
+                            Arc::new(paraphina::live::connectors::aster::AsterRestClient::new(
+                                aster_cfg.clone(),
+                            ));
                         let aster = paraphina::live::connectors::aster::AsterConnector::new(
                             aster_cfg,
                             channels.market_tx.clone(),
@@ -2093,7 +2184,12 @@ async fn main() {
                                 let rest_client_clone = rest_client.clone();
                                 tokio::spawn(async move {
                                     rest_client_clone
-                                        .run_account_polling(account_tx, venue_id, venue_index, poll_ms)
+                                        .run_account_polling(
+                                            account_tx,
+                                            venue_id,
+                                            venue_index,
+                                            poll_ms,
+                                        )
                                         .await;
                                 });
                             } else {
@@ -2101,7 +2197,11 @@ async fn main() {
                                     "paraphina_live | account_snapshots_disabled=true reason=missing_aster_api_keys connector=aster"
                                 );
                                 if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
-                                    send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                                    send_unavailable_account_snapshot_for(
+                                        &_account_tx,
+                                        &cfg,
+                                        index,
+                                    );
                                 }
                             }
                         }
@@ -2127,16 +2227,29 @@ async fn main() {
                 {
                     if paradex_fixture_mode(&args) {
                         let Some(fixture_dir) = resolve_fixture_dir(*connector) else {
-                            eprintln!("paraphina_live | error=fixture_dir_missing connector=paradex");
+                            eprintln!(
+                                "paraphina_live | error=fixture_dir_missing connector=paradex"
+                            );
                             return;
                         };
-                        match paraphina::live::connectors::paradex::ParadexFixtureFeed::from_dir(&fixture_dir) {
+                        match paraphina::live::connectors::paradex::ParadexFixtureFeed::from_dir(
+                            &fixture_dir,
+                        ) {
                             Ok(feed) => {
                                 let market_tx = channels.market_tx.clone();
                                 let account_tx = channels.account_tx.clone();
                                 let venue_id = venue_id.clone();
                                 tokio::spawn(async move {
-                                    feed.run_ticks(market_tx, account_tx, &venue_id, venue_index, 1_000, 250, 200).await;
+                                    feed.run_ticks(
+                                        market_tx,
+                                        account_tx,
+                                        &venue_id,
+                                        venue_index,
+                                        1_000,
+                                        250,
+                                        200,
+                                    )
+                                    .await;
                                 });
                             }
                             Err(err) => {
@@ -2151,6 +2264,7 @@ async fn main() {
                     } else {
                         let mut paradex_cfg =
                             paraphina::live::connectors::paradex::ParadexConfig::from_env();
+                        paradex_cfg.venue_index = venue_index;
                         if paradex_record_enabled(&args) {
                             paradex_cfg = paradex_cfg.with_record_dir(resolve_paradex_record_dir());
                         }
@@ -2179,7 +2293,12 @@ async fn main() {
                                 let rest_client_clone = rest_client.clone();
                                 tokio::spawn(async move {
                                     rest_client_clone
-                                        .run_account_polling(account_tx, venue_id, venue_index, poll_ms)
+                                        .run_account_polling(
+                                            account_tx,
+                                            venue_id,
+                                            venue_index,
+                                            poll_ms,
+                                        )
                                         .await;
                                 });
                             } else {
@@ -2187,7 +2306,11 @@ async fn main() {
                                     "paraphina_live | account_snapshots_disabled=true reason=missing_paradex_auth connector=paradex"
                                 );
                                 if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
-                                    send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                                    send_unavailable_account_snapshot_for(
+                                        &_account_tx,
+                                        &cfg,
+                                        index,
+                                    );
                                 }
                             }
                         }
@@ -2255,7 +2378,10 @@ async fn main() {
             ) {
                 Ok(gw) => Some(gw),
                 Err(err) => {
-                    eprintln!("paraphina_live | exec_gateway_error={} fallback=shadow", err.message);
+                    eprintln!(
+                        "paraphina_live | exec_gateway_error={} fallback=shadow",
+                        err.message
+                    );
                     None
                 }
             }
@@ -2465,7 +2591,11 @@ async fn handle_live_gateway_place<C: LiveRestClient>(
     use paraphina::live::types::{ExecutionEvent, OrderAccepted, OrderRejected};
     let mut events = Vec::new();
     let res = gateway
-        .submit_intent(&paraphina::types::OrderIntent::Place(place.clone()), tick, now_ms)
+        .submit_intent(
+            &paraphina::types::OrderIntent::Place(place.clone()),
+            tick,
+            now_ms,
+        )
         .await;
     match res {
         Ok(resp) => {
@@ -2512,8 +2642,13 @@ async fn handle_live_gateway_cancel<C: LiveRestClient>(
 ) -> Vec<paraphina::live::types::ExecutionEvent> {
     use paraphina::live::types::{CancelAccepted, CancelRejected, ExecutionEvent};
     let mut events = Vec::new();
-    let res =
-        gateway.submit_intent(&paraphina::types::OrderIntent::Cancel(cancel.clone()), tick, now_ms).await;
+    let res = gateway
+        .submit_intent(
+            &paraphina::types::OrderIntent::Cancel(cancel.clone()),
+            tick,
+            now_ms,
+        )
+        .await;
     match res {
         Ok(_resp) => {
             *seq = seq.wrapping_add(1);

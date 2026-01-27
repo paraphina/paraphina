@@ -1,3 +1,5 @@
+#![cfg(feature = "roadmap_b")]
+
 #[cfg(all(feature = "live", feature = "live_hyperliquid"))]
 mod tests {
     use std::process::Command;

@@ -94,6 +94,10 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
 ) {
     let tox_cfg = &cfg.toxicity;
     let vol_cfg = &cfg.volatility;
+    let shadow_mode = std::env::var("PARAPHINA_TRADE_MODE")
+        .ok()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "shadow" | "safe" | "s"))
+        .unwrap_or(false);
 
     // Hoist config lookups outside the venue loop to avoid repeated struct access.
     let markout_scale = tox_cfg.markout_scale_usd_per_tao.max(1e-9);
@@ -150,6 +154,9 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
                     Side::Sell => pm.price - mid,
                 };
 
+                // Attach markout to the corresponding recent fill (if present).
+                venue.apply_markout_to_fill(pm.fill_seq, markout);
+
                 // Compute instantaneous toxicity from markout:
                 // - markout >= 0: favorable fill, tox_instant = 0
                 // - markout < 0: adverse fill, tox_instant in (0, 1]
@@ -181,7 +188,16 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
                 .map_or(i64::MAX, |pm| pm.t_eval_ms);
         }
 
-        // --- 2) Fallback: if no mid or no depth, apply legacy vol-based toxicity ---
+        // --- 2) Shadow-mode warmup override ---
+        if shadow_mode
+            && venue.last_mid_update_ms.is_some()
+            && venue.mid.unwrap_or(0.0) > 0.0
+            && venue.depth_near_mid > 0.0
+        {
+            venue.toxicity = 0.0;
+        }
+
+        // --- 3) Fallback: if no mid or no depth, apply legacy vol-based toxicity ---
         // This ensures venues with missing book data are still penalized.
         if venue.mid.is_none() || venue.depth_near_mid <= 0.0 {
             // No valid book data -> treat as highly toxic
@@ -207,10 +223,10 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
             venue.toxicity = venue.toxicity.max(f_vol);
         }
 
-        // --- 3) Clamp final toxicity to [0, 1] ---
+        // --- 4) Clamp final toxicity to [0, 1] ---
         venue.toxicity = venue.toxicity.clamp(0.0, 1.0);
 
-        // --- 4) Set venue health status based on toxicity thresholds ---
+        // --- 5) Set venue health status based on toxicity thresholds ---
         // If disable_toxicity_gate ablation is active, all venues remain Healthy
         if DISABLE_TOX_GATE {
             venue.status = VenueStatus::Healthy;
@@ -232,6 +248,7 @@ mod tests {
     use crate::config::Config;
     use crate::state::PendingMarkout;
     use crate::types::Side;
+    use std::sync::Mutex;
 
     fn make_test_config() -> Config {
         let mut cfg = Config::default();
@@ -243,6 +260,8 @@ mod tests {
         cfg.toxicity.markout_horizon_ms = 1000; // 1 second
         cfg
     }
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_favorable_markout_does_not_increase_toxicity() {
@@ -265,6 +284,7 @@ mod tests {
             price: 99.0, // Bought at 99
             fair_at_fill: 99.0,
             mid_at_fill: 99.0,
+            fill_seq: 0,
         });
         venue.pending_markouts_next_eval_ms = 1000;
 
@@ -302,6 +322,7 @@ mod tests {
             price: 100.0, // Bought at 100
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
+            fill_seq: 0,
         });
         venue.pending_markouts_next_eval_ms = 1000;
 
@@ -339,6 +360,7 @@ mod tests {
             price: 100.0,
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
+            fill_seq: 0,
         });
         venue.pending_markouts_next_eval_ms = 1000;
 
@@ -390,6 +412,7 @@ mod tests {
             price: 100.0,
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
+            fill_seq: 0,
         });
         venue.pending_markouts_next_eval_ms = 1000;
 
@@ -421,6 +444,7 @@ mod tests {
             price: 100.0, // Sold at 100
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
+            fill_seq: 0,
         });
         venue.pending_markouts_next_eval_ms = 1000;
 
@@ -460,6 +484,7 @@ mod tests {
                 price: 100.0,
                 fair_at_fill: 100.0,
                 mid_at_fill: 100.0,
+                fill_seq: i as u64,
             });
         }
         venue.pending_markouts_next_eval_ms = 1000; // First entry's t_eval_ms
@@ -526,6 +551,7 @@ mod tests {
                 price: 100.0,
                 fair_at_fill: 100.0,
                 mid_at_fill: 100.0,
+                fill_seq: 0,
             });
         }
 
@@ -538,6 +564,7 @@ mod tests {
             price: 100.0,
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
+            fill_seq: 3,
         });
         venue.pending_markouts_next_eval_ms = 1000; // First entry's t_eval_ms
 
@@ -584,6 +611,7 @@ mod tests {
             price: 100.0, // markout = 100 - 100 = 0 → tox=0
             fair_at_fill: 100.0,
             mid_at_fill: 100.0,
+            fill_seq: 0,
         });
         venue.pending_markouts.push_back(PendingMarkout {
             t_fill_ms: 0,
@@ -593,6 +621,7 @@ mod tests {
             price: 101.0, // markout = 100 - 101 = -1 → tox=1
             fair_at_fill: 101.0,
             mid_at_fill: 101.0,
+            fill_seq: 1,
         });
         venue.pending_markouts_next_eval_ms = 1000;
 
@@ -684,5 +713,25 @@ mod tests {
             expected_f_vol,
             state.venues[0].toxicity
         );
+    }
+
+    #[test]
+    fn shadow_mode_warmup_clears_toxicity_with_book() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_TRADE_MODE", "shadow");
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(1.0);
+        venue.depth_near_mid = 500.0;
+        venue.last_mid_update_ms = Some(1_000);
+        venue.toxicity = 1.0;
+
+        update_toxicity_and_health(&mut state, &cfg, 1_000);
+
+        assert_eq!(state.venues[0].toxicity, 0.0);
+        assert!(matches!(state.venues[0].status, VenueStatus::Healthy));
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
     }
 }

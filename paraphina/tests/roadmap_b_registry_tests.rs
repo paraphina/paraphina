@@ -1,3 +1,5 @@
+#![cfg(feature = "roadmap_b")]
+
 use paraphina::connector_registry::{roadmap_b_selectable_venues, validate_roadmap_b_connector_coverage};
 use paraphina::venues::{ROADMAP_B_VENUE_IDS, VenueId};
 

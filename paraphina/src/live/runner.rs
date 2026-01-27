@@ -7,8 +7,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
 
+use super::ops::{
+    append_account_reconcile_audit, append_reconcile_drift_audit, default_audit_dir, HealthState,
+    LiveMetrics,
+};
+use super::venue_health::VenueHealthManager;
+use crate::actions::{intents_to_actions, ActionBatch, ActionIdGenerator};
 use crate::config::Config;
 use crate::engine::Engine;
+#[cfg(feature = "event_log")]
+use crate::event_log::read_event_log;
+#[cfg(feature = "event_log")]
+use crate::event_log::{EventLogPayload, EventLogRecord, EventLogWriter};
 use crate::execution_events::apply_execution_events;
 use crate::exit;
 use crate::fill_batcher::FillBatcher;
@@ -16,25 +26,17 @@ use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::loop_scheduler::LoopScheduler;
 use crate::mm::{compute_mm_quotes, compute_mm_quotes_with_ablations};
 use crate::order_management::plan_mm_order_actions;
+use crate::sim_eval::AblationSet;
 use crate::state::GlobalState;
 use crate::state::VenueState;
-use crate::sim_eval::AblationSet;
-use crate::telemetry::{ensure_schema_v1, ReconcileDriftRecord, TelemetryBuilder, TelemetryInputs, TelemetrySink};
+use crate::telemetry::{
+    ensure_schema_v1, ReconcileDriftRecord, TelemetryBuilder, TelemetryInputs, TelemetrySink,
+};
+#[cfg(feature = "event_log")]
+use crate::telemetry::{TelemetryConfig, TelemetryMode};
 use crate::types::{
     ExecutionEvent, OrderAck, OrderIntent, OrderPurpose, OrderReject, TimestampMs, VenueStatus,
 };
-use crate::actions::{intents_to_actions, ActionBatch, ActionIdGenerator};
-#[cfg(feature = "event_log")]
-use crate::event_log::{EventLogPayload, EventLogRecord, EventLogWriter};
-#[cfg(feature = "event_log")]
-use crate::event_log::read_event_log;
-#[cfg(feature = "event_log")]
-use crate::telemetry::{TelemetryConfig, TelemetryMode};
-use super::ops::{
-    append_account_reconcile_audit, append_reconcile_drift_audit, default_audit_dir, HealthState,
-    LiveMetrics,
-};
-use super::venue_health::VenueHealthManager;
 
 use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache};
 use super::types::ExecutionEvent as LiveExecutionEvent;
@@ -119,8 +121,15 @@ fn account_snapshot_available(
 
 #[derive(Debug, Clone, Copy)]
 pub enum LiveRunMode {
-    Realtime { interval_ms: u64, max_ticks: Option<u64> },
-    Step { start_ms: TimestampMs, step_ms: i64, ticks: u64 },
+    Realtime {
+        interval_ms: u64,
+        max_ticks: Option<u64>,
+    },
+    Step {
+        start_ms: TimestampMs,
+        step_ms: i64,
+        ticks: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -231,15 +240,18 @@ fn execution_event_key(event: &super::types::ExecutionEvent) -> Option<String> {
                 ))
             }
         }
-        super::types::ExecutionEvent::CancelAllAccepted(ack) => {
-            Some(format!("cancel_all:venue:{}:seq:{}", ack.venue_index, ack.seq))
-        }
-        super::types::ExecutionEvent::CancelAllRejected(rej) => {
-            Some(format!("cancel_all_reject:venue:{}:seq:{}", rej.venue_index, rej.seq))
-        }
-        super::types::ExecutionEvent::OrderSnapshot(snapshot) => {
-            Some(format!("order_snapshot:venue:{}:seq:{}", snapshot.venue_index, snapshot.seq))
-        }
+        super::types::ExecutionEvent::CancelAllAccepted(ack) => Some(format!(
+            "cancel_all:venue:{}:seq:{}",
+            ack.venue_index, ack.seq
+        )),
+        super::types::ExecutionEvent::CancelAllRejected(rej) => Some(format!(
+            "cancel_all_reject:venue:{}:seq:{}",
+            rej.venue_index, rej.seq
+        )),
+        super::types::ExecutionEvent::OrderSnapshot(snapshot) => Some(format!(
+            "order_snapshot:venue:{}:seq:{}",
+            snapshot.venue_index, snapshot.seq
+        )),
     }
 }
 
@@ -341,26 +353,18 @@ fn drain_ordered_events(
     }
 
     out.sort_by(|a, b| {
-        (
-            &a.venue_id,
-            a.source_seq,
-            a.event_ts_ms,
-            a.type_order,
-        )
-            .cmp(&(
-                &b.venue_id,
-                b.source_seq,
-                b.event_ts_ms,
-                b.type_order,
-            ))
+        (&a.venue_id, a.source_seq, a.event_ts_ms, a.type_order).cmp(&(
+            &b.venue_id,
+            b.source_seq,
+            b.event_ts_ms,
+            b.type_order,
+        ))
     });
 
     out
 }
 
-fn ordered_event_for_market(
-    event: super::types::MarketDataEvent,
-) -> Option<OrderedEvent> {
+fn ordered_event_for_market(event: super::types::MarketDataEvent) -> Option<OrderedEvent> {
     let (venue_id, source_seq, event_ts_ms) = match &event {
         super::types::MarketDataEvent::L2Snapshot(s) => (s.venue_id.clone(), s.seq, s.timestamp_ms),
         super::types::MarketDataEvent::L2Delta(d) => (d.venue_id.clone(), d.seq, d.timestamp_ms),
@@ -378,9 +382,7 @@ fn ordered_event_for_market(
     })
 }
 
-fn ordered_event_for_account(
-    event: super::types::AccountEvent,
-) -> Option<OrderedEvent> {
+fn ordered_event_for_account(event: super::types::AccountEvent) -> Option<OrderedEvent> {
     let (venue_id, source_seq, event_ts_ms) = match &event {
         super::types::AccountEvent::Snapshot(s) => (s.venue_id.clone(), s.seq, s.timestamp_ms),
     };
@@ -393,9 +395,7 @@ fn ordered_event_for_account(
     })
 }
 
-fn ordered_event_for_execution(
-    event: super::types::ExecutionEvent,
-) -> Option<OrderedEvent> {
+fn ordered_event_for_execution(event: super::types::ExecutionEvent) -> Option<OrderedEvent> {
     let (venue_id, source_seq, event_ts_ms) = match &event {
         super::types::ExecutionEvent::OrderAccepted(e) => {
             (e.venue_id.clone(), e.seq, e.timestamp_ms)
@@ -488,6 +488,7 @@ pub async fn run_live_loop(
     let mut cache = LiveStateCache::new(cfg);
     let mut health_manager = VenueHealthManager::new(cfg);
     let mut telemetry_builder = TelemetryBuilder::new(cfg);
+    let mut applied_book_logged: Vec<bool> = vec![false; cfg.venues.len()];
 
     let mut market_rx = channels.market_rx;
     let mut account_rx = channels.account_rx;
@@ -572,7 +573,9 @@ pub async fn run_live_loop(
         AblationSet::new()
     };
     let mut interval = match mode {
-        LiveRunMode::Realtime { interval_ms, .. } => Some(tokio::time::interval(Duration::from_millis(interval_ms))),
+        LiveRunMode::Realtime { interval_ms, .. } => {
+            Some(tokio::time::interval(Duration::from_millis(interval_ms)))
+        }
         LiveRunMode::Step { .. } => None,
     };
 
@@ -596,7 +599,11 @@ pub async fn run_live_loop(
                 }
                 now_ms()
             }
-            LiveRunMode::Step { start_ms, step_ms, ticks } => {
+            LiveRunMode::Step {
+                start_ms,
+                step_ms,
+                ticks,
+            } => {
                 if tick >= ticks {
                     break;
                 }
@@ -615,7 +622,8 @@ pub async fn run_live_loop(
             });
         }
 
-        if let (Some(interval_ms), Some(tx)) = (account_reconcile_ms, account_reconcile_tx.as_ref()) {
+        if let (Some(interval_ms), Some(tx)) = (account_reconcile_ms, account_reconcile_tx.as_ref())
+        {
             let should_reconcile = last_account_reconcile_ms
                 .map(|prev| now_ms.saturating_sub(prev) >= interval_ms)
                 .unwrap_or(true);
@@ -642,8 +650,9 @@ pub async fn run_live_loop(
                                     let (report, diff) =
                                         cache.reconcile_account_snapshot_with_diff(&snapshot);
                                     if let Some(diff) = diff {
-                                        let _ =
-                                            append_account_reconcile_audit(&audit_dir, now_ms, diff);
+                                        let _ = append_account_reconcile_audit(
+                                            &audit_dir, now_ms, diff,
+                                        );
                                     }
                                     if !report.account_ok {
                                         if let Some(hooks) = hooks.as_ref() {
@@ -668,9 +677,10 @@ pub async fn run_live_loop(
                 .unwrap_or(true);
             if should_reconcile {
                 last_account_reconcile_ms = Some(now_ms);
-                let has_fresh_snapshot = last_account_snapshot_ms.iter().flatten().any(|ts| {
-                    now_ms.saturating_sub(*ts) <= account_snapshot_max_age_ms
-                });
+                let has_fresh_snapshot = last_account_snapshot_ms
+                    .iter()
+                    .flatten()
+                    .any(|ts| now_ms.saturating_sub(*ts) <= account_snapshot_max_age_ms);
                 if has_fresh_snapshot {
                     push_reconcile_drift(
                         &mut pending_drift_events,
@@ -714,18 +724,12 @@ pub async fn run_live_loop(
         }
         pending_events = future_events;
         ordered_events.sort_by(|a, b| {
-            (
-                &a.venue_id,
-                a.source_seq,
-                a.event_ts_ms,
-                a.type_order,
-            )
-                .cmp(&(
-                    &b.venue_id,
-                    b.source_seq,
-                    b.event_ts_ms,
-                    b.type_order,
-                ))
+            (&a.venue_id, a.source_seq, a.event_ts_ms, a.type_order).cmp(&(
+                &b.venue_id,
+                b.source_seq,
+                b.event_ts_ms,
+                b.type_order,
+            ))
         });
 
         for ordered in ordered_events {
@@ -749,6 +753,36 @@ pub async fn run_live_loop(
                         });
                     } else {
                         apply_market_event_to_core(&mut state, cfg, &event);
+                        let venue_index = match &event {
+                            super::types::MarketDataEvent::L2Snapshot(s) => s.venue_index,
+                            super::types::MarketDataEvent::L2Delta(d) => d.venue_index,
+                            super::types::MarketDataEvent::Trade(t) => t.venue_index,
+                            super::types::MarketDataEvent::FundingUpdate(f) => f.venue_index,
+                        };
+                        if let Some(logged) = applied_book_logged.get_mut(venue_index) {
+                            if !*logged {
+                                if let Some(market) = cache.market.get(venue_index) {
+                                    if let (Some(mid), Some(spread)) = (market.mid, market.spread) {
+                                        if market.depth_near_mid > 0.0 {
+                                            let venue_id = cfg
+                                                .venues
+                                                .get(venue_index)
+                                                .map(|v| v.id.as_str())
+                                                .unwrap_or("unknown");
+                                            eprintln!(
+                                                "APPLIED_BOOK venue={} venue_index={} mid={} spread={} depth_usd={}",
+                                                venue_id,
+                                                venue_index,
+                                                mid,
+                                                spread,
+                                                market.depth_near_mid
+                                            );
+                                            *logged = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 CanonicalEvent::Account(event) => {
@@ -780,100 +814,100 @@ pub async fn run_live_loop(
                     if let Some(vstate) = state.venues.get(snapshot.venue_index) {
                         let pos_internal = vstate.position_tao;
                         let pos_venue = derive_position_tao(&snapshot.positions);
-                            if diff_exceeds(pos_internal, pos_venue, pos_tol) {
-                                push_reconcile_drift(
-                                    &mut pending_drift_events,
-                                    &audit_dir,
-                                    ReconcileDriftRecord {
-                                        timestamp_ms: snapshot.timestamp_ms,
-                                        venue_index: snapshot.venue_index,
-                                        venue_id: snapshot.venue_id.clone(),
-                                        kind: "position_tao".to_string(),
-                                        internal: Some(pos_internal),
-                                        venue: Some(pos_venue),
-                                        diff: Some(pos_internal - pos_venue),
-                                        tolerance: Some(pos_tol),
-                                        source: "account_snapshot".to_string(),
-                                        available: true,
-                                    },
-                                );
-                                if !state.kill_switch {
-                                    state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
-                                }
+                        if diff_exceeds(pos_internal, pos_venue, pos_tol) {
+                            push_reconcile_drift(
+                                &mut pending_drift_events,
+                                &audit_dir,
+                                ReconcileDriftRecord {
+                                    timestamp_ms: snapshot.timestamp_ms,
+                                    venue_index: snapshot.venue_index,
+                                    venue_id: snapshot.venue_id.clone(),
+                                    kind: "position_tao".to_string(),
+                                    internal: Some(pos_internal),
+                                    venue: Some(pos_venue),
+                                    diff: Some(pos_internal - pos_venue),
+                                    tolerance: Some(pos_tol),
+                                    source: "account_snapshot".to_string(),
+                                    available: true,
+                                },
+                            );
+                            if !state.kill_switch {
+                                state.kill_switch = true;
+                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
                             }
-                            let bal_internal = vstate.margin_balance_usd;
-                            let bal_venue = snapshot.margin.balance_usd;
-                            if diff_exceeds(bal_internal, bal_venue, bal_tol) {
-                                push_reconcile_drift(
-                                    &mut pending_drift_events,
-                                    &audit_dir,
-                                    ReconcileDriftRecord {
-                                        timestamp_ms: snapshot.timestamp_ms,
-                                        venue_index: snapshot.venue_index,
-                                        venue_id: snapshot.venue_id.clone(),
-                                        kind: "margin_balance_usd".to_string(),
-                                        internal: Some(bal_internal),
-                                        venue: Some(bal_venue),
-                                        diff: Some(bal_internal - bal_venue),
-                                        tolerance: Some(bal_tol),
-                                        source: "account_snapshot".to_string(),
-                                        available: true,
-                                    },
-                                );
-                                if !state.kill_switch {
-                                    state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
-                                }
-                            }
-                            let used_internal = vstate.margin_used_usd;
-                            let used_venue = snapshot.margin.used_usd;
-                            if diff_exceeds(used_internal, used_venue, bal_tol) {
-                                push_reconcile_drift(
-                                    &mut pending_drift_events,
-                                    &audit_dir,
-                                    ReconcileDriftRecord {
-                                        timestamp_ms: snapshot.timestamp_ms,
-                                        venue_index: snapshot.venue_index,
-                                        venue_id: snapshot.venue_id.clone(),
-                                        kind: "margin_used_usd".to_string(),
-                                        internal: Some(used_internal),
-                                        venue: Some(used_venue),
-                                        diff: Some(used_internal - used_venue),
-                                        tolerance: Some(bal_tol),
-                                        source: "account_snapshot".to_string(),
-                                        available: true,
-                                    },
-                                );
-                                if !state.kill_switch {
-                                    state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
-                                }
-                            }
-                            let avail_internal = vstate.margin_available_usd;
-                            let avail_venue = snapshot.margin.available_usd;
-                            if diff_exceeds(avail_internal, avail_venue, bal_tol) {
-                                push_reconcile_drift(
-                                    &mut pending_drift_events,
-                                    &audit_dir,
-                                    ReconcileDriftRecord {
-                                        timestamp_ms: snapshot.timestamp_ms,
-                                        venue_index: snapshot.venue_index,
-                                        venue_id: snapshot.venue_id.clone(),
-                                        kind: "margin_available_usd".to_string(),
-                                        internal: Some(avail_internal),
-                                        venue: Some(avail_venue),
-                                        diff: Some(avail_internal - avail_venue),
-                                        tolerance: Some(bal_tol),
-                                        source: "account_snapshot".to_string(),
-                                        available: true,
-                                    },
-                                );
-                        if !state.kill_switch {
-                            state.kill_switch = true;
-                            state.kill_reason = crate::state::KillReason::ReconciliationDrift;
                         }
-                    }
+                        let bal_internal = vstate.margin_balance_usd;
+                        let bal_venue = snapshot.margin.balance_usd;
+                        if diff_exceeds(bal_internal, bal_venue, bal_tol) {
+                            push_reconcile_drift(
+                                &mut pending_drift_events,
+                                &audit_dir,
+                                ReconcileDriftRecord {
+                                    timestamp_ms: snapshot.timestamp_ms,
+                                    venue_index: snapshot.venue_index,
+                                    venue_id: snapshot.venue_id.clone(),
+                                    kind: "margin_balance_usd".to_string(),
+                                    internal: Some(bal_internal),
+                                    venue: Some(bal_venue),
+                                    diff: Some(bal_internal - bal_venue),
+                                    tolerance: Some(bal_tol),
+                                    source: "account_snapshot".to_string(),
+                                    available: true,
+                                },
+                            );
+                            if !state.kill_switch {
+                                state.kill_switch = true;
+                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            }
+                        }
+                        let used_internal = vstate.margin_used_usd;
+                        let used_venue = snapshot.margin.used_usd;
+                        if diff_exceeds(used_internal, used_venue, bal_tol) {
+                            push_reconcile_drift(
+                                &mut pending_drift_events,
+                                &audit_dir,
+                                ReconcileDriftRecord {
+                                    timestamp_ms: snapshot.timestamp_ms,
+                                    venue_index: snapshot.venue_index,
+                                    venue_id: snapshot.venue_id.clone(),
+                                    kind: "margin_used_usd".to_string(),
+                                    internal: Some(used_internal),
+                                    venue: Some(used_venue),
+                                    diff: Some(used_internal - used_venue),
+                                    tolerance: Some(bal_tol),
+                                    source: "account_snapshot".to_string(),
+                                    available: true,
+                                },
+                            );
+                            if !state.kill_switch {
+                                state.kill_switch = true;
+                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            }
+                        }
+                        let avail_internal = vstate.margin_available_usd;
+                        let avail_venue = snapshot.margin.available_usd;
+                        if diff_exceeds(avail_internal, avail_venue, bal_tol) {
+                            push_reconcile_drift(
+                                &mut pending_drift_events,
+                                &audit_dir,
+                                ReconcileDriftRecord {
+                                    timestamp_ms: snapshot.timestamp_ms,
+                                    venue_index: snapshot.venue_index,
+                                    venue_id: snapshot.venue_id.clone(),
+                                    kind: "margin_available_usd".to_string(),
+                                    internal: Some(avail_internal),
+                                    venue: Some(avail_venue),
+                                    diff: Some(avail_internal - avail_venue),
+                                    tolerance: Some(bal_tol),
+                                    source: "account_snapshot".to_string(),
+                                    available: true,
+                                },
+                            );
+                            if !state.kill_switch {
+                                state.kill_switch = true;
+                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            }
+                        }
                     }
                 }
                 CanonicalEvent::Execution(event) => {
@@ -978,12 +1012,11 @@ pub async fn run_live_loop(
         let stale_count = snapshot.market.iter().filter(|m| m.is_stale).count() as u64;
         if !disabled.is_empty() {
             for venue_index in &disabled {
-                let intent = crate::types::OrderIntent::CancelAll(
-                    crate::types::CancelAllOrderIntent {
+                let intent =
+                    crate::types::OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
                         venue_index: Some(*venue_index),
                         venue_id: Some(cfg.venues[*venue_index].id_arc.clone()),
-                    },
-                );
+                    });
                 would_send_intents.push(intent.clone());
                 dispatch_cancel_all_and_apply(
                     cfg,
@@ -1147,8 +1180,7 @@ pub async fn run_live_loop(
             }
             let mut action_id_gen = ActionIdGenerator::new(tick);
             let actions = intents_to_actions(&intents, &mut action_id_gen);
-            let mut action_batch =
-                ActionBatch::new(now_ms, tick, &cfg.version).with_seed(None);
+            let mut action_batch = ActionBatch::new(now_ms, tick, &cfg.version).with_seed(None);
             for action in actions {
                 action_batch.push(action);
             }
@@ -1207,7 +1239,9 @@ pub async fn run_live_loop(
                                         kind: "open_orders".to_string(),
                                         internal: Some(internal.len() as f64),
                                         venue: Some(venue_orders.len() as f64),
-                                        diff: Some(internal.len() as f64 - venue_orders.len() as f64),
+                                        diff: Some(
+                                            internal.len() as f64 - venue_orders.len() as f64,
+                                        ),
                                         tolerance: Some(order_tol as f64),
                                         source: "order_snapshot".to_string(),
                                         available: true,
@@ -1215,7 +1249,8 @@ pub async fn run_live_loop(
                                 );
                                 if !state.kill_switch {
                                     state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                    state.kill_reason =
+                                        crate::state::KillReason::ReconciliationDrift;
                                 }
                             }
                             state.live_order_state.reconcile(&snapshot, now_ms);
@@ -1286,15 +1321,23 @@ pub async fn run_live_loop(
                                 if deduper.is_duplicate(&event) {
                                     continue;
                                 }
-                                if let super::types::ExecutionEvent::OrderSnapshot(snapshot) = event {
+                                if let super::types::ExecutionEvent::OrderSnapshot(snapshot) = event
+                                {
                                     state.live_order_state.reconcile(&snapshot, now_ms);
                                     continue;
                                 }
                                 #[cfg(feature = "event_log")]
-                                log_live_execution_event(&mut event_log, tick, now_ms, "gateway", &event);
+                                log_live_execution_event(
+                                    &mut event_log,
+                                    tick,
+                                    now_ms,
+                                    "gateway",
+                                    &event,
+                                );
                                 let core_events = live_events_to_core(&[event]);
                                 tick_exec_events.extend(core_events.iter().cloned());
-                                let fills = apply_execution_events(&mut state, &core_events, now_ms);
+                                let fills =
+                                    apply_execution_events(&mut state, &core_events, now_ms);
                                 if !fills.is_empty() {
                                     tick_fills.extend(fills.iter().cloned());
                                     exit_fills.extend(fills);
@@ -1356,15 +1399,24 @@ pub async fn run_live_loop(
                                     if deduper.is_duplicate(&event) {
                                         continue;
                                     }
-                                    if let super::types::ExecutionEvent::OrderSnapshot(snapshot) = event {
+                                    if let super::types::ExecutionEvent::OrderSnapshot(snapshot) =
+                                        event
+                                    {
                                         state.live_order_state.reconcile(&snapshot, now_ms);
                                         continue;
                                     }
                                     #[cfg(feature = "event_log")]
-                                    log_live_execution_event(&mut event_log, tick, now_ms, "gateway", &event);
+                                    log_live_execution_event(
+                                        &mut event_log,
+                                        tick,
+                                        now_ms,
+                                        "gateway",
+                                        &event,
+                                    );
                                     let core_events = live_events_to_core(&[event]);
                                     tick_exec_events.extend(core_events.iter().cloned());
-                                    let fills = apply_execution_events(&mut state, &core_events, now_ms);
+                                    let fills =
+                                        apply_execution_events(&mut state, &core_events, now_ms);
                                     if !fills.is_empty() {
                                         tick_fills.extend(fills.iter().cloned());
                                         hedge_fills.extend(fills);
@@ -1445,17 +1497,8 @@ pub async fn handle_kill_switch(
             venue_index: Some(venue_index),
             venue_id: Some(venue.id_arc.clone()),
         });
-        dispatch_cancel_all_and_apply(
-            cfg,
-            state,
-            order_tx,
-            now_ms,
-            tick,
-            intent,
-            hooks,
-            audit_dir,
-        )
-        .await;
+        dispatch_cancel_all_and_apply(cfg, state, order_tx, now_ms, tick, intent, hooks, audit_dir)
+            .await;
     }
 
     if best_effort_flatten {
@@ -1604,7 +1647,8 @@ fn apply_market_event_to_core(
                 );
             }
         }
-        super::types::MarketDataEvent::Trade(_) | super::types::MarketDataEvent::FundingUpdate(_) => {}
+        super::types::MarketDataEvent::Trade(_)
+        | super::types::MarketDataEvent::FundingUpdate(_) => {}
     }
 }
 
@@ -1657,10 +1701,7 @@ fn update_live_telemetry_stats(
             }
             OrderIntent::Replace(replace) => {
                 let key = format!("{:?}", replace.purpose);
-                *guard
-                    .would_replace_by_purpose
-                    .entry(key)
-                    .or_insert(0) += 1;
+                *guard.would_replace_by_purpose.entry(key).or_insert(0) += 1;
             }
         }
     }
@@ -1841,12 +1882,9 @@ pub fn apply_account_snapshot_to_state(
         if !sigma_eff.is_finite() || sigma_eff <= 0.0 {
             continue;
         }
-        let mid = v.mid.or_else(|| {
-            snapshot
-                .market
-                .get(acct.venue_index)
-                .and_then(|m| m.mid)
-        });
+        let mid = v
+            .mid
+            .or_else(|| snapshot.market.get(acct.venue_index).and_then(|m| m.mid));
         let Some(mid) = mid else {
             continue;
         };
@@ -1995,9 +2033,7 @@ pub fn replay_event_log(
                         cfg.hedge_loop_interval_ms,
                         cfg.risk_loop_interval_ms,
                     );
-                    fill_batcher.set_last_flush_ms(
-                        sched.next_main_ms() - cfg.fill_agg_interval_ms,
-                    );
+                    fill_batcher.set_last_flush_ms(sched.next_main_ms() - cfg.fill_agg_interval_ms);
                     scheduler = Some(sched);
                 }
             }

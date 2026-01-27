@@ -14,9 +14,10 @@
 use clap::{ArgAction, Parser, ValueEnum};
 
 use paraphina::config::{resolve_effective_profile, Config, RiskProfile};
-use paraphina::gateway::SimGateway;
+use paraphina::io::sim::create_sim_adapters;
+use paraphina::io::{Gateway, GatewayPolicy};
 use paraphina::logging::NoopSink;
-use paraphina::strategy::StrategyRunner;
+use paraphina::strategy_action::StrategyRunner;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum ProfileArg {
@@ -95,7 +96,7 @@ fn main() {
     );
 
     // Gateway + sink
-    let gateway = SimGateway;
+    let gateway = Gateway::new(create_sim_adapters(&cfg), GatewayPolicy::for_simulation());
     let sink = NoopSink;
 
     // Strategy runner owns engine/state/telemetry and runs the loop.

@@ -1542,6 +1542,9 @@ fn create_inline_scenario_spec(inline: &InlineScenario, steps: u64) -> ScenarioS
             fees_bps_taker: 0.75,
             latency_ms: 1.0,
         },
+        latency_spike: None,
+        partial_fill: paraphina::sim_eval::PartialFillModel::default(),
+        cancel_storm: None,
         invariants: Invariants {
             expect_kill_switch: ExpectKillSwitch::Allowed,
             pnl_linearity_check: PnlLinearityCheck::Disabled,

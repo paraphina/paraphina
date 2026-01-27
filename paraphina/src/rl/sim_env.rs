@@ -15,18 +15,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::engine::Engine;
+#[cfg(feature = "event_log")]
+use crate::event_log::{EventLogRecord, EventLogWriter, SerializableExecutionEvent};
+use crate::execution_events::apply_execution_events;
 use crate::exit;
 use crate::gateway::{ExecutionGateway, SimGateway};
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::mm::{compute_mm_quotes_with_ablations, mm_quotes_to_order_intents};
-use crate::sim_eval::AblationSet;
-use crate::state::{GlobalState, PendingMarkoutRecord, RiskRegime};
+use crate::sim_eval::{AblationSet, CancelStorm, LatencySpike, PartialFillModel};
+use crate::state::{GlobalState, RiskRegime};
 use crate::toxicity::update_toxicity_and_health_with_ablations;
-use crate::types::{FillEvent, OrderIntent, Side, TimestampMs};
+use crate::types::{
+    FillEvent, OrderIntent, OrderPurpose, PlaceOrderIntent, ReplaceOrderIntent, Side, TimestampMs,
+};
 
+use super::action_encoding::encode_action;
 use super::domain_rand::{DomainRandConfig, DomainRandSample, DomainRandSampler};
 use super::observation::Observation;
 use super::policy::PolicyAction;
+use super::safety::SafetyLayer;
 use super::telemetry::{RewardComponents, RewardWeights};
 
 /// Result of a single environment step.
@@ -71,6 +78,12 @@ pub struct StepInfo {
     pub domain_rand_sample: Option<DomainRandSample>,
     /// Reward components breakdown.
     pub reward_components: Option<RewardComponents>,
+    /// Raw policy action (pre-clamp).
+    pub policy_action_raw: Option<Vec<f64>>,
+    /// Applied policy action (post-clamp).
+    pub policy_action_applied: Option<Vec<f64>>,
+    /// Safety layer rejection reasons.
+    pub policy_rejection_reasons: Option<Vec<String>>,
 }
 
 impl Default for StepInfo {
@@ -89,6 +102,9 @@ impl Default for StepInfo {
             basis_usd: 0.0,
             domain_rand_sample: None,
             reward_components: None,
+            policy_action_raw: None,
+            policy_action_applied: None,
+            policy_rejection_reasons: None,
         }
     }
 }
@@ -108,6 +124,14 @@ pub struct SimEnvConfig {
     pub apply_domain_rand: bool,
     /// Active ablations for research experiments.
     pub ablations: AblationSet,
+    /// Baseline latency in ms (from scenario microstructure model).
+    pub latency_baseline_ms: f64,
+    /// Optional latency spike window.
+    pub latency_spike: Option<LatencySpike>,
+    /// Partial fill model (disabled by default).
+    pub partial_fill: PartialFillModel,
+    /// Cancel-storm stressor (optional).
+    pub cancel_storm: Option<CancelStorm>,
 }
 
 impl Default for SimEnvConfig {
@@ -119,6 +143,10 @@ impl Default for SimEnvConfig {
             reward_weights: RewardWeights::default(),
             apply_domain_rand: true,
             ablations: AblationSet::new(),
+            latency_baseline_ms: 0.0,
+            latency_spike: None,
+            partial_fill: PartialFillModel::default(),
+            cancel_storm: None,
         }
     }
 }
@@ -133,6 +161,10 @@ impl SimEnvConfig {
             reward_weights: RewardWeights::default(),
             apply_domain_rand: false,
             ablations: AblationSet::new(),
+            latency_baseline_ms: 0.0,
+            latency_spike: None,
+            partial_fill: PartialFillModel::default(),
+            cancel_storm: None,
         }
     }
 
@@ -145,6 +177,10 @@ impl SimEnvConfig {
             reward_weights: RewardWeights::default(),
             apply_domain_rand: true,
             ablations: AblationSet::new(),
+            latency_baseline_ms: 0.0,
+            latency_spike: None,
+            partial_fill: PartialFillModel::default(),
+            cancel_storm: None,
         }
     }
 
@@ -192,6 +228,8 @@ pub struct SimEnv {
     peak_pnl: f64,
     /// Whether the episode is done.
     done: bool,
+    #[cfg(feature = "event_log")]
+    event_log: Option<EventLogWriter>,
     /// Current seed.
     seed: u64,
     /// Static config holder (for engine lifetime).
@@ -223,6 +261,8 @@ impl SimEnv {
             prev_pnl: 0.0,
             peak_pnl: 0.0,
             done: false,
+            #[cfg(feature = "event_log")]
+            event_log: EventLogWriter::from_env(),
             seed: 0,
             static_config: None,
         }
@@ -297,12 +337,18 @@ impl SimEnv {
 
         // Seed synthetic market data
         self.seed_synthetic_data(now_ms);
+        #[cfg(feature = "event_log")]
+        self.log_book_events(now_ms);
 
         // Run engine tick (FV, vol, toxicity, risk)
         self.run_engine_tick(now_ms);
 
-        // Execute strategy with the given action
-        self.execute_strategy(now_ms, action);
+        // Apply safety layer before execution
+        let safety = SafetyLayer::apply(action, self.config.venues.len());
+        let applied_action = safety.applied.clone();
+
+        // Execute strategy with the applied action
+        self.execute_strategy(now_ms, &applied_action);
 
         // Check termination conditions
         let termination_reason = self.check_termination();
@@ -323,6 +369,21 @@ impl SimEnv {
         // Build info
         let mut info = self.build_step_info(termination_reason);
         info.reward_components = Some(reward_components);
+        info.policy_action_raw = Some(
+            encode_action(&safety.raw, self.config.venues.len())
+                .into_iter()
+                .map(|v| v as f64)
+                .collect(),
+        );
+        info.policy_action_applied = Some(
+            encode_action(&safety.applied, self.config.venues.len())
+                .into_iter()
+                .map(|v| v as f64)
+                .collect(),
+        );
+        if !safety.rejection_reasons.is_empty() {
+            info.policy_rejection_reasons = Some(safety.rejection_reasons);
+        }
 
         StepResult {
             observation: obs,
@@ -414,6 +475,7 @@ impl SimEnv {
     fn seed_synthetic_data(&mut self, now_ms: TimestampMs) {
         let sample = self.current_domain_rand.as_ref();
         let base = sample.map(|s| s.initial_fair_value).unwrap_or(300.0);
+        let storm = self.cancel_storm_active().cloned();
 
         // Add some randomness to the base price
         let price_noise: f64 = self.rng.gen_range(-0.5..0.5);
@@ -430,11 +492,16 @@ impl SimEnv {
                 .and_then(|s| s.spread_offsets.get(idx))
                 .copied()
                 .unwrap_or(0.0);
-            let spread = (0.4 + idx as f64 * 0.02) * spread_mult + spread_offset;
-            let depth = sample
+            let mut spread = (0.4 + idx as f64 * 0.02) * spread_mult + spread_offset;
+            let mut depth = sample
                 .and_then(|s| s.depth_near_mid.get(idx))
                 .copied()
                 .unwrap_or(10_000.0);
+
+            if let Some(storm) = storm.as_ref() {
+                spread *= storm.spread_mult;
+                depth *= storm.depth_mult;
+            }
 
             // Apply funding from domain rand
             let funding = sample
@@ -447,7 +514,7 @@ impl SimEnv {
             v.mid = Some(mid);
             v.spread = Some(spread.max(0.01));
             v.last_mid_update_ms = Some(now_ms);
-            v.depth_near_mid = depth;
+            v.depth_near_mid = depth.max(0.0);
 
             // Update local per-venue volatility
             if let Some(prev) = mid_prev {
@@ -489,6 +556,9 @@ impl SimEnv {
             now_ms,
             &self.env_config.ablations,
         );
+
+        // 3b) Cancel-storm toxicity floor (if active)
+        self.apply_cancel_storm_toxicity_floor();
 
         // 4) Risk limits + regime / kill switch
         self.update_risk_limits_and_regime();
@@ -574,72 +644,19 @@ impl SimEnv {
         self.state.kf_last_update_ms = now_ms;
     }
 
-    /// Update risk limits and regime (simplified inline version).
+    /// Update risk limits and regime (delegate to Engine for single source of truth).
     fn update_risk_limits_and_regime(&mut self) {
-        let risk_cfg = &self.config.risk;
-
-        // Vol-scaled delta limit
-        let vol_ratio = self.state.vol_ratio_clipped.max(1e-6);
-        self.state.delta_limit_usd = risk_cfg.delta_hard_limit_usd_base / vol_ratio;
-
-        self.state.basis_limit_hard_usd = risk_cfg.basis_hard_limit_usd;
-        self.state.basis_limit_warn_usd = risk_cfg.basis_hard_limit_usd * risk_cfg.basis_warn_frac;
-
-        // Aggregate daily PnL
-        self.state.daily_pnl_total =
-            self.state.daily_realised_pnl + self.state.daily_unrealised_pnl;
-
-        // If disable_risk_regime ablation is active, skip regime switching and keep Normal
+        // If disable_risk_regime ablation is active, keep Normal unless kill is latched.
         if self.env_config.ablations.disable_risk_regime() {
-            self.state.risk_regime = RiskRegime::Normal;
-            // Don't trigger kill switch for risk reasons (but still track limits for reporting)
-            return;
-        }
-
-        // Hard breach conditions
-        let delta_abs = self.state.dollar_delta_usd.abs();
-        let basis_abs = self.state.basis_usd.abs();
-        let pnl = self.state.daily_pnl_total;
-
-        let loss_limit = -risk_cfg.daily_loss_limit.abs();
-
-        let pnl_hard_breach = pnl <= loss_limit;
-        let delta_hard_breach = delta_abs >= self.state.delta_limit_usd;
-        let basis_hard_breach = basis_abs >= self.state.basis_limit_hard_usd;
-
-        // Kill switch
-        if !self.state.kill_switch {
-            use crate::state::KillReason;
-            if pnl_hard_breach {
-                self.state.kill_switch = true;
-                self.state.kill_reason = KillReason::PnlHardBreach;
-            } else if delta_hard_breach {
-                self.state.kill_switch = true;
-                self.state.kill_reason = KillReason::DeltaHardBreach;
-            } else if basis_hard_breach {
-                self.state.kill_switch = true;
-                self.state.kill_reason = KillReason::BasisHardBreach;
-            }
-        }
-
-        // Risk regime
-        self.state.risk_regime = if self.state.kill_switch
-            || pnl_hard_breach
-            || delta_hard_breach
-            || basis_hard_breach
-        {
-            RiskRegime::HardLimit
-        } else {
-            let delta_warn = risk_cfg.delta_warn_frac * self.state.delta_limit_usd;
-            let basis_warn = self.state.basis_limit_warn_usd;
-            let pnl_warn = loss_limit * risk_cfg.pnl_warn_frac;
-
-            if delta_abs >= delta_warn || basis_abs >= basis_warn || pnl <= pnl_warn {
-                RiskRegime::Warning
+            self.state.risk_regime = if self.state.kill_switch {
+                RiskRegime::HardLimit
             } else {
                 RiskRegime::Normal
-            }
-        };
+            };
+            return;
+        }
+        let engine = Engine::new(&self.config);
+        engine.update_risk_limits_and_regime(&mut self.state);
     }
 
     /// Execute strategy with the given action.
@@ -658,11 +675,14 @@ impl SimEnv {
         // Apply action modifiers to MM intents
         let modified_intents = self.apply_action_to_intents(&mm_intents, action);
 
-        let mm_fills =
-            self.gateway
-                .process_intents(&self.config, &mut self.state, &modified_intents);
-
-        self.record_markouts_for_fills(&mm_fills, now_ms);
+        let modified_intents = self.apply_partial_fill_model(&modified_intents);
+        let mm_events = self
+            .gateway
+            .process_intents(&self.config, &modified_intents, now_ms);
+        #[cfg(feature = "event_log")]
+        self.record_events("mm", self.tick, now_ms, &mm_events);
+        let mm_fills = apply_execution_events(&mut self.state, &mm_events, now_ms);
+        self.apply_fills(&mm_fills, now_ms);
         all_fills.extend(mm_fills);
         self.state.recompute_after_fills(&self.config);
 
@@ -670,10 +690,14 @@ impl SimEnv {
         if self.config.exit.enabled {
             let exit_intents = exit::compute_exit_intents(&self.config, &self.state, now_ms);
             if !exit_intents.is_empty() {
-                let exit_fills =
-                    self.gateway
-                        .process_intents(&self.config, &mut self.state, &exit_intents);
-                self.record_markouts_for_fills(&exit_fills, now_ms);
+                let exit_intents = self.apply_partial_fill_model(&exit_intents);
+                let exit_events = self
+                    .gateway
+                    .process_intents(&self.config, &exit_intents, now_ms);
+                #[cfg(feature = "event_log")]
+                self.record_events("exit", self.tick, now_ms, &exit_events);
+                let exit_fills = apply_execution_events(&mut self.state, &exit_events, now_ms);
+                self.apply_fills(&exit_fills, now_ms);
                 all_fills.extend(exit_fills);
                 self.state.recompute_after_fills(&self.config);
             }
@@ -689,13 +713,194 @@ impl SimEnv {
         let hedge_intents = self.apply_hedge_action(&hedge_intents, action);
 
         if !hedge_intents.is_empty() {
-            let hedge_fills =
-                self.gateway
-                    .process_intents(&self.config, &mut self.state, &hedge_intents);
-            self.record_markouts_for_fills(&hedge_fills, now_ms);
+            let hedge_intents = self.apply_partial_fill_model(&hedge_intents);
+            let hedge_events = self
+                .gateway
+                .process_intents(&self.config, &hedge_intents, now_ms);
+            #[cfg(feature = "event_log")]
+            self.record_events("hedge", self.tick, now_ms, &hedge_events);
+            let hedge_fills = apply_execution_events(&mut self.state, &hedge_events, now_ms);
+            self.apply_fills(&hedge_fills, now_ms);
             all_fills.extend(hedge_fills);
             self.state.recompute_after_fills(&self.config);
         }
+    }
+
+    #[cfg(feature = "event_log")]
+    fn record_events(
+        &mut self,
+        phase: &str,
+        tick: u64,
+        now_ms: TimestampMs,
+        events: &[crate::types::ExecutionEvent],
+    ) {
+        if let Some(writer) = self.event_log.as_mut() {
+            for event in events {
+                let record = EventLogRecord {
+                    tick,
+                    now_ms,
+                    phase: phase.to_string(),
+                    event: crate::event_log::EventLogPayload::Execution(
+                        SerializableExecutionEvent::from(event),
+                    ),
+                };
+                writer.log_event(&record);
+            }
+        }
+    }
+
+    #[cfg(feature = "event_log")]
+    fn log_book_events(&mut self, now_ms: TimestampMs) {
+        if let Some(writer) = self.event_log.as_mut() {
+            for (idx, v) in self.state.venues.iter().enumerate() {
+                if let (Some(mid), Some(spread)) = (v.mid, v.spread) {
+                    let record = EventLogRecord {
+                        tick: self.tick,
+                        now_ms,
+                        phase: "book".to_string(),
+                        event: crate::event_log::EventLogPayload::Execution(
+                            SerializableExecutionEvent::from(
+                                &crate::types::ExecutionEvent::BookUpdate(
+                                    crate::types::BookUpdate {
+                                        venue_index: idx,
+                                        venue_id: v.id.clone(),
+                                        mid,
+                                        spread,
+                                        depth_near_mid: v.depth_near_mid,
+                                        timestamp_ms: now_ms,
+                                    },
+                                ),
+                            ),
+                        ),
+                    };
+                    writer.log_event(&record);
+                }
+            }
+        }
+    }
+
+    fn effective_latency_ms(&self) -> f64 {
+        let mut latency = self.env_config.latency_baseline_ms;
+        if let Some(spike) = self.env_config.latency_spike.as_ref() {
+            if self.tick >= spike.start_step && self.tick <= spike.end_step {
+                latency = spike.spike_ms;
+            }
+        }
+        latency
+    }
+
+    fn cancel_storm_active(&self) -> Option<&CancelStorm> {
+        self.env_config.cancel_storm.as_ref().and_then(|storm| {
+            if self.tick >= storm.start_step && self.tick <= storm.end_step {
+                Some(storm)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn apply_cancel_storm_toxicity_floor(&mut self) {
+        let Some(storm) = self.cancel_storm_active().cloned() else {
+            return;
+        };
+
+        let tox_high = self.config.toxicity.tox_high_threshold;
+        let tox_med = self.config.toxicity.tox_med_threshold;
+
+        for venue in self.state.venues.iter_mut() {
+            if venue.toxicity < storm.toxicity_floor {
+                venue.toxicity = storm.toxicity_floor;
+            }
+
+            venue.status = if venue.toxicity >= tox_high {
+                crate::types::VenueStatus::Disabled
+            } else if venue.toxicity >= tox_med {
+                crate::types::VenueStatus::Warning
+            } else {
+                crate::types::VenueStatus::Healthy
+            };
+        }
+    }
+
+    fn apply_partial_fill_model(&mut self, intents: &[OrderIntent]) -> Vec<OrderIntent> {
+        let model = &self.env_config.partial_fill;
+        if !model.enabled {
+            return intents.to_vec();
+        }
+
+        let latency_ms = self.effective_latency_ms();
+        let mut adjusted: Vec<OrderIntent> = Vec::with_capacity(intents.len());
+
+        let mut compute_fill_size =
+            |venue_index: usize, purpose: OrderPurpose, size: f64| -> Option<f64> {
+                let apply = match purpose {
+                    OrderPurpose::Mm => model.apply_to_mm,
+                    OrderPurpose::Exit | OrderPurpose::Hedge => true,
+                };
+                if !apply {
+                    return Some(size);
+                }
+
+                let depth = self
+                    .state
+                    .venues
+                    .get(venue_index)
+                    .map(|v| v.depth_near_mid)
+                    .unwrap_or(model.depth_ref);
+
+                let depth_factor = (depth / model.depth_ref).clamp(0.0, 1.0);
+                let latency_factor = (1.0
+                    - model.latency_sensitivity * (latency_ms / model.latency_ref_ms))
+                    .clamp(0.0, 1.0);
+                let fill_prob =
+                    (model.base_fill_prob * depth_factor * latency_factor).clamp(0.0, 1.0);
+
+                let u_fill: f64 = self.rng.gen();
+                if u_fill > fill_prob {
+                    return None;
+                }
+
+                let min_frac = model.min_fill_frac.clamp(0.0, 1.0);
+                let max_frac = model.max_fill_frac.clamp(0.0, 1.0);
+                let frac = if (max_frac - min_frac).abs() < 1e-12 {
+                    min_frac
+                } else {
+                    let u_frac: f64 = self.rng.gen();
+                    min_frac + u_frac * (max_frac - min_frac)
+                };
+
+                let size = size * frac;
+                if size <= 0.0 {
+                    return None;
+                }
+                Some(size)
+            };
+
+        for intent in intents {
+            match intent {
+                OrderIntent::Place(pi) => {
+                    if let Some(size) = compute_fill_size(pi.venue_index, pi.purpose, pi.size) {
+                        adjusted.push(OrderIntent::Place(PlaceOrderIntent { size, ..pi.clone() }));
+                    }
+                }
+                OrderIntent::Replace(ri) => {
+                    if let Some(size) = compute_fill_size(ri.venue_index, ri.purpose, ri.size) {
+                        adjusted.push(OrderIntent::Replace(ReplaceOrderIntent {
+                            size,
+                            ..ri.clone()
+                        }));
+                    }
+                }
+                OrderIntent::Cancel(ci) => {
+                    adjusted.push(OrderIntent::Cancel(ci.clone()));
+                }
+                OrderIntent::CancelAll(ci) => {
+                    adjusted.push(OrderIntent::CancelAll(ci.clone()));
+                }
+            }
+        }
+
+        adjusted
     }
 
     /// Apply action modifiers to MM intents.
@@ -706,23 +911,35 @@ impl SimEnv {
     ) -> Vec<OrderIntent> {
         intents
             .iter()
-            .map(|intent| {
-                let mut modified = intent.clone();
-
-                // Apply size scale
-                if intent.venue_index < action.size_scale.len() {
-                    modified.size *= action.size_scale[intent.venue_index];
+            .map(|intent| match intent {
+                OrderIntent::Place(pi) => {
+                    let mut modified = pi.clone();
+                    if modified.venue_index < action.size_scale.len() {
+                        modified.size *= action.size_scale[modified.venue_index];
+                    }
+                    if modified.venue_index < action.spread_scale.len() {
+                        let scale = action.spread_scale[modified.venue_index];
+                        let fair = self.state.fair_value.unwrap_or(modified.price);
+                        let offset = modified.price - fair;
+                        modified.price = fair + offset * scale;
+                    }
+                    OrderIntent::Place(modified)
                 }
-
-                // Apply spread scale to price (simplified)
-                if intent.venue_index < action.spread_scale.len() {
-                    let scale = action.spread_scale[intent.venue_index];
-                    let fair = self.state.fair_value.unwrap_or(intent.price);
-                    let offset = intent.price - fair;
-                    modified.price = fair + offset * scale;
+                OrderIntent::Replace(ri) => {
+                    let mut modified = ri.clone();
+                    if modified.venue_index < action.size_scale.len() {
+                        modified.size *= action.size_scale[modified.venue_index];
+                    }
+                    if modified.venue_index < action.spread_scale.len() {
+                        let scale = action.spread_scale[modified.venue_index];
+                        let fair = self.state.fair_value.unwrap_or(modified.price);
+                        let offset = modified.price - fair;
+                        modified.price = fair + offset * scale;
+                    }
+                    OrderIntent::Replace(modified)
                 }
-
-                modified
+                OrderIntent::Cancel(ci) => OrderIntent::Cancel(ci.clone()),
+                OrderIntent::CancelAll(ci) => OrderIntent::CancelAll(ci.clone()),
             })
             .collect()
     }
@@ -735,45 +952,27 @@ impl SimEnv {
     ) -> Vec<OrderIntent> {
         intents
             .iter()
-            .map(|intent| {
-                let mut modified = intent.clone();
-                modified.size *= action.hedge_scale;
-                modified
+            .map(|intent| match intent {
+                OrderIntent::Place(pi) => {
+                    let mut modified = pi.clone();
+                    modified.size *= action.hedge_scale;
+                    OrderIntent::Place(modified)
+                }
+                OrderIntent::Replace(ri) => {
+                    let mut modified = ri.clone();
+                    modified.size *= action.hedge_scale;
+                    OrderIntent::Replace(modified)
+                }
+                OrderIntent::Cancel(ci) => OrderIntent::Cancel(ci.clone()),
+                OrderIntent::CancelAll(ci) => OrderIntent::CancelAll(ci.clone()),
             })
             .collect()
     }
 
-    /// Record pending markouts for fills.
-    fn record_markouts_for_fills(&mut self, fills: &[FillEvent], now_ms: TimestampMs) {
-        let tox_cfg = &self.config.toxicity;
-        let horizon_ms = tox_cfg.markout_horizon_ms;
-        let max_pending = tox_cfg.max_pending_per_venue;
-
-        let fair = self
-            .state
-            .fair_value
-            .unwrap_or(self.state.fair_value_prev)
-            .max(1.0);
-
+    /// Apply fills to state (single update point for PnL/positions).
+    fn apply_fills(&mut self, fills: &[FillEvent], now_ms: TimestampMs) {
         for fill in fills {
-            let mid = self
-                .state
-                .venues
-                .get(fill.venue_index)
-                .and_then(|v| v.mid)
-                .unwrap_or(fair);
-
-            self.state.record_pending_markout(PendingMarkoutRecord {
-                venue_index: fill.venue_index,
-                side: fill.side,
-                size_tao: fill.size,
-                price: fill.price,
-                now_ms,
-                fair,
-                mid,
-                horizon_ms,
-                max_pending,
-            });
+            self.state.apply_fill_event(fill, now_ms, &self.config);
         }
     }
 
@@ -823,6 +1022,9 @@ impl SimEnv {
             basis_usd: self.state.basis_usd,
             domain_rand_sample: self.current_domain_rand.clone(),
             reward_components: None,
+            policy_action_raw: None,
+            policy_action_applied: None,
+            policy_rejection_reasons: None,
         }
     }
 }

@@ -63,6 +63,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+use serde::Serialize;
 use serde_json::{self, Value as JsonValue};
 
 use crate::config::Config;
@@ -70,8 +71,10 @@ use crate::exit::compute_exit_edge_components;
 use crate::hedge::compute_hedge_cost_components;
 use crate::mm::{compute_mm_quotes, compute_mm_reservation_components};
 use crate::state::{GlobalState, KillEvent};
-use crate::types::{ExecutionEvent, FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
 use crate::treasury::TreasuryGuidanceEngine;
+use crate::types::{
+    ExecutionEvent, FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus,
+};
 /// Current telemetry schema version.
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -334,7 +337,23 @@ pub struct TelemetryInputs<'a> {
     pub last_hedge_intent: Option<&'a OrderIntent>,
     pub kill_event: Option<&'a KillEvent>,
     pub shadow_mode: bool,
+    pub execution_mode: &'a str,
+    pub reconcile_drift: &'a [ReconcileDriftRecord],
     pub max_orders_per_tick: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconcileDriftRecord {
+    pub timestamp_ms: TimestampMs,
+    pub venue_index: usize,
+    pub venue_id: String,
+    pub kind: String,
+    pub internal: Option<f64>,
+    pub venue: Option<f64>,
+    pub diff: Option<f64>,
+    pub tolerance: Option<f64>,
+    pub source: String,
+    pub available: bool,
 }
 
 impl TelemetryBuilder {
@@ -375,6 +394,8 @@ impl TelemetryBuilder {
         };
 
         let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
+        let healthy_venues_used = compute_healthy_venues_used(state, now_ms);
+        let healthy_venues_used_count = healthy_venues_used.len();
         let mut record = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "t": tick,
@@ -397,10 +418,23 @@ impl TelemetryBuilder {
             "kf_x_hat": state.kf_x_hat,
             "kf_last_update_ms": state.kf_last_update_ms,
             "regime_ratio": state.vol_ratio_clipped,
-            "healthy_venues_used_count": state.healthy_venues_used_count,
-            "healthy_venues_used": state.healthy_venues_used,
+            "healthy_venues_used_count": healthy_venues_used_count,
+            "healthy_venues_used": healthy_venues_used,
             "config_version_id": cfg.version,
+            "execution_mode": input.execution_mode,
         });
+
+        if !input.reconcile_drift.is_empty() {
+            let drift = input
+                .reconcile_drift
+                .iter()
+                .map(|rec| serde_json::to_value(rec).unwrap_or_default())
+                .collect::<Vec<_>>();
+            record.as_object_mut().expect("telemetry record").insert(
+                "reconcile_drift".to_string(),
+                serde_json::Value::Array(drift),
+            );
+        }
 
         if let serde_json::Value::Object(map) = &mut record {
             self.treasury.update(state, fair);
@@ -409,7 +443,10 @@ impl TelemetryBuilder {
                 self.treasury.build_guidance(state, tick, now_ms),
             );
             let quote_levels = build_quote_levels(cfg, state, fair);
-            map.insert("quote_levels".to_string(), serde_json::Value::Array(quote_levels));
+            map.insert(
+                "quote_levels".to_string(),
+                serde_json::Value::Array(quote_levels),
+            );
 
             let (orders, would_send_orders, would_send_truncated) = build_order_records(
                 cfg,
@@ -425,9 +462,7 @@ impl TelemetryBuilder {
             );
             map.insert(
                 "would_send_orders_count".to_string(),
-                serde_json::Value::Number(
-                    serde_json::Number::from(input.intents.len() as u64),
-                ),
+                serde_json::Value::Number(serde_json::Number::from(input.intents.len() as u64)),
             );
             map.insert(
                 "would_send_orders_truncated".to_string(),
@@ -456,11 +491,20 @@ impl TelemetryBuilder {
                 now_ms,
             );
             map.insert("hedges".to_string(), serde_json::Value::Array(hedges));
-            map.insert("hedge_x_t".to_string(), serde_json::json!(state.q_global_tao));
-            map.insert("hedge_delta_h_t".to_string(), serde_json::json!(hedge_delta_h_t));
+            map.insert(
+                "hedge_x_t".to_string(),
+                serde_json::json!(state.q_global_tao),
+            );
+            map.insert(
+                "hedge_delta_h_t".to_string(),
+                serde_json::json!(hedge_delta_h_t),
+            );
 
             let risk_events = self.build_risk_events(cfg, state, now_ms);
-            map.insert("risk_events".to_string(), serde_json::Value::Array(risk_events));
+            map.insert(
+                "risk_events".to_string(),
+                serde_json::Value::Array(risk_events),
+            );
 
             let venue_metrics = build_venue_metrics(state, now_ms);
             for (key, value) in venue_metrics {
@@ -569,7 +613,9 @@ impl TelemetryBuilder {
         }
 
         for (idx, v) in state.venues.iter().enumerate() {
-            if self.prev_venue_status.get(idx).map(|s| s.as_str()) != Some(&format!("{:?}", v.status)) {
+            if self.prev_venue_status.get(idx).map(|s| s.as_str())
+                != Some(&format!("{:?}", v.status))
+            {
                 if matches!(v.status, VenueStatus::Disabled) {
                     events.push(serde_json::json!({
                         "event_type": "venue_disabled",
@@ -578,7 +624,8 @@ impl TelemetryBuilder {
                     }));
                 }
             }
-            let liq_warn = v.dist_liq_sigma.is_finite() && v.dist_liq_sigma <= cfg.risk.liq_warn_sigma;
+            let liq_warn =
+                v.dist_liq_sigma.is_finite() && v.dist_liq_sigma <= cfg.risk.liq_warn_sigma;
             if liq_warn && !self.prev_liq_warn.get(idx).copied().unwrap_or(false) {
                 events.push(serde_json::json!({
                     "event_type": "liq_warn",
@@ -613,6 +660,33 @@ impl TelemetryBuilder {
     }
 }
 
+fn compute_age_ms(now_ms: TimestampMs, last_mid_update_ms: Option<TimestampMs>) -> TimestampMs {
+    match last_mid_update_ms {
+        None => -1,
+        Some(ts) => {
+            if now_ms >= ts {
+                now_ms - ts
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn compute_healthy_venues_used(state: &GlobalState, now_ms: TimestampMs) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (idx, venue) in state.venues.iter().enumerate() {
+        if !matches!(venue.status, VenueStatus::Healthy) {
+            continue;
+        }
+        let age_ms = compute_age_ms(now_ms, venue.last_mid_update_ms);
+        if age_ms >= 0 {
+            out.push(idx);
+        }
+    }
+    out
+}
+
 fn build_quote_levels(cfg: &Config, state: &GlobalState, fair: f64) -> Vec<JsonValue> {
     let components = compute_mm_reservation_components(cfg, state);
     let quotes = compute_mm_quotes(cfg, state);
@@ -631,7 +705,11 @@ fn build_quote_levels(cfg: &Config, state: &GlobalState, fair: f64) -> Vec<JsonV
         let (bid_price, bid_size, ask_price, ask_size) = quote_by_venue[idx];
         let basis_adj = components.basis_adj_usd.get(idx).copied().unwrap_or(0.0);
         let funding_adj = components.funding_adj_usd.get(idx).copied().unwrap_or(0.0);
-        let inv_term = components.inventory_term_usd.get(idx).copied().unwrap_or(0.0);
+        let inv_term = components
+            .inventory_term_usd
+            .get(idx)
+            .copied()
+            .unwrap_or(0.0);
         let s_tilde = fair + basis_adj + funding_adj - inv_term;
         let delta_final = match (bid_price, ask_price) {
             (Some(b), Some(a)) if a >= b => (a - b) / 2.0,
@@ -663,7 +741,7 @@ fn build_quote_levels(cfg: &Config, state: &GlobalState, fair: f64) -> Vec<JsonV
 
         out.push(serde_json::json!({
             "venue_index": idx,
-            "venue_id": v.id,
+            "venue_id": v.id.as_ref(),
             "side": "Bid",
             "s_tilde": s_tilde,
             "basis_adj_usd": basis_adj,
@@ -681,7 +759,7 @@ fn build_quote_levels(cfg: &Config, state: &GlobalState, fair: f64) -> Vec<JsonV
         }));
         out.push(serde_json::json!({
             "venue_index": idx,
-            "venue_id": v.id,
+            "venue_id": v.id.as_ref(),
             "side": "Ask",
             "s_tilde": s_tilde,
             "basis_adj_usd": basis_adj,
@@ -760,68 +838,80 @@ fn build_order_records(
     let mut would_send = Vec::new();
 
     for intent in intents {
-        let (action, venue_index, venue_id, side, price, size, tif, post_only, reduce_only, purpose, order_id, client_order_id) =
-            match intent {
-                OrderIntent::Place(pi) => (
-                    "place",
-                    pi.venue_index as i64,
-                    pi.venue_id.to_string(),
-                    Some(format!("{:?}", pi.side)),
-                    Some(pi.price),
-                    Some(pi.size),
-                    Some(format!("{:?}", pi.time_in_force)),
-                    Some(pi.post_only),
-                    Some(pi.reduce_only),
-                    Some(format!("{:?}", pi.purpose)),
-                    None,
-                    pi.client_order_id.clone(),
-                ),
-                OrderIntent::Cancel(ci) => (
-                    "cancel",
-                    ci.venue_index as i64,
-                    ci.venue_id.to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(ci.order_id.clone()),
-                    None,
-                ),
-                OrderIntent::Replace(ri) => (
-                    "replace",
-                    ri.venue_index as i64,
-                    ri.venue_id.to_string(),
-                    Some(format!("{:?}", ri.side)),
-                    Some(ri.price),
-                    Some(ri.size),
-                    Some(format!("{:?}", ri.time_in_force)),
-                    Some(ri.post_only),
-                    Some(ri.reduce_only),
-                    Some(format!("{:?}", ri.purpose)),
-                    Some(ri.order_id.clone()),
-                    ri.client_order_id.clone(),
-                ),
-                OrderIntent::CancelAll(ci) => (
-                    "cancel_all",
-                    ci.venue_index.map(|v| v as i64).unwrap_or(-1),
-                    ci.venue_id
-                        .as_ref()
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "ALL".to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            };
+        let (
+            action,
+            venue_index,
+            venue_id,
+            side,
+            price,
+            size,
+            tif,
+            post_only,
+            reduce_only,
+            purpose,
+            order_id,
+            client_order_id,
+        ) = match intent {
+            OrderIntent::Place(pi) => (
+                "place",
+                pi.venue_index as i64,
+                pi.venue_id.to_string(),
+                Some(format!("{:?}", pi.side)),
+                Some(pi.price),
+                Some(pi.size),
+                Some(format!("{:?}", pi.time_in_force)),
+                Some(pi.post_only),
+                Some(pi.reduce_only),
+                Some(format!("{:?}", pi.purpose)),
+                None,
+                pi.client_order_id.clone(),
+            ),
+            OrderIntent::Cancel(ci) => (
+                "cancel",
+                ci.venue_index as i64,
+                ci.venue_id.to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ci.order_id.clone()),
+                None,
+            ),
+            OrderIntent::Replace(ri) => (
+                "replace",
+                ri.venue_index as i64,
+                ri.venue_id.to_string(),
+                Some(format!("{:?}", ri.side)),
+                Some(ri.price),
+                Some(ri.size),
+                Some(format!("{:?}", ri.time_in_force)),
+                Some(ri.post_only),
+                Some(ri.reduce_only),
+                Some(format!("{:?}", ri.purpose)),
+                Some(ri.order_id.clone()),
+                ri.client_order_id.clone(),
+            ),
+            OrderIntent::CancelAll(ci) => (
+                "cancel_all",
+                ci.venue_index.map(|v| v as i64).unwrap_or(-1),
+                ci.venue_id
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "ALL".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        };
 
         let action_id = build_order_action_id(
             action,
@@ -875,7 +965,7 @@ fn build_order_records(
                     "action": action,
                     "status": "ack",
                     "venue_index": ack.venue_index as i64,
-                    "venue_id": ack.venue_id,
+                    "venue_id": ack.venue_id.as_ref(),
                     "side": side_str,
                     "price": ack.price,
                     "size": ack.size,
@@ -903,7 +993,7 @@ fn build_order_records(
                     "action": "place",
                     "status": "reject",
                     "venue_index": rej.venue_index as i64,
-                    "venue_id": rej.venue_id,
+                    "venue_id": rej.venue_id.as_ref(),
                     "side": Option::<String>::None,
                     "price": Option::<f64>::None,
                     "size": Option::<f64>::None,
@@ -967,7 +1057,10 @@ fn order_sort_key(value: &JsonValue) -> (String, i64, String, i64, i64, String, 
         .to_string();
     let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    let venue_index = value.get("venue_index").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let venue_index = value
+        .get("venue_index")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
     let side = value.get("side").and_then(|v| v.as_str()).unwrap_or("");
     let price = value
         .get("price")
@@ -990,14 +1083,18 @@ fn order_sort_key(value: &JsonValue) -> (String, i64, String, i64, i64, String, 
     )
 }
 
-fn build_fill_records(state: &GlobalState, fills: &[FillEvent], now_ms: TimestampMs) -> Vec<JsonValue> {
+fn build_fill_records(
+    state: &GlobalState,
+    fills: &[FillEvent],
+    now_ms: TimestampMs,
+) -> Vec<JsonValue> {
     let mut out = Vec::new();
     for fill in fills {
         let record = find_fill_record(state, fill, now_ms);
         out.push(serde_json::json!({
             "fill_seq": record.as_ref().map(|r| r.fill_seq),
             "venue_index": fill.venue_index as i64,
-            "venue_id": fill.venue_id,
+            "venue_id": fill.venue_id.as_ref(),
             "order_id": fill.order_id,
             "client_order_id": fill.client_order_id,
             "side": format!("{:?}", fill.side),
@@ -1020,13 +1117,20 @@ fn build_fill_records(state: &GlobalState, fills: &[FillEvent], now_ms: Timestam
 
 fn fill_sort_key(value: &JsonValue) -> (i64, i64, i64, String) {
     let seq = value.get("fill_seq").and_then(|v| v.as_i64()).unwrap_or(-1);
-    let venue_index = value.get("venue_index").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let venue_index = value
+        .get("venue_index")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
     let price = value
         .get("price")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0)
         .to_bits() as i64;
-    let side = value.get("side").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let side = value
+        .get("side")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     (seq, venue_index, price, side)
 }
 
@@ -1079,10 +1183,13 @@ fn build_exit_records(
     now_ms: TimestampMs,
 ) -> Vec<JsonValue> {
     let mut out = Vec::new();
-    let mut fill_sizes: std::collections::HashMap<(usize, Side), f64> = std::collections::HashMap::new();
+    let mut fill_sizes: std::collections::HashMap<(usize, Side), f64> =
+        std::collections::HashMap::new();
     for fill in fills {
         if matches!(fill.purpose, OrderPurpose::Exit) {
-            *fill_sizes.entry((fill.venue_index, fill.side)).or_insert(0.0) += fill.size;
+            *fill_sizes
+                .entry((fill.venue_index, fill.side))
+                .or_insert(0.0) += fill.size;
         }
     }
     for intent in intents {
@@ -1092,7 +1199,10 @@ fn build_exit_records(
             }
             let components = compute_exit_edge_components(cfg, state, now_ms, intent);
             let components_json = components.as_ref().map(exit_components_to_json);
-            let filled = fill_sizes.get(&(pi.venue_index, pi.side)).copied().unwrap_or(0.0);
+            let filled = fill_sizes
+                .get(&(pi.venue_index, pi.side))
+                .copied()
+                .unwrap_or(0.0);
             let entry_fill_seqs = state
                 .venues
                 .get(pi.venue_index)
@@ -1122,7 +1232,7 @@ fn build_exit_records(
             });
             out.push(serde_json::json!({
                 "venue_index": pi.venue_index as i64,
-                "venue_id": pi.venue_id,
+                "venue_id": pi.venue_id.as_ref(),
                 "side": format!("{:?}", pi.side),
                 "intended_size": pi.size,
                 "filled_size": filled,
@@ -1158,10 +1268,13 @@ fn build_hedge_records(
 ) -> (Vec<JsonValue>, f64) {
     let mut out = Vec::new();
     let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
-    let mut filled_by_venue: std::collections::HashMap<(usize, Side), f64> = std::collections::HashMap::new();
+    let mut filled_by_venue: std::collections::HashMap<(usize, Side), f64> =
+        std::collections::HashMap::new();
     for fill in fills {
         if matches!(fill.purpose, OrderPurpose::Hedge) {
-            *filled_by_venue.entry((fill.venue_index, fill.side)).or_insert(0.0) += fill.size;
+            *filled_by_venue
+                .entry((fill.venue_index, fill.side))
+                .or_insert(0.0) += fill.size;
         }
     }
     let mut delta_h_t = 0.0;
@@ -1177,11 +1290,14 @@ fn build_hedge_records(
             delta_h_t += signed;
             let components = compute_hedge_cost_components(cfg, state, intent);
             let components_json = components.as_ref().map(hedge_components_to_json);
-            let filled = filled_by_venue.get(&(pi.venue_index, pi.side)).copied().unwrap_or(0.0);
+            let filled = filled_by_venue
+                .get(&(pi.venue_index, pi.side))
+                .copied()
+                .unwrap_or(0.0);
             let venue = state.venues.get(pi.venue_index);
             out.push(serde_json::json!({
                 "venue_index": pi.venue_index as i64,
-                "venue_id": pi.venue_id,
+                "venue_id": pi.venue_id.as_ref(),
                 "side": format!("{:?}", pi.side),
                 "delta_h_v": signed,
                 "intended_size": pi.size,
@@ -1236,10 +1352,7 @@ fn build_venue_metrics(state: &GlobalState, now_ms: TimestampMs) -> Vec<(String,
         venue_depth.push(venue.depth_near_mid);
         venue_status.push(format!("{:?}", venue.status));
         venue_toxicity.push(venue.toxicity);
-        let age = venue
-            .last_mid_update_ms
-            .map(|ts| now_ms.saturating_sub(ts))
-            .unwrap_or(-1);
+        let age = compute_age_ms(now_ms, venue.last_mid_update_ms);
         venue_age_ms.push(age);
         venue_position.push(venue.position_tao);
         venue_dist_liq_sigma.push(venue.dist_liq_sigma);
@@ -1249,12 +1362,14 @@ fn build_venue_metrics(state: &GlobalState, now_ms: TimestampMs) -> Vec<(String,
         venue_margin_balance.push(venue.margin_balance_usd);
         venue_margin_available.push(venue.margin_available_usd);
         venue_margin_used.push(venue.margin_used_usd);
-        let (maker_volume, taker_volume) = venue.recent_fills.iter().fold((0.0, 0.0), |acc, fill| {
-            match fill.purpose {
-                OrderPurpose::Mm => (acc.0 + fill.size, acc.1),
-                OrderPurpose::Exit | OrderPurpose::Hedge => (acc.0, acc.1 + fill.size),
-            }
-        });
+        let (maker_volume, taker_volume) =
+            venue
+                .recent_fills
+                .iter()
+                .fold((0.0, 0.0), |acc, fill| match fill.purpose {
+                    OrderPurpose::Mm => (acc.0 + fill.size, acc.1),
+                    OrderPurpose::Exit | OrderPurpose::Hedge => (acc.0, acc.1 + fill.size),
+                });
         venue_maker_volume.push(maker_volume);
         venue_taker_volume.push(taker_volume);
         let fills_count = venue.recent_fills.len() as f64;
@@ -1270,23 +1385,68 @@ fn build_venue_metrics(state: &GlobalState, now_ms: TimestampMs) -> Vec<(String,
 
     vec![
         ("venue_mid_usd".to_string(), serde_json::json!(venue_mid)),
-        ("venue_spread_usd".to_string(), serde_json::json!(venue_spread)),
-        ("venue_depth_near_mid_usd".to_string(), serde_json::json!(venue_depth)),
+        (
+            "venue_spread_usd".to_string(),
+            serde_json::json!(venue_spread),
+        ),
+        (
+            "venue_depth_near_mid_usd".to_string(),
+            serde_json::json!(venue_depth),
+        ),
         ("venue_status".to_string(), serde_json::json!(venue_status)),
-        ("venue_toxicity".to_string(), serde_json::json!(venue_toxicity)),
+        (
+            "venue_toxicity".to_string(),
+            serde_json::json!(venue_toxicity),
+        ),
         ("venue_age_ms".to_string(), serde_json::json!(venue_age_ms)),
-        ("venue_position_tao".to_string(), serde_json::json!(venue_position)),
-        ("venue_dist_liq_sigma".to_string(), serde_json::json!(venue_dist_liq_sigma)),
-        ("venue_funding_8h".to_string(), serde_json::json!(venue_funding_8h)),
-        ("venue_local_vol_short".to_string(), serde_json::json!(venue_local_vol_short)),
-        ("venue_local_vol_long".to_string(), serde_json::json!(venue_local_vol_long)),
-        ("venue_margin_balance_usd".to_string(), serde_json::json!(venue_margin_balance)),
-        ("venue_margin_available_usd".to_string(), serde_json::json!(venue_margin_available)),
-        ("venue_margin_used_usd".to_string(), serde_json::json!(venue_margin_used)),
-        ("venue_maker_volume".to_string(), serde_json::json!(venue_maker_volume)),
-        ("venue_taker_volume".to_string(), serde_json::json!(venue_taker_volume)),
-        ("venue_fill_rate".to_string(), serde_json::json!(venue_fill_rate)),
-        ("venue_markout_ewma_usd_per_tao".to_string(), serde_json::json!(venue_markout_ewma)),
+        (
+            "venue_position_tao".to_string(),
+            serde_json::json!(venue_position),
+        ),
+        (
+            "venue_dist_liq_sigma".to_string(),
+            serde_json::json!(venue_dist_liq_sigma),
+        ),
+        (
+            "venue_funding_8h".to_string(),
+            serde_json::json!(venue_funding_8h),
+        ),
+        (
+            "venue_local_vol_short".to_string(),
+            serde_json::json!(venue_local_vol_short),
+        ),
+        (
+            "venue_local_vol_long".to_string(),
+            serde_json::json!(venue_local_vol_long),
+        ),
+        (
+            "venue_margin_balance_usd".to_string(),
+            serde_json::json!(venue_margin_balance),
+        ),
+        (
+            "venue_margin_available_usd".to_string(),
+            serde_json::json!(venue_margin_available),
+        ),
+        (
+            "venue_margin_used_usd".to_string(),
+            serde_json::json!(venue_margin_used),
+        ),
+        (
+            "venue_maker_volume".to_string(),
+            serde_json::json!(venue_maker_volume),
+        ),
+        (
+            "venue_taker_volume".to_string(),
+            serde_json::json!(venue_taker_volume),
+        ),
+        (
+            "venue_fill_rate".to_string(),
+            serde_json::json!(venue_fill_rate),
+        ),
+        (
+            "venue_markout_ewma_usd_per_tao".to_string(),
+            serde_json::json!(venue_markout_ewma),
+        ),
     ]
 }
 
@@ -1299,6 +1459,8 @@ impl Drop for TelemetrySink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::state::GlobalState;
     use serde_json::json;
 
     #[test]
@@ -1334,5 +1496,112 @@ mod tests {
     fn ensure_schema_v1_panics_on_non_object_debug() {
         let mut record = json!([1, 2, 3]);
         ensure_schema_v1(&mut record);
+    }
+
+    #[test]
+    fn venue_metrics_reflect_book_updates() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        for (idx, venue) in state.venues.iter_mut().enumerate() {
+            venue.mid = Some(100.0 + idx as f64);
+            venue.spread = Some(0.5);
+            venue.depth_near_mid = 10.0 + idx as f64;
+            venue.last_mid_update_ms = Some(1_000);
+        }
+        let metrics = build_venue_metrics(&state, 1_050);
+        let mid = metrics
+            .iter()
+            .find(|(k, _)| k == "venue_mid_usd")
+            .and_then(|(_, v)| v.as_array())
+            .expect("venue_mid_usd");
+        let age = metrics
+            .iter()
+            .find(|(k, _)| k == "venue_age_ms")
+            .and_then(|(_, v)| v.as_array())
+            .expect("venue_age_ms");
+        let depth = metrics
+            .iter()
+            .find(|(k, _)| k == "venue_depth_near_mid_usd")
+            .and_then(|(_, v)| v.as_array())
+            .expect("venue_depth_near_mid_usd");
+        for idx in 0..cfg.venues.len() {
+            assert!(mid[idx].as_f64().unwrap_or(0.0) > 0.0);
+            assert!(age[idx].as_i64().unwrap_or(-1) >= 0);
+            assert!(depth[idx].as_f64().unwrap_or(0.0) > 0.0);
+        }
+    }
+
+    #[test]
+    fn healthy_venues_used_matches_statuses() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 1_000;
+        let statuses = [
+            VenueStatus::Disabled,
+            VenueStatus::Healthy,
+            VenueStatus::Healthy,
+            VenueStatus::Disabled,
+            VenueStatus::Healthy,
+        ];
+        for (idx, venue) in state.venues.iter_mut().enumerate() {
+            let status = if idx < statuses.len() {
+                statuses[idx]
+            } else {
+                VenueStatus::Disabled
+            };
+            venue.status = status;
+            if matches!(venue.status, VenueStatus::Healthy) {
+                venue.last_mid_update_ms = Some(900);
+            }
+        }
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "shadow",
+            reconcile_drift: &[],
+            max_orders_per_tick: 0,
+        });
+        let used = record
+            .get("healthy_venues_used")
+            .and_then(|v| v.as_array())
+            .expect("healthy_venues_used");
+        let used_count = record
+            .get("healthy_venues_used_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let indices: Vec<u64> = used.iter().filter_map(|v| v.as_u64()).collect();
+        assert_eq!(indices, vec![1, 2, 4]);
+        assert_eq!(used_count, 3);
+    }
+
+    #[test]
+    fn venue_age_clamps_future_timestamp_and_keeps_missing() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+
+        state.venues[0].status = VenueStatus::Healthy;
+        state.venues[0].last_mid_update_ms = Some(now_ms + 500);
+        state.venues[1].status = VenueStatus::Healthy;
+        state.venues[1].last_mid_update_ms = None;
+
+        let metrics = build_venue_metrics(&state, now_ms);
+        let age = metrics
+            .iter()
+            .find(|(k, _)| k == "venue_age_ms")
+            .and_then(|(_, v)| v.as_array())
+            .expect("venue_age_ms");
+        assert_eq!(age[0].as_i64().unwrap_or(-1), 0);
+        assert_eq!(age[1].as_i64().unwrap_or(0), -1);
     }
 }

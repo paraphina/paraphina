@@ -14,13 +14,13 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::super::gateway::{
-    BoxFuture, LiveGatewayError, LiveGatewayErrorKind, LiveRestCancelAllRequest, LiveRestCancelRequest,
-    LiveRestClient, LiveRestPlaceRequest, LiveRestResponse, LiveResult,
+    BoxFuture, LiveGatewayError, LiveGatewayErrorKind, LiveRestCancelAllRequest,
+    LiveRestCancelRequest, LiveRestClient, LiveRestPlaceRequest, LiveRestResponse, LiveResult,
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, LiquidationSnapshot, MarginSnapshot,
-    MarketDataEvent, PositionSnapshot,
+    MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::types::{Side, TimeInForce, TimestampMs};
 
@@ -41,6 +41,7 @@ pub struct ParadexConfig {
     pub market: String,
     pub account_path: String,
     pub order_path: String,
+    pub venue_index: usize,
     pub jwt: Option<String>,
     pub auth_payload_json: Option<Value>,
     pub record_dir: Option<PathBuf>,
@@ -54,12 +55,11 @@ impl ParadexConfig {
             .unwrap_or_else(|_| "https://api.prod.paradex.trade/v1".to_string());
         let auth_url = std::env::var("PARADEX_AUTH_URL")
             .unwrap_or_else(|_| "https://api.prod.paradex.trade/v1/auth/token".to_string());
-        let market = std::env::var("PARADEX_MARKET")
-            .unwrap_or_else(|_| "BTC-USD-PERP".to_string());
-        let account_path = std::env::var("PARADEX_ACCOUNT_PATH")
-            .unwrap_or_else(|_| "/account".to_string());
-        let order_path = std::env::var("PARADEX_ORDER_PATH")
-            .unwrap_or_else(|_| "/orders".to_string());
+        let market = std::env::var("PARADEX_MARKET").unwrap_or_else(|_| "BTC-USD-PERP".to_string());
+        let account_path =
+            std::env::var("PARADEX_ACCOUNT_PATH").unwrap_or_else(|_| "/account".to_string());
+        let order_path =
+            std::env::var("PARADEX_ORDER_PATH").unwrap_or_else(|_| "/orders".to_string());
         let jwt = std::env::var("PARADEX_JWT").ok();
         let auth_payload_json = std::env::var("PARADEX_AUTH_PAYLOAD_JSON")
             .ok()
@@ -71,6 +71,7 @@ impl ParadexConfig {
             market,
             account_path,
             order_path,
+            venue_index: 0,
             jwt,
             auth_payload_json,
             record_dir: None,
@@ -122,36 +123,162 @@ impl ParadexConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
+        eprintln!("INFO: Paradex public WS connecting url={}", self.cfg.ws_url);
         let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        eprintln!("INFO: Paradex public WS connected url={}", self.cfg.ws_url);
         let (mut write, mut read) = ws_stream.split();
-        let sub = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "subscribe",
-            "params": {
-                "channel": "orderbook",
-                "market": self.cfg.market,
-            }
-        });
-        write.send(Message::Text(sub.to_string())).await?;
+        let mut subscribed = false;
+        let channel = format!("bbo.{}", self.cfg.market);
+        let subscribe =
+            ParadexSubscribeCandidate::new("subscribe", serde_json::json!({ "channel": channel }));
+        send_paradex_subscribe(&mut write, &subscribe).await?;
+        eprintln!(
+            "INFO: Paradex subscribed channel={}",
+            format!("bbo.{}", self.cfg.market)
+        );
 
-        let mut tracker = ParadexSeqState::new();
+        let mut tracker = ParadexSeqState::new(self.cfg.venue_index);
+        let mut first_book_update_logged = false;
+        let mut first_message_logged = false;
+        let mut first_message_keys_logged = false;
+        let mut logged_non_utf8_binary = false;
+        let mut first_decoded_top_logged = false;
+        let mut decode_miss_count = 0usize;
+        let mut bbo_seq: u64 = 0;
         while let Some(msg) = read.next().await {
             let msg = msg?;
-            if let Message::Text(text) = msg {
-                if let Some(recorder) = self.recorder.as_ref() {
-                    let mut guard = recorder.lock().await;
-                    let _ = guard.record_ws_frame(&text);
+            let payload = match msg {
+                Message::Text(text) => text,
+                Message::Binary(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        if !logged_non_utf8_binary {
+                            eprintln!(
+                                "WARN: Paradex public WS non-utf8 binary frame url={}",
+                                self.cfg.ws_url
+                            );
+                            logged_non_utf8_binary = true;
+                        }
+                        continue;
+                    }
+                },
+                Message::Ping(payload) => {
+                    let _ = write.send(Message::Pong(payload)).await;
+                    continue;
                 }
-                if let Some(event) = parse_orderbook_message(&text, &mut tracker)? {
-                    let _ = self.market_tx.send(event).await;
+                _ => continue,
+            };
+            if !first_message_logged {
+                eprintln!("INFO: Paradex public WS first message received");
+                first_message_logged = true;
+            }
+            if let Some(recorder) = self.recorder.as_ref() {
+                let mut guard = recorder.lock().await;
+                let _ = guard.record_ws_frame(&payload);
+            }
+            let value = match serde_json::from_str::<Value>(&payload) {
+                Ok(value) => value,
+                Err(err) => {
+                    let snippet: String = payload.chars().take(160).collect();
+                    eprintln!(
+                        "WARN: Paradex public WS parse error: {err} url={} snippet={}",
+                        self.cfg.ws_url, snippet
+                    );
+                    continue;
                 }
-            } else if let Message::Ping(payload) = msg {
-                let _ = write.send(Message::Pong(payload)).await;
+            };
+            if !first_message_keys_logged {
+                let keys = value
+                    .as_object()
+                    .map(|obj| {
+                        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                        keys.sort();
+                        format!("[{}]", keys.join(","))
+                    })
+                    .unwrap_or_else(|| "[non-object]".to_string());
+                let snippet: String = payload.chars().take(160).collect();
+                eprintln!("INFO: Paradex WS first msg keys={keys} snippet={snippet}");
+                first_message_keys_logged = true;
+            }
+            if !subscribed {
+                if paradex_subscribe_error(&value) {
+                    if let Some(err) = value.get("error") {
+                        eprintln!("WARN: Paradex subscribe error: {err}");
+                    }
+                    anyhow::bail!("Paradex subscribe failed: invalid channel");
+                }
+                if value.get("id").and_then(|v| v.as_i64()) == Some(1)
+                    && value.get("result").is_some()
+                {
+                    subscribed = true;
+                }
+            }
+            if let Some((top, snapshot)) = decode_bbo_top_and_snapshot(
+                &value,
+                self.cfg.venue_index,
+                &self.cfg.market,
+                &mut bbo_seq,
+            ) {
+                if !first_decoded_top_logged {
+                    eprintln!(
+                        "FIRST_DECODED_TOP venue=paradex bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                        top.best_bid_px, top.best_bid_sz, top.best_ask_px, top.best_ask_sz
+                    );
+                    first_decoded_top_logged = true;
+                }
+                if !first_book_update_logged {
+                    eprintln!("INFO: Paradex public WS first book update");
+                    first_book_update_logged = true;
+                }
+                if let Err(err) = self.market_tx.send(snapshot).await {
+                    eprintln!("Paradex public WS market send failed: {err}");
+                }
+            }
+            if subscribed {
+                if !has_paradex_book_fields(&value) {
+                    continue;
+                }
+                if let Some(top) = decode_top_of_book_value(&value) {
+                    if !first_decoded_top_logged {
+                        eprintln!(
+                            "FIRST_DECODED_TOP venue=paradex bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                            top.best_bid_px, top.best_bid_sz, top.best_ask_px, top.best_ask_sz
+                        );
+                        first_decoded_top_logged = true;
+                    }
+                } else if decode_miss_count < 3 {
+                    decode_miss_count += 1;
+                    log_decode_miss(
+                        "Paradex",
+                        &value,
+                        &payload,
+                        decode_miss_count,
+                        self.cfg.ws_url.as_str(),
+                    );
+                }
+            }
+            if let Some(event) = parse_orderbook_message_value(&value, &mut tracker)? {
+                if !first_book_update_logged {
+                    eprintln!("INFO: Paradex public WS first book update");
+                    first_book_update_logged = true;
+                }
+                let _ = self.market_tx.send(event).await;
             }
         }
         Ok(())
     }
+}
+
+fn has_paradex_book_fields(value: &Value) -> bool {
+    let payload = value
+        .get("params")
+        .or_else(|| value.get("data"))
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+    payload.get("bids").is_some()
+        || payload.get("asks").is_some()
+        || payload.get("bid").is_some()
+        || payload.get("ask").is_some()
 }
 
 #[derive(Clone)]
@@ -199,9 +326,8 @@ impl ParadexRestClient {
             }
         }
         let token = self.fetch_token().await?;
-        let jwt = token_token(&token).ok_or_else(|| {
-            LiveGatewayError::fatal("paradex auth token missing access_token")
-        })?;
+        let jwt = token_token(&token)
+            .ok_or_else(|| LiveGatewayError::fatal("paradex auth token missing access_token"))?;
         *guard = Some(token);
         Ok(jwt)
     }
@@ -262,8 +388,9 @@ impl ParadexRestClient {
         if !status.is_success() {
             return Err(map_rest_error(status.as_u16(), &body));
         }
-        let value: Value = serde_json::from_str(&body)
-            .map_err(|err| LiveGatewayError::fatal(format!("paradex account parse error: {err}")))?;
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("paradex account parse error: {err}"))
+        })?;
         parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
             LiveGatewayError::fatal("paradex account snapshot missing required fields")
         })
@@ -378,13 +505,15 @@ struct ParadexDelta {
 struct ParadexSeqState {
     last_seq: Option<u64>,
     has_snapshot: bool,
+    venue_index: usize,
 }
 
 impl ParadexSeqState {
-    fn new() -> Self {
+    fn new(venue_index: usize) -> Self {
         Self {
             last_seq: None,
             has_snapshot: false,
+            venue_index,
         }
     }
 
@@ -395,7 +524,7 @@ impl ParadexSeqState {
                 self.has_snapshot = true;
                 Ok(Some(MarketDataEvent::L2Snapshot(
                     super::super::types::L2Snapshot {
-                        venue_index: 0,
+                        venue_index: self.venue_index,
                         venue_id: snapshot.market,
                         seq: snapshot.seq,
                         timestamp_ms: snapshot.timestamp_ms,
@@ -435,7 +564,7 @@ impl ParadexSeqState {
                 changes.extend(delta.asks.iter().cloned());
                 Ok(Some(MarketDataEvent::L2Delta(
                     super::super::types::L2Delta {
-                        venue_index: 0,
+                        venue_index: self.venue_index,
                         venue_id: delta.market,
                         seq: delta.seq,
                         timestamp_ms: delta.timestamp_ms,
@@ -498,10 +627,7 @@ fn map_side(side: Side) -> &'static str {
     }
 }
 
-fn build_order_payload(
-    market: &str,
-    req: &LiveRestPlaceRequest,
-) -> LiveResult<Value> {
+fn build_order_payload(market: &str, req: &LiveRestPlaceRequest) -> LiveResult<Value> {
     if req.post_only && req.time_in_force == TimeInForce::Ioc {
         return Err(LiveGatewayError::post_only_reject(
             "paradex: post_only + IOC not allowed",
@@ -536,7 +662,10 @@ fn parse_account_snapshot(
                     .filter_map(|pos| {
                         let symbol = pos.get("symbol")?.as_str()?.to_string();
                         let size = pos.get("size")?.as_f64()?;
-                        let entry_price = pos.get("entry_price").or_else(|| pos.get("entryPrice"))?.as_f64()?;
+                        let entry_price = pos
+                            .get("entry_price")
+                            .or_else(|| pos.get("entryPrice"))?
+                            .as_f64()?;
                         Some(PositionSnapshot {
                             symbol,
                             size,
@@ -579,7 +708,10 @@ fn parse_account_snapshot(
             venue_index,
             venue_id: venue_id.to_string(),
             seq: value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
-            timestamp_ms: value.get("timestamp_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+            timestamp_ms: value
+                .get("timestamp_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
             positions,
             balances,
             funding_8h: value.get("funding_8h").and_then(|v| v.as_f64()),
@@ -640,14 +772,10 @@ impl ParadexRecorder {
     }
 }
 
-fn parse_orderbook_message(
-    text: &str,
+fn parse_orderbook_message_value(
+    value: &Value,
     tracker: &mut ParadexSeqState,
 ) -> anyhow::Result<Option<MarketDataEvent>> {
-    let value: Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
     let payload = value
         .get("params")
         .or_else(|| value.get("data"))
@@ -737,12 +865,205 @@ fn parse_delta(payload: &Value) -> Option<ParadexDelta> {
     })
 }
 
+fn decode_top_of_book(value: &Value) -> Option<TopOfBook> {
+    let payload = value
+        .get("params")
+        .or_else(|| value.get("data"))
+        .unwrap_or(value);
+    let bids = parse_levels_from_value(payload.get("bids")?)?;
+    let asks = parse_levels_from_value(payload.get("asks")?)?;
+    let timestamp_ms = payload
+        .get("ts")
+        .or_else(|| payload.get("timestamp"))
+        .and_then(|v| v.as_i64());
+    TopOfBook::from_levels(&bids, &asks, timestamp_ms)
+}
+
+fn decode_top_of_book_value(value: &Value) -> Option<TopOfBook> {
+    let payload = value
+        .get("params")
+        .or_else(|| value.get("data"))
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+    let bids = parse_levels_any(payload.get("bids")?)?;
+    let asks = parse_levels_any(payload.get("asks")?)?;
+    let timestamp_ms = payload
+        .get("ts")
+        .or_else(|| payload.get("timestamp"))
+        .and_then(|v| v.as_i64());
+    TopOfBook::from_levels(&bids, &asks, timestamp_ms)
+}
+
+fn decode_bbo_top_and_snapshot(
+    value: &Value,
+    venue_index: usize,
+    venue_id: &str,
+    seq: &mut u64,
+) -> Option<(TopOfBook, MarketDataEvent)> {
+    let payload = value
+        .get("params")
+        .or_else(|| value.get("data"))
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+    let channel = payload
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("channel").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    if !channel.starts_with("bbo.") {
+        return None;
+    }
+    let data = payload.get("data").unwrap_or(payload);
+    let bid_px = data
+        .get("bid")
+        .or_else(|| data.get("bid_price"))
+        .and_then(parse_f64)?;
+    let bid_sz = data
+        .get("bid_size")
+        .or_else(|| data.get("bidSize"))
+        .and_then(parse_f64)?;
+    let ask_px = data
+        .get("ask")
+        .or_else(|| data.get("ask_price"))
+        .and_then(parse_f64)?;
+    let ask_sz = data
+        .get("ask_size")
+        .or_else(|| data.get("askSize"))
+        .and_then(parse_f64)?;
+    if bid_sz <= 0.0 || ask_sz <= 0.0 {
+        return None;
+    }
+    let timestamp_ms = data
+        .get("ts")
+        .or_else(|| data.get("timestamp"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(now_ms);
+    *seq = seq.wrapping_add(1);
+    let bids = vec![BookLevel {
+        price: bid_px,
+        size: bid_sz,
+    }];
+    let asks = vec![BookLevel {
+        price: ask_px,
+        size: ask_sz,
+    }];
+    let top = TopOfBook::from_levels(&bids, &asks, Some(timestamp_ms))?;
+    let snapshot = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
+        venue_index,
+        venue_id: venue_id.to_string(),
+        seq: *seq,
+        timestamp_ms,
+        bids,
+        asks,
+    });
+    Some((top, snapshot))
+}
+
+fn log_decode_miss(venue: &str, value: &Value, payload: &str, count: usize, url: &str) {
+    let keys = value
+        .as_object()
+        .map(|obj| {
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            format!("[{}]", keys.join(","))
+        })
+        .unwrap_or_else(|| "[non-object]".to_string());
+    let snippet: String = payload.chars().take(160).collect();
+    eprintln!(
+        "WARN: {venue} WS decode miss keys={keys} snippet={snippet} (count={count}) url={url}",
+    );
+}
+
+#[derive(Clone)]
+struct ParadexSubscribeCandidate {
+    method: String,
+    params: Value,
+}
+
+impl ParadexSubscribeCandidate {
+    fn new(method: &str, params: Value) -> Self {
+        Self {
+            method: method.to_string(),
+            params,
+        }
+    }
+}
+
+async fn send_paradex_subscribe(
+    write: &mut (impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+              + Unpin),
+    candidate: &ParadexSubscribeCandidate,
+) -> anyhow::Result<()> {
+    let sub = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": candidate.method,
+        "params": candidate.params,
+    });
+    write.send(Message::Text(sub.to_string())).await?;
+    Ok(())
+}
+
+fn paradex_subscribe_error(value: &Value) -> bool {
+    let err = value.get("error").and_then(|v| v.as_object());
+    let Some(err) = err else {
+        return false;
+    };
+    let message = err
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let data = err
+        .get("data")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    message.contains("invalid") || data.contains("invalid")
+}
+
+fn is_paradex_orderbook_message(value: &Value) -> bool {
+    let payload = value
+        .get("params")
+        .or_else(|| value.get("data"))
+        .unwrap_or(value);
+    let channel = payload
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("channel").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    channel == "orderbook" || channel == "order_book"
+}
+
 fn parse_levels_from_value(value: &Value) -> Option<Vec<BookLevel>> {
     let entries = value.as_array()?;
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         let (price, size) = parse_level_pair(entry)?;
         out.push(BookLevel { price, size });
+    }
+    Some(out)
+}
+
+fn parse_levels_any(value: &Value) -> Option<Vec<BookLevel>> {
+    let entries = value.as_array()?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some((price, size)) = parse_level_pair(entry) {
+            out.push(BookLevel { price, size });
+            continue;
+        }
+        if let Some(obj) = entry.as_object() {
+            let price = obj
+                .get("px")
+                .or_else(|| obj.get("price"))
+                .and_then(parse_f64)?;
+            let size = obj
+                .get("sz")
+                .or_else(|| obj.get("size"))
+                .and_then(parse_f64)?;
+            out.push(BookLevel { price, size });
+        }
     }
     Some(out)
 }
@@ -1014,9 +1335,8 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
         if line.trim().is_empty() {
             continue;
         }
-        let item: T = serde_json::from_str(line).map_err(|err| {
-            format!("fixture_parse_error path={} err={}", path.display(), err)
-        })?;
+        let item: T = serde_json::from_str(line)
+            .map_err(|err| format!("fixture_parse_error path={} err={}", path.display(), err))?;
         out.push(item);
     }
     Ok(out)
@@ -1025,14 +1345,14 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use httpmock::Method::{POST};
+    use httpmock::Method::POST;
     use httpmock::MockServer;
     use std::path::PathBuf;
 
     #[test]
     fn fixture_snapshot_parses() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/paradex");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/paradex");
         let feed = ParadexFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         assert!(!feed.snapshot.bids.is_empty());
         assert!(!feed.snapshot.asks.is_empty());
@@ -1040,8 +1360,8 @@ mod tests {
 
     #[test]
     fn delta_applies_to_snapshot_levels() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/paradex");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/paradex");
         let feed = ParadexFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         let mut bids = feed.snapshot.bids.clone();
         let delta = feed.deltas.first().expect("delta");
@@ -1081,8 +1401,8 @@ mod tests {
 
     #[test]
     fn deterministic_serialization_roundtrip() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/paradex");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/paradex");
         let feed = ParadexFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         let raw = serde_json::to_string(&feed.snapshot).expect("serialize");
         let reparsed: FixtureSnapshot = serde_json::from_str(&raw).expect("reparse");
@@ -1094,9 +1414,12 @@ mod tests {
     fn live_ws_snapshot_parses() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/roadmap_b/paradex_live_recording");
-        let frames = std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl"))
-            .expect("ws frames");
-        let first = frames.lines().find(|line| !line.trim().is_empty()).expect("frame");
+        let frames =
+            std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl")).expect("ws frames");
+        let first = frames
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("frame");
         let value: Value = serde_json::from_str(first).expect("snapshot json");
         let payload = value.get("params").unwrap_or(&value);
         let snapshot = parse_snapshot(payload).expect("parse snapshot");
@@ -1109,16 +1432,17 @@ mod tests {
     fn live_ws_replay_is_deterministic_and_monotonic() {
         let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/roadmap_b/paradex_live_recording");
-        let frames = std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl"))
-            .expect("ws frames");
-        let mut tracker = ParadexSeqState::new();
+        let frames =
+            std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl")).expect("ws frames");
+        let mut tracker = ParadexSeqState::new(0);
         let mut events = Vec::new();
         for line in frames.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(Some(event)) = parse_orderbook_message(trimmed, &mut tracker) {
+            let value: Value = serde_json::from_str(trimmed).expect("parse json");
+            if let Ok(Some(event)) = parse_orderbook_message_value(&value, &mut tracker) {
                 events.push(event);
             }
         }
@@ -1140,11 +1464,36 @@ mod tests {
 
     #[test]
     fn auth_token_fixture_parses() {
-        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../tests/fixtures/roadmap_b/paradex");
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/roadmap_b/paradex");
         let raw = std::fs::read_to_string(fixture_dir.join("auth_token.json")).expect("token");
         let token = parse_auth_token(&raw).expect("parse token");
         assert_eq!(token_token(&token).unwrap(), "test.jwt");
+    }
+
+    #[test]
+    fn bbo_decode_emits_top() {
+        let mut seq = 0u64;
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "subscription",
+            "params": {
+                "channel": "bbo.BTC-USD-PERP",
+                "data": {
+                    "bid": "30000",
+                    "bid_size": "1.2",
+                    "ask": "30010",
+                    "ask_size": "0.9",
+                    "ts": 1700000000000i64
+                }
+            }
+        });
+        let (top, _snapshot) =
+            decode_bbo_top_and_snapshot(&msg, 0, "BTC-USD-PERP", &mut seq).expect("bbo");
+        assert_eq!(top.best_bid_px, 30000.0);
+        assert_eq!(top.best_bid_sz, 1.2);
+        assert_eq!(top.best_ask_px, 30010.0);
+        assert_eq!(top.best_ask_sz, 0.9);
     }
 
     #[tokio::test]
@@ -1157,6 +1506,7 @@ mod tests {
             market: "BTC-USD-PERP".to_string(),
             account_path: "/account".to_string(),
             order_path: "/orders".to_string(),
+            venue_index: 0,
             jwt: Some("test.jwt".to_string()),
             auth_payload_json: None,
             record_dir: None,

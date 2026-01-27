@@ -37,9 +37,10 @@ pub use report::{
     VariantStats,
 };
 pub use scenario::{
-    Engine, ExpectKillSwitch, HistoricalStubConfig, Horizon, InitialState, Invariants, MarketModel,
-    MarketModelType, MicrostructureModel, PnlLinearityCheck, Rng, ScenarioError, ScenarioSpec,
-    SyntheticConfig, SyntheticParams, SyntheticProcess, SCENARIO_SCHEMA_VERSION,
+    CancelStorm, Engine, ExpectKillSwitch, HistoricalStubConfig, Horizon, InitialState, Invariants,
+    LatencySpike, MarketModel, MarketModelType, MicrostructureModel, PartialFillModel,
+    PnlLinearityCheck, Rng, ScenarioError, ScenarioSpec, SyntheticConfig, SyntheticParams,
+    SyntheticProcess, SCENARIO_SCHEMA_VERSION,
 };
 pub use suite::{
     InlineScenario, ScenarioRef, SuiteError, SuiteInvariants, SuiteSpec, SUITE_SCHEMA_VERSION,

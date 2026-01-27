@@ -113,6 +113,9 @@ pub enum KillReasonObs {
     DeltaHardBreach,
     BasisHardBreach,
     LiquidationDistanceBreach,
+    ReconciliationDrift,
+    CanaryLimitBreach,
+    StaleMarket,
 }
 
 impl From<KillReason> for KillReasonObs {
@@ -123,6 +126,9 @@ impl From<KillReason> for KillReasonObs {
             KillReason::DeltaHardBreach => KillReasonObs::DeltaHardBreach,
             KillReason::BasisHardBreach => KillReasonObs::BasisHardBreach,
             KillReason::LiquidationDistanceBreach => KillReasonObs::LiquidationDistanceBreach,
+            KillReason::ReconciliationDrift => KillReasonObs::ReconciliationDrift,
+            KillReason::CanaryLimitBreach => KillReasonObs::CanaryLimitBreach,
+            KillReason::StaleMarket => KillReasonObs::StaleMarket,
         }
     }
 }

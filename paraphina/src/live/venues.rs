@@ -1,13 +1,7 @@
 use std::env;
 
 /// Canonical Roadmap-B venue registry (stable order).
-pub const ROADMAP_B_VENUES: [&str; 5] = [
-    "extended",
-    "hyperliquid",
-    "aster",
-    "lighter",
-    "paradex",
-];
+pub const ROADMAP_B_VENUES: [&str; 5] = ["extended", "hyperliquid", "aster", "lighter", "paradex"];
 
 /// Stable venue ordering used across live telemetry + connector selection + gating.
 pub const CANONICAL_VENUE_ORDER: [&str; 5] = ROADMAP_B_VENUES;
@@ -30,9 +24,7 @@ pub fn warn_if_noncanonical_venue_order(venue_ids: &[&str], context: &str) {
     if venue_ids != CANONICAL_VENUE_ORDER {
         eprintln!(
             "paraphina | warn=noncanonical_venue_order context={} expected={:?} actual={:?}",
-            context,
-            CANONICAL_VENUE_ORDER,
-            venue_ids
+            context, CANONICAL_VENUE_ORDER, venue_ids
         );
     }
 }

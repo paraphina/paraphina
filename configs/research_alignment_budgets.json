@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "risk_tiers": [
+    {
+      "name": "conservative",
+      "max_kill_prob": 0.01,
+      "max_drawdown_abs": 2000.0,
+      "min_final_pnl_mean": 0.0,
+      "lambda_std": 0.5,
+      "lambda_dd": 0.5,
+      "lambda_kill": 200.0
+    },
+    {
+      "name": "balanced",
+      "max_kill_prob": 0.05,
+      "max_drawdown_abs": 4000.0,
+      "min_final_pnl_mean": 0.0,
+      "lambda_std": 0.3,
+      "lambda_dd": 0.3,
+      "lambda_kill": 100.0
+    },
+    {
+      "name": "aggressive",
+      "max_kill_prob": 0.15,
+      "max_drawdown_abs": 8000.0,
+      "min_final_pnl_mean": -500.0,
+      "lambda_std": 0.1,
+      "lambda_dd": 0.1,
+      "lambda_kill": 50.0
+    }
+  ]
+}

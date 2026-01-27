@@ -1,0 +1,18 @@
+{
+  "channel": "userEvents",
+  "seq": 301,
+  "data": {
+    "event": "order",
+    "status": "open",
+    "coin": "TAO",
+    "order": {
+      "oid": "oid_123",
+      "cloid": "co_123",
+      "side": "B",
+      "limitPx": "100.25",
+      "sz": "1.5",
+      "timestamp": 1700000000200,
+      "purpose": "Mm"
+    }
+  }
+}

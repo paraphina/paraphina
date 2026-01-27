@@ -199,6 +199,76 @@ impl Default for MicrostructureModel {
     }
 }
 
+/// Optional latency spike regime.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LatencySpike {
+    /// Absolute latency during the spike (ms).
+    pub spike_ms: f64,
+    /// Inclusive start step for the spike window.
+    pub start_step: u64,
+    /// Inclusive end step for the spike window.
+    pub end_step: u64,
+}
+
+/// Partial fill model parameters (disabled by default).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartialFillModel {
+    /// Enable partial fill behavior.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base probability of any fill (0..1).
+    #[serde(default)]
+    pub base_fill_prob: f64,
+    /// Sensitivity to latency (0..1): higher => lower fill probability at higher latency.
+    #[serde(default)]
+    pub latency_sensitivity: f64,
+    /// Reference latency in ms for scaling.
+    #[serde(default)]
+    pub latency_ref_ms: f64,
+    /// Reference depth for scaling (units: TAO).
+    #[serde(default)]
+    pub depth_ref: f64,
+    /// Minimum fill fraction when a fill occurs (0..1).
+    #[serde(default)]
+    pub min_fill_frac: f64,
+    /// Maximum fill fraction when a fill occurs (0..1).
+    #[serde(default)]
+    pub max_fill_frac: f64,
+    /// Apply partial fills to MM intents as well as Exit/Hedge.
+    #[serde(default)]
+    pub apply_to_mm: bool,
+}
+
+impl Default for PartialFillModel {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_fill_prob: 1.0,
+            latency_sensitivity: 0.0,
+            latency_ref_ms: 50.0,
+            depth_ref: 10_000.0,
+            min_fill_frac: 1.0,
+            max_fill_frac: 1.0,
+            apply_to_mm: false,
+        }
+    }
+}
+
+/// Cancel-storm stressor (spread widening + depth thinning + toxicity boost).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CancelStorm {
+    /// Inclusive start step for the storm window.
+    pub start_step: u64,
+    /// Inclusive end step for the storm window.
+    pub end_step: u64,
+    /// Multiply spread by this factor while active.
+    pub spread_mult: f64,
+    /// Multiply depth by this factor while active.
+    pub depth_mult: f64,
+    /// Minimum toxicity level while active (0..1).
+    pub toxicity_floor: f64,
+}
+
 /// Kill switch expectation for invariant checking.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -257,6 +327,15 @@ pub struct ScenarioSpec {
     /// Microstructure model.
     #[serde(default)]
     pub microstructure_model: MicrostructureModel,
+    /// Optional latency spike regime.
+    #[serde(default)]
+    pub latency_spike: Option<LatencySpike>,
+    /// Partial fill model (disabled by default).
+    #[serde(default)]
+    pub partial_fill: PartialFillModel,
+    /// Cancel-storm stressor (optional).
+    #[serde(default)]
+    pub cancel_storm: Option<CancelStorm>,
     /// Invariants.
     #[serde(default)]
     pub invariants: Invariants,
@@ -340,6 +419,48 @@ impl ScenarioSpec {
                             .to_string(),
                     });
                 }
+            }
+        }
+
+        // Validate partial fill ranges (if enabled)
+        if self.partial_fill.enabled {
+            if !(0.0..=1.0).contains(&self.partial_fill.base_fill_prob) {
+                return Err(ScenarioError::ValidationError {
+                    field: "partial_fill.base_fill_prob".to_string(),
+                    message: "base_fill_prob must be in [0, 1]".to_string(),
+                });
+            }
+            if !(0.0..=1.0).contains(&self.partial_fill.latency_sensitivity) {
+                return Err(ScenarioError::ValidationError {
+                    field: "partial_fill.latency_sensitivity".to_string(),
+                    message: "latency_sensitivity must be in [0, 1]".to_string(),
+                });
+            }
+            if self.partial_fill.latency_ref_ms <= 0.0 {
+                return Err(ScenarioError::ValidationError {
+                    field: "partial_fill.latency_ref_ms".to_string(),
+                    message: "latency_ref_ms must be > 0".to_string(),
+                });
+            }
+            if self.partial_fill.depth_ref <= 0.0 {
+                return Err(ScenarioError::ValidationError {
+                    field: "partial_fill.depth_ref".to_string(),
+                    message: "depth_ref must be > 0".to_string(),
+                });
+            }
+            if !(0.0..=1.0).contains(&self.partial_fill.min_fill_frac)
+                || !(0.0..=1.0).contains(&self.partial_fill.max_fill_frac)
+            {
+                return Err(ScenarioError::ValidationError {
+                    field: "partial_fill.min_fill_frac/max_fill_frac".to_string(),
+                    message: "fill fractions must be in [0, 1]".to_string(),
+                });
+            }
+            if self.partial_fill.min_fill_frac > self.partial_fill.max_fill_frac {
+                return Err(ScenarioError::ValidationError {
+                    field: "partial_fill".to_string(),
+                    message: "min_fill_frac must be <= max_fill_frac".to_string(),
+                });
             }
         }
 
