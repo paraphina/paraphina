@@ -69,3 +69,6 @@ reports/
 
 # generated research reports
 _reports/
+
+# allow fixture jsonl files (needed for CI tests)
+!tests/fixtures/**/*.jsonl
