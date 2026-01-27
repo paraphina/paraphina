@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::state::GlobalState;
-use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
+use crate::types::{
+    OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs, VenueStatus,
+};
 
 // ============================================================================
 // MARGIN CONSTRAINT HELPERS (Section A of specification)
@@ -188,6 +190,10 @@ pub fn build_chunk_candidates(
 ) -> Vec<ChunkCandidate> {
     let mut chunks = Vec::new();
 
+    if !base_unit_cost.is_finite() || !convexity_cost_per_chunk.is_finite() {
+        return chunks;
+    }
+
     // Safety: ensure chunk_size is positive to avoid infinite loop
     let effective_chunk_size = chunk_size_abs.max(1e-9);
 
@@ -323,6 +329,88 @@ pub struct HedgePlan {
     /// Sign convention: positive = sell TAO (reduce long), negative = buy TAO (reduce short).
     pub desired_delta: f64,
     pub allocations: Vec<HedgeAllocation>,
+}
+
+/// Hedge cost component breakdown (telemetry).
+#[derive(Debug, Clone)]
+pub struct HedgeCostComponents {
+    pub exec_cost: f64,
+    pub funding_benefit: f64,
+    pub basis_edge: f64,
+    pub liq_penalty: f64,
+    pub frag_penalty: f64,
+    pub total_cost: f64,
+}
+
+/// Compute hedge cost components for a hedge intent.
+pub fn compute_hedge_cost_components(
+    cfg: &Config,
+    state: &GlobalState,
+    intent: &OrderIntent,
+) -> Option<HedgeCostComponents> {
+    let intent = match intent {
+        OrderIntent::Place(pi) if matches!(pi.purpose, OrderPurpose::Hedge) => pi,
+        _ => return None,
+    };
+
+    let vcfg = cfg.venues.get(intent.venue_index)?;
+    let v = state.venues.get(intent.venue_index)?;
+    let fair = state.fair_value.unwrap_or(1.0).max(1.0);
+    let mid = v.mid.unwrap_or(fair);
+    let spread = v.spread.unwrap_or(0.0).max(0.0);
+
+    let half_spread = 0.5 * spread;
+    let taker_fee = (vcfg.taker_fee_bps / 10_000.0).abs() * mid;
+    let exec_cost = half_spread + taker_fee + cfg.hedge.slippage_buffer;
+
+    let horizon_frac = cfg.hedge.funding_horizon_sec / (8.0 * 60.0 * 60.0);
+    let funding_benefit = match intent.side {
+        Side::Sell => v.funding_8h * horizon_frac * fair,
+        Side::Buy => -v.funding_8h * horizon_frac * fair,
+    };
+
+    let basis_edge = match intent.side {
+        Side::Sell => intent.price - fair,
+        Side::Buy => fair - intent.price,
+    };
+
+    let liq_penalty = compute_liq_penalty(
+        v.dist_liq_sigma,
+        cfg.hedge.liq_warn_sigma,
+        cfg.hedge.liq_crit_sigma,
+        cfg.hedge.liq_penalty_scale,
+    );
+
+    let frag_penalty = if v.position_tao.abs() < 1e-9 {
+        cfg.hedge.frag_penalty
+    } else {
+        0.0
+    };
+
+    let total_cost = exec_cost
+        - cfg.hedge.funding_weight * funding_benefit
+        - cfg.hedge.basis_weight * basis_edge
+        + liq_penalty
+        + frag_penalty;
+
+    if !exec_cost.is_finite()
+        || !funding_benefit.is_finite()
+        || !basis_edge.is_finite()
+        || !liq_penalty.is_finite()
+        || !frag_penalty.is_finite()
+        || !total_cost.is_finite()
+    {
+        return None;
+    }
+
+    Some(HedgeCostComponents {
+        exec_cost,
+        funding_benefit,
+        basis_edge,
+        liq_penalty,
+        frag_penalty,
+        total_cost,
+    })
 }
 
 /// Candidate venue for hedge allocation (internal).
@@ -800,14 +888,18 @@ pub fn hedge_plan_to_order_intents_into(plan: &HedgePlan, out: &mut Vec<OrderInt
     out.clear();
 
     for alloc in &plan.allocations {
-        out.push(OrderIntent {
+        out.push(OrderIntent::Place(PlaceOrderIntent {
             venue_index: alloc.venue_index,
             venue_id: alloc.venue_id.clone(),
             side: alloc.side,
             price: alloc.est_price,
             size: alloc.size,
             purpose: OrderPurpose::Hedge,
-        });
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: None,
+        }));
     }
 }
 
@@ -846,14 +938,18 @@ pub fn compute_hedge_orders_into(
     out.clear();
     if let Some(plan) = compute_hedge_plan(cfg, state, now_ms) {
         for alloc in &plan.allocations {
-            out.push(OrderIntent {
+            out.push(OrderIntent::Place(PlaceOrderIntent {
                 venue_index: alloc.venue_index,
                 venue_id: alloc.venue_id.clone(),
                 side: alloc.side,
                 price: alloc.est_price,
                 size: alloc.size,
                 purpose: OrderPurpose::Hedge,
-            });
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: None,
+            }));
         }
     }
 }

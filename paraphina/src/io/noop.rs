@@ -261,6 +261,9 @@ mod tests {
             price: 100.0,
             size: 1.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_001".to_string(),
         });
 
@@ -290,6 +293,9 @@ mod tests {
             price: 100.0,
             size: 1.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_002".to_string(),
         };
 
@@ -324,6 +330,9 @@ mod tests {
             price: 100.0,
             size: 1.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_003".to_string(),
         });
 
@@ -346,6 +355,9 @@ mod tests {
             price: 100.0,
             size: 1.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_004".to_string(),
         }));
 
@@ -367,6 +379,9 @@ mod tests {
             price: 100.0,
             size: 1.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_005".to_string(),
         }));
 
@@ -378,6 +393,9 @@ mod tests {
             price: 100.0,
             size: 1.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_005".to_string(),
         }));
 

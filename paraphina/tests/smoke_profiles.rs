@@ -4,11 +4,13 @@
 // Goal: if any core wiring breaks (config, gateway, runner, sinks),
 // these tests will fail immediately.
 
-use paraphina::{Config, NoopSink, SimGateway, StrategyRunner};
+use paraphina::io::sim::create_sim_adapters;
+use paraphina::io::{Gateway, GatewayPolicy};
+use paraphina::{Config, NoopSink, StrategyRunner};
 
 fn run_smoke(cfg: Config, ticks: u64) {
     // Use the same wiring as src/main.rs, but with a NoopSink so tests are fast.
-    let gateway = SimGateway::new();
+    let gateway = Gateway::new(create_sim_adapters(&cfg), GatewayPolicy::for_simulation());
     let sink = Box::new(NoopSink);
     let mut runner = StrategyRunner::new(&cfg, gateway, sink);
 

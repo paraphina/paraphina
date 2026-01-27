@@ -1,0 +1,1221 @@
+   Compiling paraphina v0.1.0 (/home/developer/code/paraphina/paraphina)
+warning: field `schema_version` is never read
+  --> paraphina/src/rl/research_budgets.rs:22:5
+   |
+21 | struct ResearchAlignmentBudgetFile {
+   |        --------------------------- field in this struct
+22 |     schema_version: i64,
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `ResearchAlignmentBudgetFile` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `paraphina` (lib) generated 1 warning
+warning: `paraphina` (lib test) generated 1 warning (1 duplicate)
+warning: variable does not need to be mutable
+   --> paraphina/src/bin/paraphina_live.rs:228:9
+    |
+228 |     let mut exec_client: Option<std::sync::Arc<dyn LiveRestClient>> = None;
+    |         ----^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> paraphina/src/bin/paraphina_live.rs:229:9
+    |
+229 |     let mut exec_supported = false;
+    |         ----^^^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: function `send_unavailable_account_snapshot` is never used
+   --> paraphina/src/bin/paraphina_live.rs:697:4
+    |
+697 | fn send_unavailable_account_snapshot(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `paraphina` (bin "paraphina_live") generated 3 warnings (run `cargo fix --bin "paraphina_live"` to apply 2 suggestions)
+warning: unused import: `SafePipelineSummary`
+ --> paraphina/tests/rl_safe_pipeline_tests.rs:3:40
+  |
+3 | use paraphina::rl::{run_safe_pipeline, SafePipelineSummary};
+  |                                        ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `paraphina` (test "rl_safe_pipeline_tests") generated 1 warning (run `cargo fix --test "rl_safe_pipeline_tests"` to apply 1 suggestion)
+warning: methods `cancel_call_count` and `cancel_all_call_count` are never used
+  --> paraphina/tests/live_gateway_tests.rs:49:12
+   |
+25 |     impl MockRestClient {
+   |     ------------------- methods in this implementation
+...
+49 |         fn cancel_call_count(&self) -> usize {
+   |            ^^^^^^^^^^^^^^^^^
+...
+53 |         fn cancel_all_call_count(&self) -> usize {
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `paraphina` (test "live_gateway_tests") generated 1 warning
+warning: `paraphina` (bin "paraphina_live" test) generated 3 warnings (3 duplicates)
+warning: unused import: `serde_json::json`
+  --> paraphina/tests/event_log_replay_tests.rs:23:5
+   |
+23 | use serde_json::json;
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `kill_reason`
+  --> paraphina/tests/event_log_replay_tests.rs:47:9
+   |
+47 |     let kill_reason = {
+   |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_kill_reason`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `paraphina` (test "event_log_replay_tests") generated 2 warnings (run `cargo fix --test "event_log_replay_tests"` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.00s
+     Running unittests src/lib.rs (target/debug/deps/paraphina-bdb74f04a5ecafcc)
+
+running 271 tests
+test actions::tests::test_action_batch ... ok
+test actions::tests::test_action_builder ... ok
+test actions::tests::test_action_id_format ... ok
+test actions::tests::test_action_id_generator_deterministic ... ok
+test exit::tests::test_compute_slippage_buffer ... ok
+test exit::tests::test_fragmentation_score ... ok
+test exit::tests::test_meets_min_notional ... ok
+test actions::tests::test_action_serialization ... ok
+test exit::tests::test_round_to_lot_size ... ok
+test fill_batcher::tests::batches_across_intervals ... ok
+test fill_batcher::tests::batches_within_same_interval ... ok
+test hedge::tests::test_build_chunk_candidates_multiple_chunks ... ok
+test hedge::tests::test_build_chunk_candidates_single_chunk ... ok
+test hedge::tests::test_cap_dq_by_abs_limit_crossing_zero ... ok
+test hedge::tests::test_cap_dq_by_abs_limit_negative_cap ... ok
+test hedge::tests::test_cap_dq_by_abs_limit_no_capping_needed ... ok
+test hedge::tests::test_cap_dq_by_abs_limit_positive_cap ... ok
+test hedge::tests::test_cap_dq_reducing_exposure ... ok
+test hedge::tests::test_compute_abs_limit_after_trade ... ok
+test hedge::tests::test_greedy_allocate_chunks_prefers_lower_cost ... ok
+test hedge::tests::test_greedy_allocate_chunks_deterministic ... ok
+test hedge::tests::test_increases_abs_exposure ... ok
+test hedge::tests::test_liq_penalty ... ok
+test hedge::tests::test_round_to_lot_size ... ok
+test hedge::tests::test_top_of_book_from_mid ... ok
+test io::noop::tests::test_action_recorder ... ok
+test io::noop::tests::test_compare_batches_different_action ... ok
+test io::noop::tests::test_compare_batches_different_count ... ok
+test io::noop::tests::test_compare_batches_equal ... ok
+test io::noop::tests::test_create_noop_adapters ... ok
+test io::noop::tests::test_noop_adapter_records ... ok
+test io::sim::tests::test_create_sim_adapters ... ok
+test io::sim::tests::test_sim_adapter_fill ... ok
+test io::sim::tests::test_sim_adapter_taker_fee ... ok
+test io::sim::tests::test_sim_adapter_invalid_size ... ok
+test io::sim::tests::test_sim_adapter_wrong_venue ... ok
+test io::tests::test_gateway_policy_default ... ok
+test io::tests::test_gateway_policy_for_live ... ok
+test io::tests::test_rate_limiter_disabled ... ok
+test io::tests::test_rate_limiter_enabled ... ok
+test live::instrument::tests::conversion_roundtrip_is_consistent ... ok
+test live::instrument::tests::rounding_and_min_notional ... ok
+test live::runner::tests::dedupe_fill_by_fill_id ... ok
+test live::runner::tests::dedupe_order_ack_by_client_order_id ... ok
+test live::state_cache::tests::account_cache_seq_checks ... ok
+test live::state_cache::tests::market_cache_staleness_and_seq ... ok
+test loop_scheduler::tests::equal_intervals_fire_every_tick ... ok
+test loop_scheduler::tests::risk_and_hedge_cadences ... ok
+test mm::tests::disabled_venue_clears_stale_quote ... ok
+test mm::tests::compute_venue_targets_into_reuse_matches_fresh_alloc_and_capacity_stable ... ok
+test mm::tests::mm_quotes_cleared_on_kill_switch ... ok
+test mm::tests::test_hardlimit_produces_no_quotes ... ok
+test mm::tests::mm_quotes_cleared_when_no_fair_value ... ok
+test mm::tests::test_kill_switch_produces_no_quotes ... ok
+test mm::tests::test_high_toxicity_skips_venue ... ok
+test mm::tests::test_mm_quotes_to_order_intents_into_determinism_and_capacity ... ok
+test mm::tests::test_order_replacement_beyond_tolerance ... ok
+test mm::tests::test_order_replacement_within_lifetime ... ok
+test mm::tests::test_mm_quotes_determinism_and_buffer_capacity ... ok
+test mm::tests::test_passivity_ask_above_best_ask ... ok
+test mm::tests::test_passivity_bid_below_best_bid ... ok
+test mm::tests::test_reservation_price_moves_with_q_global ... ok
+test mm::tests::test_reservation_price_with_venue_target_deviation ... ok
+test mm::tests::test_venue_targets_computed_from_depth ... ok
+test mm::tests::warning_regime_widens_spread_and_caps_size ... ok
+test order_management::tests::cancel_when_side_not_quoted ... ok
+test order_management::tests::dangerous_offside_bypasses_lifetime ... ok
+test order_management::tests::deterministic_ordering_cancels_before_places ... ok
+test order_management::tests::kill_switch_blocks_mm_order_management ... ok
+test order_management::tests::min_quote_lifetime_respected ... ok
+test order_management::tests::replace_triggers_on_price_or_size_diff ... ok
+test orderbook_l2::tests::depth_near_mid_computed ... ok
+test orderbook_l2::tests::seq_regression_rejected ... ok
+test orderbook_l2::tests::determinism_serialization ... ok
+test orderbook_l2::tests::snapshot_then_deltas_best_bid_ask ... ok
+test rl::action_encoding::tests::test_action_spec ... ok
+test rl::action_encoding::tests::test_clamping_out_of_bounds ... ok
+test rl::action_encoding::tests::test_decode_wrong_dimension ... ok
+test rl::action_encoding::tests::test_encoding_determinism ... ok
+test rl::action_encoding::tests::test_hedge_weights_normalization ... ok
+test rl::action_encoding::tests::test_identity_action_encode_decode ... ok
+test rl::action_encoding::tests::test_l2_distance ... ok
+test rl::action_encoding::tests::test_mae ... ok
+test rl::action_encoding::tests::test_normalize_denormalize_01 ... ok
+test rl::action_encoding::tests::test_normalize_denormalize_symmetric ... ok
+test rl::action_encoding::tests::test_round_trip_various_values ... ok
+test rl::domain_rand::tests::test_deterministic_config ... ok
+test rl::domain_rand::tests::test_domain_rand_determinism ... ok
+test rl::domain_rand::tests::test_domain_rand_different_seeds ... ok
+test rl::observation::tests::test_mean_toxicity ... ok
+test rl::observation::tests::test_min_dist_liq_sigma ... ok
+test rl::observation::tests::test_observation_from_state ... ok
+test rl::observation::tests::test_observation_roundtrip ... ok
+test rl::observation::tests::test_observation_serialization_deterministic ... ok
+test rl::policy::tests::test_heuristic_policy_deterministic ... ok
+test rl::policy::tests::test_heuristic_policy_is_identity ... ok
+test rl::policy::tests::test_noop_policy ... ok
+test rl::policy::tests::test_policy_action_clamp ... ok
+test rl::policy::tests::test_policy_action_identity ... ok
+test rl::policy::tests::test_policy_action_serialization ... ok
+test rl::policy::tests::test_policy_reset_episode ... ok
+test rl::runner::tests::test_episode_config_builder ... ok
+test rl::domain_rand::tests::test_sample_ranges ... ok
+test rl::runner::tests::test_shadow_runner_creation ... ok
+test rl::runner::tests::test_shadow_runner_determinism ... ok
+test rl::runner::tests::test_shadow_runner_reset_episode ... ok
+test rl::runner::tests::test_shadow_mode_does_not_affect_execution ... ok
+test rl::runner::tests::test_shadow_runner_with_shadow_policy ... ok
+test rl::safety::tests::safety_layer_is_deterministic ... ok
+test rl::safety::tests::safety_layer_serialization_stable ... ok
+test rl::sim_env::tests::test_episode_terminates_on_max_ticks ... ok
+test rl::sim_env::tests::test_sim_env_determinism ... ok
+test rl::sim_env::tests::test_sim_env_reset ... ok
+test rl::sim_env::tests::test_sim_env_different_seeds_different_results ... ok
+test rl::sim_env::tests::test_sim_env_step ... ok
+test rl::sim_env::tests::test_vec_env_basic ... ok
+test rl::telemetry::tests::test_episode_marker_serialization ... ok
+test rl::telemetry::tests::test_reward_components_from_observation ... ok
+test rl::telemetry::tests::test_reward_computation ... ok
+test rl::telemetry::tests::test_tick_record_creation ... ok
+test rl::telemetry::tests::test_tick_record_serialization ... ok
+test rl::trajectory::tests::test_obs_encoding_dim ... ok
+test rl::trajectory::tests::test_obs_encoding_from_observation ... ok
+test rl::sim_env::tests::test_vec_env_determinism ... ok
+test rl::trajectory::tests::test_trajectory_collector_determinism ... ok
+test rl::trajectory::tests::test_trajectory_record_serialization ... ok
+test sim_eval::ablation::tests::test_ablations_sorted_and_deduped ... ok
+test sim_eval::ablation::tests::test_checksum_bytes_determinism ... ok
+test sim_eval::ablation::tests::test_different_ablations_different_hash ... ok
+test sim_eval::ablation::tests::test_dir_suffix_no_ablation ... ok
+test sim_eval::ablation::tests::test_dir_suffix_one_ablation ... ok
+test sim_eval::ablation::tests::test_dir_suffix_three_ablations_sorted ... ok
+test sim_eval::ablation::tests::test_dir_suffix_two_ablations_sorted ... ok
+test sim_eval::ablation::tests::test_display ... ok
+test sim_eval::ablation::tests::test_empty_ablation_set ... ok
+test sim_eval::ablation::tests::test_serde_empty ... ok
+test sim_eval::ablation::tests::test_serde_round_trip ... ok
+test rl::trajectory::tests::test_trajectory_collector_small ... ok
+test sim_eval::ablation::tests::test_unknown_ablation_error ... ok
+test sim_eval::ablation::tests::test_short_hash_determinism ... ok
+test sim_eval::ablation::tests::test_valid_ablation_set ... ok
+test sim_eval::env_override::tests::test_env_restoration_exact ... ok
+test sim_eval::env_override::tests::test_parse_env_overrides_invalid_type ... ok
+test sim_eval::env_override::tests::test_parse_env_overrides_invalid_list_item ... ok
+test sim_eval::env_override::tests::test_parse_env_overrides_list ... ok
+test sim_eval::env_override::tests::test_parse_env_overrides_mapping ... ok
+test sim_eval::env_override::tests::test_parse_env_overrides_null ... ok
+test sim_eval::env_override::tests::test_with_env_overrides_empty ... ok
+test sim_eval::env_override::tests::test_with_env_overrides_multiple_vars ... ok
+test sim_eval::env_override::tests::test_with_env_overrides_restores_unset ... ok
+test sim_eval::env_override::tests::test_with_env_overrides_sets_and_restores ... ok
+test sim_eval::evidence_pack::tests::test_atomic_write ... ok
+test sim_eval::evidence_pack::tests::test_error_on_absolute_path ... ok
+test sim_eval::evidence_pack::tests::test_error_on_missing_artifact ... ok
+test sim_eval::evidence_pack::tests::test_error_on_path_escape_parent ... ok
+test sim_eval::evidence_pack::tests::test_hash_file_sha256 ... ok
+test sim_eval::evidence_pack::tests::test_hex_encode ... ok
+test sim_eval::evidence_pack::tests::test_manifest_artifacts_sorted ... ok
+test sim_eval::evidence_pack::tests::test_deterministic_manifest_json_output ... ok
+test sim_eval::evidence_pack::tests::test_manifest_excludes_itself ... ok
+test sim_eval::evidence_pack::tests::test_normalize_path_str ... ok
+test sim_eval::evidence_pack::tests::test_path_escapes_root ... ok
+test sim_eval::evidence_pack::tests::test_nested_artifact_paths ... ok
+test sim_eval::evidence_pack::tests::test_repository_info_fields_present ... ok
+test sim_eval::evidence_pack::tests::test_sha256sums_covers_all_files ... ok
+test sim_eval::evidence_pack::tests::test_sha256sums_hashes_match ... ok
+test sim_eval::evidence_pack::tests::test_suite_byte_identical_copy ... ok
+test sim_eval::evidence_pack::tests::test_write_evidence_pack_basic ... ok
+test sim_eval::evidence_pack::tests::test_write_root_evidence_pack_basic ... ok
+test sim_eval::evidence_pack::tests::test_write_root_evidence_pack_error_nonexistent ... ok
+test sim_eval::evidence_pack::tests::test_write_root_evidence_pack_error_not_directory ... ok
+test sim_eval::evidence_pack::tests::test_write_root_evidence_pack_excludes_junk_dirs ... ok
+test sim_eval::evidence_pack::tests::test_write_root_evidence_pack_deterministic ... ok
+test sim_eval::evidence_pack::tests::test_write_root_evidence_pack_verifiable ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_absolute_path ... ok
+test sim_eval::evidence_pack_verify::tests::test_deeply_nested_artifact ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_empty_sha256sums ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_duplicate_paths ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_invalid_hash_format ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_hash_mismatch ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_missing_required_manifest ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_missing_referenced_file ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_missing_sha256sums ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_missing_required_suite ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_no_packs_in_tree ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_path_traversal ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_windows_path_drive ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_symlink_rejected ... ok
+test sim_eval::evidence_pack_verify::tests::test_hex_validation ... ok
+test sim_eval::evidence_pack_verify::tests::test_error_windows_unc_path ... ok
+test sim_eval::evidence_pack_verify::tests::test_uppercase_hash_accepted ... ok
+test sim_eval::evidence_pack_verify::tests::test_verify_valid_evidence_pack ... ok
+test sim_eval::evidence_pack_verify::tests::test_verify_evidence_pack_tree ... ok
+test sim_eval::evidence_pack_verify::tests::test_verify_with_binary_mode_indicator ... ok
+test sim_eval::evidence_pack_verify::tests::test_verify_with_leading_dot_slash ... ok
+test sim_eval::evidence_pack_verify::tests::test_verify_with_empty_lines_and_crlf ... ok
+test sim_eval::evidence_pack_verify::tests::test_windows_path_detection ... ok
+test sim_eval::output::tests::test_checksum_determinism ... ok
+test sim_eval::output::tests::test_checksum_differs_for_different_results ... ok
+test sim_eval::output::tests::test_config_resolved_includes_ablations ... ok
+test sim_eval::output::tests::test_checksum_differs_with_ablations ... ok
+test sim_eval::output::tests::test_run_summary_creation ... ok
+test sim_eval::report::tests::test_compute_stats ... ok
+test sim_eval::report::tests::test_full_report_generation ... ok
+test sim_eval::report::tests::test_gate_regression_pct ... ok
+test sim_eval::report::tests::test_gate_regression_usd ... ok
+test sim_eval::report::tests::test_deterministic_sorting ... ok
+test sim_eval::report::tests::test_missing_fields_handled_gracefully ... ok
+test sim_eval::scenario::tests::test_expand_seeds ... ok
+test sim_eval::scenario::tests::test_parse_synth_baseline ... ok
+test sim_eval::scenario::tests::test_validation_empty_id ... ok
+test sim_eval::scenario::tests::test_validation_zero_version ... ok
+test sim_eval::suite::tests::test_default_values ... ok
+test sim_eval::report::tests::test_match_runs_basic ... ok
+test sim_eval::suite::tests::test_env_overrides_btreemap_ordering ... ok
+test sim_eval::suite::tests::test_mixed_path_and_inline_scenarios ... ok
+test sim_eval::suite::tests::test_parse_ci_smoke_suite ... ok
+test sim_eval::suite::tests::test_parse_inline_scenario_with_env_overrides ... ok
+test sim_eval::suite::tests::test_parse_suite_level_env_overrides ... ok
+test sim_eval::suite::tests::test_validation_empty_scenarios ... ok
+test sim_eval::suite::tests::test_validation_empty_inline_id ... ok
+test sim_eval::suite::tests::test_validation_empty_suite_id ... ok
+test sim_eval::suite::tests::test_validation_zero_repeat_runs ... ok
+test sim_eval::summarize::tests::test_ablations_pnl_checksum_surfaced ... ok
+test sim_eval::summarize::tests::test_discover_run_summaries ... ok
+test sim_eval::summarize::tests::test_kill_switch_status ... ok
+test sim_eval::summarize::tests::test_markdown_output_format ... ok
+test sim_eval::summarize::tests::test_print_table ... ok
+test sim_eval::summarize::tests::test_sort_rows ... ok
+test sim_eval::summarize::tests::test_parse_run_summary ... ok
+test state::tests::basis_and_unrealised_pnl_two_venues ... ok
+test state::tests::long_open_and_close_no_fees ... ok
+test state::tests::short_open_and_close_with_fees ... ok
+test strategy_core::tests::test_compute_actions_deterministic ... ok
+test strategy_core::tests::test_compute_actions_kill_switch_active ... ok
+test strategy_core::tests::test_compute_actions_produces_mm_intents ... ok
+test tail_risk::tests::test_cvar_larger_sample ... ok
+test tail_risk::tests::test_cvar_simple_vector ... ok
+test tail_risk::tests::test_normal_quantile_basic ... ok
+test tail_risk::tests::test_quantiles_standard ... ok
+test tail_risk::tests::test_tail_risk_metrics_integration ... ok
+test tail_risk::tests::test_var_all_negative ... ok
+test tail_risk::tests::test_var_cvar_empty ... ok
+test tail_risk::tests::test_var_ignores_nan ... ok
+test tail_risk::tests::test_var_simple_vector ... ok
+test sim_eval::summarize::tests::test_stable_sorting ... ok
+test tail_risk::tests::test_var_single_element ... ok
+test tail_risk::tests::test_wilson_ci_half ... ok
+test tail_risk::tests::test_wilson_ci_large_n ... ok
+test tail_risk::tests::test_wilson_ci_n_n ... ok
+test tail_risk::tests::test_wilson_ci_wider_at_higher_alpha ... ok
+test tail_risk::tests::test_wilson_ci_small_n ... ok
+test tail_risk::tests::test_wilson_ci_zero_n ... ok
+test tail_risk::tests::test_wilson_ci_zero_zero ... ok
+test telemetry::tests::ensure_schema_v1_does_not_overwrite_version ... ok
+test telemetry::tests::ensure_schema_v1_inserts_when_missing ... ok
+test telemetry::tests::ensure_schema_v1_panics_on_non_object_debug - should panic ... ok
+test telemetry::tests::ensure_schema_v1_preserves_existing ... ok
+test tests::basis_and_unrealised_pnl_two_venues ... ok
+test tests::long_open_and_close_no_fees ... ok
+test tests::short_open_and_close_with_fees ... ok
+test toxicity::tests::test_favorable_markout_does_not_increase_toxicity ... ok
+test toxicity::tests::test_adverse_markout_increases_toxicity ... ok
+test toxicity::tests::test_fifo_pops_exactly_matured_subset ... ok
+test toxicity::tests::test_fifo_preserves_insertion_order ... ok
+test toxicity::tests::test_fifo_processes_same_time_markouts ... ok
+test toxicity::tests::test_high_toxicity_disables_venue ... ok
+test toxicity::tests::test_markout_only_applies_after_horizon ... ok
+test toxicity::tests::test_sell_adverse_markout ... ok
+test toxicity::tests::vol_fallback_local_gt_sigma_eff_increases_toxicity_floor ... ok
+test toxicity::tests::vol_fallback_local_le_sigma_eff_is_zero ... ok
+
+test result: ok. 271 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running unittests src/bin/monte_carlo.rs (target/debug/deps/monte_carlo-0785f99707a5adc9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/paraphina-a2a10fdb5d54638c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/paraphina_live.rs (target/debug/deps/paraphina_live-0c0404d10e6b5fc0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/replay.rs (target/debug/deps/replay-3ad849b138568b54)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/rl_safe_pipeline.rs (target/debug/deps/rl_safe_pipeline-4f5b7f4dfb7f159e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/sim_eval.rs (target/debug/deps/sim_eval-28872a2cfc2feb0f)
+
+running 14 tests
+test tests::test_default_suite_output_dir_structure ... ok
+test tests::test_default_suite_output_dir_not_runs_directly ... ok
+test tests::test_different_suite_ids_different_directories ... ok
+test tests::test_is_evidence_pack_dir_detection ... ok
+test tests::test_suite_full_options_parsing ... ok
+test tests::test_suite_no_output_dir_is_none ... ok
+test tests::test_suite_output_dir_cli_parsing ... ok
+test tests::test_suite_output_dir_equals_syntax ... ok
+test tests::test_timestamp_format ... ok
+test tests::test_is_evidence_pack_dir_false_positives ... ok
+test tests::verify_evidence_pack_rejects_evidence_pack_dir ... ok
+test tests::verify_evidence_pack_success_and_tamper_failure ... ok
+test tests::verify_evidence_tree_rejects_evidence_pack_dir ... ok
+test tests::test_unique_directories_per_call ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+
+     Running tests/ablation_tests.rs (target/debug/deps/ablation_tests-b3c7e7ad59089d08)
+
+running 14 tests
+test test_ablation_helper_methods ... ok
+test test_ablation_set_json_serialization ... ok
+test test_ablation_short_hash_baseline ... ok
+test test_ablation_short_hash_deterministic ... ok
+test test_ablation_short_hash_unique ... ok
+test test_checksum_same_with_same_ablations ... ok
+test test_checksum_differs_with_ablations ... ok
+test test_empty_ablation_set_all_false ... ok
+test test_config_resolved_includes_ablations ... ok
+test test_parse_multiple_ablations_sorts_and_dedups ... ok
+test test_run_summary_includes_ablations ... ok
+test test_unknown_ablation_returns_error ... ok
+test test_run_summary_json_includes_ablations ... ok
+test test_valid_ablation_ids_are_complete ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/action_gateway_regression.rs (target/debug/deps/action_gateway_regression-ab8071bd9bca5c4b)
+
+running 2 tests
+test mm_quote_intents_produce_fill_events ... ok
+test action_gateway_is_deterministic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/buffer_reuse_determinism_tests.rs (target/debug/deps/buffer_reuse_determinism_tests-3d02d6392bf01e19)
+
+running 18 tests
+test test_compute_exit_intents_into_matches_allocating ... ok
+test test_compute_hedge_orders_into_matches_allocating ... ok
+test test_compute_mm_quotes_into_matches_allocating ... ok
+test test_compute_mm_quotes_into_with_scratch_matches_allocating ... ok
+test test_exit_into_buffer_reuse ... ok
+test test_full_tick_loop_determinism ... ok
+test test_hedge_into_buffer_reuse ... ok
+test test_log_return_optimization_equivalence ... ok
+test test_mm_into_buffer_reuse_preserves_capacity ... ok
+test test_mm_quotes_to_order_intents_into_matches_allocating ... ok
+test test_mm_scratch_buffer_reuse_preserves_capacity ... ok
+test test_mm_scratch_determinism_across_ticks ... ok
+test test_repeated_buffer_clears ... ok
+test test_engine_scratch_buffer_capacity_preserved ... ok
+test test_seed_dummy_mids_determinism_regression ... ok
+test test_seed_dummy_mids_log_return_consistency ... ok
+test test_toxicity_update_determinism ... ok
+test test_seed_dummy_mids_isolated_determinism_and_no_alloc ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/config_profile_tests.rs (target/debug/deps/config_profile_tests-1f3510cd9456ffad)
+
+running 10 tests
+test daily_loss_limit_presets_are_positive ... ok
+test env_daily_loss_limit_is_abs_magnitude ... ok
+test resolve_profile_cli_arg_overrides_env_var ... ok
+test env_risk_profile_is_honored_by_from_env_or_default ... ok
+test resolve_profile_default_when_nothing_specified ... ok
+test resolve_profile_env_var_empty_falls_through_to_scenario ... ok
+test resolve_profile_env_var_overrides_scenario_and_default ... ok
+test resolve_profile_scenario_used_when_no_cli_or_env ... ok
+test risk_profile_parse_accepts_various_formats ... ok
+test unknown_env_risk_profile_falls_back_to_balanced ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/event_log_replay_tests.rs (target/debug/deps/event_log_replay_tests-b1726691624dc93a)
+
+running 1 test
+test replay_produces_identical_telemetry ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/event_log_sim_eval_replay_tests.rs (target/debug/deps/event_log_sim_eval_replay_tests-f68a7df56d29364e)
+
+running 1 test
+test sim_eval_replay_produces_identical_telemetry ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/exit_engine_tests.rs (target/debug/deps/exit_engine_tests-6ed44a3d511e700d)
+
+running 10 tests
+test exit_noops_when_kill_switch_active ... ok
+test exit_deterministic_ordering_with_identical_edges ... ok
+test exit_noops_without_fair_value ... ok
+test exit_prefers_less_basis_risk_when_edges_similar ... ok
+test exit_prefers_less_fragmentation_when_edges_similar ... ok
+test exit_profit_only_blocks_unprofitable_exits ... ok
+test exit_respects_lot_size_and_min_notional ... ok
+test exit_respects_min_notional ... ok
+test exit_skips_disabled_or_toxic_or_stale ... ok
+test exit_splits_across_best_venues_when_capped_per_venue ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fair_value_gating_tests.rs (target/debug/deps/fair_value_gating_tests-ad1752c2d65d457d)
+
+running 10 tests
+test fv_degrades_gracefully_with_all_stale_data ... ok
+test fv_updates_when_exactly_at_min_healthy ... ok
+test healthy_count_reflects_outlier_exclusion ... ok
+test min_healthy_threshold_enforced ... ok
+test mm_quotes_shrink_when_fv_unavailable ... ok
+test outlier_venue_excluded_from_fv_update ... ok
+test stale_venue_data_excluded_from_fv_update ... ok
+test telemetry_fields_populated_correctly ... ok
+test telemetry_healthy_venues_empty_when_fv_unavailable ... ok
+test fv_gating_disables_mm_and_telemetry_flags_unavailable ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fill_batcher_flow_tests.rs (target/debug/deps/fill_batcher_flow_tests-77d1d0f652a53ad9)
+
+running 2 tests
+test fills_across_intervals_remain_separate ... ok
+test fills_in_same_interval_apply_together_for_exit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hedge_allocator_golden.rs (target/debug/deps/hedge_allocator_golden-613435171c6de867)
+
+running 8 tests
+test golden_basic_short_hedge ... ok
+test golden_basic_long_hedge ... ok
+test golden_deadband ... ok
+test golden_max_step_respected ... ok
+test golden_output_sorted ... ok
+test golden_vector_tests ... ok
+test golden_zero_margin_skipped ... ok
+test golden_vectors_deterministic ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hedge_allocator_invariants.rs (target/debug/deps/hedge_allocator_invariants-71b9f93b4d62c0f1)
+
+running 15 tests
+test edge_case_all_venues_disabled ... ok
+test edge_case_at_deadband_boundary ... ok
+test edge_case_very_large_inventory ... ok
+test edge_case_single_venue ... ok
+test edge_case_zero_inventory ... ok
+test edge_case_zero_margin ... ok
+test invariant_hedge_direction_reduces_exposure ... ok
+test invariant_margin_constraint_respected ... ok
+test invariant_no_nans_or_infs_in_outputs ... ok
+test invariant_per_venue_cap_respected ... ok
+test invariant_output_determinism ... ok
+test invariant_single_order_per_venue ... ok
+test invariant_total_hedge_bounded_by_max_step ... ok
+test systematic_parameter_combinations ... ok
+test invariant_venue_ordering_consistent ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/hedge_allocator_tests.rs (target/debug/deps/hedge_allocator_tests-5d8a011b1ecbeb04)
+
+running 20 tests
+test hedge_convexity_spreads_flow ... ok
+test hedge_avoids_near_liquidation ... ok
+test hedge_covers_short_position ... ok
+test hedge_deadband_no_orders ... ok
+test hedge_disabled_when_kill_switch_active ... ok
+test hedge_deterministic_tiebreak_by_venue_index ... ok
+test hedge_margin_cap_limits_new_position_opening ... ok
+test hedge_multi_chunk_allocation_is_deterministic_and_aggregated ... ok
+test hedge_noops_when_kill_switch_active ... ok
+test hedge_outside_deadband_generates_orders ... ok
+test hedge_prefers_basis_when_funding_equal ... ok
+test hedge_respects_global_max_step ... ok
+test hedge_prefers_funding_or_basis_when_exec_equal ... ok
+test hedge_respects_margin_available_cap ... ok
+test hedge_respects_per_venue_caps ... ok
+test hedge_skips_critical_liquidation_venues ... ok
+test test_cap_dq_by_abs_limit_integration ... ok
+test hedge_skips_disabled_stale_toxic_venues ... ok
+test test_compute_abs_limit_after_trade_integration ... ok
+test test_increases_abs_exposure_integration ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hedge_testkit.rs (target/debug/deps/hedge_testkit-fe87254cedd885fa)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/hyperliquid_fixture_tests.rs (target/debug/deps/hyperliquid_fixture_tests-90f225aaeba48e1f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/kill_switch_integration_tests.rs (target/debug/deps/kill_switch_integration_tests-7287affc197c40d0)
+
+running 7 tests
+test kill_switch_latches_and_blocks_intents_after_basis_breach ... ok
+test kill_switch_latches_and_blocks_intents_after_delta_breach ... ok
+test kill_switch_latches_and_blocks_intents_after_liq_distance_breach ... ok
+test kill_switch_latches_and_blocks_intents_after_pnl_breach ... ok
+test kill_best_effort_emits_single_reduce_only_ioc ... ok
+test kill_transition_cancels_open_orders_and_blocks_new_placements ... ok
+test kill_transition_emits_single_cancel_all_batch ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/legacy_runner_ab_tests.rs (target/debug/deps/legacy_runner_ab_tests-673af87634f3f4fa)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lighter_fixture_tests.rs (target/debug/deps/lighter_fixture_tests-1db9edfec4589031)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_account_ingestion_tests.rs (target/debug/deps/live_account_ingestion_tests-056fc841e84802c1)
+
+running 4 tests
+test tests::account_snapshot_staleness_tracks_unavailable ... ok
+test tests::dist_liq_sigma_updates_from_account_snapshot ... ok
+test tests::kill_switch_triggers_on_liq_distance ... ok
+test tests::reconciliation_diff_is_idempotent ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_cli_tests.rs (target/debug/deps/live_cli_tests-d7256552768914ec)
+
+running 1 test
+test live_startup_log_includes_required_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/live_event_log_replay_tests.rs (target/debug/deps/live_event_log_replay_tests-a1f85ad49890386f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_event_serialization_tests.rs (target/debug/deps/live_event_serialization_tests-59f452fb2887b255)
+
+running 3 tests
+test tests::serialize_execution_event_order_accepted ... ok
+test tests::serialize_account_snapshot ... ok
+test tests::serialize_market_data_event_snapshot ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_fill_batcher_tests.rs (target/debug/deps/live_fill_batcher_tests-f936b4cae09cea1f)
+
+running 3 tests
+test tests::live_fill_batcher_defers_exit_until_flush ... ok
+test tests::live_kill_flushes_pending_fills_once ... ok
+test tests::live_mock_determinism_execution_log ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/live_gateway_tests.rs (target/debug/deps/live_gateway_tests-db5cc0f732b6c0f3)
+
+running 9 tests
+test tests::cancel_all_removes_open_orders ... ok
+test tests::cancel_paths_increment_metrics ... ok
+test tests::deterministic_client_order_id_generation ... ok
+test tests::idempotent_replay_keeps_single_open_order ... ok
+test tests::post_only_reject_is_fatal ... ok
+test tests::rate_limit_sleeps_are_counted ... ok
+test tests::reduce_only_reject_is_fatal ... ok
+test tests::retries_retryable_failures ... ok
+test tests::shadow_mode_blocks_rest_gateway ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/live_hyperliquid_core_orderbook_tests.rs (target/debug/deps/live_hyperliquid_core_orderbook_tests-22b46243452ce902)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_hyperliquid_runner_fixture_tests.rs (target/debug/deps/live_hyperliquid_runner_fixture_tests-c652b353fd450abc)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_kill_switch_tests.rs (target/debug/deps/live_kill_switch_tests-a37fc4c2e8e19500)
+
+running 2 tests
+test tests::kill_switch_best_effort_flatten_reduces_position ... ok
+test tests::kill_switch_cancel_all_only ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_mock_exchange_tests.rs (target/debug/deps/live_mock_exchange_tests-b1dd3053d7f4b609)
+
+running 1 test
+test tests::live_mock_exchange_semantics ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_ops_tests.rs (target/debug/deps/live_ops_tests-9e1b9b15725fe437)
+
+running 2 tests
+test tests::config_hash_is_stable_for_same_config ... ok
+test tests::startup_log_is_deterministic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_reconciliation_tests.rs (target/debug/deps/live_reconciliation_tests-ab9b0798b2a35462)
+
+running 1 test
+test tests::reconciliation_recovers_open_orders_after_ws_drop ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_shadow_adapter_tests.rs (target/debug/deps/live_shadow_adapter_tests-7b995e977fc2d4a2)
+
+running 2 tests
+test tests::shadow_adapter_deterministic_ids_and_open_order_stability ... ok
+test tests::live_runner_tick_metrics_monotonic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_shadow_output_tests.rs (target/debug/deps/live_shadow_output_tests-84d3cab53c07b380)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_state_cache_parity_tests.rs (target/debug/deps/live_state_cache_parity_tests-9c6b22ba06304b0d)
+
+running 1 test
+test tests::cache_and_core_l2_parity_with_account_snapshot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_telemetry_contract_tests.rs (target/debug/deps/live_telemetry_contract_tests-ed5c25def7b7faf0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/live_venue_health_tests.rs (target/debug/deps/live_venue_health_tests-0b76a048d2368301)
+
+running 1 test
+test tests::disable_triggers_cancel_all ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/local_vol_update_tests.rs (target/debug/deps/local_vol_update_tests-c1f276e6ddea1e18)
+
+running 1 test
+test local_vol_updates_match_reference_formula ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/loop_interval_cli_tests.rs (target/debug/deps/loop_interval_cli_tests-ba0c8f7a538cf340)
+
+running 1 test
+test env_overrides_loop_intervals_show_in_stdout ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/metrics_tests.rs (target/debug/deps/metrics_tests-85f6fee654bdda79)
+
+running 3 tests
+test drawdown_tracker_basic ... ok
+test drawdown_tracker_handles_negative_equity ... ok
+test online_stats_basic ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mm_quote_model_tests.rs (target/debug/deps/mm_quote_model_tests-65fa6c2bf7cc99f4)
+
+running 27 tests
+test compute_order_actions_cancel_when_no_desired ... ok
+test compute_order_actions_place_new ... ok
+test disabled_venue_produces_no_quotes ... ok
+test critical_liquidation_distance_produces_no_quotes ... ok
+test hardlimit_produces_no_quotes_even_if_kill_switch_false ... ok
+test extreme_delta_produces_no_quotes ... ok
+test high_toxicity_venue_produces_no_quotes ... ok
+test high_delta_only_allows_risk_reducing ... ok
+test kill_switch_produces_no_quotes ... ok
+test liquidation_warning_shrinks_size ... ok
+test non_passive_order_replaced_even_if_young ... ok
+test old_order_with_price_change_replaced ... ok
+test old_order_with_size_change_replaced ... ok
+test passivity_ask_strictly_above_best_ask ... ok
+test passivity_bid_ask_do_not_cross ... ok
+test passivity_bid_strictly_below_best_bid ... ok
+test reservation_price_affected_by_venue_target_deviation ... ok
+test reservation_price_decreases_when_long ... ok
+test reservation_price_increases_when_short ... ok
+test size_respects_lot_size ... ok
+test size_respects_max_order_size ... ok
+test stale_book_produces_no_quotes ... ok
+test venue_targets_respond_to_funding ... ok
+test venue_targets_scale_with_depth ... ok
+test warning_regime_caps_size ... ok
+test young_passive_order_not_replaced ... ok
+test warning_regime_widens_spread ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/monte_carlo_evidence_pack_tests.rs (target/debug/deps/monte_carlo_evidence_pack_tests-c7c1a126875605fd)
+
+running 7 tests
+test test_monte_carlo_cli_verify_evidence_tree ... ok
+test test_monte_carlo_cli_verify_evidence_pack ... ok
+test test_monte_carlo_evidence_pack_verifies ... ok
+test test_monte_carlo_evidence_pack_verifies_tree ... ok
+test test_monte_carlo_generates_evidence_pack ... ok
+test test_monte_carlo_manifest_structure ... ok
+test test_monte_carlo_with_csv_in_evidence_pack ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/monte_carlo_scale_tests.rs (target/debug/deps/monte_carlo_scale_tests-a2de6162750c4c35)
+
+running 11 tests
+test test_seed_mapping_basic ... ok
+test test_seed_mapping_non_zero_start ... ok
+test test_seed_mapping_shard_slicing ... ok
+test test_jsonl_round_trip ... ok
+test test_seed_mapping_wrapping ... ok
+test test_summarize_accepts_valid_contiguous_indices ... ok
+test test_summarize_detects_seed_contract_violation ... ok
+test test_summarize_rejects_duplicate_indices ... ok
+test test_summarize_rejects_non_contiguous_indices ... ok
+test test_summarize_validates_seed_contract ... ok
+test test_summarize_handles_malformed_json ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/monte_carlo_threaded_determinism_tests.rs (target/debug/deps/monte_carlo_threaded_determinism_tests-00688e4084ccb5b6)
+
+running 8 tests
+test test_single_thread_default ... ok
+test test_threaded_determinism_jsonl_identical ... ok
+test test_threaded_determinism_summary_identical ... ok
+test test_threaded_jsonl_sorted_by_run_index ... ok
+test test_threaded_determinism_with_jitter ... ok
+test test_threaded_quiet_no_interleaved_output ... ok
+test test_threaded_schema_version_preserved ... ok
+test test_threads_cli_argument_parsing ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/order_ledger_tests.rs (target/debug/deps/order_ledger_tests-7f91c7fbaabb3f96)
+
+running 5 tests
+test markout_updates_fill_record ... ok
+test cancel_all_clears_open_orders ... ok
+test open_order_lifecycle_updates_remaining_and_cancel ... ok
+test recent_fills_ring_buffer_is_bounded ... ok
+test simulation_records_recent_fills_and_markouts ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/order_management_mm_one_per_side_tests.rs (target/debug/deps/order_management_mm_one_per_side_tests-eeea000034a09180)
+
+running 2 tests
+test mm_one_per_side_respects_min_quote_lifetime ... ok
+test mm_one_per_side_replaces_instead_of_placing ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/order_semantics_tests.rs (target/debug/deps/order_semantics_tests-9e520dd3de9f4ac4)
+
+running 5 tests
+test live_semantics::mock_live_ioc_cancels_when_no_fill ... ok
+test live_semantics::mock_live_post_only_rejects_crossing ... ok
+test sim_ioc_fills_when_crossing ... ok
+test sim_post_only_rejects_crossing_orders ... ok
+test sim_ioc_rejects_when_no_fill ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/orderbook_core_l2_tests.rs (target/debug/deps/orderbook_core_l2_tests-2e01d80b65f77e11)
+
+running 3 tests
+test l2_derived_metrics_match_known_book ... ok
+test l2_last_update_ms_updates_on_book_events ... ok
+test l2_snapshot_and_delta_update_levels ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/pnl_identity_tests.rs (target/debug/deps/pnl_identity_tests-a94c13f823889f32)
+
+running 6 tests
+test pnl_identity_holds_after_round_trip_with_fees ... ok
+test pnl_identity_holds_after_single_fill_and_mark ... ok
+test realised_pnl_flip_long_to_short_with_fees ... ok
+test realised_pnl_flip_short_to_long_with_fees ... ok
+test unrealised_pnl_and_basis_match_definitions_multi_venue ... ok
+test pnl_invariants_hold_for_random_fill_sequences ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/replay_determinism_tests.rs (target/debug/deps/replay_determinism_tests-f078524ab552cbda)
+
+running 7 tests
+test test_event_replay_with_reject_is_deterministic ... ok
+test test_event_replay_produces_same_state_and_intents ... ok
+test test_kill_switch_determinism ... ok
+test test_replay_determinism_multi_tick ... ok
+test test_replay_determinism_single_tick ... ok
+test test_replay_determinism_with_inventory ... ok
+test test_replay_performance ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/risk_regim_tests.rs (target/debug/deps/risk_regim_tests-8ab036ba7ac4f7f2)
+
+running 14 tests
+test exit_disabled_when_kill_switch_active ... ok
+test hardlimit_and_kill_switch_when_basis_limit_breached ... ok
+test hardlimit_and_kill_switch_when_delta_limit_breached ... ok
+test hardlimit_and_kill_switch_when_liquidation_distance_breached ... ok
+test hardlimit_and_kill_switch_when_loss_limit_breached ... ok
+test hardlimit_from_delta_breach_triggers_kill_and_disables_mm ... ok
+test hedge_disabled_when_kill_switch_active ... ok
+test kill_switch_latches_once_true ... ok
+test kill_switch_latches_preserves_first_reason ... ok
+test pnl_boundary_transitions_follow_spec ... ok
+test regime_stays_normal_with_small_exposures ... ok
+test warning_at_basis_warn_boundary_not_hardlimit ... ok
+test warning_at_delta_warn_boundary_not_hardlimit ... ok
+test warning_when_delta_above_warn_but_below_hard ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/rl2_bc_tests.rs (target/debug/deps/rl2_bc_tests-cb5fa126cf386aec)
+
+running 14 tests
+test test_action_encoding_determinism_identity ... ok
+test test_action_encoding_clamping ... ok
+test test_action_encoding_determinism_varied ... ok
+test test_action_encoding_round_trip_extreme_values ... ok
+test test_action_encoding_round_trip_identity ... ok
+test test_action_encoding_spec_dimensions ... ok
+test test_heuristic_policy_determinism ... ok
+test test_heuristic_policy_produces_identity ... ok
+test test_observation_to_features_determinism ... ok
+test test_trajectory_collection_determinism_small ... ok
+test test_trajectory_collection_different_seeds ... ok
+test test_trajectory_metadata_versions ... ok
+test test_version_constants_are_documented ... ok
+test test_trajectory_record_dimensions ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/rl_determinism_tests.rs (target/debug/deps/rl_determinism_tests-a0c0d172facb6221)
+
+running 14 tests
+test test_episode_determinism ... ok
+test test_different_seeds_produce_different_results ... ok
+test test_heuristic_policy_is_identity ... ok
+test test_observation_deterministic ... ok
+test test_observation_has_required_fields ... ok
+test test_observation_json_roundtrip ... ok
+test test_observation_venue_ordering ... ok
+test test_observation_version ... ok
+test test_policy_action_clamp ... ok
+test test_policy_action_deterministic ... ok
+test test_policy_action_json_roundtrip ... ok
+test test_policy_reset_episode ... ok
+test test_multiple_episodes_with_reset ... ok
+test test_shadow_mode_no_execution_impact ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/rl_env_determinism_tests.rs (target/debug/deps/rl_env_determinism_tests-32ef30796284909a)
+
+running 11 tests
+test test_domain_rand_sampler_determinism ... ok
+test test_episode_termination_max_ticks ... ok
+test test_observation_structure ... ok
+test test_episode_termination_kill_switch ... ok
+test test_sim_env_determinism_with_domain_rand ... ok
+test test_sim_env_different_seeds_different_results ... ok
+test test_vec_env_custom_actions ... ok
+test test_sim_env_determinism_same_seed_same_actions ... ok
+test test_vec_env_independence ... ok
+test test_vec_env_smoke ... ok
+test test_vec_env_determinism ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/rl_reward_budgets_tests.rs (target/debug/deps/rl_reward_budgets_tests-4f6bb95969a6b919)
+
+running 1 test
+test reward_weights_use_alignment_budgets ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/rl_safe_pipeline_tests.rs (target/debug/deps/rl_safe_pipeline_tests-5fc51ca2aebc3442)
+
+running 2 tests
+test safe_pipeline_uses_alignment_budgets ... ok
+test safe_pipeline_is_deterministic_and_enforces_safety ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sim_account_snapshot_tests.rs (target/debug/deps/sim_account_snapshot_tests-ea009e5f0f58fe06)
+
+running 2 tests
+test sim_account_snapshot_applies_liq_and_margin_fields ... ok
+test sim_account_snapshot_synthesizer_is_deterministic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sim_eval_cli_verify_cmds.rs (target/debug/deps/sim_eval_cli_verify_cmds-3d7edd48f26e3771)
+
+running 5 tests
+test help_mentions_verify_commands ... ok
+test verify_pack_accepts_positional_output_root ... ok
+test verify_pack_missing_arg_is_usage_error ... ok
+test verify_tree_accepts_positional_root ... ok
+test verify_tree_missing_arg_is_usage_error ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sim_eval_contract_tests.rs (target/debug/deps/sim_eval_contract_tests-ff626b05ce5c8286)
+
+running 27 tests
+test test_determinism_different_seeds_different_checksums ... ok
+test test_determinism_consistency_across_runs ... ok
+test test_determinism_gate_would_fail_for_different_seeds ... ok
+test test_determinism_gate_passes_for_identical_runs ... ok
+test test_evidence_pack_files_exist ... ok
+test test_determinism_same_seed_same_checksum ... ok
+test test_evidence_pack_manifest_required_keys ... ok
+test test_evidence_pack_paths_are_relative ... ok
+test test_evidence_pack_sha256sums_includes_manifest ... ok
+test test_evidence_pack_sha256sums_verification ... ok
+test test_parse_ci_smoke_suite_yaml ... ok
+test test_parse_historical_stub_yaml ... ok
+test test_parse_synth_baseline_yaml ... ok
+test test_parse_synth_jump_yaml ... ok
+test test_run_summary_required_fields ... ok
+test test_run_summary_with_kill_switch ... ok
+test test_schema_completeness_all_fields_present ... ok
+test test_seed_expansion ... ok
+test test_suite_default_values ... ok
+test test_suite_parsing_inline ... ok
+test test_suite_validation_empty_id ... ok
+test test_suite_validation_empty_scenarios ... ok
+test test_suite_validation_zero_repeat_runs ... ok
+test test_validation_empty_scenario_id ... ok
+test test_validation_missing_synthetic_config ... ok
+test test_validation_zero_steps ... ok
+test test_evidence_pack_suite_yaml_byte_identical ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/sim_eval_suite_output_dir_test.rs (target/debug/deps/sim_eval_suite_output_dir_test-577e2d0c8bc258e0)
+
+running 6 tests
+test suite_help_mentions_env_overrides ... ok
+test suite_help_mentions_output_dir ... ok
+test suite_inline_env_overrides_creates_evidence_packs ... ok
+test suite_output_dir_before_suite_path ... ok
+test suite_output_dir_creates_evidence_pack ... ok
+test suite_output_dir_equals_syntax ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.13s
+
+     Running tests/sim_eval_summarize_tests.rs (target/debug/deps/sim_eval_summarize_tests-314c8126b7564021)
+
+running 5 tests
+test test_summarize_no_files_found ... ok
+test test_summarize_finds_multiple_runs ... ok
+test test_summarize_output_is_sorted ... ok
+test test_summarize_table_has_expected_columns ... ok
+test test_summarize_with_nested_directories ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sim_eval_verify_tests.rs (target/debug/deps/sim_eval_verify_tests-2b7bb217b28d88db)
+
+running 7 tests
+test test_report_default_is_empty ... ok
+test test_verify_evidence_pack_missing_sha256sums ... ok
+test test_verify_evidence_pack_hash_mismatch ... ok
+test test_verify_evidence_pack_success ... ok
+test test_verify_evidence_tree_multiple_packs ... ok
+test test_verify_evidence_tree_no_packs ... ok
+test test_verify_evidence_tree_one_bad_pack ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/smoke_profiles.rs (target/debug/deps/smoke_profiles-bf6c858a865f8381)
+
+running 2 tests
+test smoke_profile_like_default ... ok
+test smoke_loose_loss_limit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/telemetry_determinism_tests.rs (target/debug/deps/telemetry_determinism_tests-2d07cbd2848e067c)
+
+running 3 tests
+test telemetry_is_byte_identical_for_same_seed ... ok
+test telemetry_is_byte_identical_with_kill_transition ... ok
+test telemetry_overwrites_default_path_and_is_monotonic ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/telemetry_kill_event_tests.rs (target/debug/deps/telemetry_kill_event_tests-0f43b1b35f87b5cb)
+
+running 1 test
+test telemetry_includes_kill_event_on_transition ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/telemetry_schema_tests.rs (target/debug/deps/telemetry_schema_tests-284fe15e3104fd99)
+
+running 16 tests
+test schema_has_required_top_level_keys ... ok
+test schema_file_exists_and_is_valid_json ... ok
+test telemetry_fair_value_can_be_null ... ok
+test schema_version_is_one ... ok
+test telemetry_golden_record_validates_against_schema ... ok
+test telemetry_healthy_venues_used_is_array_of_integers ... ok
+test telemetry_kill_switch_is_boolean ... ok
+test telemetry_kill_event_is_valid_optional_object ... ok
+test telemetry_numeric_fields_are_finite ... ok
+test telemetry_record_includes_schema_version ... ok
+test telemetry_record_has_all_required_fields ... ok
+test telemetry_rl_optional_fields_validate ... ok
+test telemetry_risk_regime_is_valid_enum ... ok
+test telemetry_tick_is_non_negative_integer ... ok
+test telemetry_schema_version_matches_schema_invariant ... ok
+test telemetry_transparency_optional_fields_validate ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/tooling_docs_tests.rs (target/debug/deps/tooling_docs_tests-54deb3d315966605)
+
+running 2 tests
+test exp12_tools_filenames_exist ... ok
+test exp07_daily_loss_limit_snippet_positive ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/toxicity_markout_tests.rs (target/debug/deps/toxicity_markout_tests-ee557d527d992880)
+
+running 20 tests
+test test_adverse_sell_markout ... ok
+test test_adverse_buy_markout_increases_toxicity ... ok
+test test_bounded_deque_fifo_order ... ok
+test test_favorable_buy_markout_decreases_toxicity ... ok
+test test_favorable_sell_markout_keeps_toxicity_low ... ok
+test test_health_status_disabled ... ok
+test test_health_status_healthy ... ok
+test test_health_status_warning ... ok
+test test_invalid_fill_not_recorded ... ok
+test test_markout_applied_after_horizon ... ok
+test test_markout_applied_at_exact_horizon ... ok
+test test_markout_ewma_telemetry_updated ... ok
+test test_markout_not_applied_before_horizon ... ok
+test test_max_pending_cap_enforced ... ok
+test test_mixed_markouts_balance_out ... ok
+test test_multiple_markouts_ewma_accumulation ... ok
+test test_no_mid_sets_high_toxicity ... ok
+test test_record_pending_markout_basic ... ok
+test test_severe_adverse_markout_disables_venue ... ok
+test test_zero_depth_sets_high_toxicity ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/treasury_guidance_tests.rs (target/debug/deps/treasury_guidance_tests-963bb948aefa06f5)
+
+running 1 test
+test treasury_guidance_is_deterministic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/vol_floor_tests.rs (target/debug/deps/vol_floor_tests-20887d62a20422a0)
+
+running 11 tests
+test sigma_eff_equals_raw_vol_when_above_floor ... ok
+test delta_limit_scales_with_vol_ratio ... ok
+test sigma_eff_floor_logic_verified ... ok
+test sigma_eff_in_telemetry_matches_state ... ok
+test sigma_eff_initialized_to_sigma_min ... ok
+test sigma_eff_stable_under_nan_protection ... ok
+test sigma_eff_never_below_sigma_min ... ok
+test sigma_eff_uses_floor_when_raw_vol_is_low ... ok
+test spread_mult_increases_with_higher_sigma_eff ... ok
+test size_mult_decreases_with_higher_sigma_eff ... ok
+test vol_scalars_use_sigma_eff ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests paraphina
+
+running 4 tests
+test paraphina/src/sim_eval/env_override.rs - sim_eval::env_override::with_env_overrides (line 61) ... ignored
+test paraphina/src/sim_eval/evidence_pack.rs - sim_eval::evidence_pack::write_evidence_pack (line 315) ... ignored
+test paraphina/src/telemetry.rs - telemetry (line 34) ... ignored
+test paraphina/src/telemetry.rs - telemetry::ensure_schema_v1 (line 95) ... ignored
+
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

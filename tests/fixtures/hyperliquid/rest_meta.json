@@ -1,0 +1,7 @@
+{
+  "universe": [
+    { "name": "BTC" },
+    { "name": "TAO" },
+    { "name": "ETH" }
+  ]
+}

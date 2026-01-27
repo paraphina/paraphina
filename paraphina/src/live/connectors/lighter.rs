@@ -1,0 +1,1253 @@
+//! Lighter connector (feature-gated).
+
+pub const STUB_CONNECTOR: bool = false;
+pub const SUPPORTS_MARKET: bool = true;
+pub const SUPPORTS_ACCOUNT: bool = true;
+pub const SUPPORTS_EXECUTION: bool = true;
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs};
+
+use super::super::gateway::{
+    LiveGatewayError, LiveGatewayErrorKind, LiveRestCancelAllRequest, LiveRestCancelRequest,
+    LiveRestClient, LiveRestPlaceRequest, LiveRestResponse,
+};
+use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
+use super::super::types::{
+    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, LiquidationSnapshot,
+    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+};
+
+#[derive(Debug, Clone)]
+pub struct LighterConfig {
+    pub ws_url: String,
+    pub rest_url: String,
+    pub market: String,
+    pub venue_id: String,
+    pub venue_index: usize,
+    pub paper_mode: bool,
+}
+
+impl LighterConfig {
+    pub fn from_env() -> Self {
+        let network = std::env::var("LIGHTER_NETWORK")
+            .unwrap_or_else(|_| "mainnet".to_string())
+            .to_lowercase();
+        let (default_rest, default_ws) = match network.as_str() {
+            "testnet" => (
+                "https://testnet.zklighter.elliot.ai",
+                "wss://testnet.zklighter.elliot.ai/stream",
+            ),
+            _ => (
+                "https://mainnet.zklighter.elliot.ai",
+                "wss://mainnet.zklighter.elliot.ai/stream",
+            ),
+        };
+        let ws_url = std::env::var("LIGHTER_WS_URL").unwrap_or_else(|_| default_ws.to_string());
+        let rest_url = std::env::var("LIGHTER_HTTP_BASE_URL")
+            .or_else(|_| std::env::var("LIGHTER_REST_URL"))
+            .unwrap_or_else(|_| default_rest.to_string());
+        let market = std::env::var("LIGHTER_MARKET").unwrap_or_else(|_| "BTC-USD".to_string());
+        let venue_id = std::env::var("LIGHTER_VENUE").unwrap_or_else(|_| "LIGHTER".to_string());
+        let paper_mode = std::env::var("LIGHTER_PAPER_MODE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true);
+        Self {
+            ws_url,
+            rest_url,
+            market,
+            venue_id,
+            venue_index: 0,
+            paper_mode,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LighterConnector {
+    cfg: LighterConfig,
+    http: Client,
+    market_tx: mpsc::Sender<MarketDataEvent>,
+    exec_tx: mpsc::Sender<ExecutionEvent>,
+    account_tx: Option<mpsc::Sender<AccountEvent>>,
+}
+
+impl LighterConnector {
+    pub fn new(
+        cfg: LighterConfig,
+        market_tx: mpsc::Sender<MarketDataEvent>,
+        exec_tx: mpsc::Sender<ExecutionEvent>,
+    ) -> Self {
+        Self {
+            cfg,
+            http: Client::new(),
+            market_tx,
+            exec_tx,
+            account_tx: None,
+        }
+    }
+
+    pub fn with_account_tx(mut self, account_tx: mpsc::Sender<AccountEvent>) -> Self {
+        self.account_tx = Some(account_tx);
+        self
+    }
+
+    async fn resolve_market_id_and_symbol(&self) -> anyhow::Result<(String, u64)> {
+        let market_id_env = std::env::var("LIGHTER_MARKET_ID")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let market_symbol_env = std::env::var("LIGHTER_MARKET").ok();
+        let (orderbooks, source_url) = fetch_lighter_orderbooks_with_fallbacks(
+            &self.http,
+            &self.cfg.rest_url,
+            &self.cfg.ws_url,
+        )
+        .await?;
+
+        if let Some(market_id) = market_id_env {
+            let symbol = market_symbol_env.clone().or_else(|| {
+                orderbooks
+                    .iter()
+                    .find(|info| info.market_id == market_id)
+                    .map(|info| info.symbol.clone())
+            });
+            let symbol = symbol.unwrap_or_else(|| "UNKNOWN".to_string());
+            eprintln!(
+                "INFO: Lighter resolving market id symbol={} source_url=env:LIGHTER_MARKET_ID",
+                symbol
+            );
+            eprintln!(
+                "INFO: Lighter market id resolved symbol={} market_id={} source_url=env:LIGHTER_MARKET_ID",
+                symbol, market_id
+            );
+            return Ok((symbol, market_id));
+        }
+
+        let symbol = market_symbol_env.unwrap_or_else(|| "BTC-USD".to_string());
+        eprintln!(
+            "INFO: Lighter resolving market id symbol={} source_url={}",
+            symbol, source_url
+        );
+        let normalized = normalize_lighter_symbol(&symbol);
+        let found = orderbooks
+            .iter()
+            .find(|info| normalize_lighter_symbol(&info.symbol) == normalized)
+            .cloned();
+        let Some(info) = found else {
+            let available: Vec<String> = orderbooks
+                .iter()
+                .take(15)
+                .map(|info| info.symbol.clone())
+                .collect();
+            eprintln!(
+                "WARN: Lighter market id not found requested={} available_symbols={:?}",
+                normalized, available
+            );
+            anyhow::bail!(
+                "LIGHTER_MARKET not found in orderBooks response: {}",
+                symbol
+            );
+        };
+        eprintln!(
+            "INFO: Lighter market id resolved symbol={} market_id={} source_url={}",
+            info.symbol, info.market_id, source_url
+        );
+        Ok((info.symbol, info.market_id))
+    }
+
+    pub async fn run_public_ws(&self) {
+        let mut backoff = Duration::from_secs(1);
+        let mut subscribe_failures = 0usize;
+        let mut logged_subscribe_failure = false;
+        loop {
+            if let Err(err) = self.public_ws_once().await {
+                let msg = err.to_string();
+                if msg.contains("Lighter subscribe failed") {
+                    subscribe_failures += 1;
+                    if subscribe_failures >= 3 && !logged_subscribe_failure {
+                        eprintln!(
+                            "WARN: Lighter subscribe failed {} times; backing off",
+                            subscribe_failures
+                        );
+                        logged_subscribe_failure = true;
+                    }
+                } else {
+                    subscribe_failures = 0;
+                    logged_subscribe_failure = false;
+                    eprintln!("Lighter public WS error: {err}");
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    async fn public_ws_once(&self) -> anyhow::Result<()> {
+        let (market_symbol, market_id) = self.resolve_market_id_and_symbol().await?;
+        eprintln!("INFO: Lighter public WS connecting url={}", self.cfg.ws_url);
+        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        eprintln!("INFO: Lighter public WS connected url={}", self.cfg.ws_url);
+        let (mut write, mut read) = ws_stream.split();
+        let channel = build_order_book_channel(market_id);
+        let sub = json!({
+            "type": "subscribe",
+            "channel": channel,
+        });
+        write.send(Message::Text(sub.to_string())).await?;
+        let mut subscribed = false;
+        let mut first_message_logs = 0usize;
+        let mut tracker = LighterSeqTracker::new();
+        let mut first_book_update_logged = false;
+        let mut first_message_logged = false;
+        let mut logged_non_utf8_binary = false;
+        let mut first_decoded_top_logged = false;
+        let mut decode_miss_count = 0usize;
+        let mut seq_fallback: u64 = 0;
+        while let Some(msg) = read.next().await {
+            let msg = msg?;
+            let payload = match msg {
+                Message::Text(text) => text,
+                Message::Binary(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        if !logged_non_utf8_binary {
+                            eprintln!(
+                                "WARN: Lighter public WS non-utf8 binary frame url={}",
+                                self.cfg.ws_url
+                            );
+                            logged_non_utf8_binary = true;
+                        }
+                        continue;
+                    }
+                },
+                _ => continue,
+            };
+            if !first_message_logged {
+                eprintln!("INFO: Lighter public WS first message received");
+                first_message_logged = true;
+            }
+            let value = match serde_json::from_str::<serde_json::Value>(&payload) {
+                Ok(value) => value,
+                Err(err) => {
+                    let snippet: String = payload.chars().take(160).collect();
+                    eprintln!(
+                        "WARN: Lighter public WS parse error: {err} url={} snippet={}",
+                        self.cfg.ws_url, snippet
+                    );
+                    continue;
+                }
+            };
+            if first_message_logs < 2 {
+                let keys = value
+                    .as_object()
+                    .map(|obj| {
+                        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                        keys.sort();
+                        format!("[{}]", keys.join(","))
+                    })
+                    .unwrap_or_else(|| "[non-object]".to_string());
+                let snippet: String = payload.chars().take(160).collect();
+                eprintln!("INFO: Lighter WS first msg keys={keys} snippet={snippet}");
+                first_message_logs += 1;
+            }
+            if value.get("type").and_then(|v| v.as_str()) == Some("ping") {
+                continue;
+            }
+            if !subscribed {
+                if let Some(code) = lighter_error_code(&value) {
+                    if code == 30005 {
+                        anyhow::bail!("Lighter subscribe failed: invalid channel");
+                    }
+                }
+            }
+            if !subscribed && is_lighter_book_message(&value) {
+                subscribed = true;
+                eprintln!(
+                    "INFO: Lighter subscribe ok channel=order_book/{} symbol={} market_id={}",
+                    market_id, market_symbol, market_id
+                );
+            }
+            if subscribed {
+                if let Some(top) = decode_order_book_top(&value) {
+                    if !first_decoded_top_logged {
+                        eprintln!(
+                            "FIRST_DECODED_TOP venue=lighter bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                            top.best_bid_px, top.best_bid_sz, top.best_ask_px, top.best_ask_sz
+                        );
+                        first_decoded_top_logged = true;
+                    }
+                } else if decode_miss_count < 3 && has_lighter_book_fields(&value) {
+                    decode_miss_count += 1;
+                    log_decode_miss(
+                        "Lighter",
+                        &value,
+                        &payload,
+                        decode_miss_count,
+                        self.cfg.ws_url.as_str(),
+                    );
+                }
+                if let Some(parsed) = decode_order_book_snapshot(
+                    &value,
+                    self.cfg.venue_index,
+                    &self.cfg.venue_id,
+                    &mut seq_fallback,
+                ) {
+                    let outcome = tracker.on_message(parsed);
+                    if let Some(event) = outcome.event {
+                        if !first_book_update_logged {
+                            eprintln!("INFO: Lighter public WS first book update");
+                            first_book_update_logged = true;
+                        }
+                        if let Err(err) = self.market_tx.send(event).await {
+                            eprintln!("Lighter public WS market send failed: {err}");
+                        }
+                    }
+                }
+            }
+            if let Some(parsed) =
+                parse_l2_message_value(&value, &self.cfg.venue_id, self.cfg.venue_index)
+            {
+                let outcome = tracker.on_message(parsed);
+                if let Some(event) = outcome.event {
+                    if !first_book_update_logged {
+                        eprintln!("INFO: Lighter public WS first book update");
+                        first_book_update_logged = true;
+                    }
+                    if let Err(err) = self.market_tx.send(event).await {
+                        eprintln!("Lighter public WS market send failed: {err}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run_account_polling(&self, interval_ms: u64) {
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        loop {
+            interval.tick().await;
+            let Some(account_tx) = self.account_tx.as_ref() else {
+                continue;
+            };
+            match fetch_account_snapshot(&self.http, &self.cfg).await {
+                Ok(snapshot) => {
+                    let _ = account_tx.send(snapshot).await;
+                }
+                Err(err) => {
+                    eprintln!("Lighter account polling error: {err}");
+                }
+            }
+        }
+    }
+
+    pub async fn run_account_fixture(
+        &self,
+        fixture_dir: &std::path::Path,
+        start_ms: i64,
+        step_ms: i64,
+        ticks: u64,
+    ) {
+        let Some(account_tx) = self.account_tx.as_ref() else {
+            return;
+        };
+        let snapshot_path = fixture_dir.join("rest_account_snapshot.json");
+        let raw = match std::fs::read_to_string(snapshot_path) {
+            Ok(val) => val,
+            Err(_) => return,
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return;
+        };
+        let Some(mut snapshot) = parse_account_snapshot(&value, &self.cfg.venue_id) else {
+            return;
+        };
+        let mut seq: u64 = 1;
+        for tick in 0..ticks {
+            snapshot.seq = seq;
+            snapshot.timestamp_ms = start_ms + step_ms.saturating_mul(tick as i64);
+            seq = seq.wrapping_add(1);
+            let _ = account_tx
+                .send(AccountEvent::Snapshot(snapshot.clone()))
+                .await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub async fn run_private_ws(&self) {
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if let Err(err) = self.private_ws_once().await {
+                eprintln!("Lighter private WS error: {err}");
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    async fn private_ws_once(&self) -> anyhow::Result<()> {
+        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        let (_write, mut read) = ws_stream.split();
+        while let Some(msg) = read.next().await {
+            let msg = msg?;
+            if let Message::Text(text) = msg {
+                if let Some(event) = translate_private_event(&text) {
+                    let _ = self.exec_tx.send(event).await;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LighterFixtureFeed {
+    messages: Vec<String>,
+}
+
+impl LighterFixtureFeed {
+    pub fn from_files(paths: &[PathBuf]) -> std::io::Result<Self> {
+        let mut messages = Vec::new();
+        for path in paths {
+            messages.push(std::fs::read_to_string(path)?);
+        }
+        Ok(Self { messages })
+    }
+
+    pub fn from_dir(dir: &Path) -> std::io::Result<Self> {
+        let snapshot = dir.join("ws_l2_snapshot.json");
+        let delta = dir.join("ws_l2_delta.json");
+        Self::from_files(&[snapshot, delta])
+    }
+
+    pub async fn run_ticks(
+        &self,
+        market_tx: mpsc::Sender<MarketDataEvent>,
+        venue_index: usize,
+        start_ms: i64,
+        step_ms: i64,
+        ticks: u64,
+    ) {
+        let pace_ticks = std::env::var("PARAPHINA_PAPER_USE_WALLCLOCK_TS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let sleep_duration = Duration::from_millis(step_ms.max(1) as u64);
+        let mut seq: u64 = 1;
+        for tick in 0..ticks {
+            let now_ms = start_ms + step_ms.saturating_mul(tick as i64);
+            for raw in &self.messages {
+                if let Some(parsed) = parse_l2_message(raw, "LIGHTER", venue_index) {
+                    let event = override_market_event(parsed.event, seq, now_ms);
+                    seq = seq.wrapping_add(1);
+                    let _ = market_tx.send(event).await;
+                }
+            }
+            if pace_ticks {
+                tokio::time::sleep(sleep_duration).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedL2Message {
+    pub event: MarketDataEvent,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LighterSeqTracker {
+    last_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LighterSeqOutcome {
+    pub event: Option<MarketDataEvent>,
+}
+
+impl LighterSeqTracker {
+    pub fn new() -> Self {
+        Self { last_seq: None }
+    }
+
+    pub fn on_message(&mut self, msg: ParsedL2Message) -> LighterSeqOutcome {
+        if let Some(prev) = self.last_seq {
+            if msg.seq <= prev {
+                return LighterSeqOutcome { event: None };
+            }
+        }
+        self.last_seq = Some(msg.seq);
+        LighterSeqOutcome {
+            event: Some(msg.event),
+        }
+    }
+}
+
+pub fn parse_l2_message(text: &str, venue_id: &str, venue_index: usize) -> Option<ParsedL2Message> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    parse_l2_message_value(&value, venue_id, venue_index)
+}
+
+fn parse_l2_message_value(
+    value: &serde_json::Value,
+    venue_id: &str,
+    venue_index: usize,
+) -> Option<ParsedL2Message> {
+    let msg_type = value.get("type")?.as_str()?;
+    let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let timestamp_ms = value
+        .get("timestamp")
+        .or_else(|| value.get("ts"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    match msg_type {
+        "l2_snapshot" => {
+            let bids = parse_levels(value.get("bids")?)?;
+            let asks = parse_levels(value.get("asks")?)?;
+            let snapshot = super::super::types::L2Snapshot {
+                venue_index,
+                venue_id: venue_id.to_string(),
+                seq,
+                timestamp_ms,
+                bids,
+                asks,
+            };
+            Some(ParsedL2Message {
+                event: MarketDataEvent::L2Snapshot(snapshot),
+                seq,
+            })
+        }
+        "l2_delta" => {
+            let changes = parse_deltas(value.get("changes")?)?;
+            let delta = super::super::types::L2Delta {
+                venue_index,
+                venue_id: venue_id.to_string(),
+                seq,
+                timestamp_ms,
+                changes,
+            };
+            Some(ParsedL2Message {
+                event: MarketDataEvent::L2Delta(delta),
+                seq,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn override_market_event(
+    event: MarketDataEvent,
+    seq: u64,
+    timestamp_ms: TimestampMs,
+) -> MarketDataEvent {
+    match event {
+        MarketDataEvent::L2Snapshot(mut snap) => {
+            snap.seq = seq;
+            snap.timestamp_ms = timestamp_ms;
+            MarketDataEvent::L2Snapshot(snap)
+        }
+        MarketDataEvent::L2Delta(mut delta) => {
+            delta.seq = seq;
+            delta.timestamp_ms = timestamp_ms;
+            MarketDataEvent::L2Delta(delta)
+        }
+        MarketDataEvent::Trade(mut trade) => {
+            trade.seq = seq;
+            trade.timestamp_ms = timestamp_ms;
+            MarketDataEvent::Trade(trade)
+        }
+        MarketDataEvent::FundingUpdate(mut funding) => {
+            funding.seq = seq;
+            funding.timestamp_ms = timestamp_ms;
+            MarketDataEvent::FundingUpdate(funding)
+        }
+    }
+}
+
+fn parse_levels(levels: &serde_json::Value) -> Option<Vec<BookLevel>> {
+    let mut out = Vec::new();
+    for level in levels.as_array()? {
+        let price = parse_f64_value(level.get(0)?)?;
+        let size = parse_f64_value(level.get(1)?)?;
+        out.push(BookLevel { price, size });
+    }
+    Some(out)
+}
+
+fn parse_deltas(changes: &serde_json::Value) -> Option<Vec<BookLevelDelta>> {
+    let mut out = Vec::new();
+    for change in changes.as_array()? {
+        let side_raw = change.get("side")?.as_str()?;
+        let side = match side_raw {
+            "bid" => BookSide::Bid,
+            "ask" => BookSide::Ask,
+            _ => return None,
+        };
+        let price = parse_f64_value(change.get("price")?)?;
+        let size = parse_f64_value(change.get("size")?)?;
+        out.push(BookLevelDelta { side, price, size });
+    }
+    Some(out)
+}
+
+fn parse_f64_value(value: &serde_json::Value) -> Option<f64> {
+    if let Some(raw) = value.as_f64() {
+        return Some(raw);
+    }
+    if let Some(raw) = value.as_str() {
+        return raw.parse::<f64>().ok();
+    }
+    None
+}
+
+fn decode_top_of_book(value: &serde_json::Value) -> Option<TopOfBook> {
+    let bids = parse_levels(value.get("bids")?)?;
+    let asks = parse_levels(value.get("asks")?)?;
+    let timestamp_ms = value.get("ts").and_then(|v| v.as_i64());
+    TopOfBook::from_levels(&bids, &asks, timestamp_ms)
+}
+
+fn decode_order_book_snapshot(
+    value: &serde_json::Value,
+    venue_index: usize,
+    venue_id: &str,
+    seq_fallback: &mut u64,
+) -> Option<ParsedL2Message> {
+    let order_book = value
+        .get("order_book")
+        .or_else(|| value.get("orderBook"))
+        .or_else(|| value.get("data").and_then(|v| v.get("order_book")))
+        .or_else(|| value.get("data").and_then(|v| v.get("orderBook")))?;
+    let bids = parse_levels_from_objects(order_book.get("bids")?)?;
+    let asks = parse_levels_from_objects(order_book.get("asks")?)?;
+    let seq = value
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| {
+            *seq_fallback = seq_fallback.wrapping_add(1);
+            *seq_fallback
+        });
+    let timestamp_ms = value
+        .get("timestamp")
+        .or_else(|| value.get("ts"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let snapshot = super::super::types::L2Snapshot {
+        venue_index,
+        venue_id: venue_id.to_string(),
+        seq,
+        timestamp_ms,
+        bids,
+        asks,
+    };
+    Some(ParsedL2Message {
+        event: MarketDataEvent::L2Snapshot(snapshot),
+        seq,
+    })
+}
+
+fn decode_order_book_top(value: &serde_json::Value) -> Option<TopOfBook> {
+    let order_book = value
+        .get("order_book")
+        .or_else(|| value.get("orderBook"))
+        .or_else(|| value.get("data").and_then(|v| v.get("order_book")))
+        .or_else(|| value.get("data").and_then(|v| v.get("orderBook")))?;
+    let bids = parse_levels_from_objects(order_book.get("bids")?)?;
+    let asks = parse_levels_from_objects(order_book.get("asks")?)?;
+    TopOfBook::from_levels(
+        &bids,
+        &asks,
+        value
+            .get("timestamp")
+            .or_else(|| value.get("ts"))
+            .and_then(|v| v.as_i64()),
+    )
+}
+
+fn lighter_error_code(value: &serde_json::Value) -> Option<i64> {
+    value
+        .get("error")
+        .and_then(|err| err.get("code"))
+        .and_then(|v| v.as_i64())
+}
+
+fn is_lighter_book_message(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("type").and_then(|v| v.as_str()),
+        Some("l2_snapshot") | Some("l2_delta") | Some("update/order_book")
+    ) || (value.get("bids").is_some() && value.get("asks").is_some())
+        || value.get("levels").is_some()
+        || value.get("order_book").is_some()
+}
+
+fn has_lighter_book_fields(value: &serde_json::Value) -> bool {
+    value.get("order_book").is_some()
+        || value.get("orderBook").is_some()
+        || value
+            .get("data")
+            .and_then(|v| v.get("order_book"))
+            .is_some()
+        || value.get("data").and_then(|v| v.get("orderBook")).is_some()
+}
+
+fn build_order_book_channel(market_id: u64) -> String {
+    format!("order_book/{market_id}")
+}
+
+async fn fetch_lighter_orderbooks_with_fallbacks(
+    http: &Client,
+    rest_url: &str,
+    ws_url: &str,
+) -> anyhow::Result<(Vec<LighterOrderBookInfo>, String)> {
+    let mut bases = Vec::new();
+    if let Ok(val) = std::env::var("LIGHTER_HTTP_BASE_URL") {
+        if !val.trim().is_empty() {
+            bases.push(val);
+        }
+    }
+    if let Ok(val) = std::env::var("LIGHTER_REST_URL") {
+        if !val.trim().is_empty() {
+            bases.push(val);
+        }
+    }
+    if !rest_url.trim().is_empty() {
+        bases.push(rest_url.to_string());
+    }
+    if let Some(derived) = derive_https_base_from_ws(ws_url) {
+        bases.push(derived);
+    }
+    bases.push("https://api.lighter.xyz".to_string());
+    let endpoints = ["/api/v1/orderBooks", "/api/v1/orderbooks"];
+    for base in bases {
+        let base = base.trim_end_matches('/').to_string();
+        for endpoint in endpoints {
+            let url = format!("{base}{endpoint}");
+            eprintln!("INFO: Lighter resolving market id attempt url={}", url);
+            match http.get(url.clone()).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+                    if status.is_success() {
+                        if let Some(value) = parsed {
+                            let data = parse_lighter_orderbooks(&value);
+                            if !data.is_empty() {
+                                return Ok((data, url));
+                            }
+                        }
+                    }
+                    let snippet: String = body.chars().take(160).collect();
+                    eprintln!(
+                        "WARN: Lighter orderBooks fetch failed status={} url={} snippet={}",
+                        status, url, snippet
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "WARN: Lighter orderBooks fetch error url={} err={}",
+                        url, err
+                    );
+                }
+            }
+        }
+    }
+    anyhow::bail!("Lighter orderBooks discovery failed")
+}
+
+fn parse_lighter_orderbooks(value: &serde_json::Value) -> Vec<LighterOrderBookInfo> {
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let list = value
+        .as_array()
+        .or_else(|| value.get("data").and_then(|v| v.as_array()))
+        .or_else(|| value.get("order_books").and_then(|v| v.as_array()))
+        .or_else(|| value.get("orderBooks").and_then(|v| v.as_array()))
+        .unwrap_or(&empty);
+    list.iter()
+        .filter_map(|entry| {
+            let symbol = entry
+                .get("symbol")
+                .or_else(|| entry.get("market"))
+                .and_then(|v| v.as_str())?
+                .to_string();
+            let market_id = entry
+                .get("market_id")
+                .or_else(|| entry.get("marketId"))
+                .or_else(|| entry.get("id"))
+                .and_then(|v| v.as_u64())?;
+            Some(LighterOrderBookInfo { symbol, market_id })
+        })
+        .collect()
+}
+
+fn parse_levels_from_objects(value: &serde_json::Value) -> Option<Vec<BookLevel>> {
+    let entries = value.as_array()?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(obj) = entry.as_object() {
+            let price = obj.get("price").or_else(|| obj.get("px"))?;
+            let size = obj.get("size").or_else(|| obj.get("sz"))?;
+            out.push(BookLevel {
+                price: parse_f64_value(price)?,
+                size: parse_f64_value(size)?,
+            });
+            continue;
+        }
+        if let Some(items) = entry.as_array() {
+            if items.len() < 2 {
+                continue;
+            }
+            let price = parse_f64_value(&items[0])?;
+            let size = parse_f64_value(&items[1])?;
+            out.push(BookLevel { price, size });
+        }
+    }
+    Some(out)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LighterOrderBookInfo {
+    symbol: String,
+    market_id: u64,
+}
+
+fn derive_https_base_from_ws(ws_url: &str) -> Option<String> {
+    let ws_url = ws_url.trim();
+    let host = ws_url
+        .strip_prefix("wss://")
+        .or_else(|| ws_url.strip_prefix("ws://"))?;
+    let host = host.split('/').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(format!("https://{host}"))
+    }
+}
+
+fn normalize_lighter_symbol(symbol: &str) -> String {
+    let mut upper = symbol.trim().to_uppercase();
+    for suffix in ["-USD-PERP", "-PERP", "-USD"] {
+        if upper.ends_with(suffix) {
+            upper = upper.trim_end_matches(suffix).to_string();
+            break;
+        }
+    }
+    upper
+}
+
+fn log_decode_miss(venue: &str, value: &serde_json::Value, payload: &str, count: usize, url: &str) {
+    let keys = value
+        .as_object()
+        .map(|obj| {
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            format!("[{}]", keys.join(","))
+        })
+        .unwrap_or_else(|| "[non-object]".to_string());
+    let snippet: String = payload.chars().take(160).collect();
+    eprintln!(
+        "WARN: {venue} WS decode miss keys={keys} snippet={snippet} (count={count}) url={url}",
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::Method::GET;
+    use httpmock::MockServer;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn order_book_channel_formats() {
+        assert_eq!(build_order_book_channel(42), "order_book/42");
+    }
+
+    #[test]
+    fn decode_order_book_update_top() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [{"price":"100.0","size":"2.0"}],
+                "asks": [{"price":"101.0","size":"3.0"}]
+            }
+        });
+        let top = decode_order_book_top(&value).expect("top");
+        assert_eq!(top.best_bid_px, 100.0);
+        assert_eq!(top.best_bid_sz, 2.0);
+        assert_eq!(top.best_ask_px, 101.0);
+        assert_eq!(top.best_ask_sz, 3.0);
+    }
+
+    #[tokio::test]
+    async fn resolve_market_id_by_symbol() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LIGHTER_MARKET_ID");
+        std::env::set_var("LIGHTER_MARKET", "BTC-USD-PERP");
+        let server = MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "code": 200,
+                    "order_books": [
+                        {"symbol":"BTC","market_id":1},
+                        {"symbol":"ETH","market_id":2}
+                    ]
+                }));
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "BTC-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: true,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let (symbol, market_id) = connector
+            .resolve_market_id_and_symbol()
+            .await
+            .expect("resolve");
+        assert_eq!(symbol, "BTC");
+        assert_eq!(market_id, 1);
+        std::env::remove_var("LIGHTER_MARKET");
+    }
+
+    #[tokio::test]
+    async fn resolve_market_id_from_env() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LIGHTER_MARKET_ID", "2");
+        std::env::remove_var("LIGHTER_MARKET");
+        let server = MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "code": 200,
+                    "order_books": [
+                        {"symbol":"BTC","market_id":1},
+                        {"symbol":"ETH","market_id":2}
+                    ]
+                }));
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "BTC-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: true,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let (symbol, market_id) = connector
+            .resolve_market_id_and_symbol()
+            .await
+            .expect("resolve");
+        assert_eq!(symbol, "ETH");
+        assert_eq!(market_id, 2);
+        std::env::remove_var("LIGHTER_MARKET_ID");
+    }
+
+    #[test]
+    fn order_book_snapshot_uses_timestamp() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "timestamp": 1700000000123i64,
+            "order_book": {
+                "bids": [{"price":"100","size":"2"}],
+                "asks": [{"price":"101","size":"3"}]
+            }
+        });
+        let mut seq = 0u64;
+        let parsed = decode_order_book_snapshot(&value, 3, "LIGHTER", &mut seq).expect("snap");
+        match parsed.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+}
+
+pub fn translate_private_event(text: &str) -> Option<ExecutionEvent> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let msg_type = value.get("type")?.as_str()?;
+    let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let timestamp_ms = value.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    let venue_id = "LIGHTER".to_string();
+    let venue_index = 0;
+    match msg_type {
+        "order_ack" => Some(ExecutionEvent::OrderAccepted(
+            super::super::types::OrderAccepted {
+                venue_index,
+                venue_id,
+                seq,
+                timestamp_ms,
+                order_id: value.get("order_id")?.as_str()?.to_string(),
+                client_order_id: value
+                    .get("client_order_id")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                side: parse_side(value.get("side")?)?,
+                price: value.get("price")?.as_f64()?,
+                size: value.get("size")?.as_f64()?,
+                purpose: parse_purpose(value.get("purpose"))?,
+            },
+        )),
+        "cancel_ack" => Some(ExecutionEvent::CancelAccepted(
+            super::super::types::CancelAccepted {
+                venue_index,
+                venue_id,
+                seq,
+                timestamp_ms,
+                order_id: value.get("order_id")?.as_str()?.to_string(),
+            },
+        )),
+        "fill" => Some(ExecutionEvent::Filled(super::super::types::Fill {
+            venue_index,
+            venue_id,
+            seq,
+            timestamp_ms,
+            order_id: value
+                .get("order_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            client_order_id: value
+                .get("client_order_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            fill_id: value
+                .get("fill_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            side: parse_side(value.get("side")?)?,
+            price: value.get("price")?.as_f64()?,
+            size: value.get("size")?.as_f64()?,
+            purpose: parse_purpose(value.get("purpose"))?,
+            fee_bps: value.get("fee_bps").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        })),
+        _ => None,
+    }
+}
+
+fn parse_side(value: &serde_json::Value) -> Option<Side> {
+    let raw = value.as_str()?;
+    match raw {
+        "buy" | "Buy" | "B" => Some(Side::Buy),
+        "sell" | "Sell" | "S" => Some(Side::Sell),
+        _ => None,
+    }
+}
+
+fn parse_purpose(value: Option<&serde_json::Value>) -> Option<OrderPurpose> {
+    let raw = value.and_then(|v| v.as_str())?;
+    match raw {
+        "Mm" | "mm" | "MM" => Some(OrderPurpose::Mm),
+        "Exit" | "exit" => Some(OrderPurpose::Exit),
+        "Hedge" | "hedge" => Some(OrderPurpose::Hedge),
+        _ => None,
+    }
+}
+
+async fn fetch_account_snapshot(
+    client: &Client,
+    cfg: &LighterConfig,
+) -> anyhow::Result<AccountEvent> {
+    let resp = client
+        .get(format!("{}/account", cfg.rest_url))
+        .send()
+        .await?;
+    let value: serde_json::Value = resp.json().await?;
+    let snapshot = parse_account_snapshot(&value, &cfg.venue_id)
+        .ok_or_else(|| anyhow::anyhow!("invalid account snapshot"))?;
+    Ok(AccountEvent::Snapshot(snapshot))
+}
+
+pub fn parse_account_snapshot(data: &serde_json::Value, venue_id: &str) -> Option<AccountSnapshot> {
+    let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let timestamp_ms = data.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    let venue_index = 0;
+    let positions = data
+        .get("positions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|pos| {
+                    let symbol = pos.get("symbol")?.as_str()?;
+                    let size = pos.get("size")?.as_f64()?;
+                    let entry_price = pos.get("entry_px")?.as_f64()?;
+                    Some(PositionSnapshot {
+                        symbol: symbol.to_string(),
+                        size,
+                        entry_price,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let margin = data.get("margin")?;
+    let margin = MarginSnapshot {
+        balance_usd: margin.get("balance")?.as_f64()?,
+        used_usd: margin.get("used")?.as_f64()?,
+        available_usd: margin.get("available")?.as_f64()?,
+    };
+    let liquidation = data.get("liquidation")?;
+    let liquidation = LiquidationSnapshot {
+        price_liq: liquidation.get("price_liq").and_then(|v| v.as_f64()),
+        dist_liq_sigma: liquidation.get("dist_liq_sigma").and_then(|v| v.as_f64()),
+    };
+    let funding_8h = data.get("funding_8h").and_then(|v| v.as_f64());
+    let balances = data
+        .get("balances")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|bal| {
+                    let asset = bal.get("asset")?.as_str()?;
+                    let total = bal.get("total")?.as_f64()?;
+                    let available = bal.get("available")?.as_f64()?;
+                    Some(BalanceSnapshot {
+                        asset: asset.to_string(),
+                        total,
+                        available,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(AccountSnapshot {
+        venue_index,
+        venue_id: venue_id.to_string(),
+        seq,
+        timestamp_ms,
+        positions,
+        balances,
+        funding_8h,
+        margin,
+        liquidation,
+    })
+}
+
+impl LiveRestClient for LighterConnector {
+    fn place_order(
+        &self,
+        req: LiveRestPlaceRequest,
+    ) -> super::super::gateway::BoxFuture<'_, super::super::gateway::LiveResult<LiveRestResponse>>
+    {
+        Box::pin(async move {
+            if self.cfg.paper_mode {
+                return Ok(LiveRestResponse { order_id: None });
+            }
+            let intent = OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: req.venue_index,
+                venue_id: req.venue_id.as_str().into(),
+                side: req.side,
+                price: req.price,
+                size: req.size,
+                purpose: req.purpose,
+                time_in_force: req.time_in_force,
+                post_only: req.post_only,
+                reduce_only: req.reduce_only,
+                client_order_id: Some(req.client_order_id.clone()),
+            });
+            let payload = json!({ "intent": format!("{intent:?}") });
+            let resp = self
+                .http
+                .post(format!("{}/orders", self.cfg.rest_url))
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| LiveGatewayError::retryable(format!("rest_error: {err}")))?;
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(map_rest_error(&body));
+            }
+            Ok(LiveRestResponse { order_id: None })
+        })
+    }
+
+    fn cancel_order(
+        &self,
+        req: LiveRestCancelRequest,
+    ) -> super::super::gateway::BoxFuture<'_, super::super::gateway::LiveResult<LiveRestResponse>>
+    {
+        Box::pin(async move {
+            if self.cfg.paper_mode {
+                return Ok(LiveRestResponse { order_id: None });
+            }
+            let payload = json!({ "order_id": req.order_id });
+            let resp = self
+                .http
+                .post(format!("{}/cancel", self.cfg.rest_url))
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|err| LiveGatewayError::retryable(format!("rest_error: {err}")))?;
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(map_rest_error(&body));
+            }
+            Ok(LiveRestResponse { order_id: None })
+        })
+    }
+
+    fn cancel_all(
+        &self,
+        _req: LiveRestCancelAllRequest,
+    ) -> super::super::gateway::BoxFuture<'_, super::super::gateway::LiveResult<LiveRestResponse>>
+    {
+        Box::pin(async move {
+            if self.cfg.paper_mode {
+                return Ok(LiveRestResponse { order_id: None });
+            }
+            let resp = self
+                .http
+                .post(format!("{}/cancel_all", self.cfg.rest_url))
+                .send()
+                .await
+                .map_err(|err| LiveGatewayError::retryable(format!("rest_error: {err}")))?;
+            if !resp.status().is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(map_rest_error(&body));
+            }
+            Ok(LiveRestResponse { order_id: None })
+        })
+    }
+}
+
+fn map_rest_error(body: &str) -> LiveGatewayError {
+    let lower = body.to_lowercase();
+    if lower.contains("post") && lower.contains("only") {
+        return LiveGatewayError::post_only_reject(body);
+    }
+    if lower.contains("reduce") && lower.contains("only") {
+        return LiveGatewayError::reduce_only_violation(body);
+    }
+    if lower.contains("rate") && lower.contains("limit") {
+        return LiveGatewayError::rate_limited(body);
+    }
+    if lower.contains("timeout") || lower.contains("tempor") {
+        return LiveGatewayError::retryable(body);
+    }
+    LiveGatewayError {
+        kind: LiveGatewayErrorKind::Fatal,
+        message: body.to_string(),
+    }
+}

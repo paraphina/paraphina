@@ -15,16 +15,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::execution_events::apply_execution_events;
 use crate::exit;
 use crate::gateway::ExecutionGateway;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::logging::EventSink;
 use crate::mm::{compute_mm_quotes, mm_quotes_to_order_intents};
-use crate::state::{GlobalState, PendingMarkoutRecord};
+use crate::state::GlobalState;
 use crate::types::{FillEvent, OrderIntent, Side, TimestampMs};
 
 use super::observation::Observation;
 use super::policy::{HeuristicPolicy, Policy, PolicyAction};
+use super::safety::SafetyLayer;
 use super::telemetry::RLTelemetry;
 
 /// Episode termination reason.
@@ -297,25 +299,36 @@ where
 
         // 3) Get baseline policy action
         let baseline_action = self.baseline_policy.act(&obs);
+        let safety = SafetyLayer::apply(&baseline_action, obs.venues.len());
+        let baseline_applied = safety.applied.clone();
 
         // 4) Get shadow policy action (if enabled)
         if config.shadow_mode {
             if let Some(shadow) = &self.shadow_policy {
                 let shadow_action = shadow.act(&obs);
+                let shadow_safety = SafetyLayer::apply(&shadow_action, obs.venues.len());
                 // Log shadow action (not executed)
-                self.rl_telemetry
-                    .log_shadow_tick(&obs, &shadow_action, self.cfg.version);
+                self.rl_telemetry.log_shadow_tick(
+                    &obs,
+                    &shadow_action,
+                    Some(&shadow_safety),
+                    self.cfg.version,
+                );
             }
         }
 
         // 5) Log baseline tick
-        self.rl_telemetry
-            .log_tick(&obs, Some(&baseline_action), self.cfg.version);
+        self.rl_telemetry.log_tick(
+            &obs,
+            Some(&baseline_action),
+            Some(&safety),
+            self.cfg.version,
+        );
 
         // 6) Execute baseline strategy (existing behavior)
         // Note: For HeuristicPolicy, baseline_action is identity, so we just run
         // the existing MM/exit/hedge logic as-is.
-        self.execute_strategy(now_ms, tick_index, &baseline_action);
+        self.execute_strategy(now_ms, tick_index, &baseline_applied);
 
         // 7) Log to event sink
         self.sink.log_tick(
@@ -368,11 +381,9 @@ where
         // TODO: Apply policy_action modifiers to mm_intents
         // For now, HeuristicPolicy returns identity, so no modification needed
 
-        let mm_fills = self
-            .gateway
-            .process_intents(self.cfg, &mut self.state, &mm_intents);
-
-        self.record_markouts_for_fills(&mm_fills, now_ms);
+        let mm_events = self.gateway.process_intents(self.cfg, &mm_intents, now_ms);
+        let mm_fills = apply_execution_events(&mut self.state, &mm_events, now_ms);
+        self.apply_fills(&mm_fills, now_ms);
         all_fills.extend(mm_fills);
         self.state.recompute_after_fills(self.cfg);
 
@@ -380,10 +391,11 @@ where
         if self.cfg.exit.enabled {
             let exit_intents = exit::compute_exit_intents(self.cfg, &self.state, now_ms);
             if !exit_intents.is_empty() {
-                let exit_fills =
-                    self.gateway
-                        .process_intents(self.cfg, &mut self.state, &exit_intents);
-                self.record_markouts_for_fills(&exit_fills, now_ms);
+                let exit_events = self
+                    .gateway
+                    .process_intents(self.cfg, &exit_intents, now_ms);
+                let exit_fills = apply_execution_events(&mut self.state, &exit_events, now_ms);
+                self.apply_fills(&exit_fills, now_ms);
                 all_fills.extend(exit_fills);
                 self.state.recompute_after_fills(self.cfg);
             }
@@ -398,46 +410,20 @@ where
         // TODO: Apply policy_action.hedge_scale and hedge_venue_weights
 
         if !hedge_intents.is_empty() {
-            let hedge_fills =
-                self.gateway
-                    .process_intents(self.cfg, &mut self.state, &hedge_intents);
-            self.record_markouts_for_fills(&hedge_fills, now_ms);
+            let hedge_events = self
+                .gateway
+                .process_intents(self.cfg, &hedge_intents, now_ms);
+            let hedge_fills = apply_execution_events(&mut self.state, &hedge_events, now_ms);
+            self.apply_fills(&hedge_fills, now_ms);
             all_fills.extend(hedge_fills);
             self.state.recompute_after_fills(self.cfg);
         }
     }
 
-    /// Record pending markouts for fills.
-    fn record_markouts_for_fills(&mut self, fills: &[FillEvent], now_ms: TimestampMs) {
-        let tox_cfg = &self.cfg.toxicity;
-        let horizon_ms = tox_cfg.markout_horizon_ms;
-        let max_pending = tox_cfg.max_pending_per_venue;
-
-        let fair = self
-            .state
-            .fair_value
-            .unwrap_or(self.state.fair_value_prev)
-            .max(1.0);
-
+    /// Apply fills to state (single update point for PnL/positions).
+    fn apply_fills(&mut self, fills: &[FillEvent], now_ms: TimestampMs) {
         for fill in fills {
-            let mid = self
-                .state
-                .venues
-                .get(fill.venue_index)
-                .and_then(|v| v.mid)
-                .unwrap_or(fair);
-
-            self.state.record_pending_markout(PendingMarkoutRecord {
-                venue_index: fill.venue_index,
-                side: fill.side,
-                size_tao: fill.size,
-                price: fill.price,
-                now_ms,
-                fair,
-                mid,
-                horizon_ms,
-                max_pending,
-            });
+            self.state.apply_fill_event(fill, now_ms, self.cfg);
         }
     }
 
@@ -548,7 +534,7 @@ mod tests {
     #[test]
     fn test_shadow_runner_creation() {
         let cfg = Config::default();
-        let gateway = SimGateway;
+        let gateway = SimGateway::new();
         let sink = NoopSink;
 
         let runner = ShadowRunner::new(&cfg, gateway, sink);
@@ -558,7 +544,7 @@ mod tests {
     #[test]
     fn test_shadow_runner_reset_episode() {
         let cfg = Config::default();
-        let gateway = SimGateway;
+        let gateway = SimGateway::new();
         let sink = NoopSink;
 
         let mut runner = ShadowRunner::new(&cfg, gateway, sink);
@@ -579,7 +565,7 @@ mod tests {
         let cfg = Config::default();
 
         // Run 1
-        let gateway1 = SimGateway;
+        let gateway1 = SimGateway::new();
         let sink1 = NoopSink;
         let mut runner1 = ShadowRunner::new(&cfg, gateway1, sink1);
         let config1 = EpisodeConfig::default()
@@ -589,7 +575,7 @@ mod tests {
         let summary1 = runner1.run_episode(config1);
 
         // Run 2 with same seed
-        let gateway2 = SimGateway;
+        let gateway2 = SimGateway::new();
         let sink2 = NoopSink;
         let mut runner2 = ShadowRunner::new(&cfg, gateway2, sink2);
         let config2 = EpisodeConfig::default()
@@ -613,7 +599,7 @@ mod tests {
     #[test]
     fn test_shadow_runner_with_shadow_policy() {
         let cfg = Config::default();
-        let gateway = SimGateway;
+        let gateway = SimGateway::new();
         let sink = NoopSink;
 
         let shadow_policy = Box::new(NoopPolicy::new());
@@ -636,7 +622,7 @@ mod tests {
         let cfg = Config::default();
 
         // Run without shadow mode
-        let gateway1 = SimGateway;
+        let gateway1 = SimGateway::new();
         let sink1 = NoopSink;
         let mut runner1 = ShadowRunner::new(&cfg, gateway1, sink1);
         let config1 = EpisodeConfig::default()
@@ -647,7 +633,7 @@ mod tests {
         let summary1 = runner1.run_episode(config1);
 
         // Run with shadow mode
-        let gateway2 = SimGateway;
+        let gateway2 = SimGateway::new();
         let sink2 = NoopSink;
         let shadow_policy = Box::new(NoopPolicy::new());
         let mut runner2 =

@@ -1,0 +1,14 @@
+{
+  "seq": 55,
+  "time": 1700000000500,
+  "coin": "TAO",
+  "positions": [
+    { "coin": "TAO", "size": "2.5", "entryPx": "100.0" }
+  ],
+  "balances": [
+    { "asset": "USD", "total": "10000", "available": "9500" }
+  ],
+  "margin": { "balance": "10000", "used": "500", "available": "9500" },
+  "liquidation": { "priceLiq": "80.0", "distLiqSigma": "4.0" },
+  "funding8h": "0.001"
+}

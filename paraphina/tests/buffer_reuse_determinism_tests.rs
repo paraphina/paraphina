@@ -55,14 +55,43 @@ fn intents_equal(a: &[OrderIntent], b: &[OrderIntent]) -> bool {
     }
 
     for (ia, ib) in a.iter().zip(b.iter()) {
-        if ia.venue_index != ib.venue_index
-            || ia.venue_id != ib.venue_id
-            || ia.side != ib.side
-            || (ia.price - ib.price).abs() > 1e-12
-            || (ia.size - ib.size).abs() > 1e-12
-            || ia.purpose != ib.purpose
-        {
-            return false;
+        match (ia, ib) {
+            (OrderIntent::Place(a), OrderIntent::Place(b)) => {
+                if a.venue_index != b.venue_index
+                    || a.venue_id != b.venue_id
+                    || a.side != b.side
+                    || (a.price - b.price).abs() > 1e-12
+                    || (a.size - b.size).abs() > 1e-12
+                    || a.purpose != b.purpose
+                {
+                    return false;
+                }
+            }
+            (OrderIntent::Replace(a), OrderIntent::Replace(b)) => {
+                if a.venue_index != b.venue_index
+                    || a.venue_id != b.venue_id
+                    || a.side != b.side
+                    || (a.price - b.price).abs() > 1e-12
+                    || (a.size - b.size).abs() > 1e-12
+                    || a.purpose != b.purpose
+                {
+                    return false;
+                }
+            }
+            (OrderIntent::Cancel(a), OrderIntent::Cancel(b)) => {
+                if a.venue_index != b.venue_index
+                    || a.venue_id != b.venue_id
+                    || a.order_id != b.order_id
+                {
+                    return false;
+                }
+            }
+            (OrderIntent::CancelAll(a), OrderIntent::CancelAll(b)) => {
+                if a.venue_index != b.venue_index || a.venue_id != b.venue_id {
+                    return false;
+                }
+            }
+            _ => return false, // different variants
         }
     }
     true
@@ -396,11 +425,16 @@ fn test_full_tick_loop_determinism() {
             .chain(exit_intents.iter())
             .chain(hedge_intents.iter())
         {
+            let (venue_index, side, size, price) = match intent {
+                OrderIntent::Place(pi) => (pi.venue_index, pi.side, pi.size, pi.price),
+                OrderIntent::Replace(ri) => (ri.venue_index, ri.side, ri.size, ri.price),
+                OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => continue,
+            };
             state_alloc.apply_perp_fill(
-                intent.venue_index,
-                intent.side,
-                intent.size,
-                intent.price,
+                venue_index,
+                side,
+                size,
+                price,
                 5.0, // 5 bps fee
             );
         }
@@ -443,13 +477,12 @@ fn test_full_tick_loop_determinism() {
             .chain(exit_intents_buf.iter())
             .chain(hedge_intents_buf.iter())
         {
-            state_buf.apply_perp_fill(
-                intent.venue_index,
-                intent.side,
-                intent.size,
-                intent.price,
-                5.0,
-            );
+            let (venue_index, side, size, price) = match intent {
+                OrderIntent::Place(pi) => (pi.venue_index, pi.side, pi.size, pi.price),
+                OrderIntent::Replace(ri) => (ri.venue_index, ri.side, ri.size, ri.price),
+                OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => continue,
+            };
+            state_buf.apply_perp_fill(venue_index, side, size, price, 5.0);
         }
         state_buf.recompute_after_fills(&cfg);
     }
@@ -898,6 +931,7 @@ fn test_toxicity_update_determinism() {
             price: 99.0,
             fair_at_fill: 99.0,
             mid_at_fill: 99.0,
+            fill_seq: 0,
         });
         v.pending_markouts.push_back(PendingMarkout {
             t_fill_ms: 100,
@@ -907,6 +941,7 @@ fn test_toxicity_update_determinism() {
             price: 101.0,
             fair_at_fill: 101.0,
             mid_at_fill: 101.0,
+            fill_seq: 1,
         });
         v.pending_markouts_next_eval_ms = 1000; // First entry's t_eval_ms
     }
@@ -944,6 +979,7 @@ fn test_toxicity_update_determinism() {
             price: 99.0,
             fair_at_fill: 99.0,
             mid_at_fill: 99.0,
+            fill_seq: 0,
         });
         v.pending_markouts.push_back(PendingMarkout {
             t_fill_ms: 100,
@@ -953,6 +989,7 @@ fn test_toxicity_update_determinism() {
             price: 101.0,
             fair_at_fill: 101.0,
             mid_at_fill: 101.0,
+            fill_seq: 1,
         });
         v.pending_markouts_next_eval_ms = 1000; // First entry's t_eval_ms
     }

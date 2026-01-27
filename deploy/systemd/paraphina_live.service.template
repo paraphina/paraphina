@@ -1,0 +1,25 @@
+[Unit]
+Description=Paraphina Live Runner (template)
+After=network.target
+
+[Service]
+Type=simple
+User=paraphina
+Group=paraphina
+WorkingDirectory=/opt/paraphina
+EnvironmentFile=/etc/paraphina/paraphina_live.env
+ExecStart=/opt/paraphina/paraphina_live
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+LimitNPROC=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/paraphina /var/log/paraphina /etc/paraphina
+StandardOutput=append:/var/log/paraphina/paraphina_live.log
+StandardError=append:/var/log/paraphina/paraphina_live.err
+
+[Install]
+WantedBy=multi-user.target

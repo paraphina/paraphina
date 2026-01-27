@@ -1,0 +1,85 @@
+{
+  "generated_at": "2026-01-17T16:21:56+00:00",
+  "results": [
+    {
+      "command": "cargo test --all",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/01_cargo_test_all.log",
+      "started_at": "2026-01-17T16:17:14+00:00",
+      "finished_at": "2026-01-17T16:17:31+00:00"
+    },
+    {
+      "command": "cargo test --features event_log",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/02_cargo_test_features_event_log.log",
+      "started_at": "2026-01-17T16:17:31+00:00",
+      "finished_at": "2026-01-17T16:18:19+00:00"
+    },
+    {
+      "command": "cargo test -p paraphina --features live",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/03_cargo_test_p_paraphina_features_live.log",
+      "started_at": "2026-01-17T16:18:19+00:00",
+      "finished_at": "2026-01-17T16:19:21+00:00"
+    },
+    {
+      "command": "cargo test -p paraphina --features live,live_hyperliquid",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/04_cargo_test_p_paraphina_features_live_live_hyperliquid.log",
+      "started_at": "2026-01-17T16:19:21+00:00",
+      "finished_at": "2026-01-17T16:20:41+00:00"
+    },
+    {
+      "command": "cargo test -p paraphina --features live,live_lighter",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/05_cargo_test_p_paraphina_features_live_live_lighter.log",
+      "started_at": "2026-01-17T16:20:41+00:00",
+      "finished_at": "2026-01-17T16:21:52+00:00"
+    },
+    {
+      "command": "python3 -m pytest -q",
+      "exit_code": 0,
+      "summary": "647 passed in 3.38s",
+      "evidence": "agent-tools/06_python3_m_pytest_q.log",
+      "started_at": "2026-01-17T16:21:52+00:00",
+      "finished_at": "2026-01-17T16:21:55+00:00"
+    },
+    {
+      "command": "python3 tools/check_docs_truth_drift.py",
+      "exit_code": 0,
+      "summary": "No output.",
+      "evidence": "agent-tools/07_python3_tools_check_docs_truth_drift_py.log",
+      "started_at": "2026-01-17T16:21:55+00:00",
+      "finished_at": "2026-01-17T16:21:55+00:00"
+    },
+    {
+      "command": "python3 tools/check_docs_integrity.py",
+      "exit_code": 0,
+      "summary": "OK: docs integrity checks passed (23 references checked; status alignment OK; canonical hash OK).",
+      "evidence": "agent-tools/08_python3_tools_check_docs_integrity_py.log",
+      "started_at": "2026-01-17T16:21:55+00:00",
+      "finished_at": "2026-01-17T16:21:55+00:00"
+    },
+    {
+      "command": "cargo run --bin paraphina -- --ticks 300 --seed 42",
+      "exit_code": 0,
+      "summary": "Risk regime: Normal",
+      "evidence": "agent-tools/09_cargo_run_bin_paraphina_ticks_300_seed_42.log",
+      "started_at": "2026-01-17T16:21:55+00:00",
+      "finished_at": "2026-01-17T16:21:56+00:00"
+    },
+    {
+      "command": "python3 tools/check_telemetry_contract.py /tmp/telemetry.jsonl",
+      "exit_code": 0,
+      "summary": "File: /tmp/telemetry.jsonl",
+      "evidence": "agent-tools/10_python3_tools_check_telemetry_contract_py_tmp_telemetry_jsonl.log",
+      "started_at": "2026-01-17T16:21:56+00:00",
+      "finished_at": "2026-01-17T16:21:56+00:00"
+    }
+  ]
+}

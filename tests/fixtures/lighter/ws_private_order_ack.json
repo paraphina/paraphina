@@ -1,0 +1,11 @@
+{
+  "type": "order_ack",
+  "seq": 5,
+  "ts": 1700000000300,
+  "order_id": "order_1",
+  "client_order_id": "co_1",
+  "side": "buy",
+  "price": 100.0,
+  "size": 1.0,
+  "purpose": "Mm"
+}

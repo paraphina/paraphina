@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::state::KillReason;
-use crate::types::{OrderPurpose, Side, TimestampMs};
+use crate::types::{OrderIntent, OrderPurpose, Side, TimeInForce, TimestampMs};
 
 /// Unique identifier for an action, computed deterministically.
 ///
@@ -63,6 +63,12 @@ pub struct PlaceOrderAction {
     pub size: f64,
     /// Order purpose (MM, Exit, Hedge).
     pub purpose: OrderPurpose,
+    /// Time-in-force policy (GTC/IOC).
+    pub time_in_force: crate::types::TimeInForce,
+    /// Post-only flag (reject if crosses).
+    pub post_only: bool,
+    /// Reduce-only flag (never increase position).
+    pub reduce_only: bool,
     /// Client order ID for tracking (deterministic).
     pub client_order_id: String,
 }
@@ -215,6 +221,89 @@ impl ActionIdGenerator {
     }
 }
 
+/// Convert order intents into deterministic action list.
+pub fn intents_to_actions(intents: &[OrderIntent], gen: &mut ActionIdGenerator) -> Vec<Action> {
+    let mut actions = Vec::new();
+    for intent in intents {
+        match intent {
+            OrderIntent::Place(place) => {
+                let purpose_str = match place.purpose {
+                    OrderPurpose::Mm => "mm",
+                    OrderPurpose::Exit => "exit",
+                    OrderPurpose::Hedge => "hedge",
+                };
+                let action_id = gen.next_id(place.venue_index, purpose_str);
+                let client_order_id = place
+                    .client_order_id
+                    .clone()
+                    .unwrap_or_else(|| gen.client_order_id(place.venue_index, place.purpose));
+                actions.push(Action::PlaceOrder(PlaceOrderAction {
+                    action_id,
+                    venue_index: place.venue_index,
+                    venue_id: place.venue_id.to_string(),
+                    side: place.side,
+                    price: place.price,
+                    size: place.size,
+                    purpose: place.purpose,
+                    time_in_force: place.time_in_force,
+                    post_only: place.post_only,
+                    reduce_only: place.reduce_only,
+                    client_order_id,
+                }));
+            }
+            OrderIntent::Cancel(cancel) => {
+                let action_id = gen.next_id(cancel.venue_index, "cancel");
+                actions.push(Action::CancelOrder(CancelOrderAction {
+                    action_id,
+                    venue_index: cancel.venue_index,
+                    venue_id: cancel.venue_id.to_string(),
+                    order_id: cancel.order_id.clone(),
+                }));
+            }
+            OrderIntent::Replace(replace) => {
+                let cancel_action_id = gen.next_id(replace.venue_index, "cancel");
+                actions.push(Action::CancelOrder(CancelOrderAction {
+                    action_id: cancel_action_id,
+                    venue_index: replace.venue_index,
+                    venue_id: replace.venue_id.to_string(),
+                    order_id: replace.order_id.clone(),
+                }));
+                let purpose_str = match replace.purpose {
+                    OrderPurpose::Mm => "mm",
+                    OrderPurpose::Exit => "exit",
+                    OrderPurpose::Hedge => "hedge",
+                };
+                let place_action_id = gen.next_id(replace.venue_index, purpose_str);
+                let client_order_id = replace
+                    .client_order_id
+                    .clone()
+                    .unwrap_or_else(|| gen.client_order_id(replace.venue_index, replace.purpose));
+                actions.push(Action::PlaceOrder(PlaceOrderAction {
+                    action_id: place_action_id,
+                    venue_index: replace.venue_index,
+                    venue_id: replace.venue_id.to_string(),
+                    side: replace.side,
+                    price: replace.price,
+                    size: replace.size,
+                    purpose: replace.purpose,
+                    time_in_force: replace.time_in_force,
+                    post_only: replace.post_only,
+                    reduce_only: replace.reduce_only,
+                    client_order_id,
+                }));
+            }
+            OrderIntent::CancelAll(cancel_all) => {
+                let action_id = gen.next_id(cancel_all.venue_index.unwrap_or(0), "cancel_all");
+                actions.push(Action::CancelAll(crate::actions::CancelAllAction {
+                    action_id,
+                    venue_index: cancel_all.venue_index,
+                }));
+            }
+        }
+    }
+    actions
+}
+
 /// Builder for creating actions with deterministic IDs.
 pub struct ActionBuilder<'a> {
     gen: &'a mut ActionIdGenerator,
@@ -252,6 +341,9 @@ impl<'a> ActionBuilder<'a> {
             price,
             size,
             purpose,
+            time_in_force: TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id,
         })
     }

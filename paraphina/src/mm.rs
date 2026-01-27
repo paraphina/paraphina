@@ -34,7 +34,9 @@ use std::sync::Arc;
 use crate::config::{Config, VenueConfig};
 use crate::sim_eval::AblationSet;
 use crate::state::{GlobalState, RiskRegime, VenueState};
-use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus};
+use crate::types::{
+    OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs, VenueStatus,
+};
 
 /// Internal MM quote level (one side of the book).
 #[derive(Debug, Clone)]
@@ -72,6 +74,60 @@ pub struct VenueTargetInventory {
     pub w_liq: f64,
     /// Target inventory q_target_v.
     pub q_target: f64,
+}
+
+/// Per-venue reservation price component breakdown (telemetry).
+#[derive(Debug, Clone)]
+pub struct MmReservationComponents {
+    pub basis_adj_usd: Vec<f64>,
+    pub funding_adj_usd: Vec<f64>,
+    pub inventory_term_usd: Vec<f64>,
+}
+
+/// Compute reservation price component breakdown for each venue.
+///
+/// This mirrors the reservation price terms used in MM quoting.
+pub fn compute_mm_reservation_components(
+    cfg: &Config,
+    state: &GlobalState,
+) -> MmReservationComponents {
+    let n = cfg.venues.len();
+    let mut basis_adj_usd = vec![0.0; n];
+    let mut funding_adj_usd = vec![0.0; n];
+    let mut inventory_term_usd = vec![0.0; n];
+
+    let fair = state.fair_value.unwrap_or(1.0).max(1.0);
+    let sigma_eff = state.sigma_eff.max(0.0);
+    let tau = cfg.mm.quote_horizon_sec.max(1.0);
+    let funding_horizon_frac = tau / (8.0 * 60.0 * 60.0);
+    let sigma_sq_tau = sigma_eff * sigma_eff * tau;
+
+    let targets = compute_venue_targets(cfg, state);
+
+    for (i, vstate) in state.venues.iter().enumerate() {
+        let vcfg = &cfg.venues[i];
+        let mid = vstate.mid.unwrap_or(fair);
+        let basis_v = mid - fair;
+        let funding_pnl_per_unit = vstate.funding_8h * funding_horizon_frac * fair;
+
+        let basis_adj = cfg.mm.basis_weight * basis_v;
+        let funding_adj = cfg.mm.funding_weight * funding_pnl_per_unit;
+
+        let q_target_v = targets.get(i).map(|t| t.q_target).unwrap_or(0.0);
+        let inv_deviation =
+            state.q_global_tao - cfg.mm.lambda_inv * (vstate.position_tao - q_target_v);
+        let inv_term = vcfg.gamma * sigma_sq_tau * inv_deviation;
+
+        basis_adj_usd[i] = basis_adj;
+        funding_adj_usd[i] = funding_adj;
+        inventory_term_usd[i] = inv_term;
+    }
+
+    MmReservationComponents {
+        basis_adj_usd,
+        funding_adj_usd,
+        inventory_term_usd,
+    }
 }
 
 /// Scratch buffers for MM quote computation.
@@ -455,6 +511,12 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
     // Opt23: No unconditional reset loop here. We clear only on early returns
     // or for disabled venues. The per-venue loop overwrites active slots.
 
+    // If fair value gating says FV is not available, don't quote (unless ablated).
+    if !DISABLE_FV && !state.fv_available {
+        clear_mm_quote_levels(out);
+        return;
+    }
+
     // If we don't have a fair value yet, we can't quote meaningfully.
     let s_t = match state.fair_value {
         Some(v) => v,
@@ -588,69 +650,39 @@ pub fn mm_quotes_to_order_intents(quotes: &[MmQuote]) -> Vec<OrderIntent> {
 /// Ordering: iterates quotes in order; for each quote, emits bid then ask.
 /// This is deterministic and matches the original implementation.
 pub fn mm_quotes_to_order_intents_into(quotes: &[MmQuote], out: &mut Vec<OrderIntent>) {
-    // We avoid out.clear() to preserve existing OrderIntent entries for in-place
-    // mutation, eliminating Arc<str> clone/drop overhead on venue_id each tick.
-
-    let mut write_idx = 0;
+    out.clear();
 
     for q in quotes {
         if let Some(bid) = &q.bid {
-            if write_idx < out.len() {
-                // Mutate existing slot in place.
-                let slot = &mut out[write_idx];
-                slot.venue_index = q.venue_index;
-                // Only reassign venue_id if pointer differs (avoids Arc refcount churn).
-                if !Arc::ptr_eq(&slot.venue_id, &q.venue_id) {
-                    slot.venue_id = q.venue_id.clone();
-                }
-                slot.side = Side::Buy;
-                slot.price = bid.price;
-                slot.size = bid.size;
-                slot.purpose = OrderPurpose::Mm;
-            } else {
-                // Push new entry.
-                out.push(OrderIntent {
-                    venue_index: q.venue_index,
-                    venue_id: q.venue_id.clone(),
-                    side: Side::Buy,
-                    price: bid.price,
-                    size: bid.size,
-                    purpose: OrderPurpose::Mm,
-                });
-            }
-            write_idx += 1;
+            out.push(OrderIntent::Place(PlaceOrderIntent {
+                venue_index: q.venue_index,
+                venue_id: q.venue_id.clone(),
+                side: Side::Buy,
+                price: bid.price,
+                size: bid.size,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: None,
+            }));
         }
 
         if let Some(ask) = &q.ask {
-            if write_idx < out.len() {
-                // Mutate existing slot in place.
-                let slot = &mut out[write_idx];
-                slot.venue_index = q.venue_index;
-                // Only reassign venue_id if pointer differs (avoids Arc refcount churn).
-                if !Arc::ptr_eq(&slot.venue_id, &q.venue_id) {
-                    slot.venue_id = q.venue_id.clone();
-                }
-                slot.side = Side::Sell;
-                slot.price = ask.price;
-                slot.size = ask.size;
-                slot.purpose = OrderPurpose::Mm;
-            } else {
-                // Push new entry.
-                out.push(OrderIntent {
-                    venue_index: q.venue_index,
-                    venue_id: q.venue_id.clone(),
-                    side: Side::Sell,
-                    price: ask.price,
-                    size: ask.size,
-                    purpose: OrderPurpose::Mm,
-                });
-            }
-            write_idx += 1;
+            out.push(OrderIntent::Place(PlaceOrderIntent {
+                venue_index: q.venue_index,
+                venue_id: q.venue_id.clone(),
+                side: Side::Sell,
+                price: ask.price,
+                size: ask.size,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: None,
+            }));
         }
     }
-
-    // Drop any leftover tail items from previous calls.
-    out.truncate(write_idx);
 }
 
 /// Compute the maker cost for a venue (fee minus rebate).
@@ -1524,6 +1556,7 @@ mod tests {
         // Set up fair value and basic market conditions.
         state.fair_value = Some(300.0);
         state.fair_value_prev = 300.0;
+        state.fv_available = true;
         state.sigma_eff = 0.02;
         state.spread_mult = 1.0;
         state.size_mult = 1.0;
@@ -1727,6 +1760,52 @@ mod tests {
     }
 
     #[test]
+    fn warning_regime_widens_spread_and_caps_size() {
+        let (mut cfg, mut state) = setup_test();
+        state.fv_available = true;
+
+        // Force a visible warning effect.
+        cfg.risk.spread_warn_mult = 2.0;
+        cfg.risk.q_warn_cap = 0.5;
+        state.size_mult = 10.0;
+
+        // Normal regime baseline.
+        state.risk_regime = RiskRegime::Normal;
+        let quotes_normal = compute_mm_quotes(&cfg, &state);
+
+        let normal = &quotes_normal[0];
+        let (Some(nb), Some(na)) = (&normal.bid, &normal.ask) else {
+            panic!("Normal regime should produce quotes");
+        };
+
+        // Warning regime.
+        state.risk_regime = RiskRegime::Warning;
+        let quotes_warn = compute_mm_quotes(&cfg, &state);
+        let warn = &quotes_warn[0];
+        let (Some(wb), Some(wa)) = (&warn.bid, &warn.ask) else {
+            panic!("Warning regime should produce quotes");
+        };
+
+        // Spread should widen: bid lower or ask higher (both in practice).
+        assert!(wb.price <= nb.price, "Warning bid should be <= normal bid");
+        assert!(wa.price >= na.price, "Warning ask should be >= normal ask");
+
+        // Sizes should be capped by q_warn_cap.
+        assert!(
+            wb.size <= cfg.risk.q_warn_cap + 1e-9,
+            "Warning bid size should be capped"
+        );
+        assert!(
+            wa.size <= cfg.risk.q_warn_cap + 1e-9,
+            "Warning ask size should be capped"
+        );
+        assert!(
+            nb.size > cfg.risk.q_warn_cap && na.size > cfg.risk.q_warn_cap,
+            "Normal sizes should exceed cap for this test setup"
+        );
+    }
+
+    #[test]
     fn test_venue_targets_computed_from_depth() {
         let (cfg, mut state) = setup_test();
 
@@ -1908,20 +1987,25 @@ mod tests {
             "Intent count differs from reference"
         );
         for (i, (got, want)) in intents_buf.iter().zip(reference.iter()).enumerate() {
-            assert_eq!(
-                got.venue_index, want.venue_index,
-                "venue_index mismatch at {}",
-                i
-            );
-            assert!(
-                Arc::ptr_eq(&got.venue_id, &want.venue_id) || *got.venue_id == *want.venue_id,
-                "venue_id mismatch at {}",
-                i
-            );
-            assert_eq!(got.side, want.side, "side mismatch at {}", i);
-            assert_eq!(got.price, want.price, "price mismatch at {}", i);
-            assert_eq!(got.size, want.size, "size mismatch at {}", i);
-            assert_eq!(got.purpose, want.purpose, "purpose mismatch at {}", i);
+            match (got, want) {
+                (OrderIntent::Place(g), OrderIntent::Place(w)) => {
+                    assert_eq!(
+                        g.venue_index, w.venue_index,
+                        "venue_index mismatch at {}",
+                        i
+                    );
+                    assert!(
+                        Arc::ptr_eq(&g.venue_id, &w.venue_id) || *g.venue_id == *w.venue_id,
+                        "venue_id mismatch at {}",
+                        i
+                    );
+                    assert_eq!(g.side, w.side, "side mismatch at {}", i);
+                    assert_eq!(g.price, w.price, "price mismatch at {}", i);
+                    assert_eq!(g.size, w.size, "size mismatch at {}", i);
+                    assert_eq!(g.purpose, w.purpose, "purpose mismatch at {}", i);
+                }
+                _ => panic!("Expected Place intents at {}", i),
+            }
         }
 
         // Second call with same inputs
@@ -1942,19 +2026,20 @@ mod tests {
             "Intent count differs after second call"
         );
         for (i, (got, want)) in intents_buf.iter().zip(reference.iter()).enumerate() {
-            assert_eq!(
-                got.venue_index, want.venue_index,
-                "venue_index mismatch at {} (2nd call)",
-                i
-            );
-            assert_eq!(got.side, want.side, "side mismatch at {} (2nd call)", i);
-            assert_eq!(got.price, want.price, "price mismatch at {} (2nd call)", i);
-            assert_eq!(got.size, want.size, "size mismatch at {} (2nd call)", i);
-            assert_eq!(
-                got.purpose, want.purpose,
-                "purpose mismatch at {} (2nd call)",
-                i
-            );
+            match (got, want) {
+                (OrderIntent::Place(g), OrderIntent::Place(w)) => {
+                    assert_eq!(
+                        g.venue_index, w.venue_index,
+                        "venue_index mismatch at {} (2nd call)",
+                        i
+                    );
+                    assert_eq!(g.side, w.side, "side mismatch at {} (2nd call)", i);
+                    assert_eq!(g.price, w.price, "price mismatch at {} (2nd call)", i);
+                    assert_eq!(g.size, w.size, "size mismatch at {} (2nd call)", i);
+                    assert_eq!(g.purpose, w.purpose, "purpose mismatch at {} (2nd call)", i);
+                }
+                _ => panic!("Expected Place intents at {} (2nd call)", i),
+            }
         }
 
         // Run many iterations to verify no capacity growth once warmed up

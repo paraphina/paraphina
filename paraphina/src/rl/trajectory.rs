@@ -241,6 +241,10 @@ impl TrajectoryCollector {
             reward_weights: Default::default(),
             apply_domain_rand: self.apply_domain_rand,
             ablations: Default::default(),
+            latency_baseline_ms: 0.0,
+            latency_spike: None,
+            partial_fill: Default::default(),
+            cancel_storm: None,
         };
 
         let mut vec_env = VecEnv::new(self.num_envs, base_config.clone(), env_config);

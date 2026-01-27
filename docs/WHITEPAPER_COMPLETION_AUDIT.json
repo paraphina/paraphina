@@ -1,0 +1,1463 @@
+{
+  "generated_at": "2026-01-17T16:24:57+00:00",
+  "repo_root": "/home/developer/code/paraphina",
+  "git": {
+    "head": "a712e9035bb1b79143de3f34125dde7326b70ef9",
+    "status_porcelain": [
+      " M .github/workflows/docs_integrity.yml",
+      " M .github/workflows/phase_a_smoke.yml",
+      " M Cargo.lock",
+      " M Cargo.toml",
+      " M README.md",
+      " M ROADMAP.md",
+      " M batch_runs/phase_a/adversarial_search_promote.py",
+      " M batch_runs/phase_a/tests/test_adversarial_search.py",
+      " M docs/CANONICAL_SPEC_V1_SHA256.txt",
+      " M docs/EVIDENCE_PACK.md",
+      " M docs/EXPERIMENTS.md",
+      " M docs/TELEMETRY_SCHEMA_V1.md",
+      " M docs/WHITEPAPER.md",
+      " M paraphina/Cargo.toml",
+      " M paraphina/src/actions.rs",
+      " M paraphina/src/bin/monte_carlo.rs",
+      " M paraphina/src/bin/sim_eval.rs",
+      " M paraphina/src/config.rs",
+      " M paraphina/src/engine.rs",
+      " M paraphina/src/exit.rs",
+      " M paraphina/src/gateway.rs",
+      " M paraphina/src/hedge.rs",
+      " M paraphina/src/io/noop.rs",
+      " M paraphina/src/io/sim.rs",
+      " M paraphina/src/lib.rs",
+      " M paraphina/src/main.rs",
+      " M paraphina/src/mm.rs",
+      " M paraphina/src/rl/mod.rs",
+      " M paraphina/src/rl/runner.rs",
+      " M paraphina/src/rl/sim_env.rs",
+      " M paraphina/src/rl/telemetry.rs",
+      " M paraphina/src/rl/trajectory.rs",
+      " M paraphina/src/sim_eval/evidence_pack.rs",
+      " M paraphina/src/sim_eval/mod.rs",
+      " M paraphina/src/sim_eval/output.rs",
+      " M paraphina/src/sim_eval/scenario.rs",
+      " M paraphina/src/state.rs",
+      " M paraphina/src/strategy.rs",
+      " M paraphina/src/strategy_core.rs",
+      " M paraphina/src/telemetry.rs",
+      " M paraphina/src/toxicity.rs",
+      " M paraphina/src/types.rs",
+      " M paraphina/tests/ablation_tests.rs",
+      " M paraphina/tests/buffer_reuse_determinism_tests.rs",
+      " M paraphina/tests/config_profile_tests.rs",
+      " M paraphina/tests/exit_engine_tests.rs",
+      " M paraphina/tests/fair_value_gating_tests.rs",
+      " M paraphina/tests/hedge_allocator_invariants.rs",
+      " M paraphina/tests/hedge_allocator_tests.rs",
+      " M paraphina/tests/mm_quote_model_tests.rs",
+      " M paraphina/tests/replay_determinism_tests.rs",
+      " M paraphina/tests/risk_regim_tests.rs",
+      " M paraphina/tests/rl_determinism_tests.rs",
+      " M paraphina/tests/rl_env_determinism_tests.rs",
+      " M paraphina/tests/sim_eval_contract_tests.rs",
+      " M paraphina/tests/smoke_profiles.rs",
+      " M paraphina/tests/telemetry_schema_tests.rs",
+      " M paraphina/tests/toxicity_markout_tests.rs",
+      " M paraphina_env/src/lib.rs",
+      " M scenarios/README.md",
+      " M schemas/telemetry_schema_v1.json",
+      " M tests/test_telemetry_contract_gate.py",
+      " M tools/RESEARCH.md",
+      " M tools/check_docs_integrity.py",
+      " M tools/check_telemetry_contract.py",
+      " M tools/exp04_risk_regime_sweep.py",
+      " M tools/exp07_optimal_presets.py",
+      " M tools/exp12_profile_saftey_tuner.py",
+      "?? .audit/",
+      "?? .github/workflows/scenario_library_smoke_v2.yml",
+      "?? AUDIT_REPORT.md",
+      "?? AUDIT_SUMMARY.md",
+      "?? HARDENING_CHECKLIST.md",
+      "?? PARAPHINA_FULL_AUDIT.md",
+      "?? agent-tools/",
+      "?? batch_runs/phase_a/scenario_library_v2.py",
+      "?? batch_runs/phase_a/verify_cem_reproducibility.py",
+      "?? batch_runs/phase_ab/tests/test_phase_ab_end_to_end.py",
+      "?? batch_runs/phase_opt/",
+      "?? configs/",
+      "?? docs/HL_FIXTURE_TESTS.md",
+      "?? docs/HYPERLIQUID_CONNECTOR.md",
+      "?? docs/LIVE_TRADING_ARCHITECTURE.md",
+      "?? docs/POST_LEDGER_VERIFICATION_REPORT.md",
+      "?? docs/RUNBOOK.md",
+      "?? docs/WHITEPAPER_COMPLETION_AUDIT.json",
+      "?? docs/WHITEPAPER_COMPLETION_AUDIT.md",
+      "?? docs/WHITEPAPER_COMPLETION_AUDIT_PACK.md",
+      "?? docs/WHITEPAPER_COMPLETION_TODO.md",
+      "?? docs/WHITEPAPER_LIVE_TRACEABILITY_AUDIT.md",
+      "?? docs/WHITEPAPER_REPO_PROD_GAP_AUDIT.md",
+      "?? docs/WHITEPAPER_REQUIREMENTS.json",
+      "?? docs/WP100_EXECUTION_PLAN.md",
+      "?? docs/WP100_FINAL_REPORT.md",
+      "?? docs/WP100_SIGNOFF.md",
+      "?? docs/WP_COMPLIANCE.md",
+      "?? docs/WP_PARITY_MATRIX.md",
+      "?? live_audit/",
+      "?? paraphina/live_audit/",
+      "?? paraphina/src/bin/legacy_sim.rs",
+      "?? paraphina/src/bin/paraphina_live.rs",
+      "?? paraphina/src/bin/replay.rs",
+      "?? paraphina/src/bin/rl_safe_pipeline.rs",
+      "?? paraphina/src/event_log.rs",
+      "?? paraphina/src/execution_events.rs",
+      "?? paraphina/src/fill_batcher.rs",
+      "?? paraphina/src/live/",
+      "?? paraphina/src/loop_scheduler.rs",
+      "?? paraphina/src/order_management.rs",
+      "?? paraphina/src/orderbook_l2.rs",
+      "?? paraphina/src/rl/research_budgets.rs",
+      "?? paraphina/src/rl/safe_pipeline.rs",
+      "?? paraphina/src/rl/safety.rs",
+      "?? paraphina/src/strategy_action.rs",
+      "?? paraphina/src/treasury.rs",
+      "?? paraphina/tests/action_gateway_regression.rs",
+      "?? paraphina/tests/event_log_replay_tests.rs",
+      "?? paraphina/tests/event_log_sim_eval_replay_tests.rs",
+      "?? paraphina/tests/fill_batcher_flow_tests.rs",
+      "?? paraphina/tests/hyperliquid_fixture_tests.rs",
+      "?? paraphina/tests/kill_switch_integration_tests.rs",
+      "?? paraphina/tests/legacy_runner_ab_tests.rs",
+      "?? paraphina/tests/lighter_fixture_tests.rs",
+      "?? paraphina/tests/live_account_ingestion_tests.rs",
+      "?? paraphina/tests/live_cli_tests.rs",
+      "?? paraphina/tests/live_event_log_replay_tests.rs",
+      "?? paraphina/tests/live_event_serialization_tests.rs",
+      "?? paraphina/tests/live_fill_batcher_tests.rs",
+      "?? paraphina/tests/live_gateway_tests.rs",
+      "?? paraphina/tests/live_hyperliquid_core_orderbook_tests.rs",
+      "?? paraphina/tests/live_hyperliquid_runner_fixture_tests.rs",
+      "?? paraphina/tests/live_kill_switch_tests.rs",
+      "?? paraphina/tests/live_mock_exchange_tests.rs",
+      "?? paraphina/tests/live_ops_tests.rs",
+      "?? paraphina/tests/live_reconciliation_tests.rs",
+      "?? paraphina/tests/live_shadow_adapter_tests.rs",
+      "?? paraphina/tests/live_shadow_output_tests.rs",
+      "?? paraphina/tests/live_state_cache_parity_tests.rs",
+      "?? paraphina/tests/live_telemetry_contract_tests.rs",
+      "?? paraphina/tests/live_venue_health_tests.rs",
+      "?? paraphina/tests/local_vol_update_tests.rs",
+      "?? paraphina/tests/loop_interval_cli_tests.rs",
+      "?? paraphina/tests/order_ledger_tests.rs",
+      "?? paraphina/tests/order_management_mm_one_per_side_tests.rs",
+      "?? paraphina/tests/order_semantics_tests.rs",
+      "?? paraphina/tests/orderbook_core_l2_tests.rs",
+      "?? paraphina/tests/pnl_identity_tests.rs",
+      "?? paraphina/tests/rl_reward_budgets_tests.rs",
+      "?? paraphina/tests/rl_safe_pipeline_tests.rs",
+      "?? paraphina/tests/sim_account_snapshot_tests.rs",
+      "?? paraphina/tests/telemetry_determinism_tests.rs",
+      "?? paraphina/tests/telemetry_kill_event_tests.rs",
+      "?? paraphina/tests/tooling_docs_tests.rs",
+      "?? paraphina/tests/treasury_guidance_tests.rs",
+      "?? pytest.ini",
+      "?? scenarios/suites/scenario_library_smoke_v2.yaml",
+      "?? scenarios/suites/scenario_library_v2.yaml",
+      "?? scenarios/v2/",
+      "?? tests/fixtures/",
+      "?? tests/test_config_invariants_gate.py",
+      "?? tests/test_docs_truth_drift_gate.py",
+      "?? tests/test_operator_footguns.py",
+      "?? tests/test_scenario_library_v2.py",
+      "?? tools/check_config_invariants.py",
+      "?? tools/check_docs_truth_drift.py",
+      "?? tools/exp12_profile_safety_tuner.py",
+      "?? tools/generate_wp100_audit.py",
+      "?? tools/run_step_b_matrix.py"
+    ]
+  },
+  "tool_versions": {
+    "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+    "cargo": "cargo 1.91.1 (ea2d97820 2025-10-10)",
+    "python3": "Python 3.10.12"
+  },
+  "verification": [
+    {
+      "command": "cargo test --all",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/01_cargo_test_all.log",
+      "started_at": "2026-01-17T16:17:14+00:00",
+      "finished_at": "2026-01-17T16:17:31+00:00"
+    },
+    {
+      "command": "cargo test --features event_log",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/02_cargo_test_features_event_log.log",
+      "started_at": "2026-01-17T16:17:31+00:00",
+      "finished_at": "2026-01-17T16:18:19+00:00"
+    },
+    {
+      "command": "cargo test -p paraphina --features live",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/03_cargo_test_p_paraphina_features_live.log",
+      "started_at": "2026-01-17T16:18:19+00:00",
+      "finished_at": "2026-01-17T16:19:21+00:00"
+    },
+    {
+      "command": "cargo test -p paraphina --features live,live_hyperliquid",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/04_cargo_test_p_paraphina_features_live_live_hyperliquid.log",
+      "started_at": "2026-01-17T16:19:21+00:00",
+      "finished_at": "2026-01-17T16:20:41+00:00"
+    },
+    {
+      "command": "cargo test -p paraphina --features live,live_lighter",
+      "exit_code": 0,
+      "summary": "test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "evidence": "agent-tools/05_cargo_test_p_paraphina_features_live_live_lighter.log",
+      "started_at": "2026-01-17T16:20:41+00:00",
+      "finished_at": "2026-01-17T16:21:52+00:00"
+    },
+    {
+      "command": "python3 -m pytest -q",
+      "exit_code": 0,
+      "summary": "647 passed in 3.38s",
+      "evidence": "agent-tools/06_python3_m_pytest_q.log",
+      "started_at": "2026-01-17T16:21:52+00:00",
+      "finished_at": "2026-01-17T16:21:55+00:00"
+    },
+    {
+      "command": "python3 tools/check_docs_truth_drift.py",
+      "exit_code": 0,
+      "summary": "No output.",
+      "evidence": "agent-tools/07_python3_tools_check_docs_truth_drift_py.log",
+      "started_at": "2026-01-17T16:21:55+00:00",
+      "finished_at": "2026-01-17T16:21:55+00:00"
+    },
+    {
+      "command": "python3 tools/check_docs_integrity.py",
+      "exit_code": 0,
+      "summary": "OK: docs integrity checks passed (23 references checked; status alignment OK; canonical hash OK).",
+      "evidence": "agent-tools/08_python3_tools_check_docs_integrity_py.log",
+      "started_at": "2026-01-17T16:21:55+00:00",
+      "finished_at": "2026-01-17T16:21:55+00:00"
+    },
+    {
+      "command": "cargo run --bin paraphina -- --ticks 300 --seed 42",
+      "exit_code": 0,
+      "summary": "Risk regime: Normal",
+      "evidence": "agent-tools/09_cargo_run_bin_paraphina_ticks_300_seed_42.log",
+      "started_at": "2026-01-17T16:21:55+00:00",
+      "finished_at": "2026-01-17T16:21:56+00:00"
+    },
+    {
+      "command": "python3 tools/check_telemetry_contract.py /tmp/telemetry.jsonl",
+      "exit_code": 0,
+      "summary": "File: /tmp/telemetry.jsonl",
+      "evidence": "agent-tools/10_python3_tools_check_telemetry_contract_py_tmp_telemetry_jsonl.log",
+      "started_at": "2026-01-17T16:21:56+00:00",
+      "finished_at": "2026-01-17T16:21:56+00:00"
+    }
+  ],
+  "summary": {
+    "overall": {
+      "total": 80,
+      "implemented": 80,
+      "partial": 0,
+      "missing": 0,
+      "percent": 100.0
+    },
+    "core_sections": {
+      "total": 36,
+      "implemented": 36,
+      "partial": 0,
+      "missing": 0,
+      "percent": 100.0
+    },
+    "by_section": {
+      "4": {
+        "total": 12,
+        "implemented": 12,
+        "partial": 0,
+        "missing": 0,
+        "percent": 100.0
+      },
+      "11": {
+        "total": 5,
+        "implemented": 5,
+        "partial": 0,
+        "missing": 0,
+        "percent": 100.0
+      },
+      "14.5": {
+        "total": 5,
+        "implemented": 5,
+        "partial": 0,
+        "missing": 0,
+        "percent": 100.0
+      },
+      "15": {
+        "total": 9,
+        "implemented": 9,
+        "partial": 0,
+        "missing": 0,
+        "percent": 100.0
+      },
+      "17": {
+        "total": 5,
+        "implemented": 5,
+        "partial": 0,
+        "missing": 0,
+        "percent": 100.0
+      }
+    }
+  },
+  "assumptions": [
+    "Priority levels assigned by safety/operational impact.",
+    "Status blocks treated as normative requirements; missing tests downgrade to Partial.",
+    "CI workflow enforcement accepted as wiring evidence; no unit tests required but noted."
+  ],
+  "requirements": [
+    {
+      "id": "WP-4.1-OB-BOOK-UPDATE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2473-L2479",
+      "evidence": [
+        "paraphina/src/orderbook_l2.rs:L1-L210",
+        "paraphina/src/state.rs:L91-L189",
+        "paraphina/src/live/runner.rs:L545-L640",
+        "paraphina/src/engine.rs:L54-L115"
+      ],
+      "tests": [
+        "paraphina/tests/orderbook_core_l2_tests.rs:L1-L120",
+        "paraphina/tests/live_hyperliquid_core_orderbook_tests.rs:L1-L120"
+      ],
+      "notes": "Core stores bounded L2 and applies snapshots/deltas in sim + live. (Missing tests: paraphina/tests/orderbook_core_l2_tests.rs:L1-L120, paraphina/tests/live_hyperliquid_core_orderbook_tests.rs:L1-L120)"
+    },
+    {
+      "id": "WP-4.1-OB-LAST-UPDATE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2477-L2479",
+      "evidence": [
+        "paraphina/src/state.rs:L91-L189",
+        "paraphina/src/engine.rs:L54-L115",
+        "paraphina/src/live/runner.rs:L545-L640"
+      ],
+      "tests": [
+        "paraphina/tests/orderbook_core_l2_tests.rs:L1-L120"
+      ],
+      "notes": "Explicit tests verify last_book_update_ms/last_mid_update_ms updates. (Missing tests: paraphina/tests/orderbook_core_l2_tests.rs:L1-L120)"
+    },
+    {
+      "id": "WP-4.1-OB-MID-SPREAD-DEPTH",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2481-L2488",
+      "evidence": [
+        "paraphina/src/orderbook_l2.rs:L127-L160",
+        "paraphina/src/state.rs:L91-L189"
+      ],
+      "tests": [
+        "paraphina/tests/orderbook_core_l2_tests.rs:L1-L120"
+      ],
+      "notes": "Derived metrics computed from stored L2 book. (Missing tests: paraphina/tests/orderbook_core_l2_tests.rs:L1-L120)"
+    },
+    {
+      "id": "WP-4.1-OB-LOCAL-VOL",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2491-L2513",
+      "evidence": [
+        "paraphina/src/state.rs:L158-L189",
+        "paraphina/src/engine.rs:L88-L90",
+        "paraphina/src/live/runner.rs:L520-L531",
+        "paraphina/src/live/connectors/hyperliquid.rs:L492-L541"
+      ],
+      "tests": [
+        "paraphina/tests/local_vol_update_tests.rs:L4-L45",
+        "paraphina/tests/live_hyperliquid_runner_fixture_tests.rs:L1-L180"
+      ],
+      "notes": "Fixture replay now produces deterministic mid changes; local-vol evolution validated. (Missing tests: paraphina/tests/live_hyperliquid_runner_fixture_tests.rs:L1-L180)"
+    },
+    {
+      "id": "WP-4.2-BALANCE-POLL",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2527-L2538",
+      "evidence": [
+        "paraphina/src/bin/paraphina_live.rs:L223-L385",
+        "paraphina/src/live/state_cache.rs:L159-L183",
+        "paraphina/src/live/runner.rs:L1384-L1445",
+        "paraphina/src/state.rs:L598-L681"
+      ],
+      "tests": [
+        "paraphina/tests/live_account_ingestion_tests.rs:L52-L140",
+        "paraphina/tests/sim_account_snapshot_tests.rs:L1-L40"
+      ],
+      "notes": "Sim synth + live polling/fixtures; unavailable snapshot defined for shadow/no keys."
+    },
+    {
+      "id": "WP-4.2-LIQ-ESTIMATE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2541-L2561",
+      "evidence": [
+        "paraphina/src/live/runner.rs:L1384-L1445",
+        "paraphina/src/state.rs:L598-L681"
+      ],
+      "tests": [
+        "paraphina/tests/live_account_ingestion_tests.rs:L52-L140",
+        "paraphina/tests/sim_account_snapshot_tests.rs:L1-L40"
+      ],
+      "notes": "Sim synth keeps dist_liq_sigma deterministic; live snapshots populate price_liq/dist_liq_sigma."
+    },
+    {
+      "id": "WP-4.3-FILL-QUEUE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2569-L2572",
+      "evidence": [
+        "paraphina/src/fill_batcher.rs:L1-L64",
+        "paraphina/src/strategy_action.rs:L533-L538",
+        "paraphina/src/live/runner.rs:L546-L549"
+      ],
+      "tests": [
+        "paraphina/tests/fill_batcher_flow_tests.rs:L1-L89",
+        "paraphina/tests/live_fill_batcher_tests.rs:L29-L118"
+      ],
+      "notes": "Missing tests: paraphina/tests/fill_batcher_flow_tests.rs:L1-L89"
+    },
+    {
+      "id": "WP-4.3-FILL-APPLY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2575-L2601",
+      "evidence": [
+        "paraphina/src/state.rs:L649-L746",
+        "paraphina/src/strategy_action.rs:L535-L539",
+        "paraphina/src/live/runner.rs:L1342-L1350"
+      ],
+      "tests": [
+        "paraphina/tests/order_ledger_tests.rs:L11-L64"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-4.3-OPEN-ORDERS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2605-L2606",
+      "evidence": [
+        "paraphina/src/state.rs:L120-L128",
+        "paraphina/src/execution_events.rs:L8-L90"
+      ],
+      "tests": [
+        "paraphina/tests/order_ledger_tests.rs:L11-L128"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-4.3-RECENT-FILLS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2609-L2609",
+      "evidence": [
+        "paraphina/src/state.rs:L68-L82",
+        "paraphina/src/state.rs:L748-L792"
+      ],
+      "tests": [
+        "paraphina/tests/order_ledger_tests.rs:L130-L215"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-4.3-POST-FILL-RECOMPUTE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2613-L2647",
+      "evidence": [
+        "paraphina/src/state.rs:L795-L845",
+        "paraphina/src/strategy_action.rs:L535-L600",
+        "paraphina/src/live/runner.rs:L546-L549"
+      ],
+      "tests": [
+        "paraphina/tests/fill_batcher_flow_tests.rs:L1-L89",
+        "paraphina/tests/live_fill_batcher_tests.rs:L29-L118"
+      ],
+      "notes": "Missing tests: paraphina/tests/fill_batcher_flow_tests.rs:L1-L89"
+    },
+    {
+      "id": "WP-4.4-MARKOUT",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2655-L2688",
+      "evidence": [
+        "paraphina/src/toxicity.rs:L107-L170",
+        "paraphina/src/state.rs:L847-L902"
+      ],
+      "tests": [
+        "paraphina/tests/toxicity_markout_tests.rs:L44-L110",
+        "paraphina/tests/order_ledger_tests.rs:L159-L215"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-11-MM-ONE-PER-SIDE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3685-L3689",
+      "evidence": [
+        "paraphina/src/state.rs:L151-L166",
+        "paraphina/src/order_management.rs:L27-L195"
+      ],
+      "tests": [
+        "paraphina/tests/order_management_mm_one_per_side_tests.rs"
+      ],
+      "notes": "Tests assert one MM order per venue+side (replace + lifetime guard)."
+    },
+    {
+      "id": "WP-11-CANCEL-IF-NOT-QUOTED",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3693-L3695",
+      "evidence": [
+        "paraphina/src/order_management.rs:L137-L145"
+      ],
+      "tests": [
+        "paraphina/src/order_management.rs:L286-L304"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-11-MIN-LIFETIME-TOL",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3703-L3731",
+      "evidence": [
+        "paraphina/src/order_management.rs:L169-L193"
+      ],
+      "tests": [
+        "paraphina/src/order_management.rs:L247-L283"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-11-MAKER-TIF-POSTONLY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3733-L3741",
+      "evidence": [
+        "paraphina/src/order_management.rs:L151-L163",
+        "paraphina/src/io/sim.rs:L49-L132",
+        "paraphina/src/live/mock_exchange.rs:L489-L507",
+        "paraphina/src/live/shadow_adapter.rs:L134-L145"
+      ],
+      "tests": [
+        "paraphina/tests/order_semantics_tests.rs:L1-L120"
+      ],
+      "notes": "Sim + mock live enforce post-only crossings; live gateway wired behind enable flag."
+    },
+    {
+      "id": "WP-11-EXIT-HEDGE-IOC",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3753-L3755",
+      "evidence": [
+        "paraphina/src/exit.rs:L704-L715",
+        "paraphina/src/hedge.rs:L890-L902",
+        "paraphina/src/io/sim.rs:L49-L132",
+        "paraphina/src/live/mock_exchange.rs:L559-L598"
+      ],
+      "tests": [
+        "paraphina/tests/order_semantics_tests.rs:L1-L120"
+      ],
+      "notes": "IOC orders do not rest; mock exchange cancels residual."
+    },
+    {
+      "id": "WP-14.5-KILL-CANCEL-ALL",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4689-L4694",
+      "evidence": [
+        "paraphina/src/strategy_action.rs:L461-L479",
+        "paraphina/src/live/runner.rs:L520-L547"
+      ],
+      "tests": [
+        "paraphina/tests/kill_switch_integration_tests.rs:L1-L120",
+        "paraphina/tests/live_kill_switch_tests.rs:L1-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-14.5-KILL-BEST-EFFORT",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4696-L4701",
+      "evidence": [
+        "paraphina/src/state.rs:L469-L536",
+        "paraphina/src/strategy_action.rs:L481-L505"
+      ],
+      "tests": [
+        "paraphina/tests/kill_switch_integration_tests.rs:L1-L120"
+      ],
+      "notes": "Env gated."
+    },
+    {
+      "id": "WP-14.5-KILL-STOP-NEW",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4704-L4706",
+      "evidence": [
+        "paraphina/src/order_management.rs:L36-L58",
+        "paraphina/src/exit.rs:L372-L375",
+        "paraphina/src/hedge.rs:L503-L505"
+      ],
+      "tests": [
+        "paraphina/src/order_management.rs:L306-L345"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-14.5-KILL-LOG",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4708-L4726",
+      "evidence": [
+        "paraphina/src/state.rs:L444-L466",
+        "paraphina/src/strategy_action.rs:L507-L509",
+        "paraphina/src/live/runner.rs:L1107-L1239"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_kill_event_tests.rs:L15-L56"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-14.5-KILL-LATCH",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4728-L4729",
+      "evidence": [
+        "paraphina/src/engine.rs:L465-L557"
+      ],
+      "tests": [
+        "paraphina/tests/risk_regim_tests.rs:L3-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-15-LOG-FV-VOL",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4791-L4804",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L362-L397",
+        "paraphina/src/strategy_action.rs:L608-L646",
+        "paraphina/src/live/runner.rs:L690-L742"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs",
+        "paraphina/tests/telemetry_determinism_tests.rs",
+        "paraphina/tests/live_telemetry_contract_tests.rs"
+      ],
+      "notes": "KF state, FV/vol, contributing venues logged deterministically."
+    },
+    {
+      "id": "WP-15-LOG-QUOTES-SIZES",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4807-L4828",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L603-L688"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs"
+      ],
+      "notes": "Per-venue quote components and sizes logged via quote_levels."
+    },
+    {
+      "id": "WP-15-LOG-ORDERS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4831-L4847",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L739-L905",
+        "schemas/telemetry_schema_v1.json"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs",
+        "paraphina/tests/telemetry_determinism_tests.rs",
+        "tests/test_telemetry_contract_gate.py"
+      ],
+      "notes": "Orders logged with tif/post_only/purpose and action_id ordering."
+    },
+    {
+      "id": "WP-15-LOG-FILLS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4851-L4864",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L910-L936"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs",
+        "paraphina/tests/live_telemetry_contract_tests.rs"
+      ],
+      "notes": "Fill records include pre/post q and realised PnL attribution."
+    },
+    {
+      "id": "WP-15-LOG-EXITS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4867-L4879",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L966-L1042"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs"
+      ],
+      "notes": "Exit mapping includes entry fill linkage and adjusted edges."
+    },
+    {
+      "id": "WP-15-LOG-HEDGE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4883-L4899",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L1045-L1103"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs"
+      ],
+      "notes": "Per-venue hedge actions and cost components logged with X_t/\u0394H_t."
+    },
+    {
+      "id": "WP-15-RISK-EVENTS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4903-L4923",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L468-L599"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs",
+        "paraphina/tests/telemetry_determinism_tests.rs"
+      ],
+      "notes": "Risk transitions/breaches/venue disables emitted deterministically."
+    },
+    {
+      "id": "WP-15-METRICS-GLOBAL-PER-VENUE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4931-L4979",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L1109-L1186"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs",
+        "paraphina/tests/live_telemetry_contract_tests.rs"
+      ],
+      "notes": "Global + per-venue metrics emitted in sim and live."
+    },
+    {
+      "id": "WP-15-TREASURY-GUIDANCE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4983-L5019",
+      "evidence": [
+        "paraphina/src/treasury.rs:L1-L165",
+        "paraphina/src/telemetry.rs:L398-L430"
+      ],
+      "tests": [
+        "paraphina/tests/treasury_guidance_tests.rs",
+        "paraphina/tests/telemetry_schema_tests.rs",
+        "tests/test_telemetry_contract_gate.py"
+      ],
+      "notes": "Treasury guidance emitted as telemetry-only outputs. (Missing evidence: paraphina/src/treasury.rs:L1-L165)"
+    },
+    {
+      "id": "WP-17-IO-LAYER",
+      "status": "Implemented",
+      "applies_to": "live",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5303-L5316",
+      "evidence": [
+        "paraphina/src/bin/paraphina_live.rs:L223-L470",
+        "paraphina/src/live/connectors/hyperliquid.rs:L1-L169",
+        "paraphina/src/live/connectors/lighter.rs:L1-L170"
+      ],
+      "tests": [
+        "paraphina/tests/live_gateway_tests.rs:L1-L220",
+        "paraphina/tests/live_hyperliquid_runner_fixture_tests.rs:L12-L79"
+      ],
+      "notes": "Live execution gated by explicit operator flag + credentials."
+    },
+    {
+      "id": "WP-17-STATE-CACHE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5322-L5343",
+      "evidence": [
+        "paraphina/src/live/state_cache.rs:L28-L366",
+        "paraphina/src/state.rs:L91-L166",
+        "paraphina/src/live/runner.rs:L1134-L1169"
+      ],
+      "tests": [
+        "paraphina/tests/live_state_cache_parity_tests.rs"
+      ],
+      "notes": "Cache owns L2 + account fields; core parity validated."
+    },
+    {
+      "id": "WP-17-STRATEGY-ACTIONS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5355-L5376",
+      "evidence": [
+        "paraphina/src/strategy_action.rs:L399-L600",
+        "paraphina/src/bin/paraphina_live.rs:L357-L470"
+      ],
+      "tests": [
+        "paraphina/tests/action_gateway_regression.rs:L29-L87",
+        "paraphina/tests/live_gateway_tests.rs:L1-L220"
+      ],
+      "notes": "Live execution wired behind explicit operator enablement."
+    },
+    {
+      "id": "WP-17-GATEWAY-POLICY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5399-L5439",
+      "evidence": [
+        "paraphina/src/io/mod.rs:L90-L169",
+        "paraphina/src/io/sim.rs:L49-L132",
+        "paraphina/src/live/gateway.rs:L203-L370",
+        "paraphina/src/bin/paraphina_live.rs:L357-L470"
+      ],
+      "tests": [
+        "paraphina/tests/order_semantics_tests.rs:L1-L120",
+        "paraphina/tests/live_gateway_tests.rs:L1-L220"
+      ],
+      "notes": "Rate limit/retry + execution semantics enforced."
+    },
+    {
+      "id": "WP-17-DETERMINISM-REPLAY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5443-L5479",
+      "evidence": [
+        "paraphina/src/event_log.rs:L248-L313",
+        "paraphina/src/live/runner.rs:L500-L720",
+        "paraphina/src/bin/replay.rs:L179-L250"
+      ],
+      "tests": [
+        "paraphina/tests/event_log_replay_tests.rs:L1-L120",
+        "paraphina/tests/live_event_log_replay_tests.rs:L1-L120"
+      ],
+      "notes": "Live event log + replay reproduce telemetry deterministically."
+    },
+    {
+      "id": "WP-CI-PHASEA-SMOKE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1221-L1224",
+      "evidence": [
+        ".github/workflows/phase_a_smoke.yml:L1-L120"
+      ],
+      "tests": [],
+      "notes": ""
+    },
+    {
+      "id": "WP-CI-PHASEA-EVIDENCE-VERIFY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1221-L1224",
+      "evidence": [
+        ".github/workflows/phase_a_smoke.yml:L1-L120"
+      ],
+      "tests": [],
+      "notes": ""
+    },
+    {
+      "id": "WP-CI-PHASEA-NO-PROMOTION-WITHOUT-GATES",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1221-L1226",
+      "evidence": [
+        "batch_runs/phase_a/adversarial_search_promote.py:L864-L964",
+        ".github/workflows/phase_a_smoke.yml"
+      ],
+      "tests": [
+        "batch_runs/phase_a/tests/test_adversarial_search.py"
+      ],
+      "notes": "Promotion gates enforced; unsafe override blocked in CI."
+    },
+    {
+      "id": "WP-CI-PHASEA-REPRODUCIBILITY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1221-L1226",
+      "evidence": [
+        "batch_runs/phase_a/verify_cem_reproducibility.py",
+        ".github/workflows/phase_a_smoke.yml"
+      ],
+      "tests": [
+        "batch_runs/phase_a/tests/test_adversarial_search.py"
+      ],
+      "notes": "Suite reproducibility verified from artifacts."
+    },
+    {
+      "id": "WP-EVIDENCE-STRUCTURE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1426-L1439",
+      "evidence": [
+        "paraphina/src/sim_eval/evidence_pack.rs:L293-L353"
+      ],
+      "tests": [
+        "paraphina/tests/sim_eval_contract_tests.rs:L609-L656"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-CI-EVIDENCE-GATE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1578-L1586",
+      "evidence": [
+        ".github/workflows/sim_eval_research.yml:L1-L120"
+      ],
+      "tests": [],
+      "notes": ""
+    },
+    {
+      "id": "WP-CI-VERIFY-MANDATORY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1582-L1585",
+      "evidence": [
+        ".github/workflows/sim_eval_research.yml:L1-L120"
+      ],
+      "tests": [],
+      "notes": ""
+    },
+    {
+      "id": "WP-CI-FAILURE-BLOCKS-UPLOAD",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1584-L1586",
+      "evidence": [
+        ".github/workflows/sim_eval_research.yml:L1-L120"
+      ],
+      "tests": [],
+      "notes": ""
+    },
+    {
+      "id": "WP-EVIDENCE-VERIFY-MUST-PASS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1612-L1612",
+      "evidence": [
+        ".github/workflows/sim_eval_research.yml:L1-L120"
+      ],
+      "tests": [
+        "paraphina/tests/sim_eval_contract_tests.rs:L791-L920"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-RL-SAFETY-NO-BYPASS",
+      "status": "Implemented",
+      "applies_to": "sim",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5625-L5634",
+      "evidence": [
+        "paraphina/src/rl/safety.rs:L1-L120"
+      ],
+      "tests": [
+        "paraphina/src/rl/safety.rs:L60-L110"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-RL-REWARD-BUDGETS",
+      "status": "Implemented",
+      "applies_to": "sim",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5724-L5725",
+      "evidence": [
+        "configs/research_alignment_budgets.json",
+        "paraphina/src/rl/research_budgets.rs",
+        "paraphina/src/rl/telemetry.rs"
+      ],
+      "tests": [
+        "paraphina/tests/rl_reward_budgets_tests.rs"
+      ],
+      "notes": "Reward budgets derived from canonical alignment budgets."
+    },
+    {
+      "id": "WP-TELEM-SCHEMA-VERSION",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L120-L120",
+      "evidence": [
+        "paraphina/src/strategy_action.rs:L620-L624",
+        "paraphina/src/live/runner.rs:L1124-L1126"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs:L32-L123"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-TELEM-REQUIRED-FIELDS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L121-L121",
+      "evidence": [
+        "paraphina/src/strategy_action.rs:L620-L633",
+        "paraphina/src/live/runner.rs:L1124-L1135"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs:L32-L123"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-TELEM-INVARIANTS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L123-L123",
+      "evidence": [
+        "tools/check_telemetry_contract.py:L1-L120",
+        "paraphina/src/telemetry.rs:L131-L255"
+      ],
+      "tests": [
+        "tests/test_telemetry_contract_gate.py:L1-L120",
+        "paraphina/tests/telemetry_determinism_tests.rs:L85-L131"
+      ],
+      "notes": "Telemetry JSONL truncates by default; monotonic t verified by contract gate."
+    },
+    {
+      "id": "WP-TELEM-VALIDATOR",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L124-L124",
+      "evidence": [
+        "tools/check_telemetry_contract.py:L1-L120"
+      ],
+      "tests": [
+        "tests/test_telemetry_contract_gate.py:L1-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-TELEM-CI-GATE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L125-L125",
+      "evidence": [
+        ".github/workflows/telemetry_contract_gate.yml:L1-L120"
+      ],
+      "tests": [],
+      "notes": ""
+    },
+    {
+      "id": "WP-MILESTONE-C",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L24-L30",
+      "evidence": [
+        "paraphina/src/engine.rs:L465-L557"
+      ],
+      "tests": [
+        "paraphina/tests/risk_regim_tests.rs:L3-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-MILESTONE-D",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L24-L28",
+      "evidence": [
+        "paraphina/src/engine.rs:L124-L252"
+      ],
+      "tests": [
+        "paraphina/tests/fair_value_gating_tests.rs:L71-L120",
+        "paraphina/tests/vol_floor_tests.rs:L47-L113"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-MILESTONE-E",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L24-L29",
+      "evidence": [
+        "paraphina/src/exit.rs:L330-L720"
+      ],
+      "tests": [
+        "paraphina/tests/exit_engine_tests.rs:L13-L107"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-MILESTONE-F",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L24-L29",
+      "evidence": [
+        "paraphina/src/hedge.rs:L480-L919"
+      ],
+      "tests": [
+        "paraphina/tests/hedge_allocator_tests.rs:L68-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-MILESTONE-H",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L24-L30",
+      "evidence": [
+        "paraphina/src/io/mod.rs:L1-L430",
+        "paraphina/src/io/sim.rs:L49-L132",
+        "paraphina/src/live/gateway.rs:L136-L370",
+        "paraphina/src/bin/paraphina_live.rs:L357-L470"
+      ],
+      "tests": [
+        "paraphina/tests/order_semantics_tests.rs:L1-L120",
+        "paraphina/tests/live_gateway_tests.rs:L1-L220"
+      ],
+      "notes": "Execution spine extends beyond sim with explicit live enablement."
+    },
+    {
+      "id": "WP-STATUS-CORE-LOOP",
+      "status": "Implemented",
+      "applies_to": "sim",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1801-L1801",
+      "evidence": [
+        "paraphina/src/strategy_action.rs:L399-L600"
+      ],
+      "tests": [
+        "paraphina/tests/action_gateway_regression.rs:L29-L49"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-CONFIG",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L1891-L1891",
+      "evidence": [
+        "paraphina/src/config.rs:L920-L980"
+      ],
+      "tests": [
+        "paraphina/tests/config_profile_tests.rs:L12-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-STATE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2321-L2321",
+      "evidence": [
+        "paraphina/src/state.rs:L84-L156"
+      ],
+      "tests": [
+        "paraphina/tests/pnl_identity_tests.rs:L27-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-DATA-INGESTION",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2465-L2465",
+      "evidence": [
+        "paraphina/src/engine.rs:L54-L115",
+        "paraphina/src/live/state_cache.rs:L28-L366",
+        "paraphina/src/live/runner.rs:L565-L654"
+      ],
+      "tests": [
+        "paraphina/tests/live_state_cache_parity_tests.rs",
+        "paraphina/tests/live_hyperliquid_core_orderbook_tests.rs"
+      ],
+      "notes": "Live cache + core L2/account ingestion validated; sim deterministic."
+    },
+    {
+      "id": "WP-STATUS-KF",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2697-L2697",
+      "evidence": [
+        "paraphina/src/engine.rs:L124-L252"
+      ],
+      "tests": [
+        "paraphina/tests/fair_value_gating_tests.rs:L71-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-VOL-SCALARS",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2917-L2917",
+      "evidence": [
+        "paraphina/src/engine.rs:L405-L458"
+      ],
+      "tests": [
+        "paraphina/tests/vol_floor_tests.rs:L47-L113"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-TOXICITY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L2997-L2997",
+      "evidence": [
+        "paraphina/src/toxicity.rs:L107-L170"
+      ],
+      "tests": [
+        "paraphina/tests/toxicity_markout_tests.rs:L44-L110"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-INVENTORY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3125-L3125",
+      "evidence": [
+        "paraphina/src/state.rs:L795-L845"
+      ],
+      "tests": [
+        "paraphina/tests/pnl_identity_tests.rs:L27-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-MM-MODEL",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3177-L3177",
+      "evidence": [
+        "paraphina/src/mm.rs:L450-L620"
+      ],
+      "tests": [
+        "paraphina/tests/mm_quote_model_tests.rs:L71-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-MM-SIZE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3489-L3489",
+      "evidence": [
+        "paraphina/src/mm.rs:L840-L890"
+      ],
+      "tests": [
+        "paraphina/tests/mm_quote_model_tests.rs:L71-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-ORDER-MGMT",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3681-L3681",
+      "evidence": [
+        "paraphina/src/order_management.rs:L27-L195",
+        "paraphina/src/io/sim.rs:L49-L132",
+        "paraphina/src/live/mock_exchange.rs:L489-L598"
+      ],
+      "tests": [
+        "paraphina/src/order_management.rs:L247-L345",
+        "paraphina/tests/order_semantics_tests.rs:L1-L120"
+      ],
+      "notes": "Execution semantics enforced in sim + mock live."
+    },
+    {
+      "id": "WP-STATUS-EXIT-ALLOCATOR",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L3765-L3765",
+      "evidence": [
+        "paraphina/src/exit.rs:L330-L720"
+      ],
+      "tests": [
+        "paraphina/tests/exit_engine_tests.rs:L13-L107"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-HEDGE-ALLOCATOR",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4129-L4129",
+      "evidence": [
+        "paraphina/src/hedge.rs:L480-L919"
+      ],
+      "tests": [
+        "paraphina/tests/hedge_allocator_tests.rs:L68-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-RISK-KILL",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4445-L4445",
+      "evidence": [
+        "paraphina/src/engine.rs:L465-L557"
+      ],
+      "tests": [
+        "paraphina/tests/risk_regim_tests.rs:L3-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-TELEMETRY",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L4783-L4783",
+      "evidence": [
+        "paraphina/src/telemetry.rs:L354-L456",
+        "schemas/telemetry_schema_v1.json"
+      ],
+      "tests": [
+        "paraphina/tests/telemetry_schema_tests.rs",
+        "paraphina/tests/telemetry_determinism_tests.rs",
+        "paraphina/tests/live_telemetry_contract_tests.rs",
+        "tests/test_telemetry_contract_gate.py"
+      ],
+      "notes": "Telemetry schema v1 fields emitted deterministically in sim + live."
+    },
+    {
+      "id": "WP-STATUS-MAIN-LOOP",
+      "status": "Implemented",
+      "applies_to": "sim",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5029-L5029",
+      "evidence": [
+        "paraphina/src/strategy_action.rs:L399-L600"
+      ],
+      "tests": [
+        "paraphina/tests/action_gateway_regression.rs:L29-L49"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-STRATEGY-CORE",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5295-L5295",
+      "evidence": [
+        "paraphina/src/strategy_action.rs:L399-L600",
+        "paraphina/src/bin/paraphina_live.rs:L357-L470"
+      ],
+      "tests": [
+        "paraphina/tests/action_gateway_regression.rs:L29-L87",
+        "paraphina/tests/live_gateway_tests.rs:L1-L220"
+      ],
+      "notes": "Live execution gated behind explicit operator enablement."
+    },
+    {
+      "id": "WP-STATUS-RL-0-2",
+      "status": "Implemented",
+      "applies_to": "sim",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5615-L5615",
+      "evidence": [
+        "paraphina/src/rl/sim_env.rs:L900-L1020"
+      ],
+      "tests": [
+        "paraphina/tests/rl_env_determinism_tests.rs:L1-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-OPTIMIZATION",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5805-L5805",
+      "evidence": [
+        "batch_runs/phase_a/promote_pipeline.py",
+        "batch_runs/phase_a/adversarial_search_promote.py",
+        "batch_runs/phase_ab/pipeline.py",
+        "batch_runs/phase_b/gate.py"
+      ],
+      "tests": [
+        "batch_runs/phase_ab/tests/test_phase_ab_end_to_end.py",
+        "batch_runs/phase_a/tests/test_adversarial_search.py"
+      ],
+      "notes": "End-to-end Phase A\u2192B optimization pipeline with deterministic smoke + gates."
+    },
+    {
+      "id": "WP-STATUS-PHASE-A-B",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5846-L5846",
+      "evidence": [
+        "batch_runs/phase_ab/pipeline.py",
+        "batch_runs/phase_ab/cli.py",
+        ".github/workflows/phase_ab_promotion_gate.yml"
+      ],
+      "tests": [
+        "batch_runs/phase_ab/tests/test_phase_ab_end_to_end.py",
+        "batch_runs/phase_ab/tests/test_phase_ab.py"
+      ],
+      "notes": "Phase A/B gating wired with evidence packs and strict gate mode."
+    },
+    {
+      "id": "WP-STATUS-CEM",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5864-L5864",
+      "evidence": [
+        "batch_runs/phase_a/adversarial_search_promote.py:L1-L120"
+      ],
+      "tests": [
+        "batch_runs/phase_a/tests/test_adversarial_search.py:L1-L120"
+      ],
+      "notes": ""
+    },
+    {
+      "id": "WP-STATUS-PHASE-B",
+      "status": "Implemented",
+      "applies_to": "both",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5888-L5888",
+      "evidence": [
+        "batch_runs/phase_b/gate.py:L1-L120"
+      ],
+      "tests": [
+        "tests/test_scenario_library_v2.py:L1-L120"
+      ],
+      "notes": "Missing tests: tests/test_scenario_library_v2.py:L1-L120"
+    },
+    {
+      "id": "WP-STATUS-POLICY-SURFACES",
+      "status": "Implemented",
+      "applies_to": "sim",
+      "whitepaper_lines": "docs/WHITEPAPER.md:L5921-L5921",
+      "evidence": [
+        "paraphina/src/rl/sim_env.rs:L320-L386",
+        "paraphina/src/rl/safety.rs:L1-L113",
+        "paraphina/src/rl/safe_pipeline.rs"
+      ],
+      "tests": [
+        "paraphina/tests/rl_safe_pipeline_tests.rs"
+      ],
+      "notes": "Safe RL pipeline enforced via safety layer + deterministic smoke run."
+    }
+  ],
+  "remaining_work": [],
+  "completion_definition": [
+    "No requirement is Partial or Missing.",
+    "No requirement is untested unless explicitly allowed.",
+    "Live and Sim applicability satisfied for each requirement.",
+    "All Step B audit commands pass."
+  ]
+}

@@ -25,6 +25,14 @@ pub struct Config {
     pub venues: Vec<VenueConfig>,
     /// Orderbook / fair-value observation config.
     pub book: BookConfig,
+    /// Fill aggregation window (ms) for batching fills (§4.3).
+    pub fill_agg_interval_ms: i64,
+    /// Main loop interval (ms) (§16).
+    pub main_loop_interval_ms: i64,
+    /// Hedge loop interval (ms) (§16).
+    pub hedge_loop_interval_ms: i64,
+    /// Risk loop interval (ms) (§16).
+    pub risk_loop_interval_ms: i64,
     /// Kalman filter config for log fair value.
     pub kalman: KalmanConfig,
     /// Volatility / control-scalar config.
@@ -844,6 +852,10 @@ impl Default for Config {
             initial_q_tao: 0.0,
             venues,
             book,
+            fill_agg_interval_ms: 1_000,
+            main_loop_interval_ms: 1_000,
+            hedge_loop_interval_ms: 1_000,
+            risk_loop_interval_ms: 1_000,
             kalman,
             volatility,
             risk,
@@ -931,6 +943,9 @@ impl Config {
     ///   - PARAPHINA_MM_SIZE_ETA       (f64)
     ///   - PARAPHINA_VOL_REF           (f64)
     ///   - PARAPHINA_DAILY_LOSS_LIMIT  (f64, USD; positive threshold)
+    ///   - PARAPHINA_MAIN_LOOP_INTERVAL_MS  (i64, ms)
+    ///   - PARAPHINA_HEDGE_LOOP_INTERVAL_MS (i64, ms)
+    ///   - PARAPHINA_RISK_LOOP_INTERVAL_MS  (i64, ms)
     ///
     /// Any variable that fails to parse is ignored with a warning.
     pub fn from_env_or_profile(profile: RiskProfile) -> Self {
@@ -1112,6 +1127,63 @@ impl Config {
                         "[config] WARN: could not parse PARAPHINA_DAILY_LOSS_LIMIT = {:?} as f64; using default {}",
                         raw,
                         cfg.risk.daily_loss_limit
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_MAIN_LOOP_INTERVAL_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    cfg.main_loop_interval_ms = v.max(1);
+                    eprintln!(
+                        "[config] PARAPHINA_MAIN_LOOP_INTERVAL_MS = {} (overrode default)",
+                        cfg.main_loop_interval_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_MAIN_LOOP_INTERVAL_MS = {:?} as i64; using default {}",
+                        raw,
+                        cfg.main_loop_interval_ms
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_HEDGE_LOOP_INTERVAL_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    cfg.hedge_loop_interval_ms = v.max(1);
+                    eprintln!(
+                        "[config] PARAPHINA_HEDGE_LOOP_INTERVAL_MS = {} (overrode default)",
+                        cfg.hedge_loop_interval_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_HEDGE_LOOP_INTERVAL_MS = {:?} as i64; using default {}",
+                        raw,
+                        cfg.hedge_loop_interval_ms
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_RISK_LOOP_INTERVAL_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    cfg.risk_loop_interval_ms = v.max(1);
+                    eprintln!(
+                        "[config] PARAPHINA_RISK_LOOP_INTERVAL_MS = {} (overrode default)",
+                        cfg.risk_loop_interval_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_RISK_LOOP_INTERVAL_MS = {:?} as i64; using default {}",
+                        raw,
+                        cfg.risk_loop_interval_ms
                     );
                 }
             }

@@ -33,6 +33,7 @@ rand_chacha = { workspace = true }
 
 # For checksum computation.
 sha2 = { workspace = true }
+toml = "0.8"
 
 # For ergonomic error handling.
 anyhow = "1"
@@ -40,7 +41,49 @@ anyhow = "1"
 # For parallel Monte Carlo execution.
 rayon = "1.10"
 
+# Tokio runtime (live trading skeleton, feature-gated).
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3", optional = true }
+prometheus = { version = "0.13", optional = true }
+tiny_http = { version = "0.12", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+rmp-serde = { version = "1.3", optional = true }
+k256 = { version = "0.13", features = ["ecdsa"], optional = true }
+sha3 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+hmac = { version = "0.12", optional = true }
+
 [dev-dependencies]
 # For creating temporary directories in tests.
 tempfile = "3"
+httpmock = "0.7"
 
+[features]
+roadmap_b = []
+# Feature-flagged event log writer (JSONL of normalized execution events).
+event_log = []
+legacy_runner = []
+live = ["tokio", "tokio-tungstenite", "futures-util", "prometheus", "tiny_http", "event_log"]
+live_hyperliquid = ["live", "reqwest", "rmp-serde", "k256", "sha3", "hex"]
+live_lighter = ["live", "reqwest"]
+live_paradex = ["live", "reqwest"]
+live_aster = ["live", "reqwest", "hex", "hmac"]
+live_extended = ["live", "reqwest", "hex", "hmac"]
+
+[[bin]]
+# Event log replay harness (feature-agnostic reader).
+name = "replay"
+path = "src/bin/replay.rs"
+
+[[bin]]
+# Legacy (pre-action-batch) simulation runner for A/B comparisons.
+name = "legacy_sim"
+path = "src/bin/legacy_sim.rs"
+required-features = ["legacy_runner"]
+
+[[bin]]
+# Live trading skeleton entrypoint (feature-gated).
+name = "paraphina_live"
+path = "src/bin/paraphina_live.rs"
+required-features = ["live"]

@@ -18,9 +18,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value as JsonValue};
 
+use super::action_encoding::{encode_action, ACTION_VERSION};
 use super::observation::{Observation, OBS_VERSION};
 use super::policy::PolicyAction;
+use super::research_budgets::{alignment_budget_for_profile, ResearchAlignmentBudget};
 use super::runner::TerminationReason;
+use super::safety::SafetyResult;
+use crate::config::RiskProfile;
 
 /// Reward components for per-tick logging and reward reconstruction.
 ///
@@ -83,7 +87,8 @@ impl RewardComponents {
     ///       - λ_tox * mean_v(toxicity_v)
     ///       - λ_inv * |q_global_tao|
     pub fn compute_reward(&self, weights: &RewardWeights) -> f64 {
-        let mut reward = self.delta_pnl;
+        let pnl_budget = weights.pnl_budget.max(1.0);
+        let mut reward = self.delta_pnl / pnl_budget;
         reward -= weights.lambda_delta * self.delta_ratio;
         reward -= weights.lambda_basis * self.basis_ratio;
         reward -= weights.lambda_drawdown * (self.drawdown_abs / weights.drawdown_budget.max(1.0));
@@ -109,6 +114,8 @@ pub struct RewardWeights {
     pub lambda_drawdown: f64,
     /// Drawdown budget for normalization.
     pub drawdown_budget: f64,
+    /// Mean PnL budget for normalization.
+    pub pnl_budget: f64,
     /// Weight on mean toxicity.
     pub lambda_toxicity: f64,
     /// Weight on inventory magnitude.
@@ -119,14 +126,28 @@ pub struct RewardWeights {
 
 impl Default for RewardWeights {
     fn default() -> Self {
+        Self::from_alignment_budget(RiskProfile::Balanced)
+    }
+}
+
+impl RewardWeights {
+    pub fn from_alignment_budget(profile: RiskProfile) -> Self {
+        let budget = alignment_budget_for_profile(profile);
+        Self::from_budget(profile, &budget)
+    }
+
+    pub fn from_budget(_profile: RiskProfile, budget: &ResearchAlignmentBudget) -> Self {
+        let pnl_budget = budget.min_final_pnl_mean.abs().max(1.0);
+        let kill_penalty = -1.0 / budget.max_kill_prob.max(1e-6);
         Self {
             lambda_delta: 1.0,
             lambda_basis: 0.5,
             lambda_drawdown: 2.0,
-            drawdown_budget: 5000.0,
+            drawdown_budget: budget.max_drawdown_abs,
+            pnl_budget,
             lambda_toxicity: 0.1,
             lambda_inventory: 0.01,
-            kill_penalty: -1000.0,
+            kill_penalty,
         }
     }
 }
@@ -137,6 +158,8 @@ pub struct TickRecord {
     // ----- Metadata -----
     /// Observation schema version.
     pub obs_version: u32,
+    /// Action encoding schema version.
+    pub action_version: u32,
     /// Policy version string.
     pub policy_version: String,
     /// Config version string.
@@ -169,6 +192,12 @@ pub struct TickRecord {
     // ----- Policy action (post-clamp) -----
     /// Policy action applied this tick.
     pub action: Option<PolicyAction>,
+    /// Raw policy action vector (pre-clamp).
+    pub action_raw: Option<Vec<f64>>,
+    /// Applied policy action vector (post-clamp).
+    pub action_applied: Option<Vec<f64>>,
+    /// Safety rejections / clamp reasons (if any).
+    pub action_rejection_reasons: Option<Vec<String>>,
     /// Whether action was from shadow policy.
     pub is_shadow: bool,
 
@@ -188,6 +217,7 @@ impl TickRecord {
     ) -> Self {
         Self {
             obs_version: OBS_VERSION,
+            action_version: ACTION_VERSION,
             policy_version: action.map(|a| a.policy_version.clone()).unwrap_or_default(),
             config_version: config_version.to_string(),
             episode_id,
@@ -202,10 +232,32 @@ impl TickRecord {
             risk_regime: format!("{:?}", obs.risk_regime),
             kill_switch: obs.kill_switch,
             action: action.cloned(),
+            action_raw: None,
+            action_applied: None,
+            action_rejection_reasons: None,
             is_shadow: false,
             reward_components: None,
             reward: None,
         }
+    }
+
+    pub fn with_safety(mut self, safety: Option<&SafetyResult>, num_venues: usize) -> Self {
+        if let Some(result) = safety {
+            let raw = encode_action(&result.raw, num_venues)
+                .into_iter()
+                .map(|v| v as f64)
+                .collect::<Vec<_>>();
+            let applied = encode_action(&result.applied, num_venues)
+                .into_iter()
+                .map(|v| v as f64)
+                .collect::<Vec<_>>();
+            self.action_raw = Some(raw);
+            self.action_applied = Some(applied);
+            if !result.rejection_reasons.is_empty() {
+                self.action_rejection_reasons = Some(result.rejection_reasons.clone());
+            }
+        }
+        self
     }
 
     pub fn with_reward(mut self, components: RewardComponents, weights: &RewardWeights) -> Self {
@@ -415,6 +467,7 @@ impl RLTelemetry {
         &mut self,
         obs: &Observation,
         action: Option<&PolicyAction>,
+        safety: Option<&SafetyResult>,
         config_version: &str,
     ) {
         // Update peak PnL
@@ -426,6 +479,7 @@ impl RLTelemetry {
         let components = RewardComponents::from_observation(obs, self.prev_pnl, self.peak_pnl);
 
         let record = TickRecord::new(obs, action, config_version, self.episode_id)
+            .with_safety(safety, obs.venues.len())
             .with_reward(components, &self.reward_weights);
 
         // Update prev_pnl for next tick
@@ -440,10 +494,12 @@ impl RLTelemetry {
         &mut self,
         obs: &Observation,
         action: &PolicyAction,
+        safety: Option<&SafetyResult>,
         config_version: &str,
     ) {
-        let record =
-            TickRecord::new(obs, Some(action), config_version, self.episode_id).with_shadow(true);
+        let record = TickRecord::new(obs, Some(action), config_version, self.episode_id)
+            .with_safety(safety, obs.venues.len())
+            .with_shadow(true);
 
         let value = serde_json::to_value(&record).unwrap_or_default();
         self.write_json(&value);

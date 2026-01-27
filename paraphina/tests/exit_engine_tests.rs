@@ -1,7 +1,36 @@
 use paraphina::config::Config;
 use paraphina::exit;
 use paraphina::state::GlobalState;
+use paraphina::types::OrderIntent;
 use paraphina::types::{Side, VenueStatus};
+
+/// Extractors for OrderIntent enum used in exit-engine tests.
+/// Exit intents are expected to be Place/Replace; panic on other variants so the test
+/// surface stays strict and deterministic.
+fn intent_venue_index(intent: &OrderIntent) -> usize {
+    match intent {
+        OrderIntent::Place(pi) => pi.venue_index,
+        OrderIntent::Replace(ri) => ri.venue_index,
+        OrderIntent::Cancel(ci) => ci.venue_index,
+        OrderIntent::CancelAll(ci) => ci.venue_index.expect("CancelAll missing venue_index"),
+    }
+}
+
+fn intent_size(intent: &OrderIntent) -> f64 {
+    match intent {
+        OrderIntent::Place(pi) => pi.size,
+        OrderIntent::Replace(ri) => ri.size,
+        other => panic!("Expected Place/Replace for size, got: {:?}", other),
+    }
+}
+
+fn intent_side(intent: &OrderIntent) -> Side {
+    match intent {
+        OrderIntent::Place(pi) => pi.side,
+        OrderIntent::Replace(ri) => ri.side,
+        other => panic!("Expected Place/Replace for side, got: {:?}", other),
+    }
+}
 
 #[test]
 fn exit_noops_without_fair_value() {
@@ -61,7 +90,8 @@ fn exit_respects_lot_size_and_min_notional() {
     // and min notional constraints (3 * 104.75 = ~314 < 1000)
     for it in &intents {
         assert_ne!(
-            it.venue_index, 1,
+            intent_venue_index(it),
+            1,
             "Should not use venue 1 due to lot size/min notional constraints"
         );
     }
@@ -69,7 +99,7 @@ fn exit_respects_lot_size_and_min_notional() {
     // Should use venue 2 which has appropriate lot sizes
     if !intents.is_empty() {
         assert!(
-            intents.iter().any(|i| i.venue_index == 2),
+            intents.iter().any(|i| intent_venue_index(i) == 2),
             "Should be able to exit on venue 2 with normal lot sizes"
         );
     }
@@ -122,7 +152,8 @@ fn exit_respects_min_notional() {
     // Should skip venue 1 due to min notional (2 * ~104.75 = ~210 < 500)
     for it in &intents {
         assert_ne!(
-            it.venue_index, 1,
+            intent_venue_index(it),
+            1,
             "Should not use venue 1 due to min notional constraint"
         );
     }
@@ -191,10 +222,10 @@ fn exit_splits_across_best_venues_when_capped_per_venue() {
 
     // Should sell (net long -> need Sell)
     for it in &intents {
-        assert_eq!(it.side, Side::Sell);
+        assert_eq!(intent_side(it), Side::Sell);
     }
 
-    let total: f64 = intents.iter().map(|i| i.size).sum();
+    let total: f64 = intents.iter().map(intent_size).sum();
     assert!(
         (total - 10.0).abs() < 1e-6 || total <= 10.0,
         "total exit should be <= max_total_tao_per_tick"
@@ -202,7 +233,7 @@ fn exit_splits_across_best_venues_when_capped_per_venue() {
 
     // With per-venue cap 6, it should split roughly 6 + 4
     assert!(intents.len() >= 2, "should allocate across multiple venues");
-    assert!(intents.iter().any(|i| (i.size - 6.0).abs() < 1e-6));
+    assert!(intents.iter().any(|i| (intent_size(i) - 6.0).abs() < 1e-6));
 }
 
 #[test]
@@ -248,9 +279,9 @@ fn exit_skips_disabled_or_toxic_or_stale() {
     // Could still be empty depending on which venues are eligible;
     // the important thing is it did not use 1/2/3.
     for it in intents {
-        assert!(it.venue_index != 1);
-        assert!(it.venue_index != 2);
-        assert!(it.venue_index != 3);
+        assert!(intent_venue_index(&it) != 1);
+        assert!(intent_venue_index(&it) != 2);
+        assert!(intent_venue_index(&it) != 3);
     }
 }
 
@@ -317,18 +348,19 @@ fn exit_prefers_less_fragmentation_when_edges_similar() {
     if intents.len() >= 2 {
         // With identical edges, venue 1 (smaller position, can be fully closed) should be preferred
         // because closing a position entirely provides the fragmentation_reduction_bonus.
-        let first_venue = intents[0].venue_index;
+        let first_venue = intent_venue_index(&intents[0]);
         let _first_closes_position =
-            intents[0].size >= state.venues[first_venue].position_tao.abs() - 0.01;
+            intent_size(&intents[0]) >= state.venues[first_venue].position_tao.abs() - 0.01;
 
         // At least verify deterministic ordering - same inputs should produce same outputs
         let intents2 = exit::compute_exit_intents(&cfg, &state, 0);
         assert_eq!(
-            intents[0].venue_index, intents2[0].venue_index,
+            intent_venue_index(&intents[0]),
+            intent_venue_index(&intents2[0]),
             "Exit ordering must be deterministic"
         );
         assert!(
-            (intents[0].size - intents2[0].size).abs() < 0.001,
+            (intent_size(&intents[0]) - intent_size(&intents2[0])).abs() < 0.001,
             "Exit sizes must be deterministic"
         );
     }
@@ -396,11 +428,12 @@ fn exit_prefers_less_basis_risk_when_edges_similar() {
     );
     for (a, b) in intents2.iter().zip(intents2_copy.iter()) {
         assert_eq!(
-            a.venue_index, b.venue_index,
+            intent_venue_index(a),
+            intent_venue_index(b),
             "Venue ordering must be deterministic"
         );
         assert!(
-            (a.size - b.size).abs() < 0.001,
+            (intent_size(a) - intent_size(b)).abs() < 0.001,
             "Size must be deterministic"
         );
     }
@@ -460,15 +493,17 @@ fn exit_deterministic_ordering_with_identical_edges() {
 
     for i in 0..intents1.len() {
         assert_eq!(
-            intents1[i].venue_index, intents2[i].venue_index,
+            intent_venue_index(&intents1[i]),
+            intent_venue_index(&intents2[i]),
             "Venue order must be deterministic at position {i}"
         );
         assert_eq!(
-            intents1[i].venue_index, intents3[i].venue_index,
+            intent_venue_index(&intents1[i]),
+            intent_venue_index(&intents3[i]),
             "Venue order must be deterministic at position {i}"
         );
         assert!(
-            (intents1[i].size - intents2[i].size).abs() < 0.001,
+            (intent_size(&intents1[i]) - intent_size(&intents2[i])).abs() < 0.001,
             "Size must be deterministic at position {i}"
         );
     }
@@ -476,7 +511,7 @@ fn exit_deterministic_ordering_with_identical_edges() {
     // With identical edges and all adjustments zeroed, should prefer lower venue index
     if intents1.len() >= 2 {
         assert!(
-            intents1[0].venue_index <= intents1[1].venue_index,
+            intent_venue_index(&intents1[0]) <= intent_venue_index(&intents1[1]),
             "With identical edges, lower venue index should come first"
         );
     }

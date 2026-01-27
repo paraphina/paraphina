@@ -424,6 +424,9 @@ mod tests {
             },
             market_model: super::super::scenario::MarketModel::default(),
             microstructure_model: super::super::scenario::MicrostructureModel::default(),
+            latency_spike: None,
+            partial_fill: super::super::scenario::PartialFillModel::default(),
+            cancel_storm: None,
             invariants: super::super::scenario::Invariants::default(),
         }
     }

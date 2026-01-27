@@ -1,0 +1,6 @@
+{
+  "type": "cancel_ack",
+  "seq": 6,
+  "ts": 1700000000400,
+  "order_id": "order_1"
+}

@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  paraphina_live:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        FEATURES: "live,live_hyperliquid"
+    image: paraphina-live:roadmap-b
+    env_file:
+      - ./env/roadmap_b_shadow.env.example
+    ports:
+      - "9898:9898"
+    volumes:
+      - /var/lib/paraphina/out:/var/lib/paraphina/out
+    restart: unless-stopped

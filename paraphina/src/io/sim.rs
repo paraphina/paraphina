@@ -14,7 +14,7 @@ use crate::actions::{CancelAllAction, CancelOrderAction, PlaceOrderAction};
 use crate::config::Config;
 use crate::io::{ActionResult, VenueAdapter};
 use crate::state::GlobalState;
-use crate::types::{FillEvent, OrderPurpose};
+use crate::types::{FillEvent, OrderPurpose, Side, TimeInForce};
 
 /// Simulation adapter that fills orders immediately at limit price.
 ///
@@ -70,6 +70,30 @@ impl VenueAdapter for SimAdapter {
             }
         };
 
+        let (best_bid, best_ask) = state
+            .venues
+            .get(action.venue_index)
+            .map(|venue| {
+                (
+                    venue.orderbook_l2.best_bid().map(|l| l.price),
+                    venue.orderbook_l2.best_ask().map(|l| l.price),
+                )
+            })
+            .unwrap_or((None, None));
+        let crosses = crosses_book(action.side, action.price, best_bid, best_ask);
+
+        if action.post_only && crosses {
+            return ActionResult::Rejected {
+                reason: "post_only_cross".to_string(),
+            };
+        }
+
+        if action.time_in_force == TimeInForce::Ioc && !crosses {
+            return ActionResult::Rejected {
+                reason: "ioc_no_fill".to_string(),
+            };
+        }
+
         // Determine fee based on order purpose
         // MM orders get maker fee minus rebate
         // Exit/Hedge orders get taker fee
@@ -100,13 +124,13 @@ impl VenueAdapter for SimAdapter {
             );
         }
 
-        // Apply fill to state
-        state.apply_perp_fill(action.venue_index, action.side, size_tao, price, fee_bps);
-
-        // Return fill event
+        // Return fill event (state application is handled by the caller's fill batcher)
         ActionResult::Filled(FillEvent {
             venue_index: action.venue_index,
             venue_id: action.venue_id.as_str().into(),
+            order_id: Some(action.client_order_id.clone()),
+            client_order_id: Some(action.client_order_id.clone()),
+            seq: None,
             side: action.side,
             price,
             size: size_tao,
@@ -148,6 +172,13 @@ impl VenueAdapter for SimAdapter {
 
     fn name(&self) -> &str {
         "SimAdapter"
+    }
+}
+
+fn crosses_book(side: Side, price: f64, best_bid: Option<f64>, best_ask: Option<f64>) -> bool {
+    match side {
+        Side::Buy => best_ask.is_some_and(|ask| price >= ask),
+        Side::Sell => best_bid.is_some_and(|bid| price <= bid),
     }
 }
 
@@ -193,6 +224,9 @@ mod tests {
             price: 100.0,
             size: 1.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_001".to_string(),
         };
 
@@ -206,6 +240,9 @@ mod tests {
                 assert_eq!(fill.size, 1.0);
                 // Maker fee - rebate = 2.0 - 0.0 = 2.0 for extended
                 assert_eq!(fill.fee_bps, 2.0);
+
+                // Apply fill (sim adapter does not mutate state)
+                state.apply_fill_event(&fill, 0, &cfg);
             }
             _ => panic!("Expected Filled result"),
         }
@@ -218,15 +255,32 @@ mod tests {
     fn test_sim_adapter_taker_fee() {
         let (cfg, mut state) = setup_test();
         let mut adapter = SimAdapter::new(0);
+        state.venues[0]
+            .orderbook_l2
+            .apply_snapshot(
+                &[crate::orderbook_l2::BookLevel {
+                    price: 99.0,
+                    size: 1.0,
+                }],
+                &[crate::orderbook_l2::BookLevel {
+                    price: 101.0,
+                    size: 1.0,
+                }],
+                1,
+            )
+            .expect("seed book");
 
         let action = PlaceOrderAction {
             action_id: "test_002".to_string(),
             venue_index: 0,
             venue_id: "extended".to_string(),
             side: Side::Sell,
-            price: 100.0,
+            price: 99.0,
             size: 1.0,
             purpose: OrderPurpose::Hedge,
+            time_in_force: crate::types::TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
             client_order_id: "co_test_002".to_string(),
         };
 
@@ -254,6 +308,9 @@ mod tests {
             price: 100.0,
             size: 1.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_003".to_string(),
         };
 
@@ -280,6 +337,9 @@ mod tests {
             price: 100.0,
             size: 0.0,
             purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: false,
+            reduce_only: false,
             client_order_id: "co_test_004".to_string(),
         };
 

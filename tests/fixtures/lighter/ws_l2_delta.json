@@ -1,0 +1,9 @@
+{
+  "type": "l2_delta",
+  "seq": 11,
+  "ts": 1700000000100,
+  "changes": [
+    { "side": "bid", "price": 100.0, "size": 1.2 },
+    { "side": "ask", "price": 100.5, "size": 0.0 }
+  ]
+}

@@ -12,6 +12,7 @@
 //  - updates risk limits + risk regime + latching kill switch.
 
 use crate::config::Config;
+use crate::orderbook_l2::BookLevel;
 use crate::state::{GlobalState, KillReason, RiskRegime};
 use crate::toxicity::update_toxicity_and_health;
 use crate::types::VenueStatus;
@@ -58,8 +59,6 @@ impl<'a> Engine<'a> {
         // repeated config access and (1.0 - alpha) computation.
         let alpha_short = self.cfg.volatility.fv_vol_alpha_short;
         let alpha_long = self.cfg.volatility.fv_vol_alpha_long;
-        let one_minus_alpha_short = 1.0 - alpha_short;
-        let one_minus_alpha_long = 1.0 - alpha_long;
 
         // Explicit indexed loop for deterministic venue ordering.
         //
@@ -79,37 +78,36 @@ impl<'a> Engine<'a> {
 
             let mid = base + offset;
             let spread = 0.4 + idx_f * 0.02;
-            let depth = 10_000.0;
+            let max_levels = self.cfg.book.depth_levels.max(1);
+            let tick = self.cfg.venues[idx].tick_size.max(1e-6);
+            let base_size = self.cfg.venues[idx].base_order_size.max(1e-6);
+            let best_bid = mid - spread / 2.0;
+            let best_ask = mid + spread / 2.0;
 
-            // Update order-book snapshot.
-            v.mid = Some(mid);
-            v.spread = Some(spread);
-            v.last_mid_update_ms = Some(now_ms);
-            v.depth_near_mid = depth;
-
-            // --- Opt15: Compute ln(mid) once per tick ---
-            // Cache ln(mid) to avoid repeated log() calls. Use max(1e-6) for safety.
-            let ln_mid = mid.max(1e-6).ln();
-
-            // --- Local per-venue volatility (short / long EWMA of log returns) ---
-            // Compute log return as ln_mid - prev_ln_mid (avoids expensive division+ln).
-            // On first tick (prev_ln_mid is None), return is 0.0 (no vol update contribution).
-            if let Some(prev_ln_mid) = v.prev_ln_mid {
-                let r = ln_mid - prev_ln_mid;
-                let r2 = r * r;
-
-                let var_short_prev = v.local_vol_short * v.local_vol_short;
-                let var_long_prev = v.local_vol_long * v.local_vol_long;
-
-                let var_short_new = one_minus_alpha_short * var_short_prev + alpha_short * r2;
-                let var_long_new = one_minus_alpha_long * var_long_prev + alpha_long * r2;
-
-                v.local_vol_short = var_short_new.max(0.0).sqrt();
-                v.local_vol_long = var_long_new.max(0.0).sqrt();
+            let mut bids = Vec::with_capacity(max_levels);
+            let mut asks = Vec::with_capacity(max_levels);
+            for level in 0..max_levels {
+                let level_f = level as f64;
+                bids.push(BookLevel {
+                    price: best_bid - level_f * tick,
+                    size: base_size * (1.0 + level_f * 0.1),
+                });
+                asks.push(BookLevel {
+                    price: best_ask + level_f * tick,
+                    size: base_size * (1.0 + level_f * 0.1),
+                });
             }
 
-            // Store current ln(mid) for next tick's log-return computation.
-            v.prev_ln_mid = Some(ln_mid);
+            let next_seq = v.orderbook_l2.last_seq().saturating_add(1);
+            let _ = v.apply_l2_snapshot(
+                &bids,
+                &asks,
+                next_seq,
+                now_ms,
+                max_levels,
+                alpha_short,
+                alpha_long,
+            );
         }
     }
 
@@ -122,6 +120,14 @@ impl<'a> Engine<'a> {
     ///   8) inventory/basis
     ///  14) risk limits + risk regime / kill switch
     pub fn main_tick(&self, state: &mut GlobalState, now_ms: i64) {
+        self.main_tick_without_risk(state, now_ms);
+        self.update_risk_limits_and_regime(state);
+    }
+
+    /// Main per-tick engine step without risk update.
+    ///
+    /// Used by the loop scheduler to run risk on a separate cadence (§16).
+    pub fn main_tick_without_risk(&self, state: &mut GlobalState, now_ms: i64) {
         // 1) Fair value + volatility + control scalars
         self.update_fair_value_and_vol(state, now_ms);
 
@@ -130,9 +136,6 @@ impl<'a> Engine<'a> {
 
         // 3) Toxicity + venue health (now processes pending markouts)
         update_toxicity_and_health(state, self.cfg, now_ms);
-
-        // 4) Risk limits + regime / kill switch (latched)
-        self.update_risk_limits_and_regime(state);
     }
 
     // ---------------------------------------------------------------------
@@ -197,13 +200,11 @@ impl<'a> Engine<'a> {
         let obs_len = state.scratch_kf_obs.len();
         let fv_available = obs_len >= min_healthy;
 
-        // Track which venues were used for telemetry.
+        // Track which venues are healthy enough for KF (telemetry only).
         // Reuse healthy_venues_used Vec in state (clear and repopulate).
         state.healthy_venues_used.clear();
-        if fv_available {
-            for (idx, _, _) in &state.scratch_kf_obs {
-                state.healthy_venues_used.push(*idx);
-            }
+        for (idx, _, _) in &state.scratch_kf_obs {
+            state.healthy_venues_used.push(*idx);
         }
 
         if fv_available {

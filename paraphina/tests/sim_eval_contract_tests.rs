@@ -146,6 +146,9 @@ fn test_run_summary_required_fields() {
         },
         market_model: paraphina::sim_eval::MarketModel::default(),
         microstructure_model: paraphina::sim_eval::MicrostructureModel::default(),
+        latency_spike: None,
+        partial_fill: paraphina::sim_eval::PartialFillModel::default(),
+        cancel_storm: None,
         invariants: paraphina::sim_eval::Invariants::default(),
     };
 
@@ -199,6 +202,9 @@ fn test_run_summary_with_kill_switch() {
         initial_state: paraphina::sim_eval::InitialState::default(),
         market_model: paraphina::sim_eval::MarketModel::default(),
         microstructure_model: paraphina::sim_eval::MicrostructureModel::default(),
+        latency_spike: None,
+        partial_fill: paraphina::sim_eval::PartialFillModel::default(),
+        cancel_storm: None,
         invariants: paraphina::sim_eval::Invariants::default(),
     };
 
@@ -272,6 +278,9 @@ fn run_simulation_for_checksum(seed: u64, steps: u64) -> String {
         initial_state: paraphina::sim_eval::InitialState::default(),
         market_model: paraphina::sim_eval::MarketModel::default(),
         microstructure_model: paraphina::sim_eval::MicrostructureModel::default(),
+        latency_spike: None,
+        partial_fill: paraphina::sim_eval::PartialFillModel::default(),
+        cancel_storm: None,
         invariants: paraphina::sim_eval::Invariants::default(),
     };
 
@@ -355,6 +364,9 @@ fn test_seed_expansion() {
         initial_state: paraphina::sim_eval::InitialState::default(),
         market_model: paraphina::sim_eval::MarketModel::default(),
         microstructure_model: paraphina::sim_eval::MicrostructureModel::default(),
+        latency_spike: None,
+        partial_fill: paraphina::sim_eval::PartialFillModel::default(),
+        cancel_storm: None,
         invariants: paraphina::sim_eval::Invariants::default(),
     };
 
@@ -971,6 +983,9 @@ fn test_schema_completeness_all_fields_present() {
         },
         market_model: paraphina::sim_eval::MarketModel::default(),
         microstructure_model: paraphina::sim_eval::MicrostructureModel::default(),
+        latency_spike: None,
+        partial_fill: paraphina::sim_eval::PartialFillModel::default(),
+        cancel_storm: None,
         invariants: paraphina::sim_eval::Invariants::default(),
     };
 

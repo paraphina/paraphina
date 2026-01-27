@@ -1,0 +1,14 @@
+{
+  "channel": "userEvents",
+  "seq": 302,
+  "data": {
+    "event": "cancel",
+    "status": "canceled",
+    "coin": "TAO",
+    "order": {
+      "oid": "oid_123",
+      "cloid": "co_123",
+      "timestamp": 1700000000300
+    }
+  }
+}

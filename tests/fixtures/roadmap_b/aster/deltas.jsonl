@@ -1,0 +1,3 @@
+{"seq":2,"timestamp_ms":1100,"side":"ask","price":201.0,"size":1.2}
+{"seq":4,"timestamp_ms":1200,"side":"bid","price":200.0,"size":0.8}
+{"seq":5,"timestamp_ms":1300,"side":"ask","price":200.5,"size":0.9}

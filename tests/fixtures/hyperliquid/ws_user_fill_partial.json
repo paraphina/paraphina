@@ -1,0 +1,20 @@
+{
+  "channel": "userFills",
+  "seq": 303,
+  "data": {
+    "coin": "TAO",
+    "fills": [
+      {
+        "oid": "oid_123",
+        "cloid": "co_123",
+        "tid": "fill_1",
+        "side": "B",
+        "px": "100.30",
+        "sz": "0.5",
+        "timestamp": 1700000000400,
+        "feeBps": "1.0",
+        "purpose": "Mm"
+      }
+    ]
+  }
+}
