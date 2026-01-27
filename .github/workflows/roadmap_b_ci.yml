@@ -15,34 +15,91 @@ jobs:
   pr-gate:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-C debuginfo=0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Disk usage (pre)
+        run: |
+          df -h
+          du -sh target || true
+
       - name: Cargo test (all)
-        run: cargo test --all
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR=target/ci/all
+          cargo test --all
+          rm -rf "$CARGO_TARGET_DIR"
+
       - name: Cargo test (live hyperliquid)
-        run: cargo test -p paraphina --features live,live_hyperliquid
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR=target/ci/live_hyperliquid
+          cargo test -p paraphina --features live,live_hyperliquid
+          rm -rf "$CARGO_TARGET_DIR"
+
       - name: Cargo test (live lighter)
-        run: cargo test -p paraphina --features live,live_lighter
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR=target/ci/live_lighter
+          cargo test -p paraphina --features live,live_lighter
+          rm -rf "$CARGO_TARGET_DIR"
+
       - name: Cargo test (live paradex)
-        run: cargo test -p paraphina --features live,live_paradex
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR=target/ci/live_paradex
+          cargo test -p paraphina --features live,live_paradex
+          rm -rf "$CARGO_TARGET_DIR"
+
       - name: Cargo test (live aster)
-        run: cargo test -p paraphina --features live,live_aster
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR=target/ci/live_aster
+          cargo test -p paraphina --features live,live_aster
+          rm -rf "$CARGO_TARGET_DIR"
+
       - name: Cargo test (live extended)
-        run: cargo test -p paraphina --features live,live_extended
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR=target/ci/live_extended
+          cargo test -p paraphina --features live,live_extended
+          rm -rf "$CARGO_TARGET_DIR"
+
       - name: Cargo test (live all five)
-        run: cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_aster,live_extended,live_paradex
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR=target/ci/live_all_five
+          cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_aster,live_extended,live_paradex
+          rm -rf "$CARGO_TARGET_DIR"
+
       - name: Fixture-driven multi-connector smoke
-        run: cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_paradex,live_aster,live_extended live_five_connector_fixture_tests
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR=target/ci/live_five_fixture
+          cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_paradex,live_aster,live_extended live_five_connector_fixture_tests
+          rm -rf "$CARGO_TARGET_DIR"
+
       - name: Python tests
         run: python3 -m pytest -q
+
       - name: Connector matrix
         run: python3 tools/print_live_connector_matrix.py
+
       - name: Readiness report
         run: python3 tools/generate_roadmap_b_readiness_report.py
+
+      - name: Disk usage (post)
+        if: always()
+        run: |
+          df -h
+          du -sh target || true
 
   nightly-matrix:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
