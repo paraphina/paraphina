@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","method":"subscription","params":{"channel":"orderbook","market":"BTC-USD-PERP","type":"snapshot","seq":100,"ts":1700000000500,"bids":[["30000","1.2"],["29950","0.8"]],"asks":[["30010","1.1"],["30020","0.7"]]}}
+{"jsonrpc":"2.0","method":"subscription","params":{"channel":"orderbook","market":"BTC-USD-PERP","type":"delta","seq":101,"prev_seq":100,"ts":1700000000600,"bids":[["30000","1.0"]],"asks":[["30010","0"]]}}
