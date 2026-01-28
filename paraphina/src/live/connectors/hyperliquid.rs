@@ -10,6 +10,7 @@ pub const SUPPORTS_EXECUTION: bool = true;
 const HL_STALE_MS: u64 = 1800;
 const HL_WATCHDOG_TICK_MS: u64 = 200;
 const HL_SNAPSHOT_COOLDOWN_MS: u64 = 8_000;
+const HL_INTERNAL_PUB_Q: usize = 256;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
@@ -223,6 +224,19 @@ impl HyperliquidConnector {
                 }
             }
         });
+        let (tx_int, mut rx_int) =
+            tokio::sync::mpsc::channel::<MarketDataEvent>(HL_INTERNAL_PUB_Q);
+        let forward_market_tx = self.market_tx.clone();
+        let forward_freshness = self.freshness.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx_int.recv().await {
+                if forward_market_tx.send(event).await.is_ok() {
+                    forward_freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
+                }
+            }
+        });
         let mut tracker = L2SeqTracker::new();
         let mut l2_seq_fallback: u64 = 0;
         let mut first_book_update_logged = false;
@@ -309,13 +323,7 @@ impl HyperliquidConnector {
                             freshness
                                 .last_parsed_ns
                                 .store(mono_now_ns(), Ordering::Relaxed);
-                            if let Err(err) = self.market_tx.send(snapshot).await {
-                                eprintln!("Hyperliquid public WS market send failed: {err}");
-                            } else {
-                                freshness
-                                    .last_published_ns
-                                    .store(mono_now_ns(), Ordering::Relaxed);
-                            }
+                            let _ = tx_int.try_send(snapshot);
                         }
                         continue;
                     }
@@ -332,11 +340,7 @@ impl HyperliquidConnector {
                                 eprintln!("INFO: Hyperliquid public WS first book update");
                                 first_book_update_logged = true;
                             }
-                            if self.market_tx.send(event).await.is_ok() {
-                                freshness
-                                    .last_published_ns
-                                    .store(mono_now_ns(), Ordering::Relaxed);
-                            }
+                            let _ = tx_int.try_send(event);
                         }
                     }
                 }
