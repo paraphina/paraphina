@@ -11,6 +11,7 @@ const HL_STALE_MS: u64 = 1800;
 const HL_WATCHDOG_TICK_MS: u64 = 200;
 const HL_SNAPSHOT_COOLDOWN_MS: u64 = 8_000;
 const HL_INTERNAL_PUB_Q: usize = 256;
+const HL_DELTA_BOOTSTRAP_BUF: usize = 1024;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
@@ -33,6 +34,7 @@ struct Freshness {
     last_snapshot_resync_ns: AtomicU64,
 }
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -246,6 +248,22 @@ impl HyperliquidConnector {
                 }
             }
         });
+        let mut try_publish = |event: MarketDataEvent| -> anyhow::Result<()> {
+            match tx_int.try_send(event) {
+                Ok(()) => Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                    if let Ok(mut guard) = pending_latest.try_lock() {
+                        *guard = Some(event);
+                    }
+                    Ok(())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Err(anyhow::anyhow!(
+                        "Hyperliquid public WS internal publish queue closed"
+                    ))
+                }
+            }
+        };
         let mut tracker = L2SeqTracker::new();
         let mut l2_seq_fallback: u64 = 0;
         let mut first_book_update_logged = false;
@@ -253,6 +271,8 @@ impl HyperliquidConnector {
         let mut logged_non_utf8_binary = false;
         let mut first_decoded_top_logged = false;
         let mut decode_miss_count = 0usize;
+        let mut have_baseline = false;
+        let mut delta_buf: VecDeque<MarketDataEvent> = VecDeque::new();
         loop {
             tokio::select! {
                 biased;
@@ -332,19 +352,11 @@ impl HyperliquidConnector {
                             freshness
                                 .last_parsed_ns
                                 .store(mono_now_ns(), Ordering::Relaxed);
-                            match tx_int.try_send(snapshot) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                                    if let Ok(mut guard) = pending_latest.try_lock() {
-                                        *guard = Some(event);
-                                    }
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    anyhow::bail!(
-                                        "Hyperliquid public WS internal publish queue closed"
-                                    );
-                                }
+                            have_baseline = true;
+                            while let Some(buffered) = delta_buf.pop_front() {
+                                try_publish(buffered)?;
                             }
+                            try_publish(snapshot)?;
                         }
                         continue;
                     }
@@ -354,26 +366,48 @@ impl HyperliquidConnector {
                             .store(mono_now_ns(), Ordering::Relaxed);
                         let outcome = tracker.on_message(parsed);
                         if let Some(seq) = outcome.refresh_snapshot {
-                            self.refresh_snapshot(seq).await;
+                        if let Some(snapshot) = self.refresh_snapshot(seq).await {
+                            if matches!(&snapshot, MarketDataEvent::L2Snapshot(_)) {
+                                have_baseline = true;
+                                while let Some(buffered) = delta_buf.pop_front() {
+                                    try_publish(buffered)?;
+                                }
+                            }
+                            try_publish(snapshot)?;
+                        }
                         }
                         if let Some(event) = outcome.event {
                             if !first_book_update_logged {
                                 eprintln!("INFO: Hyperliquid public WS first book update");
                                 first_book_update_logged = true;
                             }
-                            match tx_int.try_send(event) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                                    if let Ok(mut guard) = pending_latest.try_lock() {
-                                        *guard = Some(event);
+                        match event {
+                            MarketDataEvent::L2Delta(_) if !have_baseline => {
+                                delta_buf.push_back(event);
+                                if delta_buf.len() > HL_DELTA_BOOTSTRAP_BUF {
+                                    delta_buf.clear();
+                                    if let Some(snapshot) = self.refresh_snapshot(0).await {
+                                    if matches!(&snapshot, MarketDataEvent::L2Snapshot(_)) {
+                                            have_baseline = true;
+                                            while let Some(buffered) = delta_buf.pop_front() {
+                                                try_publish(buffered)?;
+                                            }
+                                        }
+                                        try_publish(snapshot)?;
                                     }
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    anyhow::bail!(
-                                        "Hyperliquid public WS internal publish queue closed"
-                                    );
-                                }
                             }
+                            MarketDataEvent::L2Snapshot(_) => {
+                                have_baseline = true;
+                                while let Some(buffered) = delta_buf.pop_front() {
+                                    try_publish(buffered)?;
+                                }
+                                try_publish(event)?;
+                            }
+                            _ => {
+                                try_publish(event)?;
+                            }
+                        }
                         }
                     }
                 }
@@ -444,27 +478,24 @@ impl HyperliquidConnector {
         }
     }
 
-    async fn refresh_snapshot(&self, seq: u64) {
+    async fn refresh_snapshot(&self, seq: u64) -> Option<MarketDataEvent> {
         let now = mono_now_ns();
         let last = self
             .freshness
             .last_snapshot_resync_ns
             .load(Ordering::Relaxed);
         if last != 0 && age_ms(now, last) < HL_SNAPSHOT_COOLDOWN_MS {
-            return;
+            return None;
         }
         self.freshness
             .last_snapshot_resync_ns
             .store(now, Ordering::Relaxed);
         if let Ok(snapshot) = fetch_l2_snapshot(&self.http, &self.cfg).await {
-            if self.market_tx.send(snapshot).await.is_ok() {
-                self.freshness
-                    .last_published_ns
-                    .store(mono_now_ns(), Ordering::Relaxed);
-            }
+            return Some(snapshot);
         } else {
             eprintln!("Hyperliquid snapshot refresh failed at seq={seq}");
         }
+        None
     }
 
     pub async fn place_order(
