@@ -44,6 +44,7 @@ pub struct AsterConfig {
     pub market: String,
     pub depth_limit: usize,
     pub venue_index: usize,
+    pub venue_id: String,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub recv_window: Option<u64>,
@@ -61,6 +62,7 @@ impl AsterConfig {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(100);
+        let venue_id = std::env::var("ASTER_VENUE").unwrap_or_else(|_| "ASTER".to_string());
         let api_key = std::env::var("ASTER_API_KEY").ok();
         let api_secret = std::env::var("ASTER_API_SECRET").ok();
         let recv_window = std::env::var("ASTER_RECV_WINDOW")
@@ -73,6 +75,7 @@ impl AsterConfig {
             market,
             depth_limit,
             venue_index: 0,
+            venue_id,
             api_key,
             api_secret,
             recv_window,
@@ -195,22 +198,21 @@ impl AsterConnector {
                                 );
                             }
                         }
-                        let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
-                            venue_index: self.cfg.venue_index,
-                            venue_id: self.cfg.market.clone(),
-                            seq: snapshot.last_update_id,
-                            timestamp_ms: now_ms(),
-                            bids: snapshot.bids,
-                            asks: snapshot.asks,
-                        });
+                        let snapshot_event =
+                            MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
+                                venue_index: self.cfg.venue_index,
+                                venue_id: self.cfg.venue_id.clone(),
+                                seq: snapshot.last_update_id,
+                                timestamp_ms: now_ms(),
+                                bids: snapshot.bids,
+                                asks: snapshot.asks,
+                            });
                         let _ = self.market_tx.send(snapshot_event).await;
 
                         let mut next_last = snapshot.last_update_id;
                         let mut gap = false;
                         for update in buffered_updates.drain(..) {
-                            if !symbol_matches(&update.symbol, &self.cfg.market) {
-                                continue;
-                            }
+                            // Stream is per-symbol; avoid dropping on formatting mismatch.
                             match seq_decision_lenient(next_last, &update) {
                                 SeqDecision::Apply => {
                                     next_last = update.end_id;
@@ -1455,6 +1457,7 @@ mod tests {
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
             venue_index: 0,
+            venue_id: "ASTER".to_string(),
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1510,6 +1513,7 @@ mod tests {
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
             venue_index: 0,
+            venue_id: "ASTER".to_string(),
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1566,6 +1570,7 @@ mod tests {
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
             venue_index: 0,
+            venue_id: "ASTER".to_string(),
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
