@@ -7,8 +7,37 @@ pub const SUPPORTS_MARKET: bool = true;
 pub const SUPPORTS_ACCOUNT: bool = true;
 pub const SUPPORTS_EXECUTION: bool = true;
 
+const HL_STALE_MS: u64 = 1800;
+const HL_WATCHDOG_TICK_MS: u64 = 200;
+const HL_SNAPSHOT_COOLDOWN_MS: u64 = 8_000;
+
+static MONO_START: OnceLock<Instant> = OnceLock::new();
+
+fn mono_now_ns() -> u64 {
+    let start = MONO_START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as u64
+}
+
+fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
+    now_ns.saturating_sub(then_ns) / 1_000_000
+}
+
+#[derive(Debug, Default)]
+struct Freshness {
+    last_ws_rx_ns: AtomicU64,
+    last_data_rx_ns: AtomicU64,
+    last_parsed_ns: AtomicU64,
+    last_applied_ns: AtomicU64,
+    last_published_ns: AtomicU64,
+    last_snapshot_resync_ns: AtomicU64,
+}
+
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use k256::ecdsa::SigningKey;
@@ -115,6 +144,7 @@ pub struct HyperliquidConnector {
     exec_tx: mpsc::Sender<ExecutionEvent>,
     account_tx: Option<mpsc::Sender<AccountEvent>>,
     asset_index: tokio::sync::Mutex<Option<u32>>,
+    freshness: Arc<Freshness>,
 }
 
 impl HyperliquidConnector {
@@ -130,6 +160,7 @@ impl HyperliquidConnector {
             exec_tx,
             account_tx: None,
             asset_index: tokio::sync::Mutex::new(None),
+            freshness: Arc::new(Freshness::default()),
         }
     }
 
@@ -150,6 +181,7 @@ impl HyperliquidConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
+        let freshness = self.freshness.clone();
         eprintln!(
             "INFO: Hyperliquid public WS connecting url={}",
             self.cfg.ws_url
@@ -183,6 +215,9 @@ impl HyperliquidConnector {
         let mut decode_miss_count = 0usize;
         while let Some(msg) = read.next().await {
             let msg = msg?;
+            freshness
+                .last_ws_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             let payload = match msg {
                 Message::Text(text) => text,
                 Message::Binary(bytes) => match String::from_utf8(bytes) {
@@ -220,6 +255,9 @@ impl HyperliquidConnector {
                 continue;
             }
             if channel == "l2Book" {
+                freshness
+                    .last_data_rx_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
                 if let Some(top) = decode_l2book_top(&value) {
                     if !first_decoded_top_logged {
                         eprintln!(
@@ -244,13 +282,23 @@ impl HyperliquidConnector {
                     self.cfg.coin.as_str(),
                     &mut l2_seq_fallback,
                 ) {
+                    freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     if let Err(err) = self.market_tx.send(snapshot).await {
                         eprintln!("Hyperliquid public WS market send failed: {err}");
+                    } else {
+                        freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                     }
                 }
                 continue;
             }
             if let Some(parsed) = parse_l2_message_value(&value, self.cfg.venue_index) {
+                freshness
+                    .last_parsed_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
                 let outcome = tracker.on_message(parsed);
                 if let Some(seq) = outcome.refresh_snapshot {
                     self.refresh_snapshot(seq).await;
@@ -260,7 +308,11 @@ impl HyperliquidConnector {
                         eprintln!("INFO: Hyperliquid public WS first book update");
                         first_book_update_logged = true;
                     }
-                    let _ = self.market_tx.send(event).await;
+                    if self.market_tx.send(event).await.is_ok() {
+                        freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -330,8 +382,23 @@ impl HyperliquidConnector {
     }
 
     async fn refresh_snapshot(&self, seq: u64) {
+        let now = mono_now_ns();
+        let last = self
+            .freshness
+            .last_snapshot_resync_ns
+            .load(Ordering::Relaxed);
+        if last != 0 && age_ms(now, last) < HL_SNAPSHOT_COOLDOWN_MS {
+            return;
+        }
+        self.freshness
+            .last_snapshot_resync_ns
+            .store(now, Ordering::Relaxed);
         if let Ok(snapshot) = fetch_l2_snapshot(&self.http, &self.cfg).await {
-            let _ = self.market_tx.send(snapshot).await;
+            if self.market_tx.send(snapshot).await.is_ok() {
+                self.freshness
+                    .last_published_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
+            }
         } else {
             eprintln!("Hyperliquid snapshot refresh failed at seq={seq}");
         }
