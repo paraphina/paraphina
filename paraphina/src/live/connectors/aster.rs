@@ -151,6 +151,12 @@ impl AsterConnector {
         let mut first_size_raw_logged = false;
         let mut decode_miss_count = 0usize;
         let mut logged_non_utf8_binary = false;
+        let mut last_applied_at = Instant::now();
+        let mut last_watchdog_trigger_at: Option<Instant> = None;
+        let mut watchdog = tokio::time::interval(Duration::from_millis(250));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        const STALE_MS: u64 = 2_000;
+        const COOLDOWN_MS: u64 = 7_000;
 
         loop {
             if last_update_id.is_none() {
@@ -207,7 +213,9 @@ impl AsterConnector {
                                 bids: snapshot.bids,
                                 asks: snapshot.asks,
                             });
-                        let _ = self.market_tx.send(snapshot_event).await;
+                        if self.market_tx.send(snapshot_event).await.is_ok() {
+                            last_applied_at = Instant::now();
+                        }
 
                         let mut next_last = snapshot.last_update_id;
                         let mut gap = false;
@@ -216,13 +224,17 @@ impl AsterConnector {
                             match seq_decision_lenient(next_last, &update) {
                                 SeqDecision::Apply => {
                                     next_last = update.end_id;
-                                    let _ = self
+                                    if self
                                         .market_tx
                                         .send(delta_event_from_update(
                                             &update,
                                             self.cfg.venue_index,
                                         ))
-                                        .await;
+                                        .await
+                                        .is_ok()
+                                    {
+                                        last_applied_at = Instant::now();
+                                    }
                                 }
                                 SeqDecision::Stale => {}
                                 SeqDecision::Gap => {
@@ -304,108 +316,141 @@ impl AsterConnector {
                 continue;
             }
 
-            let Some(msg) = read.next().await else {
-                return Ok(());
-            };
-            let msg = msg?;
-            match msg {
-                Message::Text(text) => {
-                    if let Some(recorder) = self.recorder.as_ref() {
-                        let mut guard = recorder.lock().await;
-                        let _ = guard.record_ws_frame(&text);
-                    }
-                    let Some(update) = parse_depth_update(&text) else {
-                        continue;
+            tokio::select! {
+                msg = read.next() => {
+                    let Some(msg) = msg else {
+                        return Ok(());
                     };
-                    if !symbol_matches(&update.symbol, &self.cfg.market) {
-                        continue;
-                    }
-                    let current_last = last_update_id.unwrap_or_default();
-                    match seq_decision_lenient(current_last, &update) {
-                        SeqDecision::Apply => {
-                            last_update_id = Some(update.end_id);
-                            let _ = self
-                                .market_tx
-                                .send(delta_event_from_update(&update, self.cfg.venue_index))
-                                .await;
-                        }
-                        SeqDecision::Stale => {}
-                        SeqDecision::Gap => {
-                            if last_gap_log.elapsed() > Duration::from_secs(30) {
-                                eprintln!(
-                                    "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
-                                    current_last,
-                                    update.prev_id,
-                                    update.start_id,
-                                    update.end_id,
-                                    self.cfg.ws_url
-                                );
-                                last_gap_log = Instant::now();
+                    let msg = msg?;
+                    match msg {
+                        Message::Text(text) => {
+                            if let Some(recorder) = self.recorder.as_ref() {
+                                let mut guard = recorder.lock().await;
+                                let _ = guard.record_ws_frame(&text);
                             }
-                            buffered_updates.clear();
-                            last_update_id = None;
-                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
-                        }
-                    }
-                }
-                Message::Binary(bytes) => match String::from_utf8(bytes) {
-                    Ok(text) => {
-                        if let Some(recorder) = self.recorder.as_ref() {
-                            let mut guard = recorder.lock().await;
-                            let _ = guard.record_ws_frame(&text);
-                        }
-                        let Some(update) = parse_depth_update(&text) else {
-                            continue;
-                        };
-                        if !symbol_matches(&update.symbol, &self.cfg.market) {
-                            continue;
-                        }
-                        let current_last = last_update_id.unwrap_or_default();
-                        match seq_decision_lenient(current_last, &update) {
-                            SeqDecision::Apply => {
-                                last_update_id = Some(update.end_id);
-                                let _ = self
-                                    .market_tx
-                                    .send(delta_event_from_update(&update, self.cfg.venue_index))
-                                    .await;
+                            let Some(update) = parse_depth_update(&text) else {
+                                continue;
+                            };
+                            if !symbol_matches(&update.symbol, &self.cfg.market) {
+                                continue;
                             }
-                            SeqDecision::Stale => {}
-                            SeqDecision::Gap => {
-                                if last_gap_log.elapsed() > Duration::from_secs(30) {
+                            let current_last = last_update_id.unwrap_or_default();
+                            match seq_decision_lenient(current_last, &update) {
+                                SeqDecision::Apply => {
+                                    last_update_id = Some(update.end_id);
+                                    if self
+                                        .market_tx
+                                        .send(delta_event_from_update(&update, self.cfg.venue_index))
+                                        .await
+                                        .is_ok()
+                                    {
+                                        last_applied_at = Instant::now();
+                                    }
+                                }
+                                SeqDecision::Stale => {}
+                                SeqDecision::Gap => {
+                                    if last_gap_log.elapsed() > Duration::from_secs(30) {
+                                        eprintln!(
+                                            "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
+                                            current_last,
+                                            update.prev_id,
+                                            update.start_id,
+                                            update.end_id,
+                                            self.cfg.ws_url
+                                        );
+                                        last_gap_log = Instant::now();
+                                    }
+                                    buffered_updates.clear();
+                                    last_update_id = None;
+                                    snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                }
+                            }
+                        }
+                        Message::Binary(bytes) => match String::from_utf8(bytes) {
+                            Ok(text) => {
+                                if let Some(recorder) = self.recorder.as_ref() {
+                                    let mut guard = recorder.lock().await;
+                                    let _ = guard.record_ws_frame(&text);
+                                }
+                                let Some(update) = parse_depth_update(&text) else {
+                                    continue;
+                                };
+                                if !symbol_matches(&update.symbol, &self.cfg.market) {
+                                    continue;
+                                }
+                                let current_last = last_update_id.unwrap_or_default();
+                                match seq_decision_lenient(current_last, &update) {
+                                    SeqDecision::Apply => {
+                                        last_update_id = Some(update.end_id);
+                                        if self
+                                            .market_tx
+                                            .send(delta_event_from_update(&update, self.cfg.venue_index))
+                                            .await
+                                            .is_ok()
+                                        {
+                                            last_applied_at = Instant::now();
+                                        }
+                                    }
+                                    SeqDecision::Stale => {}
+                                    SeqDecision::Gap => {
+                                        if last_gap_log.elapsed() > Duration::from_secs(30) {
+                                            eprintln!(
+                                                "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
+                                                current_last,
+                                                update.prev_id,
+                                                update.start_id,
+                                                update.end_id,
+                                                self.cfg.ws_url
+                                            );
+                                            last_gap_log = Instant::now();
+                                        }
+                                        buffered_updates.clear();
+                                        last_update_id = None;
+                                        snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                if !logged_non_utf8_binary {
                                     eprintln!(
-                                        "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
-                                        current_last,
-                                        update.prev_id,
-                                        update.start_id,
-                                        update.end_id,
+                                        "WARN: Aster public WS non-utf8 binary frame url={}",
                                         self.cfg.ws_url
                                     );
-                                    last_gap_log = Instant::now();
+                                    logged_non_utf8_binary = true;
                                 }
-                                buffered_updates.clear();
-                                last_update_id = None;
-                                snapshot_future = Some(Box::pin(self.fetch_snapshot()));
                             }
+                        },
+                        Message::Ping(payload) => {
+                            write.send(Message::Pong(payload)).await?;
                         }
-                    }
-                    Err(_) => {
-                        if !logged_non_utf8_binary {
-                            eprintln!(
-                                "WARN: Aster public WS non-utf8 binary frame url={}",
-                                self.cfg.ws_url
-                            );
-                            logged_non_utf8_binary = true;
+                        Message::Close(_) => {
+                            eprintln!("Aster WS closed; reconnecting url={}", self.cfg.ws_url);
+                            return Ok(());
                         }
+                        _ => {}
                     }
-                },
-                Message::Ping(payload) => {
-                    write.send(Message::Pong(payload)).await?;
                 }
-                Message::Close(_) => {
-                    eprintln!("Aster WS closed; reconnecting url={}", self.cfg.ws_url);
-                    return Ok(());
+                _ = watchdog.tick() => {
+                    let now = Instant::now();
+                    let stale = now.duration_since(last_applied_at);
+                    let cooldown_ok = last_watchdog_trigger_at
+                        .map(|last| now.duration_since(last) >= Duration::from_millis(COOLDOWN_MS))
+                        .unwrap_or(true);
+                    if stale > Duration::from_millis(STALE_MS)
+                        && (cooldown_ok || stale >= Duration::from_millis(15_000))
+                    {
+                        eprintln!(
+                            "WARN: Aster WS stale; resyncing url={} stale_ms={}",
+                            self.cfg.ws_url,
+                            stale.as_millis()
+                        );
+                        buffered_updates.clear();
+                        last_update_id = None;
+                        snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                        last_watchdog_trigger_at = Some(now);
+                        continue;
+                    }
                 }
-                _ => {}
             }
         }
     }
