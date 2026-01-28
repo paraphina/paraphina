@@ -527,7 +527,7 @@ impl LighterSeqTracker {
 
     pub fn on_message(&mut self, msg: ParsedL2Message) -> LighterSeqOutcome {
         if let Some(prev) = self.last_seq {
-            if msg.seq <= prev {
+            if msg.seq < prev {
                 return LighterSeqOutcome { event: None };
             }
         }
@@ -1325,6 +1325,30 @@ mod tests {
             }
             _ => panic!("expected delta"),
         }
+    }
+
+    #[test]
+    fn lighter_seq_tracker_allows_equal_seq() {
+        let mut tracker = LighterSeqTracker::new();
+        let base_event = MarketDataEvent::L2Delta(crate::live::types::L2Delta {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            seq: 7,
+            timestamp_ms: 0,
+            changes: Vec::new(),
+        });
+        let first = ParsedL2Message {
+            event: base_event.clone(),
+            seq: 7,
+        };
+        let second = ParsedL2Message {
+            event: base_event,
+            seq: 7,
+        };
+        let first_outcome = tracker.on_message(first);
+        let second_outcome = tracker.on_message(second);
+        assert!(first_outcome.event.is_some());
+        assert!(second_outcome.event.is_some());
     }
 }
 
