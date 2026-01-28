@@ -147,6 +147,7 @@ impl AsterConnector {
         let mut last_update_id: Option<u64> = None;
         let mut snapshot_future: Option<SnapshotFuture<'_>> = Some(Box::pin(self.fetch_snapshot()));
         let mut last_gap_log = Instant::now() - Duration::from_secs(60);
+        let mut last_snapshot_err_log = Instant::now() - Duration::from_secs(60);
         let mut first_decoded_top_logged = false;
         let mut first_size_raw_logged = false;
         let mut decode_miss_count = 0usize;
@@ -162,8 +163,10 @@ impl AsterConnector {
             if last_update_id.is_none() {
                 let future = snapshot_future.get_or_insert_with(|| Box::pin(self.fetch_snapshot()));
                 tokio::select! {
+                    biased;
                     snapshot = future => {
-                        let (snapshot_raw, snapshot) = snapshot?;
+                        match snapshot {
+                            Ok((snapshot_raw, snapshot)) => {
                         snapshot_future = None;
                         if let Some(recorder) = self.recorder.as_ref() {
                             let mut guard = recorder.lock().await;
@@ -251,6 +254,46 @@ impl AsterConnector {
                             continue;
                         }
                         last_update_id = Some(next_last);
+                            }
+                            Err(err) => {
+                                if last_snapshot_err_log.elapsed() > Duration::from_secs(30) {
+                                    let url = format!(
+                                        "{}/fapi/v1/depth?symbol={}&limit={}",
+                                        self.cfg.rest_url, self.cfg.market, self.cfg.depth_limit
+                                    );
+                                    eprintln!(
+                                        "WARN: Aster snapshot fetch failed; url={} err={}",
+                                        url, err
+                                    );
+                                    last_snapshot_err_log = Instant::now();
+                                }
+                                snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                buffered_updates.clear();
+                                last_update_id = None;
+                                continue;
+                            }
+                        }
+                    }
+                    _ = watchdog.tick() => {
+                        let now = Instant::now();
+                        let stale = now.duration_since(last_applied_at);
+                        let cooldown_ok = last_watchdog_trigger_at
+                            .map(|last| now.duration_since(last) >= Duration::from_millis(COOLDOWN_MS))
+                            .unwrap_or(true);
+                        if stale > Duration::from_millis(STALE_MS)
+                            && (cooldown_ok || stale >= Duration::from_millis(15_000))
+                        {
+                            eprintln!(
+                                "WARN: Aster WS stale; resyncing url={} stale_ms={}",
+                                self.cfg.ws_url,
+                                stale.as_millis()
+                            );
+                            buffered_updates.clear();
+                            last_update_id = None;
+                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                            last_watchdog_trigger_at = Some(now);
+                            continue;
+                        }
                     }
                     msg = read.next() => {
                         let Some(msg) = msg else {
@@ -311,27 +354,6 @@ impl AsterConnector {
                                 return Ok(());
                             }
                             _ => {}
-                        }
-                    }
-                    _ = watchdog.tick() => {
-                        let now = Instant::now();
-                        let stale = now.duration_since(last_applied_at);
-                        let cooldown_ok = last_watchdog_trigger_at
-                            .map(|last| now.duration_since(last) >= Duration::from_millis(COOLDOWN_MS))
-                            .unwrap_or(true);
-                        if stale > Duration::from_millis(STALE_MS)
-                            && (cooldown_ok || stale >= Duration::from_millis(15_000))
-                        {
-                            eprintln!(
-                                "WARN: Aster WS stale; resyncing url={} stale_ms={}",
-                                self.cfg.ws_url,
-                                stale.as_millis()
-                            );
-                            buffered_updates.clear();
-                            last_update_id = None;
-                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
-                            last_watchdog_trigger_at = Some(now);
-                            continue;
                         }
                     }
                 }
@@ -490,7 +512,13 @@ impl AsterConnector {
             "{}/fapi/v1/depth?symbol={}&limit={}",
             self.cfg.rest_url, self.cfg.market, self.cfg.depth_limit
         );
-        let resp = self.http.get(url).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await?
+            .error_for_status()?;
         let raw = resp.text().await?;
         let value: Value = serde_json::from_str(&raw)?;
         let snapshot = parse_depth_snapshot(&value)
