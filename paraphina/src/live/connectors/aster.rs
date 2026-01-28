@@ -44,6 +44,7 @@ pub struct AsterConfig {
     pub market: String,
     pub depth_limit: usize,
     pub venue_index: usize,
+    pub venue_id: String,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub recv_window: Option<u64>,
@@ -61,6 +62,7 @@ impl AsterConfig {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(100);
+        let venue_id = std::env::var("ASTER_VENUE").unwrap_or_else(|_| "ASTER".to_string());
         let api_key = std::env::var("ASTER_API_KEY").ok();
         let api_secret = std::env::var("ASTER_API_SECRET").ok();
         let recv_window = std::env::var("ASTER_RECV_WINDOW")
@@ -73,6 +75,7 @@ impl AsterConfig {
             market,
             depth_limit,
             venue_index: 0,
+            venue_id,
             api_key,
             api_secret,
             recv_window,
@@ -144,16 +147,31 @@ impl AsterConnector {
         let mut last_update_id: Option<u64> = None;
         let mut snapshot_future: Option<SnapshotFuture<'_>> = Some(Box::pin(self.fetch_snapshot()));
         let mut last_gap_log = Instant::now() - Duration::from_secs(60);
+        let mut last_snapshot_err_log = Instant::now() - Duration::from_secs(60);
         let mut first_decoded_top_logged = false;
         let mut first_size_raw_logged = false;
         let mut decode_miss_count = 0usize;
+        let mut logged_non_utf8_binary = false;
+        let mut emit_seq: u64 = 0;
+        let mut next_seq = || {
+            emit_seq = emit_seq.wrapping_add(1);
+            emit_seq
+        };
+        let mut last_applied_at = Instant::now();
+        let mut last_watchdog_trigger_at: Option<Instant> = None;
+        let mut watchdog = tokio::time::interval(Duration::from_millis(250));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        const STALE_MS: u64 = 2_000;
+        const COOLDOWN_MS: u64 = 7_000;
 
         loop {
             if last_update_id.is_none() {
                 let future = snapshot_future.get_or_insert_with(|| Box::pin(self.fetch_snapshot()));
                 tokio::select! {
+                    biased;
                     snapshot = future => {
-                        let (snapshot_raw, snapshot) = snapshot?;
+                        match snapshot {
+                            Ok((snapshot_raw, snapshot)) => {
                         snapshot_future = None;
                         if let Some(recorder) = self.recorder.as_ref() {
                             let mut guard = recorder.lock().await;
@@ -194,32 +212,39 @@ impl AsterConnector {
                                 );
                             }
                         }
-                        let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
-                            venue_index: self.cfg.venue_index,
-                            venue_id: self.cfg.market.clone(),
-                            seq: snapshot.last_update_id,
-                            timestamp_ms: now_ms(),
-                            bids: snapshot.bids,
-                            asks: snapshot.asks,
-                        });
-                        let _ = self.market_tx.send(snapshot_event).await;
+                        let snapshot_event =
+                            MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
+                                venue_index: self.cfg.venue_index,
+                                venue_id: self.cfg.venue_id.clone(),
+                                seq: next_seq(),
+                                timestamp_ms: now_ms(),
+                                bids: snapshot.bids,
+                                asks: snapshot.asks,
+                            });
+                        if self.market_tx.send(snapshot_event).await.is_ok() {
+                            last_applied_at = Instant::now();
+                        }
 
                         let mut next_last = snapshot.last_update_id;
                         let mut gap = false;
                         for update in buffered_updates.drain(..) {
-                            if !symbol_matches(&update.symbol, &self.cfg.market) {
-                                continue;
-                            }
+                            // Stream is per-symbol; avoid dropping on formatting mismatch.
                             match seq_decision_lenient(next_last, &update) {
                                 SeqDecision::Apply => {
                                     next_last = update.end_id;
-                                    let _ = self
+                                    if self
                                         .market_tx
                                         .send(delta_event_from_update(
                                             &update,
                                             self.cfg.venue_index,
+                                            &self.cfg.venue_id,
+                                            next_seq(),
                                         ))
-                                        .await;
+                                        .await
+                                        .is_ok()
+                                    {
+                                        last_applied_at = Instant::now();
+                                    }
                                 }
                                 SeqDecision::Stale => {}
                                 SeqDecision::Gap => {
@@ -235,6 +260,46 @@ impl AsterConnector {
                             continue;
                         }
                         last_update_id = Some(next_last);
+                            }
+                            Err(err) => {
+                                if last_snapshot_err_log.elapsed() > Duration::from_secs(30) {
+                                    let url = format!(
+                                        "{}/fapi/v1/depth?symbol={}&limit={}",
+                                        self.cfg.rest_url, self.cfg.market, self.cfg.depth_limit
+                                    );
+                                    eprintln!(
+                                        "WARN: Aster snapshot fetch failed; url={} err={}",
+                                        url, err
+                                    );
+                                    last_snapshot_err_log = Instant::now();
+                                }
+                                snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                buffered_updates.clear();
+                                last_update_id = None;
+                                continue;
+                            }
+                        }
+                    }
+                    _ = watchdog.tick() => {
+                        let now = Instant::now();
+                        let stale = now.duration_since(last_applied_at);
+                        let cooldown_ok = last_watchdog_trigger_at
+                            .map(|last| now.duration_since(last) >= Duration::from_millis(COOLDOWN_MS))
+                            .unwrap_or(true);
+                        if stale > Duration::from_millis(STALE_MS)
+                            && (cooldown_ok || stale >= Duration::from_millis(15_000))
+                        {
+                            eprintln!(
+                                "WARN: Aster WS stale; resyncing url={} stale_ms={}",
+                                self.cfg.ws_url,
+                                stale.as_millis()
+                            );
+                            buffered_updates.clear();
+                            last_update_id = None;
+                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                            last_watchdog_trigger_at = Some(now);
+                            continue;
+                        }
                     }
                     msg = read.next() => {
                         let Some(msg) = msg else {
@@ -259,6 +324,34 @@ impl AsterConnector {
                                     }
                                 }
                             }
+                            Message::Binary(bytes) => match String::from_utf8(bytes) {
+                                Ok(text) => {
+                                    if let Some(recorder) = self.recorder.as_ref() {
+                                        let mut guard = recorder.lock().await;
+                                        let _ = guard.record_ws_frame(&text);
+                                    }
+                                    if let Some(update) = parse_depth_update(&text) {
+                                        buffered_updates.push(update);
+                                        if buffered_updates.len() > MAX_BUFFERED_UPDATES {
+                                            eprintln!(
+                                                "Aster WS buffer overflow; resyncing url={}",
+                                                self.cfg.ws_url
+                                            );
+                                            buffered_updates.clear();
+                                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    if !logged_non_utf8_binary {
+                                        eprintln!(
+                                            "WARN: Aster public WS non-utf8 binary frame url={}",
+                                            self.cfg.ws_url
+                                        );
+                                        logged_non_utf8_binary = true;
+                                    }
+                                }
+                            },
                             Message::Ping(payload) => {
                                 write.send(Message::Pong(payload)).await?;
                             }
@@ -273,58 +366,151 @@ impl AsterConnector {
                 continue;
             }
 
-            let Some(msg) = read.next().await else {
-                return Ok(());
-            };
-            let msg = msg?;
-            match msg {
-                Message::Text(text) => {
-                    if let Some(recorder) = self.recorder.as_ref() {
-                        let mut guard = recorder.lock().await;
-                        let _ = guard.record_ws_frame(&text);
-                    }
-                    let Some(update) = parse_depth_update(&text) else {
-                        continue;
+            tokio::select! {
+                msg = read.next() => {
+                    let Some(msg) = msg else {
+                        return Ok(());
                     };
-                    if !symbol_matches(&update.symbol, &self.cfg.market) {
+                    let msg = msg?;
+                    match msg {
+                        Message::Text(text) => {
+                            if let Some(recorder) = self.recorder.as_ref() {
+                                let mut guard = recorder.lock().await;
+                                let _ = guard.record_ws_frame(&text);
+                            }
+                            let Some(update) = parse_depth_update(&text) else {
+                                continue;
+                            };
+                            if !symbol_matches(&update.symbol, &self.cfg.market) {
+                                continue;
+                            }
+                            let current_last = last_update_id.unwrap_or_default();
+                            match seq_decision_lenient(current_last, &update) {
+                                SeqDecision::Apply => {
+                                    last_update_id = Some(update.end_id);
+                                    if self
+                                        .market_tx
+                                        .send(delta_event_from_update(
+                                            &update,
+                                            self.cfg.venue_index,
+                                            &self.cfg.venue_id,
+                                            next_seq(),
+                                        ))
+                                        .await
+                                        .is_ok()
+                                    {
+                                        last_applied_at = Instant::now();
+                                    }
+                                }
+                                SeqDecision::Stale => {}
+                                SeqDecision::Gap => {
+                                    if last_gap_log.elapsed() > Duration::from_secs(30) {
+                                        eprintln!(
+                                            "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
+                                            current_last,
+                                            update.prev_id,
+                                            update.start_id,
+                                            update.end_id,
+                                            self.cfg.ws_url
+                                        );
+                                        last_gap_log = Instant::now();
+                                    }
+                                    buffered_updates.clear();
+                                    last_update_id = None;
+                                    snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                }
+                            }
+                        }
+                        Message::Binary(bytes) => match String::from_utf8(bytes) {
+                            Ok(text) => {
+                                if let Some(recorder) = self.recorder.as_ref() {
+                                    let mut guard = recorder.lock().await;
+                                    let _ = guard.record_ws_frame(&text);
+                                }
+                                let Some(update) = parse_depth_update(&text) else {
+                                    continue;
+                                };
+                                if !symbol_matches(&update.symbol, &self.cfg.market) {
+                                    continue;
+                                }
+                                let current_last = last_update_id.unwrap_or_default();
+                                match seq_decision_lenient(current_last, &update) {
+                                    SeqDecision::Apply => {
+                                        last_update_id = Some(update.end_id);
+                                        if self
+                                            .market_tx
+                                        .send(delta_event_from_update(
+                                            &update,
+                                            self.cfg.venue_index,
+                                            &self.cfg.venue_id,
+                                            next_seq(),
+                                        ))
+                                            .await
+                                            .is_ok()
+                                        {
+                                            last_applied_at = Instant::now();
+                                        }
+                                    }
+                                    SeqDecision::Stale => {}
+                                    SeqDecision::Gap => {
+                                        if last_gap_log.elapsed() > Duration::from_secs(30) {
+                                            eprintln!(
+                                                "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
+                                                current_last,
+                                                update.prev_id,
+                                                update.start_id,
+                                                update.end_id,
+                                                self.cfg.ws_url
+                                            );
+                                            last_gap_log = Instant::now();
+                                        }
+                                        buffered_updates.clear();
+                                        last_update_id = None;
+                                        snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                if !logged_non_utf8_binary {
+                                    eprintln!(
+                                        "WARN: Aster public WS non-utf8 binary frame url={}",
+                                        self.cfg.ws_url
+                                    );
+                                    logged_non_utf8_binary = true;
+                                }
+                            }
+                        },
+                        Message::Ping(payload) => {
+                            write.send(Message::Pong(payload)).await?;
+                        }
+                        Message::Close(_) => {
+                            eprintln!("Aster WS closed; reconnecting url={}", self.cfg.ws_url);
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+                _ = watchdog.tick() => {
+                    let now = Instant::now();
+                    let stale = now.duration_since(last_applied_at);
+                    let cooldown_ok = last_watchdog_trigger_at
+                        .map(|last| now.duration_since(last) >= Duration::from_millis(COOLDOWN_MS))
+                        .unwrap_or(true);
+                    if stale > Duration::from_millis(STALE_MS)
+                        && (cooldown_ok || stale >= Duration::from_millis(15_000))
+                    {
+                        eprintln!(
+                            "WARN: Aster WS stale; resyncing url={} stale_ms={}",
+                            self.cfg.ws_url,
+                            stale.as_millis()
+                        );
+                        buffered_updates.clear();
+                        last_update_id = None;
+                        snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                        last_watchdog_trigger_at = Some(now);
                         continue;
                     }
-                    let current_last = last_update_id.unwrap_or_default();
-                    match seq_decision_lenient(current_last, &update) {
-                        SeqDecision::Apply => {
-                            last_update_id = Some(update.end_id);
-                            let _ = self
-                                .market_tx
-                                .send(delta_event_from_update(&update, self.cfg.venue_index))
-                                .await;
-                        }
-                        SeqDecision::Stale => {}
-                        SeqDecision::Gap => {
-                            if last_gap_log.elapsed() > Duration::from_secs(30) {
-                                eprintln!(
-                                    "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
-                                    current_last,
-                                    update.prev_id,
-                                    update.start_id,
-                                    update.end_id,
-                                    self.cfg.ws_url
-                                );
-                                last_gap_log = Instant::now();
-                            }
-                            buffered_updates.clear();
-                            last_update_id = None;
-                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
-                        }
-                    }
                 }
-                Message::Ping(payload) => {
-                    write.send(Message::Pong(payload)).await?;
-                }
-                Message::Close(_) => {
-                    eprintln!("Aster WS closed; reconnecting url={}", self.cfg.ws_url);
-                    return Ok(());
-                }
-                _ => {}
             }
         }
     }
@@ -334,7 +520,13 @@ impl AsterConnector {
             "{}/fapi/v1/depth?symbol={}&limit={}",
             self.cfg.rest_url, self.cfg.market, self.cfg.depth_limit
         );
-        let resp = self.http.get(url).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await?
+            .error_for_status()?;
         let raw = resp.text().await?;
         let value: Value = serde_json::from_str(&raw)?;
         let snapshot = parse_depth_snapshot(&value)
@@ -724,17 +916,19 @@ struct AsterDepthUpdate {
     asks: Vec<BookLevelDelta>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AsterSeqState {
     last_update_id: u64,
     venue_index: usize,
+    venue_id: String,
 }
 
 impl AsterSeqState {
-    fn new(last_update_id: u64, venue_index: usize) -> Self {
+    fn new(last_update_id: u64, venue_index: usize, venue_id: &str) -> Self {
         Self {
             last_update_id,
             venue_index,
+            venue_id: venue_id.to_string(),
         }
     }
 
@@ -767,7 +961,7 @@ impl AsterSeqState {
         changes.extend(update.asks.iter().cloned());
         let event = MarketDataEvent::L2Delta(super::super::types::L2Delta {
             venue_index: self.venue_index,
-            venue_id: update.symbol.clone(),
+            venue_id: self.venue_id.clone(),
             seq: update.end_id,
             timestamp_ms: update.event_time.unwrap_or_else(now_ms),
             changes,
@@ -805,14 +999,19 @@ fn seq_decision_lenient(last_update_id: u64, update: &AsterDepthUpdate) -> SeqDe
     }
 }
 
-fn delta_event_from_update(update: &AsterDepthUpdate, venue_index: usize) -> MarketDataEvent {
+fn delta_event_from_update(
+    update: &AsterDepthUpdate,
+    venue_index: usize,
+    venue_id: &str,
+    seq: u64,
+) -> MarketDataEvent {
     let mut changes = Vec::with_capacity(update.bids.len() + update.asks.len());
     changes.extend(update.bids.iter().cloned());
     changes.extend(update.asks.iter().cloned());
     MarketDataEvent::L2Delta(super::super::types::L2Delta {
         venue_index,
-        venue_id: update.symbol.clone(),
-        seq: update.end_id,
+        venue_id: venue_id.to_string(),
+        seq,
         timestamp_ms: update.event_time.unwrap_or_else(now_ms),
         changes,
     })
@@ -1298,7 +1497,7 @@ mod tests {
             std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl")).expect("ws frames");
 
         let collect_events = |snapshot_id: u64| -> Vec<MarketDataEvent> {
-            let mut state = AsterSeqState::new(snapshot_id, 0);
+            let mut state = AsterSeqState::new(snapshot_id, 0, "ASTER");
             let mut events = Vec::new();
             for line in frames.lines() {
                 let trimmed = line.trim();
@@ -1376,6 +1575,7 @@ mod tests {
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
             venue_index: 0,
+            venue_id: "ASTER".to_string(),
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1431,6 +1631,7 @@ mod tests {
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
             venue_index: 0,
+            venue_id: "ASTER".to_string(),
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),
@@ -1487,6 +1688,7 @@ mod tests {
             market: "BTCUSDT".to_string(),
             depth_limit: 10,
             venue_index: 0,
+            venue_id: "ASTER".to_string(),
             api_key: Some("test-key".to_string()),
             api_secret: Some("testsecret".to_string()),
             recv_window: Some(5000),

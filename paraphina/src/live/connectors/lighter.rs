@@ -210,11 +210,32 @@ impl LighterConnector {
         let mut first_message_logged = false;
         let mut logged_non_utf8_binary = false;
         let mut first_decoded_top_logged = false;
+        let mut first_json_pong_logged = false;
         let mut decode_miss_count = 0usize;
         let mut seq_fallback: u64 = 0;
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
+        let mut have_snapshot = false;
+        loop {
+            let msg = match read.next().await {
+                Some(Ok(msg)) => msg,
+                Some(Err(err)) => {
+                    eprintln!("Lighter public WS read error: {err}");
+                    break;
+                }
+                None => {
+                    eprintln!("Lighter public WS stream ended");
+                    break;
+                }
+            };
             let payload = match msg {
+                Message::Ping(payload) => {
+                    let _ = write.send(Message::Pong(payload)).await;
+                    continue;
+                }
+                Message::Pong(_) => continue,
+                Message::Close(frame) => {
+                    eprintln!("Lighter public WS closed frame={frame:?}");
+                    break;
+                }
                 Message::Text(text) => text,
                 Message::Binary(bytes) => match String::from_utf8(bytes) {
                     Ok(text) => text,
@@ -259,7 +280,12 @@ impl LighterConnector {
                 eprintln!("INFO: Lighter WS first msg keys={keys} snippet={snippet}");
                 first_message_logs += 1;
             }
-            if value.get("type").and_then(|v| v.as_str()) == Some("ping") {
+            if let Some(pong) = json_ping_response(&value) {
+                if !first_json_pong_logged {
+                    eprintln!("INFO: Lighter sent JSON pong");
+                    first_json_pong_logged = true;
+                }
+                let _ = write.send(Message::Text(pong.to_string())).await;
                 continue;
             }
             if !subscribed {
@@ -294,6 +320,25 @@ impl LighterConnector {
                         decode_miss_count,
                         self.cfg.ws_url.as_str(),
                     );
+                }
+                if let Some(parsed) = decode_order_book_channel_message(
+                    &value,
+                    self.cfg.venue_index,
+                    &self.cfg.venue_id,
+                    &mut seq_fallback,
+                    &mut have_snapshot,
+                ) {
+                    let outcome = tracker.on_message(parsed);
+                    if let Some(event) = outcome.event {
+                        if !first_book_update_logged {
+                            eprintln!("INFO: Lighter public WS first book update");
+                            first_book_update_logged = true;
+                        }
+                        if let Err(err) = self.market_tx.send(event).await {
+                            eprintln!("Lighter public WS market send failed: {err}");
+                        }
+                    }
+                    continue;
                 }
                 if let Some(parsed) = decode_order_book_snapshot(
                     &value,
@@ -482,7 +527,7 @@ impl LighterSeqTracker {
 
     pub fn on_message(&mut self, msg: ParsedL2Message) -> LighterSeqOutcome {
         if let Some(prev) = self.last_seq {
-            if msg.seq <= prev {
+            if msg.seq < prev {
                 return LighterSeqOutcome { event: None };
             }
         }
@@ -628,8 +673,14 @@ fn decode_order_book_snapshot(
         .or_else(|| value.get("orderBook"))
         .or_else(|| value.get("data").and_then(|v| v.get("order_book")))
         .or_else(|| value.get("data").and_then(|v| v.get("orderBook")))?;
-    let bids = parse_levels_from_objects(order_book.get("bids")?)?;
-    let asks = parse_levels_from_objects(order_book.get("asks")?)?;
+    let bids = match order_book.get("bids") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
+    let asks = match order_book.get("asks") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
     let seq = value
         .get("seq")
         .and_then(|v| v.as_u64())
@@ -662,8 +713,14 @@ fn decode_order_book_top(value: &serde_json::Value) -> Option<TopOfBook> {
         .or_else(|| value.get("orderBook"))
         .or_else(|| value.get("data").and_then(|v| v.get("order_book")))
         .or_else(|| value.get("data").and_then(|v| v.get("orderBook")))?;
-    let bids = parse_levels_from_objects(order_book.get("bids")?)?;
-    let asks = parse_levels_from_objects(order_book.get("asks")?)?;
+    let bids = match order_book.get("bids") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
+    let asks = match order_book.get("asks") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
     TopOfBook::from_levels(
         &bids,
         &asks,
@@ -672,6 +729,85 @@ fn decode_order_book_top(value: &serde_json::Value) -> Option<TopOfBook> {
             .or_else(|| value.get("ts"))
             .and_then(|v| v.as_i64()),
     )
+}
+
+fn json_ping_response(value: &serde_json::Value) -> Option<&'static str> {
+    let msg_type = value.get("type").and_then(|v| v.as_str());
+    if msg_type == Some("ping") {
+        Some(r#"{"type":"pong"}"#)
+    } else {
+        None
+    }
+}
+
+fn decode_order_book_channel_message(
+    value: &serde_json::Value,
+    venue_index: usize,
+    venue_id: &str,
+    seq_fallback: &mut u64,
+    have_snapshot: &mut bool,
+) -> Option<ParsedL2Message> {
+    let channel = value.get("channel").and_then(|v| v.as_str())?;
+    if !channel.starts_with("order_book:") {
+        return None;
+    }
+    let order_book = value.get("order_book")?;
+    let bids = match order_book.get("bids") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
+    let asks = match order_book.get("asks") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
+    *seq_fallback = seq_fallback.wrapping_add(1);
+    let seq = *seq_fallback;
+    let timestamp_ms = value
+        .get("timestamp")
+        .or_else(|| value.get("ts"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if !*have_snapshot && !bids.is_empty() && !asks.is_empty() {
+        *have_snapshot = true;
+        let snapshot = super::super::types::L2Snapshot {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq,
+            timestamp_ms,
+            bids,
+            asks,
+        };
+        return Some(ParsedL2Message {
+            event: MarketDataEvent::L2Snapshot(snapshot),
+            seq,
+        });
+    }
+    let mut changes = Vec::with_capacity(bids.len() + asks.len());
+    for level in bids {
+        changes.push(BookLevelDelta {
+            side: BookSide::Bid,
+            price: level.price,
+            size: level.size,
+        });
+    }
+    for level in asks {
+        changes.push(BookLevelDelta {
+            side: BookSide::Ask,
+            price: level.price,
+            size: level.size,
+        });
+    }
+        let delta = super::super::types::L2Delta {
+        venue_index,
+        venue_id: venue_id.to_string(),
+        seq,
+        timestamp_ms,
+        changes,
+    };
+    Some(ParsedL2Message {
+        event: MarketDataEvent::L2Delta(delta),
+        seq,
+    })
 }
 
 fn lighter_error_code(value: &serde_json::Value) -> Option<i64> {
@@ -983,6 +1119,260 @@ mod tests {
             }
             _ => panic!("expected snapshot"),
         }
+    }
+
+    #[test]
+    fn order_book_snapshot_allows_empty_bids() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [],
+                "asks": [{"price":"101.0","size":"3.0"}]
+            }
+        });
+        let mut seq = 0u64;
+        let parsed = decode_order_book_snapshot(&value, 3, "LIGHTER", &mut seq).expect("snap");
+        match parsed.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert!(snapshot.bids.is_empty());
+                assert_eq!(snapshot.asks.len(), 1);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn order_book_snapshot_allows_empty_asks() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [{"price":"100.0","size":"2.0"}],
+                "asks": []
+            }
+        });
+        let mut seq = 0u64;
+        let parsed = decode_order_book_snapshot(&value, 3, "LIGHTER", &mut seq).expect("snap");
+        match parsed.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.bids.len(), 1);
+                assert!(snapshot.asks.is_empty());
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn order_book_snapshot_allows_zero_size_level() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [{"price":"100.0","size":"0.00000"}],
+                "asks": [{"price":"101.0","size":"1.00000"}]
+            }
+        });
+        let mut seq = 0u64;
+        let parsed = decode_order_book_snapshot(&value, 3, "LIGHTER", &mut seq).expect("snap");
+        match parsed.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.bids.len(), 1);
+                assert_eq!(snapshot.bids[0].size, 0.0);
+                assert_eq!(snapshot.asks.len(), 1);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn order_book_channel_delta_allows_empty_asks() {
+        let value = serde_json::json!({
+            "channel": "order_book:1",
+            "offset": 42,
+            "timestamp": 1700000000123i64,
+            "order_book": {
+                "bids": [{"price":"100.0","size":"2.0"}],
+                "asks": []
+            }
+        });
+        let mut seq = 0u64;
+        let mut have_snapshot = false;
+        let parsed =
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq, &mut have_snapshot)
+                .expect("delta");
+        match parsed.event {
+            MarketDataEvent::L2Delta(delta) => {
+                assert_eq!(delta.changes.len(), 1);
+                assert_eq!(delta.changes[0].side, BookSide::Bid);
+            }
+            _ => panic!("expected delta"),
+        }
+    }
+
+    #[test]
+    fn order_book_channel_delta_allows_empty_bids() {
+        let value = serde_json::json!({
+            "channel": "order_book:1",
+            "offset": 43,
+            "timestamp": 1700000000456i64,
+            "order_book": {
+                "bids": [],
+                "asks": [{"price":"101.0","size":"3.0"}]
+            }
+        });
+        let mut seq = 0u64;
+        let mut have_snapshot = false;
+        let parsed =
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq, &mut have_snapshot)
+                .expect("delta");
+        match parsed.event {
+            MarketDataEvent::L2Delta(delta) => {
+                assert_eq!(delta.changes.len(), 1);
+                assert_eq!(delta.changes[0].side, BookSide::Ask);
+            }
+            _ => panic!("expected delta"),
+        }
+    }
+
+    #[test]
+    fn order_book_channel_delta_allows_zero_size() {
+        let value = serde_json::json!({
+            "channel": "order_book:1",
+            "offset": 44,
+            "timestamp": 1700000000789i64,
+            "order_book": {
+                "bids": [{"price":"100.0","size":"0.00000"}],
+                "asks": [{"price":"101.0","size":"1.00000"}]
+            }
+        });
+        let mut seq = 0u64;
+        let mut have_snapshot = true;
+        let parsed =
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq, &mut have_snapshot)
+                .expect("delta");
+        match parsed.event {
+            MarketDataEvent::L2Delta(delta) => {
+                assert_eq!(delta.changes.len(), 2);
+                assert_eq!(delta.changes[0].size, 0.0);
+            }
+            _ => panic!("expected delta"),
+        }
+    }
+
+    #[test]
+    fn json_ping_triggers_pong_response() {
+        let value = serde_json::json!({
+            "type": "ping"
+        });
+        assert_eq!(json_ping_response(&value), Some(r#"{"type":"pong"}"#));
+    }
+
+    #[test]
+    fn order_book_channel_snapshot_then_delta() {
+        let snapshot_value = serde_json::json!({
+            "channel": "order_book:1",
+            "offset": 100,
+            "timestamp": 1700000000123i64,
+            "order_book": {
+                "bids": [{"price":"100.0","size":"2.0"}],
+                "asks": [{"price":"101.0","size":"3.0"}]
+            }
+        });
+        let delta_value = serde_json::json!({
+            "channel": "order_book:1",
+            "offset": 101,
+            "timestamp": 1700000000456i64,
+            "order_book": {
+                "bids": [],
+                "asks": [{"price":"101.0","size":"1.0"}]
+            }
+        });
+        let mut seq = 0u64;
+        let mut have_snapshot = false;
+        let first = decode_order_book_channel_message(
+            &snapshot_value,
+            3,
+            "LIGHTER",
+            &mut seq,
+            &mut have_snapshot,
+        )
+        .expect("first");
+        match first.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.bids.len(), 1);
+                assert_eq!(snapshot.asks.len(), 1);
+            }
+            _ => panic!("expected snapshot"),
+        }
+        let second = decode_order_book_channel_message(
+            &delta_value,
+            3,
+            "LIGHTER",
+            &mut seq,
+            &mut have_snapshot,
+        )
+        .expect("second");
+        match second.event {
+            MarketDataEvent::L2Delta(delta) => {
+                assert_eq!(delta.changes.len(), 1);
+                assert_eq!(delta.changes[0].side, BookSide::Ask);
+            }
+            _ => panic!("expected delta"),
+        }
+    }
+
+    #[test]
+    fn lighter_seq_tracker_allows_equal_seq() {
+        let mut tracker = LighterSeqTracker::new();
+        let base_event = MarketDataEvent::L2Delta(crate::live::types::L2Delta {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            seq: 7,
+            timestamp_ms: 0,
+            changes: Vec::new(),
+        });
+        let first = ParsedL2Message {
+            event: base_event.clone(),
+            seq: 7,
+        };
+        let second = ParsedL2Message {
+            event: base_event,
+            seq: 7,
+        };
+        let first_outcome = tracker.on_message(first);
+        let second_outcome = tracker.on_message(second);
+        assert!(first_outcome.event.is_some());
+        assert!(second_outcome.event.is_some());
+    }
+
+    #[test]
+    fn order_book_channel_seq_always_increments() {
+        let value = serde_json::json!({
+            "channel": "order_book:1",
+            "offset": 10,
+            "timestamp": 1700000000123i64,
+            "order_book": {
+                "bids": [{"price":"100.0","size":"2.0"}],
+                "asks": [{"price":"101.0","size":"3.0"}]
+            }
+        });
+        let mut seq = 0u64;
+        let mut have_snapshot = false;
+        let first = decode_order_book_channel_message(
+            &value,
+            3,
+            "LIGHTER",
+            &mut seq,
+            &mut have_snapshot,
+        )
+        .expect("first");
+        let second = decode_order_book_channel_message(
+            &value,
+            3,
+            "LIGHTER",
+            &mut seq,
+            &mut have_snapshot,
+        )
+        .expect("second");
+        assert!(second.seq > first.seq);
     }
 }
 
