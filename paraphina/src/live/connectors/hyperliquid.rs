@@ -209,22 +209,26 @@ impl HyperliquidConnector {
             self.cfg.coin, self.cfg.n_sig_figs, self.cfg.n_levels
         );
         let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
-        let watchdog_freshness = self.freshness.clone();
-        tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_millis(HL_WATCHDOG_TICK_MS));
-            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                iv.tick().await;
-                let now = mono_now_ns();
-                let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
-                let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
-                let anchor = if last_pub != 0 { last_pub } else { last_parsed };
-                if anchor != 0 && age_ms(now, anchor) > HL_STALE_MS {
-                    let _ = stale_tx.send(());
-                    break;
+        if std::env::var_os("HL_FIXTURE_DIR").is_some() {
+            eprintln!("INFO: Hyperliquid fixture mode detected; freshness watchdog disabled");
+        } else {
+            let watchdog_freshness = self.freshness.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(Duration::from_millis(HL_WATCHDOG_TICK_MS));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    iv.tick().await;
+                    let now = mono_now_ns();
+                    let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
+                    let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
+                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    if anchor != 0 && age_ms(now, anchor) > HL_STALE_MS {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
                 }
-            }
-        });
+            });
+        }
         let (tx_int, mut rx_int) = tokio::sync::mpsc::channel::<MarketDataEvent>(HL_INTERNAL_PUB_Q);
         let pending_latest = Arc::new(tokio::sync::Mutex::new(None::<MarketDataEvent>));
         let forward_market_tx = self.market_tx.clone();
