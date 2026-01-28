@@ -226,14 +226,23 @@ impl HyperliquidConnector {
         });
         let (tx_int, mut rx_int) =
             tokio::sync::mpsc::channel::<MarketDataEvent>(HL_INTERNAL_PUB_Q);
+        let pending_latest = Arc::new(tokio::sync::Mutex::new(None::<MarketDataEvent>));
         let forward_market_tx = self.market_tx.clone();
         let forward_freshness = self.freshness.clone();
+        let forward_pending = pending_latest.clone();
         tokio::spawn(async move {
             while let Some(event) = rx_int.recv().await {
                 if forward_market_tx.send(event).await.is_ok() {
                     forward_freshness
                         .last_published_ns
                         .store(mono_now_ns(), Ordering::Relaxed);
+                }
+                if let Some(pending) = forward_pending.lock().await.take() {
+                    if forward_market_tx.send(pending).await.is_ok() {
+                        forward_freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -323,7 +332,19 @@ impl HyperliquidConnector {
                             freshness
                                 .last_parsed_ns
                                 .store(mono_now_ns(), Ordering::Relaxed);
-                            let _ = tx_int.try_send(snapshot);
+                            match tx_int.try_send(snapshot) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                                    if let Ok(mut guard) = pending_latest.try_lock() {
+                                        *guard = Some(event);
+                                    }
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    anyhow::bail!(
+                                        "Hyperliquid public WS internal publish queue closed"
+                                    );
+                                }
+                            }
                         }
                         continue;
                     }
@@ -340,7 +361,19 @@ impl HyperliquidConnector {
                                 eprintln!("INFO: Hyperliquid public WS first book update");
                                 first_book_update_logged = true;
                             }
-                            let _ = tx_int.try_send(event);
+                            match tx_int.try_send(event) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                                    if let Ok(mut guard) = pending_latest.try_lock() {
+                                        *guard = Some(event);
+                                    }
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    anyhow::bail!(
+                                        "Hyperliquid public WS internal publish queue closed"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
