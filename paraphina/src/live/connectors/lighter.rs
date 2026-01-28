@@ -760,13 +760,8 @@ fn decode_order_book_channel_message(
         Some(value) => parse_levels_from_objects(value)?,
         None => Vec::new(),
     };
-    let seq = value
-        .get("offset")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| {
-            *seq_fallback = seq_fallback.wrapping_add(1);
-            *seq_fallback
-        });
+    *seq_fallback = seq_fallback.wrapping_add(1);
+    let seq = *seq_fallback;
     let timestamp_ms = value
         .get("timestamp")
         .or_else(|| value.get("ts"))
@@ -802,7 +797,7 @@ fn decode_order_book_channel_message(
             size: level.size,
         });
     }
-    let delta = super::super::types::L2Delta {
+        let delta = super::super::types::L2Delta {
         venue_index,
         venue_id: venue_id.to_string(),
         seq,
@@ -1205,7 +1200,6 @@ mod tests {
                 .expect("delta");
         match parsed.event {
             MarketDataEvent::L2Delta(delta) => {
-                assert_eq!(delta.seq, 42);
                 assert_eq!(delta.changes.len(), 1);
                 assert_eq!(delta.changes[0].side, BookSide::Bid);
             }
@@ -1231,7 +1225,6 @@ mod tests {
                 .expect("delta");
         match parsed.event {
             MarketDataEvent::L2Delta(delta) => {
-                assert_eq!(delta.seq, 43);
                 assert_eq!(delta.changes.len(), 1);
                 assert_eq!(delta.changes[0].side, BookSide::Ask);
             }
@@ -1257,7 +1250,6 @@ mod tests {
                 .expect("delta");
         match parsed.event {
             MarketDataEvent::L2Delta(delta) => {
-                assert_eq!(delta.seq, 44);
                 assert_eq!(delta.changes.len(), 2);
                 assert_eq!(delta.changes[0].size, 0.0);
             }
@@ -1349,6 +1341,38 @@ mod tests {
         let second_outcome = tracker.on_message(second);
         assert!(first_outcome.event.is_some());
         assert!(second_outcome.event.is_some());
+    }
+
+    #[test]
+    fn order_book_channel_seq_always_increments() {
+        let value = serde_json::json!({
+            "channel": "order_book:1",
+            "offset": 10,
+            "timestamp": 1700000000123i64,
+            "order_book": {
+                "bids": [{"price":"100.0","size":"2.0"}],
+                "asks": [{"price":"101.0","size":"3.0"}]
+            }
+        });
+        let mut seq = 0u64;
+        let mut have_snapshot = false;
+        let first = decode_order_book_channel_message(
+            &value,
+            3,
+            "LIGHTER",
+            &mut seq,
+            &mut have_snapshot,
+        )
+        .expect("first");
+        let second = decode_order_book_channel_message(
+            &value,
+            3,
+            "LIGHTER",
+            &mut seq,
+            &mut have_snapshot,
+        )
+        .expect("second");
+        assert!(second.seq > first.seq);
     }
 }
 
