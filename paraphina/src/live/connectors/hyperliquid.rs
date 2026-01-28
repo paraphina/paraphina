@@ -29,7 +29,6 @@ struct Freshness {
     last_ws_rx_ns: AtomicU64,
     last_data_rx_ns: AtomicU64,
     last_parsed_ns: AtomicU64,
-    last_applied_ns: AtomicU64,
     last_published_ns: AtomicU64,
     last_snapshot_resync_ns: AtomicU64,
 }
@@ -226,8 +225,7 @@ impl HyperliquidConnector {
                 }
             }
         });
-        let (tx_int, mut rx_int) =
-            tokio::sync::mpsc::channel::<MarketDataEvent>(HL_INTERNAL_PUB_Q);
+        let (tx_int, mut rx_int) = tokio::sync::mpsc::channel::<MarketDataEvent>(HL_INTERNAL_PUB_Q);
         let pending_latest = Arc::new(tokio::sync::Mutex::new(None::<MarketDataEvent>));
         let forward_market_tx = self.market_tx.clone();
         let forward_freshness = self.freshness.clone();
@@ -247,7 +245,7 @@ impl HyperliquidConnector {
                 }
             }
         });
-        let mut try_publish = |event: MarketDataEvent| -> anyhow::Result<()> {
+        let try_publish = |event: MarketDataEvent| -> anyhow::Result<()> {
             match tx_int.try_send(event) {
                 Ok(()) => Ok(()),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
@@ -256,11 +254,9 @@ impl HyperliquidConnector {
                     }
                     Ok(())
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    Err(anyhow::anyhow!(
-                        "Hyperliquid public WS internal publish queue closed"
-                    ))
-                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(anyhow::anyhow!(
+                    "Hyperliquid public WS internal publish queue closed"
+                )),
             }
         };
         let mut tracker = L2SeqTracker::new();
@@ -963,37 +959,6 @@ fn parse_f64_value(value: &serde_json::Value) -> Option<f64> {
         return raw.parse::<f64>().ok();
     }
     None
-}
-
-fn decode_top_of_book(value: &serde_json::Value, _coin: &str) -> Option<TopOfBook> {
-    let channel = value.get("channel").and_then(|v| v.as_str())?;
-    if channel != "l2Book" {
-        return None;
-    }
-    let data = value.get("data")?;
-    let levels = data.get("levels")?;
-    let bids = parse_levels(levels.get(0)?)?;
-    let asks = parse_levels(levels.get(1)?)?;
-    let timestamp_ms = data.get("time").and_then(|v| v.as_i64());
-    let bid = bids.first()?;
-    let ask = asks.first()?;
-    if bid.size <= 0.0 || ask.size <= 0.0 {
-        return None;
-    }
-    if !bid.price.is_finite()
-        || !ask.price.is_finite()
-        || !bid.size.is_finite()
-        || !ask.size.is_finite()
-    {
-        return None;
-    }
-    Some(TopOfBook {
-        best_bid_px: bid.price,
-        best_bid_sz: bid.size,
-        best_ask_px: ask.price,
-        best_ask_sz: ask.size,
-        timestamp_ms,
-    })
 }
 
 fn decode_l2book_top(value: &serde_json::Value) -> Option<TopOfBook> {
