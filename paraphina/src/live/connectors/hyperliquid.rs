@@ -233,18 +233,17 @@ impl HyperliquidConnector {
         let forward_freshness = self.freshness.clone();
         let forward_pending = pending_latest.clone();
         tokio::spawn(async move {
-            while let Some(event) = rx_int.recv().await {
+            while let Some(mut event) = rx_int.recv().await {
+                while let Ok(next) = rx_int.try_recv() {
+                    event = next;
+                }
+                if let Some(pending) = forward_pending.lock().await.take() {
+                    event = pending;
+                }
                 if forward_market_tx.send(event).await.is_ok() {
                     forward_freshness
                         .last_published_ns
                         .store(mono_now_ns(), Ordering::Relaxed);
-                }
-                if let Some(pending) = forward_pending.lock().await.take() {
-                    if forward_market_tx.send(pending).await.is_ok() {
-                        forward_freshness
-                            .last_published_ns
-                            .store(mono_now_ns(), Ordering::Relaxed);
-                    }
                 }
             }
         });
