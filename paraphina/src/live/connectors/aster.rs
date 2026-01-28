@@ -152,6 +152,11 @@ impl AsterConnector {
         let mut first_size_raw_logged = false;
         let mut decode_miss_count = 0usize;
         let mut logged_non_utf8_binary = false;
+        let mut emit_seq: u64 = 0;
+        let mut next_seq = || {
+            emit_seq = emit_seq.wrapping_add(1);
+            emit_seq
+        };
         let mut last_applied_at = Instant::now();
         let mut last_watchdog_trigger_at: Option<Instant> = None;
         let mut watchdog = tokio::time::interval(Duration::from_millis(250));
@@ -211,7 +216,7 @@ impl AsterConnector {
                             MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
                                 venue_index: self.cfg.venue_index,
                                 venue_id: self.cfg.venue_id.clone(),
-                                seq: snapshot.last_update_id,
+                                seq: next_seq(),
                                 timestamp_ms: now_ms(),
                                 bids: snapshot.bids,
                                 asks: snapshot.asks,
@@ -233,6 +238,7 @@ impl AsterConnector {
                                             &update,
                                             self.cfg.venue_index,
                                             &self.cfg.venue_id,
+                                            next_seq(),
                                         ))
                                         .await
                                         .is_ok()
@@ -388,6 +394,7 @@ impl AsterConnector {
                                             &update,
                                             self.cfg.venue_index,
                                             &self.cfg.venue_id,
+                                            next_seq(),
                                         ))
                                         .await
                                         .is_ok()
@@ -436,6 +443,7 @@ impl AsterConnector {
                                             &update,
                                             self.cfg.venue_index,
                                             &self.cfg.venue_id,
+                                            next_seq(),
                                         ))
                                             .await
                                             .is_ok()
@@ -995,6 +1003,7 @@ fn delta_event_from_update(
     update: &AsterDepthUpdate,
     venue_index: usize,
     venue_id: &str,
+    seq: u64,
 ) -> MarketDataEvent {
     let mut changes = Vec::with_capacity(update.bids.len() + update.asks.len());
     changes.extend(update.bids.iter().cloned());
@@ -1002,7 +1011,7 @@ fn delta_event_from_update(
     MarketDataEvent::L2Delta(super::super::types::L2Delta {
         venue_index,
         venue_id: venue_id.to_string(),
-        seq: update.end_id,
+        seq,
         timestamp_ms: update.event_time.unwrap_or_else(now_ms),
         changes,
     })
