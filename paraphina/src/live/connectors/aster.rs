@@ -229,6 +229,7 @@ impl AsterConnector {
                                         .send(delta_event_from_update(
                                             &update,
                                             self.cfg.venue_index,
+                                            &self.cfg.venue_id,
                                         ))
                                         .await
                                         .is_ok()
@@ -361,7 +362,11 @@ impl AsterConnector {
                                     last_update_id = Some(update.end_id);
                                     if self
                                         .market_tx
-                                        .send(delta_event_from_update(&update, self.cfg.venue_index))
+                                        .send(delta_event_from_update(
+                                            &update,
+                                            self.cfg.venue_index,
+                                            &self.cfg.venue_id,
+                                        ))
                                         .await
                                         .is_ok()
                                     {
@@ -405,7 +410,11 @@ impl AsterConnector {
                                         last_update_id = Some(update.end_id);
                                         if self
                                             .market_tx
-                                            .send(delta_event_from_update(&update, self.cfg.venue_index))
+                                        .send(delta_event_from_update(
+                                            &update,
+                                            self.cfg.venue_index,
+                                            &self.cfg.venue_id,
+                                        ))
                                             .await
                                             .is_ok()
                                         {
@@ -871,17 +880,19 @@ struct AsterDepthUpdate {
     asks: Vec<BookLevelDelta>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AsterSeqState {
     last_update_id: u64,
     venue_index: usize,
+    venue_id: String,
 }
 
 impl AsterSeqState {
-    fn new(last_update_id: u64, venue_index: usize) -> Self {
+    fn new(last_update_id: u64, venue_index: usize, venue_id: &str) -> Self {
         Self {
             last_update_id,
             venue_index,
+            venue_id: venue_id.to_string(),
         }
     }
 
@@ -914,7 +925,7 @@ impl AsterSeqState {
         changes.extend(update.asks.iter().cloned());
         let event = MarketDataEvent::L2Delta(super::super::types::L2Delta {
             venue_index: self.venue_index,
-            venue_id: update.symbol.clone(),
+            venue_id: self.venue_id.clone(),
             seq: update.end_id,
             timestamp_ms: update.event_time.unwrap_or_else(now_ms),
             changes,
@@ -952,13 +963,17 @@ fn seq_decision_lenient(last_update_id: u64, update: &AsterDepthUpdate) -> SeqDe
     }
 }
 
-fn delta_event_from_update(update: &AsterDepthUpdate, venue_index: usize) -> MarketDataEvent {
+fn delta_event_from_update(
+    update: &AsterDepthUpdate,
+    venue_index: usize,
+    venue_id: &str,
+) -> MarketDataEvent {
     let mut changes = Vec::with_capacity(update.bids.len() + update.asks.len());
     changes.extend(update.bids.iter().cloned());
     changes.extend(update.asks.iter().cloned());
     MarketDataEvent::L2Delta(super::super::types::L2Delta {
         venue_index,
-        venue_id: update.symbol.clone(),
+        venue_id: venue_id.to_string(),
         seq: update.end_id,
         timestamp_ms: update.event_time.unwrap_or_else(now_ms),
         changes,
@@ -1445,7 +1460,7 @@ mod tests {
             std::fs::read_to_string(fixture_dir.join("ws_frames.jsonl")).expect("ws frames");
 
         let collect_events = |snapshot_id: u64| -> Vec<MarketDataEvent> {
-            let mut state = AsterSeqState::new(snapshot_id, 0);
+            let mut state = AsterSeqState::new(snapshot_id, 0, "ASTER");
             let mut events = Vec::new();
             for line in frames.lines() {
                 let trimmed = line.trim();
