@@ -25,6 +25,11 @@ fn multi_connector_fixture_run_is_deterministic_and_healthy() {
         .join("lighter");
 
     let output = Command::new(env!("CARGO_BIN_EXE_paraphina_live"))
+        .env_remove("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
+        .env_remove("PARAPHINA_LIVE_RECONCILE_MS")
+        .env_remove("PARAPHINA_LIVE_KILL_FLATTEN")
+        .env_remove("PARAPHINA_LIVE_KILL_SWITCH")
+        .env_remove("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
         .env("PARAPHINA_TRADE_MODE", "paper")
         .env("PARAPHINA_LIVE_CONNECTORS", "hyperliquid_fixture,lighter")
         .env("HL_FIXTURE_DIR", &hl_fixture_dir)

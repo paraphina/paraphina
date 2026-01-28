@@ -7,8 +7,39 @@ pub const SUPPORTS_MARKET: bool = true;
 pub const SUPPORTS_ACCOUNT: bool = true;
 pub const SUPPORTS_EXECUTION: bool = true;
 
+const HL_STALE_MS: u64 = 1800;
+const HL_WATCHDOG_TICK_MS: u64 = 200;
+const HL_SNAPSHOT_COOLDOWN_MS: u64 = 8_000;
+const HL_INTERNAL_PUB_Q: usize = 256;
+const HL_DELTA_BOOTSTRAP_BUF: usize = 1024;
+
+static MONO_START: OnceLock<Instant> = OnceLock::new();
+
+fn mono_now_ns() -> u64 {
+    let start = MONO_START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as u64
+}
+
+fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
+    now_ns.saturating_sub(then_ns) / 1_000_000
+}
+
+#[derive(Debug, Default)]
+struct Freshness {
+    last_ws_rx_ns: AtomicU64,
+    last_data_rx_ns: AtomicU64,
+    last_parsed_ns: AtomicU64,
+    last_published_ns: AtomicU64,
+    last_snapshot_resync_ns: AtomicU64,
+}
+
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use k256::ecdsa::SigningKey;
@@ -115,6 +146,7 @@ pub struct HyperliquidConnector {
     exec_tx: mpsc::Sender<ExecutionEvent>,
     account_tx: Option<mpsc::Sender<AccountEvent>>,
     asset_index: tokio::sync::Mutex<Option<u32>>,
+    freshness: Arc<Freshness>,
 }
 
 impl HyperliquidConnector {
@@ -130,6 +162,7 @@ impl HyperliquidConnector {
             exec_tx,
             account_tx: None,
             asset_index: tokio::sync::Mutex::new(None),
+            freshness: Arc::new(Freshness::default()),
         }
     }
 
@@ -150,6 +183,7 @@ impl HyperliquidConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
+        let freshness = self.freshness.clone();
         eprintln!(
             "INFO: Hyperliquid public WS connecting url={}",
             self.cfg.ws_url
@@ -174,6 +208,61 @@ impl HyperliquidConnector {
             "INFO: Hyperliquid public WS subscribed coin={} nSigFigs={} nLevels={}",
             self.cfg.coin, self.cfg.n_sig_figs, self.cfg.n_levels
         );
+        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        if std::env::var_os("HL_FIXTURE_DIR").is_some() {
+            eprintln!("INFO: Hyperliquid fixture mode detected; freshness watchdog disabled");
+        } else {
+            let watchdog_freshness = self.freshness.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(Duration::from_millis(HL_WATCHDOG_TICK_MS));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    iv.tick().await;
+                    let now = mono_now_ns();
+                    let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
+                    let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
+                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    if anchor != 0 && age_ms(now, anchor) > HL_STALE_MS {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
+        let (tx_int, mut rx_int) = tokio::sync::mpsc::channel::<MarketDataEvent>(HL_INTERNAL_PUB_Q);
+        let pending_latest = Arc::new(tokio::sync::Mutex::new(None::<MarketDataEvent>));
+        let forward_market_tx = self.market_tx.clone();
+        let forward_freshness = self.freshness.clone();
+        let forward_pending = pending_latest.clone();
+        tokio::spawn(async move {
+            while let Some(mut event) = rx_int.recv().await {
+                while let Ok(next) = rx_int.try_recv() {
+                    event = next;
+                }
+                if let Some(pending) = forward_pending.lock().await.take() {
+                    event = pending;
+                }
+                if forward_market_tx.send(event).await.is_ok() {
+                    forward_freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
+                }
+            }
+        });
+        let try_publish = |event: MarketDataEvent| -> anyhow::Result<()> {
+            match tx_int.try_send(event) {
+                Ok(()) => Ok(()),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                    if let Ok(mut guard) = pending_latest.try_lock() {
+                        *guard = Some(event);
+                    }
+                    Ok(())
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(anyhow::anyhow!(
+                    "Hyperliquid public WS internal publish queue closed"
+                )),
+            }
+        };
         let mut tracker = L2SeqTracker::new();
         let mut l2_seq_fallback: u64 = 0;
         let mut first_book_update_logged = false;
@@ -181,86 +270,145 @@ impl HyperliquidConnector {
         let mut logged_non_utf8_binary = false;
         let mut first_decoded_top_logged = false;
         let mut decode_miss_count = 0usize;
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
-            let payload = match msg {
-                Message::Text(text) => text,
-                Message::Binary(bytes) => match String::from_utf8(bytes) {
-                    Ok(text) => text,
-                    Err(_) => {
-                        if !logged_non_utf8_binary {
+        let mut have_baseline = false;
+        let mut delta_buf: VecDeque<MarketDataEvent> = VecDeque::new();
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stale_rx => {
+                    anyhow::bail!("Hyperliquid public WS stale: freshness exceeded HL_STALE_MS");
+                }
+                maybe = read.next() => {
+                    let Some(msg) = maybe else { break; };
+                    let msg = msg?;
+                    freshness
+                        .last_ws_rx_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
+                    let payload = match msg {
+                        Message::Text(text) => text,
+                        Message::Binary(bytes) => match String::from_utf8(bytes) {
+                            Ok(text) => text,
+                            Err(_) => {
+                                if !logged_non_utf8_binary {
+                                    eprintln!(
+                                        "WARN: Hyperliquid public WS non-utf8 binary frame url={}",
+                                        self.cfg.ws_url
+                                    );
+                                    logged_non_utf8_binary = true;
+                                }
+                                continue;
+                            }
+                        },
+                        _ => continue,
+                    };
+                    if !first_message_logged {
+                        eprintln!("INFO: Hyperliquid public WS first message received");
+                        first_message_logged = true;
+                    }
+                    let value = match serde_json::from_str::<serde_json::Value>(&payload) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let snippet: String = payload.chars().take(160).collect();
                             eprintln!(
-                                "WARN: Hyperliquid public WS non-utf8 binary frame url={}",
-                                self.cfg.ws_url
+                                "WARN: Hyperliquid public WS parse error: {err} url={} snippet={}",
+                                self.cfg.ws_url, snippet
                             );
-                            logged_non_utf8_binary = true;
+                            continue;
+                        }
+                    };
+                    let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                    if channel == "subscriptionResponse" {
+                        continue;
+                    }
+                    if channel == "l2Book" {
+                        freshness
+                            .last_data_rx_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
+                        if let Some(top) = decode_l2book_top(&value) {
+                            if !first_decoded_top_logged {
+                                eprintln!(
+                                    "FIRST_DECODED_TOP venue=hyperliquid bid_px={} bid_sz={} ask_px={} ask_sz={}",
+                                    top.best_bid_px, top.best_bid_sz, top.best_ask_px, top.best_ask_sz
+                                );
+                                first_decoded_top_logged = true;
+                            }
+                        } else if decode_miss_count < 3 {
+                            decode_miss_count += 1;
+                            log_decode_miss(
+                                "Hyperliquid",
+                                &value,
+                                &payload,
+                                decode_miss_count,
+                                self.cfg.ws_url.as_str(),
+                            );
+                        }
+                        if let Some(snapshot) = decode_l2book_snapshot(
+                            &value,
+                            self.cfg.venue_index,
+                            self.cfg.coin.as_str(),
+                            &mut l2_seq_fallback,
+                        ) {
+                            freshness
+                                .last_parsed_ns
+                                .store(mono_now_ns(), Ordering::Relaxed);
+                            have_baseline = true;
+                            while let Some(buffered) = delta_buf.pop_front() {
+                                try_publish(buffered)?;
+                            }
+                            try_publish(snapshot)?;
                         }
                         continue;
                     }
-                },
-                _ => continue,
-            };
-            if !first_message_logged {
-                eprintln!("INFO: Hyperliquid public WS first message received");
-                first_message_logged = true;
-            }
-            let value = match serde_json::from_str::<serde_json::Value>(&payload) {
-                Ok(value) => value,
-                Err(err) => {
-                    let snippet: String = payload.chars().take(160).collect();
-                    eprintln!(
-                        "WARN: Hyperliquid public WS parse error: {err} url={} snippet={}",
-                        self.cfg.ws_url, snippet
-                    );
-                    continue;
-                }
-            };
-            let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-            if channel == "subscriptionResponse" {
-                continue;
-            }
-            if channel == "l2Book" {
-                if let Some(top) = decode_l2book_top(&value) {
-                    if !first_decoded_top_logged {
-                        eprintln!(
-                            "FIRST_DECODED_TOP venue=hyperliquid bid_px={} bid_sz={} ask_px={} ask_sz={}",
-                            top.best_bid_px, top.best_bid_sz, top.best_ask_px, top.best_ask_sz
-                        );
-                        first_decoded_top_logged = true;
+                    if let Some(parsed) = parse_l2_message_value(&value, self.cfg.venue_index) {
+                        freshness
+                            .last_parsed_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
+                        let outcome = tracker.on_message(parsed);
+                        if let Some(seq) = outcome.refresh_snapshot {
+                        if let Some(snapshot) = self.refresh_snapshot(seq).await {
+                            if matches!(&snapshot, MarketDataEvent::L2Snapshot(_)) {
+                                have_baseline = true;
+                                while let Some(buffered) = delta_buf.pop_front() {
+                                    try_publish(buffered)?;
+                                }
+                            }
+                            try_publish(snapshot)?;
+                        }
+                        }
+                        if let Some(event) = outcome.event {
+                            if !first_book_update_logged {
+                                eprintln!("INFO: Hyperliquid public WS first book update");
+                                first_book_update_logged = true;
+                            }
+                        match event {
+                            MarketDataEvent::L2Delta(_) if !have_baseline => {
+                                delta_buf.push_back(event);
+                                if delta_buf.len() > HL_DELTA_BOOTSTRAP_BUF {
+                                    delta_buf.clear();
+                                    if let Some(snapshot) = self.refresh_snapshot(0).await {
+                                    if matches!(&snapshot, MarketDataEvent::L2Snapshot(_)) {
+                                            have_baseline = true;
+                                            while let Some(buffered) = delta_buf.pop_front() {
+                                                try_publish(buffered)?;
+                                            }
+                                        }
+                                        try_publish(snapshot)?;
+                                    }
+                                }
+                            }
+                            MarketDataEvent::L2Snapshot(_) => {
+                                have_baseline = true;
+                                while let Some(buffered) = delta_buf.pop_front() {
+                                    try_publish(buffered)?;
+                                }
+                                try_publish(event)?;
+                            }
+                            _ => {
+                                try_publish(event)?;
+                            }
+                        }
+                        }
                     }
-                } else if decode_miss_count < 3 {
-                    decode_miss_count += 1;
-                    log_decode_miss(
-                        "Hyperliquid",
-                        &value,
-                        &payload,
-                        decode_miss_count,
-                        self.cfg.ws_url.as_str(),
-                    );
-                }
-                if let Some(snapshot) = decode_l2book_snapshot(
-                    &value,
-                    self.cfg.venue_index,
-                    self.cfg.coin.as_str(),
-                    &mut l2_seq_fallback,
-                ) {
-                    if let Err(err) = self.market_tx.send(snapshot).await {
-                        eprintln!("Hyperliquid public WS market send failed: {err}");
-                    }
-                }
-                continue;
-            }
-            if let Some(parsed) = parse_l2_message_value(&value, self.cfg.venue_index) {
-                let outcome = tracker.on_message(parsed);
-                if let Some(seq) = outcome.refresh_snapshot {
-                    self.refresh_snapshot(seq).await;
-                }
-                if let Some(event) = outcome.event {
-                    if !first_book_update_logged {
-                        eprintln!("INFO: Hyperliquid public WS first book update");
-                        first_book_update_logged = true;
-                    }
-                    let _ = self.market_tx.send(event).await;
                 }
             }
         }
@@ -329,12 +477,24 @@ impl HyperliquidConnector {
         }
     }
 
-    async fn refresh_snapshot(&self, seq: u64) {
+    async fn refresh_snapshot(&self, seq: u64) -> Option<MarketDataEvent> {
+        let now = mono_now_ns();
+        let last = self
+            .freshness
+            .last_snapshot_resync_ns
+            .load(Ordering::Relaxed);
+        if last != 0 && age_ms(now, last) < HL_SNAPSHOT_COOLDOWN_MS {
+            return None;
+        }
+        self.freshness
+            .last_snapshot_resync_ns
+            .store(now, Ordering::Relaxed);
         if let Ok(snapshot) = fetch_l2_snapshot(&self.http, &self.cfg).await {
-            let _ = self.market_tx.send(snapshot).await;
+            return Some(snapshot);
         } else {
             eprintln!("Hyperliquid snapshot refresh failed at seq={seq}");
         }
+        None
     }
 
     pub async fn place_order(
@@ -803,37 +963,6 @@ fn parse_f64_value(value: &serde_json::Value) -> Option<f64> {
         return raw.parse::<f64>().ok();
     }
     None
-}
-
-fn decode_top_of_book(value: &serde_json::Value, _coin: &str) -> Option<TopOfBook> {
-    let channel = value.get("channel").and_then(|v| v.as_str())?;
-    if channel != "l2Book" {
-        return None;
-    }
-    let data = value.get("data")?;
-    let levels = data.get("levels")?;
-    let bids = parse_levels(levels.get(0)?)?;
-    let asks = parse_levels(levels.get(1)?)?;
-    let timestamp_ms = data.get("time").and_then(|v| v.as_i64());
-    let bid = bids.first()?;
-    let ask = asks.first()?;
-    if bid.size <= 0.0 || ask.size <= 0.0 {
-        return None;
-    }
-    if !bid.price.is_finite()
-        || !ask.price.is_finite()
-        || !bid.size.is_finite()
-        || !ask.size.is_finite()
-    {
-        return None;
-    }
-    Some(TopOfBook {
-        best_bid_px: bid.price,
-        best_bid_sz: bid.size,
-        best_ask_px: ask.price,
-        best_ask_sz: ask.size,
-        timestamp_ms,
-    })
 }
 
 fn decode_l2book_top(value: &serde_json::Value) -> Option<TopOfBook> {
