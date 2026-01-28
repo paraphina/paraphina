@@ -628,8 +628,14 @@ fn decode_order_book_snapshot(
         .or_else(|| value.get("orderBook"))
         .or_else(|| value.get("data").and_then(|v| v.get("order_book")))
         .or_else(|| value.get("data").and_then(|v| v.get("orderBook")))?;
-    let bids = parse_levels_from_objects(order_book.get("bids")?)?;
-    let asks = parse_levels_from_objects(order_book.get("asks")?)?;
+    let bids = match order_book.get("bids") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
+    let asks = match order_book.get("asks") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
     let seq = value
         .get("seq")
         .and_then(|v| v.as_u64())
@@ -662,8 +668,14 @@ fn decode_order_book_top(value: &serde_json::Value) -> Option<TopOfBook> {
         .or_else(|| value.get("orderBook"))
         .or_else(|| value.get("data").and_then(|v| v.get("order_book")))
         .or_else(|| value.get("data").and_then(|v| v.get("orderBook")))?;
-    let bids = parse_levels_from_objects(order_book.get("bids")?)?;
-    let asks = parse_levels_from_objects(order_book.get("asks")?)?;
+    let bids = match order_book.get("bids") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
+    let asks = match order_book.get("asks") {
+        Some(value) => parse_levels_from_objects(value)?,
+        None => Vec::new(),
+    };
     TopOfBook::from_levels(
         &bids,
         &asks,
@@ -980,6 +992,67 @@ mod tests {
         match parsed.event {
             MarketDataEvent::L2Snapshot(snapshot) => {
                 assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn order_book_snapshot_allows_empty_bids() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [],
+                "asks": [{"price":"101.0","size":"3.0"}]
+            }
+        });
+        let mut seq = 0u64;
+        let parsed = decode_order_book_snapshot(&value, 3, "LIGHTER", &mut seq).expect("snap");
+        match parsed.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert!(snapshot.bids.is_empty());
+                assert_eq!(snapshot.asks.len(), 1);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn order_book_snapshot_allows_empty_asks() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [{"price":"100.0","size":"2.0"}],
+                "asks": []
+            }
+        });
+        let mut seq = 0u64;
+        let parsed = decode_order_book_snapshot(&value, 3, "LIGHTER", &mut seq).expect("snap");
+        match parsed.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.bids.len(), 1);
+                assert!(snapshot.asks.is_empty());
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn order_book_snapshot_allows_zero_size_level() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [{"price":"100.0","size":"0.00000"}],
+                "asks": [{"price":"101.0","size":"1.00000"}]
+            }
+        });
+        let mut seq = 0u64;
+        let parsed = decode_order_book_snapshot(&value, 3, "LIGHTER", &mut seq).expect("snap");
+        match parsed.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.bids.len(), 1);
+                assert_eq!(snapshot.bids[0].size, 0.0);
+                assert_eq!(snapshot.asks.len(), 1);
             }
             _ => panic!("expected snapshot"),
         }
