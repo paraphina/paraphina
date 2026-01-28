@@ -312,6 +312,27 @@ impl AsterConnector {
                             _ => {}
                         }
                     }
+                    _ = watchdog.tick() => {
+                        let now = Instant::now();
+                        let stale = now.duration_since(last_applied_at);
+                        let cooldown_ok = last_watchdog_trigger_at
+                            .map(|last| now.duration_since(last) >= Duration::from_millis(COOLDOWN_MS))
+                            .unwrap_or(true);
+                        if stale > Duration::from_millis(STALE_MS)
+                            && (cooldown_ok || stale >= Duration::from_millis(15_000))
+                        {
+                            eprintln!(
+                                "WARN: Aster WS stale; resyncing url={} stale_ms={}",
+                                self.cfg.ws_url,
+                                stale.as_millis()
+                            );
+                            buffered_updates.clear();
+                            last_update_id = None;
+                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                            last_watchdog_trigger_at = Some(now);
+                            continue;
+                        }
+                    }
                 }
                 continue;
             }
