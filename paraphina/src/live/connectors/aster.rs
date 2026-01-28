@@ -147,6 +147,7 @@ impl AsterConnector {
         let mut first_decoded_top_logged = false;
         let mut first_size_raw_logged = false;
         let mut decode_miss_count = 0usize;
+        let mut logged_non_utf8_binary = false;
 
         loop {
             if last_update_id.is_none() {
@@ -259,6 +260,34 @@ impl AsterConnector {
                                     }
                                 }
                             }
+                            Message::Binary(bytes) => match String::from_utf8(bytes) {
+                                Ok(text) => {
+                                    if let Some(recorder) = self.recorder.as_ref() {
+                                        let mut guard = recorder.lock().await;
+                                        let _ = guard.record_ws_frame(&text);
+                                    }
+                                    if let Some(update) = parse_depth_update(&text) {
+                                        buffered_updates.push(update);
+                                        if buffered_updates.len() > MAX_BUFFERED_UPDATES {
+                                            eprintln!(
+                                                "Aster WS buffer overflow; resyncing url={}",
+                                                self.cfg.ws_url
+                                            );
+                                            buffered_updates.clear();
+                                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    if !logged_non_utf8_binary {
+                                        eprintln!(
+                                            "WARN: Aster public WS non-utf8 binary frame url={}",
+                                            self.cfg.ws_url
+                                        );
+                                        logged_non_utf8_binary = true;
+                                    }
+                                }
+                            },
                             Message::Ping(payload) => {
                                 write.send(Message::Pong(payload)).await?;
                             }
@@ -317,6 +346,56 @@ impl AsterConnector {
                         }
                     }
                 }
+                Message::Binary(bytes) => match String::from_utf8(bytes) {
+                    Ok(text) => {
+                        if let Some(recorder) = self.recorder.as_ref() {
+                            let mut guard = recorder.lock().await;
+                            let _ = guard.record_ws_frame(&text);
+                        }
+                        let Some(update) = parse_depth_update(&text) else {
+                            continue;
+                        };
+                        if !symbol_matches(&update.symbol, &self.cfg.market) {
+                            continue;
+                        }
+                        let current_last = last_update_id.unwrap_or_default();
+                        match seq_decision_lenient(current_last, &update) {
+                            SeqDecision::Apply => {
+                                last_update_id = Some(update.end_id);
+                                let _ = self
+                                    .market_tx
+                                    .send(delta_event_from_update(&update, self.cfg.venue_index))
+                                    .await;
+                            }
+                            SeqDecision::Stale => {}
+                            SeqDecision::Gap => {
+                                if last_gap_log.elapsed() > Duration::from_secs(30) {
+                                    eprintln!(
+                                        "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
+                                        current_last,
+                                        update.prev_id,
+                                        update.start_id,
+                                        update.end_id,
+                                        self.cfg.ws_url
+                                    );
+                                    last_gap_log = Instant::now();
+                                }
+                                buffered_updates.clear();
+                                last_update_id = None;
+                                snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if !logged_non_utf8_binary {
+                            eprintln!(
+                                "WARN: Aster public WS non-utf8 binary frame url={}",
+                                self.cfg.ws_url
+                            );
+                            logged_non_utf8_binary = true;
+                        }
+                    }
+                },
                 Message::Ping(payload) => {
                     write.send(Message::Pong(payload)).await?;
                 }
