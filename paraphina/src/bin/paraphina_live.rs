@@ -28,7 +28,7 @@ use paraphina::live::types::L2Snapshot;
 use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
 use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
-use reqwest::Url;
+use url::Url;
 use serde::Deserialize;
 use std::path::PathBuf;
 

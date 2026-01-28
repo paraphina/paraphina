@@ -48,6 +48,7 @@ futures-util = { version = "0.3", optional = true }
 prometheus = { version = "0.13", optional = true }
 tiny_http = { version = "0.12", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+url = { version = "2", optional = true }
 rmp-serde = { version = "1.3", optional = true }
 k256 = { version = "0.13", features = ["ecdsa"], optional = true }
 sha3 = { version = "0.10", optional = true }
@@ -64,7 +65,7 @@ roadmap_b = []
 # Feature-flagged event log writer (JSONL of normalized execution events).
 event_log = []
 legacy_runner = []
-live = ["tokio", "tokio-tungstenite", "futures-util", "prometheus", "tiny_http", "event_log"]
+live = ["tokio", "tokio-tungstenite", "futures-util", "prometheus", "tiny_http", "event_log", "url"]
 live_hyperliquid = ["live", "reqwest", "rmp-serde", "k256", "sha3", "hex"]
 live_lighter = ["live", "reqwest"]
 live_paradex = ["live", "reqwest"]
