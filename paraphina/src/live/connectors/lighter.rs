@@ -212,9 +212,28 @@ impl LighterConnector {
         let mut first_decoded_top_logged = false;
         let mut decode_miss_count = 0usize;
         let mut seq_fallback: u64 = 0;
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
+        loop {
+            let msg = match read.next().await {
+                Some(Ok(msg)) => msg,
+                Some(Err(err)) => {
+                    eprintln!("Lighter public WS read error: {err}");
+                    break;
+                }
+                None => {
+                    eprintln!("Lighter public WS stream ended");
+                    break;
+                }
+            };
             let payload = match msg {
+                Message::Ping(payload) => {
+                    let _ = write.send(Message::Pong(payload)).await;
+                    continue;
+                }
+                Message::Pong(_) => continue,
+                Message::Close(frame) => {
+                    eprintln!("Lighter public WS closed frame={frame:?}");
+                    break;
+                }
                 Message::Text(text) => text,
                 Message::Binary(bytes) => match String::from_utf8(bytes) {
                     Ok(text) => text,
