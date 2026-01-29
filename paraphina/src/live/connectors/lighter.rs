@@ -25,7 +25,10 @@ struct Freshness {
 }
 
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::AtomicU64, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -99,6 +102,7 @@ pub struct LighterConnector {
     market_tx: mpsc::Sender<MarketDataEvent>,
     exec_tx: mpsc::Sender<ExecutionEvent>,
     account_tx: Option<mpsc::Sender<AccountEvent>>,
+    freshness: Arc<Freshness>,
 }
 
 impl LighterConnector {
@@ -113,6 +117,7 @@ impl LighterConnector {
             market_tx,
             exec_tx,
             account_tx: None,
+            freshness: Arc::new(Freshness::default()),
         }
     }
 
@@ -246,6 +251,9 @@ impl LighterConnector {
                     break;
                 }
             };
+            self.freshness
+                .last_ws_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             let payload = match msg {
                 Message::Ping(payload) => {
                     let _ = write.send(Message::Pong(payload)).await;
@@ -272,6 +280,9 @@ impl LighterConnector {
                 },
                 _ => continue,
             };
+            self.freshness
+                .last_data_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             if !first_message_logged {
                 eprintln!("INFO: Lighter public WS first message received");
                 first_message_logged = true;
@@ -348,6 +359,9 @@ impl LighterConnector {
                     &mut seq_fallback,
                     &mut have_snapshot,
                 ) {
+                    self.freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
                         if !first_book_update_logged {
@@ -366,6 +380,9 @@ impl LighterConnector {
                     &self.cfg.venue_id,
                     &mut seq_fallback,
                 ) {
+                    self.freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
                         if !first_book_update_logged {
