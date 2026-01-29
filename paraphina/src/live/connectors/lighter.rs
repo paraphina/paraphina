@@ -5,6 +5,9 @@ pub const SUPPORTS_MARKET: bool = true;
 pub const SUPPORTS_ACCOUNT: bool = true;
 pub const SUPPORTS_EXECUTION: bool = true;
 
+const LIGHTER_STALE_MS: u64 = 1800;
+const LIGHTER_WATCHDOG_TICK_MS: u64 = 200;
+
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
 fn mono_now_ns() -> u64 {
@@ -240,16 +243,48 @@ impl LighterConnector {
         let mut decode_miss_count = 0usize;
         let mut seq_fallback: u64 = 0;
         let mut have_snapshot = false;
-        loop {
-            let msg = match read.next().await {
-                Some(Ok(msg)) => msg,
-                Some(Err(err)) => {
-                    eprintln!("Lighter public WS read error: {err}");
-                    break;
+        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        if std::env::var_os("LIGHTER_FIXTURE_DIR").is_some() {
+            eprintln!("INFO: Lighter fixture mode detected; freshness watchdog disabled");
+        } else {
+            let watchdog_freshness = self.freshness.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(Duration::from_millis(LIGHTER_WATCHDOG_TICK_MS));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    iv.tick().await;
+                    let now = mono_now_ns();
+                    let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
+                    let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
+                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    if anchor == 0 {
+                        continue;
+                    }
+                    if age_ms(now, anchor) > LIGHTER_STALE_MS {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
                 }
-                None => {
-                    eprintln!("Lighter public WS stream ended");
-                    break;
+            });
+        }
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = &mut stale_rx => {
+                    anyhow::bail!("Lighter public WS stale: freshness exceeded LIGHTER_STALE_MS");
+                }
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(err)) => {
+                            eprintln!("Lighter public WS read error: {err}");
+                            break;
+                        }
+                        None => {
+                            eprintln!("Lighter public WS stream ended");
+                            break;
+                        }
+                    }
                 }
             };
             self.freshness
