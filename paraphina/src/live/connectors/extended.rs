@@ -9,6 +9,9 @@ pub const SUPPORTS_ACCOUNT: bool = true;
 #[cfg(feature = "live_extended")]
 pub const SUPPORTS_EXECUTION: bool = true;
 
+const EXTENDED_STALE_MS: u64 = 1800;
+const EXTENDED_WATCHDOG_TICK_MS: u64 = 200;
+
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
 fn mono_now_ns() -> u64 {
@@ -246,8 +249,41 @@ impl ExtendedConnector {
         let mut no_book_warned = false;
         let mut first_ws_keys: Option<String> = None;
         let mut first_ws_snippet: Option<String> = None;
+        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        let fixture_mode = std::env::var_os("EXTENDED_FIXTURE_DIR").is_some()
+            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some()
+            || std::env::var("EXTENDED_FIXTURE_MODE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        if fixture_mode {
+            eprintln!("INFO: Extended fixture mode detected; freshness watchdog disabled");
+        } else {
+            let watchdog_freshness = self.freshness.clone();
+            tokio::spawn(async move {
+                let mut iv =
+                    tokio::time::interval(Duration::from_millis(EXTENDED_WATCHDOG_TICK_MS));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    iv.tick().await;
+                    let now = mono_now_ns();
+                    let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
+                    let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
+                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    if anchor != 0 && age_ms(now, anchor) > EXTENDED_STALE_MS {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
         loop {
-            let next = tokio::time::timeout(Duration::from_secs(10), read.next()).await;
+            let next = tokio::select! {
+                biased;
+                _ = &mut stale_rx => {
+                    anyhow::bail!("Extended public WS stale: freshness exceeded EXTENDED_STALE_MS");
+                }
+                next = tokio::time::timeout(Duration::from_secs(10), read.next()) => next,
+            };
             let msg = match next {
                 Ok(Some(msg)) => msg?,
                 Ok(None) => break,
