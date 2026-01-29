@@ -1,8 +1,40 @@
 //! Paradex connector (public WS market data + fixtures, feature-gated).
 
+#[cfg(feature = "live_paradex")]
+pub const STUB_CONNECTOR: bool = false;
+#[cfg(feature = "live_paradex")]
+pub const SUPPORTS_MARKET: bool = true;
+#[cfg(feature = "live_paradex")]
+pub const SUPPORTS_ACCOUNT: bool = true;
+#[cfg(feature = "live_paradex")]
+pub const SUPPORTS_EXECUTION: bool = true;
+
+static MONO_START: OnceLock<Instant> = OnceLock::new();
+
+fn mono_now_ns() -> u64 {
+    let start = MONO_START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as u64
+}
+
+#[allow(dead_code)]
+fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
+    now_ns.saturating_sub(then_ns) / 1_000_000
+}
+
+#[derive(Debug, Default)]
+struct Freshness {
+    last_ws_rx_ns: AtomicU64,
+    last_data_rx_ns: AtomicU64,
+    last_parsed_ns: AtomicU64,
+    last_published_ns: AtomicU64,
+}
+
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -23,15 +55,6 @@ use super::super::types::{
     MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::types::{Side, TimeInForce, TimestampMs};
-
-#[cfg(feature = "live_paradex")]
-pub const STUB_CONNECTOR: bool = false;
-#[cfg(feature = "live_paradex")]
-pub const SUPPORTS_MARKET: bool = true;
-#[cfg(feature = "live_paradex")]
-pub const SUPPORTS_ACCOUNT: bool = true;
-#[cfg(feature = "live_paradex")]
-pub const SUPPORTS_EXECUTION: bool = true;
 
 #[derive(Debug, Clone)]
 pub struct ParadexConfig {
@@ -94,6 +117,7 @@ pub struct ParadexConnector {
     http: Client,
     market_tx: mpsc::Sender<MarketDataEvent>,
     recorder: Option<Mutex<ParadexRecorder>>,
+    freshness: Arc<Freshness>,
 }
 
 impl ParadexConnector {
@@ -108,6 +132,7 @@ impl ParadexConnector {
             http: Client::new(),
             market_tx,
             recorder,
+            freshness: Arc::new(Freshness::default()),
         }
     }
 
@@ -147,6 +172,9 @@ impl ParadexConnector {
         let mut bbo_seq: u64 = 0;
         while let Some(msg) = read.next().await {
             let msg = msg?;
+            self.freshness
+                .last_ws_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             let payload = match msg {
                 Message::Text(text) => text,
                 Message::Binary(bytes) => match String::from_utf8(bytes) {
@@ -168,6 +196,9 @@ impl ParadexConnector {
                 }
                 _ => continue,
             };
+            self.freshness
+                .last_data_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             if !first_message_logged {
                 eprintln!("INFO: Paradex public WS first message received");
                 first_message_logged = true;
@@ -230,6 +261,12 @@ impl ParadexConnector {
                     eprintln!("INFO: Paradex public WS first book update");
                     first_book_update_logged = true;
                 }
+                self.freshness
+                    .last_parsed_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
+                self.freshness
+                    .last_published_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
                 if let Err(err) = self.market_tx.send(snapshot).await {
                     eprintln!("Paradex public WS market send failed: {err}");
                 }
@@ -262,6 +299,12 @@ impl ParadexConnector {
                     eprintln!("INFO: Paradex public WS first book update");
                     first_book_update_logged = true;
                 }
+                self.freshness
+                    .last_parsed_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
+                self.freshness
+                    .last_published_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
                 let _ = self.market_tx.send(event).await;
             }
         }
