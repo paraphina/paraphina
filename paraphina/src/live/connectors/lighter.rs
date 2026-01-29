@@ -5,8 +5,35 @@ pub const SUPPORTS_MARKET: bool = true;
 pub const SUPPORTS_ACCOUNT: bool = true;
 pub const SUPPORTS_EXECUTION: bool = true;
 
+const LIGHTER_STALE_MS: u64 = 1800;
+const LIGHTER_WATCHDOG_TICK_MS: u64 = 200;
+
+static MONO_START: OnceLock<Instant> = OnceLock::new();
+
+fn mono_now_ns() -> u64 {
+    let start = MONO_START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as u64
+}
+
+#[allow(dead_code)]
+fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
+    now_ns.saturating_sub(then_ns) / 1_000_000
+}
+
+#[derive(Debug, Default)]
+struct Freshness {
+    last_ws_rx_ns: AtomicU64,
+    last_data_rx_ns: AtomicU64,
+    last_parsed_ns: AtomicU64,
+    last_published_ns: AtomicU64,
+}
+
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -79,6 +106,7 @@ pub struct LighterConnector {
     market_tx: mpsc::Sender<MarketDataEvent>,
     exec_tx: mpsc::Sender<ExecutionEvent>,
     account_tx: Option<mpsc::Sender<AccountEvent>>,
+    freshness: Arc<Freshness>,
 }
 
 impl LighterConnector {
@@ -93,6 +121,7 @@ impl LighterConnector {
             market_tx,
             exec_tx,
             account_tx: None,
+            freshness: Arc::new(Freshness::default()),
         }
     }
 
@@ -214,18 +243,53 @@ impl LighterConnector {
         let mut decode_miss_count = 0usize;
         let mut seq_fallback: u64 = 0;
         let mut have_snapshot = false;
-        loop {
-            let msg = match read.next().await {
-                Some(Ok(msg)) => msg,
-                Some(Err(err)) => {
-                    eprintln!("Lighter public WS read error: {err}");
-                    break;
+        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        if std::env::var_os("LIGHTER_FIXTURE_DIR").is_some() {
+            eprintln!("INFO: Lighter fixture mode detected; freshness watchdog disabled");
+        } else {
+            let watchdog_freshness = self.freshness.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(Duration::from_millis(LIGHTER_WATCHDOG_TICK_MS));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    iv.tick().await;
+                    let now = mono_now_ns();
+                    let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
+                    let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
+                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    if anchor == 0 {
+                        continue;
+                    }
+                    if age_ms(now, anchor) > LIGHTER_STALE_MS {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
                 }
-                None => {
-                    eprintln!("Lighter public WS stream ended");
-                    break;
+            });
+        }
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = &mut stale_rx => {
+                    anyhow::bail!("Lighter public WS stale: freshness exceeded LIGHTER_STALE_MS");
+                }
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(err)) => {
+                            eprintln!("Lighter public WS read error: {err}");
+                            break;
+                        }
+                        None => {
+                            eprintln!("Lighter public WS stream ended");
+                            break;
+                        }
+                    }
                 }
             };
+            self.freshness
+                .last_ws_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             let payload = match msg {
                 Message::Ping(payload) => {
                     let _ = write.send(Message::Pong(payload)).await;
@@ -252,6 +316,9 @@ impl LighterConnector {
                 },
                 _ => continue,
             };
+            self.freshness
+                .last_data_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             if !first_message_logged {
                 eprintln!("INFO: Lighter public WS first message received");
                 first_message_logged = true;
@@ -328,12 +395,18 @@ impl LighterConnector {
                     &mut seq_fallback,
                     &mut have_snapshot,
                 ) {
+                    self.freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
                         if !first_book_update_logged {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
                         }
+                        self.freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if let Err(err) = self.market_tx.send(event).await {
                             eprintln!("Lighter public WS market send failed: {err}");
                         }
@@ -346,12 +419,18 @@ impl LighterConnector {
                     &self.cfg.venue_id,
                     &mut seq_fallback,
                 ) {
+                    self.freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
                         if !first_book_update_logged {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
                         }
+                        self.freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if let Err(err) = self.market_tx.send(event).await {
                             eprintln!("Lighter public WS market send failed: {err}");
                         }
@@ -367,6 +446,9 @@ impl LighterConnector {
                         eprintln!("INFO: Lighter public WS first book update");
                         first_book_update_logged = true;
                     }
+                    self.freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     if let Err(err) = self.market_tx.send(event).await {
                         eprintln!("Lighter public WS market send failed: {err}");
                     }
@@ -385,6 +467,9 @@ impl LighterConnector {
             };
             match fetch_account_snapshot(&self.http, &self.cfg).await {
                 Ok(snapshot) => {
+                    self.freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let _ = account_tx.send(snapshot).await;
                 }
                 Err(err) => {
@@ -420,6 +505,9 @@ impl LighterConnector {
             snapshot.seq = seq;
             snapshot.timestamp_ms = start_ms + step_ms.saturating_mul(tick as i64);
             seq = seq.wrapping_add(1);
+            self.freshness
+                .last_published_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             let _ = account_tx
                 .send(AccountEvent::Snapshot(snapshot.clone()))
                 .await;
@@ -445,6 +533,9 @@ impl LighterConnector {
             let msg = msg?;
             if let Message::Text(text) = msg {
                 if let Some(event) = translate_private_event(&text) {
+                    self.freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let _ = self.exec_tx.send(event).await;
                 }
             }
