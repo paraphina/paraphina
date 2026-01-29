@@ -5,7 +5,11 @@ pub const SUPPORTS_MARKET: bool = true;
 pub const SUPPORTS_ACCOUNT: bool = true;
 pub const SUPPORTS_EXECUTION: bool = true;
 
+const LIGHTER_MARKET_PUB_QUEUE_CAP: usize = 256;
+const LIGHTER_MARKET_PUB_DRAIN_MAX: usize = 64;
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -13,6 +17,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs};
@@ -77,8 +83,11 @@ pub struct LighterConnector {
     cfg: LighterConfig,
     http: Client,
     market_tx: mpsc::Sender<MarketDataEvent>,
+    market_pub_tx: mpsc::Sender<MarketDataEvent>,
+    market_pending_latest: Arc<Mutex<Option<MarketDataEvent>>>,
     exec_tx: mpsc::Sender<ExecutionEvent>,
     account_tx: Option<mpsc::Sender<AccountEvent>>,
+    is_fixture: bool,
 }
 
 impl LighterConnector {
@@ -87,18 +96,85 @@ impl LighterConnector {
         market_tx: mpsc::Sender<MarketDataEvent>,
         exec_tx: mpsc::Sender<ExecutionEvent>,
     ) -> Self {
-        Self {
+        let is_fixture = std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
+        let (market_pub_tx, mut market_pub_rx) =
+            mpsc::channel::<MarketDataEvent>(LIGHTER_MARKET_PUB_QUEUE_CAP);
+        let market_pending_latest = Arc::new(Mutex::new(None));
+        let connector = Self {
             cfg,
             http: Client::new(),
             market_tx,
+            market_pub_tx,
+            market_pending_latest,
             exec_tx,
             account_tx: None,
-        }
+            is_fixture,
+        };
+        let forward_market_tx = connector.market_tx.clone();
+        let forward_pending = connector.market_pending_latest.clone();
+        tokio::spawn(async move {
+            while let Some(first) = market_pub_rx.recv().await {
+                let mut batch = Vec::with_capacity(1 + LIGHTER_MARKET_PUB_DRAIN_MAX);
+                batch.push(first);
+                for _ in 0..LIGHTER_MARKET_PUB_DRAIN_MAX {
+                    match market_pub_rx.try_recv() {
+                        Ok(ev) => batch.push(ev),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                for ev in batch {
+                    if forward_market_tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+                let overflow = {
+                    let mut guard = forward_pending.lock().await;
+                    guard.take()
+                };
+                if let Some(ev) = overflow {
+                    if forward_market_tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        connector
     }
 
     pub fn with_account_tx(mut self, account_tx: mpsc::Sender<AccountEvent>) -> Self {
         self.account_tx = Some(account_tx);
         self
+    }
+
+    async fn publish_market(&self, event: MarketDataEvent) -> anyhow::Result<()> {
+        if self.is_fixture {
+            self.market_tx
+                .send(event)
+                .await
+                .map_err(|_| anyhow::anyhow!("lighter market_tx closed"))?;
+            return Ok(());
+        }
+        match event {
+            MarketDataEvent::L2Delta(_) => {
+                self.market_pub_tx
+                    .send(event)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("lighter market publish queue closed"))?;
+                Ok(())
+            }
+            other => match self.market_pub_tx.try_send(other) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(event)) => {
+                    let mut pending = self.market_pending_latest.lock().await;
+                    *pending = Some(event);
+                    Ok(())
+                }
+                Err(TrySendError::Closed(_)) => {
+                    anyhow::bail!("lighter market publish queue closed")
+                }
+            },
+        }
     }
 
     async fn resolve_market_id_and_symbol(&self) -> anyhow::Result<(String, u64)> {
@@ -334,7 +410,7 @@ impl LighterConnector {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
                         }
-                        if let Err(err) = self.market_tx.send(event).await {
+                        if let Err(err) = self.publish_market(event).await {
                             eprintln!("Lighter public WS market send failed: {err}");
                         }
                     }
@@ -352,7 +428,7 @@ impl LighterConnector {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
                         }
-                        if let Err(err) = self.market_tx.send(event).await {
+                        if let Err(err) = self.publish_market(event).await {
                             eprintln!("Lighter public WS market send failed: {err}");
                         }
                     }
@@ -367,7 +443,7 @@ impl LighterConnector {
                         eprintln!("INFO: Lighter public WS first book update");
                         first_book_update_logged = true;
                     }
-                    if let Err(err) = self.market_tx.send(event).await {
+                    if let Err(err) = self.publish_market(event).await {
                         eprintln!("Lighter public WS market send failed: {err}");
                     }
                 }
