@@ -73,6 +73,23 @@ fn run_all5_paper_fixture(
     roadmap_b_fixture_dir: &PathBuf,
 ) {
     let output = Command::new(env!("CARGO_BIN_EXE_paraphina_live"))
+        .env_remove("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
+        .env_remove("PARAPHINA_LIVE_RECONCILE_MS")
+        .env_remove("PARAPHINA_LIVE_KILL_FLATTEN")
+        .env_remove("PARAPHINA_LIVE_KILL_SWITCH")
+        .env_remove("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+        .env_remove("ROADMAP_B_FIXTURE_DIR")
+        .env_remove("HL_FIXTURE_DIR")
+        .env_remove("LIGHTER_FIXTURE_DIR")
+        .env_remove("EXTENDED_FIXTURE_DIR")
+        .env_remove("ASTER_FIXTURE_DIR")
+        .env_remove("PARADEX_FIXTURE_DIR")
+        .env_remove("EXTENDED_FIXTURE_MODE")
+        .env_remove("ASTER_FIXTURE_MODE")
+        .env_remove("PARADEX_FIXTURE_MODE")
+        .env_remove("EXTENDED_RECORD_FIXTURES")
+        .env_remove("ASTER_RECORD_FIXTURES")
+        .env_remove("PARADEX_RECORD_FIXTURES")
         .env("PARAPHINA_TRADE_MODE", "paper")
         .env(
             "PARAPHINA_LIVE_CONNECTORS",

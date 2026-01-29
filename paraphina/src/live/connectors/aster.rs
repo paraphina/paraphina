@@ -3,7 +3,10 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -36,6 +39,35 @@ pub const SUPPORTS_MARKET: bool = true;
 pub const SUPPORTS_ACCOUNT: bool = true;
 #[cfg(feature = "live_aster")]
 pub const SUPPORTS_EXECUTION: bool = true;
+
+const ASTER_STALE_MS: u64 = 1_800;
+const ASTER_WATCHDOG_TICK_MS: u64 = 200;
+
+static MONO_START: OnceLock<Instant> = OnceLock::new();
+
+fn mono_now_ns() -> u64 {
+    let start = MONO_START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as u64
+}
+
+#[allow(dead_code)]
+fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
+    now_ns.saturating_sub(then_ns) / 1_000_000
+}
+
+fn env_is_true(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Default)]
+struct Freshness {
+    last_ws_rx_ns: AtomicU64,
+    last_data_rx_ns: AtomicU64,
+    last_parsed_ns: AtomicU64,
+    last_published_ns: AtomicU64,
+}
 
 #[derive(Debug, Clone)]
 pub struct AsterConfig {
@@ -103,6 +135,7 @@ pub struct AsterConnector {
     http: Client,
     market_tx: mpsc::Sender<MarketDataEvent>,
     recorder: Option<Mutex<AsterRecorder>>,
+    freshness: Arc<Freshness>,
 }
 
 impl AsterConnector {
@@ -117,6 +150,7 @@ impl AsterConnector {
             http: Client::new(),
             market_tx,
             recorder,
+            freshness: Arc::new(Freshness::default()),
         }
     }
 
@@ -163,12 +197,41 @@ impl AsterConnector {
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         const STALE_MS: u64 = 2_000;
         const COOLDOWN_MS: u64 = 7_000;
+        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        let fixture_mode = env_is_true("ASTER_FIXTURE_MODE")
+            || std::env::var_os("ASTER_FIXTURE_DIR").is_some()
+            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
+        let mut _stale_tx_guard = None;
+        if fixture_mode {
+            _stale_tx_guard = Some(stale_tx);
+        } else {
+            let freshness = Arc::clone(&self.freshness);
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_millis(ASTER_WATCHDOG_TICK_MS));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let now = mono_now_ns();
+                    let last_pub = freshness.last_published_ns.load(Ordering::Relaxed);
+                    let last_parsed = freshness.last_parsed_ns.load(Ordering::Relaxed);
+                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    if anchor != 0 && age_ms(now, anchor) > ASTER_STALE_MS {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
 
         loop {
             if last_update_id.is_none() {
                 let future = snapshot_future.get_or_insert_with(|| Box::pin(self.fetch_snapshot()));
                 tokio::select! {
                     biased;
+                    _ = &mut stale_rx => {
+                        anyhow::bail!("Aster public WS stale: freshness exceeded ASTER_STALE_MS");
+                    }
                     snapshot = future => {
                         match snapshot {
                             Ok((snapshot_raw, snapshot)) => {
@@ -221,8 +284,14 @@ impl AsterConnector {
                                 bids: snapshot.bids,
                                 asks: snapshot.asks,
                             });
+                        self.freshness
+                            .last_parsed_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if self.market_tx.send(snapshot_event).await.is_ok() {
                             last_applied_at = Instant::now();
+                            self.freshness
+                                .last_published_ns
+                                .store(mono_now_ns(), Ordering::Relaxed);
                         }
 
                         let mut next_last = snapshot.last_update_id;
@@ -232,6 +301,9 @@ impl AsterConnector {
                             match seq_decision_lenient(next_last, &update) {
                                 SeqDecision::Apply => {
                                     next_last = update.end_id;
+                                    self.freshness
+                                        .last_parsed_ns
+                                        .store(mono_now_ns(), Ordering::Relaxed);
                                     if self
                                         .market_tx
                                         .send(delta_event_from_update(
@@ -244,6 +316,9 @@ impl AsterConnector {
                                         .is_ok()
                                     {
                                         last_applied_at = Instant::now();
+                                        self.freshness
+                                            .last_published_ns
+                                            .store(mono_now_ns(), Ordering::Relaxed);
                                     }
                                 }
                                 SeqDecision::Stale => {}
@@ -306,13 +381,22 @@ impl AsterConnector {
                             return Ok(());
                         };
                         let msg = msg?;
+                        self.freshness
+                            .last_ws_rx_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         match msg {
                             Message::Text(text) => {
                                 if let Some(recorder) = self.recorder.as_ref() {
                                     let mut guard = recorder.lock().await;
                                     let _ = guard.record_ws_frame(&text);
                                 }
+                                self.freshness
+                                    .last_data_rx_ns
+                                    .store(mono_now_ns(), Ordering::Relaxed);
                                 if let Some(update) = parse_depth_update(&text) {
+                                    self.freshness
+                                        .last_parsed_ns
+                                        .store(mono_now_ns(), Ordering::Relaxed);
                                     buffered_updates.push(update);
                                     if buffered_updates.len() > MAX_BUFFERED_UPDATES {
                                         eprintln!(
@@ -330,7 +414,13 @@ impl AsterConnector {
                                         let mut guard = recorder.lock().await;
                                         let _ = guard.record_ws_frame(&text);
                                     }
+                                    self.freshness
+                                        .last_data_rx_ns
+                                        .store(mono_now_ns(), Ordering::Relaxed);
                                     if let Some(update) = parse_depth_update(&text) {
+                                        self.freshness
+                                            .last_parsed_ns
+                                            .store(mono_now_ns(), Ordering::Relaxed);
                                         buffered_updates.push(update);
                                         if buffered_updates.len() > MAX_BUFFERED_UPDATES {
                                             eprintln!(
@@ -367,20 +457,33 @@ impl AsterConnector {
             }
 
             tokio::select! {
+                biased;
+                _ = &mut stale_rx => {
+                    anyhow::bail!("Aster public WS stale: freshness exceeded ASTER_STALE_MS");
+                }
                 msg = read.next() => {
                     let Some(msg) = msg else {
                         return Ok(());
                     };
                     let msg = msg?;
+                    self.freshness
+                        .last_ws_rx_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     match msg {
                         Message::Text(text) => {
                             if let Some(recorder) = self.recorder.as_ref() {
                                 let mut guard = recorder.lock().await;
                                 let _ = guard.record_ws_frame(&text);
                             }
+                            self.freshness
+                                .last_data_rx_ns
+                                .store(mono_now_ns(), Ordering::Relaxed);
                             let Some(update) = parse_depth_update(&text) else {
                                 continue;
                             };
+                            self.freshness
+                                .last_parsed_ns
+                                .store(mono_now_ns(), Ordering::Relaxed);
                             if !symbol_matches(&update.symbol, &self.cfg.market) {
                                 continue;
                             }
@@ -388,6 +491,9 @@ impl AsterConnector {
                             match seq_decision_lenient(current_last, &update) {
                                 SeqDecision::Apply => {
                                     last_update_id = Some(update.end_id);
+                                    self.freshness
+                                        .last_parsed_ns
+                                        .store(mono_now_ns(), Ordering::Relaxed);
                                     if self
                                         .market_tx
                                         .send(delta_event_from_update(
@@ -400,6 +506,9 @@ impl AsterConnector {
                                         .is_ok()
                                     {
                                         last_applied_at = Instant::now();
+                                        self.freshness
+                                            .last_published_ns
+                                            .store(mono_now_ns(), Ordering::Relaxed);
                                     }
                                 }
                                 SeqDecision::Stale => {}
@@ -427,9 +536,15 @@ impl AsterConnector {
                                     let mut guard = recorder.lock().await;
                                     let _ = guard.record_ws_frame(&text);
                                 }
+                                self.freshness
+                                    .last_data_rx_ns
+                                    .store(mono_now_ns(), Ordering::Relaxed);
                                 let Some(update) = parse_depth_update(&text) else {
                                     continue;
                                 };
+                                self.freshness
+                                    .last_parsed_ns
+                                    .store(mono_now_ns(), Ordering::Relaxed);
                                 if !symbol_matches(&update.symbol, &self.cfg.market) {
                                     continue;
                                 }
@@ -437,6 +552,9 @@ impl AsterConnector {
                                 match seq_decision_lenient(current_last, &update) {
                                     SeqDecision::Apply => {
                                         last_update_id = Some(update.end_id);
+                                        self.freshness
+                                            .last_parsed_ns
+                                            .store(mono_now_ns(), Ordering::Relaxed);
                                         if self
                                             .market_tx
                                         .send(delta_event_from_update(
@@ -449,6 +567,9 @@ impl AsterConnector {
                                             .is_ok()
                                         {
                                             last_applied_at = Instant::now();
+                                            self.freshness
+                                                .last_published_ns
+                                                .store(mono_now_ns(), Ordering::Relaxed);
                                         }
                                     }
                                     SeqDecision::Stale => {}
