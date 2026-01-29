@@ -12,6 +12,7 @@ fn mono_now_ns() -> u64 {
     start.elapsed().as_nanos() as u64
 }
 
+#[allow(dead_code)]
 fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
     now_ns.saturating_sub(then_ns) / 1_000_000
 }
@@ -368,6 +369,9 @@ impl LighterConnector {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
                         }
+                        self.freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if let Err(err) = self.market_tx.send(event).await {
                             eprintln!("Lighter public WS market send failed: {err}");
                         }
@@ -389,6 +393,9 @@ impl LighterConnector {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
                         }
+                        self.freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if let Err(err) = self.market_tx.send(event).await {
                             eprintln!("Lighter public WS market send failed: {err}");
                         }
@@ -404,6 +411,9 @@ impl LighterConnector {
                         eprintln!("INFO: Lighter public WS first book update");
                         first_book_update_logged = true;
                     }
+                    self.freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     if let Err(err) = self.market_tx.send(event).await {
                         eprintln!("Lighter public WS market send failed: {err}");
                     }
@@ -422,6 +432,9 @@ impl LighterConnector {
             };
             match fetch_account_snapshot(&self.http, &self.cfg).await {
                 Ok(snapshot) => {
+                    self.freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let _ = account_tx.send(snapshot).await;
                 }
                 Err(err) => {
@@ -457,6 +470,9 @@ impl LighterConnector {
             snapshot.seq = seq;
             snapshot.timestamp_ms = start_ms + step_ms.saturating_mul(tick as i64);
             seq = seq.wrapping_add(1);
+            self.freshness
+                .last_published_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             let _ = account_tx
                 .send(AccountEvent::Snapshot(snapshot.clone()))
                 .await;
@@ -482,6 +498,9 @@ impl LighterConnector {
             let msg = msg?;
             if let Message::Text(text) = msg {
                 if let Some(event) = translate_private_event(&text) {
+                    self.freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let _ = self.exec_tx.send(event).await;
                 }
             }
