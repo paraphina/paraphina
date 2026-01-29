@@ -24,12 +24,6 @@ fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
     now_ns.saturating_sub(then_ns) / 1_000_000
 }
 
-fn env_is_true(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 #[derive(Debug, Default)]
 struct Freshness {
     last_ws_rx_ns: AtomicU64,
@@ -180,9 +174,11 @@ impl ParadexConnector {
         let mut decode_miss_count = 0usize;
         let mut bbo_seq: u64 = 0;
         let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
-        let fixture_mode = env_is_true("PARADEX_FIXTURE_MODE")
-            || std::env::var_os("PARADEX_FIXTURE_DIR").is_some()
-            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
+        let fixture_mode = std::env::var_os("PARADEX_FIXTURE_DIR").is_some()
+            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some()
+            || std::env::var("PARADEX_FIXTURE_MODE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
         if fixture_mode {
             eprintln!("INFO: Paradex fixture mode detected; freshness watchdog disabled");
         } else {
