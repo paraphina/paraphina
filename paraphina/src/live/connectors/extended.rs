@@ -1,7 +1,39 @@
 //! Extended connector (public WS market data + fixtures, feature-gated).
 
+#[cfg(feature = "live_extended")]
+pub const STUB_CONNECTOR: bool = false;
+#[cfg(feature = "live_extended")]
+pub const SUPPORTS_MARKET: bool = true;
+#[cfg(feature = "live_extended")]
+pub const SUPPORTS_ACCOUNT: bool = true;
+#[cfg(feature = "live_extended")]
+pub const SUPPORTS_EXECUTION: bool = true;
+
+static MONO_START: OnceLock<Instant> = OnceLock::new();
+
+fn mono_now_ns() -> u64 {
+    let start = MONO_START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as u64
+}
+
+#[allow(dead_code)]
+fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
+    now_ns.saturating_sub(then_ns) / 1_000_000
+}
+
+#[derive(Debug, Default)]
+struct Freshness {
+    last_ws_rx_ns: AtomicU64,
+    last_data_rx_ns: AtomicU64,
+    last_parsed_ns: AtomicU64,
+    last_published_ns: AtomicU64,
+}
+
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -28,15 +60,6 @@ use super::super::types::{
     MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::types::{Side, TimeInForce, TimestampMs};
-
-#[cfg(feature = "live_extended")]
-pub const STUB_CONNECTOR: bool = false;
-#[cfg(feature = "live_extended")]
-pub const SUPPORTS_MARKET: bool = true;
-#[cfg(feature = "live_extended")]
-pub const SUPPORTS_ACCOUNT: bool = true;
-#[cfg(feature = "live_extended")]
-pub const SUPPORTS_EXECUTION: bool = true;
 
 #[derive(Debug, Clone)]
 pub struct ExtendedConfig {
@@ -107,6 +130,7 @@ pub struct ExtendedConnector {
     http: Client,
     market_tx: mpsc::Sender<MarketDataEvent>,
     recorder: Option<Mutex<ExtendedRecorder>>,
+    freshness: Arc<Freshness>,
 }
 
 impl ExtendedConnector {
@@ -125,6 +149,7 @@ impl ExtendedConnector {
             http,
             market_tx,
             recorder,
+            freshness: Arc::new(Freshness::default()),
         }
     }
 
@@ -187,6 +212,9 @@ impl ExtendedConnector {
             self.cfg.venue_index,
         );
         if let Some(snapshot) = snapshot_state {
+            self.freshness
+                .last_parsed_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
                 venue_index: self.cfg.venue_index,
                 venue_id: self.cfg.market.clone(),
@@ -195,6 +223,9 @@ impl ExtendedConnector {
                 bids: snapshot.bids,
                 asks: snapshot.asks,
             });
+            self.freshness
+                .last_published_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             let _ = self.market_tx.send(snapshot_event).await;
         }
 
@@ -231,6 +262,9 @@ impl ExtendedConnector {
                     continue;
                 }
             };
+            self.freshness
+                .last_ws_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
             match msg {
                 Message::Text(text) => {
                     if !first_message_logged {
@@ -240,6 +274,9 @@ impl ExtendedConnector {
                     let Some(cleaned) = clean_ws_payload(&text) else {
                         continue;
                     };
+                    self.freshness
+                        .last_data_rx_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     if !first_ws_message_logged {
                         if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
                             let keys = value
@@ -298,6 +335,12 @@ impl ExtendedConnector {
                                     eprintln!("INFO: Extended public WS first book update");
                                     first_book_update_logged = true;
                                 }
+                                self.freshness
+                                    .last_parsed_ns
+                                    .store(mono_now_ns(), Ordering::Relaxed);
+                                self.freshness
+                                    .last_published_ns
+                                    .store(mono_now_ns(), Ordering::Relaxed);
                                 if let Err(err) = self.market_tx.send(event).await {
                                     eprintln!("Extended public WS market send failed: {err}");
                                 }
@@ -317,6 +360,9 @@ impl ExtendedConnector {
                         }
                         continue;
                     };
+                    self.freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     if !first_decoded_top_logged {
                         if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
                             if let Some(top) = decode_top_from_value(&value) {
@@ -365,6 +411,9 @@ impl ExtendedConnector {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
                         }
+                        self.freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if let Err(err) = self.market_tx.send(event).await {
                             eprintln!("Extended public WS market send failed: {err}");
                         }
@@ -379,6 +428,9 @@ impl ExtendedConnector {
                     let Some(cleaned) = clean_ws_payload(&text) else {
                         continue;
                     };
+                    self.freshness
+                        .last_data_rx_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     if !first_ws_message_logged {
                         if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
                             let keys = value
@@ -437,6 +489,12 @@ impl ExtendedConnector {
                                     eprintln!("INFO: Extended public WS first book update");
                                     first_book_update_logged = true;
                                 }
+                                self.freshness
+                                    .last_parsed_ns
+                                    .store(mono_now_ns(), Ordering::Relaxed);
+                                self.freshness
+                                    .last_published_ns
+                                    .store(mono_now_ns(), Ordering::Relaxed);
                                 if let Err(err) = self.market_tx.send(event).await {
                                     eprintln!("Extended public WS market send failed: {err}");
                                 }
@@ -456,6 +514,9 @@ impl ExtendedConnector {
                         }
                         continue;
                     };
+                    self.freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     if !first_decoded_top_logged {
                         if let Ok(value) = serde_json::from_str::<Value>(cleaned) {
                             if let Some(top) = decode_top_from_value(&value) {
@@ -504,6 +565,9 @@ impl ExtendedConnector {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
                         }
+                        self.freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if let Err(err) = self.market_tx.send(event).await {
                             eprintln!("Extended public WS market send failed: {err}");
                         }
@@ -1333,6 +1397,7 @@ struct FixtureSnapshot {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct FixtureDelta {
     seq: u64,
     timestamp_ms: TimestampMs,
@@ -1369,6 +1434,7 @@ struct FixtureLiquidation {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct FixtureAccountSnapshot {
     seq: u64,
     timestamp_ms: TimestampMs,
