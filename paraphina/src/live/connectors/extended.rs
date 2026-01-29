@@ -11,6 +11,8 @@ pub const SUPPORTS_EXECUTION: bool = true;
 
 const EXTENDED_STALE_MS: u64 = 1800;
 const EXTENDED_WATCHDOG_TICK_MS: u64 = 200;
+const EXTENDED_MARKET_PUB_QUEUE_CAP: usize = 256;
+const EXTENDED_MARKET_PUB_DRAIN_MAX: usize = 64;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
@@ -47,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::USER_AGENT;
@@ -132,6 +135,8 @@ pub struct ExtendedConnector {
     cfg: ExtendedConfig,
     http: Client,
     market_tx: mpsc::Sender<MarketDataEvent>,
+    market_pub_tx: mpsc::Sender<MarketDataEvent>,
+    market_pending_latest: Arc<Mutex<Option<MarketDataEvent>>>,
     recorder: Option<Mutex<ExtendedRecorder>>,
     freshness: Arc<Freshness>,
 }
@@ -147,12 +152,69 @@ impl ExtendedConnector {
             .user_agent("paraphina")
             .build()
             .expect("extended http client build");
-        Self {
+        let freshness = Arc::new(Freshness::default());
+        let (market_pub_tx, mut market_pub_rx) =
+            mpsc::channel::<MarketDataEvent>(EXTENDED_MARKET_PUB_QUEUE_CAP);
+        let market_pending_latest = Arc::new(Mutex::new(None));
+        let connector = Self {
             cfg,
             http,
             market_tx,
+            market_pub_tx,
+            market_pending_latest,
             recorder,
-            freshness: Arc::new(Freshness::default()),
+            freshness,
+        };
+        let forward_market_tx = connector.market_tx.clone();
+        let forward_freshness = connector.freshness.clone();
+        let forward_pending = connector.market_pending_latest.clone();
+        tokio::spawn(async move {
+            while let Some(first) = market_pub_rx.recv().await {
+                let mut batch = Vec::with_capacity(1 + EXTENDED_MARKET_PUB_DRAIN_MAX);
+                batch.push(first);
+                for _ in 0..EXTENDED_MARKET_PUB_DRAIN_MAX {
+                    match market_pub_rx.try_recv() {
+                        Ok(ev) => batch.push(ev),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                for ev in batch {
+                    if forward_market_tx.send(ev).await.is_err() {
+                        return;
+                    }
+                    forward_freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
+                }
+                let pending = {
+                    let mut guard = forward_pending.lock().await;
+                    guard.take()
+                };
+                if let Some(ev) = pending {
+                    if forward_market_tx.send(ev).await.is_err() {
+                        return;
+                    }
+                    forward_freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
+                }
+            }
+        });
+        connector
+    }
+
+    async fn try_publish_market(&self, event: MarketDataEvent) -> anyhow::Result<()> {
+        match self.market_pub_tx.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(event)) => {
+                let mut pending = self.market_pending_latest.lock().await;
+                *pending = Some(event);
+                Ok(())
+            }
+            Err(TrySendError::Closed(_)) => {
+                anyhow::bail!("extended market publish queue closed")
+            }
         }
     }
 
@@ -226,10 +288,7 @@ impl ExtendedConnector {
                 bids: snapshot.bids,
                 asks: snapshot.asks,
             });
-            self.freshness
-                .last_published_ns
-                .store(mono_now_ns(), Ordering::Relaxed);
-            let _ = self.market_tx.send(snapshot_event).await;
+            let _ = self.try_publish_market(snapshot_event).await;
         }
 
         let ws_url = self.cfg.orderbook_ws_url();
@@ -342,7 +401,9 @@ impl ExtendedConnector {
                         Ok(update) => update,
                         Err(err) => {
                             consecutive_parse_errors += 1;
-                            if consecutive_parse_errors == 1 || consecutive_parse_errors % 10 == 0 {
+                            if consecutive_parse_errors == 1
+                                || consecutive_parse_errors.is_multiple_of(10)
+                            {
                                 let snippet: String = cleaned.chars().take(160).collect();
                                 eprintln!(
                                     "WARN: Extended public WS parse error: {err} url={} snippet={}",
@@ -374,10 +435,7 @@ impl ExtendedConnector {
                                 self.freshness
                                     .last_parsed_ns
                                     .store(mono_now_ns(), Ordering::Relaxed);
-                                self.freshness
-                                    .last_published_ns
-                                    .store(mono_now_ns(), Ordering::Relaxed);
-                                if let Err(err) = self.market_tx.send(event).await {
+                                if let Err(err) = self.try_publish_market(event).await {
                                     eprintln!("Extended public WS market send failed: {err}");
                                 }
                             }
@@ -447,10 +505,7 @@ impl ExtendedConnector {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
                         }
-                        self.freshness
-                            .last_published_ns
-                            .store(mono_now_ns(), Ordering::Relaxed);
-                        if let Err(err) = self.market_tx.send(event).await {
+                        if let Err(err) = self.try_publish_market(event).await {
                             eprintln!("Extended public WS market send failed: {err}");
                         }
                     }
@@ -496,7 +551,9 @@ impl ExtendedConnector {
                         Ok(update) => update,
                         Err(err) => {
                             consecutive_parse_errors += 1;
-                            if consecutive_parse_errors == 1 || consecutive_parse_errors % 10 == 0 {
+                            if consecutive_parse_errors == 1
+                                || consecutive_parse_errors.is_multiple_of(10)
+                            {
                                 let snippet: String = cleaned.chars().take(160).collect();
                                 eprintln!(
                                     "WARN: Extended public WS parse error: {err} url={} snippet={}",
@@ -528,10 +585,7 @@ impl ExtendedConnector {
                                 self.freshness
                                     .last_parsed_ns
                                     .store(mono_now_ns(), Ordering::Relaxed);
-                                self.freshness
-                                    .last_published_ns
-                                    .store(mono_now_ns(), Ordering::Relaxed);
-                                if let Err(err) = self.market_tx.send(event).await {
+                                if let Err(err) = self.try_publish_market(event).await {
                                     eprintln!("Extended public WS market send failed: {err}");
                                 }
                             }
@@ -601,10 +655,7 @@ impl ExtendedConnector {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
                         }
-                        self.freshness
-                            .last_published_ns
-                            .store(mono_now_ns(), Ordering::Relaxed);
-                        if let Err(err) = self.market_tx.send(event).await {
+                        if let Err(err) = self.try_publish_market(event).await {
                             eprintln!("Extended public WS market send failed: {err}");
                         }
                     }
