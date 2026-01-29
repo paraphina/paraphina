@@ -11,7 +11,8 @@ pub const SUPPORTS_EXECUTION: bool = true;
 
 const EXTENDED_STALE_MS: u64 = 1800;
 const EXTENDED_WATCHDOG_TICK_MS: u64 = 200;
-const EXTENDED_MARKET_PUB_QUEUE_CAP: usize = 256;
+const EXTENDED_MARKET_PUB_QUEUE_CAP_LIVE: usize = 256;
+const EXTENDED_MARKET_PUB_QUEUE_CAP_FIXTURE: usize = 4096;
 const EXTENDED_MARKET_PUB_DRAIN_MAX: usize = 64;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
@@ -139,6 +140,7 @@ pub struct ExtendedConnector {
     market_pending_latest: Arc<Mutex<Option<MarketDataEvent>>>,
     recorder: Option<Mutex<ExtendedRecorder>>,
     freshness: Arc<Freshness>,
+    is_fixture: bool,
 }
 
 impl ExtendedConnector {
@@ -153,8 +155,15 @@ impl ExtendedConnector {
             .build()
             .expect("extended http client build");
         let freshness = Arc::new(Freshness::default());
-        let (market_pub_tx, mut market_pub_rx) =
-            mpsc::channel::<MarketDataEvent>(EXTENDED_MARKET_PUB_QUEUE_CAP);
+        let is_fixture = std::env::var_os("EXTENDED_FIXTURE_DIR").is_some()
+            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some()
+            || std::env::var_os("EXTENDED_FIXTURE_MODE").is_some();
+        let cap = if is_fixture {
+            EXTENDED_MARKET_PUB_QUEUE_CAP_FIXTURE
+        } else {
+            EXTENDED_MARKET_PUB_QUEUE_CAP_LIVE
+        };
+        let (market_pub_tx, mut market_pub_rx) = mpsc::channel::<MarketDataEvent>(cap);
         let market_pending_latest = Arc::new(Mutex::new(None));
         let connector = Self {
             cfg,
@@ -164,6 +173,7 @@ impl ExtendedConnector {
             market_pending_latest,
             recorder,
             freshness,
+            is_fixture,
         };
         let forward_market_tx = connector.market_tx.clone();
         let forward_freshness = connector.freshness.clone();
@@ -204,17 +214,36 @@ impl ExtendedConnector {
         connector
     }
 
-    async fn try_publish_market(&self, event: MarketDataEvent) -> anyhow::Result<()> {
-        match self.market_pub_tx.try_send(event) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(event)) => {
-                let mut pending = self.market_pending_latest.lock().await;
-                *pending = Some(event);
+    async fn publish_market(&self, event: MarketDataEvent) -> anyhow::Result<()> {
+        if self.is_fixture {
+            self.market_tx
+                .send(event)
+                .await
+                .map_err(|_| anyhow::anyhow!("extended market_tx closed"))?;
+            self.freshness
+                .last_published_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
+            return Ok(());
+        }
+        match event {
+            MarketDataEvent::L2Delta(_) => {
+                self.market_pub_tx
+                    .send(event)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("extended market publish queue closed"))?;
                 Ok(())
             }
-            Err(TrySendError::Closed(_)) => {
-                anyhow::bail!("extended market publish queue closed")
-            }
+            other => match self.market_pub_tx.try_send(other) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(event)) => {
+                    let mut pending = self.market_pending_latest.lock().await;
+                    *pending = Some(event);
+                    Ok(())
+                }
+                Err(TrySendError::Closed(_)) => {
+                    anyhow::bail!("extended market publish queue closed")
+                }
+            },
         }
     }
 
@@ -288,7 +317,7 @@ impl ExtendedConnector {
                 bids: snapshot.bids,
                 asks: snapshot.asks,
             });
-            let _ = self.try_publish_market(snapshot_event).await;
+            let _ = self.publish_market(snapshot_event).await;
         }
 
         let ws_url = self.cfg.orderbook_ws_url();
@@ -435,7 +464,7 @@ impl ExtendedConnector {
                                 self.freshness
                                     .last_parsed_ns
                                     .store(mono_now_ns(), Ordering::Relaxed);
-                                if let Err(err) = self.try_publish_market(event).await {
+                                if let Err(err) = self.publish_market(event).await {
                                     eprintln!("Extended public WS market send failed: {err}");
                                 }
                             }
@@ -505,7 +534,7 @@ impl ExtendedConnector {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
                         }
-                        if let Err(err) = self.try_publish_market(event).await {
+                        if let Err(err) = self.publish_market(event).await {
                             eprintln!("Extended public WS market send failed: {err}");
                         }
                     }
@@ -585,7 +614,7 @@ impl ExtendedConnector {
                                 self.freshness
                                     .last_parsed_ns
                                     .store(mono_now_ns(), Ordering::Relaxed);
-                                if let Err(err) = self.try_publish_market(event).await {
+                                if let Err(err) = self.publish_market(event).await {
                                     eprintln!("Extended public WS market send failed: {err}");
                                 }
                             }
@@ -655,7 +684,7 @@ impl ExtendedConnector {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
                         }
-                        if let Err(err) = self.try_publish_market(event).await {
+                        if let Err(err) = self.publish_market(event).await {
                             eprintln!("Extended public WS market send failed: {err}");
                         }
                     }
