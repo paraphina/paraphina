@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -42,6 +43,9 @@ pub const SUPPORTS_EXECUTION: bool = true;
 
 const ASTER_STALE_MS: u64 = 1_800;
 const ASTER_WATCHDOG_TICK_MS: u64 = 200;
+const ASTER_MARKET_PUB_QUEUE_CAP_LIVE: usize = 256;
+const ASTER_MARKET_PUB_QUEUE_CAP_FIXTURE: usize = 4096;
+const ASTER_MARKET_PUB_DRAIN_MAX: usize = 64;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
@@ -59,6 +63,12 @@ fn env_is_true(key: &str) -> bool {
     std::env::var(key)
         .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
         .unwrap_or(false)
+}
+
+fn is_aster_fixture_mode_now() -> bool {
+    env_is_true("ASTER_FIXTURE_MODE")
+        || std::env::var_os("ASTER_FIXTURE_DIR").is_some()
+        || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some()
 }
 
 #[derive(Debug, Default)]
@@ -134,8 +144,11 @@ pub struct AsterConnector {
     cfg: AsterConfig,
     http: Client,
     market_tx: mpsc::Sender<MarketDataEvent>,
+    market_pub_tx: mpsc::Sender<MarketDataEvent>,
+    market_pending_latest: Arc<Mutex<Option<MarketDataEvent>>>,
     recorder: Option<Mutex<AsterRecorder>>,
     freshness: Arc<Freshness>,
+    is_fixture: bool,
 }
 
 impl AsterConnector {
@@ -145,12 +158,93 @@ impl AsterConnector {
             .as_ref()
             .and_then(|dir| AsterRecorder::new(dir).ok())
             .map(Mutex::new);
-        Self {
+        let is_fixture = is_aster_fixture_mode_now();
+        let cap = if is_aster_fixture_mode_now() {
+            ASTER_MARKET_PUB_QUEUE_CAP_FIXTURE
+        } else {
+            ASTER_MARKET_PUB_QUEUE_CAP_LIVE
+        };
+        let (market_pub_tx, mut market_pub_rx) = mpsc::channel::<MarketDataEvent>(cap);
+        let market_pending_latest = Arc::new(Mutex::new(None));
+        let connector = Self {
             cfg,
             http: Client::new(),
             market_tx,
+            market_pub_tx,
+            market_pending_latest,
             recorder,
             freshness: Arc::new(Freshness::default()),
+            is_fixture,
+        };
+        let forward_market_tx = connector.market_tx.clone();
+        let forward_freshness = connector.freshness.clone();
+        let forward_pending = connector.market_pending_latest.clone();
+        tokio::spawn(async move {
+            while let Some(first) = market_pub_rx.recv().await {
+                let mut batch = Vec::with_capacity(1 + ASTER_MARKET_PUB_DRAIN_MAX);
+                batch.push(first);
+                for _ in 0..ASTER_MARKET_PUB_DRAIN_MAX {
+                    match market_pub_rx.try_recv() {
+                        Ok(ev) => batch.push(ev),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
+                    }
+                }
+                for ev in batch {
+                    if forward_market_tx.send(ev).await.is_err() {
+                        return;
+                    }
+                    forward_freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
+                }
+                let overflow = {
+                    let mut guard = forward_pending.lock().await;
+                    guard.take()
+                };
+                if let Some(ev) = overflow {
+                    if forward_market_tx.send(ev).await.is_err() {
+                        return;
+                    }
+                    forward_freshness
+                        .last_published_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
+                }
+            }
+        });
+        connector
+    }
+
+    async fn publish_market(&self, event: MarketDataEvent) -> anyhow::Result<()> {
+        if self.is_fixture || is_aster_fixture_mode_now() {
+            self.market_tx
+                .send(event)
+                .await
+                .map_err(|_| anyhow::anyhow!("aster market_tx closed"))?;
+            self.freshness
+                .last_published_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
+            return Ok(());
+        }
+        match event {
+            MarketDataEvent::L2Delta(_) | MarketDataEvent::L2Snapshot(_) => {
+                self.market_pub_tx
+                    .send(event)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("aster market publish queue closed"))?;
+                Ok(())
+            }
+            other => match self.market_pub_tx.try_send(other) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(event)) => {
+                    let mut pending = self.market_pending_latest.lock().await;
+                    *pending = Some(event);
+                    Ok(())
+                }
+                Err(TrySendError::Closed(_)) => {
+                    anyhow::bail!("aster market publish queue closed")
+                }
+            },
         }
     }
 
@@ -287,11 +381,8 @@ impl AsterConnector {
                         self.freshness
                             .last_parsed_ns
                             .store(mono_now_ns(), Ordering::Relaxed);
-                        if self.market_tx.send(snapshot_event).await.is_ok() {
+                        if self.publish_market(snapshot_event).await.is_ok() {
                             last_applied_at = Instant::now();
-                            self.freshness
-                                .last_published_ns
-                                .store(mono_now_ns(), Ordering::Relaxed);
                         }
 
                         let mut next_last = snapshot.last_update_id;
@@ -305,8 +396,7 @@ impl AsterConnector {
                                         .last_parsed_ns
                                         .store(mono_now_ns(), Ordering::Relaxed);
                                     if self
-                                        .market_tx
-                                        .send(delta_event_from_update(
+                                        .publish_market(delta_event_from_update(
                                             &update,
                                             self.cfg.venue_index,
                                             &self.cfg.venue_id,
@@ -316,9 +406,6 @@ impl AsterConnector {
                                         .is_ok()
                                     {
                                         last_applied_at = Instant::now();
-                                        self.freshness
-                                            .last_published_ns
-                                            .store(mono_now_ns(), Ordering::Relaxed);
                                     }
                                 }
                                 SeqDecision::Stale => {}
@@ -495,8 +582,7 @@ impl AsterConnector {
                                         .last_parsed_ns
                                         .store(mono_now_ns(), Ordering::Relaxed);
                                     if self
-                                        .market_tx
-                                        .send(delta_event_from_update(
+                                        .publish_market(delta_event_from_update(
                                             &update,
                                             self.cfg.venue_index,
                                             &self.cfg.venue_id,
@@ -506,9 +592,6 @@ impl AsterConnector {
                                         .is_ok()
                                     {
                                         last_applied_at = Instant::now();
-                                        self.freshness
-                                            .last_published_ns
-                                            .store(mono_now_ns(), Ordering::Relaxed);
                                     }
                                 }
                                 SeqDecision::Stale => {}
@@ -556,20 +639,16 @@ impl AsterConnector {
                                             .last_parsed_ns
                                             .store(mono_now_ns(), Ordering::Relaxed);
                                         if self
-                                            .market_tx
-                                        .send(delta_event_from_update(
-                                            &update,
-                                            self.cfg.venue_index,
-                                            &self.cfg.venue_id,
-                                            next_seq(),
-                                        ))
+                                            .publish_market(delta_event_from_update(
+                                                &update,
+                                                self.cfg.venue_index,
+                                                &self.cfg.venue_id,
+                                                next_seq(),
+                                            ))
                                             .await
                                             .is_ok()
                                         {
                                             last_applied_at = Instant::now();
-                                            self.freshness
-                                                .last_published_ns
-                                                .store(mono_now_ns(), Ordering::Relaxed);
                                         }
                                     }
                                     SeqDecision::Stale => {}
