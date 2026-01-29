@@ -25,6 +25,7 @@ fn multi_connector_fixture_run_is_deterministic_and_healthy() {
         .join("lighter");
 
     let output = Command::new(env!("CARGO_BIN_EXE_paraphina_live"))
+        .env_clear()
         .env_remove("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
         .env_remove("PARAPHINA_LIVE_RECONCILE_MS")
         .env_remove("PARAPHINA_LIVE_KILL_FLATTEN")
