@@ -9,6 +9,9 @@ pub const SUPPORTS_ACCOUNT: bool = true;
 #[cfg(feature = "live_paradex")]
 pub const SUPPORTS_EXECUTION: bool = true;
 
+const PARADEX_STALE_MS: u64 = 1800;
+const PARADEX_WATCHDOG_TICK_MS: u64 = 200;
+
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
 fn mono_now_ns() -> u64 {
@@ -19,6 +22,12 @@ fn mono_now_ns() -> u64 {
 #[allow(dead_code)]
 fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
     now_ns.saturating_sub(then_ns) / 1_000_000
+}
+
+fn env_is_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
@@ -170,8 +179,42 @@ impl ParadexConnector {
         let mut first_decoded_top_logged = false;
         let mut decode_miss_count = 0usize;
         let mut bbo_seq: u64 = 0;
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
+        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        let fixture_mode = env_is_true("PARADEX_FIXTURE_MODE")
+            || std::env::var_os("PARADEX_FIXTURE_DIR").is_some()
+            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
+        if fixture_mode {
+            eprintln!("INFO: Paradex fixture mode detected; freshness watchdog disabled");
+        } else {
+            let watchdog_freshness = self.freshness.clone();
+            tokio::spawn(async move {
+                let mut iv =
+                    tokio::time::interval(Duration::from_millis(PARADEX_WATCHDOG_TICK_MS));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    iv.tick().await;
+                    let now = mono_now_ns();
+                    let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
+                    let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
+                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    if anchor != 0 && age_ms(now, anchor) > PARADEX_STALE_MS {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = &mut stale_rx => {
+                    anyhow::bail!("Paradex public WS stale: freshness exceeded PARADEX_STALE_MS");
+                }
+                msg = read.next() => {
+                    let Some(msg) = msg else { break; };
+                    msg?
+                }
+            };
             self.freshness
                 .last_ws_rx_ns
                 .store(mono_now_ns(), Ordering::Relaxed);
