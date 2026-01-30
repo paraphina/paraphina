@@ -424,7 +424,12 @@ fn drain_ordered_events(
                 let vi = d.venue_index;
                 if vi < 64 {
                     if !venue_ready(vi, *saw_l2_snapshot_mask_this_tick) {
-                        // Not ready: drop deltas until this venue is snapshot-seeded.
+                        if let Some(pending_deltas) = pending_deltas.as_mut() {
+                            if pending_deltas.len() <= vi {
+                                pending_deltas.resize_with(vi + 1, Vec::new);
+                            }
+                            pending_deltas[vi].push(d);
+                        }
                         continue;
                     } else {
                     if l2_snapshot_coalesce {
@@ -573,7 +578,10 @@ fn drain_ordered_events(
         }
     }
     if coalesce_deltas {
-        for deltas in pending_deltas.into_iter() {
+        for (vi, deltas) in pending_deltas.into_iter().enumerate() {
+            if vi < 64 && !venue_ready(vi, *saw_l2_snapshot_mask_this_tick) {
+                continue;
+            }
             emit_delta_list(deltas, &mut market_stats, &mut out);
         }
     }
