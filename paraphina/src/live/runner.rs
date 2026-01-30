@@ -41,6 +41,7 @@ use crate::types::{
 use super::orderbook_l2::OrderBookL2;
 use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache};
 use super::types::ExecutionEvent as LiveExecutionEvent;
+use serde_json::json;
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -1519,6 +1520,7 @@ pub async fn run_live_loop(
                     None,
                     None,
                     &pending_drift_events,
+                    market_rx_stats.as_ref(),
                 );
                 pending_drift_events.clear();
             }
@@ -2116,6 +2118,7 @@ fn emit_live_telemetry(
     last_exit_intent: Option<&OrderIntent>,
     last_hedge_intent: Option<&OrderIntent>,
     reconcile_drift: &[ReconcileDriftRecord],
+    market_rx_stats: Option<&MarketRxStats>,
 ) {
     let mut record = builder.build_record(TelemetryInputs {
         cfg,
@@ -2134,6 +2137,26 @@ fn emit_live_telemetry(
         max_orders_per_tick: telemetry.max_orders_per_tick,
     });
     ensure_schema_v1(&mut record);
+    if let Some(stats) = market_rx_stats {
+        if let serde_json::Value::Object(ref mut map) = record {
+            map.insert(
+                "market_rx_stats".to_string(),
+                json!({
+                    "drained": stats.drained,
+                    "l2_delta": stats.l2_delta,
+                    "l2_snapshot": stats.l2_snapshot,
+                    "trade": stats.trade,
+                    "funding_update": stats.funding_update,
+                    "out_market": stats.out_market,
+                    "out_l2_delta": stats.out_l2_delta,
+                    "out_l2_snapshot": stats.out_l2_snapshot,
+                    "out_trade": stats.out_trade,
+                    "out_funding_update": stats.out_funding_update,
+                    "cap_hits": stats.cap_hits
+                }),
+            );
+        }
+    }
     if let Ok(mut guard) = telemetry.sink.lock() {
         guard.log_json(&record);
     }
@@ -2554,6 +2577,7 @@ fn flush_replay_tick(
         None,
         None,
         &[],
+        None,
     );
     let _ = flush_batched_fills(fill_batcher, cfg, state, now_ms, true);
     snapshot
