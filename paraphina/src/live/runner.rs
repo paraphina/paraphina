@@ -350,6 +350,12 @@ fn drain_ordered_events(
     let venue_ready = |vi: usize, saw_mask: u64| -> bool {
         vi < 64 && ((coalesce_ready_mask | saw_mask) & (1u64 << vi)) != 0
     };
+    let tick_delta_buffer_max: Option<usize> = std::env::var("PARAPHINA_L2_TICK_DELTA_BUFFER_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0);
+    let mut buffer_disabled_mask: u64 = 0;
+    let buffer_disabled = |vi: usize, mask: u64| vi < 64 && (mask & (1u64 << vi)) != 0;
     let count_out_market =
         |stats: &mut Option<&mut MarketRxStats>, event: &super::types::MarketDataEvent| {
             if let Some(stats) = stats.as_deref_mut() {
@@ -424,14 +430,45 @@ fn drain_ordered_events(
                 let vi = d.venue_index;
                 if vi < 64 {
                     if !venue_ready(vi, *saw_l2_snapshot_mask_this_tick) {
+                        // UNREADY venue: buffer if cap not reached, else drop
+                        if buffer_disabled(vi, buffer_disabled_mask) {
+                            // Cap already reached: drop delta for unready venue
+                            continue;
+                        }
                         if let Some(pending_deltas) = pending_deltas.as_mut() {
                             if pending_deltas.len() <= vi {
                                 pending_deltas.resize_with(vi + 1, Vec::new);
+                            }
+                            if let Some(max) = tick_delta_buffer_max {
+                                if pending_deltas[vi].len() >= max {
+                                    buffer_disabled_mask |= 1u64 << vi;
+                                    // Cap reached: drop delta for unready venue
+                                    continue;
+                                }
                             }
                             pending_deltas[vi].push(d);
                         }
                         continue;
                     } else {
+                    // READY venue: buffer if cap not reached, else emit immediately
+                    if buffer_disabled(vi, buffer_disabled_mask) {
+                        // Cap already reached: apply snapshot-dominance check, then emit if not dominated
+                        if l2_snapshot_coalesce {
+                            if let Some(last_snapshots) = last_snapshots.as_ref() {
+                                if let Some(Some(snapshot)) = last_snapshots.get(vi) {
+                                    if snapshot.seq >= d.seq {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        let event = super::types::MarketDataEvent::L2Delta(d);
+                        count_out_market(&mut market_stats, &event);
+                        if let Some(ordered) = ordered_event_for_market(event) {
+                            out.push(ordered);
+                        }
+                        continue;
+                    }
                     if l2_snapshot_coalesce {
                         if let Some(last_snapshots) = last_snapshots.as_ref() {
                             if let Some(Some(snapshot)) = last_snapshots.get(vi) {
@@ -444,6 +481,18 @@ fn drain_ordered_events(
                     if let Some(pending_deltas) = pending_deltas.as_mut() {
                         if pending_deltas.len() <= vi {
                             pending_deltas.resize_with(vi + 1, Vec::new);
+                        }
+                        if let Some(max) = tick_delta_buffer_max {
+                            if pending_deltas[vi].len() >= max {
+                                buffer_disabled_mask |= 1u64 << vi;
+                                // Cap reached: emit immediately for ready venue
+                                let event = super::types::MarketDataEvent::L2Delta(d);
+                                count_out_market(&mut market_stats, &event);
+                                if let Some(ordered) = ordered_event_for_market(event) {
+                                    out.push(ordered);
+                                }
+                                continue;
+                            }
                         }
                         pending_deltas[vi].push(d);
                     }
