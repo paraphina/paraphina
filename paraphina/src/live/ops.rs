@@ -79,6 +79,9 @@ pub struct LiveMetrics {
     retry_count: IntCounter,
     rate_limit_sleep_total: IntCounter,
     reconcile_mismatch_count: IntCounter,
+    market_rx_raw_drained_total: IntCounter,
+    market_rx_out_emitted_total: IntCounter,
+    market_rx_cap_hits_total: IntCounter,
 }
 
 impl LiveMetrics {
@@ -132,6 +135,21 @@ impl LiveMetrics {
             "Reconcile mismatch count",
         ))
         .expect("reconcile mismatch");
+        let market_rx_raw_drained_total = IntCounter::with_opts(Opts::new(
+            "paraphina_live_market_rx_raw_drained_total",
+            "Market RX raw drained total",
+        ))
+        .expect("market rx raw drained");
+        let market_rx_out_emitted_total = IntCounter::with_opts(Opts::new(
+            "paraphina_live_market_rx_out_emitted_total",
+            "Market RX out emitted total",
+        ))
+        .expect("market rx out emitted");
+        let market_rx_cap_hits_total = IntCounter::with_opts(Opts::new(
+            "paraphina_live_market_rx_cap_hits_total",
+            "Market RX cap hits total",
+        ))
+        .expect("market rx cap hits");
         registry
             .register(Box::new(tick_total.clone()))
             .expect("reg tick");
@@ -171,6 +189,15 @@ impl LiveMetrics {
         registry
             .register(Box::new(reconcile_mismatch_count.clone()))
             .expect("reg reconcile mismatch");
+        registry
+            .register(Box::new(market_rx_raw_drained_total.clone()))
+            .expect("reg market rx raw drained");
+        registry
+            .register(Box::new(market_rx_out_emitted_total.clone()))
+            .expect("reg market rx out emitted");
+        registry
+            .register(Box::new(market_rx_cap_hits_total.clone()))
+            .expect("reg market rx cap hits");
         Self {
             registry,
             tick_total,
@@ -186,6 +213,9 @@ impl LiveMetrics {
             retry_count,
             rate_limit_sleep_total,
             reconcile_mismatch_count,
+            market_rx_raw_drained_total,
+            market_rx_out_emitted_total,
+            market_rx_cap_hits_total,
         }
     }
 
@@ -236,6 +266,12 @@ impl LiveMetrics {
 
     pub fn inc_reconcile_mismatch(&self) {
         self.reconcile_mismatch_count.inc();
+    }
+
+    pub fn add_market_rx_stats(&self, raw_drained: u64, out_emitted: u64, cap_hits: u64) {
+        self.market_rx_raw_drained_total.inc_by(raw_drained);
+        self.market_rx_out_emitted_total.inc_by(out_emitted);
+        self.market_rx_cap_hits_total.inc_by(cap_hits);
     }
 
     pub fn gather(&self) -> String {
