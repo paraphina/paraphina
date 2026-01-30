@@ -336,10 +336,15 @@ fn drain_ordered_events(
     order_snapshot_rx: &mut Option<mpsc::Receiver<super::types::OrderSnapshot>>,
     mut market_stats: Option<&mut MarketRxStats>,
     l2_delta_coalesce: bool,
+    l2_snapshot_coalesce: bool,
+    saw_l2_snapshot_this_tick: &mut bool,
 ) -> Vec<OrderedEvent> {
     let mut out = Vec::new();
+    let coalesce_deltas = l2_delta_coalesce || l2_snapshot_coalesce;
     let mut coalesced: Option<Vec<Option<super::types::L2Delta>>> =
-        l2_delta_coalesce.then(|| Vec::new());
+        coalesce_deltas.then(|| Vec::new());
+    let mut last_snapshots: Option<Vec<Option<super::types::L2Snapshot>>> =
+        l2_snapshot_coalesce.then(|| Vec::new());
     let count_out_market =
         |stats: &mut Option<&mut MarketRxStats>, event: &super::types::MarketDataEvent| {
             if let Some(stats) = stats.as_deref_mut() {
@@ -354,6 +359,9 @@ fn drain_ordered_events(
         };
 
     while let Ok(event) = market_rx.try_recv() {
+        if matches!(&event, super::types::MarketDataEvent::L2Snapshot(_)) {
+            *saw_l2_snapshot_this_tick = true;
+        }
         if let Some(stats) = market_stats.as_deref_mut() {
             stats.drained += 1;
             match &event {
@@ -363,10 +371,54 @@ fn drain_ordered_events(
                 super::types::MarketDataEvent::FundingUpdate(_) => stats.funding_update += 1,
             }
         }
-        if l2_delta_coalesce {
+        if l2_snapshot_coalesce {
+            if let super::types::MarketDataEvent::L2Snapshot(s) = event {
+                let vi = s.venue_index;
+                if vi < 64 {
+                    if let Some(last_snapshots) = last_snapshots.as_mut() {
+                        if last_snapshots.len() <= vi {
+                            last_snapshots.resize_with(vi + 1, || None);
+                        }
+                        let replace = match last_snapshots[vi].as_ref() {
+                            Some(prev) => {
+                                s.seq > prev.seq
+                                    || (s.seq == prev.seq && s.timestamp_ms >= prev.timestamp_ms)
+                            }
+                            None => true,
+                        };
+                        if replace {
+                            last_snapshots[vi] = Some(s);
+                            if let Some(coalesced) = coalesced.as_mut() {
+                                if coalesced.len() <= vi {
+                                    coalesced.resize_with(vi + 1, || None);
+                                }
+                                coalesced[vi] = None;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let event = super::types::MarketDataEvent::L2Snapshot(s);
+                count_out_market(&mut market_stats, &event);
+                if let Some(ordered) = ordered_event_for_market(event) {
+                    out.push(ordered);
+                }
+                continue;
+            }
+        }
+        if coalesce_deltas {
             if let super::types::MarketDataEvent::L2Delta(d) = event {
                 let vi = d.venue_index;
                 if vi < 64 {
+                    if l2_snapshot_coalesce {
+                        if let Some(last_snapshots) = last_snapshots.as_ref() {
+                            if let Some(Some(snapshot)) = last_snapshots.get(vi) {
+                                if snapshot.seq >= d.seq {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     if let Some(coalesced) = coalesced.as_mut() {
                         if coalesced.len() <= vi {
                             coalesced.resize_with(vi + 1, || None);
@@ -395,7 +447,18 @@ fn drain_ordered_events(
             out.push(ordered);
         }
     }
-    if l2_delta_coalesce {
+    if l2_snapshot_coalesce {
+        if let Some(last_snapshots) = last_snapshots {
+            for slot in last_snapshots.into_iter().flatten() {
+                let event = super::types::MarketDataEvent::L2Snapshot(slot);
+                count_out_market(&mut market_stats, &event);
+                if let Some(ordered) = ordered_event_for_market(event) {
+                    out.push(ordered);
+                }
+            }
+        }
+    }
+    if coalesce_deltas {
         if let Some(coalesced) = coalesced {
             for slot in coalesced.into_iter().flatten() {
                 let event = super::types::MarketDataEvent::L2Delta(slot);
@@ -643,6 +706,9 @@ pub async fn run_live_loop(
     let l2_delta_coalesce = std::env::var("PARAPHINA_L2_DELTA_COALESCE")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let l2_snapshot_coalesce = std::env::var("PARAPHINA_L2_SNAPSHOT_COALESCE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let mut canary_stale_ticks: u64 = 0;
     let pos_tol = std::env::var("PARAPHINA_RECONCILE_POS_TAO_TOL")
         .ok()
@@ -844,7 +910,9 @@ pub async fn run_live_loop(
             }
         };
 
-        let coalesce_now = l2_delta_coalesce && saw_ready_once;
+        let delta_coalesce_now = l2_delta_coalesce && saw_ready_once;
+        let snapshot_coalesce_now = l2_snapshot_coalesce && saw_ready_once;
+        let mut saw_l2_snapshot_this_tick = false;
 
         // Drain ingress channels, canonicalize ordering, then apply.
         pending_events.extend(drain_ordered_events(
@@ -853,7 +921,9 @@ pub async fn run_live_loop(
             &mut exec_rx,
             &mut order_snapshot_rx,
             market_rx_stats.as_mut(),
-            coalesce_now,
+            delta_coalesce_now,
+            snapshot_coalesce_now,
+            &mut saw_l2_snapshot_this_tick,
         ));
         let mut ordered_events = Vec::new();
         let mut future_events = Vec::new();
@@ -1143,7 +1213,7 @@ pub async fn run_live_loop(
         }
 
         let snapshot = cache.snapshot(now_ms, cfg.main_loop_interval_ms * 2);
-        if snapshot.ready_market_count() == 5 {
+        if snapshot.ready_market_count() > 0 || saw_l2_snapshot_this_tick {
             saw_ready_once = true;
         }
         last_snapshot = Some(snapshot.clone());
