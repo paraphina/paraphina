@@ -167,6 +167,20 @@ struct ExecutionEventDeduper {
     max_entries: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct MarketRxStats {
+    drained: u64,
+    l2_delta: u64,
+    l2_snapshot: u64,
+    trade: u64,
+    funding_update: u64,
+    out_market: u64,
+    out_l2_delta: u64,
+    out_l2_snapshot: u64,
+    out_trade: u64,
+    out_funding_update: u64,
+}
+
 impl ExecutionEventDeduper {
     fn new(max_entries: usize) -> Self {
         Self {
@@ -320,12 +334,76 @@ fn drain_ordered_events(
     account_rx: &mut mpsc::Receiver<super::types::AccountEvent>,
     exec_rx: &mut Option<mpsc::Receiver<super::types::ExecutionEvent>>,
     order_snapshot_rx: &mut Option<mpsc::Receiver<super::types::OrderSnapshot>>,
+    mut market_stats: Option<&mut MarketRxStats>,
+    l2_delta_coalesce: bool,
 ) -> Vec<OrderedEvent> {
     let mut out = Vec::new();
+    let mut coalesced: Option<Vec<Option<super::types::L2Delta>>> =
+        l2_delta_coalesce.then(|| Vec::new());
+    let count_out_market =
+        |stats: &mut Option<&mut MarketRxStats>, event: &super::types::MarketDataEvent| {
+            if let Some(stats) = stats.as_deref_mut() {
+                stats.out_market += 1;
+                match event {
+                    super::types::MarketDataEvent::L2Snapshot(_) => stats.out_l2_snapshot += 1,
+                    super::types::MarketDataEvent::L2Delta(_) => stats.out_l2_delta += 1,
+                    super::types::MarketDataEvent::Trade(_) => stats.out_trade += 1,
+                    super::types::MarketDataEvent::FundingUpdate(_) => stats.out_funding_update += 1,
+                }
+            }
+        };
 
     while let Ok(event) = market_rx.try_recv() {
+        if let Some(stats) = market_stats.as_deref_mut() {
+            stats.drained += 1;
+            match &event {
+                super::types::MarketDataEvent::L2Snapshot(_) => stats.l2_snapshot += 1,
+                super::types::MarketDataEvent::L2Delta(_) => stats.l2_delta += 1,
+                super::types::MarketDataEvent::Trade(_) => stats.trade += 1,
+                super::types::MarketDataEvent::FundingUpdate(_) => stats.funding_update += 1,
+            }
+        }
+        if l2_delta_coalesce {
+            if let super::types::MarketDataEvent::L2Delta(d) = event {
+                let vi = d.venue_index;
+                if vi < 64 {
+                    if let Some(coalesced) = coalesced.as_mut() {
+                        if coalesced.len() <= vi {
+                            coalesced.resize_with(vi + 1, || None);
+                        }
+                        if let Some(slot) = coalesced[vi].as_mut() {
+                            slot.changes.extend(d.changes);
+                            slot.seq = d.seq;
+                            slot.timestamp_ms = d.timestamp_ms;
+                        } else {
+                            coalesced[vi] = Some(d);
+                        }
+                    }
+                    continue;
+                }
+                // venue_index >= 64: fall through to push normally
+                let event = super::types::MarketDataEvent::L2Delta(d);
+                count_out_market(&mut market_stats, &event);
+                if let Some(ordered) = ordered_event_for_market(event) {
+                    out.push(ordered);
+                }
+                continue;
+            }
+        }
+        count_out_market(&mut market_stats, &event);
         if let Some(ordered) = ordered_event_for_market(event) {
             out.push(ordered);
+        }
+    }
+    if l2_delta_coalesce {
+        if let Some(coalesced) = coalesced {
+            for slot in coalesced.into_iter().flatten() {
+                let event = super::types::MarketDataEvent::L2Delta(slot);
+                count_out_market(&mut market_stats, &event);
+                if let Some(ordered) = ordered_event_for_market(event) {
+                    out.push(ordered);
+                }
+            }
         }
     }
     while let Ok(event) = account_rx.try_recv() {
@@ -553,6 +631,18 @@ pub async fn run_live_loop(
     let canary_enforce_reduce_only = std::env::var("PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let market_rx_stats_enabled = std::env::var("PARAPHINA_MARKET_RX_STATS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let market_rx_stats_every = std::env::var("PARAPHINA_MARKET_RX_STATS_EVERY_TICKS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1);
+    let market_rx_stats_path = std::env::var_os("PARAPHINA_MARKET_RX_STATS_PATH");
+    let l2_delta_coalesce = std::env::var("PARAPHINA_L2_DELTA_COALESCE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let mut canary_stale_ticks: u64 = 0;
     let pos_tol = std::env::var("PARAPHINA_RECONCILE_POS_TAO_TOL")
         .ok()
@@ -585,6 +675,7 @@ pub async fn run_live_loop(
     let mut last_now_ms: TimestampMs = 0;
     let mut last_snapshot: Option<super::state_cache::CanonicalCacheSnapshot> = None;
     let mut pending_events: Vec<OrderedEvent> = Vec::new();
+    let mut saw_ready_once = false;
 
     loop {
         let now_ms = match mode {
@@ -706,12 +797,63 @@ pub async fn run_live_loop(
         let mut tick_exec_events: Vec<ExecutionEvent> = Vec::new();
         let mut tick_fills: Vec<crate::types::FillEvent> = Vec::new();
 
+        let mut market_rx_stats = market_rx_stats_enabled.then_some(MarketRxStats::default());
+        let maybe_print_market_rx_stats = |tick: u64, stats: &Option<MarketRxStats>| {
+            if let Some(stats) = stats.as_ref() {
+                if tick % market_rx_stats_every == 0 {
+                    let other = stats.drained.saturating_sub(
+                        stats.l2_delta + stats.l2_snapshot + stats.trade + stats.funding_update,
+                    );
+                    if let Some(path) = &market_rx_stats_path {
+                        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+                            let _ = writeln!(
+                                f,
+                                "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={}",
+                                tick,
+                                stats.drained,
+                                stats.l2_delta,
+                                stats.l2_snapshot,
+                                stats.trade,
+                                stats.funding_update,
+                                stats.out_market,
+                                stats.out_l2_delta,
+                                stats.out_l2_snapshot,
+                                stats.out_trade,
+                                stats.out_funding_update,
+                                other
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={}",
+                            tick,
+                            stats.drained,
+                            stats.l2_delta,
+                            stats.l2_snapshot,
+                            stats.trade,
+                            stats.funding_update,
+                            stats.out_market,
+                            stats.out_l2_delta,
+                            stats.out_l2_snapshot,
+                            stats.out_trade,
+                            stats.out_funding_update,
+                            other
+                        );
+                    }
+                }
+            }
+        };
+
+        let coalesce_now = l2_delta_coalesce && saw_ready_once;
+
         // Drain ingress channels, canonicalize ordering, then apply.
         pending_events.extend(drain_ordered_events(
             &mut market_rx,
             &mut account_rx,
             &mut exec_rx,
             &mut order_snapshot_rx,
+            market_rx_stats.as_mut(),
+            coalesce_now,
         ));
         let mut ordered_events = Vec::new();
         let mut future_events = Vec::new();
@@ -1001,6 +1143,9 @@ pub async fn run_live_loop(
         }
 
         let snapshot = cache.snapshot(now_ms, cfg.main_loop_interval_ms * 2);
+        if snapshot.ready_market_count() == 5 {
+            saw_ready_once = true;
+        }
         last_snapshot = Some(snapshot.clone());
         let mut disabled = health_manager.update_from_snapshot(cfg, &mut state, &snapshot);
         if disable_health_gates {
@@ -1133,10 +1278,12 @@ pub async fn run_live_loop(
         }
 
         if state.kill_switch {
+            maybe_print_market_rx_stats(tick, &market_rx_stats);
             break;
         }
 
         if snapshot.ready_market_count() == 0 && !smoke_intents {
+            maybe_print_market_rx_stats(tick, &market_rx_stats);
             tick += 1;
             continue;
         }
@@ -1435,9 +1582,11 @@ pub async fn run_live_loop(
         }
 
         if state.kill_switch {
+            maybe_print_market_rx_stats(tick, &market_rx_stats);
             break;
         }
 
+        maybe_print_market_rx_stats(tick, &market_rx_stats);
         tick += 1;
         if let LiveRunMode::Step { .. } = mode {
             tokio::task::yield_now().await;
