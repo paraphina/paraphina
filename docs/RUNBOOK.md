@@ -111,6 +111,31 @@ Validate telemetry contract:
 python3 tools/check_telemetry_contract.py ./live_runs/all5_paper/telemetry.jsonl
 ```
 
+## Market-data burst controls (Frontier 2)
+
+These toggles reduce market-event volume under bursty feeds while preserving L2 correctness.
+All are optional and default OFF unless noted.
+
+- `PARAPHINA_L2_SNAPSHOT_COALESCE=1`  
+  After the system has observed readiness, keep only the latest L2 snapshot per venue per tick.
+
+- `PARAPHINA_L2_DELTA_COALESCE=1`  
+  After readiness, perform tick-local L2 delta handling. Deltas are only folded when seq-safe:
+  contiguous deltas after a snapshot are applied via the deterministic `OrderBookL2` engine and
+  emitted as a synthesized snapshot. Otherwise deltas are emitted individually (no cross-seq merge).
+
+- `PARAPHINA_L2_TICK_DELTA_BUFFER_MAX=<N>`  
+  Optional safety cap for per-venue tick-local delta buffering (venue_index < 64). If exceeded:
+  - READY venues: stop buffering further deltas for that venue in the tick and emit subsequent deltas immediately.
+  - UNREADY venues: stop buffering further deltas for that venue in the tick and do not emit (pre-baseline safety).
+  Unset/0/invalid => no cap (default behavior).
+
+- `PARAPHINA_MARKET_RX_STATS=1`  
+  Print per-tick market drain counters (raw vs emitted).
+  Optional:
+  - `PARAPHINA_MARKET_RX_STATS_EVERY_TICKS=<k>` (default `1`)
+  - `PARAPHINA_MARKET_RX_STATS_PATH=<path>` (append; if unset prints to stderr)
+
 ## All-5 CanaryLive (Online)
 
 Canary live requires credentials and explicit live execution gates. Run manually only:
