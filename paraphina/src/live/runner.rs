@@ -180,6 +180,7 @@ struct MarketRxStats {
     out_l2_snapshot: u64,
     out_trade: u64,
     out_funding_update: u64,
+    cap_hits: u64,
 }
 
 impl ExecutionEventDeduper {
@@ -442,6 +443,9 @@ fn drain_ordered_events(
                             if let Some(max) = tick_delta_buffer_max {
                                 if pending_deltas[vi].len() >= max {
                                     buffer_disabled_mask |= 1u64 << vi;
+                                    if let Some(stats) = market_stats.as_deref_mut() {
+                                        stats.cap_hits += 1;
+                                    }
                                     // Cap reached: drop delta for unready venue
                                     continue;
                                 }
@@ -485,6 +489,9 @@ fn drain_ordered_events(
                         if let Some(max) = tick_delta_buffer_max {
                             if pending_deltas[vi].len() >= max {
                                 buffer_disabled_mask |= 1u64 << vi;
+                                if let Some(stats) = market_stats.as_deref_mut() {
+                                    stats.cap_hits += 1;
+                                }
                                 // Cap reached: emit immediately for ready venue
                                 let event = super::types::MarketDataEvent::L2Delta(d);
                                 count_out_market(&mut market_stats, &event);
@@ -1040,7 +1047,7 @@ pub async fn run_live_loop(
                         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
                             let _ = writeln!(
                                 f,
-                                "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={}",
+                                "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={} cap_hits={}",
                                 tick,
                                 stats.drained,
                                 stats.l2_delta,
@@ -1052,12 +1059,13 @@ pub async fn run_live_loop(
                                 stats.out_l2_snapshot,
                                 stats.out_trade,
                                 stats.out_funding_update,
-                                other
+                                other,
+                                stats.cap_hits
                             );
                         }
                     } else {
                         eprintln!(
-                            "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={}",
+                            "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={} cap_hits={}",
                             tick,
                             stats.drained,
                             stats.l2_delta,
@@ -1069,7 +1077,8 @@ pub async fn run_live_loop(
                             stats.out_l2_snapshot,
                             stats.out_trade,
                             stats.out_funding_update,
-                            other
+                            other,
+                            stats.cap_hits
                         );
                     }
                 }
