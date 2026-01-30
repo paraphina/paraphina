@@ -38,6 +38,7 @@ use crate::types::{
     ExecutionEvent, OrderAck, OrderIntent, OrderPurpose, OrderReject, TimestampMs, VenueStatus,
 };
 
+use super::orderbook_l2::OrderBookL2;
 use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache};
 use super::types::ExecutionEvent as LiveExecutionEvent;
 use std::cmp::Ordering;
@@ -341,7 +342,7 @@ fn drain_ordered_events(
 ) -> Vec<OrderedEvent> {
     let mut out = Vec::new();
     let coalesce_deltas = l2_delta_coalesce || l2_snapshot_coalesce;
-    let mut coalesced: Option<Vec<Option<super::types::L2Delta>>> =
+    let mut pending_deltas: Option<Vec<Vec<super::types::L2Delta>>> =
         coalesce_deltas.then(|| Vec::new());
     let mut last_snapshots: Option<Vec<Option<super::types::L2Snapshot>>> =
         l2_snapshot_coalesce.then(|| Vec::new());
@@ -386,14 +387,15 @@ fn drain_ordered_events(
                             }
                             None => true,
                         };
+                        let snapshot_seq = s.seq;
                         if replace {
                             last_snapshots[vi] = Some(s);
-                            if let Some(coalesced) = coalesced.as_mut() {
-                                if coalesced.len() <= vi {
-                                    coalesced.resize_with(vi + 1, || None);
-                                }
-                                coalesced[vi] = None;
+                        }
+                        if let Some(pending_deltas) = pending_deltas.as_mut() {
+                            if pending_deltas.len() <= vi {
+                                pending_deltas.resize_with(vi + 1, Vec::new);
                             }
+                            pending_deltas[vi].retain(|d| d.seq > snapshot_seq);
                         }
                     }
                     continue;
@@ -419,17 +421,11 @@ fn drain_ordered_events(
                             }
                         }
                     }
-                    if let Some(coalesced) = coalesced.as_mut() {
-                        if coalesced.len() <= vi {
-                            coalesced.resize_with(vi + 1, || None);
+                    if let Some(pending_deltas) = pending_deltas.as_mut() {
+                        if pending_deltas.len() <= vi {
+                            pending_deltas.resize_with(vi + 1, Vec::new);
                         }
-                        if let Some(slot) = coalesced[vi].as_mut() {
-                            slot.changes.extend(d.changes);
-                            slot.seq = d.seq;
-                            slot.timestamp_ms = d.timestamp_ms;
-                        } else {
-                            coalesced[vi] = Some(d);
-                        }
+                        pending_deltas[vi].push(d);
                     }
                     continue;
                 }
@@ -447,26 +443,122 @@ fn drain_ordered_events(
             out.push(ordered);
         }
     }
+    let mut pending_deltas = pending_deltas.unwrap_or_default();
+    let emit_delta_list = |deltas: Vec<super::types::L2Delta>,
+                           market_stats: &mut Option<&mut MarketRxStats>,
+                           out: &mut Vec<OrderedEvent>| {
+        if deltas.is_empty() {
+            return;
+        }
+        let mut deltas = deltas;
+        deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
+        let mut merged: Vec<super::types::L2Delta> = Vec::with_capacity(deltas.len());
+        for delta in deltas {
+            if let Some(last) = merged.last_mut() {
+                if last.seq == delta.seq {
+                    last.changes.extend(delta.changes);
+                    if delta.timestamp_ms > last.timestamp_ms {
+                        last.timestamp_ms = delta.timestamp_ms;
+                    }
+                    continue;
+                }
+            }
+            merged.push(delta);
+        }
+        for delta in merged {
+            let event = super::types::MarketDataEvent::L2Delta(delta);
+            count_out_market(market_stats, &event);
+            if let Some(ordered) = ordered_event_for_market(event) {
+                out.push(ordered);
+            }
+        }
+    };
+
     if l2_snapshot_coalesce {
         if let Some(last_snapshots) = last_snapshots {
-            for slot in last_snapshots.into_iter().flatten() {
-                let event = super::types::MarketDataEvent::L2Snapshot(slot);
+            for (vi, slot) in last_snapshots.into_iter().enumerate() {
+                let Some(snapshot) = slot else { continue };
+                let mut deltas = if vi < pending_deltas.len() {
+                    std::mem::take(&mut pending_deltas[vi])
+                } else {
+                    Vec::new()
+                };
+                if !deltas.is_empty() {
+                    deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
+                    let mut merged: Vec<super::types::L2Delta> = Vec::with_capacity(deltas.len());
+                    for delta in deltas {
+                        if let Some(last) = merged.last_mut() {
+                            if last.seq == delta.seq {
+                                last.changes.extend(delta.changes);
+                                if delta.timestamp_ms > last.timestamp_ms {
+                                    last.timestamp_ms = delta.timestamp_ms;
+                                }
+                                continue;
+                            }
+                        }
+                        merged.push(delta);
+                    }
+                    deltas = merged;
+                    deltas.retain(|d| d.seq > snapshot.seq);
+                }
+                let mut contiguous = false;
+                if let Some(first) = deltas.first() {
+                    contiguous = first.seq == snapshot.seq + 1;
+                    if contiguous {
+                        let mut prev = first.seq;
+                        for delta in deltas.iter().skip(1) {
+                            if delta.seq != prev + 1 {
+                                contiguous = false;
+                                break;
+                            }
+                            prev = delta.seq;
+                        }
+                    }
+                }
+                if contiguous {
+                    let mut book = OrderBookL2::new();
+                    let mut ok = book
+                        .apply_snapshot(&snapshot.bids, &snapshot.asks, snapshot.seq)
+                        .is_ok();
+                    if ok {
+                        for delta in &deltas {
+                            if book.apply_delta(&delta.changes, delta.seq).is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let last_delta = deltas.last().unwrap();
+                        let event = super::types::MarketDataEvent::L2Snapshot(
+                            super::types::L2Snapshot {
+                                venue_index: snapshot.venue_index,
+                                venue_id: snapshot.venue_id.clone(),
+                                seq: book.last_seq(),
+                                timestamp_ms: snapshot.timestamp_ms.max(last_delta.timestamp_ms),
+                                bids: book.bids().to_vec(),
+                                asks: book.asks().to_vec(),
+                            },
+                        );
+                        count_out_market(&mut market_stats, &event);
+                        if let Some(ordered) = ordered_event_for_market(event) {
+                            out.push(ordered);
+                        }
+                        continue;
+                    }
+                }
+                let event = super::types::MarketDataEvent::L2Snapshot(snapshot);
                 count_out_market(&mut market_stats, &event);
                 if let Some(ordered) = ordered_event_for_market(event) {
                     out.push(ordered);
                 }
+                emit_delta_list(deltas, &mut market_stats, &mut out);
             }
         }
     }
     if coalesce_deltas {
-        if let Some(coalesced) = coalesced {
-            for slot in coalesced.into_iter().flatten() {
-                let event = super::types::MarketDataEvent::L2Delta(slot);
-                count_out_market(&mut market_stats, &event);
-                if let Some(ordered) = ordered_event_for_market(event) {
-                    out.push(ordered);
-                }
-            }
+        for deltas in pending_deltas.into_iter() {
+            emit_delta_list(deltas, &mut market_stats, &mut out);
         }
     }
     while let Ok(event) = account_rx.try_recv() {
@@ -2386,7 +2478,9 @@ fn flush_replay_tick(
 mod tests {
     use super::*;
     use crate::live::types;
+    use crate::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
     use crate::types::{OrderPurpose, Side};
+    use tokio::sync::mpsc;
 
     #[test]
     fn dedupe_order_ack_by_client_order_id() {
@@ -2426,5 +2520,81 @@ mod tests {
         });
         assert!(!deduper.is_duplicate(&event));
         assert!(deduper.is_duplicate(&event));
+    }
+
+    #[test]
+    fn coalesced_deltas_fold_into_snapshot() {
+        let (market_tx, mut market_rx) = mpsc::channel(16);
+        let (_account_tx, mut account_rx) = mpsc::channel(1);
+        let mut exec_rx: Option<mpsc::Receiver<types::ExecutionEvent>> = None;
+        let mut order_snapshot_rx: Option<mpsc::Receiver<types::OrderSnapshot>> = None;
+        let mut saw_l2_snapshot_this_tick = false;
+
+        let snapshot = types::L2Snapshot {
+            venue_index: 0,
+            venue_id: "TAO".to_string(),
+            seq: 10,
+            timestamp_ms: 1_700_000_000_000,
+            bids: vec![BookLevel {
+                price: 100.0,
+                size: 1.0,
+            }],
+            asks: vec![BookLevel {
+                price: 101.0,
+                size: 1.0,
+            }],
+        };
+        market_tx
+            .try_send(types::MarketDataEvent::L2Snapshot(snapshot))
+            .unwrap();
+        for (seq, price, size) in [(11, 100.0, 2.0), (12, 101.0, 2.0), (13, 99.0, 1.0)] {
+            let delta = types::L2Delta {
+                venue_index: 0,
+                venue_id: "TAO".to_string(),
+                seq,
+                timestamp_ms: 1_700_000_000_000 + seq as i64,
+                changes: vec![BookLevelDelta {
+                    side: BookSide::Bid,
+                    price,
+                    size,
+                }],
+            };
+            market_tx
+                .try_send(types::MarketDataEvent::L2Delta(delta))
+                .unwrap();
+        }
+        drop(market_tx);
+
+        let out = drain_ordered_events(
+            &mut market_rx,
+            &mut account_rx,
+            &mut exec_rx,
+            &mut order_snapshot_rx,
+            None,
+            true,
+            true,
+            &mut saw_l2_snapshot_this_tick,
+        );
+
+        let mut snapshots = 0;
+        let mut deltas = 0;
+        let mut snapshot_seq = None;
+        for event in out {
+            if let CanonicalEvent::Market(market) = event.event {
+                match market {
+                    types::MarketDataEvent::L2Snapshot(s) => {
+                        snapshots += 1;
+                        snapshot_seq = Some(s.seq);
+                    }
+                    types::MarketDataEvent::L2Delta(_) => {
+                        deltas += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(snapshots, 1);
+        assert_eq!(deltas, 0);
+        assert_eq!(snapshot_seq, Some(13));
     }
 }
