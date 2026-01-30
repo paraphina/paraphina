@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn live_telemetry_contract_passes_fixture_run() {
+    std::env::set_var("PARAPHINA_MARKET_RX_STATS", "1");
+
     let mut cfg = Config::default();
     cfg.venues = vec![cfg.venues[0].clone()];
     cfg.book.min_healthy_for_kf = 1;
@@ -97,6 +99,12 @@ async fn live_telemetry_contract_passes_fixture_run() {
         guard.flush();
     }
 
+    let text = std::fs::read_to_string(&telemetry_path).expect("read telemetry");
+    assert!(
+        text.contains("\"market_rx_stats\""),
+        "expected market_rx_stats in telemetry"
+    );
+
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let status = Command::new("python3")
         .current_dir(&repo_root)
@@ -105,4 +113,6 @@ async fn live_telemetry_contract_passes_fixture_run() {
         .status()
         .expect("telemetry contract command");
     assert!(status.success());
+
+    std::env::remove_var("PARAPHINA_MARKET_RX_STATS");
 }
