@@ -2597,4 +2597,168 @@ mod tests {
         assert_eq!(deltas, 0);
         assert_eq!(snapshot_seq, Some(13));
     }
+
+    #[test]
+    fn non_contiguous_deltas_do_not_fold() {
+        let (market_tx, mut market_rx) = mpsc::channel(16);
+        let (_account_tx, mut account_rx) = mpsc::channel(1);
+        let mut exec_rx: Option<mpsc::Receiver<types::ExecutionEvent>> = None;
+        let mut order_snapshot_rx: Option<mpsc::Receiver<types::OrderSnapshot>> = None;
+        let mut saw_l2_snapshot_this_tick = false;
+
+        let snapshot = types::L2Snapshot {
+            venue_index: 0,
+            venue_id: "TAO".to_string(),
+            seq: 10,
+            timestamp_ms: 1_700_000_000_000,
+            bids: vec![BookLevel {
+                price: 100.0,
+                size: 1.0,
+            }],
+            asks: vec![BookLevel {
+                price: 101.0,
+                size: 1.0,
+            }],
+        };
+        market_tx
+            .try_send(types::MarketDataEvent::L2Snapshot(snapshot))
+            .unwrap();
+        for (seq, price, size) in [(12, 100.0, 2.0), (13, 99.0, 1.0)] {
+            let delta = types::L2Delta {
+                venue_index: 0,
+                venue_id: "TAO".to_string(),
+                seq,
+                timestamp_ms: 1_700_000_000_000 + seq as i64,
+                changes: vec![BookLevelDelta {
+                    side: BookSide::Bid,
+                    price,
+                    size,
+                }],
+            };
+            market_tx
+                .try_send(types::MarketDataEvent::L2Delta(delta))
+                .unwrap();
+        }
+        drop(market_tx);
+
+        let out = drain_ordered_events(
+            &mut market_rx,
+            &mut account_rx,
+            &mut exec_rx,
+            &mut order_snapshot_rx,
+            None,
+            true,
+            true,
+            &mut saw_l2_snapshot_this_tick,
+        );
+
+        let mut snapshots = 0;
+        let mut deltas = 0;
+        let mut snapshot_seq = None;
+        for event in out {
+            if let CanonicalEvent::Market(market) = event.event {
+                match market {
+                    types::MarketDataEvent::L2Snapshot(s) => {
+                        snapshots += 1;
+                        snapshot_seq = Some(s.seq);
+                    }
+                    types::MarketDataEvent::L2Delta(_) => {
+                        deltas += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(snapshots, 1);
+        assert_eq!(deltas, 2);
+        assert_eq!(snapshot_seq, Some(10));
+    }
+
+    #[test]
+    fn snapshot_dominates_lower_or_equal_deltas() {
+        let (market_tx, mut market_rx) = mpsc::channel(16);
+        let (_account_tx, mut account_rx) = mpsc::channel(1);
+        let mut exec_rx: Option<mpsc::Receiver<types::ExecutionEvent>> = None;
+        let mut order_snapshot_rx: Option<mpsc::Receiver<types::OrderSnapshot>> = None;
+        let mut saw_l2_snapshot_this_tick = false;
+
+        for seq in [9_u64, 10_u64] {
+            let delta = types::L2Delta {
+                venue_index: 0,
+                venue_id: "TAO".to_string(),
+                seq,
+                timestamp_ms: 1_700_000_000_000 + seq as i64,
+                changes: vec![BookLevelDelta {
+                    side: BookSide::Bid,
+                    price: 100.0 + seq as f64,
+                    size: 1.0,
+                }],
+            };
+            market_tx
+                .try_send(types::MarketDataEvent::L2Delta(delta))
+                .unwrap();
+        }
+        let snapshot = types::L2Snapshot {
+            venue_index: 0,
+            venue_id: "TAO".to_string(),
+            seq: 10,
+            timestamp_ms: 1_700_000_000_000,
+            bids: vec![BookLevel {
+                price: 100.0,
+                size: 1.0,
+            }],
+            asks: vec![BookLevel {
+                price: 101.0,
+                size: 1.0,
+            }],
+        };
+        market_tx
+            .try_send(types::MarketDataEvent::L2Snapshot(snapshot))
+            .unwrap();
+        let delta = types::L2Delta {
+            venue_index: 0,
+            venue_id: "TAO".to_string(),
+            seq: 11,
+            timestamp_ms: 1_700_000_000_011,
+            changes: vec![BookLevelDelta {
+                side: BookSide::Bid,
+                price: 99.0,
+                size: 2.0,
+            }],
+        };
+        market_tx
+            .try_send(types::MarketDataEvent::L2Delta(delta))
+            .unwrap();
+        drop(market_tx);
+
+        let out = drain_ordered_events(
+            &mut market_rx,
+            &mut account_rx,
+            &mut exec_rx,
+            &mut order_snapshot_rx,
+            None,
+            true,
+            true,
+            &mut saw_l2_snapshot_this_tick,
+        );
+
+        let mut snapshot_seq = None;
+        let mut delta_seqs = Vec::new();
+        for event in out {
+            if let CanonicalEvent::Market(market) = event.event {
+                match market {
+                    types::MarketDataEvent::L2Snapshot(s) => {
+                        snapshot_seq = Some(s.seq);
+                    }
+                    types::MarketDataEvent::L2Delta(d) => {
+                        delta_seqs.push(d.seq);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        delta_seqs.sort_unstable();
+        assert_eq!(snapshot_seq, Some(11));
+        assert!(delta_seqs.is_empty());
+    }
 }
