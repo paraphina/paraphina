@@ -338,7 +338,8 @@ fn drain_ordered_events(
     mut market_stats: Option<&mut MarketRxStats>,
     l2_delta_coalesce: bool,
     l2_snapshot_coalesce: bool,
-    saw_l2_snapshot_this_tick: &mut bool,
+    coalesce_ready_mask: u64,
+    saw_l2_snapshot_mask_this_tick: &mut u64,
 ) -> Vec<OrderedEvent> {
     let mut out = Vec::new();
     let coalesce_deltas = l2_delta_coalesce || l2_snapshot_coalesce;
@@ -346,6 +347,9 @@ fn drain_ordered_events(
         coalesce_deltas.then(|| Vec::new());
     let mut last_snapshots: Option<Vec<Option<super::types::L2Snapshot>>> =
         l2_snapshot_coalesce.then(|| Vec::new());
+    let venue_ready = |vi: usize, saw_mask: u64| -> bool {
+        vi < 64 && ((coalesce_ready_mask | saw_mask) & (1u64 << vi)) != 0
+    };
     let count_out_market =
         |stats: &mut Option<&mut MarketRxStats>, event: &super::types::MarketDataEvent| {
             if let Some(stats) = stats.as_deref_mut() {
@@ -360,8 +364,11 @@ fn drain_ordered_events(
         };
 
     while let Ok(event) = market_rx.try_recv() {
-        if matches!(&event, super::types::MarketDataEvent::L2Snapshot(_)) {
-            *saw_l2_snapshot_this_tick = true;
+        if let super::types::MarketDataEvent::L2Snapshot(snapshot) = &event {
+            let vi = snapshot.venue_index;
+            if vi < 64 {
+                *saw_l2_snapshot_mask_this_tick |= 1u64 << vi;
+            }
         }
         if let Some(stats) = market_stats.as_deref_mut() {
             stats.drained += 1;
@@ -376,6 +383,9 @@ fn drain_ordered_events(
             if let super::types::MarketDataEvent::L2Snapshot(s) = event {
                 let vi = s.venue_index;
                 if vi < 64 {
+                    if !venue_ready(vi, *saw_l2_snapshot_mask_this_tick) {
+                        // Not ready: fall through to forward normally.
+                    } else {
                     if let Some(last_snapshots) = last_snapshots.as_mut() {
                         if last_snapshots.len() <= vi {
                             last_snapshots.resize_with(vi + 1, || None);
@@ -399,6 +409,7 @@ fn drain_ordered_events(
                         }
                     }
                     continue;
+                    }
                 }
                 let event = super::types::MarketDataEvent::L2Snapshot(s);
                 count_out_market(&mut market_stats, &event);
@@ -412,6 +423,10 @@ fn drain_ordered_events(
             if let super::types::MarketDataEvent::L2Delta(d) = event {
                 let vi = d.venue_index;
                 if vi < 64 {
+                    if !venue_ready(vi, *saw_l2_snapshot_mask_this_tick) {
+                        // Not ready: drop deltas until this venue is snapshot-seeded.
+                        continue;
+                    } else {
                     if l2_snapshot_coalesce {
                         if let Some(last_snapshots) = last_snapshots.as_ref() {
                             if let Some(Some(snapshot)) = last_snapshots.get(vi) {
@@ -428,6 +443,7 @@ fn drain_ordered_events(
                         pending_deltas[vi].push(d);
                     }
                     continue;
+                    }
                 }
                 // venue_index >= 64: fall through to push normally
                 let event = super::types::MarketDataEvent::L2Delta(d);
@@ -834,6 +850,7 @@ pub async fn run_live_loop(
     let mut last_snapshot: Option<super::state_cache::CanonicalCacheSnapshot> = None;
     let mut pending_events: Vec<OrderedEvent> = Vec::new();
     let mut saw_ready_once = false;
+    let mut coalesce_ready_mask: u64 = 0;
 
     loop {
         let now_ms = match mode {
@@ -1004,7 +1021,7 @@ pub async fn run_live_loop(
 
         let delta_coalesce_now = l2_delta_coalesce && saw_ready_once;
         let snapshot_coalesce_now = l2_snapshot_coalesce && saw_ready_once;
-        let mut saw_l2_snapshot_this_tick = false;
+        let mut saw_l2_snapshot_mask_this_tick: u64 = 0;
 
         // Drain ingress channels, canonicalize ordering, then apply.
         pending_events.extend(drain_ordered_events(
@@ -1015,7 +1032,8 @@ pub async fn run_live_loop(
             market_rx_stats.as_mut(),
             delta_coalesce_now,
             snapshot_coalesce_now,
-            &mut saw_l2_snapshot_this_tick,
+            coalesce_ready_mask,
+            &mut saw_l2_snapshot_mask_this_tick,
         ));
         let mut ordered_events = Vec::new();
         let mut future_events = Vec::new();
@@ -1305,9 +1323,10 @@ pub async fn run_live_loop(
         }
 
         let snapshot = cache.snapshot(now_ms, cfg.main_loop_interval_ms * 2);
-        if snapshot.ready_market_count() > 0 || saw_l2_snapshot_this_tick {
+        if snapshot.ready_market_count() > 0 || saw_l2_snapshot_mask_this_tick != 0 {
             saw_ready_once = true;
         }
+        coalesce_ready_mask |= saw_l2_snapshot_mask_this_tick;
         last_snapshot = Some(snapshot.clone());
         let mut disabled = health_manager.update_from_snapshot(cfg, &mut state, &snapshot);
         if disable_health_gates {
@@ -2528,7 +2547,8 @@ mod tests {
         let (_account_tx, mut account_rx) = mpsc::channel(1);
         let mut exec_rx: Option<mpsc::Receiver<types::ExecutionEvent>> = None;
         let mut order_snapshot_rx: Option<mpsc::Receiver<types::OrderSnapshot>> = None;
-        let mut saw_l2_snapshot_this_tick = false;
+        let coalesce_ready_mask: u64 = 0;
+        let mut saw_l2_snapshot_mask_this_tick: u64 = 0;
 
         let snapshot = types::L2Snapshot {
             venue_index: 0,
@@ -2573,7 +2593,8 @@ mod tests {
             None,
             true,
             true,
-            &mut saw_l2_snapshot_this_tick,
+            coalesce_ready_mask,
+            &mut saw_l2_snapshot_mask_this_tick,
         );
 
         let mut snapshots = 0;
@@ -2604,7 +2625,8 @@ mod tests {
         let (_account_tx, mut account_rx) = mpsc::channel(1);
         let mut exec_rx: Option<mpsc::Receiver<types::ExecutionEvent>> = None;
         let mut order_snapshot_rx: Option<mpsc::Receiver<types::OrderSnapshot>> = None;
-        let mut saw_l2_snapshot_this_tick = false;
+        let coalesce_ready_mask: u64 = 0;
+        let mut saw_l2_snapshot_mask_this_tick: u64 = 0;
 
         let snapshot = types::L2Snapshot {
             venue_index: 0,
@@ -2649,7 +2671,8 @@ mod tests {
             None,
             true,
             true,
-            &mut saw_l2_snapshot_this_tick,
+            coalesce_ready_mask,
+            &mut saw_l2_snapshot_mask_this_tick,
         );
 
         let mut snapshots = 0;
@@ -2680,7 +2703,8 @@ mod tests {
         let (_account_tx, mut account_rx) = mpsc::channel(1);
         let mut exec_rx: Option<mpsc::Receiver<types::ExecutionEvent>> = None;
         let mut order_snapshot_rx: Option<mpsc::Receiver<types::OrderSnapshot>> = None;
-        let mut saw_l2_snapshot_this_tick = false;
+        let coalesce_ready_mask: u64 = 0;
+        let mut saw_l2_snapshot_mask_this_tick: u64 = 0;
 
         for seq in [9_u64, 10_u64] {
             let delta = types::L2Delta {
@@ -2739,7 +2763,8 @@ mod tests {
             None,
             true,
             true,
-            &mut saw_l2_snapshot_this_tick,
+            coalesce_ready_mask,
+            &mut saw_l2_snapshot_mask_this_tick,
         );
 
         let mut snapshot_seq = None;
