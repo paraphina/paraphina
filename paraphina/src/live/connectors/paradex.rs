@@ -47,7 +47,6 @@ use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -60,6 +59,7 @@ use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, LiquidationSnapshot, MarginSnapshot,
     MarketDataEvent, PositionSnapshot, TopOfBook,
 };
+use crate::live::MarketPublisher;
 use crate::types::{Side, TimeInForce, TimestampMs};
 
 #[derive(Debug, Clone)]
@@ -121,9 +121,7 @@ impl ParadexConfig {
 pub struct ParadexConnector {
     cfg: ParadexConfig,
     http: Client,
-    market_tx: mpsc::Sender<MarketDataEvent>,
-    market_pub_tx: mpsc::Sender<MarketDataEvent>,
-    market_pending_latest: Arc<Mutex<Option<MarketDataEvent>>>,
+    market_publisher: MarketPublisher,
     recorder: Option<Mutex<ParadexRecorder>>,
     freshness: Arc<Freshness>,
     is_fixture: bool,
@@ -139,55 +137,31 @@ impl ParadexConnector {
         let is_fixture = std::env::var_os("PARADEX_FIXTURE_DIR").is_some()
             || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some()
             || std::env::var("PARADEX_FIXTURE_MODE").is_ok();
-        let (market_pub_tx, mut market_pub_rx) =
-            mpsc::channel::<MarketDataEvent>(PARADEX_MARKET_PUB_QUEUE_CAP);
-        let market_pending_latest = Arc::new(Mutex::new(None));
+        let freshness = Arc::new(Freshness::default());
+        let publish_freshness = freshness.clone();
+        let on_published = Arc::new(move || {
+            publish_freshness
+                .last_published_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
+        });
+        let market_publisher = MarketPublisher::new(
+            PARADEX_MARKET_PUB_QUEUE_CAP,
+            PARADEX_MARKET_PUB_DRAIN_MAX,
+            market_tx.clone(),
+            Some(Arc::new(move || is_fixture || Self::fixture_mode_now())),
+            Arc::new(|event: &MarketDataEvent| matches!(event, MarketDataEvent::L2Delta(_))),
+            Some(on_published),
+            "paradex market_tx closed",
+            "paradex market publish queue closed",
+        );
         let connector = Self {
             cfg,
             http: Client::new(),
-            market_tx,
-            market_pub_tx,
-            market_pending_latest,
+            market_publisher,
             recorder,
-            freshness: Arc::new(Freshness::default()),
+            freshness,
             is_fixture,
         };
-        let forward_market_tx = connector.market_tx.clone();
-        let forward_freshness = connector.freshness.clone();
-        let forward_pending = connector.market_pending_latest.clone();
-        tokio::spawn(async move {
-            while let Some(first) = market_pub_rx.recv().await {
-                let mut batch = Vec::with_capacity(1 + PARADEX_MARKET_PUB_DRAIN_MAX);
-                batch.push(first);
-                for _ in 0..PARADEX_MARKET_PUB_DRAIN_MAX {
-                    match market_pub_rx.try_recv() {
-                        Ok(ev) => batch.push(ev),
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => break,
-                    }
-                }
-                for ev in batch {
-                    if forward_market_tx.send(ev).await.is_err() {
-                        return;
-                    }
-                    forward_freshness
-                        .last_published_ns
-                        .store(mono_now_ns(), Ordering::Relaxed);
-                }
-                let overflow = {
-                    let mut guard = forward_pending.lock().await;
-                    guard.take()
-                };
-                if let Some(ev) = overflow {
-                    if forward_market_tx.send(ev).await.is_err() {
-                        return;
-                    }
-                    forward_freshness
-                        .last_published_ns
-                        .store(mono_now_ns(), Ordering::Relaxed);
-                }
-            }
-        });
         connector
     }
 
@@ -200,36 +174,7 @@ impl ParadexConnector {
     }
 
     async fn publish_market(&self, event: MarketDataEvent) -> anyhow::Result<()> {
-        if self.is_fixture || Self::fixture_mode_now() {
-            self.market_tx
-                .send(event)
-                .await
-                .map_err(|_| anyhow::anyhow!("paradex market_tx closed"))?;
-            self.freshness
-                .last_published_ns
-                .store(mono_now_ns(), Ordering::Relaxed);
-            return Ok(());
-        }
-        match event {
-            MarketDataEvent::L2Delta(_) => {
-                self.market_pub_tx
-                    .send(event)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("paradex market publish queue closed"))?;
-                Ok(())
-            }
-            other => match self.market_pub_tx.try_send(other) {
-                Ok(()) => Ok(()),
-                Err(TrySendError::Full(event)) => {
-                    let mut pending = self.market_pending_latest.lock().await;
-                    *pending = Some(event);
-                    Ok(())
-                }
-                Err(TrySendError::Closed(_)) => {
-                    anyhow::bail!("paradex market publish queue closed")
-                }
-            },
-        }
+        self.market_publisher.publish_market(event).await
     }
 
     pub async fn run_public_ws(&self) {
