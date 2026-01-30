@@ -6,6 +6,7 @@
 pub mod connectors;
 pub mod gateway;
 pub mod instrument;
+mod market_publisher;
 pub mod mock_exchange;
 pub mod ops;
 pub mod order_state;
@@ -28,6 +29,7 @@ pub use runner::{
     run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRunSummary, LiveTelemetry,
     LiveTelemetryStats,
 };
+pub(crate) use market_publisher::MarketPublisher;
 pub use shadow_adapter::ShadowAckAdapter;
 pub use state_cache::{
     CanonicalCacheSnapshot, ReconciliationReport, VenueAccountCache, VenueMarketCache,
