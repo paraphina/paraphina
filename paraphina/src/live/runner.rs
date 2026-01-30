@@ -1836,6 +1836,11 @@ pub async fn run_live_loop(
         }
 
         maybe_print_market_rx_stats(tick, &market_rx_stats);
+        if let (Some(hooks), Some(stats)) = (hooks.as_ref(), market_rx_stats.as_ref()) {
+            hooks
+                .metrics
+                .add_market_rx_stats(stats.drained, stats.out_market, stats.cap_hits);
+        }
         tick += 1;
         if let LiveRunMode::Step { .. } = mode {
             tokio::task::yield_now().await;
