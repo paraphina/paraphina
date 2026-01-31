@@ -9,7 +9,7 @@ pub const SUPPORTS_ACCOUNT: bool = true;
 #[cfg(feature = "live_paradex")]
 pub const SUPPORTS_EXECUTION: bool = true;
 
-const PARADEX_STALE_MS: u64 = 1800;
+const PARADEX_STALE_MS_DEFAULT: u64 = 10_000;
 const PARADEX_WATCHDOG_TICK_MS: u64 = 200;
 const PARADEX_MARKET_PUB_QUEUE_CAP: usize = 256;
 const PARADEX_MARKET_PUB_DRAIN_MAX: usize = 64;
@@ -19,6 +19,13 @@ static MONO_START: OnceLock<Instant> = OnceLock::new();
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
     start.elapsed().as_nanos() as u64
+}
+
+fn paradex_stale_ms() -> u64 {
+    std::env::var("PARAPHINA_PARADEX_STALE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(PARADEX_STALE_MS_DEFAULT)
 }
 
 #[allow(dead_code)]
@@ -217,9 +224,11 @@ impl ParadexConnector {
             || std::env::var("PARADEX_FIXTURE_MODE")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+        let stale_ms = paradex_stale_ms();
         if fixture_mode {
             eprintln!("INFO: Paradex fixture mode detected; freshness watchdog disabled");
         } else {
+            let watchdog_stale_ms = stale_ms;
             let watchdog_freshness = self.freshness.clone();
             tokio::spawn(async move {
                 let mut iv =
@@ -231,7 +240,7 @@ impl ParadexConnector {
                     let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
                     let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
                     let anchor = if last_pub != 0 { last_pub } else { last_parsed };
-                    if anchor != 0 && age_ms(now, anchor) > PARADEX_STALE_MS {
+                    if anchor != 0 && age_ms(now, anchor) > watchdog_stale_ms {
                         let _ = stale_tx.send(());
                         break;
                     }
@@ -242,7 +251,7 @@ impl ParadexConnector {
             let msg = tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
-                    anyhow::bail!("Paradex public WS stale: freshness exceeded PARADEX_STALE_MS");
+                    anyhow::bail!("Paradex public WS stale: freshness exceeded {stale_ms}ms");
                 }
                 msg = read.next() => {
                     let Some(msg) = msg else { break; };

@@ -7,7 +7,7 @@ pub const SUPPORTS_MARKET: bool = true;
 pub const SUPPORTS_ACCOUNT: bool = true;
 pub const SUPPORTS_EXECUTION: bool = true;
 
-const HL_STALE_MS: u64 = 1800;
+const HL_STALE_MS_DEFAULT: u64 = 10_000;
 const HL_WATCHDOG_TICK_MS: u64 = 200;
 const HL_SNAPSHOT_COOLDOWN_MS: u64 = 8_000;
 const HL_INTERNAL_PUB_Q: usize = 256;
@@ -18,6 +18,13 @@ static MONO_START: OnceLock<Instant> = OnceLock::new();
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
     start.elapsed().as_nanos() as u64
+}
+
+fn hl_stale_ms() -> u64 {
+    std::env::var("PARAPHINA_HL_STALE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(HL_STALE_MS_DEFAULT)
 }
 
 fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
@@ -209,9 +216,11 @@ impl HyperliquidConnector {
             self.cfg.coin, self.cfg.n_sig_figs, self.cfg.n_levels
         );
         let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        let stale_ms = hl_stale_ms();
         if std::env::var_os("HL_FIXTURE_DIR").is_some() {
             eprintln!("INFO: Hyperliquid fixture mode detected; freshness watchdog disabled");
         } else {
+            let watchdog_stale_ms = stale_ms;
             let watchdog_freshness = self.freshness.clone();
             tokio::spawn(async move {
                 let mut iv = tokio::time::interval(Duration::from_millis(HL_WATCHDOG_TICK_MS));
@@ -222,7 +231,7 @@ impl HyperliquidConnector {
                     let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
                     let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
                     let anchor = if last_pub != 0 { last_pub } else { last_parsed };
-                    if anchor != 0 && age_ms(now, anchor) > HL_STALE_MS {
+                    if anchor != 0 && age_ms(now, anchor) > watchdog_stale_ms {
                         let _ = stale_tx.send(());
                         break;
                     }
@@ -276,7 +285,7 @@ impl HyperliquidConnector {
             tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
-                    anyhow::bail!("Hyperliquid public WS stale: freshness exceeded HL_STALE_MS");
+                    anyhow::bail!("Hyperliquid public WS stale: freshness exceeded {stale_ms}ms");
                 }
                 maybe = read.next() => {
                     let Some(msg) = maybe else { break; };
