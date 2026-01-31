@@ -1548,6 +1548,13 @@ async fn main() {
     let build_info = paraphina::BuildInfo::capture();
     let trade_mode = resolve_effective_trade_mode(args.trade_mode.map(TradeMode::from));
     trade_mode.log_startup();
+    let tm_env: &str = match trade_mode.trade_mode {
+        TradeMode::Shadow => "shadow",
+        TradeMode::Paper => "paper",
+        TradeMode::Testnet => "testnet",
+        TradeMode::Live => "live",
+    };
+    std::env::set_var("PARAPHINA_TRADE_MODE", tm_env);
     let connector_selection = resolve_connectors(&args);
     let connectors = connector_selection.connectors.clone();
     let out_dir = resolve_out_dir(args.out_dir.clone());
