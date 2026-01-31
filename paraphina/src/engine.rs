@@ -185,7 +185,7 @@ impl<'a> Engine<'a> {
 
         // --- Measurement update (sequential over eligible venues)
         // Gate around the prior fair value if we have one.
-        let gate_ref = if prev_fair.is_finite() && prev_fair > 0.0 {
+        let gate_ref = if state.fv_available && prev_fair.is_finite() && prev_fair > 0.0 {
             Some(prev_fair)
         } else {
             None
@@ -490,6 +490,11 @@ impl<'a> Engine<'a> {
     /// - Once kill_switch is true, it stays true until manual reset.
     pub fn update_risk_limits_and_regime(&self, state: &mut GlobalState) {
         let risk_cfg = &self.cfg.risk;
+        let trade_mode = std::env::var("PARAPHINA_TRADE_MODE")
+            .ok()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let paper_mode = matches!(trade_mode.as_str(), "paper" | "p");
 
         // ---- 1) Vol-scaled delta limit + static basis limits ---------------
         let vol_ratio = state.vol_ratio_clipped.max(1e-6);
@@ -558,8 +563,10 @@ impl<'a> Engine<'a> {
         if !state.kill_switch {
             // Check in priority order: PnL > Delta > Basis > Liquidation
             if pnl_hard_breach {
-                state.kill_switch = true;
-                state.kill_reason = KillReason::PnlHardBreach;
+                if !paper_mode {
+                    state.kill_switch = true;
+                    state.kill_reason = KillReason::PnlHardBreach;
+                }
             } else if delta_hard_breach {
                 state.kill_switch = true;
                 state.kill_reason = KillReason::DeltaHardBreach;
