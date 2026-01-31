@@ -1037,35 +1037,19 @@ pub async fn run_live_loop(
         let mut tick_exec_events: Vec<ExecutionEvent> = Vec::new();
         let mut tick_fills: Vec<crate::types::FillEvent> = Vec::new();
 
-        let mut market_rx_stats = market_rx_stats_enabled.then_some(MarketRxStats::default());
-        let maybe_print_market_rx_stats = |tick: u64, stats: &Option<MarketRxStats>| {
-            if let Some(stats) = stats.as_ref() {
-                if tick % market_rx_stats_every == 0 {
-                    let other = stats.drained.saturating_sub(
-                        stats.l2_delta + stats.l2_snapshot + stats.trade + stats.funding_update,
-                    );
-                    if let Some(path) = &market_rx_stats_path {
-                        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-                            let _ = writeln!(
-                                f,
-                                "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={} cap_hits={}",
-                                tick,
-                                stats.drained,
-                                stats.l2_delta,
-                                stats.l2_snapshot,
-                                stats.trade,
-                                stats.funding_update,
-                                stats.out_market,
-                                stats.out_l2_delta,
-                                stats.out_l2_snapshot,
-                                stats.out_trade,
-                                stats.out_funding_update,
-                                other,
-                                stats.cap_hits
-                            );
-                        }
-                    } else {
-                        eprintln!(
+        let mut market_rx_stats = MarketRxStats::default();
+        let maybe_print_market_rx_stats = |tick: u64, enabled: bool, stats: &MarketRxStats| {
+            if !enabled {
+                return;
+            }
+            if tick % market_rx_stats_every == 0 {
+                let other = stats.drained.saturating_sub(
+                    stats.l2_delta + stats.l2_snapshot + stats.trade + stats.funding_update,
+                );
+                if let Some(path) = &market_rx_stats_path {
+                    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+                        let _ = writeln!(
+                            f,
                             "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={} cap_hits={}",
                             tick,
                             stats.drained,
@@ -1082,6 +1066,23 @@ pub async fn run_live_loop(
                             stats.cap_hits
                         );
                     }
+                } else {
+                    eprintln!(
+                        "market_rx_stats tick={} raw_drained={} raw_l2_delta={} raw_l2_snapshot={} raw_trade={} raw_funding_update={} out_market={} out_l2_delta={} out_l2_snapshot={} out_trade={} out_funding_update={} other={} cap_hits={}",
+                        tick,
+                        stats.drained,
+                        stats.l2_delta,
+                        stats.l2_snapshot,
+                        stats.trade,
+                        stats.funding_update,
+                        stats.out_market,
+                        stats.out_l2_delta,
+                        stats.out_l2_snapshot,
+                        stats.out_trade,
+                        stats.out_funding_update,
+                        other,
+                        stats.cap_hits
+                    );
                 }
             }
         };
@@ -1096,7 +1097,7 @@ pub async fn run_live_loop(
             &mut account_rx,
             &mut exec_rx,
             &mut order_snapshot_rx,
-            market_rx_stats.as_mut(),
+            Some(&mut market_rx_stats),
             delta_coalesce_now,
             snapshot_coalesce_now,
             coalesce_ready_mask,
@@ -1520,19 +1521,19 @@ pub async fn run_live_loop(
                     None,
                     None,
                     &pending_drift_events,
-                    market_rx_stats.as_ref(),
+                    market_rx_stats_enabled.then_some(&market_rx_stats),
                 );
                 pending_drift_events.clear();
             }
         }
 
         if state.kill_switch {
-            maybe_print_market_rx_stats(tick, &market_rx_stats);
+            maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
             break;
         }
 
         if snapshot.ready_market_count() == 0 && !smoke_intents {
-            maybe_print_market_rx_stats(tick, &market_rx_stats);
+            maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
             tick += 1;
             continue;
         }
@@ -1831,15 +1832,17 @@ pub async fn run_live_loop(
         }
 
         if state.kill_switch {
-            maybe_print_market_rx_stats(tick, &market_rx_stats);
+            maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
             break;
         }
 
-        maybe_print_market_rx_stats(tick, &market_rx_stats);
-        if let (Some(hooks), Some(stats)) = (hooks.as_ref(), market_rx_stats.as_ref()) {
-            hooks
-                .metrics
-                .add_market_rx_stats(stats.drained, stats.out_market, stats.cap_hits);
+        maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
+        if let Some(hooks) = hooks.as_ref() {
+            hooks.metrics.add_market_rx_stats(
+                market_rx_stats.drained,
+                market_rx_stats.out_market,
+                market_rx_stats.cap_hits,
+            );
         }
         tick += 1;
         if let LiveRunMode::Step { .. } = mode {
