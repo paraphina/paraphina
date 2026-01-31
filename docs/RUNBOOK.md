@@ -235,6 +235,27 @@ python3 tools/check_telemetry_contract.py ./live_runs/fixture_001/telemetry.json
 
 Default bind: `127.0.0.1:9898` (override with `PARAPHINA_LIVE_METRICS_ADDR`).
 
+### Market RX burst metrics (Frontier 2)
+
+These counters are always-on when the live metrics server is running (no need to enable per-tick logging).
+
+Quick check:
+
+```
+curl -s http://127.0.0.1:9898/metrics | rg "paraphina_live_market_rx_"
+```
+
+
+Counters:
+- `paraphina_live_market_rx_raw_drained_total`: total market events drained from ingress queues (pressure indicator).
+- `paraphina_live_market_rx_out_emitted_total`: total market events emitted into ordered processing (post-coalesce load).
+- `paraphina_live_market_rx_cap_hits_total`: number of per-venue per-tick delta-buffer cap activations (guardrail engagement).
+
+Interpretation:
+- If `raw_drained_total` grows much faster than `out_emitted_total`, the system is successfully compressing burst volume.
+- If `cap_hits_total` increases, the tick-local delta buffer cap engaged; consider raising `PARAPHINA_L2_TICK_DELTA_BUFFER_MAX` if this happens frequently under normal conditions.
+- For detailed per-tick breakdowns, enable `PARAPHINA_MARKET_RX_STATS=1` (optional, noisy).
+
 ## Startup Artifacts
 
 At startup, Paraphina writes:
