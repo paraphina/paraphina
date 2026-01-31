@@ -545,20 +545,18 @@ fn drain_ordered_events(
         if !l2_deltas_strictly_increasing_by_seq_ts(&deltas) {
             deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
         }
-        let mut merged: Vec<super::types::L2Delta> = Vec::with_capacity(deltas.len());
-        for delta in deltas {
-            if let Some(last) = merged.last_mut() {
-                if last.seq == delta.seq {
-                    last.changes.extend(delta.changes);
-                    if delta.timestamp_ms > last.timestamp_ms {
-                        last.timestamp_ms = delta.timestamp_ms;
-                    }
-                    continue;
+        deltas.dedup_by(|a, b| {
+            if a.seq == b.seq {
+                a.changes.extend(std::mem::take(&mut b.changes));
+                if b.timestamp_ms > a.timestamp_ms {
+                    a.timestamp_ms = b.timestamp_ms;
                 }
+                true
+            } else {
+                false
             }
-            merged.push(delta);
-        }
-        for delta in merged {
+        });
+        for delta in deltas {
             let event = super::types::MarketDataEvent::L2Delta(delta);
             count_out_market(market_stats, &event);
             if let Some(ordered) = ordered_event_for_market(event) {
@@ -580,20 +578,17 @@ fn drain_ordered_events(
                     if !l2_deltas_strictly_increasing_by_seq_ts(&deltas) {
                         deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
                     }
-                    let mut merged: Vec<super::types::L2Delta> = Vec::with_capacity(deltas.len());
-                    for delta in deltas {
-                        if let Some(last) = merged.last_mut() {
-                            if last.seq == delta.seq {
-                                last.changes.extend(delta.changes);
-                                if delta.timestamp_ms > last.timestamp_ms {
-                                    last.timestamp_ms = delta.timestamp_ms;
-                                }
-                                continue;
+                    deltas.dedup_by(|a, b| {
+                        if a.seq == b.seq {
+                            a.changes.extend(std::mem::take(&mut b.changes));
+                            if b.timestamp_ms > a.timestamp_ms {
+                                a.timestamp_ms = b.timestamp_ms;
                             }
+                            true
+                        } else {
+                            false
                         }
-                        merged.push(delta);
-                    }
-                    deltas = merged;
+                    });
                     deltas.retain(|d| d.seq > snapshot.seq);
                 }
                 let mut contiguous = false;
