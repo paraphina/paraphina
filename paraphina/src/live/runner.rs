@@ -860,6 +860,11 @@ pub async fn run_live_loop(
     let smoke_intents = std::env::var("PARAPHINA_PAPER_SMOKE_INTENTS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let trade_mode = std::env::var("PARAPHINA_TRADE_MODE")
+        .ok()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let skip_reconcile_kill = matches!(trade_mode.as_str(), "paper" | "p");
     let canary_enabled = std::env::var("PARAPHINA_CANARY_MODE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -1233,9 +1238,11 @@ pub async fn run_live_loop(
                                     available: true,
                                 },
                             );
-                            if !state.kill_switch {
-                                state.kill_switch = true;
-                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            if !skip_reconcile_kill {
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
                             }
                         }
                         let bal_internal = vstate.margin_balance_usd;
@@ -1257,9 +1264,11 @@ pub async fn run_live_loop(
                                     available: true,
                                 },
                             );
-                            if !state.kill_switch {
-                                state.kill_switch = true;
-                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            if !skip_reconcile_kill {
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
                             }
                         }
                         let used_internal = vstate.margin_used_usd;
@@ -1281,9 +1290,11 @@ pub async fn run_live_loop(
                                     available: true,
                                 },
                             );
-                            if !state.kill_switch {
-                                state.kill_switch = true;
-                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            if !skip_reconcile_kill {
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
                             }
                         }
                         let avail_internal = vstate.margin_available_usd;
@@ -1305,9 +1316,11 @@ pub async fn run_live_loop(
                                     available: true,
                                 },
                             );
-                            if !state.kill_switch {
-                                state.kill_switch = true;
-                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            if !skip_reconcile_kill {
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
                             }
                         }
                     }
@@ -1360,9 +1373,11 @@ pub async fn run_live_loop(
                                     available: true,
                                 },
                             );
-                            if !state.kill_switch {
-                                state.kill_switch = true;
-                                state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                            if !skip_reconcile_kill {
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                }
                             }
                         }
                         state.live_order_state.reconcile(&snapshot, now_ms);
@@ -1656,10 +1671,12 @@ pub async fn run_live_loop(
                                         available: true,
                                     },
                                 );
-                                if !state.kill_switch {
-                                    state.kill_switch = true;
-                                    state.kill_reason =
-                                        crate::state::KillReason::ReconciliationDrift;
+                                if !skip_reconcile_kill {
+                                    if !state.kill_switch {
+                                        state.kill_switch = true;
+                                        state.kill_reason =
+                                            crate::state::KillReason::ReconciliationDrift;
+                                    }
                                 }
                             }
                             state.live_order_state.reconcile(&snapshot, now_ms);

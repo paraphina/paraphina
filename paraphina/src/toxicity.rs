@@ -96,7 +96,12 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
     let vol_cfg = &cfg.volatility;
     let shadow_mode = std::env::var("PARAPHINA_TRADE_MODE")
         .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "shadow" | "safe" | "s"))
+        .map(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "shadow" | "safe" | "s" | "paper" | "p" | "testnet" | "tn" | "t"
+            )
+        })
         .unwrap_or(false);
 
     // Hoist config lookups outside the venue loop to avoid repeated struct access.
@@ -202,7 +207,7 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
         if venue.mid.is_none() || venue.depth_near_mid <= 0.0 {
             // No valid book data -> treat as highly toxic
             venue.toxicity = 1.0;
-        } else if vol_tox_scale > 0.0 && sigma_eff > 0.0 {
+        } else if !shadow_mode && vol_tox_scale > 0.0 && sigma_eff > 0.0 {
             // Optionally blend in volatility-based feature for extra signal
             // (only if local vol is significantly elevated)
             let local: f64 = venue.local_vol_short.max(sigma_min);
