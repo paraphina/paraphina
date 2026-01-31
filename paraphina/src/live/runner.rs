@@ -522,6 +522,19 @@ fn drain_ordered_events(
         }
     }
     let mut pending_deltas = pending_deltas.unwrap_or_default();
+    fn l2_deltas_strictly_increasing_by_seq_ts(deltas: &[super::types::L2Delta]) -> bool {
+        if deltas.len() <= 1 {
+            return true;
+        }
+        let mut prev = &deltas[0];
+        for cur in deltas.iter().skip(1) {
+            if (prev.seq, prev.timestamp_ms) >= (cur.seq, cur.timestamp_ms) {
+                return false;
+            }
+            prev = cur;
+        }
+        true
+    }
     let emit_delta_list = |deltas: Vec<super::types::L2Delta>,
                            market_stats: &mut Option<&mut MarketRxStats>,
                            out: &mut Vec<OrderedEvent>| {
@@ -529,7 +542,9 @@ fn drain_ordered_events(
             return;
         }
         let mut deltas = deltas;
-        deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
+        if !l2_deltas_strictly_increasing_by_seq_ts(&deltas) {
+            deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
+        }
         let mut merged: Vec<super::types::L2Delta> = Vec::with_capacity(deltas.len());
         for delta in deltas {
             if let Some(last) = merged.last_mut() {
@@ -562,7 +577,9 @@ fn drain_ordered_events(
                     Vec::new()
                 };
                 if !deltas.is_empty() {
-                    deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
+                    if !l2_deltas_strictly_increasing_by_seq_ts(&deltas) {
+                        deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
+                    }
                     let mut merged: Vec<super::types::L2Delta> = Vec::with_capacity(deltas.len());
                     for delta in deltas {
                         if let Some(last) = merged.last_mut() {
