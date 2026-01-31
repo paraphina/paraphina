@@ -80,6 +80,11 @@
       "evidence": "agent-tools/10_python3_tools_check_telemetry_contract_py_tmp_telemetry_jsonl.log",
       "started_at": "2026-01-17T16:21:56+00:00",
       "finished_at": "2026-01-17T16:21:56+00:00"
+    },
+    {
+      "command": "cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_aster,live_extended,live_paradex",
+      "exit_code": 0,
+      "summary": "passed (manual run)"
     }
   ]
 }

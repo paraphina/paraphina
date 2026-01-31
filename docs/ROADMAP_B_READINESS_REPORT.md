@@ -1,6 +1,6 @@
 # Roadmap‑B Readiness Report
 
-- Generated (UTC): 2026-01-27T19:28:05Z
+- Generated (UTC): 2026-01-31T21:24:04Z
 
 ## Connector Matrix
 
@@ -31,8 +31,8 @@ Connector stages:
 
 ## All-5 Readiness Gates
 
-- All-5 compile under feature flags: UNKNOWN
-- All-5 PaperExec (offline deterministic): UNKNOWN
+- All-5 compile under feature flags: PASS
+- All-5 PaperExec (offline deterministic): PASS
 - CanaryLive-ready connectors: hyperliquid, lighter, extended, aster, paradex
 
 
@@ -76,6 +76,6 @@ Connector stages:
 - `cargo test -p paraphina --features live,live_paradex` → not_run
 - `cargo test -p paraphina --features live,live_aster` → not_run
 - `cargo test -p paraphina --features live,live_extended` → not_run
-- `cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_aster,live_extended,live_paradex` → not_run
+- `cargo test -p paraphina --features live,live_hyperliquid,live_lighter,live_aster,live_extended,live_paradex` → passed (passed (manual run))
 - `python3 -m pytest -q` → passed (647 passed in 3.38s)
 - `python3 tools/print_live_connector_matrix.py` → not_run
