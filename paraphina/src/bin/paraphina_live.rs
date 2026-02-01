@@ -28,9 +28,9 @@ use paraphina::live::types::L2Snapshot;
 use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
 use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
-use url::Url;
 use serde::Deserialize;
 use std::path::PathBuf;
+use url::Url;
 
 use tokio::sync::mpsc;
 
@@ -759,7 +759,13 @@ fn connector_support(connector: ConnectorArg) -> ConnectorSupport {
         ConnectorArg::Mock => ConnectorSupport::MarketOnly,
         ConnectorArg::Hyperliquid => ConnectorSupport::MarketAccountExec,
         ConnectorArg::HyperliquidFixture => ConnectorSupport::MarketAccount,
-        ConnectorArg::Lighter => ConnectorSupport::MarketAccountExec,
+        ConnectorArg::Lighter => {
+            if cfg!(feature = "live_lighter") {
+                ConnectorSupport::MarketAccountExec
+            } else {
+                ConnectorSupport::MissingFeature
+            }
+        }
         ConnectorArg::Extended => {
             if cfg!(feature = "live_extended") {
                 ConnectorSupport::MarketAccountExec
@@ -1370,12 +1376,28 @@ fn run_preflight(
                     .as_ref()
                     .map(|dir| std::path::Path::new(dir).is_dir())
                     .unwrap_or(false);
-                if trade_mode == TradeMode::Live {
-                    creds_ok = creds_ok && true;
+                let api_key_index_present = env_present("LIGHTER_API_KEY_INDEX");
+                let account_index_present = env_present("LIGHTER_ACCOUNT_INDEX");
+                let priv_present = env_present("LIGHTER_API_PRIVATE_KEY_HEX");
+                let token_present = env_present("LIGHTER_AUTH_TOKEN");
+                let signer_present = env_present("LIGHTER_SIGNER_URL");
+                let needs_auth = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
+                if needs_auth {
+                    creds_ok = creds_ok
+                        && api_key_index_present
+                        && account_index_present
+                        && priv_present
+                        && signer_present;
                 }
                 let detail = format!(
-                    "{}:no_key_required=true fixture_dir_ok={}",
+                    "{}:auth_required={} api_key_index={} account_index={} api_private_key_hex={} auth_token={} signer_url_present={} fixture_dir_ok={}",
                     connector.as_str(),
+                    needs_auth,
+                    api_key_index_present,
+                    account_index_present,
+                    priv_present,
+                    token_present,
+                    signer_present,
                     fixture_ok
                 );
                 creds_detail.push_str(&detail);
@@ -1937,14 +1959,23 @@ async fn main() {
                         channels.market_tx.clone(),
                         channels.exec_tx.clone(),
                     );
+                    let fixture_dir = std::env::var("LIGHTER_FIXTURE_DIR")
+                        .ok()
+                        .map(std::path::PathBuf::from);
+                    let use_fixture = fixture_dir.is_some();
                     if trade_mode.trade_mode != TradeMode::Shadow {
                         if lighter_cfg.paper_mode {
                             eprintln!("paraphina_live | account_snapshots_disabled=true reason=lighter_paper_mode connector=lighter");
                             if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
                                 send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
                             }
-                        } else {
+                        } else if use_fixture || lighter_cfg.has_auth() {
                             lighter = lighter.with_account_tx(channels.account_tx.clone());
+                        } else {
+                            eprintln!("paraphina_live | account_snapshots_disabled=true reason=missing_lighter_auth connector=lighter");
+                            if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
+                                send_unavailable_account_snapshot_for(&_account_tx, &cfg, index);
+                            }
                         }
                     } else {
                         eprintln!("paraphina_live | account_snapshots_disabled=true reason=trade_mode_shadow connector=lighter");
@@ -1953,14 +1984,25 @@ async fn main() {
                         }
                     }
                     let lighter_arc = Arc::new(lighter);
-                    let fixture_dir = std::env::var("LIGHTER_FIXTURE_DIR")
-                        .ok()
-                        .map(std::path::PathBuf::from);
                     if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
-                        if lighter_cfg.paper_mode {
+                        if use_fixture {
+                            eprintln!("paraphina_live | exec_disabled=true reason=lighter_fixture_mode connector=lighter");
+                        } else if lighter_cfg.paper_mode {
                             eprintln!("paraphina_live | exec_disabled=true reason=lighter_paper_mode connector=lighter");
-                        } else {
+                        } else if lighter_cfg.has_auth()
+                            && lighter_cfg
+                                .signer_url
+                                .as_ref()
+                                .map(|s| !s.trim().is_empty())
+                                .unwrap_or(false)
+                        {
                             exec_clients.insert(venue_id.clone(), lighter_arc.clone());
+                        } else {
+                            if lighter_cfg.has_auth() {
+                                eprintln!("paraphina_live | exec_disabled=true reason=missing_lighter_signer connector=lighter");
+                            } else {
+                                eprintln!("paraphina_live | exec_disabled=true reason=missing_lighter_auth connector=lighter");
+                            }
                         }
                     }
                     if let Some(fixture_dir) = fixture_dir {
@@ -1990,7 +2032,11 @@ async fn main() {
                             );
                         }
                     } else {
-                        if trade_mode.trade_mode != TradeMode::Shadow && !lighter_cfg.paper_mode {
+                        if trade_mode.trade_mode != TradeMode::Shadow
+                            && !lighter_cfg.paper_mode
+                            && !use_fixture
+                            && lighter_cfg.has_auth()
+                        {
                             let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
                                 .ok()
                                 .and_then(|v| v.parse::<u64>().ok())

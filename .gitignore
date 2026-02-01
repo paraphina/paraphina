@@ -72,3 +72,4 @@ _reports/
 
 # allow fixture jsonl files (needed for CI tests)
 !tests/fixtures/**/*.jsonl
+live_audit/

@@ -21,6 +21,7 @@ pub mod venue_health;
 pub mod venues;
 
 pub use gateway::{LiveGateway, LiveGatewayError, LiveGatewayErrorKind, LiveRestClient};
+pub(crate) use market_publisher::MarketPublisher;
 pub use orderbook_l2::{
     BookLevel, BookLevelDelta, BookSide, DepthConfig, DerivedBookMetrics, OrderBookError,
     OrderBookL2,
@@ -29,7 +30,6 @@ pub use runner::{
     run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRunSummary, LiveTelemetry,
     LiveTelemetryStats,
 };
-pub(crate) use market_publisher::MarketPublisher;
 pub use shadow_adapter::ShadowAckAdapter;
 pub use state_cache::{
     CanonicalCacheSnapshot, ReconciliationReport, VenueAccountCache, VenueMarketCache,
