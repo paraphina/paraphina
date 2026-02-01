@@ -358,18 +358,18 @@ fn drain_ordered_events(
         .filter(|&n| n > 0);
     let mut buffer_disabled_mask: u64 = 0;
     let buffer_disabled = |vi: usize, mask: u64| vi < 64 && (mask & (1u64 << vi)) != 0;
-    let count_out_market =
-        |stats: &mut Option<&mut MarketRxStats>, event: &super::types::MarketDataEvent| {
-            if let Some(stats) = stats.as_deref_mut() {
-                stats.out_market += 1;
-                match event {
-                    super::types::MarketDataEvent::L2Snapshot(_) => stats.out_l2_snapshot += 1,
-                    super::types::MarketDataEvent::L2Delta(_) => stats.out_l2_delta += 1,
-                    super::types::MarketDataEvent::Trade(_) => stats.out_trade += 1,
-                    super::types::MarketDataEvent::FundingUpdate(_) => stats.out_funding_update += 1,
-                }
+    let count_out_market = |stats: &mut Option<&mut MarketRxStats>,
+                            event: &super::types::MarketDataEvent| {
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.out_market += 1;
+            match event {
+                super::types::MarketDataEvent::L2Snapshot(_) => stats.out_l2_snapshot += 1,
+                super::types::MarketDataEvent::L2Delta(_) => stats.out_l2_delta += 1,
+                super::types::MarketDataEvent::Trade(_) => stats.out_trade += 1,
+                super::types::MarketDataEvent::FundingUpdate(_) => stats.out_funding_update += 1,
             }
-        };
+        }
+    };
 
     while let Ok(event) = market_rx.try_recv() {
         if let super::types::MarketDataEvent::L2Snapshot(snapshot) = &event {
@@ -394,29 +394,30 @@ fn drain_ordered_events(
                     if !venue_ready(vi, *saw_l2_snapshot_mask_this_tick) {
                         // Not ready: fall through to forward normally.
                     } else {
-                    if let Some(last_snapshots) = last_snapshots.as_mut() {
-                        if last_snapshots.len() <= vi {
-                            last_snapshots.resize_with(vi + 1, || None);
-                        }
-                        let replace = match last_snapshots[vi].as_ref() {
-                            Some(prev) => {
-                                s.seq > prev.seq
-                                    || (s.seq == prev.seq && s.timestamp_ms >= prev.timestamp_ms)
+                        if let Some(last_snapshots) = last_snapshots.as_mut() {
+                            if last_snapshots.len() <= vi {
+                                last_snapshots.resize_with(vi + 1, || None);
                             }
-                            None => true,
-                        };
-                        let snapshot_seq = s.seq;
-                        if replace {
-                            last_snapshots[vi] = Some(s);
-                        }
-                        if let Some(pending_deltas) = pending_deltas.as_mut() {
-                            if pending_deltas.len() <= vi {
-                                pending_deltas.resize_with(vi + 1, Vec::new);
+                            let replace = match last_snapshots[vi].as_ref() {
+                                Some(prev) => {
+                                    s.seq > prev.seq
+                                        || (s.seq == prev.seq
+                                            && s.timestamp_ms >= prev.timestamp_ms)
+                                }
+                                None => true,
+                            };
+                            let snapshot_seq = s.seq;
+                            if replace {
+                                last_snapshots[vi] = Some(s);
                             }
-                            pending_deltas[vi].retain(|d| d.seq > snapshot_seq);
+                            if let Some(pending_deltas) = pending_deltas.as_mut() {
+                                if pending_deltas.len() <= vi {
+                                    pending_deltas.resize_with(vi + 1, Vec::new);
+                                }
+                                pending_deltas[vi].retain(|d| d.seq > snapshot_seq);
+                            }
                         }
-                    }
-                    continue;
+                        continue;
                     }
                 }
                 let event = super::types::MarketDataEvent::L2Snapshot(s);
@@ -455,9 +456,25 @@ fn drain_ordered_events(
                         }
                         continue;
                     } else {
-                    // READY venue: buffer if cap not reached, else emit immediately
-                    if buffer_disabled(vi, buffer_disabled_mask) {
-                        // Cap already reached: apply snapshot-dominance check, then emit if not dominated
+                        // READY venue: buffer if cap not reached, else emit immediately
+                        if buffer_disabled(vi, buffer_disabled_mask) {
+                            // Cap already reached: apply snapshot-dominance check, then emit if not dominated
+                            if l2_snapshot_coalesce {
+                                if let Some(last_snapshots) = last_snapshots.as_ref() {
+                                    if let Some(Some(snapshot)) = last_snapshots.get(vi) {
+                                        if snapshot.seq >= d.seq {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                            let event = super::types::MarketDataEvent::L2Delta(d);
+                            count_out_market(&mut market_stats, &event);
+                            if let Some(ordered) = ordered_event_for_market(event) {
+                                out.push(ordered);
+                            }
+                            continue;
+                        }
                         if l2_snapshot_coalesce {
                             if let Some(last_snapshots) = last_snapshots.as_ref() {
                                 if let Some(Some(snapshot)) = last_snapshots.get(vi) {
@@ -467,44 +484,28 @@ fn drain_ordered_events(
                                 }
                             }
                         }
-                        let event = super::types::MarketDataEvent::L2Delta(d);
-                        count_out_market(&mut market_stats, &event);
-                        if let Some(ordered) = ordered_event_for_market(event) {
-                            out.push(ordered);
-                        }
-                        continue;
-                    }
-                    if l2_snapshot_coalesce {
-                        if let Some(last_snapshots) = last_snapshots.as_ref() {
-                            if let Some(Some(snapshot)) = last_snapshots.get(vi) {
-                                if snapshot.seq >= d.seq {
+                        if let Some(pending_deltas) = pending_deltas.as_mut() {
+                            if pending_deltas.len() <= vi {
+                                pending_deltas.resize_with(vi + 1, Vec::new);
+                            }
+                            if let Some(max) = tick_delta_buffer_max {
+                                if pending_deltas[vi].len() >= max {
+                                    buffer_disabled_mask |= 1u64 << vi;
+                                    if let Some(stats) = market_stats.as_deref_mut() {
+                                        stats.cap_hits += 1;
+                                    }
+                                    // Cap reached: emit immediately for ready venue
+                                    let event = super::types::MarketDataEvent::L2Delta(d);
+                                    count_out_market(&mut market_stats, &event);
+                                    if let Some(ordered) = ordered_event_for_market(event) {
+                                        out.push(ordered);
+                                    }
                                     continue;
                                 }
                             }
+                            pending_deltas[vi].push(d);
                         }
-                    }
-                    if let Some(pending_deltas) = pending_deltas.as_mut() {
-                        if pending_deltas.len() <= vi {
-                            pending_deltas.resize_with(vi + 1, Vec::new);
-                        }
-                        if let Some(max) = tick_delta_buffer_max {
-                            if pending_deltas[vi].len() >= max {
-                                buffer_disabled_mask |= 1u64 << vi;
-                                if let Some(stats) = market_stats.as_deref_mut() {
-                                    stats.cap_hits += 1;
-                                }
-                                // Cap reached: emit immediately for ready venue
-                                let event = super::types::MarketDataEvent::L2Delta(d);
-                                count_out_market(&mut market_stats, &event);
-                                if let Some(ordered) = ordered_event_for_market(event) {
-                                    out.push(ordered);
-                                }
-                                continue;
-                            }
-                        }
-                        pending_deltas[vi].push(d);
-                    }
-                    continue;
+                        continue;
                     }
                 }
                 // venue_index >= 64: fall through to push normally
@@ -576,7 +577,8 @@ fn drain_ordered_events(
                 };
                 if !deltas.is_empty() {
                     if !l2_deltas_strictly_increasing_by_seq_ts(&deltas) {
-                        deltas.sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
+                        deltas
+                            .sort_by(|a, b| (a.seq, a.timestamp_ms).cmp(&(b.seq, b.timestamp_ms)));
                     }
                     deltas.dedup_by(|a, b| {
                         if a.seq == b.seq {
@@ -620,16 +622,15 @@ fn drain_ordered_events(
                     }
                     if ok {
                         let last_delta = deltas.last().unwrap();
-                        let event = super::types::MarketDataEvent::L2Snapshot(
-                            super::types::L2Snapshot {
+                        let event =
+                            super::types::MarketDataEvent::L2Snapshot(super::types::L2Snapshot {
                                 venue_index: snapshot.venue_index,
                                 venue_id: snapshot.venue_id.clone(),
                                 seq: book.last_seq(),
                                 timestamp_ms: snapshot.timestamp_ms.max(last_delta.timestamp_ms),
                                 bids: book.bids().to_vec(),
                                 asks: book.asks().to_vec(),
-                            },
-                        );
+                            });
                         count_out_market(&mut market_stats, &event);
                         if let Some(ordered) = ordered_event_for_market(event) {
                             out.push(ordered);
@@ -1241,7 +1242,8 @@ pub async fn run_live_loop(
                             if !skip_reconcile_kill {
                                 if !state.kill_switch {
                                     state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                    state.kill_reason =
+                                        crate::state::KillReason::ReconciliationDrift;
                                 }
                             }
                         }
@@ -1267,7 +1269,8 @@ pub async fn run_live_loop(
                             if !skip_reconcile_kill {
                                 if !state.kill_switch {
                                     state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                    state.kill_reason =
+                                        crate::state::KillReason::ReconciliationDrift;
                                 }
                             }
                         }
@@ -1293,7 +1296,8 @@ pub async fn run_live_loop(
                             if !skip_reconcile_kill {
                                 if !state.kill_switch {
                                     state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                    state.kill_reason =
+                                        crate::state::KillReason::ReconciliationDrift;
                                 }
                             }
                         }
@@ -1319,7 +1323,8 @@ pub async fn run_live_loop(
                             if !skip_reconcile_kill {
                                 if !state.kill_switch {
                                     state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                    state.kill_reason =
+                                        crate::state::KillReason::ReconciliationDrift;
                                 }
                             }
                         }
@@ -1376,7 +1381,8 @@ pub async fn run_live_loop(
                             if !skip_reconcile_kill {
                                 if !state.kill_switch {
                                     state.kill_switch = true;
-                                    state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+                                    state.kill_reason =
+                                        crate::state::KillReason::ReconciliationDrift;
                                 }
                             }
                         }

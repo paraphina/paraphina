@@ -231,8 +231,7 @@ impl ParadexConnector {
             let watchdog_stale_ms = stale_ms;
             let watchdog_freshness = self.freshness.clone();
             tokio::spawn(async move {
-                let mut iv =
-                    tokio::time::interval(Duration::from_millis(PARADEX_WATCHDOG_TICK_MS));
+                let mut iv = tokio::time::interval(Duration::from_millis(PARADEX_WATCHDOG_TICK_MS));
                 iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     iv.tick().await;

@@ -175,7 +175,10 @@ impl AsterConnector {
             market_tx.clone(),
             Some(Arc::new(move || is_fixture || is_aster_fixture_mode_now())),
             Arc::new(|event: &MarketDataEvent| {
-                matches!(event, MarketDataEvent::L2Delta(_) | MarketDataEvent::L2Snapshot(_))
+                matches!(
+                    event,
+                    MarketDataEvent::L2Delta(_) | MarketDataEvent::L2Snapshot(_)
+                )
             }),
             Some(on_published),
             "aster market_tx closed",

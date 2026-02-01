@@ -8,5 +8,9 @@ pub mod extended;
 pub mod hyperliquid;
 #[cfg(feature = "live_lighter")]
 pub mod lighter;
+#[cfg(feature = "live_lighter")]
+pub mod lighter_nonce;
+#[cfg(feature = "live_lighter")]
+pub mod lighter_signer;
 #[cfg(feature = "live_paradex")]
 pub mod paradex;
