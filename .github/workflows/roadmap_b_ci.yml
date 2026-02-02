@@ -14,7 +14,7 @@ permissions:
 jobs:
   pr-gate:
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","vpsb-ci"]' || '["ubuntu-latest"]') }}
     env:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: "-C debuginfo=0"
@@ -108,7 +108,7 @@ jobs:
 
   nightly-matrix:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","vpsb-ci"]' || '["ubuntu-latest"]') }}
     strategy:
       fail-fast: false
       matrix:

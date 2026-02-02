@@ -54,7 +54,7 @@ concurrency:
 
 jobs:
   research:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","vpsb-ci"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 120
 
     # Environment variables for consistent path contracts
