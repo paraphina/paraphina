@@ -1490,6 +1490,10 @@ mod tests {
 
     #[tokio::test]
     async fn lighter_place_order_calls_signer_then_sendtx() {
+
+          let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+          std::env::remove_var("LIGHTER_MARKET_ID");
+          std::env::remove_var("LIGHTER_MARKET");
         let api = MockServer::start_async().await;
         let signer = MockServer::start_async().await;
         let orderbooks = api
