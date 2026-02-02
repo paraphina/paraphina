@@ -1088,7 +1088,7 @@ impl AsterSeqState {
         update: &AsterDepthUpdate,
     ) -> anyhow::Result<Option<MarketDataEvent>> {
         if let Some(prev) = update.prev_id {
-            if prev != self.last_update_id {
+            if prev != self.last_update_id && !seq_bridge_ok(self.last_update_id, update) {
                 return Err(anyhow::anyhow!(
                     "aster seq mismatch prev_id={} last={}",
                     prev,
@@ -1131,9 +1131,20 @@ enum SeqDecision {
     Gap,
 }
 
+fn seq_bridge_ok(last_update_id: u64, update: &AsterDepthUpdate) -> bool {
+    let want = last_update_id + 1;
+    update.start_id <= want && update.end_id >= want
+}
+
 fn seq_decision_lenient(last_update_id: u64, update: &AsterDepthUpdate) -> SeqDecision {
     if let Some(prev) = update.prev_id {
+        if update.end_id <= last_update_id {
+            return SeqDecision::Stale;
+        }
         if prev == last_update_id {
+            return SeqDecision::Apply;
+        }
+        if seq_bridge_ok(last_update_id, update) {
             return SeqDecision::Apply;
         }
         if prev < last_update_id {
@@ -1715,6 +1726,34 @@ mod tests {
         };
         let decision = seq_decision_lenient(100, &update);
         assert_eq!(decision, SeqDecision::Gap);
+    }
+
+    #[test]
+    fn seq_bridge_allows_lock_on_after_snapshot() {
+        let update = AsterDepthUpdate {
+            symbol: "BTCUSDT".to_string(),
+            event_time: None,
+            start_id: 95,
+            end_id: 105,
+            prev_id: Some(90),
+            bids: vec![BookLevelDelta {
+                side: BookSide::Bid,
+                price: 100.0,
+                size: 1.0,
+            }],
+            asks: vec![BookLevelDelta {
+                side: BookSide::Ask,
+                price: 101.0,
+                size: 1.0,
+            }],
+        };
+        let decision = seq_decision_lenient(100, &update);
+        assert_eq!(decision, SeqDecision::Apply);
+
+        let mut state = AsterSeqState::new(100, 0, "ASTER");
+        let event = state.apply_update(&update).expect("apply update");
+        assert!(event.is_some());
+        assert_eq!(state.last_update_id, 105);
     }
 
     #[tokio::test]
