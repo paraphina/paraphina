@@ -260,7 +260,7 @@ impl AsterConnector {
                     let now = mono_now_ns();
                     let last_pub = freshness.last_published_ns.load(Ordering::Relaxed);
                     let last_parsed = freshness.last_parsed_ns.load(Ordering::Relaxed);
-                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    let anchor = last_pub.max(last_parsed);
                     if anchor != 0 && age_ms(now, anchor) > ASTER_STALE_MS {
                         let _ = stale_tx.send(());
                         break;
