@@ -316,10 +316,27 @@ pub fn compute_venue_targets_into(
 /// This is the default hot path which does NOT construct an AblationSet
 /// or check ablation flags. It calls the specialized "no ablations"
 /// implementation directly.
+///
+/// **Staleness guard**: If `now_ms` is provided and `cfg.mm.quote_max_age_ms` is set,
+/// venues with `age_ms > quote_max_age_ms` will have their quotes cleared. This prevents
+/// quoting on stale orderbook data. Pass `None` to disable the guard (e.g., in tests).
 pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
+    compute_mm_quotes_with_now(cfg, state, None)
+}
+
+/// Main MM quoting function with explicit timestamp for staleness guard.
+///
+/// Same as `compute_mm_quotes` but with explicit `now_ms` for staleness checking.
+/// If `now_ms` is provided and `cfg.mm.quote_max_age_ms` is set, venues with stale
+/// data will have their quotes cleared.
+pub fn compute_mm_quotes_with_now(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: Option<TimestampMs>,
+) -> Vec<MmQuote> {
     let n = cfg.venues.len();
     let mut out = Vec::with_capacity(n);
-    compute_mm_quotes_impl::<false, false>(cfg, state, &mut out);
+    compute_mm_quotes_impl::<false, false>(cfg, state, now_ms, &mut out);
     out
 }
 
@@ -335,7 +352,19 @@ pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
 /// Note: This version still allocates an internal scratch buffer each call.
 /// For zero-allocation hot paths, use `compute_mm_quotes_into_with_scratch`.
 pub fn compute_mm_quotes_into(cfg: &Config, state: &GlobalState, out: &mut Vec<MmQuote>) {
-    compute_mm_quotes_impl::<false, false>(cfg, state, out)
+    compute_mm_quotes_impl::<false, false>(cfg, state, None, out)
+}
+
+/// Main MM quoting function (buffer-reusing variant) with explicit timestamp.
+///
+/// Same as `compute_mm_quotes_into` but with explicit `now_ms` for staleness checking.
+pub fn compute_mm_quotes_into_with_now(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: Option<TimestampMs>,
+    out: &mut Vec<MmQuote>,
+) {
+    compute_mm_quotes_impl::<false, false>(cfg, state, now_ms, out)
 }
 
 /// Main MM quoting function (fully buffer-reusing variant).
@@ -355,7 +384,7 @@ pub fn compute_mm_quotes_into_with_scratch(
     out: &mut Vec<MmQuote>,
     scratch: &mut MmScratch,
 ) {
-    compute_mm_quotes_impl_with_scratch::<false, false>(cfg, state, out, scratch)
+    compute_mm_quotes_impl_with_scratch::<false, false>(cfg, state, None, out, scratch)
 }
 
 /// Main MM quoting function with ablation support.
@@ -394,11 +423,12 @@ pub fn compute_mm_quotes_with_ablations_into(
     let disable_fv = ablations.disable_fair_value_gating();
     let disable_tox = ablations.disable_toxicity_gate();
 
+    // Ablation mode: no staleness guard (now_ms = None) since this is for simulation/eval.
     match (disable_fv, disable_tox) {
-        (false, false) => compute_mm_quotes_impl::<false, false>(cfg, state, out),
-        (true, false) => compute_mm_quotes_impl::<true, false>(cfg, state, out),
-        (false, true) => compute_mm_quotes_impl::<false, true>(cfg, state, out),
-        (true, true) => compute_mm_quotes_impl::<true, true>(cfg, state, out),
+        (false, false) => compute_mm_quotes_impl::<false, false>(cfg, state, None, out),
+        (true, false) => compute_mm_quotes_impl::<true, false>(cfg, state, None, out),
+        (false, true) => compute_mm_quotes_impl::<false, true>(cfg, state, None, out),
+        (true, true) => compute_mm_quotes_impl::<true, true>(cfg, state, None, out),
     }
 }
 
@@ -423,17 +453,18 @@ pub fn compute_mm_quotes_with_ablations_into_with_scratch(
     let disable_fv = ablations.disable_fair_value_gating();
     let disable_tox = ablations.disable_toxicity_gate();
 
+    // Ablation mode: no staleness guard (now_ms = None) since this is for simulation/eval.
     match (disable_fv, disable_tox) {
         (false, false) => {
-            compute_mm_quotes_impl_with_scratch::<false, false>(cfg, state, out, scratch)
+            compute_mm_quotes_impl_with_scratch::<false, false>(cfg, state, None, out, scratch)
         }
         (true, false) => {
-            compute_mm_quotes_impl_with_scratch::<true, false>(cfg, state, out, scratch)
+            compute_mm_quotes_impl_with_scratch::<true, false>(cfg, state, None, out, scratch)
         }
         (false, true) => {
-            compute_mm_quotes_impl_with_scratch::<false, true>(cfg, state, out, scratch)
+            compute_mm_quotes_impl_with_scratch::<false, true>(cfg, state, None, out, scratch)
         }
-        (true, true) => compute_mm_quotes_impl_with_scratch::<true, true>(cfg, state, out, scratch),
+        (true, true) => compute_mm_quotes_impl_with_scratch::<true, true>(cfg, state, None, out, scratch),
     }
 }
 
@@ -462,10 +493,11 @@ pub fn compute_mm_quotes_with_ablations_into_with_scratch(
 fn compute_mm_quotes_impl<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
     cfg: &Config,
     state: &GlobalState,
+    now_ms: Option<TimestampMs>,
     out: &mut Vec<MmQuote>,
 ) {
     let mut scratch = MmScratch::new();
-    compute_mm_quotes_impl_with_scratch::<DISABLE_FV, DISABLE_TOX>(cfg, state, out, &mut scratch)
+    compute_mm_quotes_impl_with_scratch::<DISABLE_FV, DISABLE_TOX>(cfg, state, now_ms, out, &mut scratch)
 }
 
 /// Opt23: Clear bid/ask levels without touching venue_id (stable slots).
@@ -486,9 +518,14 @@ fn clear_mm_quote_levels(out: &mut [MmQuote]) {
 ///
 /// The scratch buffer's capacity is preserved across calls; only the contents
 /// are cleared and repopulated each tick.
+///
+/// **Staleness guard (Milestone F)**: If `now_ms` is provided and
+/// `cfg.mm.quote_max_age_ms` is set, venues with `age_ms > quote_max_age_ms`
+/// will have their quotes cleared. This prevents quoting on stale orderbook data.
 fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
     cfg: &Config,
     state: &GlobalState,
+    now_ms: Option<TimestampMs>,
     out: &mut Vec<MmQuote>,
     scratch: &mut MmScratch,
 ) {
@@ -611,6 +648,27 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
             out[i].bid = None;
             out[i].ask = None;
             continue;
+        }
+
+        // Staleness guard (Milestone F): Skip quoting if venue data is too old.
+        // If now_ms is provided, check age against quote_max_age_ms threshold.
+        // Uses per-venue stale_ms_override if set, otherwise global book.stale_ms.
+        if let Some(now) = now_ms {
+            let quote_max_age = cfg.mm.quote_max_age_ms
+                .unwrap_or_else(|| vcfg.effective_stale_ms(cfg.book.stale_ms));
+            if let Some(last_update) = vstate.last_mid_update_ms {
+                let age_ms = now - last_update;
+                if age_ms > quote_max_age {
+                    out[i].bid = None;
+                    out[i].ask = None;
+                    continue;
+                }
+            } else {
+                // No book data yet => skip quoting (fail-closed).
+                out[i].bid = None;
+                out[i].ask = None;
+                continue;
+            }
         }
 
         // Venue mid: prefer local mid if present, else fall back to fair value.
@@ -2190,7 +2248,7 @@ mod tests {
 
         // First, run with valid fair_value to populate quotes.
         let mut scratch = MmScratch::new();
-        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, None, &mut out, &mut scratch);
 
         // Verify we have some quotes after valid run.
         let has_quotes = out.iter().any(|q| q.bid.is_some() || q.ask.is_some());
@@ -2198,7 +2256,7 @@ mod tests {
 
         // Now set fair_value to None and call again.
         state.fair_value = None;
-        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, None, &mut out, &mut scratch);
 
         // All bids/asks must be None (Opt23: no stale quotes leak).
         for (i, q) in out.iter().enumerate() {
@@ -2231,7 +2289,7 @@ mod tests {
 
         // First, run with valid state to populate quotes.
         let mut scratch = MmScratch::new();
-        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, None, &mut out, &mut scratch);
 
         // Verify we have some quotes after valid run.
         let has_quotes = out.iter().any(|q| q.bid.is_some() || q.ask.is_some());
@@ -2239,7 +2297,7 @@ mod tests {
 
         // Now set kill_switch and call again.
         state.kill_switch = true;
-        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, None, &mut out, &mut scratch);
 
         // All bids/asks must be None (Opt23: no stale quotes leak).
         for (i, q) in out.iter().enumerate() {
@@ -2272,7 +2330,7 @@ mod tests {
 
         // First, run with all venues healthy to populate quotes.
         let mut scratch = MmScratch::new();
-        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, None, &mut out, &mut scratch);
 
         // Verify venue 0 has quotes after valid run.
         assert!(
@@ -2282,7 +2340,7 @@ mod tests {
 
         // Now disable venue 0 and call again.
         state.venues[0].status = VenueStatus::Disabled;
-        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, &mut out, &mut scratch);
+        compute_mm_quotes_impl_with_scratch::<false, false>(&cfg, &state, None, &mut out, &mut scratch);
 
         // Venue 0 must have bid/ask cleared (Opt23: no stale quotes leak).
         assert!(out[0].bid.is_none(), "Disabled venue 0: bid should be None");
@@ -2293,6 +2351,91 @@ mod tests {
         assert!(
             other_has_quotes,
             "Other venues should still have quotes after disabling venue 0"
+        );
+    }
+
+    /// Milestone F: Quote staleness guard prevents quoting on stale venue data.
+    #[test]
+    fn quote_staleness_guard_skips_stale_venues() {
+        let (mut cfg, mut state) = setup_test();
+        let n = cfg.venues.len();
+        let now_ms: TimestampMs = 10_000;
+
+        // Set all venues healthy with fresh data.
+        for (i, v) in state.venues.iter_mut().enumerate() {
+            v.status = VenueStatus::Healthy;
+            v.mid = Some(100.0);
+            v.last_mid_update_ms = Some(now_ms - 50); // Fresh: 50ms old
+            v.spread = Some(1.0);
+            v.depth_near_mid = 1000.0 + i as f64;
+        }
+
+        // Set global stale_ms = 1000 (default).
+        // Without staleness guard (now_ms = None), all venues should get quotes.
+        let quotes_no_guard = compute_mm_quotes_with_now(&cfg, &state, None);
+        let count_no_guard = quotes_no_guard
+            .iter()
+            .filter(|q| q.bid.is_some() || q.ask.is_some())
+            .count();
+        assert!(
+            count_no_guard > 0,
+            "Without staleness guard, should have quotes"
+        );
+
+        // Now make venue 0 stale (1500ms old, exceeds 1000ms threshold).
+        state.venues[0].last_mid_update_ms = Some(now_ms - 1500);
+
+        // With staleness guard (now_ms = Some(now_ms)), venue 0 should be skipped.
+        let quotes_with_guard = compute_mm_quotes_with_now(&cfg, &state, Some(now_ms));
+        assert!(
+            quotes_with_guard[0].bid.is_none() && quotes_with_guard[0].ask.is_none(),
+            "Stale venue 0 (age 1500ms > 1000ms) should have no quotes with staleness guard"
+        );
+
+        // Other venues should still have quotes.
+        let others_with_guard = quotes_with_guard[1..]
+            .iter()
+            .any(|q| q.bid.is_some() || q.ask.is_some());
+        assert!(
+            others_with_guard,
+            "Fresh venues should still have quotes with staleness guard"
+        );
+
+        // Test per-venue override: Set venue 0 override to 2000ms.
+        cfg.venues[0].stale_ms_override = Some(2000);
+        let quotes_with_override = compute_mm_quotes_with_now(&cfg, &state, Some(now_ms));
+        assert!(
+            quotes_with_override[0].bid.is_some() || quotes_with_override[0].ask.is_some(),
+            "Venue 0 with override 2000ms, age 1500ms should have quotes"
+        );
+
+        // Test explicit quote_max_age_ms config.
+        cfg.mm.quote_max_age_ms = Some(500); // Strict: 500ms max age.
+        let quotes_strict = compute_mm_quotes_with_now(&cfg, &state, Some(now_ms));
+        // All venues except maybe some with very recent updates should be skipped.
+        // Since venue 0 is 1500ms old and threshold is 500ms, it should be skipped.
+        assert!(
+            quotes_strict[0].bid.is_none() && quotes_strict[0].ask.is_none(),
+            "Venue 0: age 1500ms > quote_max_age_ms 500ms should be skipped"
+        );
+    }
+
+    /// Milestone F: Quote staleness guard with no last_mid_update_ms (fail-closed).
+    #[test]
+    fn quote_staleness_guard_no_update_fails_closed() {
+        let (cfg, mut state) = setup_test();
+        let now_ms: TimestampMs = 10_000;
+
+        // Venue 0: Healthy but no last_mid_update_ms (never received book data).
+        state.venues[0].status = VenueStatus::Healthy;
+        state.venues[0].mid = None;
+        state.venues[0].last_mid_update_ms = None;
+
+        // With staleness guard, should skip venue 0 (fail-closed).
+        let quotes = compute_mm_quotes_with_now(&cfg, &state, Some(now_ms));
+        assert!(
+            quotes[0].bid.is_none() && quotes[0].ask.is_none(),
+            "Venue with no book data should have no quotes (fail-closed)"
         );
     }
 }
