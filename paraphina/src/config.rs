@@ -1280,6 +1280,39 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Global lock for tests that touch env vars. Env vars are process-global,
+    /// so parallel tests that modify them will race. Acquire this lock first.
+    static ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// RAII guard that saves an env var's current value and restores it on Drop.
+    /// Ensures cleanup even if the test panics.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn new(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(val) => std::env::set_var(self.key, val),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     /// Test that PARAPHINA_HL_STATE_STALE_MS_OVERRIDE sets hyperliquid's
     /// stale_ms_override without affecting other venues.
@@ -1289,8 +1322,11 @@ mod tests {
 
         const ENV_KEY: &str = "PARAPHINA_HL_STATE_STALE_MS_OVERRIDE";
 
-        // Save and clear any existing value.
-        let prev = env::var(ENV_KEY).ok();
+        // Serialize env-var tests to avoid races.
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        // Clear any existing value for baseline test.
         env::remove_var(ENV_KEY);
 
         // Baseline: no override set.
@@ -1331,12 +1367,7 @@ mod tests {
                 );
             }
         }
-
-        // Cleanup: restore previous env state.
-        match prev {
-            Some(val) => env::set_var(ENV_KEY, val),
-            None => env::remove_var(ENV_KEY),
-        }
+        // EnvGuard restores on drop.
     }
 
     /// Test that invalid values are ignored (no panic, no override).
@@ -1346,7 +1377,10 @@ mod tests {
 
         const ENV_KEY: &str = "PARAPHINA_HL_STATE_STALE_MS_OVERRIDE";
 
-        let prev = env::var(ENV_KEY).ok();
+        // Serialize env-var tests to avoid races.
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
         env::set_var(ENV_KEY, "not_a_number");
 
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
@@ -1359,10 +1393,6 @@ mod tests {
             hl.stale_ms_override, None,
             "invalid env value should be ignored"
         );
-
-        match prev {
-            Some(val) => env::set_var(ENV_KEY, val),
-            None => env::remove_var(ENV_KEY),
-        }
+        // EnvGuard restores on drop.
     }
 }
