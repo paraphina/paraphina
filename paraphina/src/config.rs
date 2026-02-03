@@ -1215,6 +1215,31 @@ impl Config {
             }
         }
 
+        // Hyperliquid state-level staleness override.
+        // This sets VenueConfig.stale_ms_override for the hyperliquid venue,
+        // which affects venue health gating and quote staleness guards.
+        // NOT the connector watchdog (that's PARAPHINA_HL_STALE_MS).
+        if let Ok(raw) = env::var("PARAPHINA_HL_STATE_STALE_MS_OVERRIDE") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let ms = v.max(0);
+                    if let Some(venue) = cfg.venues.iter_mut().find(|v| v.id == "hyperliquid") {
+                        venue.stale_ms_override = Some(ms);
+                        eprintln!(
+                            "[config] PARAPHINA_HL_STATE_STALE_MS_OVERRIDE = {} (set hyperliquid stale_ms_override)",
+                            ms
+                        );
+                    }
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_HL_STATE_STALE_MS_OVERRIDE = {:?} as i64; ignoring",
+                        raw
+                    );
+                }
+            }
+        }
+
         cfg
     }
 
@@ -1249,5 +1274,95 @@ impl Config {
         };
 
         Self::from_env_or_profile(profile)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that PARAPHINA_HL_STATE_STALE_MS_OVERRIDE sets hyperliquid's
+    /// stale_ms_override without affecting other venues.
+    #[test]
+    fn hl_state_stale_override_env_sets_hyperliquid_only() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_HL_STATE_STALE_MS_OVERRIDE";
+
+        // Save and clear any existing value.
+        let prev = env::var(ENV_KEY).ok();
+        env::remove_var(ENV_KEY);
+
+        // Baseline: no override set.
+        let cfg_baseline = Config::from_env_or_profile(RiskProfile::Balanced);
+        let hl_baseline = cfg_baseline.venues.iter().find(|v| v.id == "hyperliquid");
+        assert!(
+            hl_baseline.is_some(),
+            "hyperliquid venue must exist in default config"
+        );
+        assert_eq!(
+            hl_baseline.unwrap().stale_ms_override, None,
+            "baseline hyperliquid stale_ms_override should be None"
+        );
+
+        // Set override and reload config.
+        env::set_var(ENV_KEY, "1500");
+        let cfg_with_override = Config::from_env_or_profile(RiskProfile::Balanced);
+
+        // Verify hyperliquid has override.
+        let hl = cfg_with_override
+            .venues
+            .iter()
+            .find(|v| v.id == "hyperliquid")
+            .expect("hyperliquid venue must exist");
+        assert_eq!(
+            hl.stale_ms_override,
+            Some(1500),
+            "hyperliquid stale_ms_override should be 1500"
+        );
+
+        // Verify other venues are NOT affected.
+        for venue in &cfg_with_override.venues {
+            if venue.id != "hyperliquid" {
+                assert_eq!(
+                    venue.stale_ms_override, None,
+                    "venue {} should not have stale_ms_override set",
+                    venue.id
+                );
+            }
+        }
+
+        // Cleanup: restore previous env state.
+        match prev {
+            Some(val) => env::set_var(ENV_KEY, val),
+            None => env::remove_var(ENV_KEY),
+        }
+    }
+
+    /// Test that invalid values are ignored (no panic, no override).
+    #[test]
+    fn hl_state_stale_override_env_ignores_invalid() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_HL_STATE_STALE_MS_OVERRIDE";
+
+        let prev = env::var(ENV_KEY).ok();
+        env::set_var(ENV_KEY, "not_a_number");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        let hl = cfg
+            .venues
+            .iter()
+            .find(|v| v.id == "hyperliquid")
+            .expect("hyperliquid venue must exist");
+        assert_eq!(
+            hl.stale_ms_override, None,
+            "invalid env value should be ignored"
+        );
+
+        match prev {
+            Some(val) => env::set_var(ENV_KEY, val),
+            None => env::remove_var(ENV_KEY),
+        }
     }
 }

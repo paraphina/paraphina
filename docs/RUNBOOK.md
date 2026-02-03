@@ -136,6 +136,24 @@ All are optional and default OFF unless noted.
   - `PARAPHINA_MARKET_RX_STATS_EVERY_TICKS=<k>` (default `1`)
   - `PARAPHINA_MARKET_RX_STATS_PATH=<path>` (append; if unset prints to stderr)
 
+## Venue Staleness Configuration
+
+Per-venue overrides for state-level staleness thresholds. These control venue health
+gating and quote staleness guards (NOT connector watchdog timeouts).
+
+- `PARAPHINA_HL_STATE_STALE_MS_OVERRIDE=<ms>`  
+  Override Hyperliquid's state-level stale_ms threshold. Recommended: `1500` to achieve
+  ≤0.5% stale rate. Hyperliquid uses exchange-provided timestamps which inflate age_ms
+  by network propagation delay (~500-800ms). Without override, the global `book.stale_ms`
+  (default 1000ms) causes ~6% false stale flips.
+
+  Example for shadow runs:
+  ```
+  export PARAPHINA_HL_STATE_STALE_MS_OVERRIDE=1500
+  ```
+
+  See `docs/INVESTIGATIONS/hyperliquid_stale.md` for telemetry analysis and threshold sweep.
+
 ## All-5 CanaryLive (Online)
 
 Canary live requires credentials and explicit live execution gates. Run manually only:
