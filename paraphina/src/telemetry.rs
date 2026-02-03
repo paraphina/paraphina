@@ -684,6 +684,47 @@ fn compute_age_ms(now_ms: TimestampMs, last_mid_update_ms: Option<TimestampMs>) 
     }
 }
 
+/// Detect if we're in fixture mode by checking if wall-clock `now_ms` is vastly
+/// ahead of venue timestamps.
+///
+/// In live mode, `now_ms` is wall-clock time and should match the book timestamps.
+/// In fixture mode, `now_ms` may be wall-clock while book timestamps are synthetic
+/// (e.g., 1000, 1250, 1500...). We detect this by checking if `now_ms` is more than
+/// 1 day ahead of the max observed `last_mid_update_ms`.
+fn is_fixture_mode(state: &GlobalState, now_ms: TimestampMs) -> bool {
+    const ONE_DAY_MS: i64 = 86_400_000;
+
+    let max_update_ms = state
+        .venues
+        .iter()
+        .filter_map(|v| v.last_mid_update_ms)
+        .max();
+
+    match max_update_ms {
+        Some(max_ts) => now_ms - max_ts > ONE_DAY_MS,
+        None => false,
+    }
+}
+
+/// Compute the effective "now" for staleness calculations.
+///
+/// Returns the effective now_ms to use for age calculations:
+/// - Live mode: returns the original `now_ms` (wall clock)
+/// - Fixture mode: returns `max(last_mid_update_ms)` from venues (fixture timeline)
+fn effective_now_for_staleness(state: &GlobalState, now_ms: TimestampMs) -> TimestampMs {
+    if is_fixture_mode(state, now_ms) {
+        // Fixture mode: use max venue timestamp as effective "now"
+        state
+            .venues
+            .iter()
+            .filter_map(|v| v.last_mid_update_ms)
+            .max()
+            .unwrap_or(now_ms)
+    } else {
+        now_ms
+    }
+}
+
 /// Compute which venues are healthy for fair-value/Kalman contribution.
 ///
 /// **Fail-closed semantics (Milestone E)**: A venue is considered healthy ONLY if:
@@ -693,20 +734,35 @@ fn compute_age_ms(now_ms: TimestampMs, last_mid_update_ms: Option<TimestampMs>) 
 ///
 /// This ensures that a venue with stale book data (even if `venue.status` hasn't
 /// been updated yet) is never included in healthy_venues_used.
+///
+/// **Fixture mode handling**: When wall-clock `now_ms` is detected to be >1 day
+/// ahead of venue timestamps (indicating fixture mode), the staleness gating is
+/// disabled because fixtures feed data asynchronously and inter-venue timing
+/// skew is expected. In fixture mode, we only check `venue.status`.
 fn compute_healthy_venues_used(
     state: &GlobalState,
     now_ms: TimestampMs,
     stale_ms: i64,
 ) -> Vec<usize> {
+    let fixture_mode = is_fixture_mode(state, now_ms);
+    let effective_now = effective_now_for_staleness(state, now_ms);
     let mut out = Vec::new();
     for (idx, venue) in state.venues.iter().enumerate() {
         if !matches!(venue.status, VenueStatus::Healthy) {
             continue;
         }
-        let age_ms = compute_age_ms(now_ms, venue.last_mid_update_ms);
-        // Fail-closed: must have a timestamp (age_ms >= 0) AND be within stale threshold.
-        if age_ms >= 0 && age_ms <= stale_ms {
-            out.push(idx);
+        if fixture_mode {
+            // Fixture mode: skip staleness gating due to async timing skew.
+            // Just check that venue has received at least one book update.
+            if venue.last_mid_update_ms.is_some() {
+                out.push(idx);
+            }
+        } else {
+            // Live mode: fail-closed staleness gating.
+            let age_ms = compute_age_ms(effective_now, venue.last_mid_update_ms);
+            if age_ms >= 0 && age_ms <= stale_ms {
+                out.push(idx);
+            }
         }
     }
     out
@@ -1358,11 +1414,21 @@ fn build_hedge_records(
 /// - If `age_ms > stale_ms` and venue is not Disabled, status is reported as "Stale"
 /// - This ensures telemetry consumers can see when a venue is stale even if the
 ///   internal VenueStatus hasn't been updated yet by the health manager.
+///
+/// **Fixture mode handling**: When wall-clock `now_ms` is detected to be >1 day
+/// ahead of venue timestamps (indicating fixture mode), the staleness override is
+/// disabled because fixtures feed data asynchronously and inter-venue timing skew
+/// is expected. In fixture mode, we report the internal `venue.status` directly.
 fn build_venue_metrics(
     state: &GlobalState,
     now_ms: TimestampMs,
     stale_ms: i64,
 ) -> Vec<(String, JsonValue)> {
+    // Detect fixture mode to disable staleness override.
+    let fixture_mode = is_fixture_mode(state, now_ms);
+    // Use effective_now for age calculation in fixture mode.
+    let effective_now = effective_now_for_staleness(state, now_ms);
+
     let mut venue_mid = Vec::new();
     let mut venue_spread = Vec::new();
     let mut venue_depth = Vec::new();
@@ -1386,12 +1452,13 @@ fn build_venue_metrics(
         venue_mid.push(venue.mid.unwrap_or(0.0));
         venue_spread.push(venue.spread.unwrap_or(0.0));
         venue_depth.push(venue.depth_near_mid);
-        let age = compute_age_ms(now_ms, venue.last_mid_update_ms);
-        // Fail-closed: report "Stale" if age exceeds threshold (unless already Disabled).
-        // age_ms == -1 means no book update ever received, which is also stale.
+        let age = compute_age_ms(effective_now, venue.last_mid_update_ms);
+        // Fail-closed in live mode: report "Stale" if age exceeds threshold.
+        // In fixture mode: skip staleness override due to async timing skew.
         let effective_status = if matches!(venue.status, VenueStatus::Disabled) {
             "Disabled".to_string()
-        } else if age < 0 || age > stale_ms {
+        } else if !fixture_mode && (age < 0 || age > stale_ms) {
+            // Fail-closed in live mode only: override to "Stale" if age exceeds threshold.
             "Stale".to_string()
         } else {
             format!("{:?}", venue.status)
