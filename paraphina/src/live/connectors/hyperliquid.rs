@@ -281,6 +281,9 @@ impl HyperliquidConnector {
         let mut decode_miss_count = 0usize;
         let mut have_baseline = false;
         let mut delta_buf: VecDeque<MarketDataEvent> = VecDeque::new();
+        // Bounded sampling for non-book messages to diagnose staleness issues.
+        let mut non_book_msg_count: u64 = 0;
+        const NON_BOOK_LOG_LIMIT: u64 = 5;
         loop {
             tokio::select! {
                 biased;
@@ -367,6 +370,21 @@ impl HyperliquidConnector {
                             try_publish(snapshot)?;
                         }
                         continue;
+                    }
+                    // Non-l2Book message received - log bounded samples for staleness diagnosis.
+                    // This helps identify if WS is alive but not receiving book updates.
+                    non_book_msg_count += 1;
+                    if non_book_msg_count <= NON_BOOK_LOG_LIMIT {
+                        let snippet: String = payload.chars().take(120).collect();
+                        eprintln!(
+                            "WARN: Hyperliquid public WS non-book message after subscribe channel={} count={} snippet={}",
+                            channel, non_book_msg_count, snippet
+                        );
+                    } else if non_book_msg_count == NON_BOOK_LOG_LIMIT + 1 {
+                        eprintln!(
+                            "WARN: Hyperliquid public WS suppressing further non-book message logs (count={})",
+                            non_book_msg_count
+                        );
                     }
                     if let Some(parsed) = parse_l2_message_value(&value, self.cfg.venue_index) {
                         freshness

@@ -403,7 +403,8 @@ impl TelemetryBuilder {
         };
 
         let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
-        let healthy_venues_used = compute_healthy_venues_used(state, now_ms);
+        let stale_ms = cfg.book.stale_ms;
+        let healthy_venues_used = compute_healthy_venues_used(state, now_ms, stale_ms);
         let healthy_venues_used_count = healthy_venues_used.len();
         let mut record = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
@@ -515,7 +516,7 @@ impl TelemetryBuilder {
                 serde_json::Value::Array(risk_events),
             );
 
-            let venue_metrics = build_venue_metrics(state, now_ms);
+            let venue_metrics = build_venue_metrics(state, now_ms, stale_ms);
             for (key, value) in venue_metrics {
                 map.insert(key, value);
             }
@@ -683,14 +684,28 @@ fn compute_age_ms(now_ms: TimestampMs, last_mid_update_ms: Option<TimestampMs>) 
     }
 }
 
-fn compute_healthy_venues_used(state: &GlobalState, now_ms: TimestampMs) -> Vec<usize> {
+/// Compute which venues are healthy for fair-value/Kalman contribution.
+///
+/// **Fail-closed semantics (Milestone E)**: A venue is considered healthy ONLY if:
+/// 1. `venue.status == VenueStatus::Healthy`, AND
+/// 2. `age_ms >= 0` (has received at least one book update), AND
+/// 3. `age_ms <= stale_ms` (book data is fresh within threshold).
+///
+/// This ensures that a venue with stale book data (even if `venue.status` hasn't
+/// been updated yet) is never included in healthy_venues_used.
+fn compute_healthy_venues_used(
+    state: &GlobalState,
+    now_ms: TimestampMs,
+    stale_ms: i64,
+) -> Vec<usize> {
     let mut out = Vec::new();
     for (idx, venue) in state.venues.iter().enumerate() {
         if !matches!(venue.status, VenueStatus::Healthy) {
             continue;
         }
         let age_ms = compute_age_ms(now_ms, venue.last_mid_update_ms);
-        if age_ms >= 0 {
+        // Fail-closed: must have a timestamp (age_ms >= 0) AND be within stale threshold.
+        if age_ms >= 0 && age_ms <= stale_ms {
             out.push(idx);
         }
     }
@@ -1337,7 +1352,17 @@ fn build_hedge_records(
     (out, delta_h_t)
 }
 
-fn build_venue_metrics(state: &GlobalState, now_ms: TimestampMs) -> Vec<(String, JsonValue)> {
+/// Build venue metric arrays for telemetry output.
+///
+/// **Fail-closed semantics (Milestone E)**: `venue_status` reflects actual staleness:
+/// - If `age_ms > stale_ms` and venue is not Disabled, status is reported as "Stale"
+/// - This ensures telemetry consumers can see when a venue is stale even if the
+///   internal VenueStatus hasn't been updated yet by the health manager.
+fn build_venue_metrics(
+    state: &GlobalState,
+    now_ms: TimestampMs,
+    stale_ms: i64,
+) -> Vec<(String, JsonValue)> {
     let mut venue_mid = Vec::new();
     let mut venue_spread = Vec::new();
     let mut venue_depth = Vec::new();
@@ -1361,9 +1386,18 @@ fn build_venue_metrics(state: &GlobalState, now_ms: TimestampMs) -> Vec<(String,
         venue_mid.push(venue.mid.unwrap_or(0.0));
         venue_spread.push(venue.spread.unwrap_or(0.0));
         venue_depth.push(venue.depth_near_mid);
-        venue_status.push(format!("{:?}", venue.status));
-        venue_toxicity.push(venue.toxicity);
         let age = compute_age_ms(now_ms, venue.last_mid_update_ms);
+        // Fail-closed: report "Stale" if age exceeds threshold (unless already Disabled).
+        // age_ms == -1 means no book update ever received, which is also stale.
+        let effective_status = if matches!(venue.status, VenueStatus::Disabled) {
+            "Disabled".to_string()
+        } else if age < 0 || age > stale_ms {
+            "Stale".to_string()
+        } else {
+            format!("{:?}", venue.status)
+        };
+        venue_status.push(effective_status);
+        venue_toxicity.push(venue.toxicity);
         venue_age_ms.push(age);
         venue_position.push(venue.position_tao);
         venue_dist_liq_sigma.push(venue.dist_liq_sigma);
@@ -1519,7 +1553,8 @@ mod tests {
             venue.depth_near_mid = 10.0 + idx as f64;
             venue.last_mid_update_ms = Some(1_000);
         }
-        let metrics = build_venue_metrics(&state, 1_050);
+        let stale_ms = cfg.book.stale_ms;
+        let metrics = build_venue_metrics(&state, 1_050, stale_ms);
         let mid = metrics
             .iter()
             .find(|(k, _)| k == "venue_mid_usd")
@@ -1600,13 +1635,14 @@ mod tests {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
         let now_ms = 10_000;
+        let stale_ms = cfg.book.stale_ms;
 
         state.venues[0].status = VenueStatus::Healthy;
         state.venues[0].last_mid_update_ms = Some(now_ms + 500);
         state.venues[1].status = VenueStatus::Healthy;
         state.venues[1].last_mid_update_ms = None;
 
-        let metrics = build_venue_metrics(&state, now_ms);
+        let metrics = build_venue_metrics(&state, now_ms, stale_ms);
         let age = metrics
             .iter()
             .find(|(k, _)| k == "venue_age_ms")
@@ -1614,5 +1650,71 @@ mod tests {
             .expect("venue_age_ms");
         assert_eq!(age[0].as_i64().unwrap_or(-1), 0);
         assert_eq!(age[1].as_i64().unwrap_or(0), -1);
+    }
+
+    /// Milestone E: Fail-closed health semantics - a venue with age_ms > stale_ms
+    /// MUST NOT be reported as Healthy and MUST NOT be included in healthy_venues_used.
+    #[test]
+    fn stale_venue_cannot_be_healthy() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let stale_ms = cfg.book.stale_ms;
+        // Set venue 0 as fresh, venue 1 as stale (but internal status still Healthy).
+        let now_ms = 10_000;
+
+        // Venue 0: fresh (updated 50ms ago, well within stale_ms=1000)
+        state.venues[0].status = VenueStatus::Healthy;
+        state.venues[0].mid = Some(100.0);
+        state.venues[0].last_mid_update_ms = Some(now_ms - 50);
+
+        // Venue 1: stale (updated 5000ms ago, beyond stale_ms=1000)
+        // Internal status is still Healthy, but telemetry should report Stale.
+        state.venues[1].status = VenueStatus::Healthy;
+        state.venues[1].mid = Some(100.0);
+        state.venues[1].last_mid_update_ms = Some(now_ms - 5000);
+
+        // Venue 2: Disabled (should remain Disabled regardless of age)
+        state.venues[2].status = VenueStatus::Disabled;
+        state.venues[2].mid = Some(100.0);
+        state.venues[2].last_mid_update_ms = Some(now_ms - 50);
+
+        // Check build_venue_metrics reports correct status.
+        let metrics = build_venue_metrics(&state, now_ms, stale_ms);
+        let status = metrics
+            .iter()
+            .find(|(k, _)| k == "venue_status")
+            .and_then(|(_, v)| v.as_array())
+            .expect("venue_status");
+
+        assert_eq!(
+            status[0].as_str(),
+            Some("Healthy"),
+            "Fresh venue should be Healthy"
+        );
+        assert_eq!(
+            status[1].as_str(),
+            Some("Stale"),
+            "Stale venue MUST NOT be Healthy (fail-closed)"
+        );
+        assert_eq!(
+            status[2].as_str(),
+            Some("Disabled"),
+            "Disabled venue should remain Disabled"
+        );
+
+        // Check compute_healthy_venues_used excludes stale venue.
+        let healthy = compute_healthy_venues_used(&state, now_ms, stale_ms);
+        assert!(
+            healthy.contains(&0),
+            "Fresh healthy venue should be included"
+        );
+        assert!(
+            !healthy.contains(&1),
+            "Stale venue MUST NOT be in healthy_venues_used (fail-closed)"
+        );
+        assert!(
+            !healthy.contains(&2),
+            "Disabled venue should not be in healthy_venues_used"
+        );
     }
 }

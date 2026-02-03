@@ -206,6 +206,25 @@ The engine tracks and exposes in telemetry:
 
 When `fv_available = false`, the engine performs a time update only (prediction step) and fair value degrades gracefully without jumping.
 
+### Fail-closed health semantics (Milestone E)
+Telemetry enforces **fail-closed** health semantics to prevent stale venues from appearing healthy:
+
+**Invariant:** A venue with `age_ms > stale_ms` MUST NOT be reported as "Healthy" and MUST NOT appear in `healthy_venues_used`.
+
+- `venue_status` in telemetry reflects *effective* staleness:
+  - If `age_ms > stale_ms` and venue is not Disabled, status is reported as "Stale"
+  - This overrides the internal `VenueStatus` which may lag due to health manager update cycles
+- `healthy_venues_used` excludes venues where `age_ms > stale_ms`, regardless of internal status
+- This ensures telemetry consumers can detect stale venues even if the connector watchdog hasn't fired yet
+
+**Rationale:** The internal `VenueStatus` may remain "Healthy" temporarily when:
+- The connector's freshness watchdog keys off generic WS activity (not book-specific updates)
+- The health manager's stale counter hasn't accumulated enough consecutive stale snapshots
+
+Fail-closed telemetry semantics ensure operators always see accurate staleness in dashboards and alerts.
+
+**Implemented: `paraphina/src/telemetry.rs::compute_healthy_venues_used`, `build_venue_metrics`**
+
 ### Volatility + scalars
 - EWMA volatility is computed on fair value log returns.
 - **Volatility floor** (Milestone D): `sigma_eff = max(sigma_short, sigma_min)`
