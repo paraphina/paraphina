@@ -238,7 +238,7 @@ impl ParadexConnector {
                     let now = mono_now_ns();
                     let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
                     let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
-                    let anchor = if last_pub != 0 { last_pub } else { last_parsed };
+                    let anchor = last_pub.max(last_parsed);
                     if anchor != 0 && age_ms(now, anchor) > watchdog_stale_ms {
                         let _ = stale_tx.send(());
                         break;
