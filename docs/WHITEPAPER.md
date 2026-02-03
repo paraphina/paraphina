@@ -225,6 +225,52 @@ Fail-closed telemetry semantics ensure operators always see accurate staleness i
 
 **Implemented: `paraphina/src/telemetry.rs::compute_healthy_venues_used`, `build_venue_metrics`**
 
+### Per-venue stale thresholds (Milestone F)
+Different venues have different latency characteristics. A global `stale_ms` threshold may cause false-positive staleness for high-latency venues (e.g., Hyperliquid P95 ~1340ms) while being appropriate for low-latency venues.
+
+**Configuration:**
+- `VenueConfig.stale_ms_override: Option<i64>` — per-venue override for staleness threshold
+- If set, uses this threshold instead of `book.stale_ms` for that venue
+- If not set (None), uses global `book.stale_ms`
+
+**Helper method:** `VenueConfig::effective_stale_ms(global_stale_ms)` returns the effective threshold.
+
+**Behavior:**
+- `compute_healthy_venues_used` uses per-venue thresholds when checking `age_ms <= venue_stale_ms`
+- `build_venue_metrics` uses per-venue thresholds when overriding status to "Stale"
+- Backward compatible: default behavior unchanged when no overrides are set
+
+**Example configuration:**
+```
+# venues[1] (Hyperliquid): stale_ms_override = Some(2000)  // Higher threshold for high-latency venue
+# venues[0..N]: stale_ms_override = None                   // Use global book.stale_ms = 1000
+```
+
+**Implemented: `paraphina/src/config.rs::VenueConfig::stale_ms_override`, `effective_stale_ms`**
+
+### Quote staleness guard (Milestone F)
+The market-making engine applies a **fail-fast staleness guard** to prevent quoting on stale orderbook data.
+
+**Configuration:**
+- `MmConfig.quote_max_age_ms: Option<i64>` — maximum venue book age before skipping quotes
+- If None, uses the venue's effective stale_ms threshold
+- If Some(ms), uses this stricter threshold for quote gating
+
+**Behavior:**
+- When `now_ms` is provided to `compute_mm_quotes_with_now()`:
+  - Computes `age_ms = now_ms - venue.last_mid_update_ms`
+  - Skips quoting if `age_ms > quote_max_age_ms` (or venue's effective stale_ms)
+  - Skips quoting if `last_mid_update_ms` is None (fail-closed: no book data)
+- When `now_ms` is None (e.g., in tests), staleness guard is disabled
+- Per-venue `stale_ms_override` is respected in the threshold calculation
+
+**Rationale:**
+- Prevents adverse selection from quoting on outdated prices
+- Uses per-venue thresholds to accommodate different venue latencies
+- Fail-closed semantics: no quotes if uncertain about data freshness
+
+**Implemented: `paraphina/src/mm.rs::compute_mm_quotes_with_now`, `compute_mm_quotes_impl_with_scratch`**
+
 ### Volatility + scalars
 - EWMA volatility is computed on fair value log returns.
 - **Volatility floor** (Milestone D): `sigma_eff = max(sigma_short, sigma_min)`

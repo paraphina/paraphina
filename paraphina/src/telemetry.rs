@@ -403,8 +403,8 @@ impl TelemetryBuilder {
         };
 
         let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
-        let stale_ms = cfg.book.stale_ms;
-        let healthy_venues_used = compute_healthy_venues_used(state, now_ms, stale_ms);
+        let global_stale_ms = cfg.book.stale_ms;
+        let healthy_venues_used = compute_healthy_venues_used(cfg, state, now_ms, global_stale_ms);
         let healthy_venues_used_count = healthy_venues_used.len();
         let mut record = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
@@ -516,7 +516,7 @@ impl TelemetryBuilder {
                 serde_json::Value::Array(risk_events),
             );
 
-            let venue_metrics = build_venue_metrics(state, now_ms, stale_ms);
+            let venue_metrics = build_venue_metrics(cfg, state, now_ms, global_stale_ms);
             for (key, value) in venue_metrics {
                 map.insert(key, value);
             }
@@ -730,19 +730,24 @@ fn effective_now_for_staleness(state: &GlobalState, now_ms: TimestampMs) -> Time
 /// **Fail-closed semantics (Milestone E)**: A venue is considered healthy ONLY if:
 /// 1. `venue.status == VenueStatus::Healthy`, AND
 /// 2. `age_ms >= 0` (has received at least one book update), AND
-/// 3. `age_ms <= stale_ms` (book data is fresh within threshold).
+/// 3. `age_ms <= venue_stale_ms` (book data is fresh within per-venue threshold).
 ///
 /// This ensures that a venue with stale book data (even if `venue.status` hasn't
 /// been updated yet) is never included in healthy_venues_used.
+///
+/// **Per-venue thresholds (Milestone F)**: Each venue can have a `stale_ms_override`
+/// to use a different threshold than the global `book.stale_ms`. This is useful for
+/// high-latency venues (e.g., Hyperliquid) that need a larger staleness window.
 ///
 /// **Fixture mode handling**: When wall-clock `now_ms` is detected to be >1 day
 /// ahead of venue timestamps (indicating fixture mode), the staleness gating is
 /// disabled because fixtures feed data asynchronously and inter-venue timing
 /// skew is expected. In fixture mode, we only check `venue.status`.
 fn compute_healthy_venues_used(
+    cfg: &Config,
     state: &GlobalState,
     now_ms: TimestampMs,
-    stale_ms: i64,
+    global_stale_ms: i64,
 ) -> Vec<usize> {
     let fixture_mode = is_fixture_mode(state, now_ms);
     let effective_now = effective_now_for_staleness(state, now_ms);
@@ -758,9 +763,14 @@ fn compute_healthy_venues_used(
                 out.push(idx);
             }
         } else {
-            // Live mode: fail-closed staleness gating.
+            // Live mode: fail-closed staleness gating with per-venue threshold.
+            let venue_stale_ms = cfg
+                .venues
+                .get(idx)
+                .map(|v| v.effective_stale_ms(global_stale_ms))
+                .unwrap_or(global_stale_ms);
             let age_ms = compute_age_ms(effective_now, venue.last_mid_update_ms);
-            if age_ms >= 0 && age_ms <= stale_ms {
+            if age_ms >= 0 && age_ms <= venue_stale_ms {
                 out.push(idx);
             }
         }
@@ -1411,18 +1421,22 @@ fn build_hedge_records(
 /// Build venue metric arrays for telemetry output.
 ///
 /// **Fail-closed semantics (Milestone E)**: `venue_status` reflects actual staleness:
-/// - If `age_ms > stale_ms` and venue is not Disabled, status is reported as "Stale"
+/// - If `age_ms > venue_stale_ms` and venue is not Disabled, status is reported as "Stale"
 /// - This ensures telemetry consumers can see when a venue is stale even if the
 ///   internal VenueStatus hasn't been updated yet by the health manager.
+///
+/// **Per-venue thresholds (Milestone F)**: Each venue can have a `stale_ms_override`
+/// to use a different threshold than the global `book.stale_ms`.
 ///
 /// **Fixture mode handling**: When wall-clock `now_ms` is detected to be >1 day
 /// ahead of venue timestamps (indicating fixture mode), the staleness override is
 /// disabled because fixtures feed data asynchronously and inter-venue timing skew
 /// is expected. In fixture mode, we report the internal `venue.status` directly.
 fn build_venue_metrics(
+    cfg: &Config,
     state: &GlobalState,
     now_ms: TimestampMs,
-    stale_ms: i64,
+    global_stale_ms: i64,
 ) -> Vec<(String, JsonValue)> {
     // Detect fixture mode to disable staleness override.
     let fixture_mode = is_fixture_mode(state, now_ms);
@@ -1448,16 +1462,21 @@ fn build_venue_metrics(
     let mut venue_fill_rate = Vec::new();
     let mut venue_markout_ewma = Vec::new();
 
-    for venue in &state.venues {
+    for (idx, venue) in state.venues.iter().enumerate() {
         venue_mid.push(venue.mid.unwrap_or(0.0));
         venue_spread.push(venue.spread.unwrap_or(0.0));
         venue_depth.push(venue.depth_near_mid);
         let age = compute_age_ms(effective_now, venue.last_mid_update_ms);
-        // Fail-closed in live mode: report "Stale" if age exceeds threshold.
+        // Fail-closed in live mode: report "Stale" if age exceeds per-venue threshold.
         // In fixture mode: skip staleness override due to async timing skew.
+        let venue_stale_ms = cfg
+            .venues
+            .get(idx)
+            .map(|v| v.effective_stale_ms(global_stale_ms))
+            .unwrap_or(global_stale_ms);
         let effective_status = if matches!(venue.status, VenueStatus::Disabled) {
             "Disabled".to_string()
-        } else if !fixture_mode && (age < 0 || age > stale_ms) {
+        } else if !fixture_mode && (age < 0 || age > venue_stale_ms) {
             // Fail-closed in live mode only: override to "Stale" if age exceeds threshold.
             "Stale".to_string()
         } else {
@@ -1621,7 +1640,7 @@ mod tests {
             venue.last_mid_update_ms = Some(1_000);
         }
         let stale_ms = cfg.book.stale_ms;
-        let metrics = build_venue_metrics(&state, 1_050, stale_ms);
+        let metrics = build_venue_metrics(&cfg, &state, 1_050, stale_ms);
         let mid = metrics
             .iter()
             .find(|(k, _)| k == "venue_mid_usd")
@@ -1709,7 +1728,7 @@ mod tests {
         state.venues[1].status = VenueStatus::Healthy;
         state.venues[1].last_mid_update_ms = None;
 
-        let metrics = build_venue_metrics(&state, now_ms, stale_ms);
+        let metrics = build_venue_metrics(&cfg, &state, now_ms, stale_ms);
         let age = metrics
             .iter()
             .find(|(k, _)| k == "venue_age_ms")
@@ -1746,7 +1765,7 @@ mod tests {
         state.venues[2].last_mid_update_ms = Some(now_ms - 50);
 
         // Check build_venue_metrics reports correct status.
-        let metrics = build_venue_metrics(&state, now_ms, stale_ms);
+        let metrics = build_venue_metrics(&cfg, &state, now_ms, stale_ms);
         let status = metrics
             .iter()
             .find(|(k, _)| k == "venue_status")
@@ -1770,7 +1789,7 @@ mod tests {
         );
 
         // Check compute_healthy_venues_used excludes stale venue.
-        let healthy = compute_healthy_venues_used(&state, now_ms, stale_ms);
+        let healthy = compute_healthy_venues_used(&cfg, &state, now_ms, stale_ms);
         assert!(
             healthy.contains(&0),
             "Fresh healthy venue should be included"
@@ -1782,6 +1801,76 @@ mod tests {
         assert!(
             !healthy.contains(&2),
             "Disabled venue should not be in healthy_venues_used"
+        );
+    }
+
+    /// Milestone F: Per-venue stale thresholds allow high-latency venues to use
+    /// a larger staleness window than the global default.
+    #[test]
+    fn per_venue_stale_threshold_override() {
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+
+        // Global stale_ms = 1000 (default).
+        let global_stale_ms = cfg.book.stale_ms;
+        assert_eq!(global_stale_ms, 1000, "Default global stale_ms should be 1000");
+
+        // Venue 0: no override, use global threshold.
+        // Set last update 500ms ago => should be healthy.
+        state.venues[0].status = VenueStatus::Healthy;
+        state.venues[0].mid = Some(100.0);
+        state.venues[0].last_mid_update_ms = Some(now_ms - 500);
+
+        // Venue 1: override to 3000ms (simulating high-latency venue).
+        // Set last update 2000ms ago => would be stale with global, but healthy with override.
+        cfg.venues[1].stale_ms_override = Some(3000);
+        state.venues[1].status = VenueStatus::Healthy;
+        state.venues[1].mid = Some(100.0);
+        state.venues[1].last_mid_update_ms = Some(now_ms - 2000);
+
+        // Venue 2: no override, 1500ms old => stale with global threshold.
+        state.venues[2].status = VenueStatus::Healthy;
+        state.venues[2].mid = Some(100.0);
+        state.venues[2].last_mid_update_ms = Some(now_ms - 1500);
+
+        // Check compute_healthy_venues_used respects per-venue threshold.
+        let healthy = compute_healthy_venues_used(&cfg, &state, now_ms, global_stale_ms);
+        assert!(
+            healthy.contains(&0),
+            "Venue 0: fresh (500ms < 1000ms) should be healthy"
+        );
+        assert!(
+            healthy.contains(&1),
+            "Venue 1: override 3000ms, age 2000ms should be healthy"
+        );
+        assert!(
+            !healthy.contains(&2),
+            "Venue 2: no override, age 1500ms > 1000ms should be stale"
+        );
+
+        // Check build_venue_metrics respects per-venue threshold.
+        let metrics = build_venue_metrics(&cfg, &state, now_ms, global_stale_ms);
+        let status = metrics
+            .iter()
+            .find(|(k, _)| k == "venue_status")
+            .and_then(|(_, v)| v.as_array())
+            .expect("venue_status");
+
+        assert_eq!(
+            status[0].as_str(),
+            Some("Healthy"),
+            "Venue 0 should be Healthy"
+        );
+        assert_eq!(
+            status[1].as_str(),
+            Some("Healthy"),
+            "Venue 1 with override should be Healthy despite 2000ms age"
+        );
+        assert_eq!(
+            status[2].as_str(),
+            Some("Stale"),
+            "Venue 2 without override should be Stale at 1500ms age"
         );
     }
 }

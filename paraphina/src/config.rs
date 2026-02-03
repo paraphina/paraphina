@@ -229,6 +229,19 @@ pub struct VenueConfig {
     pub size_step_tao: f64,
     /// Minimum notional value in USD (orders below this are skipped).
     pub min_notional_usd: f64,
+    /// Per-venue override for stale_ms threshold. If Some, this venue uses this
+    /// threshold instead of the global `book.stale_ms`. Useful for high-latency
+    /// venues (e.g., Hyperliquid) that need a larger staleness window.
+    pub stale_ms_override: Option<i64>,
+}
+
+impl VenueConfig {
+    /// Returns the effective stale_ms for this venue: the override if set,
+    /// otherwise the provided global fallback.
+    #[inline]
+    pub fn effective_stale_ms(&self, global_stale_ms: i64) -> i64 {
+        self.stale_ms_override.unwrap_or(global_stale_ms)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +358,10 @@ pub struct MmConfig {
     pub funding_target_rate_scale: f64,
     /// Maximum TAO shift from funding preference per venue.
     pub funding_target_max_tao: f64,
+    /// Maximum venue book age (ms) before skipping MM quotes for that venue.
+    /// If None, uses the venue's effective stale_ms threshold.
+    /// This is a fail-fast guard to prevent quoting on stale data.
+    pub quote_max_age_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -584,6 +601,7 @@ impl Default for Config {
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
+                stale_ms_override: None,
             },
             VenueConfig {
                 id: "hyperliquid".to_string(),
@@ -603,6 +621,9 @@ impl Default for Config {
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
+                // Hyperliquid has higher latency (P95 ~1340ms), needs larger stale threshold.
+                // In live, consider setting to 2000ms via env override.
+                stale_ms_override: None,
             },
             VenueConfig {
                 id: "aster".to_string(),
@@ -622,6 +643,7 @@ impl Default for Config {
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
+                stale_ms_override: None,
             },
             VenueConfig {
                 id: "lighter".to_string(),
@@ -641,6 +663,7 @@ impl Default for Config {
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
+                stale_ms_override: None,
             },
             VenueConfig {
                 id: "paradex".to_string(),
@@ -660,6 +683,7 @@ impl Default for Config {
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
+                stale_ms_override: None,
             },
         ];
 
@@ -749,6 +773,8 @@ impl Default for Config {
             // Funding target inventory (Section 9)
             funding_target_rate_scale: 0.001, // 0.1% funding rate = full shift
             funding_target_max_tao: 5.0,      // max TAO shift from funding preference
+            // Quote staleness guard (fail-fast)
+            quote_max_age_ms: None, // None = use venue's effective stale_ms
         };
 
         // ----- Hedge engine (global LQ controller + allocation, Section 13) -----

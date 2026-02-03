@@ -24,7 +24,7 @@ use crate::exit;
 use crate::fill_batcher::FillBatcher;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::loop_scheduler::LoopScheduler;
-use crate::mm::{compute_mm_quotes, compute_mm_quotes_with_ablations};
+use crate::mm::{compute_mm_quotes_with_ablations, compute_mm_quotes_with_now};
 use crate::order_management::plan_mm_order_actions;
 use crate::sim_eval::AblationSet;
 use crate::state::GlobalState;
@@ -1574,7 +1574,8 @@ pub async fn run_live_loop(
         let mm_quotes = if disable_fv_gate {
             compute_mm_quotes_with_ablations(cfg, &state, &fv_ablations)
         } else {
-            compute_mm_quotes(cfg, &state)
+            // Use staleness-guarded quoting in live mode with current timestamp.
+            compute_mm_quotes_with_now(cfg, &state, Some(now_ms))
         };
         let mut action_id_gen = crate::actions::ActionIdGenerator::new(tick);
         let mm_plan = plan_mm_order_actions(cfg, &state, &mm_quotes, now_ms, &mut action_id_gen);
