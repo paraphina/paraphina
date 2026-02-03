@@ -419,7 +419,6 @@ impl LighterConnector {
         let mut first_json_pong_logged = false;
         let mut decode_miss_count = 0usize;
         let mut seq_fallback: u64 = 0;
-        let mut have_snapshot = false;
         loop {
             let msg = match read.next().await {
                 Some(Ok(msg)) => msg,
@@ -532,7 +531,6 @@ impl LighterConnector {
                     self.cfg.venue_index,
                     &self.cfg.venue_id,
                     &mut seq_fallback,
-                    &mut have_snapshot,
                 ) {
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
@@ -939,12 +937,17 @@ fn json_ping_response(value: &serde_json::Value) -> Option<&'static str> {
     }
 }
 
+/// Decode Lighter order_book channel messages.
+///
+/// **IMPORTANT**: Lighter sends full orderbook state in every message, not incremental deltas.
+/// Therefore, we ALWAYS emit L2Snapshot to ensure stale price levels are replaced, not accumulated.
+/// Previously, this function emitted L2Delta after the first snapshot, which caused stale bid/ask
+/// levels to persist and resulted in crossed books (negative spread).
 fn decode_order_book_channel_message(
     value: &serde_json::Value,
     venue_index: usize,
     venue_id: &str,
     seq_fallback: &mut u64,
-    have_snapshot: &mut bool,
 ) -> Option<ParsedL2Message> {
     let channel = value.get("channel").and_then(|v| v.as_str())?;
     if !channel.starts_with("order_book:") {
@@ -966,45 +969,17 @@ fn decode_order_book_channel_message(
         .or_else(|| value.get("ts"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    if !*have_snapshot && !bids.is_empty() && !asks.is_empty() {
-        *have_snapshot = true;
-        let snapshot = super::super::types::L2Snapshot {
-            venue_index,
-            venue_id: venue_id.to_string(),
-            seq,
-            timestamp_ms,
-            bids,
-            asks,
-        };
-        return Some(ParsedL2Message {
-            event: MarketDataEvent::L2Snapshot(snapshot),
-            seq,
-        });
-    }
-    let mut changes = Vec::with_capacity(bids.len() + asks.len());
-    for level in bids {
-        changes.push(BookLevelDelta {
-            side: BookSide::Bid,
-            price: level.price,
-            size: level.size,
-        });
-    }
-    for level in asks {
-        changes.push(BookLevelDelta {
-            side: BookSide::Ask,
-            price: level.price,
-            size: level.size,
-        });
-    }
-    let delta = super::super::types::L2Delta {
+    // Always emit L2Snapshot since Lighter sends full book state each message.
+    let snapshot = super::super::types::L2Snapshot {
         venue_index,
         venue_id: venue_id.to_string(),
         seq,
         timestamp_ms,
-        changes,
+        bids,
+        asks,
     };
     Some(ParsedL2Message {
-        event: MarketDataEvent::L2Delta(delta),
+        event: MarketDataEvent::L2Snapshot(snapshot),
         seq,
     })
 }
@@ -1846,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn order_book_channel_delta_allows_empty_asks() {
+    fn order_book_channel_snapshot_allows_empty_asks() {
         let value = serde_json::json!({
             "channel": "order_book:1",
             "offset": 42,
@@ -1857,21 +1832,20 @@ mod tests {
             }
         });
         let mut seq = 0u64;
-        let mut have_snapshot = false;
         let parsed =
-            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq, &mut have_snapshot)
-                .expect("delta");
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
+                .expect("snapshot");
         match parsed.event {
-            MarketDataEvent::L2Delta(delta) => {
-                assert_eq!(delta.changes.len(), 1);
-                assert_eq!(delta.changes[0].side, BookSide::Bid);
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.bids.len(), 1);
+                assert_eq!(snapshot.asks.len(), 0);
             }
-            _ => panic!("expected delta"),
+            _ => panic!("expected snapshot"),
         }
     }
 
     #[test]
-    fn order_book_channel_delta_allows_empty_bids() {
+    fn order_book_channel_snapshot_allows_empty_bids() {
         let value = serde_json::json!({
             "channel": "order_book:1",
             "offset": 43,
@@ -1882,21 +1856,20 @@ mod tests {
             }
         });
         let mut seq = 0u64;
-        let mut have_snapshot = false;
         let parsed =
-            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq, &mut have_snapshot)
-                .expect("delta");
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
+                .expect("snapshot");
         match parsed.event {
-            MarketDataEvent::L2Delta(delta) => {
-                assert_eq!(delta.changes.len(), 1);
-                assert_eq!(delta.changes[0].side, BookSide::Ask);
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.bids.len(), 0);
+                assert_eq!(snapshot.asks.len(), 1);
             }
-            _ => panic!("expected delta"),
+            _ => panic!("expected snapshot"),
         }
     }
 
     #[test]
-    fn order_book_channel_delta_allows_zero_size() {
+    fn order_book_channel_snapshot_allows_zero_size() {
         let value = serde_json::json!({
             "channel": "order_book:1",
             "offset": 44,
@@ -1907,16 +1880,15 @@ mod tests {
             }
         });
         let mut seq = 0u64;
-        let mut have_snapshot = true;
         let parsed =
-            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq, &mut have_snapshot)
-                .expect("delta");
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
+                .expect("snapshot");
         match parsed.event {
-            MarketDataEvent::L2Delta(delta) => {
-                assert_eq!(delta.changes.len(), 2);
-                assert_eq!(delta.changes[0].size, 0.0);
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.bids.len(), 1);
+                assert_eq!(snapshot.bids[0].size, 0.0);
             }
-            _ => panic!("expected delta"),
+            _ => panic!("expected snapshot"),
         }
     }
 
@@ -1929,8 +1901,9 @@ mod tests {
     }
 
     #[test]
-    fn order_book_channel_snapshot_then_delta() {
-        let snapshot_value = serde_json::json!({
+    fn order_book_channel_always_emits_snapshot() {
+        // First message with full book
+        let first_value = serde_json::json!({
             "channel": "order_book:1",
             "offset": 100,
             "timestamp": 1700000000123i64,
@@ -1939,7 +1912,8 @@ mod tests {
                 "asks": [{"price":"101.0","size":"3.0"}]
             }
         });
-        let delta_value = serde_json::json!({
+        // Second message with different full book (no bids)
+        let second_value = serde_json::json!({
             "channel": "order_book:1",
             "offset": 101,
             "timestamp": 1700000000456i64,
@@ -1949,36 +1923,25 @@ mod tests {
             }
         });
         let mut seq = 0u64;
-        let mut have_snapshot = false;
-        let first = decode_order_book_channel_message(
-            &snapshot_value,
-            3,
-            "LIGHTER",
-            &mut seq,
-            &mut have_snapshot,
-        )
-        .expect("first");
+        let first = decode_order_book_channel_message(&first_value, 3, "LIGHTER", &mut seq)
+            .expect("first");
         match first.event {
             MarketDataEvent::L2Snapshot(snapshot) => {
                 assert_eq!(snapshot.bids.len(), 1);
                 assert_eq!(snapshot.asks.len(), 1);
             }
-            _ => panic!("expected snapshot"),
+            _ => panic!("expected snapshot for first message"),
         }
-        let second = decode_order_book_channel_message(
-            &delta_value,
-            3,
-            "LIGHTER",
-            &mut seq,
-            &mut have_snapshot,
-        )
-        .expect("second");
+        // Second message MUST also be snapshot (not delta) to avoid stale level accumulation
+        let second = decode_order_book_channel_message(&second_value, 3, "LIGHTER", &mut seq)
+            .expect("second");
         match second.event {
-            MarketDataEvent::L2Delta(delta) => {
-                assert_eq!(delta.changes.len(), 1);
-                assert_eq!(delta.changes[0].side, BookSide::Ask);
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                // Bids should be empty (not accumulated from first message)
+                assert_eq!(snapshot.bids.len(), 0, "stale bids must not persist");
+                assert_eq!(snapshot.asks.len(), 1);
             }
-            _ => panic!("expected delta"),
+            _ => panic!("expected snapshot for second message (always snapshot, never delta)"),
         }
     }
 
@@ -2018,14 +1981,74 @@ mod tests {
             }
         });
         let mut seq = 0u64;
-        let mut have_snapshot = false;
-        let first =
-            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq, &mut have_snapshot)
-                .expect("first");
-        let second =
-            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq, &mut have_snapshot)
-                .expect("second");
+        let first = decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
+            .expect("first");
+        let second = decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
+            .expect("second");
         assert!(second.seq > first.seq);
+    }
+
+    /// Regression test: Lighter sends full orderbook state each message.
+    /// If we treated these as deltas, stale bid levels would accumulate and cause crossed books.
+    /// This test verifies that when the best bid drops from 110 to 100, the old 110 bid is removed.
+    #[test]
+    fn order_book_channel_stale_bids_do_not_accumulate() {
+        use crate::orderbook_l2::OrderBookL2;
+
+        // Message 1: best_bid=110, best_ask=111
+        let msg1 = serde_json::json!({
+            "channel": "order_book:1",
+            "timestamp": 1700000000100i64,
+            "order_book": {
+                "bids": [{"price":"110.0","size":"1.0"}],
+                "asks": [{"price":"111.0","size":"1.0"}]
+            }
+        });
+        // Message 2: best_bid drops to 100, best_ask=101 (market moved down)
+        let msg2 = serde_json::json!({
+            "channel": "order_book:1",
+            "timestamp": 1700000000200i64,
+            "order_book": {
+                "bids": [{"price":"100.0","size":"1.0"}],
+                "asks": [{"price":"101.0","size":"1.0"}]
+            }
+        });
+
+        let mut seq = 0u64;
+        let mut book = OrderBookL2::new();
+
+        // Apply first message
+        let parsed1 = decode_order_book_channel_message(&msg1, 0, "LIGHTER", &mut seq)
+            .expect("msg1");
+        match parsed1.event {
+            MarketDataEvent::L2Snapshot(snap) => {
+                book.apply_snapshot(&snap.bids, &snap.asks, snap.seq).unwrap();
+            }
+            _ => panic!("expected snapshot"),
+        }
+        assert_eq!(book.best_bid().unwrap().price, 110.0);
+        assert_eq!(book.best_ask().unwrap().price, 111.0);
+        let spread1 = book.best_ask().unwrap().price - book.best_bid().unwrap().price;
+        assert!(spread1 > 0.0, "spread must be positive");
+
+        // Apply second message
+        let parsed2 = decode_order_book_channel_message(&msg2, 0, "LIGHTER", &mut seq)
+            .expect("msg2");
+        match parsed2.event {
+            MarketDataEvent::L2Snapshot(snap) => {
+                book.apply_snapshot(&snap.bids, &snap.asks, snap.seq).unwrap();
+            }
+            _ => panic!("expected snapshot for second message too"),
+        }
+
+        // CRITICAL: The old bid at 110 must NOT be present.
+        // If it were (due to delta semantics), we'd have:
+        //   best_bid = 110 (stale), best_ask = 101 → spread = -9 (CROSSED!)
+        assert_eq!(book.best_bid().unwrap().price, 100.0, "stale bid at 110 must be gone");
+        assert_eq!(book.best_ask().unwrap().price, 101.0);
+        let spread2 = book.best_ask().unwrap().price - book.best_bid().unwrap().price;
+        assert!(spread2 > 0.0, "spread must be positive after update");
+        assert_eq!(spread2, 1.0, "spread should be 101 - 100 = 1");
     }
 }
 
