@@ -3021,6 +3021,10 @@ additional Warning multipliers (SPREAD_WARN_MULT, Q_WARN_CAP).
 
 > **[STATUS: Implemented]** `toxicity.rs::update_toxicity_and_health`. EWMA markout-based toxicity, venue disable thresholds. See EVIDENCE_PACK.md §6.
 
+**Implementation note:** If `mid` is missing or `depth_near_mid <= 0` persists beyond a short
+grace window (`depth_fallback_grace_ms`), the venue is forced to `toxicity = 1.0` (Disabled).
+This avoids false disables from transient empty-side snapshots while preserving fail-closed behavior.
+
   
 
 For each venue \(v\), compute a toxicity score tox\(_v\) ∈ [0, 1] from 

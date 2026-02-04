@@ -202,9 +202,17 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
             venue.toxicity = 0.0;
         }
 
-        // --- 3) Fallback: if no mid or no depth, apply legacy vol-based toxicity ---
-        // This ensures venues with missing book data are still penalized.
-        if venue.mid.is_none() || venue.depth_near_mid <= 0.0 {
+        // --- 3) Fallback: if no mid or prolonged no depth, apply legacy toxicity ---
+        // This ensures venues with missing book data are still penalized,
+        // while avoiding false disables from brief empty-side snapshots.
+        let depth_zero_prolonged = venue.depth_near_mid <= 0.0
+            && venue
+                .last_mid_update_ms
+                .map(|last_ms| {
+                    now_ms.saturating_sub(last_ms) > cfg.toxicity.depth_fallback_grace_ms
+                })
+                .unwrap_or(true);
+        if venue.mid.is_none() || depth_zero_prolonged {
             // No valid book data -> treat as highly toxic
             venue.toxicity = 1.0;
         } else if !shadow_mode && vol_tox_scale > 0.0 && sigma_eff > 0.0 {
@@ -426,6 +434,60 @@ mod tests {
         // With alpha=0.5: tox = 0.5 * 0.7 + 0.5 * 1.0 = 0.85
         // Should be >= tox_high_threshold (0.8) => Disabled
         assert_eq!(state.venues[0].status, VenueStatus::Disabled);
+    }
+
+    #[test]
+    fn test_depth_zero_within_grace_does_not_force_toxicity() {
+        let mut cfg = make_test_config();
+        cfg.toxicity.depth_fallback_grace_ms = 500;
+        let mut state = GlobalState::new(&cfg);
+
+        let now_ms = 2_000;
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 0.0;
+        venue.last_mid_update_ms = Some(1_800); // 200ms ago, within grace
+        venue.toxicity = 0.2;
+
+        update_toxicity_and_health(&mut state, &cfg, now_ms);
+
+        assert!(
+            state.venues[0].toxicity < 1.0,
+            "Depth=0 within grace should not force toxicity to 1.0"
+        );
+        assert_ne!(
+            state.venues[0].status,
+            VenueStatus::Disabled,
+            "Depth=0 within grace should not disable venue"
+        );
+    }
+
+    #[test]
+    fn test_depth_zero_beyond_grace_forces_toxicity() {
+        let mut cfg = make_test_config();
+        cfg.toxicity.depth_fallback_grace_ms = 500;
+        let mut state = GlobalState::new(&cfg);
+
+        let now_ms = 2_000;
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 0.0;
+        venue.last_mid_update_ms = Some(1_000); // 1000ms ago, beyond grace
+        venue.toxicity = 0.2;
+
+        update_toxicity_and_health(&mut state, &cfg, now_ms);
+
+        assert_eq!(
+            state.venues[0].toxicity, 1.0,
+            "Depth=0 beyond grace should force toxicity to 1.0"
+        );
+        assert_eq!(
+            state.venues[0].status,
+            VenueStatus::Disabled,
+            "Depth=0 beyond grace should disable venue"
+        );
     }
 
     #[test]
