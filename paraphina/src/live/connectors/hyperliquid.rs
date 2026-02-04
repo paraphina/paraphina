@@ -40,6 +40,28 @@ struct Freshness {
     last_snapshot_resync_ns: AtomicU64,
 }
 
+impl Freshness {
+    fn reset_for_new_connection(&self) {
+        self.last_ws_rx_ns.store(0, Ordering::Relaxed);
+        self.last_data_rx_ns.store(0, Ordering::Relaxed);
+        self.last_parsed_ns.store(0, Ordering::Relaxed);
+        self.last_published_ns.store(0, Ordering::Relaxed);
+        self.last_snapshot_resync_ns
+            .store(0, Ordering::Relaxed);
+    }
+
+    fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
+        let last_pub = self.last_published_ns.load(Ordering::Relaxed);
+        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
+        let anchor = last_pub.max(last_parsed);
+        if anchor == 0 {
+            connect_start_ns
+        } else {
+            anchor
+        }
+    }
+}
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -215,6 +237,8 @@ impl HyperliquidConnector {
             "INFO: Hyperliquid public WS subscribed coin={} nSigFigs={} nLevels={}",
             self.cfg.coin, self.cfg.n_sig_figs, self.cfg.n_levels
         );
+        let connect_start_ns = mono_now_ns();
+        freshness.reset_for_new_connection();
         let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
         let stale_ms = hl_stale_ms();
         if std::env::var_os("HL_FIXTURE_DIR").is_some() {
@@ -228,9 +252,7 @@ impl HyperliquidConnector {
                 loop {
                     iv.tick().await;
                     let now = mono_now_ns();
-                    let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
-                    let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
-                    let anchor = last_pub.max(last_parsed);
+                    let anchor = watchdog_freshness.anchor_with_connect_start(connect_start_ns);
                     if anchor != 0 && age_ms(now, anchor) > watchdog_stale_ms {
                         let _ = stale_tx.send(());
                         break;
@@ -1205,6 +1227,7 @@ fn build_cancel_all_action(asset_index: u32) -> serde_json::Value {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn hyperliquid_cancel_all_smoke() {
@@ -1247,6 +1270,46 @@ mod tests {
         let (exec_tx, _exec_rx) = mpsc::channel(1);
         let connector = HyperliquidConnector::new(cfg, market_tx, exec_tx);
         connector.cancel_all(1_234).await.expect("cancel_all");
+    }
+
+    #[test]
+    fn freshness_reset_and_anchor_behavior() {
+        let freshness = Freshness::default();
+        freshness
+            .last_parsed_ns
+            .store(123, Ordering::Relaxed);
+        freshness
+            .last_published_ns
+            .store(456, Ordering::Relaxed);
+        freshness.reset_for_new_connection();
+        assert_eq!(
+            freshness.last_parsed_ns.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            freshness.last_published_ns.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            freshness.last_snapshot_resync_ns.load(Ordering::Relaxed),
+            0
+        );
+
+        let connect_start_ns = 1_000;
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, connect_start_ns);
+
+        freshness
+            .last_parsed_ns
+            .store(2_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 2_000);
+
+        freshness
+            .last_published_ns
+            .store(3_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 3_000);
     }
 }
 
