@@ -556,6 +556,10 @@ pub struct ToxicityConfig {
     /// Maximum number of pending markout evaluations per venue.
     /// Older entries are dropped when this limit is exceeded.
     pub max_pending_per_venue: usize,
+    /// Grace period (ms) before depth=0 triggers the toxicity fallback.
+    /// This prevents transient empty-side snapshots from immediately disabling a venue.
+    /// Set to 0 to restore legacy behavior.
+    pub depth_fallback_grace_ms: i64,
 }
 
 impl Default for Config {
@@ -871,6 +875,7 @@ impl Default for Config {
             markout_alpha: 0.1,             // EWMA blend factor
             markout_scale_usd_per_tao: 2.0, // $2 adverse markout → tox_instant = 1.0
             max_pending_per_venue: 100,     // bounded queue size
+            depth_fallback_grace_ms: 500,   // tolerate brief empty-side snapshots
         };
 
         Config {
