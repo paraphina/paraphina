@@ -1240,6 +1240,30 @@ impl Config {
             }
         }
 
+        // Extended state-level staleness override.
+        // Same pattern as Hyperliquid: affects venue health gating and quote staleness guards.
+        // NOT the connector watchdog (that's PARAPHINA_EXTENDED_STALE_MS).
+        if let Ok(raw) = env::var("PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let ms = v.max(0);
+                    if let Some(venue) = cfg.venues.iter_mut().find(|v| v.id == "extended") {
+                        venue.stale_ms_override = Some(ms);
+                        eprintln!(
+                            "[config] PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE = {} (set extended stale_ms_override)",
+                            ms
+                        );
+                    }
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE = {:?} as i64; ignoring",
+                        raw
+                    );
+                }
+            }
+        }
+
         cfg
     }
 
@@ -1391,6 +1415,88 @@ mod tests {
             .expect("hyperliquid venue must exist");
         assert_eq!(
             hl.stale_ms_override, None,
+            "invalid env value should be ignored"
+        );
+        // EnvGuard restores on drop.
+    }
+
+    /// Test that PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE sets extended's
+    /// stale_ms_override without affecting other venues.
+    #[test]
+    fn extended_state_stale_override_env_sets_extended_only() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE";
+
+        // Serialize env-var tests to avoid races.
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        // Clear any existing value for baseline test.
+        env::remove_var(ENV_KEY);
+
+        // Baseline: no override set.
+        let cfg_baseline = Config::from_env_or_profile(RiskProfile::Balanced);
+        let ext_baseline = cfg_baseline.venues.iter().find(|v| v.id == "extended");
+        assert!(
+            ext_baseline.is_some(),
+            "extended venue must exist in default config"
+        );
+        assert_eq!(
+            ext_baseline.unwrap().stale_ms_override, None,
+            "baseline extended stale_ms_override should be None"
+        );
+
+        // Set override and reload config.
+        env::set_var(ENV_KEY, "1500");
+        let cfg_with_override = Config::from_env_or_profile(RiskProfile::Balanced);
+
+        // Verify extended has override.
+        let ext = cfg_with_override
+            .venues
+            .iter()
+            .find(|v| v.id == "extended")
+            .expect("extended venue must exist");
+        assert_eq!(
+            ext.stale_ms_override,
+            Some(1500),
+            "extended stale_ms_override should be 1500"
+        );
+
+        // Verify other venues are NOT affected.
+        for venue in &cfg_with_override.venues {
+            if venue.id != "extended" {
+                assert_eq!(
+                    venue.stale_ms_override, None,
+                    "venue {} should not have stale_ms_override set",
+                    venue.id
+                );
+            }
+        }
+        // EnvGuard restores on drop.
+    }
+
+    /// Test that invalid values for Extended are ignored (no panic, no override).
+    #[test]
+    fn extended_state_stale_override_env_ignores_invalid() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE";
+
+        // Serialize env-var tests to avoid races.
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "not_a_number");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        let ext = cfg
+            .venues
+            .iter()
+            .find(|v| v.id == "extended")
+            .expect("extended venue must exist");
+        assert_eq!(
+            ext.stale_ms_override, None,
             "invalid env value should be ignored"
         );
         // EnvGuard restores on drop.

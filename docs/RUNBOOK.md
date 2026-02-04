@@ -154,6 +154,18 @@ gating and quote staleness guards (NOT connector watchdog timeouts).
 
   See `docs/INVESTIGATIONS/hyperliquid_stale.md` for telemetry analysis and threshold sweep.
 
+- `PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE=<ms>`  
+  Override Extended's state-level stale_ms threshold. Recommended: `1500` to achieve
+  ~0.6% stale rate. Extended experiences intermittent network latency spikes (P99 ~1250ms,
+  max ~5s) causing ~1.7% stale with default 1000ms threshold.
+
+  Example for shadow runs:
+  ```
+  export PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE=1500
+  ```
+
+  See `docs/INVESTIGATIONS/extended_stale.md` for telemetry analysis and threshold sweep.
+
 ## All-5 CanaryLive (Online)
 
 Canary live requires credentials and explicit live execution gates. Run manually only:
