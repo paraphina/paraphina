@@ -42,6 +42,26 @@ struct Freshness {
     last_published_ns: AtomicU64,
 }
 
+impl Freshness {
+    fn reset_for_new_connection(&self) {
+        self.last_ws_rx_ns.store(0, Ordering::Relaxed);
+        self.last_data_rx_ns.store(0, Ordering::Relaxed);
+        self.last_parsed_ns.store(0, Ordering::Relaxed);
+        self.last_published_ns.store(0, Ordering::Relaxed);
+    }
+
+    fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
+        let last_pub = self.last_published_ns.load(Ordering::Relaxed);
+        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
+        let anchor = last_pub.max(last_parsed);
+        if anchor == 0 {
+            connect_start_ns
+        } else {
+            anchor
+        }
+    }
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -289,6 +309,8 @@ impl ExtendedConnector {
         let mut no_book_warned = false;
         let mut first_ws_keys: Option<String> = None;
         let mut first_ws_snippet: Option<String> = None;
+        let connect_start_ns = mono_now_ns();
+        self.freshness.reset_for_new_connection();
         let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
         let fixture_mode = std::env::var_os("EXTENDED_FIXTURE_DIR").is_some()
             || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some()
@@ -308,9 +330,7 @@ impl ExtendedConnector {
                 loop {
                     iv.tick().await;
                     let now = mono_now_ns();
-                    let last_pub = watchdog_freshness.last_published_ns.load(Ordering::Relaxed);
-                    let last_parsed = watchdog_freshness.last_parsed_ns.load(Ordering::Relaxed);
-                    let anchor = last_pub.max(last_parsed);
+                    let anchor = watchdog_freshness.anchor_with_connect_start(connect_start_ns);
                     if anchor != 0 && age_ms(now, anchor) > watchdog_stale_ms {
                         let _ = stale_tx.send(());
                         break;
@@ -1702,6 +1722,7 @@ mod tests {
     use httpmock::Method::{DELETE, POST};
     use httpmock::MockServer;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn fixture_snapshot_parses() {
@@ -2032,5 +2053,41 @@ mod tests {
         assert_eq!(normalize_extended_market("BTCUSD"), "BTC-USD");
         assert_eq!(normalize_extended_market("BTC-USD"), "BTC-USD");
         assert_eq!(normalize_extended_market("btc-usd-perp"), "BTC-USD");
+    }
+
+    #[test]
+    fn freshness_reset_and_anchor_behavior() {
+        let freshness = Freshness::default();
+        freshness
+            .last_parsed_ns
+            .store(123, Ordering::Relaxed);
+        freshness
+            .last_published_ns
+            .store(456, Ordering::Relaxed);
+        freshness.reset_for_new_connection();
+        assert_eq!(
+            freshness.last_parsed_ns.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            freshness.last_published_ns.load(Ordering::Relaxed),
+            0
+        );
+
+        let connect_start_ns = 1_000;
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, connect_start_ns);
+
+        freshness
+            .last_parsed_ns
+            .store(2_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 2_000);
+
+        freshness
+            .last_published_ns
+            .store(3_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 3_000);
     }
 }
