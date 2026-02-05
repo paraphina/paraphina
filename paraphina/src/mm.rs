@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use crate::config::{Config, VenueConfig};
 use crate::sim_eval::AblationSet;
-use crate::state::{GlobalState, RiskRegime, VenueState};
+use crate::state::{funding_rate_for_decision, GlobalState, RiskRegime, VenueState};
 use crate::types::{
     OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs, VenueStatus,
 };
@@ -84,12 +84,24 @@ pub struct MmReservationComponents {
     pub inventory_term_usd: Vec<f64>,
 }
 
+fn funding_rate_for_mm(cfg: &Config, vstate: &VenueState, now_ms: Option<TimestampMs>) -> f64 {
+    if !cfg.mm.funding_enabled {
+        return 0.0;
+    }
+    match now_ms {
+        Some(now) => funding_rate_for_decision(&vstate.funding_state, now, &cfg.funding, true)
+            .unwrap_or(0.0),
+        None => vstate.funding_state.rate_8h.unwrap_or(0.0),
+    }
+}
+
 /// Compute reservation price component breakdown for each venue.
 ///
 /// This mirrors the reservation price terms used in MM quoting.
 pub fn compute_mm_reservation_components(
     cfg: &Config,
     state: &GlobalState,
+    now_ms: Option<TimestampMs>,
 ) -> MmReservationComponents {
     let n = cfg.venues.len();
     let mut basis_adj_usd = vec![0.0; n];
@@ -102,13 +114,14 @@ pub fn compute_mm_reservation_components(
     let funding_horizon_frac = tau / (8.0 * 60.0 * 60.0);
     let sigma_sq_tau = sigma_eff * sigma_eff * tau;
 
-    let targets = compute_venue_targets(cfg, state);
+    let targets = compute_venue_targets(cfg, state, now_ms);
 
     for (i, vstate) in state.venues.iter().enumerate() {
         let vcfg = &cfg.venues[i];
         let mid = vstate.mid.unwrap_or(fair);
         let basis_v = mid - fair;
-        let funding_pnl_per_unit = vstate.funding_8h * funding_horizon_frac * fair;
+        let funding_8h = funding_rate_for_mm(cfg, vstate, now_ms);
+        let funding_pnl_per_unit = funding_8h * funding_horizon_frac * fair;
 
         let basis_adj = cfg.mm.basis_weight * basis_v;
         let funding_adj = cfg.mm.funding_weight * funding_pnl_per_unit;
@@ -212,10 +225,14 @@ struct TickScalars {
 ///   w_liq_v = depth_v / sum(depth)
 ///   phi(funding) = clip(funding_8h / FUNDING_TARGET_RATE_SCALE, -1, 1) * FUNDING_TARGET_MAX_TAO
 ///   q_target_v = w_liq_v * q_global + w_fund_v * phi(funding_8h_v)
-pub fn compute_venue_targets(cfg: &Config, state: &GlobalState) -> Vec<VenueTargetInventory> {
+pub fn compute_venue_targets(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: Option<TimestampMs>,
+) -> Vec<VenueTargetInventory> {
     let n = cfg.venues.len();
     let mut targets = Vec::with_capacity(n);
-    compute_venue_targets_into(cfg, state, &mut targets);
+    compute_venue_targets_into(cfg, state, now_ms, &mut targets);
     targets
 }
 
@@ -229,6 +246,7 @@ pub fn compute_venue_targets(cfg: &Config, state: &GlobalState) -> Vec<VenueTarg
 pub fn compute_venue_targets_into(
     cfg: &Config,
     state: &GlobalState,
+    now_ms: Option<TimestampMs>,
     out: &mut Vec<VenueTargetInventory>,
 ) {
     let n = cfg.venues.len();
@@ -289,8 +307,9 @@ pub fn compute_venue_targets_into(
 
         // Compute funding preference phi.
         // phi(funding_8h) = clip(funding_8h / scale, -1, 1) * max_tao
+        let funding_8h = funding_rate_for_mm(cfg, vstate, now_ms);
         let funding_norm = if has_funding_scale {
-            (vstate.funding_8h * funding_scale_inv).clamp(-1.0, 1.0)
+            (funding_8h * funding_scale_inv).clamp(-1.0, 1.0)
         } else {
             0.0
         };
@@ -628,7 +647,7 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
     };
 
     // Compute per-venue target inventories using scratch buffer (no allocation).
-    compute_venue_targets_into(cfg, state, &mut scratch.venue_targets);
+    compute_venue_targets_into(cfg, state, now_ms, &mut scratch.venue_targets);
 
     // ---------------------------------------------------------------------
     // Per-venue quoting (explicit indexed loop for determinism)
@@ -674,11 +693,13 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
         // Venue mid: prefer local mid if present, else fall back to fair value.
         let mid = vstate.mid.unwrap_or(s_t);
 
+        let funding_8h = funding_rate_for_mm(cfg, vstate, now_ms);
         let (bid, ask) = compute_single_venue_quotes_fast::<DISABLE_FV, DISABLE_TOX>(
             vcfg,
             vstate,
             mid,
             target.q_target,
+            funding_8h,
             &scalars,
         );
 
@@ -768,6 +789,7 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     vstate: &VenueState,
     mid: f64,
     q_target_v: f64,
+    funding_8h: f64,
     sc: &TickScalars,
 ) -> (Option<MmLevel>, Option<MmLevel>) {
     // ---------------------------------------------------------------------
@@ -850,7 +872,6 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
 
     // Basis and funding for this venue.
     let basis_v = mid - sc.s_t;
-    let funding_8h = vstate.funding_8h;
     let q_v = vstate.position_tao;
 
     // Funding expected PnL per unit over horizon tau:
@@ -1874,7 +1895,7 @@ mod tests {
         state.venues[1].depth_near_mid = 10_000.0;
         state.venues[2].depth_near_mid = 5_000.0;
 
-        let targets = compute_venue_targets(&cfg, &state);
+        let targets = compute_venue_targets(&cfg, &state, None);
 
         // Venue 0 should have higher liquidity weight.
         assert!(
@@ -2136,7 +2157,7 @@ mod tests {
 
         // Run with fresh buffer (starts empty)
         let mut fresh: Vec<VenueTargetInventory> = Vec::new();
-        compute_venue_targets_into(&cfg, &state, &mut fresh);
+        compute_venue_targets_into(&cfg, &state, None, &mut fresh);
 
         // Run with "dirty" reuse buffer (pre-sized with extra capacity)
         let mut reuse: Vec<VenueTargetInventory> = Vec::with_capacity(n * 2);
@@ -2149,7 +2170,7 @@ mod tests {
             });
         }
         let cap_before = reuse.capacity();
-        compute_venue_targets_into(&cfg, &state, &mut reuse);
+        compute_venue_targets_into(&cfg, &state, None, &mut reuse);
 
         // Assert lengths match
         assert_eq!(fresh.len(), n, "fresh.len() should equal cfg.venues.len()");
@@ -2193,7 +2214,7 @@ mod tests {
             // Vary state slightly each iteration to ensure computation runs
             state.q_global_tao = 5.0 + (iter as f64) * 0.01;
 
-            compute_venue_targets_into(&cfg, &state, &mut reuse);
+            compute_venue_targets_into(&cfg, &state, None, &mut reuse);
 
             assert_eq!(
                 reuse.capacity(),
@@ -2211,7 +2232,7 @@ mod tests {
         }
 
         // Final bit-exact check: run fresh again with updated state and compare
-        compute_venue_targets_into(&cfg, &state, &mut fresh);
+        compute_venue_targets_into(&cfg, &state, None, &mut fresh);
         for i in 0..n {
             assert_eq!(
                 fresh[i].w_liq.to_bits(),

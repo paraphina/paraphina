@@ -39,6 +39,8 @@ pub struct Config {
     pub volatility: VolatilityConfig,
     /// Global risk / limit config.
     pub risk: RiskConfig,
+    /// Funding staleness + boundary policy.
+    pub funding: FundingPolicyConfig,
     /// Quoting (Avellaneda–Stoikov + funding/basis) config.
     pub mm: MmConfig,
     /// Hedge engine (global LQ controller + band).
@@ -324,11 +326,21 @@ pub struct RiskConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct FundingPolicyConfig {
+    /// Funding data staleness threshold (ms).
+    pub stale_ms: i64,
+    /// Avoid using funding within this window (ms) of next funding timestamp.
+    pub avoid_window_ms: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct MmConfig {
     /// Weight of basis in reservation price (β_b in spec).
     pub basis_weight: f64,
     /// Weight of funding in reservation price (β_f in spec).
     pub funding_weight: f64,
+    /// Enable funding-aware MM logic (default: false).
+    pub funding_enabled: bool,
     /// Minimum per-unit edge for local MM quotes (in USD).
     pub edge_local_min: f64,
     /// Multiplier for volatility-based edge buffer.
@@ -394,6 +406,8 @@ pub struct HedgeConfig {
     /// Weight for funding benefit in the per-venue cost model.
     /// Positive => prefer venues with favorable funding.
     pub funding_weight: f64,
+    /// Enable funding-aware hedge logic (default: false).
+    pub funding_enabled: bool,
 
     /// Weight for basis edge in the per-venue cost model.
     /// Positive => prefer venues where we can capture basis spread.
@@ -487,6 +501,8 @@ pub struct ExitConfig {
 
     /// Scoring weight on funding benefit term (USD/TAO).
     pub funding_weight: f64,
+    /// Enable funding-aware exit logic (default: false).
+    pub funding_enabled: bool,
 
     /// Funding horizon (seconds) used for approximating funding benefit.
     pub funding_horizon_sec: f64,
@@ -749,12 +765,19 @@ impl Default for Config {
             liq_crit_sigma: 2.0, // treat as “too close” inside 2σ
         };
 
+        // ----- Funding policy (staleness + avoid window) -----
+        let funding = FundingPolicyConfig {
+            stale_ms: 10 * 60 * 1000,   // 10 minutes
+            avoid_window_ms: 60 * 1000, // 60 seconds
+        };
+
         // ----- MM (Avellaneda–Stoikov + basis/funding) -----
         let mm = MmConfig {
             // Reservation price adjustment weights. These are deliberately
             // modest so we only lightly lean inventory based on basis/funding.
             basis_weight: 0.3,
             funding_weight: 0.3,
+            funding_enabled: false,
             // Local minimum edge in USD, plus a vol-dependent buffer.
             edge_local_min: 0.5,
             edge_vol_mult: 0.2,
@@ -799,6 +822,7 @@ impl Default for Config {
             depth_fraction: 0.10,
             min_depth_usd: 500.0,
             funding_weight: 0.20,
+            funding_enabled: false,
             basis_weight: 0.20,
             funding_horizon_sec: 30.0,
             slippage_buffer: 0.05, // USD/TAO
@@ -836,6 +860,7 @@ impl Default for Config {
             edge_vol_mult: 0.10,
             basis_weight: 0.20,
             funding_weight: 0.20,
+            funding_enabled: false,
             funding_horizon_sec: 30.0,
             fragmentation_penalty_per_tao: 0.05,
             depth_fraction: 0.10,
@@ -890,6 +915,7 @@ impl Default for Config {
             kalman,
             volatility,
             risk,
+            funding,
             mm,
             hedge,
             exit,
@@ -1267,6 +1293,69 @@ impl Config {
                     );
                 }
             }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_FUNDING_STALE_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    cfg.funding.stale_ms = v.max(0);
+                    eprintln!(
+                        "[config] PARAPHINA_FUNDING_STALE_MS = {} (overrode default)",
+                        cfg.funding.stale_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_FUNDING_STALE_MS = {:?} as i64; using default {}",
+                        raw, cfg.funding.stale_ms
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_FUNDING_AVOID_WINDOW_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    cfg.funding.avoid_window_ms = v.max(0);
+                    eprintln!(
+                        "[config] PARAPHINA_FUNDING_AVOID_WINDOW_MS = {} (overrode default)",
+                        cfg.funding.avoid_window_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_FUNDING_AVOID_WINDOW_MS = {:?} as i64; using default {}",
+                        raw, cfg.funding.avoid_window_ms
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_ENABLE_FUNDING_MM") {
+            let enabled = raw == "1" || raw.eq_ignore_ascii_case("true");
+            cfg.mm.funding_enabled = enabled;
+            eprintln!(
+                "[config] PARAPHINA_ENABLE_FUNDING_MM = {} (overrode default)",
+                cfg.mm.funding_enabled
+            );
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_ENABLE_FUNDING_HEDGE") {
+            let enabled = raw == "1" || raw.eq_ignore_ascii_case("true");
+            cfg.hedge.funding_enabled = enabled;
+            eprintln!(
+                "[config] PARAPHINA_ENABLE_FUNDING_HEDGE = {} (overrode default)",
+                cfg.hedge.funding_enabled
+            );
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_ENABLE_FUNDING_EXIT") {
+            let enabled = raw == "1" || raw.eq_ignore_ascii_case("true");
+            cfg.exit.funding_enabled = enabled;
+            eprintln!(
+                "[config] PARAPHINA_ENABLE_FUNDING_EXIT = {} (overrode default)",
+                cfg.exit.funding_enabled
+            );
         }
 
         cfg

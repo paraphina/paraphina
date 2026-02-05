@@ -71,7 +71,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs};
+use crate::types::{
+    FundingSource, OrderIntent, OrderPurpose, SettlementPriceKind, Side, TimestampMs,
+};
 
 use super::super::gateway::{
     LiveGatewayError, LiveGatewayErrorKind, LiveRestCancelAllRequest, LiveRestCancelRequest,
@@ -79,8 +81,8 @@ use super::super::gateway::{
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, LiquidationSnapshot,
-    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
+    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use super::lighter_nonce::{load_last_nonce, store_last_nonce, LighterNonceManager};
 use super::lighter_signer::{
@@ -209,7 +211,6 @@ fn scale_to_i64(value: f64, decimals: u32, label: &str) -> anyhow::Result<i64> {
     Ok(scaled as i64)
 }
 
-#[derive(Debug)]
 pub struct LighterConnector {
     cfg: LighterConfig,
     http: Client,
@@ -429,7 +430,18 @@ impl LighterConnector {
         let mut backoff = Duration::from_secs(1);
         let mut subscribe_failures = 0usize;
         let mut logged_subscribe_failure = false;
+
+        // FIX: Configurable healthy connection threshold for backoff reset
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
         loop {
+            let session_start = Instant::now();
+
             if let Err(err) = self.public_ws_once().await {
                 let msg = err.to_string();
                 if msg.contains("Lighter subscribe failed") {
@@ -447,6 +459,17 @@ impl LighterConnector {
                     eprintln!("Lighter public WS error: {err}");
                 }
             }
+
+            // FIX: Reset backoff if connection was healthy for long enough
+            let session_duration = session_start.elapsed();
+            if session_duration >= healthy_threshold {
+                eprintln!(
+                    "INFO: Lighter WS session was healthy for {:?}; resetting backoff",
+                    session_duration
+                );
+                backoff = Duration::from_secs(1);
+            }
+
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
@@ -483,6 +506,34 @@ impl LighterConnector {
         }
 
         let (market_symbol, market_id) = self.resolve_market_id_and_symbol().await?;
+
+        // FIX: Setup freshness watchdog (mirrors pattern in HL/Paradex/Extended/Aster)
+        let connect_start_ns = mono_now_ns();
+        self.freshness.reset_for_new_connection();
+        let stale_ms = lighter_stale_ms();
+
+        let fixture_mode = std::env::var_os("LIGHTER_FIXTURE_DIR").is_some()
+            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
+
+        // Spawn watchdog task that signals when connection is stale
+        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        if !fixture_mode {
+            let watchdog_freshness = self.freshness.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(Duration::from_millis(LIGHTER_WATCHDOG_TICK_MS));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    iv.tick().await;
+                    let now = mono_now_ns();
+                    let anchor = watchdog_freshness.anchor_with_connect_start(connect_start_ns);
+                    if anchor != 0 && age_ms(now, anchor) > stale_ms {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
+
         eprintln!("INFO: Lighter public WS connecting url={}", self.cfg.ws_url);
         let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
         eprintln!("INFO: Lighter public WS connected url={}", self.cfg.ws_url);
@@ -525,8 +576,9 @@ impl LighterConnector {
                     }
                 }
             };
+
             // Update WS receive timestamp
-            freshness
+            self.freshness
                 .last_ws_rx_ns
                 .store(mono_now_ns(), Ordering::Relaxed);
 
@@ -556,6 +608,12 @@ impl LighterConnector {
                 },
                 _ => continue,
             };
+
+            // Update freshness on data message
+            self.freshness
+                .last_data_rx_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
+
             if !first_message_logged {
                 eprintln!("INFO: Lighter public WS first message received");
                 first_message_logged = true;
@@ -637,6 +695,10 @@ impl LighterConnector {
                     &self.cfg.venue_id,
                     &mut seq_fallback,
                 ) {
+                    // Update freshness on parsed data
+                    self.freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
                         // Update freshness only when we produce a publishable event
@@ -662,6 +724,10 @@ impl LighterConnector {
                     &self.cfg.venue_id,
                     &mut seq_fallback,
                 ) {
+                    // Update freshness on parsed data
+                    self.freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
                         // Update freshness only when we produce a publishable event
@@ -705,6 +771,10 @@ impl LighterConnector {
             if let Some(parsed) =
                 parse_l2_message_value(&value, &self.cfg.venue_id, self.cfg.venue_index)
             {
+                // Update freshness on parsed data
+                self.freshness
+                    .last_parsed_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
                 let outcome = tracker.on_message(parsed);
                 if let Some(event) = outcome.event {
                     // Update freshness only when we produce a publishable event
@@ -739,6 +809,56 @@ impl LighterConnector {
                 }
                 Err(err) => {
                     eprintln!("Lighter account polling error: {err}");
+                }
+            }
+        }
+    }
+
+    pub async fn run_funding_polling(&self, interval_ms: u64) {
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        let mut seq: u64 = 0;
+
+        // FIX: Retry initialization with exponential backoff instead of fatal exit
+        let mut init_backoff = Duration::from_secs(5);
+        const MAX_INIT_BACKOFF_SECS: u64 = 60;
+        let (market_symbol, market_id) = loop {
+            match self.resolve_market_id_and_symbol().await {
+                Ok(val) => break val,
+                Err(err) => {
+                    eprintln!(
+                        "Lighter funding polling init error (retry in {:?}): {err}",
+                        init_backoff
+                    );
+                    tokio::time::sleep(init_backoff).await;
+                    init_backoff =
+                        (init_backoff * 2).min(Duration::from_secs(MAX_INIT_BACKOFF_SECS));
+                    // Continue loop to retry
+                }
+            }
+        };
+
+        eprintln!(
+            "INFO: Lighter funding polling initialized symbol={} market_id={}",
+            market_symbol, market_id
+        );
+
+        loop {
+            interval.tick().await;
+            match fetch_public_funding(&self.http, &self.cfg, market_id, &market_symbol).await {
+                Ok(mut update) => {
+                    seq = seq.wrapping_add(1);
+                    update.seq = seq;
+                    // FIX: Log channel send failures instead of silently ignoring
+                    if let Err(err) = self
+                        .market_publisher
+                        .publish_market(MarketDataEvent::FundingUpdate(update))
+                        .await
+                    {
+                        eprintln!("Lighter funding publish error: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Lighter funding polling error: {err}");
                 }
             }
         }
@@ -779,10 +899,32 @@ impl LighterConnector {
 
     pub async fn run_private_ws(&self) {
         let mut backoff = Duration::from_secs(1);
+
+        // FIX: Configurable healthy connection threshold for backoff reset
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
         loop {
+            let session_start = Instant::now();
+
             if let Err(err) = self.private_ws_once().await {
                 eprintln!("Lighter private WS error: {err}");
             }
+
+            // FIX: Reset backoff if connection was healthy for long enough
+            let session_duration = session_start.elapsed();
+            if session_duration >= healthy_threshold {
+                eprintln!(
+                    "INFO: Lighter private WS session was healthy for {:?}; resetting backoff",
+                    session_duration
+                );
+                backoff = Duration::from_secs(1);
+            }
+
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
@@ -964,6 +1106,9 @@ fn override_market_event(
         MarketDataEvent::FundingUpdate(mut funding) => {
             funding.seq = seq;
             funding.timestamp_ms = timestamp_ms;
+            if funding.received_ms.is_none() {
+                funding.received_ms = Some(timestamp_ms);
+            }
             MarketDataEvent::FundingUpdate(funding)
         }
     }
@@ -993,16 +1138,6 @@ fn parse_deltas(changes: &serde_json::Value) -> Option<Vec<BookLevelDelta>> {
         out.push(BookLevelDelta { side, price, size });
     }
     Some(out)
-}
-
-fn parse_f64_value(value: &serde_json::Value) -> Option<f64> {
-    if let Some(raw) = value.as_f64() {
-        return Some(raw);
-    }
-    if let Some(raw) = value.as_str() {
-        return raw.parse::<f64>().ok();
-    }
-    None
 }
 
 fn decode_order_book_snapshot(
@@ -2239,6 +2374,61 @@ mod tests {
     /// If we treated these as deltas, stale bid levels would accumulate and cause crossed books.
     /// This test verifies that when the best bid drops from 110 to 100, the old 110 bid is removed.
     #[test]
+    fn parse_public_funding_rates_fixture() {
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/lighter/public_funding_rates.json"
+        );
+        let raw = fs::read_to_string(fixture_path).expect("fixture exists");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "https://example.invalid".to_string(),
+            market: "ETH".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 3,
+            paper_mode: true,
+            api_key_index: None,
+            account_index: None,
+            api_private_key_hex: None,
+            auth_token: None,
+            nonce_path: None,
+            signer_url: None,
+        };
+
+        // Test: find ETH by market_id=0
+        let update = parse_public_funding(&value, &cfg, 0, "ETH").expect("parse ok");
+        assert_eq!(update.venue_index, 3);
+        assert_eq!(update.venue_id, "LIGHTER");
+
+        // rate = 0.00001234 (hourly), interval_sec = 3600
+        // rate_8h = 0.00001234 * 8 = 0.00009872
+        let rate_native = update.funding_rate_native.expect("rate_native present");
+        assert!((rate_native - 0.00001234).abs() < 1e-10, "rate_native mismatch");
+
+        let interval = update.interval_sec.expect("interval_sec present");
+        assert_eq!(interval, 3600);
+
+        let rate_8h = update.funding_rate_8h.expect("rate_8h present");
+        assert!((rate_8h - 0.00009872).abs() < 1e-10, "rate_8h mismatch");
+
+        // Test: find BTC by market_id=1
+        let update_btc = parse_public_funding(&value, &cfg, 1, "BTC").expect("parse btc ok");
+        let rate_btc = update_btc.funding_rate_native.expect("btc rate present");
+        assert!((rate_btc - 0.00000567).abs() < 1e-10);
+
+        // Test: find by symbol fallback (market_id=999 doesn't exist, but symbol "ETH" does)
+        let update_symbol = parse_public_funding(&value, &cfg, 999, "ETH").expect("symbol fallback");
+        let rate_symbol = update_symbol.funding_rate_native.expect("rate present");
+        assert!((rate_symbol - 0.00001234).abs() < 1e-10);
+
+        // Test: non-existent market returns None
+        let none_result = parse_public_funding(&value, &cfg, 999, "NOSUCH");
+        assert!(none_result.is_none());
+    }
+
+    #[test]
     fn order_book_channel_stale_bids_do_not_accumulate() {
         use crate::orderbook_l2::OrderBookL2;
 
@@ -2401,6 +2591,195 @@ async fn fetch_account_snapshot(
     let snapshot = parse_account_snapshot(&value, &cfg.venue_id)
         .ok_or_else(|| anyhow::anyhow!("invalid account snapshot"))?;
     Ok(AccountEvent::Snapshot(snapshot))
+}
+
+/// Rate-limit log state for funding fetch errors.
+static LIGHTER_FUNDING_ERROR_LOG_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+async fn fetch_public_funding(
+    client: &Client,
+    cfg: &LighterConfig,
+    market_id: u64,
+    market_symbol: &str,
+) -> anyhow::Result<FundingUpdate> {
+    // Default to /api/v1/funding-rates which is the working public endpoint.
+    // The old /api/v1/marketStats returns HTTP 403 on mainnet CloudFront.
+    let path = std::env::var("LIGHTER_FUNDING_PATH")
+        .unwrap_or_else(|_| "/api/v1/funding-rates".to_string());
+    let base = cfg.rest_url.trim_end_matches('/');
+    let mut url = format!("{base}{path}");
+    let query = format!("market_id={market_id}&symbol={market_symbol}");
+    if url.contains('?') {
+        url.push('&');
+        url.push_str(&query);
+    } else {
+        url.push('?');
+        url.push_str(&query);
+    }
+    let resp = client.get(&url).send().await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        // Rate-limited logging: only log first 3 errors, then every 100th
+        let count = LIGHTER_FUNDING_ERROR_LOG_COUNT
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count < 3 || count % 100 == 0 {
+            let snippet: String = body.chars().take(160).collect();
+            eprintln!(
+                "WARN: Lighter funding fetch failed status={} url={} snippet={} (count={})",
+                status, url, snippet, count + 1
+            );
+        }
+        anyhow::bail!("Lighter funding fetch failed: HTTP {}", status);
+    }
+
+    let value: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            let count = LIGHTER_FUNDING_ERROR_LOG_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count < 3 || count % 100 == 0 {
+                let snippet: String = body.chars().take(160).collect();
+                eprintln!(
+                    "WARN: Lighter funding JSON parse failed url={} err={} snippet={} (count={})",
+                    url, err, snippet, count + 1
+                );
+            }
+            anyhow::bail!("Lighter funding JSON parse failed: {}", err);
+        }
+    };
+
+    parse_public_funding(&value, cfg, market_id, market_symbol)
+        .ok_or_else(|| anyhow::anyhow!("invalid public funding response"))
+}
+
+fn parse_public_funding(
+    value: &serde_json::Value,
+    cfg: &LighterConfig,
+    market_id: u64,
+    market_symbol: &str,
+) -> Option<FundingUpdate> {
+    // Try to extract from funding_rates[] array (the /api/v1/funding-rates endpoint format)
+    if let Some(funding_rates) = value.get("funding_rates").and_then(|v| v.as_array()) {
+        // First try to find by market_id (preferred)
+        let entry = funding_rates
+            .iter()
+            .find(|e| e.get("market_id").and_then(|v| v.as_u64()) == Some(market_id))
+            .or_else(|| {
+                // Fallback: match by symbol (normalized)
+                let target = normalize_lighter_symbol(market_symbol);
+                funding_rates.iter().find(|e| {
+                    e.get("symbol")
+                        .and_then(|v| v.as_str())
+                        .map(normalize_lighter_symbol)
+                        == Some(target.clone())
+                })
+            });
+
+        if let Some(data) = entry {
+            return parse_funding_entry(data, cfg);
+        }
+        // No matching entry found in funding_rates array
+        return None;
+    }
+
+    // Fallback: legacy marketStats-style response (single market object)
+    let data = value
+        .get("data")
+        .or_else(|| value.get("market"))
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+
+    parse_funding_entry(data, cfg)
+}
+
+/// Parse a single funding entry (either from funding_rates[] or legacy single-market response).
+fn parse_funding_entry(data: &serde_json::Value, cfg: &LighterConfig) -> Option<FundingUpdate> {
+    let rate_native = data
+        .get("rate")
+        .or_else(|| data.get("funding_rate"))
+        .or_else(|| data.get("fundingRate"))
+        .or_else(|| data.get("funding_rate_1h"))
+        .or_else(|| data.get("fundingRate1h"))
+        .or_else(|| data.get("funding_8h"))
+        .and_then(parse_f64_value);
+
+    // For /api/v1/funding-rates, the rate is hourly (1h).
+    // Default to 3600s (1 hour) if not explicitly provided.
+    let interval_sec = data
+        .get("funding_interval_sec")
+        .or_else(|| data.get("fundingIntervalSec"))
+        .or_else(|| data.get("funding_interval"))
+        .or_else(|| data.get("fundingInterval"))
+        .and_then(parse_i64_value)
+        .and_then(|v| if v > 0 { Some(v as u64) } else { None })
+        .or_else(|| {
+            // If rate field is present but no interval, assume hourly (Lighter default)
+            if rate_native.is_some() {
+                Some(3600)
+            } else {
+                None
+            }
+        });
+
+    let next_funding_ms = data
+        .get("next_funding_time")
+        .or_else(|| data.get("nextFundingTime"))
+        .or_else(|| data.get("nextFundingTimestamp"))
+        .or_else(|| data.get("next_funding_ms"))
+        .and_then(parse_i64_value);
+
+    let as_of_ms = data
+        .get("timestamp")
+        .or_else(|| data.get("ts"))
+        .and_then(parse_i64_value)
+        .unwrap_or_else(|| now_ms() as i64);
+
+    // Convert to 8h rate: rate_8h = rate_native * (8h / interval_sec)
+    let rate_8h = match (rate_native, interval_sec) {
+        (Some(rate), Some(sec)) if sec > 0 => Some(rate * (8.0 * 60.0 * 60.0 / sec as f64)),
+        (Some(rate), None) => Some(rate), // Assume already 8h if no interval
+        _ => None,
+    };
+
+    Some(FundingUpdate {
+        venue_index: cfg.venue_index,
+        venue_id: cfg.venue_id.clone(),
+        seq: 0,
+        timestamp_ms: as_of_ms,
+        received_ms: Some(now_ms() as i64),
+        funding_rate_8h: rate_8h,
+        funding_rate_native: rate_native,
+        interval_sec,
+        next_funding_ms,
+        settlement_price_kind: Some(SettlementPriceKind::Unknown),
+        source: FundingSource::MarketDataRest,
+    })
+}
+
+fn parse_f64_value(value: &serde_json::Value) -> Option<f64> {
+    if let Some(raw) = value.as_f64() {
+        return Some(raw);
+    }
+    if let Some(raw) = value.as_str() {
+        return raw.parse::<f64>().ok();
+    }
+    None
+}
+
+fn parse_i64_value(value: &serde_json::Value) -> Option<i64> {
+    if let Some(raw) = value.as_i64() {
+        return Some(raw);
+    }
+    if let Some(raw) = value.as_f64() {
+        return Some(raw as i64);
+    }
+    if let Some(raw) = value.as_str() {
+        return raw.parse::<i64>().ok();
+    }
+    None
 }
 
 pub fn parse_account_snapshot(data: &serde_json::Value, venue_id: &str) -> Option<AccountSnapshot> {

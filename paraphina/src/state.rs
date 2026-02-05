@@ -25,8 +25,8 @@ use crate::orderbook_l2::{
     BookLevel, BookLevelDelta, DepthConfig, DerivedBookMetrics, OrderBookError, OrderBookL2,
 };
 use crate::types::{
-    FillEvent, OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs,
-    VenueStatus,
+    FillEvent, FundingSource, FundingStatus, OrderIntent, OrderPurpose, PlaceOrderIntent, Side,
+    SettlementPriceKind, TimeInForce, TimestampMs, VenueStatus,
 };
 
 /// A pending markout evaluation entry.
@@ -50,6 +50,86 @@ pub struct PendingMarkout {
     pub mid_at_fill: f64,
     /// Deterministic fill sequence for linking to recent_fills.
     pub fill_seq: u64,
+}
+
+/// Canonical funding state for a venue.
+#[derive(Debug, Clone)]
+pub struct FundingState {
+    pub rate_8h: Option<f64>,
+    pub rate_native: Option<f64>,
+    pub interval_sec: Option<u64>,
+    pub as_of_ms_exchange: Option<TimestampMs>,
+    pub received_ms: Option<TimestampMs>,
+    pub next_funding_ms: Option<TimestampMs>,
+    pub settlement_price_kind: SettlementPriceKind,
+    pub source: FundingSource,
+    pub status: FundingStatus,
+}
+
+impl Default for FundingState {
+    fn default() -> Self {
+        Self {
+            rate_8h: None,
+            rate_native: None,
+            interval_sec: None,
+            as_of_ms_exchange: None,
+            received_ms: None,
+            next_funding_ms: None,
+            settlement_price_kind: SettlementPriceKind::Unknown,
+            source: FundingSource::Unknown,
+            status: FundingStatus::Unknown,
+        }
+    }
+}
+
+impl FundingState {
+    pub fn age_ms(&self, now_ms: TimestampMs) -> Option<i64> {
+        let base = self
+            .received_ms
+            .filter(|v| *v > 0)
+            .or_else(|| self.as_of_ms_exchange.filter(|v| *v > 0));
+        base.map(|ts| now_ms.saturating_sub(ts))
+    }
+
+    pub fn status_at(&self, now_ms: TimestampMs, stale_ms: i64) -> FundingStatus {
+        if self.rate_8h.is_none() {
+            return FundingStatus::Unknown;
+        }
+        match self.age_ms(now_ms) {
+            Some(age) if age >= 0 && age <= stale_ms => FundingStatus::Healthy,
+            Some(_) => FundingStatus::Stale,
+            None => FundingStatus::Unknown,
+        }
+    }
+
+    pub fn is_within_avoid_window(&self, now_ms: TimestampMs, avoid_window_ms: i64) -> bool {
+        if avoid_window_ms <= 0 {
+            return false;
+        }
+        let Some(next_ms) = self.next_funding_ms else {
+            return false;
+        };
+        (next_ms - now_ms).abs() <= avoid_window_ms
+    }
+}
+
+/// Determine if funding is usable for decision logic.
+pub fn funding_rate_for_decision(
+    funding_state: &FundingState,
+    now_ms: TimestampMs,
+    policy: &crate::config::FundingPolicyConfig,
+    enabled: bool,
+) -> Option<f64> {
+    if !enabled {
+        return None;
+    }
+    if funding_state.status_at(now_ms, policy.stale_ms) != FundingStatus::Healthy {
+        return None;
+    }
+    if funding_state.is_within_avoid_window(now_ms, policy.avoid_window_ms) {
+        return None;
+    }
+    funding_state.rate_8h
 }
 
 /// Canonical open-order record for per-venue order ledger.
@@ -143,6 +223,8 @@ pub struct VenueState {
     pub position_tao: f64,
     /// Current 8h funding rate (dimensionless).
     pub funding_8h: f64,
+    /// Canonical funding state (nullable, fail-closed).
+    pub funding_state: FundingState,
     /// Volume-weighted average entry price of the current position (USD per TAO).
     /// Defined only when `position_tao != 0.0`, otherwise 0.0.
     pub avg_entry_price: f64,
@@ -658,6 +740,7 @@ impl GlobalState {
 
                 position_tao: 0.0,
                 funding_8h: 0.0,
+                funding_state: FundingState::default(),
                 avg_entry_price: 0.0,
 
                 // Synthetic defaults; real implementations poll these.

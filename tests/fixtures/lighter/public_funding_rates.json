@@ -1,0 +1,17 @@
+{
+  "code": 200,
+  "funding_rates": [
+    {
+      "market_id": 0,
+      "exchange": "lighter",
+      "symbol": "ETH",
+      "rate": "0.00001234"
+    },
+    {
+      "market_id": 1,
+      "exchange": "lighter",
+      "symbol": "BTC",
+      "rate": "0.00000567"
+    }
+  ]
+}

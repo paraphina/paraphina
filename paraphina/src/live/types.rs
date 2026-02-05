@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{OrderPurpose, Side, TimestampMs};
+use crate::types::{FundingSource, OrderPurpose, SettlementPriceKind, Side, TimestampMs};
 
 use super::orderbook_l2::{BookLevel, BookLevelDelta};
 
@@ -76,7 +76,14 @@ pub struct FundingUpdate {
     pub venue_id: String,
     pub seq: u64,
     pub timestamp_ms: TimestampMs,
-    pub funding_rate_8h: f64,
+    pub received_ms: Option<TimestampMs>,
+    pub funding_rate_8h: Option<f64>,
+    pub funding_rate_native: Option<f64>,
+    pub interval_sec: Option<u64>,
+    pub next_funding_ms: Option<TimestampMs>,
+    pub settlement_price_kind: Option<SettlementPriceKind>,
+    #[serde(default)]
+    pub source: FundingSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

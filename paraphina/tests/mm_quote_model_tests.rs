@@ -18,7 +18,7 @@ use paraphina::mm::{
     compute_mm_quotes, compute_order_actions, compute_venue_targets, should_replace_order,
     ActiveMmOrder, MmOrderAction, ShouldReplaceOrderCtx,
 };
-use paraphina::state::{GlobalState, KillReason, RiskRegime};
+use paraphina::state::{FundingState, GlobalState, KillReason, RiskRegime};
 use paraphina::types::{Side, VenueStatus};
 
 /// Small harness that gives us a Config, Engine and GlobalState
@@ -258,7 +258,7 @@ fn reservation_price_affected_by_venue_target_deviation() {
     h.state.venues[0].position_tao = 0.0;
 
     // Compute targets first.
-    let targets = compute_venue_targets(h.cfg, &h.state);
+    let targets = compute_venue_targets(h.cfg, &h.state, None);
     let q_target_0 = targets[0].q_target;
 
     let quotes_at_target = compute_mm_quotes(h.cfg, &h.state);
@@ -584,7 +584,7 @@ fn venue_targets_scale_with_depth() {
     h.state.venues[1].depth_near_mid = 15_000.0;
     h.state.venues[2].depth_near_mid = 5_000.0;
 
-    let targets = compute_venue_targets(h.cfg, &h.state);
+    let targets = compute_venue_targets(h.cfg, &h.state, None);
 
     // Venue 0 (highest depth) should have highest liquidity weight.
     assert!(
@@ -623,7 +623,7 @@ fn venue_targets_respond_to_funding() {
     // Venue 2: zero funding.
     h.state.venues[2].funding_8h = 0.0;
 
-    let targets = compute_venue_targets(h.cfg, &h.state);
+    let targets = compute_venue_targets(h.cfg, &h.state, None);
 
     // With positive funding, target should be higher (prefer shorts there).
     // With negative funding, target should be lower (prefer longs there).
@@ -634,9 +634,9 @@ fn venue_targets_respond_to_funding() {
     let t2 = targets[2].q_target;
 
     // They should not all be identical if funding matters.
-    // (Unless w_fund is 0 in config.)
+    // (Unless funding is disabled in mm config.)
     let all_same = (t0 - t1).abs() < 1e-9 && (t1 - t2).abs() < 1e-9;
-    if h.cfg.venues[0].w_fund > 0.0 {
+    if h.cfg.mm.funding_enabled && h.cfg.venues[0].w_fund > 0.0 {
         assert!(
             !all_same,
             "Different funding rates should produce different targets"
@@ -858,6 +858,7 @@ fn compute_order_actions_place_new() {
         next_fill_seq: 0,
         position_tao: 0.0,
         funding_8h: 0.0,
+        funding_state: FundingState::default(),
         avg_entry_price: 0.0,
         margin_balance_usd: 10_000.0,
         margin_used_usd: 0.0,
@@ -940,6 +941,7 @@ fn compute_order_actions_cancel_when_no_desired() {
         next_fill_seq: 0,
         position_tao: 0.0,
         funding_8h: 0.0,
+        funding_state: FundingState::default(),
         avg_entry_price: 0.0,
         margin_balance_usd: 10_000.0,
         margin_used_usd: 0.0,

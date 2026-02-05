@@ -1,0 +1,20 @@
+{
+  "results": [
+    {
+      "symbol": "ETH-USD-PERP",
+      "funding_rate": "-0.00011283359389",
+      "created_at": 1770309699810,
+      "mark_price": "2850.50",
+      "index_price": "2849.80",
+      "open_interest": "125000.5"
+    },
+    {
+      "symbol": "BTC-USD-PERP",
+      "funding_rate": "0.00005672",
+      "created_at": 1770309699810,
+      "mark_price": "98500.00",
+      "index_price": "98480.00",
+      "open_interest": "50000.0"
+    }
+  ]
+}

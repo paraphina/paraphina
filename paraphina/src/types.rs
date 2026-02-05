@@ -4,9 +4,18 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Millisecond timestamp since Unix epoch.
 pub type TimestampMs = i64;
+
+/// Current time in milliseconds since Unix epoch.
+pub fn now_ms() -> TimestampMs {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as TimestampMs
+}
 
 /// Health status of a venue used by the strategy & risk engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +23,36 @@ pub enum VenueStatus {
     Healthy,
     Warning,  // used for "medium" toxicity / soft risk clamp
     Disabled, // venue is turned off
+}
+
+/// Funding data source provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FundingSource {
+    MarketDataWs,
+    MarketDataRest,
+    AccountSnapshot,
+    Derived,
+    #[default]
+    Unknown,
+}
+
+/// Health status of funding data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FundingStatus {
+    Healthy,
+    Stale,
+    Unknown,
+}
+
+/// Settlement price basis used for funding computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SettlementPriceKind {
+    Oracle,
+    Mark,
+    Index,
+    UsdcOracleAdjusted,
+    #[default]
+    Unknown,
 }
 
 /// Buy or sell side for an order.

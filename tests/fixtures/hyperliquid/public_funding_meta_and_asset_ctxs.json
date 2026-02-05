@@ -1,0 +1,15 @@
+{
+  "time": 1700000000000,
+  "universe": [
+    {
+      "name": "TAO"
+    }
+  ],
+  "assetCtxs": [
+    {
+      "funding8h": "0.001",
+      "nextFundingTime": 1700003600000,
+      "fundingIntervalSec": 28800
+    }
+  ]
+}

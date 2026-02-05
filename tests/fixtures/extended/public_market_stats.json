@@ -1,0 +1,20 @@
+{
+  "status": "OK",
+  "data": {
+    "dailyVolume": "677904933.397600",
+    "dailyVolumeBase": "326454.170",
+    "dailyPriceChange": "-139.3",
+    "dailyPriceChangePercentage": "-0.0662",
+    "dailyLow": "1920.7",
+    "dailyHigh": "2187.3",
+    "lastPrice": "1965.5",
+    "askPrice": "1965.5",
+    "bidPrice": "1965.4",
+    "markPrice": "1963.0832622375",
+    "indexPrice": "1964.63264326875",
+    "fundingRate": "0.000013",
+    "nextFundingRate": 1770314400000,
+    "openInterest": "58338847.865834",
+    "openInterestBase": "29713.437"
+  }
+}

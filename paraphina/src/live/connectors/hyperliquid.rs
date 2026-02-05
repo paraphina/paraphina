@@ -69,7 +69,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, OnceLock,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use k256::ecdsa::SigningKey;
@@ -80,12 +80,14 @@ use sha3::{Digest, Keccak256};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::types::{OrderIntent, OrderPurpose, Side, TimeInForce, TimestampMs};
+use crate::types::{
+    FundingSource, OrderIntent, OrderPurpose, SettlementPriceKind, Side, TimeInForce, TimestampMs,
+};
 
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, LiquidationSnapshot,
-    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
+    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::live::gateway::{
     BoxFuture, LiveGatewayError, LiveRestCancelAllRequest, LiveRestCancelRequest, LiveRestClient,
@@ -203,10 +205,32 @@ impl HyperliquidConnector {
 
     pub async fn run_public_ws(&self) {
         let mut backoff = Duration::from_secs(1);
+
+        // FIX: Configurable healthy connection threshold for backoff reset
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
         loop {
+            let session_start = std::time::Instant::now();
+
             if let Err(err) = self.public_ws_once().await {
                 eprintln!("Hyperliquid public WS error: {err}");
             }
+
+            // FIX: Reset backoff if connection was healthy for long enough
+            let session_duration = session_start.elapsed();
+            if session_duration >= healthy_threshold {
+                eprintln!(
+                    "INFO: Hyperliquid WS session was healthy for {:?}; resetting backoff",
+                    session_duration
+                );
+                backoff = Duration::from_secs(1);
+            }
+
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
@@ -518,10 +542,32 @@ impl HyperliquidConnector {
             return;
         }
         let mut backoff = Duration::from_secs(1);
+
+        // FIX: Configurable healthy connection threshold for backoff reset
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
         loop {
+            let session_start = std::time::Instant::now();
+
             if let Err(err) = self.private_ws_once().await {
                 eprintln!("Hyperliquid private WS error: {err}");
             }
+
+            // FIX: Reset backoff if connection was healthy for long enough
+            let session_duration = session_start.elapsed();
+            if session_duration >= healthy_threshold {
+                eprintln!(
+                    "INFO: Hyperliquid private WS session was healthy for {:?}; resetting backoff",
+                    session_duration
+                );
+                backoff = Duration::from_secs(1);
+            }
+
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
@@ -571,6 +617,31 @@ impl HyperliquidConnector {
                 }
                 Err(err) => {
                     eprintln!("Hyperliquid account polling error: {err}");
+                }
+            }
+        }
+    }
+
+    pub async fn run_funding_polling(&self, interval_ms: u64) {
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        let mut seq: u64 = 0;
+        loop {
+            interval.tick().await;
+            match fetch_public_funding(&self.http, &self.cfg).await {
+                Ok(mut update) => {
+                    seq = seq.wrapping_add(1);
+                    update.seq = seq;
+                    // FIX: Log channel send failures instead of silently ignoring
+                    if let Err(err) = self
+                        .market_tx
+                        .send(MarketDataEvent::FundingUpdate(update))
+                        .await
+                    {
+                        eprintln!("Hyperliquid funding send failed: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Hyperliquid funding polling error: {err}");
                 }
             }
         }
@@ -995,6 +1066,9 @@ fn override_market_event(
         MarketDataEvent::FundingUpdate(mut funding) => {
             funding.seq = seq;
             funding.timestamp_ms = timestamp_ms;
+            if funding.received_ms.is_none() {
+                funding.received_ms = Some(timestamp_ms);
+            }
             MarketDataEvent::FundingUpdate(funding)
         }
     }
@@ -1091,6 +1165,26 @@ fn parse_f64_value(value: &serde_json::Value) -> Option<f64> {
         return raw.parse::<f64>().ok();
     }
     None
+}
+
+fn parse_i64_value(value: &serde_json::Value) -> Option<i64> {
+    if let Some(raw) = value.as_i64() {
+        return Some(raw);
+    }
+    if let Some(raw) = value.as_f64() {
+        return Some(raw as i64);
+    }
+    if let Some(raw) = value.as_str() {
+        return raw.parse::<i64>().ok();
+    }
+    None
+}
+
+fn now_ms() -> TimestampMs {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as TimestampMs
 }
 
 fn decode_l2book_top(value: &serde_json::Value) -> Option<TopOfBook> {
@@ -1361,6 +1455,91 @@ async fn fetch_account_snapshot(
     Ok(AccountEvent::Snapshot(snapshot))
 }
 
+async fn fetch_public_funding(
+    client: &Client,
+    cfg: &HyperliquidConfig,
+) -> anyhow::Result<FundingUpdate> {
+    let payload = json!({ "type": "metaAndAssetCtxs" });
+    let resp = client
+        .post(cfg.info_url.as_str())
+        .json(&payload)
+        .send()
+        .await?;
+    let value: serde_json::Value = resp.json().await?;
+    parse_public_funding(&value, cfg).ok_or_else(|| {
+        anyhow::anyhow!("invalid public funding response for coin={}", cfg.coin)
+    })
+}
+
+fn parse_public_funding(value: &serde_json::Value, cfg: &HyperliquidConfig) -> Option<FundingUpdate> {
+    let now_ms = now_ms();
+    let mut universe: Option<&Vec<serde_json::Value>> = None;
+    let mut ctxs: Option<&Vec<serde_json::Value>> = None;
+    let mut as_of_ms: Option<i64> = None;
+
+    if let Some(obj) = value.as_object() {
+        universe = obj.get("universe").and_then(|v| v.as_array());
+        ctxs = obj.get("assetCtxs").and_then(|v| v.as_array());
+        as_of_ms = obj.get("time").and_then(parse_i64_value);
+    } else if let Some(arr) = value.as_array() {
+        if let Some(meta) = arr.get(0).and_then(|v| v.as_object()) {
+            universe = meta.get("universe").and_then(|v| v.as_array());
+            as_of_ms = meta.get("time").and_then(parse_i64_value);
+        }
+        if let Some(ctx) = arr.get(1) {
+            ctxs = ctx
+                .get("assetCtxs")
+                .and_then(|v| v.as_array())
+                .or_else(|| ctx.as_array());
+        }
+    }
+
+    let universe = universe?;
+    let ctxs = ctxs?;
+    let idx = universe.iter().position(|entry| {
+        entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|name| name.eq_ignore_ascii_case(&cfg.coin))
+            .unwrap_or(false)
+    })?;
+    let ctx = ctxs.get(idx)?;
+
+    let funding_rate = ctx
+        .get("funding8h")
+        .or_else(|| ctx.get("funding"))
+        .or_else(|| ctx.get("fundingRate"))
+        .or_else(|| ctx.get("fundingRate8h"))
+        .and_then(parse_f64_value);
+
+    let interval_sec = ctx
+        .get("fundingIntervalSec")
+        .or_else(|| ctx.get("fundingInterval"))
+        .and_then(parse_i64_value)
+        .and_then(|v| if v > 0 { Some(v as u64) } else { None })
+        .or(Some(8 * 60 * 60));
+
+    let next_funding_ms = ctx
+        .get("nextFundingTime")
+        .or_else(|| ctx.get("nextFundingTimestamp"))
+        .or_else(|| ctx.get("nextFundingMs"))
+        .and_then(parse_i64_value);
+
+    Some(FundingUpdate {
+        venue_index: cfg.venue_index,
+        venue_id: cfg.coin.clone(),
+        seq: 0,
+        timestamp_ms: as_of_ms.unwrap_or(now_ms),
+        received_ms: Some(now_ms),
+        funding_rate_8h: funding_rate,
+        funding_rate_native: funding_rate,
+        interval_sec,
+        next_funding_ms,
+        settlement_price_kind: Some(SettlementPriceKind::Unknown),
+        source: FundingSource::MarketDataRest,
+    })
+}
+
 fn build_action(intent: &OrderIntent, asset_index: u32) -> anyhow::Result<serde_json::Value> {
     let OrderIntent::Place(place) = intent else {
         anyhow::bail!("intent not a place order");
@@ -1499,6 +1678,32 @@ mod tests {
             .store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
+    }
+
+    #[test]
+    fn parse_public_funding_fixture() {
+        let raw = include_str!(
+            "../../../../tests/fixtures/hyperliquid/public_funding_meta_and_asset_ctxs.json"
+        );
+        let value: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
+        let cfg = HyperliquidConfig {
+            network: HyperliquidNetwork::Testnet,
+            ws_url: "wss://example".to_string(),
+            rest_url: "https://example".to_string(),
+            info_url: "https://example".to_string(),
+            coin: "TAO".to_string(),
+            n_sig_figs: 5,
+            n_levels: 5,
+            venue_index: 0,
+            paper_mode: true,
+            private_key_hex: None,
+            vault_address: None,
+        };
+        let update = parse_public_funding(&value, &cfg).expect("funding update");
+        assert_eq!(update.funding_rate_8h, Some(0.001));
+        assert_eq!(update.interval_sec, Some(28_800));
+        assert_eq!(update.next_funding_ms, Some(1_700_003_600_000));
+        assert_eq!(update.source, FundingSource::MarketDataRest);
     }
 
     #[test]
