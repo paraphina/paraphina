@@ -7,14 +7,65 @@ pub const SUPPORTS_EXECUTION: bool = true;
 
 const LIGHTER_MARKET_PUB_QUEUE_CAP: usize = 256;
 const LIGHTER_MARKET_PUB_DRAIN_MAX: usize = 64;
+const LIGHTER_STALE_MS_DEFAULT: u64 = 10_000;
+const LIGHTER_WATCHDOG_TICK_MS: u64 = 200;
+const LIGHTER_DECODE_WARN_INTERVAL_MS: u64 = 10_000;
+
+static MONO_START: OnceLock<Instant> = OnceLock::new();
+
+fn mono_now_ns() -> u64 {
+    let start = MONO_START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as u64
+}
+
+fn lighter_stale_ms() -> u64 {
+    std::env::var("PARAPHINA_LIGHTER_STALE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(LIGHTER_STALE_MS_DEFAULT)
+}
+
+fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
+    now_ns.saturating_sub(then_ns) / 1_000_000
+}
+
+#[derive(Debug, Default)]
+struct Freshness {
+    last_ws_rx_ns: AtomicU64,
+    last_data_rx_ns: AtomicU64,
+    last_parsed_ns: AtomicU64,
+    last_published_ns: AtomicU64,
+}
+
+impl Freshness {
+    fn reset_for_new_connection(&self) {
+        self.last_ws_rx_ns.store(0, Ordering::Relaxed);
+        self.last_data_rx_ns.store(0, Ordering::Relaxed);
+        self.last_parsed_ns.store(0, Ordering::Relaxed);
+        self.last_published_ns.store(0, Ordering::Relaxed);
+    }
+
+    fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
+        let last_pub = self.last_published_ns.load(Ordering::Relaxed);
+        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
+        let anchor = last_pub.max(last_parsed);
+        if anchor == 0 {
+            connect_start_ns
+        } else {
+            anchor
+        }
+    }
+}
 
 // Freshness watchdog constants
 const LIGHTER_STALE_MS_DEFAULT: u64 = 10_000;
 const LIGHTER_WATCHDOG_TICK_MS: u64 = 200;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -266,6 +317,7 @@ impl LighterConnector {
             .signer_url
             .as_ref()
             .map(|url| LighterSignerClient::new(url.clone()));
+        let freshness = Arc::new(Freshness::default());
         Self {
             cfg,
             http: Client::new(),
@@ -275,7 +327,7 @@ impl LighterConnector {
             nonce,
             nonce_path,
             signer,
-            freshness: Arc::new(Freshness::default()),
+            freshness,
         }
     }
 
@@ -480,6 +532,35 @@ impl LighterConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
+        let freshness = self.freshness.clone();
+        let connect_start_ns = mono_now_ns();
+        freshness.reset_for_new_connection();
+
+        // Setup watchdog for stale detection
+        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
+        let stale_ms = lighter_stale_ms();
+        let is_fixture = std::env::var_os("LIGHTER_FIXTURE_DIR").is_some()
+            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
+        if is_fixture {
+            eprintln!("INFO: Lighter fixture mode detected; freshness watchdog disabled");
+        } else {
+            let watchdog_stale_ms = stale_ms;
+            let watchdog_freshness = self.freshness.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(Duration::from_millis(LIGHTER_WATCHDOG_TICK_MS));
+                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    iv.tick().await;
+                    let now = mono_now_ns();
+                    let anchor = watchdog_freshness.anchor_with_connect_start(connect_start_ns);
+                    if anchor != 0 && age_ms(now, anchor) > watchdog_stale_ms {
+                        let _ = stale_tx.send(());
+                        break;
+                    }
+                }
+            });
+        }
+
         let (market_symbol, market_id) = self.resolve_market_id_and_symbol().await?;
 
         // FIX: Setup freshness watchdog (mirrors pattern in HL/Paradex/Extended/Aster)
@@ -529,19 +610,16 @@ impl LighterConnector {
         let mut first_json_pong_logged = false;
         let mut decode_miss_count = 0usize;
         let mut seq_fallback: u64 = 0;
-
+        // Rate-limited logging for decode failures
+        let mut last_decode_fail_warn_ns: u64 = 0;
         loop {
-            // FIX: Use select! to check for stale signal alongside message receipt
             let msg = tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
-                    anyhow::bail!(
-                        "Lighter public WS stale: freshness exceeded {}ms",
-                        stale_ms
-                    );
+                    anyhow::bail!("Lighter public WS stale: freshness exceeded {stale_ms}ms");
                 }
-                msg = read.next() => {
-                    match msg {
+                maybe = read.next() => {
+                    match maybe {
                         Some(Ok(msg)) => msg,
                         Some(Err(err)) => {
                             eprintln!("Lighter public WS read error: {err}");
@@ -555,7 +633,7 @@ impl LighterConnector {
                 }
             };
 
-            // Update freshness on any message receipt
+            // Update WS receive timestamp
             self.freshness
                 .last_ws_rx_ns
                 .store(mono_now_ns(), Ordering::Relaxed);
@@ -643,6 +721,11 @@ impl LighterConnector {
                 );
             }
             if subscribed {
+                // Update data receive timestamp when we get book-related messages
+                freshness
+                    .last_data_rx_ns
+                    .store(mono_now_ns(), Ordering::Relaxed);
+
                 if let Some(top) = decode_order_book_top(&value) {
                     if !first_decoded_top_logged {
                         eprintln!(
@@ -661,6 +744,7 @@ impl LighterConnector {
                         self.cfg.ws_url.as_str(),
                     );
                 }
+                // Try decode_order_book_channel_message first
                 if let Some(parsed) = decode_order_book_channel_message(
                     &value,
                     self.cfg.venue_index,
@@ -673,16 +757,23 @@ impl LighterConnector {
                         .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
+                        // Update freshness only when we produce a publishable event
+                        freshness
+                            .last_parsed_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if !first_book_update_logged {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
                         }
-                        if let Err(err) = self.publish_market(event).await {
-                            eprintln!("Lighter public WS market send failed: {err}");
+                        if self.publish_market(event).await.is_ok() {
+                            freshness
+                                .last_published_ns
+                                .store(mono_now_ns(), Ordering::Relaxed);
                         }
                     }
                     continue;
                 }
+                // Try decode_order_book_snapshot
                 if let Some(parsed) = decode_order_book_snapshot(
                     &value,
                     self.cfg.venue_index,
@@ -695,16 +786,44 @@ impl LighterConnector {
                         .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
+                        // Update freshness only when we produce a publishable event
+                        freshness
+                            .last_parsed_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if !first_book_update_logged {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
                         }
-                        if let Err(err) = self.publish_market(event).await {
-                            eprintln!("Lighter public WS market send failed: {err}");
+                        if self.publish_market(event).await.is_ok() {
+                            freshness
+                                .last_published_ns
+                                .store(mono_now_ns(), Ordering::Relaxed);
                         }
+                    }
+                    continue;
+                }
+                // Both decode attempts failed - emit bounded warning
+                if has_lighter_book_fields(&value) {
+                    let now_ns = mono_now_ns();
+                    if age_ms(now_ns, last_decode_fail_warn_ns) >= LIGHTER_DECODE_WARN_INTERVAL_MS {
+                        last_decode_fail_warn_ns = now_ns;
+                        let keys = value
+                            .as_object()
+                            .map(|obj| {
+                                let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                                keys.sort();
+                                format!("[{}]", keys.join(","))
+                            })
+                            .unwrap_or_else(|| "[non-object]".to_string());
+                        let snippet: String = payload.chars().take(200).collect();
+                        eprintln!(
+                            "WARN: Lighter order_book decode failed (no channel_msg, no snapshot) keys={} snippet={}",
+                            keys, snippet
+                        );
                     }
                 }
             }
+            // Try parse_l2_message_value as fallback
             if let Some(parsed) =
                 parse_l2_message_value(&value, &self.cfg.venue_id, self.cfg.venue_index)
             {
@@ -714,12 +833,18 @@ impl LighterConnector {
                     .store(mono_now_ns(), Ordering::Relaxed);
                 let outcome = tracker.on_message(parsed);
                 if let Some(event) = outcome.event {
+                    // Update freshness only when we produce a publishable event
+                    freshness
+                        .last_parsed_ns
+                        .store(mono_now_ns(), Ordering::Relaxed);
                     if !first_book_update_logged {
                         eprintln!("INFO: Lighter public WS first book update");
                         first_book_update_logged = true;
                     }
-                    if let Err(err) = self.publish_market(event).await {
-                        eprintln!("Lighter public WS market send failed: {err}");
+                    if self.publish_market(event).await.is_ok() {
+                        freshness
+                            .last_published_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                     }
                 }
             }
@@ -1488,6 +1613,107 @@ mod tests {
             nanos
         ));
         path
+    }
+
+    #[test]
+    fn freshness_reset_and_anchor_behavior() {
+        let freshness = Freshness::default();
+        freshness
+            .last_parsed_ns
+            .store(123, Ordering::Relaxed);
+        freshness
+            .last_published_ns
+            .store(456, Ordering::Relaxed);
+
+        // After reset, all timestamps should be 0
+        freshness.reset_for_new_connection();
+        assert_eq!(
+            freshness.last_parsed_ns.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            freshness.last_published_ns.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            freshness.last_ws_rx_ns.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            freshness.last_data_rx_ns.load(Ordering::Relaxed),
+            0
+        );
+
+        // With anchor == 0, should use connect_start_ns
+        let connect_start_ns = 1_000;
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, connect_start_ns);
+
+        // With last_parsed_ns set, should use it
+        freshness
+            .last_parsed_ns
+            .store(2_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 2_000);
+
+        // With last_published_ns > last_parsed_ns, should use last_published_ns
+        freshness
+            .last_published_ns
+            .store(3_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 3_000);
+    }
+
+    #[test]
+    fn freshness_watchdog_would_stale_with_no_data() {
+        let freshness = Freshness::default();
+        freshness.reset_for_new_connection();
+
+        // Simulate connect_start_ns at time 0
+        let connect_start_ns: u64 = 0;
+
+        // With no data, anchor should be connect_start_ns
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, connect_start_ns, "anchor should be connect_start_ns when no data");
+
+        // Simulate "now" being 15 seconds later (15_000_000_000 ns)
+        let now_ns: u64 = 15_000_000_000;
+        let age = age_ms(now_ns, anchor);
+        assert_eq!(age, 15_000, "age should be 15000ms");
+
+        // With default stale_ms of 10_000, this should trigger stale
+        assert!(
+            age > LIGHTER_STALE_MS_DEFAULT,
+            "should be stale when age ({age}ms) > stale_ms ({LIGHTER_STALE_MS_DEFAULT}ms)"
+        );
+    }
+
+    #[test]
+    fn freshness_stays_fresh_with_data() {
+        let freshness = Freshness::default();
+        freshness.reset_for_new_connection();
+
+        // Simulate connect_start_ns at time 0
+        let connect_start_ns: u64 = 0;
+
+        // Simulate receiving data at 5 seconds
+        let data_time_ns: u64 = 5_000_000_000;
+        freshness.last_parsed_ns.store(data_time_ns, Ordering::Relaxed);
+
+        // Check anchor uses last_parsed_ns
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, data_time_ns, "anchor should be last_parsed_ns");
+
+        // Simulate "now" being 8 seconds (8_000_000_000 ns)
+        let now_ns: u64 = 8_000_000_000;
+        let age = age_ms(now_ns, anchor);
+        assert_eq!(age, 3_000, "age should be 3000ms from last data");
+
+        // With default stale_ms of 10_000, this should NOT trigger stale
+        assert!(
+            age < LIGHTER_STALE_MS_DEFAULT,
+            "should NOT be stale when age ({age}ms) < stale_ms ({LIGHTER_STALE_MS_DEFAULT}ms)"
+        );
     }
 
     #[test]

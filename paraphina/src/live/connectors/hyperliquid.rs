@@ -12,6 +12,7 @@ const HL_WATCHDOG_TICK_MS: u64 = 200;
 const HL_SNAPSHOT_COOLDOWN_MS: u64 = 8_000;
 const HL_INTERNAL_PUB_Q: usize = 256;
 const HL_DELTA_BOOTSTRAP_BUF: usize = 1024;
+const HL_DECODE_WARN_INTERVAL_MS: u64 = 10_000;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
@@ -330,6 +331,9 @@ impl HyperliquidConnector {
         // Bounded sampling for non-book messages to diagnose staleness issues.
         let mut non_book_msg_count: u64 = 0;
         const NON_BOOK_LOG_LIMIT: u64 = 5;
+        // Rate-limited logging for snapshot decode failures and skipped levels.
+        let mut last_snapshot_fail_warn_ns: u64 = 0;
+        let mut last_skipped_levels_warn_ns: u64 = 0;
         loop {
             tokio::select! {
                 biased;
@@ -400,12 +404,33 @@ impl HyperliquidConnector {
                                 self.cfg.ws_url.as_str(),
                             );
                         }
-                        if let Some(snapshot) = decode_l2book_snapshot(
+                        // Use resilient snapshot decoder that skips malformed levels
+                        let decode_result = decode_l2book_snapshot_resilient(
                             &value,
                             self.cfg.venue_index,
                             self.cfg.coin.as_str(),
                             &mut l2_seq_fallback,
-                        ) {
+                        );
+
+                        // Log skipped levels (rate-limited)
+                        let total_skipped = decode_result.bid_skipped + decode_result.ask_skipped;
+                        if total_skipped > 0 {
+                            let now_ns = mono_now_ns();
+                            if age_ms(now_ns, last_skipped_levels_warn_ns) >= HL_DECODE_WARN_INTERVAL_MS {
+                                last_skipped_levels_warn_ns = now_ns;
+                                eprintln!(
+                                    "WARN: Hyperliquid l2Book skipped {} malformed levels (bids: {}/{}, asks: {}/{})",
+                                    total_skipped,
+                                    decode_result.bid_skipped,
+                                    decode_result.bid_total,
+                                    decode_result.ask_skipped,
+                                    decode_result.ask_total
+                                );
+                            }
+                        }
+
+                        if let Some(snapshot) = decode_result.event {
+                            // Update freshness ONLY when we produce a publishable event
                             freshness
                                 .last_parsed_ns
                                 .store(mono_now_ns(), Ordering::Relaxed);
@@ -414,6 +439,31 @@ impl HyperliquidConnector {
                                 try_publish(buffered)?;
                             }
                             try_publish(snapshot)?;
+                        } else {
+                            // Snapshot decode failed - emit bounded warning
+                            let now_ns = mono_now_ns();
+                            if age_ms(now_ns, last_snapshot_fail_warn_ns) >= HL_DECODE_WARN_INTERVAL_MS {
+                                last_snapshot_fail_warn_ns = now_ns;
+                                let keys = value
+                                    .as_object()
+                                    .map(|obj| {
+                                        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+                                        keys.sort();
+                                        format!("[{}]", keys.join(","))
+                                    })
+                                    .unwrap_or_else(|| "[non-object]".to_string());
+                                let snippet: String = payload.chars().take(200).collect();
+                                eprintln!(
+                                    "WARN: Hyperliquid l2Book snapshot decode failed reason={:?} keys={} bids={}/{} asks={}/{} snippet={}",
+                                    decode_result.failure_reason.unwrap_or("unknown"),
+                                    keys,
+                                    decode_result.bid_total.saturating_sub(decode_result.bid_skipped),
+                                    decode_result.bid_total,
+                                    decode_result.ask_total.saturating_sub(decode_result.ask_skipped),
+                                    decode_result.ask_total,
+                                    snippet
+                                );
+                            }
                         }
                         continue;
                     }
@@ -1050,6 +1100,35 @@ fn parse_levels(levels: &serde_json::Value) -> Option<Vec<BookLevel>> {
     Some(out)
 }
 
+/// Result of resilient level parsing: parsed levels + count of skipped invalid entries.
+#[derive(Debug, Clone)]
+struct ResilientLevelsResult {
+    levels: Vec<BookLevel>,
+    skipped_count: usize,
+    total_count: usize,
+}
+
+/// Parse levels resiliently: skip invalid entries instead of failing entirely.
+/// Returns None only if the input is not an array.
+fn parse_levels_resilient(levels: &serde_json::Value) -> Option<ResilientLevelsResult> {
+    let arr = levels.as_array()?;
+    let total_count = arr.len();
+    let mut out = Vec::with_capacity(total_count);
+    let mut skipped_count = 0;
+    for level in arr {
+        if let Some(parsed) = parse_level_entry(level) {
+            out.push(parsed);
+        } else {
+            skipped_count += 1;
+        }
+    }
+    Some(ResilientLevelsResult {
+        levels: out,
+        skipped_count,
+        total_count,
+    })
+}
+
 fn parse_level_entry(level: &serde_json::Value) -> Option<BookLevel> {
     if let Some(items) = level.as_array() {
         let price = parse_f64_value(items.get(0)?)?;
@@ -1135,16 +1214,117 @@ fn decode_l2book_top(value: &serde_json::Value) -> Option<TopOfBook> {
     })
 }
 
-fn decode_l2book_snapshot(
+/// Result of decode_l2book_snapshot with diagnostic info for logging.
+#[derive(Debug)]
+struct SnapshotDecodeResult {
+    event: Option<MarketDataEvent>,
+    bid_skipped: usize,
+    ask_skipped: usize,
+    bid_total: usize,
+    ask_total: usize,
+    /// If event is None, this explains why.
+    failure_reason: Option<&'static str>,
+}
+
+fn decode_l2book_snapshot_resilient(
     value: &serde_json::Value,
     venue_index: usize,
     default_coin: &str,
     fallback_seq: &mut u64,
-) -> Option<MarketDataEvent> {
-    let data = value.get("data")?;
-    let levels = data.get("levels")?;
-    let bids = parse_levels(levels.get(0)?)?;
-    let asks = parse_levels(levels.get(1)?)?;
+) -> SnapshotDecodeResult {
+    let data = match value.get("data") {
+        Some(d) => d,
+        None => {
+            return SnapshotDecodeResult {
+                event: None,
+                bid_skipped: 0,
+                ask_skipped: 0,
+                bid_total: 0,
+                ask_total: 0,
+                failure_reason: Some("missing 'data' field"),
+            };
+        }
+    };
+    let levels = match data.get("levels") {
+        Some(l) => l,
+        None => {
+            return SnapshotDecodeResult {
+                event: None,
+                bid_skipped: 0,
+                ask_skipped: 0,
+                bid_total: 0,
+                ask_total: 0,
+                failure_reason: Some("missing 'levels' field"),
+            };
+        }
+    };
+    let bid_levels_value = match levels.get(0) {
+        Some(b) => b,
+        None => {
+            return SnapshotDecodeResult {
+                event: None,
+                bid_skipped: 0,
+                ask_skipped: 0,
+                bid_total: 0,
+                ask_total: 0,
+                failure_reason: Some("missing bid levels at index 0"),
+            };
+        }
+    };
+    let ask_levels_value = match levels.get(1) {
+        Some(a) => a,
+        None => {
+            return SnapshotDecodeResult {
+                event: None,
+                bid_skipped: 0,
+                ask_skipped: 0,
+                bid_total: 0,
+                ask_total: 0,
+                failure_reason: Some("missing ask levels at index 1"),
+            };
+        }
+    };
+
+    // Parse levels resiliently (skip invalid entries)
+    let bid_result = match parse_levels_resilient(bid_levels_value) {
+        Some(r) => r,
+        None => {
+            return SnapshotDecodeResult {
+                event: None,
+                bid_skipped: 0,
+                ask_skipped: 0,
+                bid_total: 0,
+                ask_total: 0,
+                failure_reason: Some("bid levels not an array"),
+            };
+        }
+    };
+    let ask_result = match parse_levels_resilient(ask_levels_value) {
+        Some(r) => r,
+        None => {
+            return SnapshotDecodeResult {
+                event: None,
+                bid_skipped: bid_result.skipped_count,
+                ask_skipped: 0,
+                bid_total: bid_result.total_count,
+                ask_total: 0,
+                failure_reason: Some("ask levels not an array"),
+            };
+        }
+    };
+
+    // Require at least 1 valid bid AND 1 valid ask to produce a snapshot
+    if bid_result.levels.is_empty() || ask_result.levels.is_empty() {
+        return SnapshotDecodeResult {
+            event: None,
+            bid_skipped: bid_result.skipped_count,
+            ask_skipped: ask_result.skipped_count,
+            bid_total: bid_result.total_count,
+            ask_total: ask_result.total_count,
+            failure_reason: Some("no valid levels on at least one side"),
+        };
+    }
+
     let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or_else(|| {
         *fallback_seq = fallback_seq.wrapping_add(1);
         *fallback_seq
@@ -1155,17 +1335,26 @@ fn decode_l2book_snapshot(
         .and_then(|v| v.as_str())
         .unwrap_or(default_coin)
         .to_string();
-    Some(MarketDataEvent::L2Snapshot(
-        super::super::types::L2Snapshot {
-            venue_index,
-            venue_id,
-            seq,
-            timestamp_ms,
-            bids,
-            asks,
-        },
-    ))
+
+    SnapshotDecodeResult {
+        event: Some(MarketDataEvent::L2Snapshot(
+            super::super::types::L2Snapshot {
+                venue_index,
+                venue_id,
+                seq,
+                timestamp_ms,
+                bids: bid_result.levels,
+                asks: ask_result.levels,
+            },
+        )),
+        bid_skipped: bid_result.skipped_count,
+        ask_skipped: ask_result.skipped_count,
+        bid_total: bid_result.total_count,
+        ask_total: ask_result.total_count,
+        failure_reason: None,
+    }
 }
+
 
 fn log_decode_miss(venue: &str, value: &serde_json::Value, payload: &str, count: usize, url: &str) {
     let keys = value
@@ -1405,11 +1594,11 @@ fn build_cancel_all_action(asset_index: u32) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
     use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn hyperliquid_cancel_all_smoke() {
+        use std::io::Read;
         use tiny_http::{Response, Server};
 
         let server = Server::http("127.0.0.1:0").expect("bind server");
@@ -1515,6 +1704,169 @@ mod tests {
         assert_eq!(update.interval_sec, Some(28_800));
         assert_eq!(update.next_funding_ms, Some(1_700_003_600_000));
         assert_eq!(update.source, FundingSource::MarketDataRest);
+    }
+
+    #[test]
+    fn resilient_snapshot_decode_skips_malformed_deeper_levels() {
+        // Message where top level is valid but a deeper level has malformed data
+        let json_str = r#"{
+            "channel": "l2Book",
+            "data": {
+                "coin": "ETH",
+                "time": 1700000000000,
+                "seq": 123,
+                "levels": [
+                    [
+                        {"px": "2000.5", "sz": "10.0"},
+                        {"px": "invalid_price", "sz": "5.0"},
+                        {"px": "1999.0", "sz": "20.0"}
+                    ],
+                    [
+                        {"px": "2001.0", "sz": "8.0"},
+                        {"px": "2002.0", "sz": "bad_size"},
+                        {"px": "2003.0", "sz": "15.0"}
+                    ]
+                ]
+            }
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let mut fallback_seq = 0u64;
+
+        let result = decode_l2book_snapshot_resilient(&value, 0, "ETH", &mut fallback_seq);
+
+        // Should produce a valid snapshot despite malformed levels
+        assert!(
+            result.event.is_some(),
+            "Should produce snapshot when at least 1 valid level per side"
+        );
+        assert_eq!(result.bid_skipped, 1, "Should skip 1 malformed bid level");
+        assert_eq!(result.ask_skipped, 1, "Should skip 1 malformed ask level");
+        assert_eq!(result.bid_total, 3, "Total bid levels should be 3");
+        assert_eq!(result.ask_total, 3, "Total ask levels should be 3");
+        assert!(result.failure_reason.is_none());
+
+        // Verify the snapshot contains valid levels
+        if let Some(MarketDataEvent::L2Snapshot(snap)) = result.event {
+            assert_eq!(snap.bids.len(), 2, "Should have 2 valid bid levels");
+            assert_eq!(snap.asks.len(), 2, "Should have 2 valid ask levels");
+            // First bid should be the valid top level
+            assert!((snap.bids[0].price - 2000.5).abs() < 0.01);
+            assert!((snap.bids[0].size - 10.0).abs() < 0.01);
+        } else {
+            panic!("Expected L2Snapshot event");
+        }
+    }
+
+    #[test]
+    fn resilient_snapshot_decode_fails_when_all_levels_one_side_malformed() {
+        // Message where ALL bid levels are malformed
+        let json_str = r#"{
+            "channel": "l2Book",
+            "data": {
+                "coin": "ETH",
+                "time": 1700000000000,
+                "seq": 456,
+                "levels": [
+                    [
+                        {"px": "not_a_number", "sz": "also_bad"},
+                        {"px": null, "sz": "5.0"}
+                    ],
+                    [
+                        {"px": "2001.0", "sz": "8.0"},
+                        {"px": "2002.0", "sz": "15.0"}
+                    ]
+                ]
+            }
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let mut fallback_seq = 0u64;
+
+        let result = decode_l2book_snapshot_resilient(&value, 0, "ETH", &mut fallback_seq);
+
+        // Should fail because no valid bid levels
+        assert!(
+            result.event.is_none(),
+            "Should fail when all levels on one side are malformed"
+        );
+        assert_eq!(result.bid_skipped, 2, "Both bid levels should be skipped");
+        assert_eq!(result.ask_skipped, 0, "No ask levels should be skipped");
+        assert_eq!(result.bid_total, 2);
+        assert_eq!(result.ask_total, 2);
+        assert_eq!(
+            result.failure_reason,
+            Some("no valid levels on at least one side")
+        );
+    }
+
+    #[test]
+    fn resilient_snapshot_decode_handles_empty_levels() {
+        // Message with empty bid levels array
+        let json_str = r#"{
+            "channel": "l2Book",
+            "data": {
+                "coin": "ETH",
+                "time": 1700000000000,
+                "seq": 789,
+                "levels": [
+                    [],
+                    [{"px": "2001.0", "sz": "8.0"}]
+                ]
+            }
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let mut fallback_seq = 0u64;
+
+        let result = decode_l2book_snapshot_resilient(&value, 0, "ETH", &mut fallback_seq);
+
+        // Should fail because no bid levels at all
+        assert!(result.event.is_none());
+        assert_eq!(result.bid_total, 0);
+        assert_eq!(result.ask_total, 1);
+        assert_eq!(
+            result.failure_reason,
+            Some("no valid levels on at least one side")
+        );
+    }
+
+    #[test]
+    fn resilient_levels_parser_works_with_array_format() {
+        // Some venues use [price, size] array format
+        let json_str = r#"[["2000.5", "10.0"], ["bad", "data"], ["1999.0", "20.0"]]"#;
+        let value: serde_json::Value = serde_json::from_str(json_str).unwrap();
+
+        let result = parse_levels_resilient(&value);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.levels.len(), 2, "Should have 2 valid levels");
+        assert_eq!(r.skipped_count, 1, "Should skip 1 malformed level");
+        assert_eq!(r.total_count, 3);
+    }
+
+    #[test]
+    fn parse_level_entry_handles_both_formats() {
+        // Object format with px/sz
+        let obj_json = r#"{"px": "100.5", "sz": "10.0", "n": 5}"#;
+        let obj_value: serde_json::Value = serde_json::from_str(obj_json).unwrap();
+        let obj_result = parse_level_entry(&obj_value);
+        assert!(obj_result.is_some());
+        let level = obj_result.unwrap();
+        assert!((level.price - 100.5).abs() < 0.01);
+        assert!((level.size - 10.0).abs() < 0.01);
+
+        // Array format [price, size]
+        let arr_json = r#"["200.25", "5.5"]"#;
+        let arr_value: serde_json::Value = serde_json::from_str(arr_json).unwrap();
+        let arr_result = parse_level_entry(&arr_value);
+        assert!(arr_result.is_some());
+        let level = arr_result.unwrap();
+        assert!((level.price - 200.25).abs() < 0.01);
+        assert!((level.size - 5.5).abs() < 0.01);
+
+        // Malformed entry
+        let bad_json = r#"{"px": "not_a_number", "sz": "10.0"}"#;
+        let bad_value: serde_json::Value = serde_json::from_str(bad_json).unwrap();
+        let bad_result = parse_level_entry(&bad_value);
+        assert!(bad_result.is_none());
     }
 }
 
