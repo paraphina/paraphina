@@ -228,6 +228,9 @@ def render_frame(state: WatchState, max_events: int) -> str:
     spread = record.get("venue_spread_usd", [])
     age = record.get("venue_age_ms", [])
     pos = record.get("venue_position_tao", [])
+    funding_rate = record.get("venue_funding_rate_8h", [])
+    funding_age = record.get("venue_funding_age_ms", [])
+    funding_status = record.get("venue_funding_status", [])
     orders = record.get("orders", [])
     fills = record.get("fills", [])
     if not isinstance(orders, list):
@@ -257,6 +260,9 @@ def render_frame(state: WatchState, max_events: int) -> str:
         spread_val = spread[idx] if idx < len(spread) else None
         age_val = age[idx] if idx < len(age) else None
         pos_val = pos[idx] if idx < len(pos) else None
+        funding_rate_val = funding_rate[idx] if idx < len(funding_rate) else None
+        funding_age_val = funding_age[idx] if idx < len(funding_age) else None
+        funding_status_val = funding_status[idx] if idx < len(funding_status) else None
         open_orders = order_counts.get(venue_id, 0)
         last_fill_ms = state.last_fill_ms.get(venue_id)
         last_fill_age = "n/a"
@@ -272,6 +278,9 @@ def render_frame(state: WatchState, max_events: int) -> str:
                 format_num(spread_val, 8).strip(),
                 format_ms(age_val),
                 format_num(pos_val, 8).strip(),
+                format_num(funding_rate_val, 8).strip(),
+                format_ms(funding_age_val),
+                format_status(funding_status_val),
                 str(open_orders),
                 last_fill_age,
                 f"{health} tox={tox_str}",
@@ -280,7 +289,19 @@ def render_frame(state: WatchState, max_events: int) -> str:
 
     lines.append(
         format_table(
-            ["venue", "mid", "spread", "age_ms", "pos", "orders", "last_fill", "health"],
+            [
+                "venue",
+                "mid",
+                "spread",
+                "age_ms",
+                "pos",
+                "fund_8h",
+                "fund_age",
+                "fund_status",
+                "orders",
+                "last_fill",
+                "health",
+            ],
             rows,
         )
     )

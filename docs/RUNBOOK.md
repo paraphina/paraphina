@@ -505,3 +505,9 @@ python3 tools/check_docs_integrity.py
 
 That tool is the only approved way to update the canonical hash after
 intentional changes to `docs/WHITEPAPER.md`.
+## Shadow runner (funding ingestion OK; funding decisions OFF by default)
+
+```bash
+SCREEN -S paraphina_shadow -dm bash -lc cd ~/code/paraphina && export HL_COIN=ETH LIGHTER_MARKET=ETH-USD PARADEX_MARKET=ETH-USD-PERP ASTER_MARKET=ETHUSDT EXTENDED_MARKET=ETH-USD EXTENDED_REST_URL=https://api.starknet.extended.exchange EXTENDED_FUNDING_PATH=/api/v1/info/markets/ETH-USD/stats PARAPHINA_TELEMETRY_MODE=jsonl PARAPHINA_TELEMETRY_PATH=/tmp/paraphina_live_shadow/telemetry.jsonl PARAPHINA_HL_STATE_STALE_MS_OVERRIDE=1500 PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE=1500 PARAPHINA_FUNDING_STALE_MS=600000 PARAPHINA_FUNDING_AVOID_WINDOW_MS=120000 HL_FUNDING_POLL_MS=5000 PARADEX_FUNDING_POLL_MS=5000 LIGHTER_FUNDING_POLL_MS=5000 EXTENDED_FUNDING_POLL_MS=5000 ASTER_FUNDING_POLL_MS=5000; RUST_LOG=info ./target/debug/paraphina_live --trade-mode shadow --connectors extended,hyperliquid,aster,lighter,paradex --out-dir /tmp/paraphina_live_shadow
+```
+

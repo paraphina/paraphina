@@ -83,11 +83,11 @@ use super::super::gateway::{
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, LiquidationSnapshot, MarginSnapshot,
-    MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, FundingUpdate, LiquidationSnapshot,
+    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::live::MarketPublisher;
-use crate::types::{Side, TimeInForce, TimestampMs};
+use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
 
 #[derive(Debug, Clone)]
 pub struct ParadexConfig {
@@ -206,12 +206,56 @@ impl ParadexConnector {
 
     pub async fn run_public_ws(&self) {
         let mut backoff = Duration::from_secs(1);
+
+        // FIX: Configurable healthy connection threshold for backoff reset
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
         loop {
+            let session_start = std::time::Instant::now();
+
             if let Err(err) = self.public_ws_once().await {
                 eprintln!("Paradex public WS error: {err}");
             }
+
+            // FIX: Reset backoff if connection was healthy for long enough
+            let session_duration = session_start.elapsed();
+            if session_duration >= healthy_threshold {
+                eprintln!(
+                    "INFO: Paradex WS session was healthy for {:?}; resetting backoff",
+                    session_duration
+                );
+                backoff = Duration::from_secs(1);
+            }
+
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    pub async fn run_funding_polling(&self, interval_ms: u64) {
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        let mut seq: u64 = 0;
+        loop {
+            interval.tick().await;
+            match fetch_public_funding(&self.http, &self.cfg).await {
+                Ok(mut update) => {
+                    seq = seq.wrapping_add(1);
+                    update.seq = seq;
+                    if let Err(err) =
+                        self.publish_market(MarketDataEvent::FundingUpdate(update)).await
+                    {
+                        eprintln!("Paradex funding publish error: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Paradex funding polling error: {err}");
+                }
+            }
         }
     }
 
@@ -864,6 +908,104 @@ fn parse_account_snapshot(
     None
 }
 
+async fn fetch_public_funding(client: &Client, cfg: &ParadexConfig) -> anyhow::Result<FundingUpdate> {
+    // Default path is "/markets/summary" (not "/v1/markets/summary") because
+    // cfg.rest_url already includes the /v1 prefix (e.g., "https://api.prod.paradex.trade/v1").
+    let path = std::env::var("PARADEX_FUNDING_PATH")
+        .unwrap_or_else(|_| "/markets/summary".to_string());
+    let url = format!("{}{}", cfg.rest_url.trim_end_matches('/'), path);
+    let resp = client
+        .get(url)
+        .query(&[("market", cfg.market.clone())])
+        .send()
+        .await?;
+    let value: Value = resp.json().await?;
+    parse_public_funding(&value, cfg)
+        .ok_or_else(|| anyhow::anyhow!("invalid public funding response"))
+}
+
+fn parse_public_funding(value: &Value, cfg: &ParadexConfig) -> Option<FundingUpdate> {
+    // Support multiple array extraction paths:
+    // - value["data"] (generic)
+    // - value["results"] (Paradex /v1/markets/summary response format)
+    // - value itself as array
+    let list = value
+        .get("data")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.get("results").and_then(|v| v.as_array()))
+        .or_else(|| value.as_array());
+
+    let entry = if let Some(list) = list {
+        // Match by "market" or "symbol" (case-insensitive)
+        list.iter()
+            .find(|item| {
+                item.get("market")
+                    .or_else(|| item.get("symbol"))
+                    .and_then(|v| v.as_str())
+                    .map(|m| m.eq_ignore_ascii_case(&cfg.market))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(value)
+    } else {
+        value
+    };
+
+    let rate_native = entry
+        .get("funding_rate_8h")
+        .or_else(|| entry.get("funding_rate"))
+        .or_else(|| entry.get("fundingRate"))
+        .or_else(|| entry.get("fundingRate8h"))
+        .and_then(parse_f64);
+
+    let interval_sec = entry
+        .get("funding_interval_sec")
+        .or_else(|| entry.get("fundingIntervalSec"))
+        .or_else(|| entry.get("funding_interval"))
+        .or_else(|| entry.get("fundingInterval"))
+        .and_then(parse_i64_value)
+        .and_then(|v| if v > 0 { Some(v as u64) } else { None });
+
+    let next_funding_ms = entry
+        .get("next_funding_time")
+        .or_else(|| entry.get("nextFundingTime"))
+        .or_else(|| entry.get("nextFundingTimestamp"))
+        .or_else(|| entry.get("next_funding_ms"))
+        .and_then(parse_i64_value);
+
+    // Timestamp extraction: try standard fields, then "created_at" (Paradex markets/summary uses this)
+    let as_of_ms = entry
+        .get("timestamp")
+        .or_else(|| entry.get("ts"))
+        .or_else(|| entry.get("time"))
+        .or_else(|| entry.get("created_at"))
+        .and_then(parse_i64_value)
+        .unwrap_or_else(now_ms);
+
+    // Rate conversion to canonical 8h:
+    // - If interval_sec is provided, scale: rate_8h = rate_native * (8h / interval_sec)
+    // - If interval_sec is absent (e.g., Paradex /v1/markets/summary), the funding_rate
+    //   field is already an 8h-equivalent rate per Paradex documentation, so we use it directly.
+    let rate_8h = match (rate_native, interval_sec) {
+        (Some(rate), Some(sec)) if sec > 0 => Some(rate * (8.0 * 60.0 * 60.0 / sec as f64)),
+        (Some(rate), None) => Some(rate), // Already 8h-equivalent for Paradex
+        _ => None,
+    };
+
+    Some(FundingUpdate {
+        venue_index: cfg.venue_index,
+        venue_id: cfg.market.clone(),
+        seq: 0,
+        timestamp_ms: as_of_ms,
+        received_ms: Some(now_ms()),
+        funding_rate_8h: rate_8h,
+        funding_rate_native: rate_native,
+        interval_sec,
+        next_funding_ms,
+        settlement_price_kind: Some(SettlementPriceKind::Unknown),
+        source: FundingSource::MarketDataRest,
+    })
+}
+
 fn map_rest_error(status: u16, body: &str) -> LiveGatewayError {
     let lower = body.to_lowercase();
     if status == 401 || status == 403 {
@@ -1236,6 +1378,19 @@ fn parse_f64(value: &Value) -> Option<f64> {
     }
     if let Some(s) = value.as_str() {
         return s.parse::<f64>().ok();
+    }
+    None
+}
+
+fn parse_i64_value(value: &Value) -> Option<i64> {
+    if let Some(v) = value.as_i64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v as i64);
+    }
+    if let Some(s) = value.as_str() {
+        return s.parse::<i64>().ok();
     }
     None
 }
@@ -1729,5 +1884,68 @@ mod tests {
             .store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
+    }
+
+    #[test]
+    fn parse_public_funding_markets_summary_fixture() {
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/paradex/public_markets_summary.json"
+        );
+        let raw = std::fs::read_to_string(fixture_path).expect("fixture exists");
+        let value: Value = serde_json::from_str(&raw).expect("valid json");
+
+        // Test parsing ETH-USD-PERP from "results" array
+        let cfg = ParadexConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "https://example.invalid".to_string(),
+            auth_url: "https://example.invalid/auth".to_string(),
+            market: "ETH-USD-PERP".to_string(),
+            account_path: "/account".to_string(),
+            order_path: "/orders".to_string(),
+            venue_index: 4,
+            jwt: None,
+            auth_payload_json: None,
+            record_dir: None,
+        };
+
+        let update = parse_public_funding(&value, &cfg).expect("parse funding ok");
+        assert_eq!(update.venue_index, 4);
+
+        // funding_rate = "-0.00011283359389" (string) should parse correctly
+        let rate_native = update.funding_rate_native.expect("rate_native present");
+        assert!((rate_native - (-0.00011283359389)).abs() < 1e-14, "rate_native mismatch");
+
+        // Sign must be preserved (negative)
+        assert!(rate_native < 0.0, "negative funding rate sign must be preserved");
+
+        // rate_8h should equal rate_native when interval_sec is absent (Paradex 8h-equivalent)
+        let rate_8h = update.funding_rate_8h.expect("rate_8h present");
+        assert!((rate_8h - rate_native).abs() < 1e-14, "rate_8h should equal rate_native");
+
+        // Timestamp should come from "created_at"
+        assert_eq!(update.timestamp_ms, 1770309699810);
+
+        // Test BTC-USD-PERP (positive rate)
+        let cfg_btc = ParadexConfig {
+            market: "BTC-USD-PERP".to_string(),
+            ..cfg.clone()
+        };
+        let update_btc = parse_public_funding(&value, &cfg_btc).expect("parse btc ok");
+        let rate_btc = update_btc.funding_rate_native.expect("btc rate present");
+        assert!(rate_btc > 0.0, "positive funding rate sign must be preserved");
+        assert!((rate_btc - 0.00005672).abs() < 1e-14);
+
+        // Test non-existent market returns None (should fall back to root value which has no funding_rate)
+        let cfg_nonexistent = ParadexConfig {
+            market: "NOSUCH-PERP".to_string(),
+            ..cfg
+        };
+        let result = parse_public_funding(&value, &cfg_nonexistent);
+        // Since no match found, it falls back to `value` itself which has no funding_rate
+        // So funding_rate_native and funding_rate_8h should be None
+        let update_none = result.expect("returns Some but with None rates");
+        assert!(update_none.funding_rate_native.is_none());
+        assert!(update_none.funding_rate_8h.is_none());
     }
 }

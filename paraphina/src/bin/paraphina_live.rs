@@ -827,6 +827,9 @@ fn override_market_timestamp(
         }
         paraphina::live::types::MarketDataEvent::FundingUpdate(mut update) => {
             update.timestamp_ms = timestamp_ms;
+            if update.received_ms.is_none() {
+                update.received_ms = Some(timestamp_ms);
+            }
             paraphina::live::types::MarketDataEvent::FundingUpdate(update)
         }
     }
@@ -1902,6 +1905,14 @@ async fn main() {
                     tokio::spawn(async move {
                         hl_public.run_public_ws().await;
                     });
+                    let hl_funding = hl_arc.clone();
+                    let funding_poll_ms = std::env::var("HL_FUNDING_POLL_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(10_000);
+                    tokio::spawn(async move {
+                        hl_funding.run_funding_polling(funding_poll_ms).await;
+                    });
                 }
                 #[cfg(not(feature = "live_hyperliquid"))]
                 {
@@ -2050,6 +2061,14 @@ async fn main() {
                         tokio::spawn(async move {
                             lighter_public.run_public_ws().await;
                         });
+                        let lighter_funding = lighter_arc.clone();
+                        let funding_poll_ms = std::env::var("LIGHTER_FUNDING_POLL_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(10_000);
+                        tokio::spawn(async move {
+                            lighter_funding.run_funding_polling(funding_poll_ms).await;
+                        });
                     }
                 }
                 #[cfg(not(feature = "live_lighter"))]
@@ -2119,6 +2138,14 @@ async fn main() {
                         let extended_public = extended_arc.clone();
                         tokio::spawn(async move {
                             extended_public.run_public_ws().await;
+                        });
+                        let extended_funding = extended_arc.clone();
+                        let funding_poll_ms = std::env::var("EXTENDED_FUNDING_POLL_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(10_000);
+                        tokio::spawn(async move {
+                            extended_funding.run_funding_polling(funding_poll_ms).await;
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {
@@ -2225,6 +2252,14 @@ async fn main() {
                         let aster_public = aster_arc.clone();
                         tokio::spawn(async move {
                             aster_public.run_public_ws().await;
+                        });
+                        let aster_funding = aster_arc.clone();
+                        let funding_poll_ms = std::env::var("ASTER_FUNDING_POLL_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(10_000);
+                        tokio::spawn(async move {
+                            aster_funding.run_funding_polling(funding_poll_ms).await;
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {
@@ -2334,6 +2369,14 @@ async fn main() {
                         let paradex_public = paradex_arc.clone();
                         tokio::spawn(async move {
                             paradex_public.run_public_ws().await;
+                        });
+                        let paradex_funding = paradex_arc.clone();
+                        let funding_poll_ms = std::env::var("PARADEX_FUNDING_POLL_MS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(10_000);
+                        tokio::spawn(async move {
+                            paradex_funding.run_funding_polling(funding_poll_ms).await;
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {

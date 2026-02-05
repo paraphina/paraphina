@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::state::GlobalState;
+use crate::state::{funding_rate_for_decision, GlobalState, VenueState};
 use crate::types::{
     OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs, VenueStatus,
 };
@@ -47,6 +47,13 @@ pub fn increases_abs_exposure(q_old: f64, dq: f64) -> bool {
     let abs_old = q_old.abs();
     let abs_new = (q_old + dq).abs();
     abs_new > abs_old
+}
+
+fn funding_rate_for_hedge(cfg: &Config, vstate: &VenueState, now_ms: TimestampMs) -> f64 {
+    if !cfg.hedge.funding_enabled {
+        return 0.0;
+    }
+    funding_rate_for_decision(&vstate.funding_state, now_ms, &cfg.funding, true).unwrap_or(0.0)
 }
 
 /// Compute the maximum absolute position allowed after the hedge.
@@ -364,9 +371,11 @@ pub fn compute_hedge_cost_components(
     let exec_cost = half_spread + taker_fee + cfg.hedge.slippage_buffer;
 
     let horizon_frac = cfg.hedge.funding_horizon_sec / (8.0 * 60.0 * 60.0);
+    let now_ms = crate::types::now_ms();
+    let funding_8h = funding_rate_for_hedge(cfg, v, now_ms);
     let funding_benefit = match intent.side {
-        Side::Sell => v.funding_8h * horizon_frac * fair,
-        Side::Buy => -v.funding_8h * horizon_frac * fair,
+        Side::Sell => funding_8h * horizon_frac * fair,
+        Side::Buy => -funding_8h * horizon_frac * fair,
     };
 
     let basis_edge = match intent.side {
@@ -725,9 +734,10 @@ fn build_candidates(
         let exec_cost = half_spread + taker_fee + hedge_cfg.slippage_buffer;
 
         let horizon_frac = hedge_cfg.funding_horizon_sec / (8.0 * 60.0 * 60.0);
+        let funding_8h = funding_rate_for_hedge(cfg, v, now_ms);
         let funding_benefit = match side {
-            Side::Sell => v.funding_8h * horizon_frac * fair,
-            Side::Buy => -v.funding_8h * horizon_frac * fair,
+            Side::Sell => funding_8h * horizon_frac * fair,
+            Side::Buy => -funding_8h * horizon_frac * fair,
         };
 
         let basis_edge = match side {

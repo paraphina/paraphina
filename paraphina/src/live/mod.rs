@@ -15,6 +15,7 @@ pub mod paper_adapter;
 pub mod runner;
 pub mod shadow_adapter;
 pub mod state_cache;
+pub mod supervision;
 pub mod trade_mode;
 pub mod types;
 pub mod venue_health;
@@ -37,4 +38,5 @@ pub use state_cache::{
 pub use trade_mode::{
     resolve_effective_trade_mode, EffectiveTradeMode, TradeMode, TradeModeSource,
 };
+pub use supervision::{spawn_supervised, spawn_supervised_with_threshold};
 pub use types::{AccountEvent, ExecutionEvent, MarketDataEvent};

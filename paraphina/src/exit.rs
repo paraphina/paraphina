@@ -32,7 +32,7 @@
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::state::{GlobalState, RiskRegime};
+use crate::state::{funding_rate_for_decision, GlobalState, RiskRegime, VenueState};
 use crate::types::{
     OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs, VenueStatus,
 };
@@ -77,6 +77,13 @@ pub struct ExitEdgeComponents {
     pub basis_risk_penalty: f64,
 }
 
+fn funding_rate_for_exit(cfg: &Config, vstate: &VenueState, now_ms: TimestampMs) -> f64 {
+    if !cfg.exit.funding_enabled {
+        return 0.0;
+    }
+    funding_rate_for_decision(&vstate.funding_state, now_ms, &cfg.funding, true).unwrap_or(0.0)
+}
+
 /// Compute exit edge components for a given exit intent.
 pub fn compute_exit_edge_components(
     cfg: &Config,
@@ -108,9 +115,10 @@ pub fn compute_exit_edge_components(
     };
 
     let horizon_frac = cfg.exit.funding_horizon_sec / (8.0 * 60.0 * 60.0);
+    let funding_8h = funding_rate_for_exit(cfg, v, now_ms);
     let funding_benefit_per_tao = match intent.side {
-        Side::Sell => v.funding_8h * horizon_frac * fair,
-        Side::Buy => -v.funding_8h * horizon_frac * fair,
+        Side::Sell => funding_8h * horizon_frac * fair,
+        Side::Buy => -funding_8h * horizon_frac * fair,
     };
 
     let trade_sign = match intent.side {
@@ -565,9 +573,10 @@ pub fn compute_exit_intents_into(
         // Positive funding means "shorts receive" under common perp convention,
         // so selling (towards short) gets +funding_8h benefit; buying gets the opposite.
         let horizon_frac = cfg.exit.funding_horizon_sec / (8.0 * 60.0 * 60.0);
+        let funding_8h = funding_rate_for_exit(cfg, v, now_ms);
         let funding_benefit_per_tao = match need_side {
-            Side::Sell => v.funding_8h * horizon_frac * fair,
-            Side::Buy => -v.funding_8h * horizon_frac * fair,
+            Side::Sell => funding_8h * horizon_frac * fair,
+            Side::Buy => -funding_8h * horizon_frac * fair,
         };
 
         // --- Basis-risk penalty (ranking) ---

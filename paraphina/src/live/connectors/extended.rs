@@ -89,11 +89,11 @@ use super::super::gateway::{
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, LiquidationSnapshot, MarginSnapshot,
-    MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, FundingUpdate, LiquidationSnapshot,
+    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::live::MarketPublisher;
-use crate::types::{Side, TimeInForce, TimestampMs};
+use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
 
 #[derive(Debug, Clone)]
 pub struct ExtendedConfig {
@@ -113,8 +113,9 @@ impl ExtendedConfig {
         let ws_url = std::env::var("EXTENDED_WS_URL").unwrap_or_else(|_| {
             "wss://api.starknet.extended.exchange/stream.extended.exchange/v1".to_string()
         });
+        // Default to Starknet Extended API (the original api.extended.exchange returns 404)
         let rest_url = std::env::var("EXTENDED_REST_URL")
-            .unwrap_or_else(|_| "https://api.extended.exchange".to_string());
+            .unwrap_or_else(|_| "https://api.starknet.extended.exchange".to_string());
         let market = std::env::var("EXTENDED_MARKET").unwrap_or_else(|_| "BTCUSDT".to_string());
         let market = normalize_extended_market(&market);
         let depth_limit = std::env::var("EXTENDED_DEPTH_LIMIT")
@@ -222,12 +223,58 @@ impl ExtendedConnector {
     pub async fn run_public_ws(&self) {
         let mut backoff = Duration::from_secs(1);
         let mut last_snapshot_warn: Option<Instant> = None;
+
+        // FIX: Configurable healthy connection threshold for backoff reset
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
         loop {
+            let session_start = Instant::now();
+
             if let Err(err) = self.public_ws_once(&mut last_snapshot_warn).await {
                 eprintln!("Extended public WS error: {err}");
             }
+
+            // FIX: Reset backoff if connection was healthy for long enough
+            let session_duration = session_start.elapsed();
+            if session_duration >= healthy_threshold {
+                eprintln!(
+                    "INFO: Extended WS session was healthy for {:?}; resetting backoff",
+                    session_duration
+                );
+                backoff = Duration::from_secs(1);
+            }
+
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    pub async fn run_funding_polling(&self, poll_ms: u64) {
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        let mut seq: u64 = 0;
+        loop {
+            interval.tick().await;
+            match fetch_public_funding(&self.http, &self.cfg).await {
+                Ok(mut update) => {
+                    seq = seq.wrapping_add(1);
+                    update.seq = seq;
+                    if let Err(err) = self
+                        .market_publisher
+                        .publish_market(MarketDataEvent::FundingUpdate(update))
+                        .await
+                    {
+                        eprintln!("Extended funding publish error: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Extended funding polling error: {err}");
+                }
+            }
         }
     }
 
@@ -820,6 +867,8 @@ impl ExtendedRestClient {
             }
         }
     }
+
+    // Note: funding polling lives on ExtendedConnector (market publisher).
 }
 
 impl LiveRestClient for ExtendedRestClient {
@@ -1049,6 +1098,95 @@ fn parse_account_snapshot(
         funding_8h: None,
         margin,
         liquidation,
+    })
+}
+
+async fn fetch_public_funding(client: &Client, cfg: &ExtendedConfig) -> anyhow::Result<FundingUpdate> {
+    // Extended uses /api/v1/info/markets/{market}/stats for funding data.
+    // The market is part of the path (e.g., ETH-USD), not a query parameter.
+    let path = std::env::var("EXTENDED_FUNDING_PATH").unwrap_or_else(|_| {
+        format!("/api/v1/info/markets/{}/stats", cfg.market)
+    });
+    let url = format!("{}{}", cfg.rest_url.trim_end_matches('/'), path);
+    let resp = client.get(&url).send().await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "Extended funding fetch failed: HTTP {} url={} body={}",
+            status,
+            url,
+            body.chars().take(160).collect::<String>()
+        );
+    }
+
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("Extended funding JSON parse error: {} body={}", e, body.chars().take(160).collect::<String>()))?;
+
+    parse_public_funding(&value, cfg)
+        .ok_or_else(|| anyhow::anyhow!("invalid public funding response"))
+}
+
+fn parse_public_funding(value: &Value, cfg: &ExtendedConfig) -> Option<FundingUpdate> {
+    let data = value
+        .get("data")
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+
+    let rate_native = data
+        .get("fundingRate")
+        .or_else(|| data.get("funding_rate"))
+        .or_else(|| data.get("lastFundingRate"))
+        .and_then(parse_f64);
+
+    // Extended API doesn't explicitly provide interval, but fundingRate is hourly.
+    // Default to 3600s (1 hour) when rate is present.
+    let interval_sec = data
+        .get("fundingIntervalSec")
+        .or_else(|| data.get("funding_interval_sec"))
+        .or_else(|| data.get("fundingInterval"))
+        .and_then(parse_i64_value)
+        .and_then(|v| if v > 0 { Some(v as u64) } else { None })
+        .or_else(|| {
+            // Extended fundingRate is hourly; assume 3600s if rate is present
+            if rate_native.is_some() { Some(3600) } else { None }
+        });
+
+    // Extended API uses "nextFundingRate" but it's actually the next funding TIME in ms
+    let next_funding_ms = data
+        .get("nextFundingRate")  // Extended's field name (actually a timestamp, not a rate)
+        .or_else(|| data.get("nextFundingTime"))
+        .or_else(|| data.get("next_funding_time"))
+        .or_else(|| data.get("nextFundingTimestamp"))
+        .and_then(parse_i64_value);
+
+    let as_of_ms = data
+        .get("time")
+        .or_else(|| data.get("timestamp"))
+        .or_else(|| data.get("ts"))
+        .and_then(parse_i64_value)
+        .unwrap_or_else(now_ms);
+
+    // Convert hourly rate to 8h: rate_8h = rate_native * (8h / interval_sec)
+    let rate_8h = match (rate_native, interval_sec) {
+        (Some(rate), Some(sec)) if sec > 0 => Some(rate * (8.0 * 60.0 * 60.0 / sec as f64)),
+        (Some(rate), None) => Some(rate), // Assume already 8h if no interval
+        _ => None,
+    };
+
+    Some(FundingUpdate {
+        venue_index: cfg.venue_index,
+        venue_id: cfg.market.clone(),
+        seq: 0,
+        timestamp_ms: as_of_ms,
+        received_ms: Some(now_ms()),
+        funding_rate_8h: rate_8h,
+        funding_rate_native: rate_native,
+        interval_sec,
+        next_funding_ms,
+        settlement_price_kind: Some(SettlementPriceKind::Mark),  // Extended uses mark price
+        source: FundingSource::MarketDataRest,
     })
 }
 
@@ -1462,6 +1600,19 @@ fn parse_f64(value: &Value) -> Option<f64> {
     }
     if let Some(s) = value.as_str() {
         return s.parse::<f64>().ok();
+    }
+    None
+}
+
+fn parse_i64_value(value: &Value) -> Option<i64> {
+    if let Some(v) = value.as_i64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v as i64);
+    }
+    if let Some(s) = value.as_str() {
+        return s.parse::<i64>().ok();
     }
     None
 }
@@ -2089,5 +2240,56 @@ mod tests {
             .store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
+    }
+
+    #[test]
+    fn parse_public_funding_market_stats_fixture() {
+        // Test parsing Extended's /api/v1/info/markets/{market}/stats response format
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/extended/public_market_stats.json");
+        let raw = std::fs::read_to_string(&fixture_path)
+            .expect("read fixture");
+        let value: Value = serde_json::from_str(&raw)
+            .expect("parse fixture JSON");
+
+        let cfg = ExtendedConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "https://api.starknet.extended.exchange".to_string(),
+            market: "ETH-USD".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            api_key: None,
+            api_secret: None,
+            recv_window: None,
+            record_dir: None,
+        };
+
+        let funding = parse_public_funding(&value, &cfg)
+            .expect("parse_public_funding should succeed");
+
+        // Verify rate parsing: fixture has fundingRate "0.000013" (hourly)
+        // rate_8h should be 0.000013 * 8 = 0.000104
+        assert!(funding.funding_rate_native.is_some(), "native rate should be present");
+        let native = funding.funding_rate_native.unwrap();
+        assert!((native - 0.000013).abs() < 1e-10, "native rate mismatch: {}", native);
+
+        assert!(funding.funding_rate_8h.is_some(), "8h rate should be present");
+        let rate_8h = funding.funding_rate_8h.unwrap();
+        assert!((rate_8h - 0.000104).abs() < 1e-10, "8h rate mismatch: {}", rate_8h);
+
+        // Verify interval is detected as hourly (3600s)
+        assert_eq!(funding.interval_sec, Some(3600), "interval_sec should be 3600");
+
+        // Verify next_funding_ms is extracted from "nextFundingRate" field
+        // Fixture has: "nextFundingRate": 1770314400000
+        assert_eq!(funding.next_funding_ms, Some(1770314400000), "next_funding_ms mismatch");
+
+        // Verify source and settlement
+        assert!(matches!(funding.source, FundingSource::MarketDataRest));
+        assert_eq!(funding.settlement_price_kind, Some(SettlementPriceKind::Mark));
+
+        // Verify venue info
+        assert_eq!(funding.venue_index, 0);
+        assert_eq!(funding.venue_id, "ETH-USD");
     }
 }

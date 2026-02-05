@@ -26,11 +26,11 @@ use super::super::gateway::{
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, LiquidationSnapshot, MarginSnapshot,
-    MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, FundingUpdate, LiquidationSnapshot,
+    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
 };
 use crate::live::MarketPublisher;
-use crate::types::{Side, TimeInForce, TimestampMs};
+use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
 
 #[cfg(feature = "live_aster")]
 pub const STUB_CONNECTOR: bool = false;
@@ -41,7 +41,8 @@ pub const SUPPORTS_ACCOUNT: bool = true;
 #[cfg(feature = "live_aster")]
 pub const SUPPORTS_EXECUTION: bool = true;
 
-const ASTER_STALE_MS: u64 = 1_800;
+// FIX: Normalized default to 10,000ms to match other venues (was 1,800ms)
+const ASTER_STALE_MS_DEFAULT: u64 = 10_000;
 const ASTER_WATCHDOG_TICK_MS: u64 = 200;
 const ASTER_MARKET_PUB_QUEUE_CAP_LIVE: usize = 256;
 const ASTER_MARKET_PUB_QUEUE_CAP_FIXTURE: usize = 4096;
@@ -52,6 +53,14 @@ static MONO_START: OnceLock<Instant> = OnceLock::new();
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
     start.elapsed().as_nanos() as u64
+}
+
+/// FIX: Configurable stale threshold via env var, normalized default to 10,000ms
+fn aster_stale_ms() -> u64 {
+    std::env::var("PARAPHINA_ASTER_STALE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(ASTER_STALE_MS_DEFAULT)
 }
 
 #[allow(dead_code)]
@@ -221,12 +230,58 @@ impl AsterConnector {
 
     pub async fn run_public_ws(&self) {
         let mut backoff = Duration::from_secs(1);
+
+        // FIX: Configurable healthy connection threshold for backoff reset
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
         loop {
+            let session_start = std::time::Instant::now();
+
             if let Err(err) = self.public_ws_once().await {
                 eprintln!("Aster public WS error: {err}");
             }
+
+            // FIX: Reset backoff if connection was healthy for long enough
+            let session_duration = session_start.elapsed();
+            if session_duration >= healthy_threshold {
+                eprintln!(
+                    "INFO: Aster WS session was healthy for {:?}; resetting backoff",
+                    session_duration
+                );
+                backoff = Duration::from_secs(1);
+            }
+
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    pub async fn run_funding_polling(&self, poll_ms: u64) {
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        let mut seq: u64 = 0;
+        loop {
+            interval.tick().await;
+            match fetch_public_funding(&self.http, &self.cfg).await {
+                Ok(mut update) => {
+                    seq = seq.wrapping_add(1);
+                    update.seq = seq;
+                    if let Err(err) = self
+                        .market_publisher
+                        .publish_market(MarketDataEvent::FundingUpdate(update))
+                        .await
+                    {
+                        eprintln!("Aster funding publish error: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Aster funding polling error: {err}");
+                }
+            }
         }
     }
 
@@ -268,6 +323,8 @@ impl AsterConnector {
         let fixture_mode = env_is_true("ASTER_FIXTURE_MODE")
             || std::env::var_os("ASTER_FIXTURE_DIR").is_some()
             || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
+        // FIX: Use configurable stale threshold (normalized to 10,000ms default)
+        let stale_ms = aster_stale_ms();
         let mut _stale_tx_guard = None;
         if fixture_mode {
             _stale_tx_guard = Some(stale_tx);
@@ -281,7 +338,7 @@ impl AsterConnector {
                     interval.tick().await;
                     let now = mono_now_ns();
                     let anchor = freshness.anchor_with_connect_start(connect_start_ns);
-                    if anchor != 0 && age_ms(now, anchor) > ASTER_STALE_MS {
+                    if anchor != 0 && age_ms(now, anchor) > stale_ms {
                         let _ = stale_tx.send(());
                         break;
                     }
@@ -295,7 +352,7 @@ impl AsterConnector {
                 tokio::select! {
                     biased;
                     _ = &mut stale_rx => {
-                        anyhow::bail!("Aster public WS stale: freshness exceeded ASTER_STALE_MS");
+                        anyhow::bail!("Aster public WS stale: freshness exceeded {}ms", stale_ms);
                     }
                     snapshot = future => {
                         match snapshot {
@@ -517,7 +574,7 @@ impl AsterConnector {
             tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
-                    anyhow::bail!("Aster public WS stale: freshness exceeded ASTER_STALE_MS");
+                    anyhow::bail!("Aster public WS stale: freshness exceeded {}ms", stale_ms);
                 }
                 msg = read.next() => {
                     let Some(msg) = msg else {
@@ -817,6 +874,8 @@ impl AsterRestClient {
             }
         }
     }
+
+    // Note: funding polling lives on AsterConnector (market publisher).
 }
 
 impl LiveRestClient for AsterRestClient {
@@ -1046,6 +1105,67 @@ fn parse_account_snapshot(
         funding_8h: None,
         margin,
         liquidation,
+    })
+}
+
+async fn fetch_public_funding(client: &Client, cfg: &AsterConfig) -> anyhow::Result<FundingUpdate> {
+    let path = std::env::var("ASTER_FUNDING_PATH")
+        .unwrap_or_else(|_| "/fapi/v1/premiumIndex".to_string());
+    let url = format!("{}{}", cfg.rest_url.trim_end_matches('/'), path);
+    let resp = client
+        .get(url)
+        .query(&[("symbol", cfg.market.clone())])
+        .send()
+        .await?;
+    let value: Value = resp.json().await?;
+    parse_public_funding(&value, cfg)
+        .ok_or_else(|| anyhow::anyhow!("invalid public funding response"))
+}
+
+fn parse_public_funding(value: &Value, cfg: &AsterConfig) -> Option<FundingUpdate> {
+    let data = value
+        .get("data")
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+    let rate_native = data
+        .get("fundingRate")
+        .or_else(|| data.get("funding_rate"))
+        .or_else(|| data.get("lastFundingRate"))
+        .and_then(parse_f64);
+    let interval_sec = data
+        .get("fundingIntervalSec")
+        .or_else(|| data.get("funding_interval_sec"))
+        .or_else(|| data.get("fundingInterval"))
+        .and_then(parse_i64_value)
+        .and_then(|v| if v > 0 { Some(v as u64) } else { None });
+    let next_funding_ms = data
+        .get("nextFundingTime")
+        .or_else(|| data.get("next_funding_time"))
+        .or_else(|| data.get("nextFundingTimestamp"))
+        .and_then(parse_i64_value);
+    let as_of_ms = data
+        .get("time")
+        .or_else(|| data.get("timestamp"))
+        .or_else(|| data.get("ts"))
+        .and_then(parse_i64_value)
+        .unwrap_or_else(now_ms);
+    let rate_8h = match (rate_native, interval_sec) {
+        (Some(rate), Some(sec)) if sec > 0 => Some(rate * (8.0 * 60.0 * 60.0 / sec as f64)),
+        (Some(rate), None) => Some(rate),
+        _ => None,
+    };
+    Some(FundingUpdate {
+        venue_index: cfg.venue_index,
+        venue_id: cfg.venue_id.clone(),
+        seq: 0,
+        timestamp_ms: as_of_ms,
+        received_ms: Some(now_ms()),
+        funding_rate_8h: rate_8h,
+        funding_rate_native: rate_native,
+        interval_sec,
+        next_funding_ms,
+        settlement_price_kind: Some(SettlementPriceKind::Unknown),
+        source: FundingSource::MarketDataRest,
     })
 }
 
@@ -1338,6 +1458,19 @@ fn parse_f64(value: &Value) -> Option<f64> {
     None
 }
 
+fn parse_i64_value(value: &Value) -> Option<i64> {
+    if let Some(v) = value.as_i64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v as i64);
+    }
+    if let Some(s) = value.as_str() {
+        return s.parse::<i64>().ok();
+    }
+    None
+}
+
 fn symbol_matches(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
@@ -1601,6 +1734,29 @@ mod tests {
         let feed = AsterFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         assert!(!feed.snapshot.bids.is_empty());
         assert!(!feed.snapshot.asks.is_empty());
+    }
+
+    #[test]
+    fn parse_public_funding_fixture() {
+        let raw =
+            include_str!("../../../../tests/fixtures/aster/public_premium_index.json");
+        let value: Value = serde_json::from_str(raw).expect("fixture json");
+        let cfg = AsterConfig {
+            ws_url: "wss://example".to_string(),
+            rest_url: "https://example".to_string(),
+            market: "BTCUSDT".to_string(),
+            depth_limit: 100,
+            venue_index: 0,
+            venue_id: "ASTER".to_string(),
+            api_key: None,
+            api_secret: None,
+            recv_window: Some(5_000),
+            record_dir: None,
+        };
+        let update = parse_public_funding(&value, &cfg).expect("funding update");
+        assert_eq!(update.funding_rate_8h, Some(0.0002));
+        assert_eq!(update.next_funding_ms, Some(1_700_003_600_000));
+        assert_eq!(update.source, FundingSource::MarketDataRest);
     }
 
     #[test]

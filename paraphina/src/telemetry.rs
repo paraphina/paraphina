@@ -452,7 +452,7 @@ impl TelemetryBuilder {
                 "treasury_guidance".to_string(),
                 self.treasury.build_guidance(state, tick, now_ms),
             );
-            let quote_levels = build_quote_levels(cfg, state, fair);
+            let quote_levels = build_quote_levels(cfg, state, fair, now_ms);
             map.insert(
                 "quote_levels".to_string(),
                 serde_json::Value::Array(quote_levels),
@@ -778,8 +778,18 @@ fn compute_healthy_venues_used(
     out
 }
 
-fn build_quote_levels(cfg: &Config, state: &GlobalState, fair: f64) -> Vec<JsonValue> {
-    let components = compute_mm_reservation_components(cfg, state);
+fn build_quote_levels(
+    cfg: &Config,
+    state: &GlobalState,
+    fair: f64,
+    now_ms: TimestampMs,
+) -> Vec<JsonValue> {
+    let effective_now_ms = if now_ms > 0 {
+        now_ms
+    } else {
+        crate::types::now_ms()
+    };
+    let components = compute_mm_reservation_components(cfg, state, Some(effective_now_ms));
     let quotes = compute_mm_quotes(cfg, state);
     #[allow(clippy::type_complexity)]
     let mut quote_by_venue: Vec<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> =
@@ -1452,6 +1462,13 @@ fn build_venue_metrics(
     let mut venue_position = Vec::new();
     let mut venue_dist_liq_sigma = Vec::new();
     let mut venue_funding_8h = Vec::new();
+    let mut venue_funding_rate_8h = Vec::new();
+    let mut venue_funding_age_ms = Vec::new();
+    let mut venue_funding_interval_sec = Vec::new();
+    let mut venue_next_funding_ms = Vec::new();
+    let mut venue_funding_source = Vec::new();
+    let mut venue_funding_status = Vec::new();
+    let mut venue_funding_settlement_price_kind = Vec::new();
     let mut venue_local_vol_short = Vec::new();
     let mut venue_local_vol_long = Vec::new();
     let mut venue_margin_balance = Vec::new();
@@ -1488,6 +1505,17 @@ fn build_venue_metrics(
         venue_position.push(venue.position_tao);
         venue_dist_liq_sigma.push(venue.dist_liq_sigma);
         venue_funding_8h.push(venue.funding_8h);
+        let funding_state = &venue.funding_state;
+        let funding_age = funding_state.age_ms(effective_now);
+        let funding_status = funding_state.status_at(effective_now, cfg.funding.stale_ms);
+        venue_funding_rate_8h.push(funding_state.rate_8h);
+        venue_funding_age_ms.push(funding_age);
+        venue_funding_interval_sec.push(funding_state.interval_sec);
+        venue_next_funding_ms.push(funding_state.next_funding_ms);
+        venue_funding_source.push(format!("{:?}", funding_state.source));
+        venue_funding_status.push(format!("{:?}", funding_status));
+        venue_funding_settlement_price_kind
+            .push(format!("{:?}", funding_state.settlement_price_kind));
         venue_local_vol_short.push(venue.local_vol_short);
         venue_local_vol_long.push(venue.local_vol_long);
         venue_margin_balance.push(venue.margin_balance_usd);
@@ -1541,6 +1569,34 @@ fn build_venue_metrics(
         (
             "venue_funding_8h".to_string(),
             serde_json::json!(venue_funding_8h),
+        ),
+        (
+            "venue_funding_rate_8h".to_string(),
+            serde_json::json!(venue_funding_rate_8h),
+        ),
+        (
+            "venue_funding_age_ms".to_string(),
+            serde_json::json!(venue_funding_age_ms),
+        ),
+        (
+            "venue_funding_interval_sec".to_string(),
+            serde_json::json!(venue_funding_interval_sec),
+        ),
+        (
+            "venue_next_funding_ms".to_string(),
+            serde_json::json!(venue_next_funding_ms),
+        ),
+        (
+            "venue_funding_source".to_string(),
+            serde_json::json!(venue_funding_source),
+        ),
+        (
+            "venue_funding_status".to_string(),
+            serde_json::json!(venue_funding_status),
+        ),
+        (
+            "venue_funding_settlement_price_kind".to_string(),
+            serde_json::json!(venue_funding_settlement_price_kind),
         ),
         (
             "venue_local_vol_short".to_string(),

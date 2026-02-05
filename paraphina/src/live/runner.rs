@@ -27,15 +27,15 @@ use crate::loop_scheduler::LoopScheduler;
 use crate::mm::{compute_mm_quotes_with_ablations, compute_mm_quotes_with_now};
 use crate::order_management::plan_mm_order_actions;
 use crate::sim_eval::AblationSet;
-use crate::state::GlobalState;
-use crate::state::VenueState;
+use crate::state::{FundingState, GlobalState, VenueState};
 use crate::telemetry::{
     ensure_schema_v1, ReconcileDriftRecord, TelemetryBuilder, TelemetryInputs, TelemetrySink,
 };
 #[cfg(feature = "event_log")]
 use crate::telemetry::{TelemetryConfig, TelemetryMode};
 use crate::types::{
-    ExecutionEvent, OrderAck, OrderIntent, OrderPurpose, OrderReject, TimestampMs, VenueStatus,
+    ExecutionEvent, FundingSource, FundingStatus, OrderAck, OrderIntent, OrderPurpose, OrderReject,
+    SettlementPriceKind, TimestampMs, VenueStatus,
 };
 
 use super::orderbook_l2::OrderBookL2;
@@ -1160,7 +1160,7 @@ pub async fn run_live_loop(
                             super::types::MarketDataEvent::FundingUpdate(f) => f.venue_index,
                         });
                     } else {
-                        apply_market_event_to_core(&mut state, cfg, &event);
+                        apply_market_event_to_core(&mut state, cfg, &event, now_ms);
                         let venue_index = match &event {
                             super::types::MarketDataEvent::L2Snapshot(s) => s.venue_index,
                             super::types::MarketDataEvent::L2Delta(d) => d.venue_index,
@@ -2059,6 +2059,7 @@ fn apply_market_event_to_core(
     state: &mut GlobalState,
     cfg: &Config,
     event: &super::types::MarketDataEvent,
+    now_ms: TimestampMs,
 ) {
     let max_levels = cfg.book.depth_levels.max(1) as usize;
     let alpha_short = cfg.volatility.fv_vol_alpha_short;
@@ -2089,8 +2090,31 @@ fn apply_market_event_to_core(
                 );
             }
         }
-        super::types::MarketDataEvent::Trade(_)
-        | super::types::MarketDataEvent::FundingUpdate(_) => {}
+        super::types::MarketDataEvent::Trade(_) => {}
+        super::types::MarketDataEvent::FundingUpdate(update) => {
+            if let Some(v) = state.venues.get_mut(update.venue_index) {
+                let received_ms = update.received_ms.unwrap_or(now_ms);
+                v.funding_state = FundingState {
+                    rate_8h: update.funding_rate_8h,
+                    rate_native: update.funding_rate_native,
+                    interval_sec: update.interval_sec,
+                    as_of_ms_exchange: Some(update.timestamp_ms).filter(|v| *v > 0),
+                    received_ms: Some(received_ms).filter(|v| *v > 0),
+                    next_funding_ms: update.next_funding_ms,
+                    settlement_price_kind: update
+                        .settlement_price_kind
+                        .unwrap_or(SettlementPriceKind::Unknown),
+                    source: update.source,
+                    status: update
+                        .funding_rate_8h
+                        .map(|_| FundingStatus::Healthy)
+                        .unwrap_or(FundingStatus::Unknown),
+                };
+                if let Some(rate) = update.funding_rate_8h {
+                    v.funding_8h = rate;
+                }
+            }
+        }
     }
 }
 
@@ -2336,6 +2360,17 @@ pub fn apply_account_snapshot_to_state(
         v.price_liq = acct.price_liq;
         if let Some(funding) = acct.funding_8h {
             v.funding_8h = funding;
+            v.funding_state = FundingState {
+                rate_8h: Some(funding),
+                rate_native: Some(funding),
+                interval_sec: None,
+                as_of_ms_exchange: acct.timestamp_ms.filter(|v| *v > 0),
+                received_ms: Some(now_ms).filter(|v| *v > 0),
+                next_funding_ms: None,
+                settlement_price_kind: SettlementPriceKind::Unknown,
+                source: FundingSource::AccountSnapshot,
+                status: FundingStatus::Healthy,
+            };
         }
 
         let price_liq = match acct.price_liq {
@@ -2502,7 +2537,7 @@ pub fn replay_event_log(
             }
             EventLogPayload::MarketData(event) => {
                 let _ = cache.apply_market_event(event);
-                apply_market_event_to_core(&mut state, cfg, event);
+                apply_market_event_to_core(&mut state, cfg, event, current_now_ms);
             }
             EventLogPayload::Account(event) => {
                 let _ = cache.apply_account_event(event);
@@ -2632,7 +2667,8 @@ mod tests {
     use super::*;
     use crate::live::types;
     use crate::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
-    use crate::types::{OrderPurpose, Side};
+    use crate::telemetry::{TelemetryBuilder, TelemetryInputs};
+    use crate::types::{FundingSource, OrderPurpose, SettlementPriceKind, Side};
     use tokio::sync::mpsc;
 
     #[test]
@@ -2751,6 +2787,61 @@ mod tests {
         assert_eq!(snapshots, 1);
         assert_eq!(deltas, 0);
         assert_eq!(snapshot_seq, Some(13));
+    }
+
+    #[test]
+    fn funding_update_flows_into_telemetry() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms: TimestampMs = 1_700_000_000_000;
+        let update = types::FundingUpdate {
+            venue_index: 0,
+            venue_id: "TAO".to_string(),
+            seq: 1,
+            timestamp_ms: now_ms - 1_000,
+            received_ms: Some(now_ms),
+            funding_rate_8h: Some(0.001),
+            funding_rate_native: Some(0.001),
+            interval_sec: Some(8 * 60 * 60),
+            next_funding_ms: Some(now_ms + 3_600_000),
+            settlement_price_kind: Some(SettlementPriceKind::Mark),
+            source: FundingSource::MarketDataRest,
+        };
+        apply_market_event_to_core(
+            &mut state,
+            &cfg,
+            &types::MarketDataEvent::FundingUpdate(update),
+            now_ms,
+        );
+        assert_eq!(state.venues[0].funding_state.rate_8h, Some(0.001));
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "shadow",
+            reconcile_drift: &[],
+            max_orders_per_tick: 0,
+        });
+        let funding_rates = record
+            .get("venue_funding_rate_8h")
+            .and_then(|v| v.as_array())
+            .expect("venue_funding_rate_8h");
+        let funding_status = record
+            .get("venue_funding_status")
+            .and_then(|v| v.as_array())
+            .expect("venue_funding_status");
+        assert_eq!(funding_rates[0].as_f64().unwrap_or(0.0), 0.001);
+        assert_eq!(funding_status[0].as_str().unwrap_or(""), "Healthy");
     }
 
     #[test]
