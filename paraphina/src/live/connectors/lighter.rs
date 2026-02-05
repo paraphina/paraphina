@@ -57,10 +57,6 @@ impl Freshness {
     }
 }
 
-// Freshness watchdog constants
-const LIGHTER_STALE_MS_DEFAULT: u64 = 10_000;
-const LIGHTER_WATCHDOG_TICK_MS: u64 = 200;
-
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -198,58 +194,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
-}
-
-// ============================================================================
-// Freshness tracking for WebSocket watchdog
-// ============================================================================
-
-static MONO_START: OnceLock<Instant> = OnceLock::new();
-
-fn mono_now_ns() -> u64 {
-    let start = MONO_START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
-}
-
-fn lighter_stale_ms() -> u64 {
-    std::env::var("PARAPHINA_LIGHTER_STALE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(LIGHTER_STALE_MS_DEFAULT)
-}
-
-fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
-    now_ns.saturating_sub(then_ns) / 1_000_000
-}
-
-/// Freshness tracking for Lighter WebSocket connections.
-/// Mirrors the pattern used in Hyperliquid, Paradex, Extended, and Aster connectors.
-#[derive(Debug, Default)]
-struct Freshness {
-    last_ws_rx_ns: AtomicU64,
-    last_data_rx_ns: AtomicU64,
-    last_parsed_ns: AtomicU64,
-    last_published_ns: AtomicU64,
-}
-
-impl Freshness {
-    fn reset_for_new_connection(&self) {
-        self.last_ws_rx_ns.store(0, Ordering::Relaxed);
-        self.last_data_rx_ns.store(0, Ordering::Relaxed);
-        self.last_parsed_ns.store(0, Ordering::Relaxed);
-        self.last_published_ns.store(0, Ordering::Relaxed);
-    }
-
-    fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
-        let last_pub = self.last_published_ns.load(Ordering::Relaxed);
-        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
-        let anchor = last_pub.max(last_parsed);
-        if anchor == 0 {
-            connect_start_ns
-        } else {
-            anchor
-        }
-    }
 }
 
 fn scale_to_i64(value: f64, decimals: u32, label: &str) -> anyhow::Result<i64> {
