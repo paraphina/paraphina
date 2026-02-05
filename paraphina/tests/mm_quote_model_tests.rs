@@ -634,9 +634,9 @@ fn venue_targets_respond_to_funding() {
     let t2 = targets[2].q_target;
 
     // They should not all be identical if funding matters.
-    // (Unless w_fund is 0 in config.)
+    // (Unless funding is disabled in mm config.)
     let all_same = (t0 - t1).abs() < 1e-9 && (t1 - t2).abs() < 1e-9;
-    if h.cfg.venues[0].w_fund > 0.0 {
+    if h.cfg.mm.funding_enabled && h.cfg.venues[0].w_fund > 0.0 {
         assert!(
             !all_same,
             "Different funding rates should produce different targets"

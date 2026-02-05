@@ -26,19 +26,14 @@ pub enum VenueStatus {
 }
 
 /// Funding data source provenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FundingSource {
     MarketDataWs,
     MarketDataRest,
     AccountSnapshot,
     Derived,
+    #[default]
     Unknown,
-}
-
-impl Default for FundingSource {
-    fn default() -> Self {
-        FundingSource::Unknown
-    }
 }
 
 /// Health status of funding data.
@@ -50,19 +45,14 @@ pub enum FundingStatus {
 }
 
 /// Settlement price basis used for funding computation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SettlementPriceKind {
     Oracle,
     Mark,
     Index,
     UsdcOracleAdjusted,
+    #[default]
     Unknown,
-}
-
-impl Default for SettlementPriceKind {
-    fn default() -> Self {
-        SettlementPriceKind::Unknown
-    }
 }
 
 /// Buy or sell side for an order.
