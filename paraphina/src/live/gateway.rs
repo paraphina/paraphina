@@ -131,6 +131,35 @@ pub trait LiveRestClient: Send + Sync {
         &self,
         req: LiveRestCancelAllRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>>;
+
+    /// Batch place: default falls back to serial. Venues with native batch
+    /// APIs (e.g. Hyperliquid `orders` array, Lighter `sendTxBatch`) should override.
+    fn place_batch(
+        &self,
+        reqs: Vec<LiveRestPlaceRequest>,
+    ) -> BoxFuture<'_, Vec<LiveResult<LiveRestResponse>>> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(reqs.len());
+            for req in reqs {
+                results.push(self.place_order(req).await);
+            }
+            results
+        })
+    }
+
+    /// Batch cancel: default falls back to serial.
+    fn cancel_batch(
+        &self,
+        reqs: Vec<LiveRestCancelRequest>,
+    ) -> BoxFuture<'_, Vec<LiveResult<LiveRestResponse>>> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(reqs.len());
+            for req in reqs {
+                results.push(self.cancel_order(req).await);
+            }
+            results
+        })
+    }
 }
 
 #[derive(Clone)]

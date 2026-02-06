@@ -3,7 +3,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -45,12 +45,21 @@ use serde_json::json;
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
+/// How the order handler should respond to a request.
+#[derive(Debug)]
+pub enum ResponseMode {
+    /// Reply via oneshot — caller blocks until response arrives (safety-critical paths).
+    Oneshot(oneshot::Sender<Vec<LiveExecutionEvent>>),
+    /// Fire-and-forget — results flow back via exec_tx on next tick (non-critical paths).
+    FireAndForget,
+}
+
 #[derive(Debug)]
 pub struct LiveOrderRequest {
     pub intents: Vec<OrderIntent>,
     pub action_batch: ActionBatch,
     pub now_ms: TimestampMs,
-    pub response: oneshot::Sender<Vec<LiveExecutionEvent>>,
+    pub response: ResponseMode,
 }
 
 #[derive(Debug)]
@@ -155,6 +164,7 @@ enum CanonicalEvent {
 
 #[derive(Debug, Clone)]
 struct OrderedEvent {
+    venue_index: usize,
     venue_id: String,
     source_seq: u64,
     event_ts_ms: i64,
@@ -332,6 +342,97 @@ fn flush_batched_fills(
     true
 }
 
+/// Send an order request via the bounded channel and wait for the response with a
+/// deterministic timeout.  Replaces the non-deterministic `yield_now() × 1000` busy-poll
+/// that previously existed at six call-sites.
+///
+/// Returns `Some(events)` on success, `None` on channel-full / handler-dropped / timeout.
+async fn send_order_and_wait(
+    order_tx: &mpsc::Sender<LiveOrderRequest>,
+    intents: Vec<OrderIntent>,
+    action_batch: ActionBatch,
+    now_ms: TimestampMs,
+    timeout_ms: u64,
+    label: &str,
+    tick: u64,
+) -> Option<Vec<super::types::ExecutionEvent>> {
+    let (response_tx, response_rx) = oneshot::channel();
+    let request = LiveOrderRequest {
+        intents,
+        action_batch,
+        now_ms,
+        response: ResponseMode::Oneshot(response_tx),
+    };
+    if let Err(_) = order_tx.try_send(request) {
+        eprintln!(
+            "[runner] tick={} {}: order_tx channel full (capacity={}), intents dropped",
+            tick,
+            label,
+            order_tx.max_capacity(),
+        );
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), response_rx).await {
+        Ok(Ok(events)) => Some(events),
+        Ok(Err(_)) => {
+            eprintln!(
+                "[runner] tick={} {}: oneshot closed (handler dropped sender)",
+                tick, label,
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "[runner] tick={} {}: timeout after {}ms waiting for response",
+                tick, label, timeout_ms,
+            );
+            None
+        }
+    }
+}
+
+/// Send an account reconciliation request and wait for the response with a deterministic
+/// timeout.  Separate from [`send_order_and_wait`] because account reconciliation uses a
+/// different request type ([`LiveAccountRequest`]) and channel.
+async fn send_account_and_wait(
+    account_tx: &mpsc::Sender<LiveAccountRequest>,
+    venue_index: usize,
+    now_ms: TimestampMs,
+    timeout_ms: u64,
+    tick: u64,
+) -> Option<super::types::AccountSnapshot> {
+    let (response_tx, response_rx) = oneshot::channel();
+    let request = LiveAccountRequest {
+        venue_index: Some(venue_index),
+        now_ms,
+        response: response_tx,
+    };
+    if let Err(_) = account_tx.try_send(request) {
+        eprintln!(
+            "[runner] tick={} account_reconcile(venue={}): account_tx channel full, request dropped",
+            tick, venue_index,
+        );
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), response_rx).await {
+        Ok(Ok(snapshot)) => Some(snapshot),
+        Ok(Err(_)) => {
+            eprintln!(
+                "[runner] tick={} account_reconcile(venue={}): oneshot closed (handler dropped sender)",
+                tick, venue_index,
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "[runner] tick={} account_reconcile(venue={}): timeout after {}ms",
+                tick, venue_index, timeout_ms,
+            );
+            None
+        }
+    }
+}
+
 fn drain_ordered_events(
     market_rx: &mut mpsc::Receiver<super::types::MarketDataEvent>,
     account_rx: &mut mpsc::Receiver<super::types::AccountEvent>,
@@ -342,8 +443,9 @@ fn drain_ordered_events(
     l2_snapshot_coalesce: bool,
     coalesce_ready_mask: u64,
     saw_l2_snapshot_mask_this_tick: &mut u64,
+    tick_delta_buffer_max: Option<usize>,
 ) -> Vec<OrderedEvent> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(64);
     let coalesce_deltas = l2_delta_coalesce || l2_snapshot_coalesce;
     let mut pending_deltas: Option<Vec<Vec<super::types::L2Delta>>> =
         coalesce_deltas.then(|| Vec::new());
@@ -352,10 +454,6 @@ fn drain_ordered_events(
     let venue_ready = |vi: usize, saw_mask: u64| -> bool {
         vi < 64 && ((coalesce_ready_mask | saw_mask) & (1u64 << vi)) != 0
     };
-    let tick_delta_buffer_max: Option<usize> = std::env::var("PARAPHINA_L2_TICK_DELTA_BUFFER_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0);
     let mut buffer_disabled_mask: u64 = 0;
     let buffer_disabled = |vi: usize, mask: u64| vi < 64 && (mask & (1u64 << vi)) != 0;
     let count_out_market = |stats: &mut Option<&mut MarketRxStats>,
@@ -670,6 +768,7 @@ fn drain_ordered_events(
     if let Some(rx) = order_snapshot_rx.as_mut() {
         while let Ok(snapshot) = rx.try_recv() {
             out.push(OrderedEvent {
+                venue_index: snapshot.venue_index,
                 venue_id: snapshot.venue_id.clone(),
                 source_seq: snapshot.seq,
                 event_ts_ms: snapshot.timestamp_ms,
@@ -680,8 +779,8 @@ fn drain_ordered_events(
     }
 
     out.sort_by(|a, b| {
-        (&a.venue_id, a.source_seq, a.event_ts_ms, a.type_order).cmp(&(
-            &b.venue_id,
+        (a.venue_index, a.source_seq, a.event_ts_ms, a.type_order).cmp(&(
+            b.venue_index,
             b.source_seq,
             b.event_ts_ms,
             b.type_order,
@@ -692,15 +791,16 @@ fn drain_ordered_events(
 }
 
 fn ordered_event_for_market(event: super::types::MarketDataEvent) -> Option<OrderedEvent> {
-    let (venue_id, source_seq, event_ts_ms) = match &event {
-        super::types::MarketDataEvent::L2Snapshot(s) => (s.venue_id.clone(), s.seq, s.timestamp_ms),
-        super::types::MarketDataEvent::L2Delta(d) => (d.venue_id.clone(), d.seq, d.timestamp_ms),
-        super::types::MarketDataEvent::Trade(t) => (t.venue_id.clone(), t.seq, t.timestamp_ms),
+    let (venue_index, venue_id, source_seq, event_ts_ms) = match &event {
+        super::types::MarketDataEvent::L2Snapshot(s) => (s.venue_index, s.venue_id.clone(), s.seq, s.timestamp_ms),
+        super::types::MarketDataEvent::L2Delta(d) => (d.venue_index, d.venue_id.clone(), d.seq, d.timestamp_ms),
+        super::types::MarketDataEvent::Trade(t) => (t.venue_index, t.venue_id.clone(), t.seq, t.timestamp_ms),
         super::types::MarketDataEvent::FundingUpdate(f) => {
-            (f.venue_id.clone(), f.seq, f.timestamp_ms)
+            (f.venue_index, f.venue_id.clone(), f.seq, f.timestamp_ms)
         }
     };
     Some(OrderedEvent {
+        venue_index,
         venue_id,
         source_seq,
         event_ts_ms,
@@ -710,10 +810,11 @@ fn ordered_event_for_market(event: super::types::MarketDataEvent) -> Option<Orde
 }
 
 fn ordered_event_for_account(event: super::types::AccountEvent) -> Option<OrderedEvent> {
-    let (venue_id, source_seq, event_ts_ms) = match &event {
-        super::types::AccountEvent::Snapshot(s) => (s.venue_id.clone(), s.seq, s.timestamp_ms),
+    let (venue_index, venue_id, source_seq, event_ts_ms) = match &event {
+        super::types::AccountEvent::Snapshot(s) => (s.venue_index, s.venue_id.clone(), s.seq, s.timestamp_ms),
     };
     Some(OrderedEvent {
+        venue_index,
         venue_id,
         source_seq,
         event_ts_ms,
@@ -723,31 +824,32 @@ fn ordered_event_for_account(event: super::types::AccountEvent) -> Option<Ordere
 }
 
 fn ordered_event_for_execution(event: super::types::ExecutionEvent) -> Option<OrderedEvent> {
-    let (venue_id, source_seq, event_ts_ms) = match &event {
+    let (venue_index, venue_id, source_seq, event_ts_ms) = match &event {
         super::types::ExecutionEvent::OrderAccepted(e) => {
-            (e.venue_id.clone(), e.seq, e.timestamp_ms)
+            (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
         super::types::ExecutionEvent::OrderRejected(e) => {
-            (e.venue_id.clone(), e.seq, e.timestamp_ms)
+            (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
-        super::types::ExecutionEvent::Filled(e) => (e.venue_id.clone(), e.seq, e.timestamp_ms),
+        super::types::ExecutionEvent::Filled(e) => (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms),
         super::types::ExecutionEvent::CancelAccepted(e) => {
-            (e.venue_id.clone(), e.seq, e.timestamp_ms)
+            (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
         super::types::ExecutionEvent::CancelRejected(e) => {
-            (e.venue_id.clone(), e.seq, e.timestamp_ms)
+            (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
         super::types::ExecutionEvent::CancelAllAccepted(e) => {
-            (e.venue_id.clone(), e.seq, e.timestamp_ms)
+            (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
         super::types::ExecutionEvent::CancelAllRejected(e) => {
-            (e.venue_id.clone(), e.seq, e.timestamp_ms)
+            (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
         super::types::ExecutionEvent::OrderSnapshot(e) => {
-            (e.venue_id.clone(), e.seq, e.timestamp_ms)
+            (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
     };
     Some(OrderedEvent {
+        venue_index,
         venue_id,
         source_seq,
         event_ts_ms,
@@ -895,11 +997,11 @@ pub async fn run_live_loop(
         .unwrap_or(1);
     let market_rx_stats_path = std::env::var_os("PARAPHINA_MARKET_RX_STATS_PATH");
     let l2_delta_coalesce = std::env::var("PARAPHINA_L2_DELTA_COALESCE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let l2_snapshot_coalesce = std::env::var("PARAPHINA_L2_SNAPSHOT_COALESCE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let mut canary_stale_ticks: u64 = 0;
     let pos_tol = std::env::var("PARAPHINA_RECONCILE_POS_TAO_TOL")
         .ok()
@@ -931,16 +1033,71 @@ pub async fn run_live_loop(
     let audit_dir = default_audit_dir();
     let mut last_now_ms: TimestampMs = 0;
     let mut last_snapshot: Option<super::state_cache::CanonicalCacheSnapshot> = None;
+    // Conditional quoting: per-venue tracking of last quoted state.
+    let conditional_quoting = std::env::var("PARAPHINA_CONDITIONAL_QUOTING")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let max_quote_age_ms: i64 = std::env::var("PARAPHINA_MAX_QUOTE_AGE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000);
+    let mut last_quoted_mid: Vec<Option<f64>> = vec![None; cfg.venues.len()];
+    let mut last_quoted_book_seq: Vec<u64> = vec![0; cfg.venues.len()];
+    let mut last_quote_ts_ms: Vec<TimestampMs> = vec![0; cfg.venues.len()];
+
     let mut pending_events: Vec<OrderedEvent> = Vec::new();
     let mut saw_ready_once = false;
     let mut coalesce_ready_mask: u64 = 0;
+    let tick_delta_buffer_max: Option<usize> = std::env::var("PARAPHINA_L2_TICK_DELTA_BUFFER_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0);
+
+    let min_inter_tick = Duration::from_millis(
+        std::env::var("PARAPHINA_MIN_INTER_TICK_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(100),
+    );
+    let mut last_tick_instant = Instant::now();
 
     loop {
         let now_ms = match mode {
             LiveRunMode::Realtime { max_ticks, .. } => {
+                // Event-driven wakeup: fire on interval OR when new market data arrives,
+                // whichever comes first. min_inter_tick prevents overload from high-frequency venues.
                 if let Some(interval) = interval.as_mut() {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            // Scheduled tick — always proceed
+                        }
+                        result = market_rx.recv() => {
+                            match result {
+                                Some(event) => {
+                                    // Push consumed event into pending_events for uniform drain processing.
+                                    if let Some(ordered) = ordered_event_for_market(event) {
+                                        pending_events.push(ordered);
+                                    }
+                                    // Check minimum inter-tick interval to prevent overload.
+                                    if last_tick_instant.elapsed() < min_inter_tick {
+                                        // Too soon — wait for the interval to fire naturally.
+                                        interval.tick().await;
+                                    } else {
+                                        // Early wakeup: reset interval to prevent back-to-back
+                                        // ticks when the dropped interval.tick() future's deadline
+                                        // has already elapsed.
+                                        interval.reset();
+                                    }
+                                }
+                                None => {
+                                    // Channel closed — proceed with regular interval
+                                    interval.tick().await;
+                                }
+                            }
+                        }
+                    }
                 }
+                last_tick_instant = Instant::now();
                 if let Some(max) = max_ticks {
                     if tick >= max {
                         break;
@@ -960,6 +1117,7 @@ pub async fn run_live_loop(
             }
         };
         last_now_ms = now_ms;
+        let tick_start = Instant::now();
 
         #[cfg(feature = "event_log")]
         if let Some(writer) = event_log.as_mut() {
@@ -979,42 +1137,26 @@ pub async fn run_live_loop(
             if should_reconcile {
                 last_account_reconcile_ms = Some(now_ms);
                 for venue_index in 0..cfg.venues.len() {
-                    let (response_tx, mut response_rx) = oneshot::channel();
-                    let request = LiveAccountRequest {
-                        venue_index: Some(venue_index),
-                        now_ms,
-                        response: response_tx,
-                    };
-                    if tx.try_send(request).is_ok() {
-                        for _ in 0..1_000 {
-                            match response_rx.try_recv() {
-                                Ok(snapshot) => {
-                                    if snapshot.timestamp_ms > 0 {
-                                        if let Some(last) =
-                                            last_account_snapshot_ms.get_mut(snapshot.venue_index)
-                                        {
-                                            *last = Some(snapshot.timestamp_ms);
-                                        }
-                                    }
-                                    let (report, diff) =
-                                        cache.reconcile_account_snapshot_with_diff(&snapshot);
-                                    if let Some(diff) = diff {
-                                        let _ = append_account_reconcile_audit(
-                                            &audit_dir, now_ms, diff,
-                                        );
-                                    }
-                                    if !report.account_ok {
-                                        if let Some(hooks) = hooks.as_ref() {
-                                            hooks.metrics.inc_error();
-                                            hooks.metrics.inc_reconcile_mismatch();
-                                        }
-                                    }
-                                    break;
-                                }
-                                Err(oneshot::error::TryRecvError::Closed) => break,
-                                Err(oneshot::error::TryRecvError::Empty) => {
-                                    tokio::task::yield_now().await
-                                }
+                    if let Some(snapshot) =
+                        send_account_and_wait(tx, venue_index, now_ms, 500, tick).await
+                    {
+                        if snapshot.timestamp_ms > 0 {
+                            if let Some(last) =
+                                last_account_snapshot_ms.get_mut(snapshot.venue_index)
+                            {
+                                *last = Some(snapshot.timestamp_ms);
+                            }
+                        }
+                        let (report, diff) =
+                            cache.reconcile_account_snapshot_with_diff(&snapshot);
+                        if let Some(diff) = diff {
+                            let _ =
+                                append_account_reconcile_audit(&audit_dir, now_ms, diff);
+                        }
+                        if !report.account_ok {
+                            if let Some(hooks) = hooks.as_ref() {
+                                hooks.metrics.inc_error();
+                                hooks.metrics.inc_reconcile_mismatch();
                             }
                         }
                     }
@@ -1050,6 +1192,8 @@ pub async fn run_live_loop(
                 }
             }
         }
+
+        let reconcile_elapsed_us = tick_start.elapsed().as_micros() as u64;
 
         let mut would_send_intents: Vec<OrderIntent> = Vec::new();
         let mut tick_exec_events: Vec<ExecutionEvent> = Vec::new();
@@ -1120,6 +1264,7 @@ pub async fn run_live_loop(
             snapshot_coalesce_now,
             coalesce_ready_mask,
             &mut saw_l2_snapshot_mask_this_tick,
+            tick_delta_buffer_max,
         ));
         let mut ordered_events = Vec::new();
         let mut future_events = Vec::new();
@@ -1132,8 +1277,8 @@ pub async fn run_live_loop(
         }
         pending_events = future_events;
         ordered_events.sort_by(|a, b| {
-            (&a.venue_id, a.source_seq, a.event_ts_ms, a.type_order).cmp(&(
-                &b.venue_id,
+            (a.venue_index, a.source_seq, a.event_ts_ms, a.type_order).cmp(&(
+                b.venue_index,
                 b.source_seq,
                 b.event_ts_ms,
                 b.type_order,
@@ -1423,13 +1568,15 @@ pub async fn run_live_loop(
             }
         }
 
-        let snapshot = cache.snapshot(now_ms, cfg.main_loop_interval_ms * 2);
+        let event_drain_elapsed_us = tick_start.elapsed().as_micros() as u64;
+
+        last_snapshot = Some(cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms));
+        let snapshot = last_snapshot.as_ref().unwrap();
         if snapshot.ready_market_count() > 0 || saw_l2_snapshot_mask_this_tick != 0 {
             saw_ready_once = true;
         }
         coalesce_ready_mask |= saw_l2_snapshot_mask_this_tick;
-        last_snapshot = Some(snapshot.clone());
-        let mut disabled = health_manager.update_from_snapshot(cfg, &mut state, &snapshot);
+        let mut disabled = health_manager.update_from_snapshot(cfg, &mut state, snapshot);
         if disable_health_gates {
             for venue in &mut state.venues {
                 venue.status = VenueStatus::Healthy;
@@ -1438,6 +1585,8 @@ pub async fn run_live_loop(
         }
         let stale_count = snapshot.market.iter().filter(|m| m.is_stale).count() as u64;
         if !disabled.is_empty() {
+            // Batch all disabled-venue cancel-all intents into a single channel send.
+            let mut cancel_intents: Vec<OrderIntent> = Vec::with_capacity(disabled.len());
             for venue_index in &disabled {
                 let intent =
                     crate::types::OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
@@ -1445,17 +1594,44 @@ pub async fn run_live_loop(
                         venue_id: Some(cfg.venues[*venue_index].id_arc.clone()),
                     });
                 would_send_intents.push(intent.clone());
-                dispatch_cancel_all_and_apply(
-                    cfg,
-                    &mut state,
+                cancel_intents.push(intent);
+            }
+            if !cancel_intents.is_empty() {
+                let mut action_id_gen = ActionIdGenerator::new(now_ms.max(0) as u64);
+                let actions = intents_to_actions(&cancel_intents, &mut action_id_gen);
+                let mut action_batch = ActionBatch::new(now_ms, now_ms.max(0) as u64, &cfg.version)
+                    .with_seed(None);
+                for action in actions {
+                    action_batch.push(action);
+                }
+                if let Some(hooks_ref) = hooks.as_ref() {
+                    hooks_ref.metrics.inc_cancel_all();
+                }
+                if let Some(events) = send_order_and_wait(
                     &order_tx,
+                    cancel_intents,
+                    action_batch,
                     now_ms,
+                    1000,
+                    "disabled_cancel_all",
                     now_ms.max(0) as u64,
-                    intent,
-                    hooks.as_ref(),
-                    &audit_dir,
                 )
-                .await;
+                .await
+                {
+                    #[cfg(feature = "event_log")]
+                    log_live_execution_events_env(
+                        now_ms.max(0) as u64,
+                        now_ms,
+                        "gateway",
+                        &events,
+                    );
+                    let core_events = live_events_to_core(&events);
+                    let fills = apply_execution_events(&mut state, &core_events, now_ms);
+                    if !fills.is_empty() {
+                        apply_live_fills(cfg, &mut state, &fills, now_ms);
+                        state.recompute_after_fills(cfg);
+                    }
+                }
             }
         }
         if let Some(hooks) = hooks.as_ref() {
@@ -1463,9 +1639,9 @@ pub async fn run_live_loop(
             let ready = ready_count == cfg.venues.len();
             hooks.health.set_ready(ready);
         }
-        let cache_events = snapshot_to_core_events(&snapshot, &state);
+        let cache_events = snapshot_to_core_events(snapshot, &state);
         let _ = apply_execution_events(&mut state, &cache_events, now_ms);
-        apply_account_snapshot_to_state(cfg, &snapshot, &mut state, now_ms);
+        apply_account_snapshot_to_state(cfg, snapshot, &mut state, now_ms);
 
         if canary_enabled && !state.kill_switch {
             if let Some(max_pos) = canary_max_position_tao {
@@ -1503,6 +1679,7 @@ pub async fn run_live_loop(
             engine.update_risk_limits_and_regime(&mut state);
             scheduler.mark_risk_ran();
         }
+        let engine_elapsed_us = tick_start.elapsed().as_micros() as u64;
 
         if let Some(hooks) = hooks.as_ref() {
             hooks.metrics.inc_tick(now_ms);
@@ -1528,47 +1705,107 @@ pub async fn run_live_loop(
             let _ = flush_batched_fills(&mut fill_batcher, cfg, &mut state, now_ms, true);
         }
 
-        if let Some(hooks) = hooks.as_ref() {
-            if let Some(telemetry) = hooks.telemetry.as_ref() {
-                update_live_telemetry_stats(
-                    telemetry,
-                    state.fv_available,
-                    stale_count,
-                    disabled.len() as u64,
-                    kill_transition,
-                    &would_send_intents,
-                );
-                pending_drift_events.sort_by(|a, b| {
-                    (a.venue_index, &a.kind, &a.source).cmp(&(b.venue_index, &b.kind, &b.source))
-                });
-                emit_live_telemetry(
-                    &mut telemetry_builder,
-                    telemetry,
-                    cfg,
-                    &state,
-                    now_ms,
-                    tick,
-                    &would_send_intents,
-                    &tick_exec_events,
-                    &tick_fills,
-                    None,
-                    None,
-                    &pending_drift_events,
-                    market_rx_stats_enabled.then_some(&market_rx_stats),
-                );
-                pending_drift_events.clear();
-            }
-        }
+        // Build tick timing snapshot for telemetry (total_us updated at tick end).
+        let order_tx_pending = order_tx.max_capacity() - order_tx.capacity();
+        let mut tick_timing = TickTiming {
+            reconcile_us: reconcile_elapsed_us,
+            event_drain_us: event_drain_elapsed_us,
+            engine_us: engine_elapsed_us,
+            submit_us: 0,
+            total_us: tick_start.elapsed().as_micros() as u64,
+            order_tx_pending,
+        };
 
+        pending_drift_events.sort_by(|a, b| {
+            (a.venue_index, &a.kind, &a.source).cmp(&(b.venue_index, &b.kind, &b.source))
+        });
+
+        // Early exit: kill switch triggered before submission phase.
         if state.kill_switch {
+            tick_timing.total_us = tick_start.elapsed().as_micros() as u64;
+            if let Some(hooks) = hooks.as_ref() {
+                if let Some(telemetry) = hooks.telemetry.as_ref() {
+                    update_live_telemetry_stats(
+                        telemetry, state.fv_available, stale_count,
+                        disabled.len() as u64, kill_transition, &would_send_intents,
+                    );
+                    emit_live_telemetry(
+                        &mut telemetry_builder, telemetry, cfg, &state, now_ms, tick,
+                        &would_send_intents, &tick_exec_events, &tick_fills, None, None,
+                        &pending_drift_events, market_rx_stats_enabled.then_some(&market_rx_stats),
+                        Some(&tick_timing),
+                    );
+                    pending_drift_events.clear();
+                }
+            }
             maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
             break;
         }
 
+        // Early exit: no ready markets — skip quoting/submission.
         if snapshot.ready_market_count() == 0 && !smoke_intents {
+            tick_timing.total_us = tick_start.elapsed().as_micros() as u64;
+            if let Some(hooks) = hooks.as_ref() {
+                if let Some(telemetry) = hooks.telemetry.as_ref() {
+                    update_live_telemetry_stats(
+                        telemetry, state.fv_available, stale_count,
+                        disabled.len() as u64, kill_transition, &would_send_intents,
+                    );
+                    emit_live_telemetry(
+                        &mut telemetry_builder, telemetry, cfg, &state, now_ms, tick,
+                        &would_send_intents, &tick_exec_events, &tick_fills, None, None,
+                        &pending_drift_events, market_rx_stats_enabled.then_some(&market_rx_stats),
+                        Some(&tick_timing),
+                    );
+                    pending_drift_events.clear();
+                }
+            }
             maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
             tick += 1;
             continue;
+        }
+
+        // Conditional quoting: skip requote for venues with unchanged data.
+        let mut should_quote = true;
+        if conditional_quoting && !smoke_intents {
+            let mut any_changed = false;
+            for vm in &snapshot.market {
+                let vi = vm.venue_index;
+                if vm.is_stale {
+                    continue;
+                }
+                let mid = vm.mid;
+                let seq = vm.seq;
+                let prev_mid = last_quoted_mid.get(vi).copied().flatten();
+                let prev_seq = last_quoted_book_seq.get(vi).copied().unwrap_or(0);
+                let prev_ts = last_quote_ts_ms.get(vi).copied().unwrap_or(0);
+                // Force requote if max quote age exceeded.
+                if now_ms.saturating_sub(prev_ts) > max_quote_age_ms {
+                    any_changed = true;
+                    break;
+                }
+                // Force requote if book sequence advanced (new data).
+                if seq > prev_seq {
+                    any_changed = true;
+                    break;
+                }
+                // Force requote if mid changed meaningfully.
+                if let (Some(cur), Some(prev)) = (mid, prev_mid) {
+                    let tick_size = cfg.venues.get(vi).map(|v| v.tick_size).unwrap_or(0.01);
+                    if (cur - prev).abs() > tick_size * 0.5 {
+                        any_changed = true;
+                        break;
+                    }
+                } else if mid.is_some() != prev_mid.is_some() {
+                    any_changed = true;
+                    break;
+                }
+            }
+            // Also force quote if no live orders exist (need to establish quotes).
+            let has_live_orders = state.venues.iter().any(|v| !v.open_orders.is_empty());
+            if !any_changed && has_live_orders {
+                should_quote = false;
+            }
         }
 
         let mm_quotes = if disable_fv_gate {
@@ -1579,7 +1816,11 @@ pub async fn run_live_loop(
         };
         let mut action_id_gen = crate::actions::ActionIdGenerator::new(tick);
         let mm_plan = plan_mm_order_actions(cfg, &state, &mm_quotes, now_ms, &mut action_id_gen);
-        let mut intents = mm_plan.intents.clone();
+        let mut intents = if should_quote {
+            mm_plan.intents.clone()
+        } else {
+            Vec::new() // Skip requote — data unchanged and live orders exist.
+        };
         apply_canary_intent_overrides(
             &mut intents,
             canary_enforce_post_only,
@@ -1603,8 +1844,20 @@ pub async fn run_live_loop(
         }
         if !intents.is_empty() {
             would_send_intents.extend(intents.iter().cloned());
+            // Update conditional quoting tracking for venues we're quoting.
+            if conditional_quoting {
+                for vm in &snapshot.market {
+                    let vi = vm.venue_index;
+                    if vi < last_quoted_mid.len() {
+                        last_quoted_mid[vi] = vm.mid;
+                        last_quoted_book_seq[vi] = vm.seq;
+                        last_quote_ts_ms[vi] = now_ms;
+                    }
+                }
+            }
         }
 
+        let submit_start = tick_start.elapsed();
         if !intents.is_empty() {
             if let Some(hooks) = hooks.as_ref() {
                 hooks.metrics.inc_orders(intents.len());
@@ -1615,91 +1868,73 @@ pub async fn run_live_loop(
             for action in actions {
                 action_batch.push(action);
             }
-            let (response_tx, mut response_rx) = oneshot::channel();
-            let request = LiveOrderRequest {
-                intents,
-                action_batch,
-                now_ms,
-                response: response_tx,
-            };
-            if order_tx.try_send(request).is_ok() {
-                let mut events = None;
-                for _ in 0..1_000 {
-                    match response_rx.try_recv() {
-                        Ok(val) => {
-                            events = Some(val);
-                            break;
-                        }
-                        Err(oneshot::error::TryRecvError::Closed) => break,
-                        Err(oneshot::error::TryRecvError::Empty) => {
-                            tokio::task::yield_now().await;
-                        }
+            if let Some(events) = send_order_and_wait(
+                &order_tx, intents, action_batch, now_ms, 500, "mm_quote", tick,
+            )
+            .await
+            {
+                for event in events {
+                    if deduper.is_duplicate(&event) {
+                        continue;
                     }
-                }
-                if let Some(events) = events {
-                    for event in events {
-                        if deduper.is_duplicate(&event) {
-                            continue;
-                        }
-                        if let super::types::ExecutionEvent::OrderSnapshot(snapshot) = event {
-                            let internal = state
-                                .live_order_state
-                                .open_order_ids_by_venue(snapshot.venue_index);
-                            let mut venue_orders = snapshot
-                                .open_orders
+                    if let super::types::ExecutionEvent::OrderSnapshot(snapshot) = event {
+                        let internal = state
+                            .live_order_state
+                            .open_order_ids_by_venue(snapshot.venue_index);
+                        let mut venue_orders = snapshot
+                            .open_orders
+                            .iter()
+                            .map(|o| o.order_id.clone())
+                            .collect::<Vec<_>>();
+                        venue_orders.sort();
+                        let diff_count = internal
+                            .iter()
+                            .filter(|id| !venue_orders.contains(*id))
+                            .count()
+                            + venue_orders
                                 .iter()
-                                .map(|o| o.order_id.clone())
-                                .collect::<Vec<_>>();
-                            venue_orders.sort();
-                            let diff_count = internal
-                                .iter()
-                                .filter(|id| !venue_orders.contains(*id))
-                                .count()
-                                + venue_orders
-                                    .iter()
-                                    .filter(|id| !internal.contains(*id))
-                                    .count();
-                            if diff_count > order_tol {
-                                push_reconcile_drift(
-                                    &mut pending_drift_events,
-                                    &audit_dir,
-                                    ReconcileDriftRecord {
-                                        timestamp_ms: snapshot.timestamp_ms,
-                                        venue_index: snapshot.venue_index,
-                                        venue_id: snapshot.venue_id.clone(),
-                                        kind: "open_orders".to_string(),
-                                        internal: Some(internal.len() as f64),
-                                        venue: Some(venue_orders.len() as f64),
-                                        diff: Some(
-                                            internal.len() as f64 - venue_orders.len() as f64,
-                                        ),
-                                        tolerance: Some(order_tol as f64),
-                                        source: "order_snapshot".to_string(),
-                                        available: true,
-                                    },
-                                );
-                                if !skip_reconcile_kill {
-                                    if !state.kill_switch {
-                                        state.kill_switch = true;
-                                        state.kill_reason =
-                                            crate::state::KillReason::ReconciliationDrift;
-                                    }
+                                .filter(|id| !internal.contains(*id))
+                                .count();
+                        if diff_count > order_tol {
+                            push_reconcile_drift(
+                                &mut pending_drift_events,
+                                &audit_dir,
+                                ReconcileDriftRecord {
+                                    timestamp_ms: snapshot.timestamp_ms,
+                                    venue_index: snapshot.venue_index,
+                                    venue_id: snapshot.venue_id.clone(),
+                                    kind: "open_orders".to_string(),
+                                    internal: Some(internal.len() as f64),
+                                    venue: Some(venue_orders.len() as f64),
+                                    diff: Some(
+                                        internal.len() as f64 - venue_orders.len() as f64,
+                                    ),
+                                    tolerance: Some(order_tol as f64),
+                                    source: "order_snapshot".to_string(),
+                                    available: true,
+                                },
+                            );
+                            if !skip_reconcile_kill {
+                                if !state.kill_switch {
+                                    state.kill_switch = true;
+                                    state.kill_reason =
+                                        crate::state::KillReason::ReconciliationDrift;
                                 }
                             }
-                            state.live_order_state.reconcile(&snapshot, now_ms);
-                            continue;
                         }
-                        #[cfg(feature = "event_log")]
-                        log_live_execution_event(&mut event_log, tick, now_ms, "gateway", &event);
-                        let core_events = live_events_to_core(&[event]);
-                        tick_exec_events.extend(core_events.iter().cloned());
-                        let fills = apply_execution_events(&mut state, &core_events, now_ms);
-                        if !fills.is_empty() {
-                            tick_fills.extend(fills.iter().cloned());
-                        }
-                        if !fills.is_empty() {
-                            fill_batcher.push(now_ms, fills);
-                        }
+                        state.live_order_state.reconcile(&snapshot, now_ms);
+                        continue;
+                    }
+                    #[cfg(feature = "event_log")]
+                    log_live_execution_event(&mut event_log, tick, now_ms, "gateway", &event);
+                    let core_events = live_events_to_core(&[event]);
+                    tick_exec_events.extend(core_events.iter().cloned());
+                    let fills = apply_execution_events(&mut state, &core_events, now_ms);
+                    if !fills.is_empty() {
+                        tick_fills.extend(fills.iter().cloned());
+                    }
+                    if !fills.is_empty() {
+                        fill_batcher.push(now_ms, fills);
                     }
                 }
             }
@@ -1727,59 +1962,41 @@ pub async fn run_live_loop(
                     for action in actions {
                         action_batch.push(action);
                     }
-                    let (response_tx, mut response_rx) = oneshot::channel();
-                    let request = LiveOrderRequest {
-                        intents: exit_intents,
-                        action_batch,
-                        now_ms,
-                        response: response_tx,
-                    };
-                    if order_tx.try_send(request).is_ok() {
-                        let mut events = None;
-                        for _ in 0..1_000 {
-                            match response_rx.try_recv() {
-                                Ok(val) => {
-                                    events = Some(val);
-                                    break;
-                                }
-                                Err(oneshot::error::TryRecvError::Closed) => break,
-                                Err(oneshot::error::TryRecvError::Empty) => {
-                                    tokio::task::yield_now().await;
-                                }
+                    if let Some(events) = send_order_and_wait(
+                        &order_tx, exit_intents, action_batch, now_ms, 500, "exit", tick,
+                    )
+                    .await
+                    {
+                        let mut exit_fills = Vec::new();
+                        for event in events {
+                            if deduper.is_duplicate(&event) {
+                                continue;
+                            }
+                            if let super::types::ExecutionEvent::OrderSnapshot(snapshot) = event
+                            {
+                                state.live_order_state.reconcile(&snapshot, now_ms);
+                                continue;
+                            }
+                            #[cfg(feature = "event_log")]
+                            log_live_execution_event(
+                                &mut event_log,
+                                tick,
+                                now_ms,
+                                "gateway",
+                                &event,
+                            );
+                            let core_events = live_events_to_core(&[event]);
+                            tick_exec_events.extend(core_events.iter().cloned());
+                            let fills =
+                                apply_execution_events(&mut state, &core_events, now_ms);
+                            if !fills.is_empty() {
+                                tick_fills.extend(fills.iter().cloned());
+                                exit_fills.extend(fills);
                             }
                         }
-                        if let Some(events) = events {
-                            let mut exit_fills = Vec::new();
-                            for event in events {
-                                if deduper.is_duplicate(&event) {
-                                    continue;
-                                }
-                                if let super::types::ExecutionEvent::OrderSnapshot(snapshot) = event
-                                {
-                                    state.live_order_state.reconcile(&snapshot, now_ms);
-                                    continue;
-                                }
-                                #[cfg(feature = "event_log")]
-                                log_live_execution_event(
-                                    &mut event_log,
-                                    tick,
-                                    now_ms,
-                                    "gateway",
-                                    &event,
-                                );
-                                let core_events = live_events_to_core(&[event]);
-                                tick_exec_events.extend(core_events.iter().cloned());
-                                let fills =
-                                    apply_execution_events(&mut state, &core_events, now_ms);
-                                if !fills.is_empty() {
-                                    tick_fills.extend(fills.iter().cloned());
-                                    exit_fills.extend(fills);
-                                }
-                            }
-                            if !exit_fills.is_empty() {
-                                apply_live_fills(cfg, &mut state, &exit_fills, now_ms);
-                                state.recompute_after_fills(cfg);
-                            }
+                        if !exit_fills.is_empty() {
+                            apply_live_fills(cfg, &mut state, &exit_fills, now_ms);
+                            state.recompute_after_fills(cfg);
                         }
                     }
                 }
@@ -1805,60 +2022,42 @@ pub async fn run_live_loop(
                         for action in actions {
                             action_batch.push(action);
                         }
-                        let (response_tx, mut response_rx) = oneshot::channel();
-                        let request = LiveOrderRequest {
-                            intents: hedge_intents,
-                            action_batch,
-                            now_ms,
-                            response: response_tx,
-                        };
-                        if order_tx.try_send(request).is_ok() {
-                            let mut events = None;
-                            for _ in 0..1_000 {
-                                match response_rx.try_recv() {
-                                    Ok(val) => {
-                                        events = Some(val);
-                                        break;
-                                    }
-                                    Err(oneshot::error::TryRecvError::Closed) => break,
-                                    Err(oneshot::error::TryRecvError::Empty) => {
-                                        tokio::task::yield_now().await;
-                                    }
+                        if let Some(events) = send_order_and_wait(
+                            &order_tx, hedge_intents, action_batch, now_ms, 500, "hedge", tick,
+                        )
+                        .await
+                        {
+                            let mut hedge_fills = Vec::new();
+                            for event in events {
+                                if deduper.is_duplicate(&event) {
+                                    continue;
+                                }
+                                if let super::types::ExecutionEvent::OrderSnapshot(snapshot) =
+                                    event
+                                {
+                                    state.live_order_state.reconcile(&snapshot, now_ms);
+                                    continue;
+                                }
+                                #[cfg(feature = "event_log")]
+                                log_live_execution_event(
+                                    &mut event_log,
+                                    tick,
+                                    now_ms,
+                                    "gateway",
+                                    &event,
+                                );
+                                let core_events = live_events_to_core(&[event]);
+                                tick_exec_events.extend(core_events.iter().cloned());
+                                let fills =
+                                    apply_execution_events(&mut state, &core_events, now_ms);
+                                if !fills.is_empty() {
+                                    tick_fills.extend(fills.iter().cloned());
+                                    hedge_fills.extend(fills);
                                 }
                             }
-                            if let Some(events) = events {
-                                let mut hedge_fills = Vec::new();
-                                for event in events {
-                                    if deduper.is_duplicate(&event) {
-                                        continue;
-                                    }
-                                    if let super::types::ExecutionEvent::OrderSnapshot(snapshot) =
-                                        event
-                                    {
-                                        state.live_order_state.reconcile(&snapshot, now_ms);
-                                        continue;
-                                    }
-                                    #[cfg(feature = "event_log")]
-                                    log_live_execution_event(
-                                        &mut event_log,
-                                        tick,
-                                        now_ms,
-                                        "gateway",
-                                        &event,
-                                    );
-                                    let core_events = live_events_to_core(&[event]);
-                                    tick_exec_events.extend(core_events.iter().cloned());
-                                    let fills =
-                                        apply_execution_events(&mut state, &core_events, now_ms);
-                                    if !fills.is_empty() {
-                                        tick_fills.extend(fills.iter().cloned());
-                                        hedge_fills.extend(fills);
-                                    }
-                                }
-                                if !hedge_fills.is_empty() {
-                                    apply_live_fills(cfg, &mut state, &hedge_fills, now_ms);
-                                    state.recompute_after_fills(cfg);
-                                }
+                            if !hedge_fills.is_empty() {
+                                apply_live_fills(cfg, &mut state, &hedge_fills, now_ms);
+                                state.recompute_after_fills(cfg);
                             }
                         }
                     }
@@ -1867,7 +2066,26 @@ pub async fn run_live_loop(
             }
         }
 
+        tick_timing.submit_us = tick_start.elapsed().as_micros() as u64 - submit_start.as_micros() as u64;
+
+        // Kill switch triggered during submission phase.
         if state.kill_switch {
+            tick_timing.total_us = tick_start.elapsed().as_micros() as u64;
+            if let Some(hooks) = hooks.as_ref() {
+                if let Some(telemetry) = hooks.telemetry.as_ref() {
+                    update_live_telemetry_stats(
+                        telemetry, state.fv_available, stale_count,
+                        disabled.len() as u64, kill_transition, &would_send_intents,
+                    );
+                    emit_live_telemetry(
+                        &mut telemetry_builder, telemetry, cfg, &state, now_ms, tick,
+                        &would_send_intents, &tick_exec_events, &tick_fills, None, None,
+                        &pending_drift_events, market_rx_stats_enabled.then_some(&market_rx_stats),
+                        Some(&tick_timing),
+                    );
+                    pending_drift_events.clear();
+                }
+            }
             maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
             break;
         }
@@ -1880,6 +2098,42 @@ pub async fn run_live_loop(
                 market_rx_stats.cap_hits,
             );
         }
+        // --- Tick timing: graduated overrun detection ---
+        tick_timing.total_us = tick_start.elapsed().as_micros() as u64;
+        if let LiveRunMode::Realtime { interval_ms, .. } = mode {
+            let budget_us = (interval_ms as u64) * 1000;
+            if tick_timing.total_us > budget_us {
+                eprintln!(
+                    "[runner] tick={} OVERRUN: {}us > {}us budget (reconcile={}us drain={}us engine={}us submit={}us order_tx_pending={})",
+                    tick, tick_timing.total_us, budget_us,
+                    tick_timing.reconcile_us, tick_timing.event_drain_us,
+                    tick_timing.engine_us, tick_timing.submit_us, tick_timing.order_tx_pending,
+                );
+            } else if tick_timing.total_us > budget_us * 4 / 5 {
+                eprintln!(
+                    "[runner] tick={} WARN: {}us > 80% of {}us budget",
+                    tick, tick_timing.total_us, budget_us,
+                );
+            }
+        }
+
+        // Normal path: emit telemetry with finalized timing (submit_us + total_us are accurate).
+        if let Some(hooks) = hooks.as_ref() {
+            if let Some(telemetry) = hooks.telemetry.as_ref() {
+                update_live_telemetry_stats(
+                    telemetry, state.fv_available, stale_count,
+                    disabled.len() as u64, kill_transition, &would_send_intents,
+                );
+                emit_live_telemetry(
+                    &mut telemetry_builder, telemetry, cfg, &state, now_ms, tick,
+                    &would_send_intents, &tick_exec_events, &tick_fills, None, None,
+                    &pending_drift_events, market_rx_stats_enabled.then_some(&market_rx_stats),
+                    Some(&tick_timing),
+                );
+                pending_drift_events.clear();
+            }
+        }
+
         tick += 1;
         if let LiveRunMode::Step { .. } = mode {
             tokio::task::yield_now().await;
@@ -1934,13 +2188,44 @@ pub async fn handle_kill_switch(
         }
     }
 
+    // Batch all venue cancel-all intents into a single channel send.
+    let mut cancel_intents: Vec<OrderIntent> = Vec::with_capacity(cfg.venues.len());
     for (venue_index, venue) in cfg.venues.iter().enumerate() {
-        let intent = OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
+        cancel_intents.push(OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
             venue_index: Some(venue_index),
             venue_id: Some(venue.id_arc.clone()),
-        });
-        dispatch_cancel_all_and_apply(cfg, state, order_tx, now_ms, tick, intent, hooks, audit_dir)
-            .await;
+        }));
+    }
+    if !cancel_intents.is_empty() {
+        let mut action_id_gen = ActionIdGenerator::new(tick);
+        let actions = intents_to_actions(&cancel_intents, &mut action_id_gen);
+        let mut action_batch = ActionBatch::new(now_ms, tick, &cfg.version).with_seed(None);
+        for action in actions {
+            action_batch.push(action);
+        }
+        if let Some(hooks_ref) = hooks {
+            hooks_ref.metrics.inc_cancel_all();
+        }
+        if let Some(events) = send_order_and_wait(
+            order_tx,
+            cancel_intents,
+            action_batch,
+            now_ms,
+            2000,
+            "kill_cancel_all",
+            tick,
+        )
+        .await
+        {
+            #[cfg(feature = "event_log")]
+            log_live_execution_events_env(tick, now_ms, "gateway", &events);
+            let core_events = live_events_to_core(&events);
+            let fills = apply_execution_events(state, &core_events, now_ms);
+            if !fills.is_empty() {
+                apply_live_fills(cfg, state, &fills, now_ms);
+                state.recompute_after_fills(cfg);
+            }
+        }
     }
 
     if best_effort_flatten {
@@ -1951,65 +2236,17 @@ pub async fn handle_kill_switch(
             for action in actions {
                 action_batch.push(action);
             }
-            let (response_tx, mut response_rx) = oneshot::channel();
-            let request = LiveOrderRequest {
-                intents: vec![intent],
+            if let Some(events) = send_order_and_wait(
+                order_tx,
+                vec![intent],
                 action_batch,
                 now_ms,
-                response: response_tx,
-            };
-            let _ = order_tx.try_send(request);
-            for _ in 0..1_000 {
-                match response_rx.try_recv() {
-                    Ok(events) => {
-                        #[cfg(feature = "event_log")]
-                        log_live_execution_events_env(tick, now_ms, "gateway", &events);
-                        let core_events = live_events_to_core(&events);
-                        let fills = apply_execution_events(state, &core_events, now_ms);
-                        if !fills.is_empty() {
-                            apply_live_fills(cfg, state, &fills, now_ms);
-                            state.recompute_after_fills(cfg);
-                        }
-                        break;
-                    }
-                    Err(oneshot::error::TryRecvError::Closed) => break,
-                    Err(oneshot::error::TryRecvError::Empty) => tokio::task::yield_now().await,
-                }
-            }
-        }
-    }
-}
-
-async fn dispatch_cancel_all_and_apply(
-    cfg: &Config,
-    state: &mut GlobalState,
-    order_tx: &mpsc::Sender<LiveOrderRequest>,
-    now_ms: TimestampMs,
-    tick: u64,
-    intent: OrderIntent,
-    hooks: Option<&LiveRuntimeHooks>,
-    _audit_dir: &PathBuf,
-) {
-    let mut action_id_gen = ActionIdGenerator::new(tick);
-    let actions = intents_to_actions(&[intent.clone()], &mut action_id_gen);
-    let mut action_batch = ActionBatch::new(now_ms, tick, &cfg.version).with_seed(None);
-    for action in actions {
-        action_batch.push(action);
-    }
-    let (response_tx, mut response_rx) = oneshot::channel();
-    let request = LiveOrderRequest {
-        intents: vec![intent],
-        action_batch,
-        now_ms,
-        response: response_tx,
-    };
-    let _ = order_tx.try_send(request);
-    if let Some(hooks) = hooks {
-        hooks.metrics.inc_cancel_all();
-    }
-    for _ in 0..1_000 {
-        match response_rx.try_recv() {
-            Ok(events) => {
+                1000,
+                "flatten",
+                tick,
+            )
+            .await
+            {
                 #[cfg(feature = "event_log")]
                 log_live_execution_events_env(tick, now_ms, "gateway", &events);
                 let core_events = live_events_to_core(&events);
@@ -2018,10 +2255,7 @@ async fn dispatch_cancel_all_and_apply(
                     apply_live_fills(cfg, state, &fills, now_ms);
                     state.recompute_after_fills(cfg);
                 }
-                break;
             }
-            Err(oneshot::error::TryRecvError::Closed) => break,
-            Err(oneshot::error::TryRecvError::Empty) => tokio::task::yield_now().await,
         }
     }
 }
@@ -2173,6 +2407,23 @@ fn update_live_telemetry_stats(
     }
 }
 
+/// Per-tick timing breakdown (microseconds) for telemetry and overrun detection.
+#[derive(Debug, Clone, Default)]
+struct TickTiming {
+    /// Wall-clock time spent in account reconciliation phase.
+    reconcile_us: u64,
+    /// Cumulative time through event drain + processing phase.
+    event_drain_us: u64,
+    /// Cumulative time through engine tick + risk update phase.
+    engine_us: u64,
+    /// Wall-clock time spent blocking on order submission (mm + exit + hedge).
+    submit_us: u64,
+    /// Total tick wall-clock time (set at tick end).
+    total_us: u64,
+    /// Approximate pending requests in the order_tx channel (back-pressure indicator).
+    order_tx_pending: usize,
+}
+
 fn emit_live_telemetry(
     builder: &mut TelemetryBuilder,
     telemetry: &LiveTelemetry,
@@ -2187,6 +2438,7 @@ fn emit_live_telemetry(
     last_hedge_intent: Option<&OrderIntent>,
     reconcile_drift: &[ReconcileDriftRecord],
     market_rx_stats: Option<&MarketRxStats>,
+    tick_timing: Option<&TickTiming>,
 ) {
     let mut record = builder.build_record(TelemetryInputs {
         cfg,
@@ -2221,6 +2473,22 @@ fn emit_live_telemetry(
                     "out_trade": stats.out_trade,
                     "out_funding_update": stats.out_funding_update,
                     "cap_hits": stats.cap_hits
+                }),
+            );
+        }
+    }
+    if let Some(timing) = tick_timing {
+        if let serde_json::Value::Object(ref mut map) = record {
+            map.insert(
+                "tick_timing".to_string(),
+                json!({
+                    "reconcile_us": timing.reconcile_us,
+                    "event_drain_us": timing.event_drain_us,
+                    "engine_us": timing.engine_us,
+                    "submit_us": timing.submit_us,
+                    "total_us": timing.total_us,
+                    "total_ms": timing.total_us / 1000,
+                    "order_tx_pending": timing.order_tx_pending,
                 }),
             );
         }
@@ -2623,7 +2891,7 @@ fn flush_replay_tick(
     exec_events: &[ExecutionEvent],
     fills: &[crate::types::FillEvent],
 ) -> CanonicalCacheSnapshot {
-    let snapshot = cache.snapshot(now_ms, cfg.main_loop_interval_ms * 2);
+    let snapshot = cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
     let disabled = health_manager.update_from_snapshot(cfg, state, &snapshot);
     let cache_events = snapshot_to_core_events(&snapshot, state);
     let _ = apply_execution_events(state, &cache_events, now_ms);
@@ -2657,6 +2925,7 @@ fn flush_replay_tick(
         None,
         &[],
         None,
+        None, // no tick timing in replay path
     );
     let _ = flush_batched_fills(fill_batcher, cfg, state, now_ms, true);
     snapshot
@@ -2765,6 +3034,7 @@ mod tests {
             true,
             coalesce_ready_mask,
             &mut saw_l2_snapshot_mask_this_tick,
+            None,
         );
 
         let mut snapshots = 0;
@@ -2898,6 +3168,7 @@ mod tests {
             true,
             coalesce_ready_mask,
             &mut saw_l2_snapshot_mask_this_tick,
+            None,
         );
 
         let mut snapshots = 0;
@@ -2990,6 +3261,7 @@ mod tests {
             true,
             coalesce_ready_mask,
             &mut saw_l2_snapshot_mask_this_tick,
+            None,
         );
 
         let mut snapshot_seq = None;

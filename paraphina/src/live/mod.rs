@@ -29,7 +29,7 @@ pub use orderbook_l2::{
 };
 pub use runner::{
     run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRunSummary, LiveTelemetry,
-    LiveTelemetryStats,
+    LiveTelemetryStats, ResponseMode,
 };
 pub use shadow_adapter::ShadowAckAdapter;
 pub use state_cache::{

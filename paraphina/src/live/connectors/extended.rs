@@ -179,6 +179,10 @@ impl ExtendedConnector {
         let http = Client::builder()
             .user_agent("paraphina")
             .timeout(Duration::from_secs(10))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .pool_idle_timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(5)
             .build()
             .expect("extended http client build");
         let freshness = Arc::new(Freshness::default());
@@ -794,6 +798,10 @@ impl ExtendedRestClient {
             http: Client::builder()
                 .user_agent("paraphina")
                 .timeout(Duration::from_secs(10))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .pool_idle_timeout(Duration::from_secs(60))
+                .pool_max_idle_per_host(5)
                 .build()
                 .expect("extended rest http client build"),
             timestamp_fn: Arc::new(now_ms),

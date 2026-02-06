@@ -21,7 +21,7 @@ use paraphina::live::ops::{
 use paraphina::live::orderbook_l2::BookLevel;
 use paraphina::live::paper_adapter::{PaperExecutionAdapter, PaperFillMode, PaperMarketUpdate};
 use paraphina::live::runner::{
-    run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRuntimeHooks,
+    run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRuntimeHooks, ResponseMode,
 };
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
 use paraphina::live::types::L2Snapshot;
@@ -2554,7 +2554,17 @@ async fn main() {
                     } else {
                         shadow.handle_intents(intents, action_batch.tick_index, now_ms)
                     };
-                    let _ = response.send(events);
+                    match response {
+                        ResponseMode::Oneshot(tx) => {
+                            let _ = tx.send(events);
+                        }
+                        ResponseMode::FireAndForget => {
+                            // Push all events to exec_tx for next-tick collection.
+                            for event in events {
+                                let _ = exec_tx.try_send(event);
+                            }
+                        }
+                    }
                 }
                 else => break,
             }

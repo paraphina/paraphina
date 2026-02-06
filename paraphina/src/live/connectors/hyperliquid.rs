@@ -225,6 +225,8 @@ pub struct HyperliquidConnector {
     account_tx: Option<mpsc::Sender<AccountEvent>>,
     asset_index: tokio::sync::Mutex<Option<u32>>,
     freshness: Arc<Freshness>,
+    /// Cached signing key parsed once at initialization (avoids per-call hex decode + key construction).
+    signing_key: Option<SigningKey>,
 }
 
 impl HyperliquidConnector {
@@ -233,10 +235,30 @@ impl HyperliquidConnector {
         market_tx: mpsc::Sender<MarketDataEvent>,
         exec_tx: mpsc::Sender<ExecutionEvent>,
     ) -> Self {
+        let signing_key = cfg.private_key_hex.as_ref().and_then(|key_hex| {
+            let trimmed = key_hex.trim_start_matches("0x");
+            match hex::decode(trimmed) {
+                Ok(key_bytes) => match SigningKey::from_slice(&key_bytes) {
+                    Ok(sk) => Some(sk),
+                    Err(e) => {
+                        eprintln!("[hl] WARN: failed to parse signing key: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[hl] WARN: failed to decode signing key hex: {e}");
+                    None
+                }
+            }
+        });
         Self {
             cfg,
             http: Client::builder()
                 .timeout(Duration::from_secs(10))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .pool_idle_timeout(Duration::from_secs(60))
+                .pool_max_idle_per_host(5)
                 .build()
                 .expect("hl http client build"),
             market_tx,
@@ -244,6 +266,7 @@ impl HyperliquidConnector {
             account_tx: None,
             asset_index: tokio::sync::Mutex::new(None),
             freshness: Arc::new(Freshness::default()),
+            signing_key,
         }
     }
 
@@ -800,7 +823,9 @@ impl HyperliquidConnector {
         let asset_index = self.get_asset_index().await?;
         let action = build_action(intent, asset_index)?;
         let nonce = now_ms;
-        let signature = sign_action(&action, nonce, &self.cfg)?;
+        let sk = self.signing_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
+        let signature = sign_action(&action, nonce, sk)?;
         let payload = json!({
             "action": action,
             "nonce": nonce,
@@ -833,7 +858,9 @@ impl HyperliquidConnector {
         let asset_index = self.get_asset_index().await?;
         let action = build_cancel_action(intent, asset_index)?;
         let nonce = now_ms;
-        let signature = sign_action(&action, nonce, &self.cfg)?;
+        let sk = self.signing_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
+        let signature = sign_action(&action, nonce, sk)?;
         let payload = json!({
             "action": action,
             "nonce": nonce,
@@ -862,7 +889,9 @@ impl HyperliquidConnector {
         let asset_index = self.get_asset_index().await?;
         let action = build_cancel_all_action(asset_index);
         let nonce = now_ms;
-        let signature = sign_action(&action, nonce, &self.cfg)?;
+        let sk = self.signing_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
+        let signature = sign_action(&action, nonce, sk)?;
         let payload = json!({
             "action": action,
             "nonce": nonce,
@@ -1690,6 +1719,56 @@ fn build_action(intent: &OrderIntent, asset_index: u32) -> anyhow::Result<serde_
     }))
 }
 
+/// Build a batch order action with N orders in a single API call.
+/// Weight cost: 1 + floor(N/40). For N<=39, cost is weight 1 (same as a single order).
+fn build_batch_action(
+    places: &[&crate::types::PlaceOrderIntent],
+    asset_index: u32,
+) -> anyhow::Result<serde_json::Value> {
+    let orders: Vec<serde_json::Value> = places
+        .iter()
+        .map(|place| {
+            let tif = if place.post_only {
+                "Alo"
+            } else {
+                match place.time_in_force {
+                    TimeInForce::Gtc => "Gtc",
+                    TimeInForce::Ioc => "Ioc",
+                }
+            };
+            json!({
+                "a": asset_index,
+                "b": place.side == Side::Buy,
+                "p": format!("{:.8}", place.price),
+                "s": format!("{:.8}", place.size),
+                "r": place.reduce_only,
+                "t": { "limit": { "tif": tif } },
+                "c": place.client_order_id,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "type": "order",
+        "orders": orders,
+        "grouping": "na",
+    }))
+}
+
+/// Build a batch cancel action with N cancels in a single API call.
+fn build_batch_cancel_action(
+    cancels: &[&crate::types::CancelOrderIntent],
+    asset_index: u32,
+) -> serde_json::Value {
+    let cancel_items: Vec<serde_json::Value> = cancels
+        .iter()
+        .map(|c| json!({ "a": asset_index, "o": c.order_id }))
+        .collect();
+    json!({
+        "type": "cancel",
+        "cancels": cancel_items,
+    })
+}
+
 fn build_cancel_action(
     intent: &OrderIntent,
     asset_index: u32,
@@ -2088,14 +2167,8 @@ struct SignedPayload {
 fn sign_action(
     action: &serde_json::Value,
     nonce: TimestampMs,
-    cfg: &HyperliquidConfig,
+    signing_key: &SigningKey,
 ) -> anyhow::Result<serde_json::Value> {
-    let key_hex = cfg
-        .private_key_hex
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
-    let key_bytes = hex::decode(key_hex.trim_start_matches("0x"))?;
-    let signing_key = SigningKey::from_slice(&key_bytes)?;
     let payload = SignedPayload {
         action: action.clone(),
         nonce: nonce as u64,
