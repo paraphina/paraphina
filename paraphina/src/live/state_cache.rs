@@ -423,6 +423,65 @@ impl LiveStateCache {
         }
     }
 
+    /// Snapshot with per-venue staleness thresholds (respects stale_ms_override).
+    pub fn snapshot_per_venue(
+        &self,
+        now_ms: TimestampMs,
+        venues: &[crate::config::VenueConfig],
+        global_stale_ms: i64,
+    ) -> CanonicalCacheSnapshot {
+        let market = self
+            .market
+            .iter()
+            .map(|m| {
+                let stale_ms = venues
+                    .get(m.venue_index)
+                    .map(|v| v.effective_stale_ms(global_stale_ms))
+                    .unwrap_or(global_stale_ms);
+                VenueMarketSnapshot {
+                    venue_index: m.venue_index,
+                    venue_id: m.venue_id.clone(),
+                    seq: m.seq,
+                    timestamp_ms: m.last_update_ms,
+                    mid: m.mid,
+                    spread: m.spread,
+                    depth_near_mid: m.depth_near_mid,
+                    is_stale: m.is_stale(now_ms, stale_ms),
+                }
+            })
+            .collect();
+        let account = self
+            .account
+            .iter()
+            .map(|a| {
+                let stale_ms = venues
+                    .get(a.venue_index)
+                    .map(|v| v.effective_stale_ms(global_stale_ms))
+                    .unwrap_or(global_stale_ms);
+                VenueAccountSnapshot {
+                    venue_index: a.venue_index,
+                    venue_id: a.venue_id.clone(),
+                    seq: a.seq,
+                    timestamp_ms: a.last_update_ms,
+                    position_tao: a.position_tao,
+                    avg_entry_price: a.avg_entry_price,
+                    funding_8h: a.funding_8h,
+                    margin_balance_usd: a.margin.balance_usd,
+                    margin_used_usd: a.margin.used_usd,
+                    margin_available_usd: a.margin.available_usd,
+                    price_liq: a.liquidation.price_liq,
+                    dist_liq_sigma: a.liquidation.dist_liq_sigma,
+                    is_stale: a.is_stale(now_ms, stale_ms),
+                }
+            })
+            .collect();
+        CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market,
+            account,
+        }
+    }
+
     pub fn reconcile_market_snapshot(&self, snapshot: &L2Snapshot) -> ReconciliationReport {
         let mut report = ReconciliationReport::new();
         let Some(cache) = self.market.get(snapshot.venue_index) else {

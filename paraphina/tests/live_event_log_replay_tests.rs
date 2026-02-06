@@ -50,7 +50,10 @@ async fn live_event_log_replay_matches_telemetry() {
         while let Some(req) = order_rx.recv().await {
             let events =
                 shadow.handle_intents(req.intents, req.action_batch.tick_index, req.now_ms);
-            let _ = req.response.send(events);
+            match req.response {
+                paraphina::live::ResponseMode::Oneshot(tx) => { let _ = tx.send(events); }
+                paraphina::live::ResponseMode::FireAndForget => {}
+            }
         }
     });
 

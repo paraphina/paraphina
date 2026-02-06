@@ -300,6 +300,10 @@ impl LighterConnector {
             cfg,
             http: Client::builder()
                 .timeout(Duration::from_secs(10))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .pool_idle_timeout(Duration::from_secs(60))
+                .pool_max_idle_per_host(5)
                 .build()
                 .expect("lighter http client build"),
             market_publisher,

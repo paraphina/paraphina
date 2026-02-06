@@ -235,6 +235,10 @@ pub struct VenueConfig {
     /// threshold instead of the global `book.stale_ms`. Useful for high-latency
     /// venues (e.g., Hyperliquid) that need a larger staleness window.
     pub stale_ms_override: Option<i64>,
+    /// Per-venue max order requests per second (overrides global rate limit).
+    pub rate_limit_rps: Option<f64>,
+    /// Per-venue rate limit burst capacity.
+    pub rate_limit_burst: Option<u32>,
 }
 
 impl VenueConfig {
@@ -627,6 +631,8 @@ impl Default for Config {
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
                 stale_ms_override: None,
+                rate_limit_rps: Some(15.0),  // Assumed Binance-compatible ~20 RPS; 75% capacity.
+                rate_limit_burst: Some(20),
             },
             VenueConfig {
                 id: "hyperliquid".to_string(),
@@ -649,6 +655,8 @@ impl Default for Config {
                 // Hyperliquid WebSocket P50 ~1195ms, P95 ~1444ms (obs_5000_ticks_report).
                 // Default 1000ms causes 63.9% Stale / 1257 flaps in 83 min.
                 stale_ms_override: Some(2_000),
+                rate_limit_rps: Some(15.0),  // 1200 wt/min; batched orders = wt 1; 75% capacity.
+                rate_limit_burst: Some(20),
             },
             VenueConfig {
                 id: "aster".to_string(),
@@ -669,6 +677,8 @@ impl Default for Config {
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
                 stale_ms_override: None,
+                rate_limit_rps: Some(15.0),  // 1200 wt/min Binance-style; ~75% capacity.
+                rate_limit_burst: Some(20),
             },
             VenueConfig {
                 id: "lighter".to_string(),
@@ -689,6 +699,8 @@ impl Default for Config {
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
                 stale_ms_override: None,
+                rate_limit_rps: Some(30.0),  // 24k wt/min premium; sendTx wt 6; ~45% capacity.
+                rate_limit_burst: Some(45),
             },
             VenueConfig {
                 id: "paradex".to_string(),
@@ -711,6 +723,8 @@ impl Default for Config {
                 // Paradex BBO feed cadence: startup P95 ~1,546ms, steady-state P95 ~250ms.
                 // 3,000ms gives ~2x headroom over worst startup case.
                 stale_ms_override: Some(3_000),
+                rate_limit_rps: Some(50.0),  // 800 RPS documented; 50 is ~6% capacity.
+                rate_limit_burst: Some(75),
             },
         ];
 
@@ -917,9 +931,9 @@ impl Default for Config {
             venues,
             book,
             fill_agg_interval_ms: 1_000,
-            main_loop_interval_ms: 1_000,
-            hedge_loop_interval_ms: 1_000,
-            risk_loop_interval_ms: 1_000,
+            main_loop_interval_ms: 250,
+            hedge_loop_interval_ms: 500,
+            risk_loop_interval_ms: 3_000,
             kalman,
             volatility,
             risk,
@@ -1249,6 +1263,25 @@ impl Config {
                         "[config] WARN: could not parse PARAPHINA_RISK_LOOP_INTERVAL_MS = {:?} as i64; using default {}",
                         raw,
                         cfg.risk_loop_interval_ms
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_FILL_AGG_INTERVAL_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    cfg.fill_agg_interval_ms = v.max(1);
+                    eprintln!(
+                        "[config] PARAPHINA_FILL_AGG_INTERVAL_MS = {} (overrode default)",
+                        cfg.fill_agg_interval_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_FILL_AGG_INTERVAL_MS = {:?} as i64; using default {}",
+                        raw,
+                        cfg.fill_agg_interval_ms
                     );
                 }
             }

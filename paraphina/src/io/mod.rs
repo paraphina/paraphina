@@ -154,8 +154,8 @@ impl GatewayPolicy {
     pub fn for_live() -> Self {
         Self {
             rate_limit: RateLimitPolicy {
-                max_requests_per_second: 5.0,
-                burst_capacity: 10,
+                max_requests_per_second: 50.0,
+                burst_capacity: 20,
                 enabled: true,
             },
             retry: RetryPolicy {
@@ -180,7 +180,7 @@ impl GatewayPolicy {
     pub fn from_env() -> Self {
         use std::env;
 
-        let mut policy = Self::default();
+        let mut policy = Self::for_live();
 
         if let Ok(val) = env::var("PARAPHINA_RATE_LIMIT_RPS") {
             if let Ok(rps) = val.parse::<f64>() {

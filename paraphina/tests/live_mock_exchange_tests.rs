@@ -128,7 +128,7 @@ mod tests {
                 &cfg.version,
             ),
             now_ms: start_ms + step_ms * ticks as i64,
-            response: response_tx,
+            response: paraphina::live::ResponseMode::Oneshot(response_tx),
         };
         let _ = handle.order_tx.send(request).await;
         let _ = handle

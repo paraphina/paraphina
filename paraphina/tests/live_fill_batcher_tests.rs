@@ -163,7 +163,7 @@ mod tests {
                 intents: vec![intent],
                 action_batch: paraphina::actions::ActionBatch::new(0, 0, &cfg.version),
                 now_ms: 0,
-                response: response_tx,
+                response: paraphina::live::ResponseMode::Oneshot(response_tx),
             })
             .await
             .expect("order send");

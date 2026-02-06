@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::types::{OrderIntent, OrderPurpose, Side, TimeInForce, TimestampMs};
 
 use super::orderbook_l2::{BookLevel, OrderBookL2};
-use super::runner::{LiveAccountRequest, LiveOrderRequest};
+use super::runner::{LiveAccountRequest, LiveOrderRequest, ResponseMode};
 use super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, LiquidationSnapshot,
     MarginSnapshot, MarketDataEvent, PositionSnapshot,
@@ -316,7 +316,10 @@ async fn run_exchange(
                         &positions,
                     )
                         .await;
-                let _ = req.response.send(events);
+                match req.response {
+                    ResponseMode::Oneshot(tx) => { let _ = tx.send(events); }
+                    ResponseMode::FireAndForget => { /* no exec_tx in mock; events dropped */ }
+                }
             }
             Some(cmd) = command_rx.recv() => {
                 handle_command(cmd, &mut venues, &execution_log, &open_orders).await;

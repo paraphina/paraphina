@@ -66,7 +66,10 @@ async fn live_telemetry_contract_passes_fixture_run() {
                 response,
             } = req;
             let events = shadow.handle_intents(intents, action_batch.tick_index, now_ms);
-            let _ = response.send(events);
+            match response {
+                paraphina::live::ResponseMode::Oneshot(tx) => { let _ = tx.send(events); }
+                paraphina::live::ResponseMode::FireAndForget => {}
+            }
         }
     });
 

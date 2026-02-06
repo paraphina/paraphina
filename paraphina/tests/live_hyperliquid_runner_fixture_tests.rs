@@ -70,6 +70,11 @@ fn compute_expected_local_vols(cfg: &Config, events: &[MarketDataEvent]) -> (f64
 
 #[tokio::test]
 async fn live_runner_consumes_hyperliquid_fixtures() {
+    // Disable L2 coalescing so every event is applied individually,
+    // matching compute_expected_local_vols' sequential application.
+    std::env::set_var("PARAPHINA_L2_DELTA_COALESCE", "0");
+    std::env::set_var("PARAPHINA_L2_SNAPSHOT_COALESCE", "0");
+
     let mut cfg = Config::default();
     cfg.venues = vec![cfg.venues[0].clone()];
     cfg.book.min_healthy_for_kf = 1;
@@ -114,7 +119,10 @@ async fn live_runner_consumes_hyperliquid_fixtures() {
                 response,
             } = req;
             let events = shadow.handle_intents(intents, action_batch.tick_index, now_ms);
-            let _ = response.send(events);
+            match response {
+                paraphina::live::ResponseMode::Oneshot(tx) => { let _ = tx.send(events); }
+                paraphina::live::ResponseMode::FireAndForget => {}
+            }
         }
     });
 

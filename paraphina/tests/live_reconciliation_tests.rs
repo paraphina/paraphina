@@ -35,7 +35,7 @@ mod tests {
             intents: vec![intent],
             action_batch: ActionBatch::new(now_ms, 0, &cfg.version),
             now_ms,
-            response: response_tx,
+            response: paraphina::live::ResponseMode::Oneshot(response_tx),
         };
         handle.order_tx.send(request).await.expect("send order");
         let mut events = None;
