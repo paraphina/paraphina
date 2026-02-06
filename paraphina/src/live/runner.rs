@@ -1715,6 +1715,9 @@ pub async fn run_live_loop(
             total_us: tick_start.elapsed().as_micros() as u64,
             order_tx_pending,
         };
+        // Only emit tick timing in Realtime mode; Step mode uses non-deterministic
+        // wall-clock values that break replay hash comparison.
+        let emit_tick_timing = matches!(mode, LiveRunMode::Realtime { .. });
 
         pending_drift_events.sort_by(|a, b| {
             (a.venue_index, &a.kind, &a.source).cmp(&(b.venue_index, &b.kind, &b.source))
@@ -1733,7 +1736,7 @@ pub async fn run_live_loop(
                         &mut telemetry_builder, telemetry, cfg, &state, now_ms, tick,
                         &would_send_intents, &tick_exec_events, &tick_fills, None, None,
                         &pending_drift_events, market_rx_stats_enabled.then_some(&market_rx_stats),
-                        Some(&tick_timing),
+                        if emit_tick_timing { Some(&tick_timing) } else { None },
                     );
                     pending_drift_events.clear();
                 }
@@ -1755,7 +1758,7 @@ pub async fn run_live_loop(
                         &mut telemetry_builder, telemetry, cfg, &state, now_ms, tick,
                         &would_send_intents, &tick_exec_events, &tick_fills, None, None,
                         &pending_drift_events, market_rx_stats_enabled.then_some(&market_rx_stats),
-                        Some(&tick_timing),
+                        if emit_tick_timing { Some(&tick_timing) } else { None },
                     );
                     pending_drift_events.clear();
                 }
@@ -2081,7 +2084,7 @@ pub async fn run_live_loop(
                         &mut telemetry_builder, telemetry, cfg, &state, now_ms, tick,
                         &would_send_intents, &tick_exec_events, &tick_fills, None, None,
                         &pending_drift_events, market_rx_stats_enabled.then_some(&market_rx_stats),
-                        Some(&tick_timing),
+                        if emit_tick_timing { Some(&tick_timing) } else { None },
                     );
                     pending_drift_events.clear();
                 }
@@ -2128,7 +2131,7 @@ pub async fn run_live_loop(
                     &mut telemetry_builder, telemetry, cfg, &state, now_ms, tick,
                     &would_send_intents, &tick_exec_events, &tick_fills, None, None,
                     &pending_drift_events, market_rx_stats_enabled.then_some(&market_rx_stats),
-                    Some(&tick_timing),
+                    if emit_tick_timing { Some(&tick_timing) } else { None },
                 );
                 pending_drift_events.clear();
             }
@@ -2925,7 +2928,7 @@ fn flush_replay_tick(
         None,
         &[],
         None,
-        None, // no tick timing in replay path
+        None, // replay path: no tick timing (matches Step mode live path)
     );
     let _ = flush_batched_fills(fill_batcher, cfg, state, now_ms, true);
     snapshot

@@ -98,7 +98,7 @@ mod tests {
                     intents: vec![intent],
                     action_batch: ActionBatch::new(0, 0, "test"),
                     now_ms: 1_000,
-                    response: response_tx,
+                    response: paraphina::live::ResponseMode::Oneshot(response_tx),
                 };
                 let _ = handle.order_tx.send(request).await;
                 let mut order_id = None;
@@ -149,7 +149,7 @@ mod tests {
                     intents: vec![intent],
                     action_batch: ActionBatch::new(0, 0, "test"),
                     now_ms: 1_000,
-                    response: response_tx,
+                    response: paraphina::live::ResponseMode::Oneshot(response_tx),
                 };
                 let _ = handle.order_tx.send(request).await;
                 let _ = response_rx.await;
@@ -181,7 +181,7 @@ mod tests {
                     intents: vec![intent],
                     action_batch: ActionBatch::new(0, 0, "test"),
                     now_ms: 1_000,
-                    response: response_tx,
+                    response: paraphina::live::ResponseMode::Oneshot(response_tx),
                 };
                 let _ = handle.order_tx.send(request).await;
                 let _ = response_rx.await;

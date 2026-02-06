@@ -31,7 +31,7 @@ mod tests {
             intents: vec![intent],
             action_batch: paraphina::actions::ActionBatch::new(0, 0, "test"),
             now_ms: 1_000,
-            response: response_tx,
+            response: paraphina::live::ResponseMode::Oneshot(response_tx),
         };
         handle.order_tx.send(request).await.expect("send order");
         for _ in 0..100 {
