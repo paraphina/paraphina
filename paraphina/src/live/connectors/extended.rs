@@ -223,6 +223,7 @@ impl ExtendedConnector {
 
     pub async fn run_public_ws(&self) {
         let mut backoff = Duration::from_secs(1);
+        let mut consecutive_failures: u32 = 0;
         let mut last_snapshot_warn: Option<Instant> = None;
 
         // FIX: Configurable healthy connection threshold for backoff reset
@@ -237,21 +238,42 @@ impl ExtendedConnector {
             let session_start = Instant::now();
 
             if let Err(err) = self.public_ws_once(&mut last_snapshot_warn).await {
-                eprintln!("Extended public WS error: {err}");
+                consecutive_failures += 1;
+                let level = if consecutive_failures >= 20 {
+                    "ERROR"
+                } else if consecutive_failures >= 5 {
+                    "WARN"
+                } else {
+                    "INFO"
+                };
+                eprintln!(
+                    "{level}: Extended public WS error (consecutive_failures={consecutive_failures}): {err}"
+                );
             }
 
-            // FIX: Reset backoff if connection was healthy for long enough
+            // FIX: Reset backoff and failure counter if connection was healthy for long enough
             let session_duration = session_start.elapsed();
             if session_duration >= healthy_threshold {
-                eprintln!(
-                    "INFO: Extended WS session was healthy for {:?}; resetting backoff",
-                    session_duration
-                );
+                if consecutive_failures > 0 {
+                    eprintln!(
+                        "INFO: Extended WS session was healthy for {:?}; \
+                         resetting backoff and failure counter (was {})",
+                        session_duration, consecutive_failures
+                    );
+                }
+                consecutive_failures = 0;
                 backoff = Duration::from_secs(1);
             }
 
+            // Escalating backoff caps: give upstream more time to recover
+            let max_backoff = match consecutive_failures {
+                0..=10 => Duration::from_secs(30),
+                11..=20 => Duration::from_secs(60),
+                _ => Duration::from_secs(120),
+            };
+
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+            backoff = (backoff * 2).min(max_backoff);
         }
     }
 
