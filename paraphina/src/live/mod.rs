@@ -35,8 +35,8 @@ pub use shadow_adapter::ShadowAckAdapter;
 pub use state_cache::{
     CanonicalCacheSnapshot, ReconciliationReport, VenueAccountCache, VenueMarketCache,
 };
+pub use supervision::{spawn_supervised, spawn_supervised_with_threshold};
 pub use trade_mode::{
     resolve_effective_trade_mode, EffectiveTradeMode, TradeMode, TradeModeSource,
 };
-pub use supervision::{spawn_supervised, spawn_supervised_with_threshold};
 pub use types::{AccountEvent, ExecutionEvent, MarketDataEvent};

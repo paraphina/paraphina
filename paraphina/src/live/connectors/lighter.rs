@@ -10,6 +10,11 @@ const LIGHTER_MARKET_PUB_DRAIN_MAX: usize = 64;
 const LIGHTER_STALE_MS_DEFAULT: u64 = 10_000;
 const LIGHTER_WATCHDOG_TICK_MS: u64 = 200;
 const LIGHTER_DECODE_WARN_INTERVAL_MS: u64 = 10_000;
+const LIGHTER_WS_CONNECT_TIMEOUT_MS_DEFAULT: u64 = 15_000;
+const LIGHTER_WS_READ_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+/// Maximum consecutive delta decode failures before forcing a reconnect to
+/// obtain a fresh full snapshot.  Protects against book drift from missed deltas.
+const LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES: usize = 10;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
@@ -23,6 +28,35 @@ fn lighter_stale_ms() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(LIGHTER_STALE_MS_DEFAULT)
+}
+
+fn lighter_ws_connect_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("PARAPHINA_LIGHTER_WS_CONNECT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(LIGHTER_WS_CONNECT_TIMEOUT_MS_DEFAULT),
+    )
+}
+
+fn lighter_ws_read_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("PARAPHINA_LIGHTER_WS_READ_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(LIGHTER_WS_READ_TIMEOUT_MS_DEFAULT),
+    )
+}
+
+/// Wrap a future with a timeout, returning an anyhow error on expiration.
+async fn with_timeout<T>(
+    duration: Duration,
+    label: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(duration, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("Lighter {label} timed out after {duration:?}"))
 }
 
 fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
@@ -264,7 +298,10 @@ impl LighterConnector {
         let freshness = Arc::new(Freshness::default());
         Self {
             cfg,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("lighter http client build"),
             market_publisher,
             exec_tx,
             account_tx: None,
@@ -476,34 +513,8 @@ impl LighterConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
-        let freshness = self.freshness.clone();
-        let connect_start_ns = mono_now_ns();
-        freshness.reset_for_new_connection();
-
-        // Setup watchdog for stale detection
-        let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
-        let stale_ms = lighter_stale_ms();
-        let is_fixture = std::env::var_os("LIGHTER_FIXTURE_DIR").is_some()
-            || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
-        if is_fixture {
-            eprintln!("INFO: Lighter fixture mode detected; freshness watchdog disabled");
-        } else {
-            let watchdog_stale_ms = stale_ms;
-            let watchdog_freshness = self.freshness.clone();
-            tokio::spawn(async move {
-                let mut iv = tokio::time::interval(Duration::from_millis(LIGHTER_WATCHDOG_TICK_MS));
-                iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    iv.tick().await;
-                    let now = mono_now_ns();
-                    let anchor = watchdog_freshness.anchor_with_connect_start(connect_start_ns);
-                    if anchor != 0 && age_ms(now, anchor) > watchdog_stale_ms {
-                        let _ = stale_tx.send(());
-                        break;
-                    }
-                }
-            });
-        }
+        let connect_timeout = lighter_ws_connect_timeout();
+        let read_timeout = lighter_ws_read_timeout();
 
         let (market_symbol, market_id) = self.resolve_market_id_and_symbol().await?;
 
@@ -535,7 +546,13 @@ impl LighterConnector {
         }
 
         eprintln!("INFO: Lighter public WS connecting url={}", self.cfg.ws_url);
-        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        let (ws_stream, _) = with_timeout(
+            connect_timeout,
+            "public WS connect",
+            connect_async(self.cfg.ws_url.as_str()),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("Lighter public WS connect error: {e}"))?;
         eprintln!("INFO: Lighter public WS connected url={}", self.cfg.ws_url);
         let (mut write, mut read) = ws_stream.split();
         let channel = build_order_book_channel(market_id);
@@ -553,6 +570,12 @@ impl LighterConnector {
         let mut first_decoded_top_logged = false;
         let mut first_json_pong_logged = false;
         let mut decode_miss_count = 0usize;
+        // Tracks whether the initial full snapshot has been applied to the L2 book.
+        // After this, all subsequent order_book messages are applied as L2Delta (not L2Snapshot),
+        // because Lighter sends only state-changes after the subscription snapshot.
+        // See: https://apidocs.lighter.xyz/docs/websocket-reference#order-book
+        let mut initial_snapshot_applied = false;
+        let mut consecutive_delta_failures: usize = 0;
         let mut seq_fallback: u64 = 0;
         // Rate-limited logging for decode failures
         let mut last_decode_fail_warn_ns: u64 = 0;
@@ -562,7 +585,16 @@ impl LighterConnector {
                 _ = &mut stale_rx => {
                     anyhow::bail!("Lighter public WS stale: freshness exceeded {stale_ms}ms");
                 }
-                maybe = read.next() => {
+                read_result = tokio::time::timeout(read_timeout, read.next()) => {
+                    let maybe = match read_result {
+                        Ok(m) => m,
+                        Err(_) => {
+                            eprintln!(
+                                "WARN: Lighter public WS read timeout ({read_timeout:?}) — no frame received, reconnecting"
+                            );
+                            anyhow::bail!("Lighter public WS read timeout after {read_timeout:?}");
+                        }
+                    };
                     match maybe {
                         Some(Ok(msg)) => msg,
                         Some(Err(err)) => {
@@ -666,7 +698,7 @@ impl LighterConnector {
             }
             if subscribed {
                 // Update data receive timestamp when we get book-related messages
-                freshness
+                self.freshness
                     .last_data_rx_ns
                     .store(mono_now_ns(), Ordering::Relaxed);
 
@@ -678,7 +710,12 @@ impl LighterConnector {
                         );
                         first_decoded_top_logged = true;
                     }
-                } else if decode_miss_count < 3 && has_lighter_book_fields(&value) {
+                } else if !initial_snapshot_applied
+                    && decode_miss_count < 3
+                    && has_lighter_book_fields(&value)
+                {
+                    // Only log decode-miss for top-of-book during snapshot phase.
+                    // In delta mode, one-sided messages are expected and not a warning.
                     decode_miss_count += 1;
                     log_decode_miss(
                         "Lighter",
@@ -688,21 +725,56 @@ impl LighterConnector {
                         self.cfg.ws_url.as_str(),
                     );
                 }
-                // Try decode_order_book_channel_message first
-                if let Some(parsed) = decode_order_book_channel_message(
-                    &value,
-                    self.cfg.venue_index,
-                    &self.cfg.venue_id,
-                    &mut seq_fallback,
-                ) {
+                // === L2 decode: snapshot for first message, delta for subsequent ===
+                //
+                // Lighter sends a full snapshot on subscription, then only state-changes
+                // (deltas) afterwards. Treating deltas as snapshots would replace the
+                // entire book with partial data, causing intermittent zero-depth and
+                // Disabled flapping.
+                //
+                // See: https://apidocs.lighter.xyz/docs/websocket-reference#order-book
+                let decoded = if !initial_snapshot_applied {
+                    // First book message: decode as full L2Snapshot.
+                    decode_order_book_channel_message(
+                        &value,
+                        self.cfg.venue_index,
+                        &self.cfg.venue_id,
+                        &mut seq_fallback,
+                    )
+                    .or_else(|| {
+                        decode_order_book_snapshot(
+                            &value,
+                            self.cfg.venue_index,
+                            &self.cfg.venue_id,
+                            &mut seq_fallback,
+                        )
+                    })
+                } else {
+                    // Subsequent messages: decode as L2Delta (state changes only).
+                    decode_order_book_channel_delta(
+                        &value,
+                        self.cfg.venue_index,
+                        &self.cfg.venue_id,
+                        &mut seq_fallback,
+                    )
+                };
+
+                if let Some(parsed) = decoded {
+                    consecutive_delta_failures = 0;
                     // Update freshness on parsed data
                     self.freshness
                         .last_parsed_ns
                         .store(mono_now_ns(), Ordering::Relaxed);
                     let outcome = tracker.on_message(parsed);
                     if let Some(event) = outcome.event {
-                        // Update freshness only when we produce a publishable event
-                        freshness
+                        // Mark snapshot applied on the first successful book event
+                        if !initial_snapshot_applied {
+                            initial_snapshot_applied = true;
+                            eprintln!(
+                                "INFO: Lighter L2 initial snapshot applied, switching to delta mode"
+                            );
+                        }
+                        self.freshness
                             .last_parsed_ns
                             .store(mono_now_ns(), Ordering::Relaxed);
                         if !first_book_update_logged {
@@ -710,44 +782,26 @@ impl LighterConnector {
                             first_book_update_logged = true;
                         }
                         if self.publish_market(event).await.is_ok() {
-                            freshness
+                            self.freshness
                                 .last_published_ns
                                 .store(mono_now_ns(), Ordering::Relaxed);
                         }
                     }
                     continue;
                 }
-                // Try decode_order_book_snapshot
-                if let Some(parsed) = decode_order_book_snapshot(
-                    &value,
-                    self.cfg.venue_index,
-                    &self.cfg.venue_id,
-                    &mut seq_fallback,
-                ) {
-                    // Update freshness on parsed data
-                    self.freshness
-                        .last_parsed_ns
-                        .store(mono_now_ns(), Ordering::Relaxed);
-                    let outcome = tracker.on_message(parsed);
-                    if let Some(event) = outcome.event {
-                        // Update freshness only when we produce a publishable event
-                        freshness
-                            .last_parsed_ns
-                            .store(mono_now_ns(), Ordering::Relaxed);
-                        if !first_book_update_logged {
-                            eprintln!("INFO: Lighter public WS first book update");
-                            first_book_update_logged = true;
-                        }
-                        if self.publish_market(event).await.is_ok() {
-                            freshness
-                                .last_published_ns
-                                .store(mono_now_ns(), Ordering::Relaxed);
-                        }
-                    }
-                    continue;
-                }
-                // Both decode attempts failed - emit bounded warning
+
+                // Decode failed — handle as bounded warning + delta-failure tracking
                 if has_lighter_book_fields(&value) {
+                    if initial_snapshot_applied {
+                        consecutive_delta_failures += 1;
+                        if consecutive_delta_failures >= LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES {
+                            anyhow::bail!(
+                                "Lighter: {} consecutive delta decode failures — \
+                                 forcing reconnect for fresh snapshot",
+                                consecutive_delta_failures
+                            );
+                        }
+                    }
                     let now_ns = mono_now_ns();
                     if age_ms(now_ns, last_decode_fail_warn_ns) >= LIGHTER_DECODE_WARN_INTERVAL_MS {
                         last_decode_fail_warn_ns = now_ns;
@@ -761,24 +815,28 @@ impl LighterConnector {
                             .unwrap_or_else(|| "[non-object]".to_string());
                         let snippet: String = payload.chars().take(200).collect();
                         eprintln!(
-                            "WARN: Lighter order_book decode failed (no channel_msg, no snapshot) keys={} snippet={}",
-                            keys, snippet
+                            "WARN: Lighter order_book decode failed (mode={}) keys={} snippet={}",
+                            if initial_snapshot_applied {
+                                "delta"
+                            } else {
+                                "snapshot"
+                            },
+                            keys,
+                            snippet
                         );
                     }
                 }
             }
-            // Try parse_l2_message_value as fallback
+            // Try parse_l2_message_value as fallback (fixture/test compatibility)
             if let Some(parsed) =
                 parse_l2_message_value(&value, &self.cfg.venue_id, self.cfg.venue_index)
             {
-                // Update freshness on parsed data
                 self.freshness
                     .last_parsed_ns
                     .store(mono_now_ns(), Ordering::Relaxed);
                 let outcome = tracker.on_message(parsed);
                 if let Some(event) = outcome.event {
-                    // Update freshness only when we produce a publishable event
-                    freshness
+                    self.freshness
                         .last_parsed_ns
                         .store(mono_now_ns(), Ordering::Relaxed);
                     if !first_book_update_logged {
@@ -786,7 +844,7 @@ impl LighterConnector {
                         first_book_update_logged = true;
                     }
                     if self.publish_market(event).await.is_ok() {
-                        freshness
+                        self.freshness
                             .last_published_ns
                             .store(mono_now_ns(), Ordering::Relaxed);
                     }
@@ -931,10 +989,28 @@ impl LighterConnector {
     }
 
     async fn private_ws_once(&self) -> anyhow::Result<()> {
-        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        let connect_timeout = lighter_ws_connect_timeout();
+        let read_timeout = lighter_ws_read_timeout();
+
+        let (ws_stream, _) = with_timeout(
+            connect_timeout,
+            "private WS connect",
+            connect_async(self.cfg.ws_url.as_str()),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("Lighter private WS connect error: {e}"))?;
         let (_write, mut read) = ws_stream.split();
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
+        loop {
+            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+                Ok(Some(msg)) => msg?,
+                Ok(None) => break,
+                Err(_) => {
+                    eprintln!(
+                        "WARN: Lighter private WS read timeout ({read_timeout:?}) — reconnecting"
+                    );
+                    anyhow::bail!("Lighter private WS read timeout after {read_timeout:?}");
+                }
+            };
             if let Message::Text(text) = msg {
                 if let Some(event) = translate_private_event(&text) {
                     let _ = self.exec_tx.send(event).await;
@@ -1250,7 +1326,7 @@ fn decode_order_book_channel_message(
         .or_else(|| value.get("ts"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    // Always emit L2Snapshot since Lighter sends full book state each message.
+    // Emit L2Snapshot for the initial subscription message (full book state).
     let snapshot = super::super::types::L2Snapshot {
         venue_index,
         venue_id: venue_id.to_string(),
@@ -1261,6 +1337,68 @@ fn decode_order_book_channel_message(
     };
     Some(ParsedL2Message {
         event: MarketDataEvent::L2Snapshot(snapshot),
+        seq,
+    })
+}
+
+/// Decode a Lighter order_book channel message as an L2Delta (post-subscription).
+///
+/// After the initial subscription snapshot, Lighter sends "state changes" only —
+/// each message contains changed levels, NOT the full book. Empty `bids`/`asks`
+/// arrays mean "no changes on that side", not "side is empty".
+///
+/// Levels with size == 0.0 represent removals; non-zero sizes are upserts.
+/// See: <https://apidocs.lighter.xyz/docs/websocket-reference#order-book>
+fn decode_order_book_channel_delta(
+    value: &serde_json::Value,
+    venue_index: usize,
+    venue_id: &str,
+    seq_fallback: &mut u64,
+) -> Option<ParsedL2Message> {
+    let channel = value.get("channel").and_then(|v| v.as_str())?;
+    if !channel.starts_with("order_book:") {
+        return None;
+    }
+    let order_book = value.get("order_book")?;
+    let mut changes: Vec<BookLevelDelta> = Vec::new();
+    if let Some(bids_val) = order_book.get("bids") {
+        if let Some(levels) = parse_levels_from_objects(bids_val) {
+            for level in levels {
+                changes.push(BookLevelDelta {
+                    side: BookSide::Bid,
+                    price: level.price,
+                    size: level.size,
+                });
+            }
+        }
+    }
+    if let Some(asks_val) = order_book.get("asks") {
+        if let Some(levels) = parse_levels_from_objects(asks_val) {
+            for level in levels {
+                changes.push(BookLevelDelta {
+                    side: BookSide::Ask,
+                    price: level.price,
+                    size: level.size,
+                });
+            }
+        }
+    }
+    *seq_fallback = seq_fallback.wrapping_add(1);
+    let seq = *seq_fallback;
+    let timestamp_ms = value
+        .get("timestamp")
+        .or_else(|| value.get("ts"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let delta = super::super::types::L2Delta {
+        venue_index,
+        venue_id: venue_id.to_string(),
+        seq,
+        timestamp_ms,
+        changes,
+    };
+    Some(ParsedL2Message {
+        event: MarketDataEvent::L2Delta(delta),
         seq,
     })
 }
@@ -1562,31 +1700,15 @@ mod tests {
     #[test]
     fn freshness_reset_and_anchor_behavior() {
         let freshness = Freshness::default();
-        freshness
-            .last_parsed_ns
-            .store(123, Ordering::Relaxed);
-        freshness
-            .last_published_ns
-            .store(456, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(123, Ordering::Relaxed);
+        freshness.last_published_ns.store(456, Ordering::Relaxed);
 
         // After reset, all timestamps should be 0
         freshness.reset_for_new_connection();
-        assert_eq!(
-            freshness.last_parsed_ns.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            freshness.last_published_ns.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            freshness.last_ws_rx_ns.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            freshness.last_data_rx_ns.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(freshness.last_parsed_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(freshness.last_ws_rx_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(freshness.last_data_rx_ns.load(Ordering::Relaxed), 0);
 
         // With anchor == 0, should use connect_start_ns
         let connect_start_ns = 1_000;
@@ -1594,16 +1716,12 @@ mod tests {
         assert_eq!(anchor, connect_start_ns);
 
         // With last_parsed_ns set, should use it
-        freshness
-            .last_parsed_ns
-            .store(2_000, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 2_000);
 
         // With last_published_ns > last_parsed_ns, should use last_published_ns
-        freshness
-            .last_published_ns
-            .store(3_000, Ordering::Relaxed);
+        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
     }
@@ -1618,7 +1736,10 @@ mod tests {
 
         // With no data, anchor should be connect_start_ns
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
-        assert_eq!(anchor, connect_start_ns, "anchor should be connect_start_ns when no data");
+        assert_eq!(
+            anchor, connect_start_ns,
+            "anchor should be connect_start_ns when no data"
+        );
 
         // Simulate "now" being 15 seconds later (15_000_000_000 ns)
         let now_ns: u64 = 15_000_000_000;
@@ -1642,7 +1763,9 @@ mod tests {
 
         // Simulate receiving data at 5 seconds
         let data_time_ns: u64 = 5_000_000_000;
-        freshness.last_parsed_ns.store(data_time_ns, Ordering::Relaxed);
+        freshness
+            .last_parsed_ns
+            .store(data_time_ns, Ordering::Relaxed);
 
         // Check anchor uses last_parsed_ns
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
@@ -1847,10 +1970,9 @@ mod tests {
 
     #[tokio::test]
     async fn lighter_place_order_calls_signer_then_sendtx() {
-
-          let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-          std::env::remove_var("LIGHTER_MARKET_ID");
-          std::env::remove_var("LIGHTER_MARKET");
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LIGHTER_MARKET_ID");
+        std::env::remove_var("LIGHTER_MARKET");
         let api = MockServer::start_async().await;
         let signer = MockServer::start_async().await;
         let orderbooks = api
@@ -2215,8 +2337,7 @@ mod tests {
         });
         let mut seq = 0u64;
         let parsed =
-            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
-                .expect("snapshot");
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq).expect("snapshot");
         match parsed.event {
             MarketDataEvent::L2Snapshot(snapshot) => {
                 assert_eq!(snapshot.bids.len(), 1);
@@ -2239,8 +2360,7 @@ mod tests {
         });
         let mut seq = 0u64;
         let parsed =
-            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
-                .expect("snapshot");
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq).expect("snapshot");
         match parsed.event {
             MarketDataEvent::L2Snapshot(snapshot) => {
                 assert_eq!(snapshot.bids.len(), 0);
@@ -2263,8 +2383,7 @@ mod tests {
         });
         let mut seq = 0u64;
         let parsed =
-            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
-                .expect("snapshot");
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq).expect("snapshot");
         match parsed.event {
             MarketDataEvent::L2Snapshot(snapshot) => {
                 assert_eq!(snapshot.bids.len(), 1);
@@ -2305,8 +2424,8 @@ mod tests {
             }
         });
         let mut seq = 0u64;
-        let first = decode_order_book_channel_message(&first_value, 3, "LIGHTER", &mut seq)
-            .expect("first");
+        let first =
+            decode_order_book_channel_message(&first_value, 3, "LIGHTER", &mut seq).expect("first");
         match first.event {
             MarketDataEvent::L2Snapshot(snapshot) => {
                 assert_eq!(snapshot.bids.len(), 1);
@@ -2363,11 +2482,235 @@ mod tests {
             }
         });
         let mut seq = 0u64;
-        let first = decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
-            .expect("first");
-        let second = decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq)
-            .expect("second");
+        let first =
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq).expect("first");
+        let second =
+            decode_order_book_channel_message(&value, 3, "LIGHTER", &mut seq).expect("second");
         assert!(second.seq > first.seq);
+    }
+
+    /// Verify that `decode_order_book_channel_delta` produces L2Delta, not L2Snapshot.
+    #[test]
+    fn decode_channel_delta_produces_l2_delta() {
+        let value = serde_json::json!({
+            "channel": "order_book:0",
+            "offset": 200,
+            "timestamp": 1700000001000i64,
+            "order_book": {
+                "code": 0,
+                "bids": [{"price":"100.0","size":"5.0"}],
+                "asks": [{"price":"101.0","size":"2.0"}]
+            }
+        });
+        let mut seq = 10u64;
+        let parsed = decode_order_book_channel_delta(&value, 3, "LIGHTER", &mut seq)
+            .expect("should decode delta");
+        assert_eq!(parsed.seq, 11);
+        match parsed.event {
+            MarketDataEvent::L2Delta(delta) => {
+                assert_eq!(delta.venue_index, 3);
+                assert_eq!(delta.timestamp_ms, 1700000001000);
+                assert_eq!(delta.changes.len(), 2);
+                assert_eq!(
+                    delta.changes[0],
+                    BookLevelDelta {
+                        side: BookSide::Bid,
+                        price: 100.0,
+                        size: 5.0
+                    }
+                );
+                assert_eq!(
+                    delta.changes[1],
+                    BookLevelDelta {
+                        side: BookSide::Ask,
+                        price: 101.0,
+                        size: 2.0
+                    }
+                );
+            }
+            _ => panic!("expected L2Delta, got {:?}", parsed.event),
+        }
+    }
+
+    /// Verify that a delta message with empty asks produces changes for bids only.
+    /// This is the core fix: previously, empty asks treated as snapshot would wipe all asks.
+    #[test]
+    fn decode_channel_delta_empty_asks_does_not_wipe_book() {
+        let value = serde_json::json!({
+            "channel": "order_book:0",
+            "offset": 300,
+            "timestamp": 1700000002000i64,
+            "order_book": {
+                "code": 0,
+                "bids": [{"price":"99.0","size":"1.0"}, {"price":"98.0","size":"0.0"}],
+                "asks": []
+            }
+        });
+        let mut seq = 0u64;
+        let parsed = decode_order_book_channel_delta(&value, 3, "LIGHTER", &mut seq)
+            .expect("should decode delta with empty asks");
+        match parsed.event {
+            MarketDataEvent::L2Delta(delta) => {
+                // Only bid changes — no ask changes because asks array is empty
+                assert_eq!(delta.changes.len(), 2, "should have 2 bid changes only");
+                assert!(
+                    delta.changes.iter().all(|c| c.side == BookSide::Bid),
+                    "all changes should be bids"
+                );
+                // Second bid has size 0.0 — this is a removal
+                assert_eq!(delta.changes[1].size, 0.0, "zero-size = removal");
+            }
+            _ => panic!("expected L2Delta"),
+        }
+    }
+
+    /// Verify that a delta message with empty bids produces changes for asks only.
+    #[test]
+    fn decode_channel_delta_empty_bids_preserves_asks() {
+        let value = serde_json::json!({
+            "channel": "order_book:0",
+            "offset": 400,
+            "timestamp": 1700000003000i64,
+            "order_book": {
+                "code": 0,
+                "bids": [],
+                "asks": [{"price":"110.0","size":"3.0"}]
+            }
+        });
+        let mut seq = 5u64;
+        let parsed =
+            decode_order_book_channel_delta(&value, 0, "LIGHTER", &mut seq).expect("should decode");
+        match parsed.event {
+            MarketDataEvent::L2Delta(delta) => {
+                assert_eq!(delta.changes.len(), 1);
+                assert_eq!(delta.changes[0].side, BookSide::Ask);
+            }
+            _ => panic!("expected L2Delta"),
+        }
+    }
+
+    /// Integration test: snapshot then delta flow works with OrderBookL2.
+    /// Simulates the Lighter WS lifecycle: first message is snapshot, subsequent are deltas.
+    #[test]
+    fn snapshot_then_delta_preserves_book_integrity() {
+        use crate::live::orderbook_l2::{DepthConfig, OrderBookL2};
+
+        let mut book = OrderBookL2::new();
+
+        // 1. Initial snapshot: full book
+        let snapshot_value = serde_json::json!({
+            "channel": "order_book:0",
+            "offset": 100,
+            "timestamp": 1000i64,
+            "order_book": {
+                "code": 0,
+                "bids": [
+                    {"price":"100.0","size":"10.0"},
+                    {"price":"99.0","size":"5.0"}
+                ],
+                "asks": [
+                    {"price":"101.0","size":"8.0"},
+                    {"price":"102.0","size":"3.0"}
+                ]
+            }
+        });
+        let mut seq = 0u64;
+        let snap_parsed = decode_order_book_channel_message(&snapshot_value, 0, "L", &mut seq)
+            .expect("snapshot should decode");
+        match snap_parsed.event {
+            MarketDataEvent::L2Snapshot(snap) => {
+                book.apply_snapshot(&snap.bids, &snap.asks, snap.seq)
+                    .expect("snapshot apply");
+            }
+            _ => panic!("expected L2Snapshot"),
+        }
+        let m1 = book.compute_mid_spread_depth(DepthConfig {
+            levels: 10,
+            include_imbalance: false,
+        });
+        assert!(m1.mid.is_some());
+        assert!(m1.depth_near_mid > 0.0);
+
+        // 2. Delta: bid-side only update (asks empty = no ask changes)
+        let delta_value = serde_json::json!({
+            "channel": "order_book:0",
+            "offset": 101,
+            "timestamp": 2000i64,
+            "order_book": {
+                "code": 0,
+                "bids": [{"price":"100.0","size":"12.0"}],  // update bid size
+                "asks": []  // no ask changes!
+            }
+        });
+        let delta_parsed = decode_order_book_channel_delta(&delta_value, 0, "L", &mut seq)
+            .expect("delta should decode");
+        match delta_parsed.event {
+            MarketDataEvent::L2Delta(delta) => {
+                book.apply_delta(&delta.changes, delta.seq)
+                    .expect("delta apply");
+            }
+            _ => panic!("expected L2Delta"),
+        }
+        let m2 = book.compute_mid_spread_depth(DepthConfig {
+            levels: 10,
+            include_imbalance: false,
+        });
+        // After delta with empty asks: asks should still be there (not wiped)
+        assert!(
+            m2.mid.is_some(),
+            "mid should exist after delta with empty asks"
+        );
+        assert!(
+            m2.depth_near_mid > 0.0,
+            "depth should be non-zero — asks must be preserved"
+        );
+        // Verify the bid was updated
+        let best_bid = book.best_bid().expect("best bid should exist");
+        assert!(
+            (best_bid.size - 12.0).abs() < 1e-9,
+            "bid size should be updated to 12.0"
+        );
+        // Verify asks are still intact
+        let best_ask = book
+            .best_ask()
+            .expect("best ask should exist after delta with empty asks");
+        assert!(
+            (best_ask.price - 101.0).abs() < 1e-9,
+            "ask price should be 101.0"
+        );
+        assert!(
+            (best_ask.size - 8.0).abs() < 1e-9,
+            "ask size should be 8.0 (unchanged)"
+        );
+
+        // 3. Delta: ask-side removal (bids empty = no bid changes)
+        let delta_value2 = serde_json::json!({
+            "channel": "order_book:0",
+            "offset": 102,
+            "timestamp": 3000i64,
+            "order_book": {
+                "code": 0,
+                "bids": [],
+                "asks": [{"price":"102.0","size":"0.0"}]  // remove 102.0 level
+            }
+        });
+        let delta_parsed2 = decode_order_book_channel_delta(&delta_value2, 0, "L", &mut seq)
+            .expect("delta2 should decode");
+        match delta_parsed2.event {
+            MarketDataEvent::L2Delta(delta) => {
+                book.apply_delta(&delta.changes, delta.seq)
+                    .expect("delta2 apply");
+            }
+            _ => panic!("expected L2Delta"),
+        }
+        let m3 = book.compute_mid_spread_depth(DepthConfig {
+            levels: 10,
+            include_imbalance: false,
+        });
+        assert!(m3.mid.is_some(), "mid should still exist");
+        // 102.0 was removed, but 101.0 still exists
+        let best_ask2 = book.best_ask().expect("best ask should still exist");
+        assert!((best_ask2.price - 101.0).abs() < 1e-9);
     }
 
     /// Regression test: Lighter sends full orderbook state each message.
@@ -2405,7 +2748,10 @@ mod tests {
         // rate = 0.00001234 (hourly), interval_sec = 3600
         // rate_8h = 0.00001234 * 8 = 0.00009872
         let rate_native = update.funding_rate_native.expect("rate_native present");
-        assert!((rate_native - 0.00001234).abs() < 1e-10, "rate_native mismatch");
+        assert!(
+            (rate_native - 0.00001234).abs() < 1e-10,
+            "rate_native mismatch"
+        );
 
         let interval = update.interval_sec.expect("interval_sec present");
         assert_eq!(interval, 3600);
@@ -2419,9 +2765,17 @@ mod tests {
         assert!((rate_btc - 0.00000567).abs() < 1e-10);
 
         // Test: find by symbol fallback (market_id=999 doesn't exist, but symbol "ETH" does)
-        let update_symbol = parse_public_funding(&value, &cfg, 999, "ETH").expect("symbol fallback");
+        let update_symbol =
+            parse_public_funding(&value, &cfg, 999, "ETH").expect("symbol fallback");
         let rate_symbol = update_symbol.funding_rate_native.expect("rate present");
         assert!((rate_symbol - 0.00001234).abs() < 1e-10);
+
+        // Fix C: Lighter settles at mark price.
+        assert_eq!(
+            update.settlement_price_kind,
+            Some(SettlementPriceKind::Mark),
+            "Lighter settlement must be Mark"
+        );
 
         // Test: non-existent market returns None
         let none_result = parse_public_funding(&value, &cfg, 999, "NOSUCH");
@@ -2455,11 +2809,12 @@ mod tests {
         let mut book = OrderBookL2::new();
 
         // Apply first message
-        let parsed1 = decode_order_book_channel_message(&msg1, 0, "LIGHTER", &mut seq)
-            .expect("msg1");
+        let parsed1 =
+            decode_order_book_channel_message(&msg1, 0, "LIGHTER", &mut seq).expect("msg1");
         match parsed1.event {
             MarketDataEvent::L2Snapshot(snap) => {
-                book.apply_snapshot(&snap.bids, &snap.asks, snap.seq).unwrap();
+                book.apply_snapshot(&snap.bids, &snap.asks, snap.seq)
+                    .unwrap();
             }
             _ => panic!("expected snapshot"),
         }
@@ -2469,11 +2824,12 @@ mod tests {
         assert!(spread1 > 0.0, "spread must be positive");
 
         // Apply second message
-        let parsed2 = decode_order_book_channel_message(&msg2, 0, "LIGHTER", &mut seq)
-            .expect("msg2");
+        let parsed2 =
+            decode_order_book_channel_message(&msg2, 0, "LIGHTER", &mut seq).expect("msg2");
         match parsed2.event {
             MarketDataEvent::L2Snapshot(snap) => {
-                book.apply_snapshot(&snap.bids, &snap.asks, snap.seq).unwrap();
+                book.apply_snapshot(&snap.bids, &snap.asks, snap.seq)
+                    .unwrap();
             }
             _ => panic!("expected snapshot for second message too"),
         }
@@ -2481,7 +2837,11 @@ mod tests {
         // CRITICAL: The old bid at 110 must NOT be present.
         // If it were (due to delta semantics), we'd have:
         //   best_bid = 110 (stale), best_ask = 101 → spread = -9 (CROSSED!)
-        assert_eq!(book.best_bid().unwrap().price, 100.0, "stale bid at 110 must be gone");
+        assert_eq!(
+            book.best_bid().unwrap().price,
+            100.0,
+            "stale bid at 110 must be gone"
+        );
         assert_eq!(book.best_ask().unwrap().price, 101.0);
         let spread2 = book.best_ask().unwrap().price - book.best_bid().unwrap().price;
         assert!(spread2 > 0.0, "spread must be positive after update");
@@ -2623,33 +2983,37 @@ async fn fetch_public_funding(
 
     if !status.is_success() {
         // Rate-limited logging: only log first 3 errors, then every 100th
-        let count = LIGHTER_FUNDING_ERROR_LOG_COUNT
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let count =
+            LIGHTER_FUNDING_ERROR_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count < 3 || count % 100 == 0 {
             let snippet: String = body.chars().take(160).collect();
             eprintln!(
                 "WARN: Lighter funding fetch failed status={} url={} snippet={} (count={})",
-                status, url, snippet, count + 1
+                status,
+                url,
+                snippet,
+                count + 1
             );
         }
         anyhow::bail!("Lighter funding fetch failed: HTTP {}", status);
     }
 
-    let value: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(err) => {
-            let count = LIGHTER_FUNDING_ERROR_LOG_COUNT
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count < 3 || count % 100 == 0 {
-                let snippet: String = body.chars().take(160).collect();
-                eprintln!(
+    let value: serde_json::Value =
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(err) => {
+                let count = LIGHTER_FUNDING_ERROR_LOG_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count < 3 || count % 100 == 0 {
+                    let snippet: String = body.chars().take(160).collect();
+                    eprintln!(
                     "WARN: Lighter funding JSON parse failed url={} err={} snippet={} (count={})",
                     url, err, snippet, count + 1
                 );
+                }
+                anyhow::bail!("Lighter funding JSON parse failed: {}", err);
             }
-            anyhow::bail!("Lighter funding JSON parse failed: {}", err);
-        }
-    };
+        };
 
     parse_public_funding(&value, cfg, market_id, market_symbol)
         .ok_or_else(|| anyhow::anyhow!("invalid public funding response"))
@@ -2754,7 +3118,9 @@ fn parse_funding_entry(data: &serde_json::Value, cfg: &LighterConfig) -> Option<
         funding_rate_native: rate_native,
         interval_sec,
         next_funding_ms,
-        settlement_price_kind: Some(SettlementPriceKind::Unknown),
+        // Lighter uses mark price for funding settlement. Mark = (Impact Bid + Impact Ask) / 2.
+        // Ref: https://docs.lighter.xyz/perpetual-futures/fair-price-marking
+        settlement_price_kind: Some(SettlementPriceKind::Mark),
         source: FundingSource::MarketDataRest,
     })
 }

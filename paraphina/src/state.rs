@@ -25,8 +25,8 @@ use crate::orderbook_l2::{
     BookLevel, BookLevelDelta, DepthConfig, DerivedBookMetrics, OrderBookError, OrderBookL2,
 };
 use crate::types::{
-    FillEvent, FundingSource, FundingStatus, OrderIntent, OrderPurpose, PlaceOrderIntent, Side,
-    SettlementPriceKind, TimeInForce, TimestampMs, VenueStatus,
+    FillEvent, FundingSource, FundingStatus, OrderIntent, OrderPurpose, PlaceOrderIntent,
+    SettlementPriceKind, Side, TimeInForce, TimestampMs, VenueStatus,
 };
 
 /// A pending markout evaluation entry.

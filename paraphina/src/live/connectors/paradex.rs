@@ -183,7 +183,10 @@ impl ParadexConnector {
         );
         let connector = Self {
             cfg,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("paradex http client build"),
             market_publisher,
             recorder,
             freshness,
@@ -246,8 +249,9 @@ impl ParadexConnector {
                 Ok(mut update) => {
                     seq = seq.wrapping_add(1);
                     update.seq = seq;
-                    if let Err(err) =
-                        self.publish_market(MarketDataEvent::FundingUpdate(update)).await
+                    if let Err(err) = self
+                        .publish_market(MarketDataEvent::FundingUpdate(update))
+                        .await
                     {
                         eprintln!("Paradex funding publish error: {err}");
                     }
@@ -261,7 +265,13 @@ impl ParadexConnector {
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
         eprintln!("INFO: Paradex public WS connecting url={}", self.cfg.ws_url);
-        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        let (ws_stream, _) = tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_async(self.cfg.ws_url.as_str()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Paradex public WS connect timeout (15s)"))?
+        .map_err(|e| anyhow::anyhow!("Paradex public WS connect error: {e}"))?;
         eprintln!("INFO: Paradex public WS connected url={}", self.cfg.ws_url);
         let (mut write, mut read) = ws_stream.split();
         let mut subscribed = false;
@@ -492,7 +502,10 @@ impl ParadexRestClient {
     pub fn new(cfg: ParadexConfig) -> Self {
         Self {
             cfg,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("paradex rest http client build"),
             token_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -908,11 +921,14 @@ fn parse_account_snapshot(
     None
 }
 
-async fn fetch_public_funding(client: &Client, cfg: &ParadexConfig) -> anyhow::Result<FundingUpdate> {
+async fn fetch_public_funding(
+    client: &Client,
+    cfg: &ParadexConfig,
+) -> anyhow::Result<FundingUpdate> {
     // Default path is "/markets/summary" (not "/v1/markets/summary") because
     // cfg.rest_url already includes the /v1 prefix (e.g., "https://api.prod.paradex.trade/v1").
-    let path = std::env::var("PARADEX_FUNDING_PATH")
-        .unwrap_or_else(|_| "/markets/summary".to_string());
+    let path =
+        std::env::var("PARADEX_FUNDING_PATH").unwrap_or_else(|_| "/markets/summary".to_string());
     let url = format!("{}{}", cfg.rest_url.trim_end_matches('/'), path);
     let resp = client
         .get(url)
@@ -963,7 +979,17 @@ fn parse_public_funding(value: &Value, cfg: &ParadexConfig) -> Option<FundingUpd
         .or_else(|| entry.get("funding_interval"))
         .or_else(|| entry.get("fundingInterval"))
         .and_then(parse_i64_value)
-        .and_then(|v| if v > 0 { Some(v as u64) } else { None });
+        .and_then(|v| if v > 0 { Some(v as u64) } else { None })
+        .or_else(|| {
+            // Paradex quotes funding rates as 8h-equivalent (28800s).
+            // Hardcode so downstream consumers see an explicit interval, not null.
+            // Ref: https://docs.paradex.trade/docs/risk/funding-mechanism
+            if rate_native.is_some() {
+                Some(28_800)
+            } else {
+                None
+            }
+        });
 
     let next_funding_ms = entry
         .get("next_funding_time")
@@ -1001,7 +1027,9 @@ fn parse_public_funding(value: &Value, cfg: &ParadexConfig) -> Option<FundingUpd
         funding_rate_native: rate_native,
         interval_sec,
         next_funding_ms,
-        settlement_price_kind: Some(SettlementPriceKind::Unknown),
+        // Paradex: Funding Premium = (Mark - Spot Oracle) / USDC Oracle.
+        // Settlement in USDC, oracle-adjusted. Ref: https://docs.paradex.trade/docs/risk/funding-mechanism
+        settlement_price_kind: Some(SettlementPriceKind::UsdcOracleAdjusted),
         source: FundingSource::MarketDataRest,
     })
 }
@@ -1853,35 +1881,21 @@ mod tests {
     #[test]
     fn freshness_reset_and_anchor_behavior() {
         let freshness = Freshness::default();
-        freshness
-            .last_parsed_ns
-            .store(123, Ordering::Relaxed);
-        freshness
-            .last_published_ns
-            .store(456, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(123, Ordering::Relaxed);
+        freshness.last_published_ns.store(456, Ordering::Relaxed);
         freshness.reset_for_new_connection();
-        assert_eq!(
-            freshness.last_parsed_ns.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            freshness.last_published_ns.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(freshness.last_parsed_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
 
         let connect_start_ns = 1_000;
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, connect_start_ns);
 
-        freshness
-            .last_parsed_ns
-            .store(2_000, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 2_000);
 
-        freshness
-            .last_published_ns
-            .store(3_000, Ordering::Relaxed);
+        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
     }
@@ -1914,14 +1928,37 @@ mod tests {
 
         // funding_rate = "-0.00011283359389" (string) should parse correctly
         let rate_native = update.funding_rate_native.expect("rate_native present");
-        assert!((rate_native - (-0.00011283359389)).abs() < 1e-14, "rate_native mismatch");
+        assert!(
+            (rate_native - (-0.00011283359389)).abs() < 1e-14,
+            "rate_native mismatch"
+        );
 
         // Sign must be preserved (negative)
-        assert!(rate_native < 0.0, "negative funding rate sign must be preserved");
+        assert!(
+            rate_native < 0.0,
+            "negative funding rate sign must be preserved"
+        );
 
-        // rate_8h should equal rate_native when interval_sec is absent (Paradex 8h-equivalent)
+        // rate_8h should equal rate_native (Paradex quotes 8h-equivalent rates, interval=28800s)
         let rate_8h = update.funding_rate_8h.expect("rate_8h present");
-        assert!((rate_8h - rate_native).abs() < 1e-14, "rate_8h should equal rate_native");
+        assert!(
+            (rate_8h - rate_native).abs() < 1e-14,
+            "rate_8h should equal rate_native"
+        );
+
+        // Fix: Paradex interval_sec must be 28800 (8h-equivalent)
+        assert_eq!(
+            update.interval_sec,
+            Some(28_800),
+            "Paradex interval_sec must be 28800"
+        );
+
+        // Fix C: Paradex settles via USDC-oracle-adjusted mechanism.
+        assert_eq!(
+            update.settlement_price_kind,
+            Some(SettlementPriceKind::UsdcOracleAdjusted),
+            "Paradex settlement must be UsdcOracleAdjusted"
+        );
 
         // Timestamp should come from "created_at"
         assert_eq!(update.timestamp_ms, 1770309699810);
@@ -1933,7 +1970,10 @@ mod tests {
         };
         let update_btc = parse_public_funding(&value, &cfg_btc).expect("parse btc ok");
         let rate_btc = update_btc.funding_rate_native.expect("btc rate present");
-        assert!(rate_btc > 0.0, "positive funding rate sign must be preserved");
+        assert!(
+            rate_btc > 0.0,
+            "positive funding rate sign must be preserved"
+        );
         assert!((rate_btc - 0.00005672).abs() < 1e-14);
 
         // Test non-existent market returns None (should fall back to root value which has no funding_rate)
