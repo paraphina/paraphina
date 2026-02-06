@@ -202,6 +202,24 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
             venue.toxicity = 0.0;
         }
 
+        // --- 2.5) Catastrophic staleness override ---
+        // If a venue's book data is older than catastrophic_stale_ms, force
+        // toxicity to 1.0 regardless of shadow mode.  This overrides step 2
+        // because a venue with no data for >2 minutes is genuinely broken,
+        // not just experiencing normal jitter.
+        // The threshold is intentionally ~60x larger than stale_ms_override
+        // to only fire for stuck reconnect loops, never for normal delays.
+        let catastrophic_stale_ms = cfg.toxicity.catastrophic_stale_ms;
+        if catastrophic_stale_ms > 0 {
+            if let Some(last_ms) = venue.last_mid_update_ms {
+                if now_ms.saturating_sub(last_ms) > catastrophic_stale_ms {
+                    venue.toxicity = 1.0;
+                }
+            }
+            // Note: if last_mid_update_ms is None, the existing
+            // mid.is_none() check in step 3 already handles it.
+        }
+
         // --- 3) Fallback: if no mid or prolonged no depth, apply legacy toxicity ---
         // This ensures venues with missing book data are still penalized,
         // while avoiding false disables from brief empty-side snapshots.
@@ -799,6 +817,143 @@ mod tests {
 
         assert_eq!(state.venues[0].toxicity, 0.0);
         assert!(matches!(state.venues[0].status, VenueStatus::Healthy));
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+    }
+
+    // ---- P3: Catastrophic staleness tests ----
+
+    #[test]
+    fn test_catastrophic_stale_forces_disabled() {
+        let mut cfg = make_test_config();
+        cfg.toxicity.catastrophic_stale_ms = 120_000; // 2 minutes
+        let mut state = GlobalState::new(&cfg);
+
+        let now_ms = 200_000;
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10_000.0;
+        venue.last_mid_update_ms = Some(70_000); // 130s ago, beyond 120s threshold
+        venue.toxicity = 0.0;
+
+        update_toxicity_and_health(&mut state, &cfg, now_ms);
+
+        assert_eq!(
+            state.venues[0].toxicity, 1.0,
+            "Catastrophic stale (130s > 120s) should force toxicity to 1.0"
+        );
+        assert_eq!(
+            state.venues[0].status,
+            VenueStatus::Disabled,
+            "Catastrophic stale should disable venue"
+        );
+    }
+
+    #[test]
+    fn test_catastrophic_stale_within_threshold_no_effect() {
+        let mut cfg = make_test_config();
+        cfg.toxicity.catastrophic_stale_ms = 120_000;
+        let mut state = GlobalState::new(&cfg);
+
+        let now_ms = 160_000;
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10_000.0;
+        venue.last_mid_update_ms = Some(100_000); // 60s ago, within threshold
+        venue.toxicity = 0.0;
+
+        update_toxicity_and_health(&mut state, &cfg, now_ms);
+
+        assert!(
+            state.venues[0].toxicity < 1.0,
+            "Within catastrophic threshold (60s < 120s), toxicity should not be forced to 1.0, got {}",
+            state.venues[0].toxicity
+        );
+        assert_ne!(
+            state.venues[0].status,
+            VenueStatus::Disabled,
+            "Within catastrophic threshold should not disable venue"
+        );
+    }
+
+    #[test]
+    fn test_catastrophic_stale_overrides_shadow_mode() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_TRADE_MODE", "shadow");
+
+        let mut cfg = make_test_config();
+        cfg.toxicity.catastrophic_stale_ms = 120_000;
+        let mut state = GlobalState::new(&cfg);
+
+        let now_ms = 300_000;
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10_000.0;
+        venue.last_mid_update_ms = Some(100_000); // 200s ago, beyond threshold
+        venue.toxicity = 0.5;
+
+        update_toxicity_and_health(&mut state, &cfg, now_ms);
+
+        // Shadow mode step 2 would set tox=0.0, but step 2.5 overrides to 1.0
+        assert_eq!(
+            state.venues[0].toxicity, 1.0,
+            "Catastrophic stale should override shadow mode warmup"
+        );
+        assert_eq!(
+            state.venues[0].status,
+            VenueStatus::Disabled,
+            "Catastrophic stale should disable venue even in shadow mode"
+        );
+
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+    }
+
+    #[test]
+    fn test_catastrophic_stale_recovery() {
+        // Recovery path: reconnect succeeds → last_mid_update_ms refreshed →
+        // step 2.5 no longer fires → shadow-mode override (step 2) resets
+        // toxicity to 0.0 → venue returns to Healthy.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_TRADE_MODE", "shadow");
+
+        let mut cfg = make_test_config();
+        cfg.toxicity.catastrophic_stale_ms = 120_000;
+        let mut state = GlobalState::new(&cfg);
+
+        // First: venue is catastrophically stale
+        let now_ms = 300_000;
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10_000.0;
+        venue.last_mid_update_ms = Some(100_000); // 200s ago
+        venue.toxicity = 0.0;
+
+        update_toxicity_and_health(&mut state, &cfg, now_ms);
+        assert_eq!(state.venues[0].status, VenueStatus::Disabled);
+
+        // Now: data resumes, simulating reconnect success
+        let now_ms_2 = 301_000;
+        state.venues[0].last_mid_update_ms = Some(301_000); // Just updated
+        state.venues[0].mid = Some(100.0);
+        state.venues[0].depth_near_mid = 10_000.0;
+
+        update_toxicity_and_health(&mut state, &cfg, now_ms_2);
+
+        // Age is now ~0ms → step 2.5 doesn't fire → shadow override resets tox=0.0
+        assert_eq!(
+            state.venues[0].toxicity, 0.0,
+            "After data resumes in shadow mode, toxicity should be 0.0, got {}",
+            state.venues[0].toxicity
+        );
+        assert_ne!(
+            state.venues[0].status,
+            VenueStatus::Disabled,
+            "After data resumes, venue should recover from Disabled"
+        );
+
         std::env::remove_var("PARAPHINA_TRADE_MODE");
     }
 }

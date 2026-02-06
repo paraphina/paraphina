@@ -465,6 +465,7 @@ impl LighterConnector {
 
     pub async fn run_public_ws(&self) {
         let mut backoff = Duration::from_secs(1);
+        let mut consecutive_failures: u32 = 0;
         let mut subscribe_failures = 0usize;
         let mut logged_subscribe_failure = false;
 
@@ -480,6 +481,7 @@ impl LighterConnector {
             let session_start = Instant::now();
 
             if let Err(err) = self.public_ws_once().await {
+                consecutive_failures += 1;
                 let msg = err.to_string();
                 if msg.contains("Lighter subscribe failed") {
                     subscribe_failures += 1;
@@ -493,22 +495,42 @@ impl LighterConnector {
                 } else {
                     subscribe_failures = 0;
                     logged_subscribe_failure = false;
-                    eprintln!("Lighter public WS error: {err}");
+                    let level = if consecutive_failures >= 20 {
+                        "ERROR"
+                    } else if consecutive_failures >= 5 {
+                        "WARN"
+                    } else {
+                        "INFO"
+                    };
+                    eprintln!(
+                        "{level}: Lighter public WS error (consecutive_failures={consecutive_failures}): {err}"
+                    );
                 }
             }
 
-            // FIX: Reset backoff if connection was healthy for long enough
+            // FIX: Reset backoff and failure counter if connection was healthy for long enough
             let session_duration = session_start.elapsed();
             if session_duration >= healthy_threshold {
-                eprintln!(
-                    "INFO: Lighter WS session was healthy for {:?}; resetting backoff",
-                    session_duration
-                );
+                if consecutive_failures > 0 {
+                    eprintln!(
+                        "INFO: Lighter WS session was healthy for {:?}; \
+                         resetting backoff and failure counter (was {})",
+                        session_duration, consecutive_failures
+                    );
+                }
+                consecutive_failures = 0;
                 backoff = Duration::from_secs(1);
             }
 
+            // Escalating backoff caps: give upstream more time to recover
+            let max_backoff = match consecutive_failures {
+                0..=10 => Duration::from_secs(30),
+                11..=20 => Duration::from_secs(60),
+                _ => Duration::from_secs(120),
+            };
+
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+            backoff = (backoff * 2).min(max_backoff);
         }
     }
 
@@ -714,16 +736,17 @@ impl LighterConnector {
                     && decode_miss_count < 3
                     && has_lighter_book_fields(&value)
                 {
-                    // Only log decode-miss for top-of-book during snapshot phase.
-                    // In delta mode, one-sided messages are expected and not a warning.
+                    // Startup decode miss: decode_order_book_top() fails on the
+                    // snapshot-format message before initial_snapshot_applied is set.
+                    // This is expected — the full L2 path handles it correctly.
+                    // Log once at INFO (not WARN) for diagnostics.
                     decode_miss_count += 1;
-                    log_decode_miss(
-                        "Lighter",
-                        &value,
-                        &payload,
-                        decode_miss_count,
-                        self.cfg.ws_url.as_str(),
-                    );
+                    if decode_miss_count == 1 {
+                        eprintln!(
+                            "INFO: Lighter startup: decode_order_book_top miss on snapshot-format \
+                             message (expected, snapshot will be processed by L2 path)"
+                        );
+                    }
                 }
                 // === L2 decode: snapshot for first message, delta for subsequent ===
                 //

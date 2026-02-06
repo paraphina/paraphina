@@ -576,6 +576,11 @@ pub struct ToxicityConfig {
     /// This prevents transient empty-side snapshots from immediately disabling a venue.
     /// Set to 0 to restore legacy behavior.
     pub depth_fallback_grace_ms: i64,
+    /// Catastrophic staleness threshold (ms). If a venue's last book update
+    /// is older than this, force toxicity=1.0 (Disabled) regardless of shadow
+    /// mode. Prevents stuck reconnect loops from leaving venues in Healthy state.
+    /// Set to 0 to disable. Default: 120_000 (2 minutes).
+    pub catastrophic_stale_ms: i64,
 }
 
 impl Default for Config {
@@ -703,7 +708,9 @@ impl Default for Config {
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
-                stale_ms_override: None,
+                // Paradex BBO feed cadence: startup P95 ~1,546ms, steady-state P95 ~250ms.
+                // 3,000ms gives ~2x headroom over worst startup case.
+                stale_ms_override: Some(3_000),
             },
         ];
 
@@ -901,6 +908,7 @@ impl Default for Config {
             markout_scale_usd_per_tao: 2.0, // $2 adverse markout → tox_instant = 1.0
             max_pending_per_venue: 100,     // bounded queue size
             depth_fallback_grace_ms: 500,   // tolerate brief empty-side snapshots
+            catastrophic_stale_ms: 120_000, // 2 minutes — force Disabled for stuck reconnects
         };
 
         Config {
@@ -1295,6 +1303,29 @@ impl Config {
             }
         }
 
+        // Paradex state-level staleness override.
+        // Same pattern as Hyperliquid/Extended: affects venue health gating and quote staleness guards.
+        if let Ok(raw) = env::var("PARAPHINA_PARADEX_STATE_STALE_MS_OVERRIDE") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let ms = v.max(0);
+                    if let Some(venue) = cfg.venues.iter_mut().find(|v| v.id == "paradex") {
+                        venue.stale_ms_override = Some(ms);
+                        eprintln!(
+                            "[config] PARAPHINA_PARADEX_STATE_STALE_MS_OVERRIDE = {} (set paradex stale_ms_override)",
+                            ms
+                        );
+                    }
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PARADEX_STATE_STALE_MS_OVERRIDE = {:?} as i64; ignoring",
+                        raw
+                    );
+                }
+            }
+        }
+
         if let Ok(raw) = env::var("PARAPHINA_FUNDING_STALE_MS") {
             match raw.parse::<i64>() {
                 Ok(v) => {
@@ -1308,6 +1339,26 @@ impl Config {
                     eprintln!(
                         "[config] WARN: could not parse PARAPHINA_FUNDING_STALE_MS = {:?} as i64; using default {}",
                         raw, cfg.funding.stale_ms
+                    );
+                }
+            }
+        }
+
+        // Catastrophic staleness threshold override.
+        // If a venue's book data is older than this, force toxicity=1.0 (Disabled).
+        if let Ok(raw) = env::var("PARAPHINA_CATASTROPHIC_STALE_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    cfg.toxicity.catastrophic_stale_ms = v.max(0);
+                    eprintln!(
+                        "[config] PARAPHINA_CATASTROPHIC_STALE_MS = {} (overrode default)",
+                        cfg.toxicity.catastrophic_stale_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_CATASTROPHIC_STALE_MS = {:?} as i64; ignoring",
+                        raw
                     );
                 }
             }
@@ -1476,12 +1527,17 @@ mod tests {
             "hyperliquid stale_ms_override should be 1500"
         );
 
-        // Verify other venues are NOT affected.
+        // Verify other venues are NOT affected (except paradex which has compiled default 3000).
         for venue in &cfg_with_override.venues {
             if venue.id != "hyperliquid" {
+                let expected = if venue.id == "paradex" {
+                    Some(3_000)
+                } else {
+                    None
+                };
                 assert_eq!(
-                    venue.stale_ms_override, None,
-                    "venue {} should not have stale_ms_override set",
+                    venue.stale_ms_override, expected,
+                    "venue {} stale_ms_override mismatch",
                     venue.id
                 );
             }
@@ -1567,6 +1623,8 @@ mod tests {
             }
             let expected = if venue.id == "hyperliquid" {
                 Some(2_000)
+            } else if venue.id == "paradex" {
+                Some(3_000)
             } else {
                 None
             };
