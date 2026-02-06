@@ -178,6 +178,7 @@ impl ExtendedConnector {
             .map(Mutex::new);
         let http = Client::builder()
             .user_agent("paraphina")
+            .timeout(Duration::from_secs(10))
             .build()
             .expect("extended http client build");
         let freshness = Arc::new(Freshness::default());
@@ -345,7 +346,10 @@ impl ExtendedConnector {
         request
             .headers_mut()
             .insert(USER_AGENT, HeaderValue::from_static("paraphina"));
-        let (ws_stream, _) = connect_async(request).await?;
+        let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(15), connect_async(request))
+            .await
+            .map_err(|_| anyhow::anyhow!("Extended public WS connect timeout (15s)"))?
+            .map_err(|e| anyhow::anyhow!("Extended public WS connect error: {e}"))?;
         eprintln!("INFO: Extended public WS connected url={}", ws_url);
         let (mut write, mut read) = ws_stream.split();
 
@@ -767,6 +771,7 @@ impl ExtendedRestClient {
             cfg,
             http: Client::builder()
                 .user_agent("paraphina")
+                .timeout(Duration::from_secs(10))
                 .build()
                 .expect("extended rest http client build"),
             timestamp_fn: Arc::new(now_ms),
@@ -1101,12 +1106,14 @@ fn parse_account_snapshot(
     })
 }
 
-async fn fetch_public_funding(client: &Client, cfg: &ExtendedConfig) -> anyhow::Result<FundingUpdate> {
+async fn fetch_public_funding(
+    client: &Client,
+    cfg: &ExtendedConfig,
+) -> anyhow::Result<FundingUpdate> {
     // Extended uses /api/v1/info/markets/{market}/stats for funding data.
     // The market is part of the path (e.g., ETH-USD), not a query parameter.
-    let path = std::env::var("EXTENDED_FUNDING_PATH").unwrap_or_else(|_| {
-        format!("/api/v1/info/markets/{}/stats", cfg.market)
-    });
+    let path = std::env::var("EXTENDED_FUNDING_PATH")
+        .unwrap_or_else(|_| format!("/api/v1/info/markets/{}/stats", cfg.market));
     let url = format!("{}{}", cfg.rest_url.trim_end_matches('/'), path);
     let resp = client.get(&url).send().await?;
     let status = resp.status();
@@ -1121,8 +1128,13 @@ async fn fetch_public_funding(client: &Client, cfg: &ExtendedConfig) -> anyhow::
         );
     }
 
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("Extended funding JSON parse error: {} body={}", e, body.chars().take(160).collect::<String>()))?;
+    let value: Value = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!(
+            "Extended funding JSON parse error: {} body={}",
+            e,
+            body.chars().take(160).collect::<String>()
+        )
+    })?;
 
     parse_public_funding(&value, cfg)
         .ok_or_else(|| anyhow::anyhow!("invalid public funding response"))
@@ -1150,12 +1162,16 @@ fn parse_public_funding(value: &Value, cfg: &ExtendedConfig) -> Option<FundingUp
         .and_then(|v| if v > 0 { Some(v as u64) } else { None })
         .or_else(|| {
             // Extended fundingRate is hourly; assume 3600s if rate is present
-            if rate_native.is_some() { Some(3600) } else { None }
+            if rate_native.is_some() {
+                Some(3600)
+            } else {
+                None
+            }
         });
 
     // Extended API uses "nextFundingRate" but it's actually the next funding TIME in ms
     let next_funding_ms = data
-        .get("nextFundingRate")  // Extended's field name (actually a timestamp, not a rate)
+        .get("nextFundingRate") // Extended's field name (actually a timestamp, not a rate)
         .or_else(|| data.get("nextFundingTime"))
         .or_else(|| data.get("next_funding_time"))
         .or_else(|| data.get("nextFundingTimestamp"))
@@ -1185,7 +1201,7 @@ fn parse_public_funding(value: &Value, cfg: &ExtendedConfig) -> Option<FundingUp
         funding_rate_native: rate_native,
         interval_sec,
         next_funding_ms,
-        settlement_price_kind: Some(SettlementPriceKind::Mark),  // Extended uses mark price
+        settlement_price_kind: Some(SettlementPriceKind::Mark), // Extended uses mark price
         source: FundingSource::MarketDataRest,
     })
 }
@@ -2209,35 +2225,21 @@ mod tests {
     #[test]
     fn freshness_reset_and_anchor_behavior() {
         let freshness = Freshness::default();
-        freshness
-            .last_parsed_ns
-            .store(123, Ordering::Relaxed);
-        freshness
-            .last_published_ns
-            .store(456, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(123, Ordering::Relaxed);
+        freshness.last_published_ns.store(456, Ordering::Relaxed);
         freshness.reset_for_new_connection();
-        assert_eq!(
-            freshness.last_parsed_ns.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            freshness.last_published_ns.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(freshness.last_parsed_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
 
         let connect_start_ns = 1_000;
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, connect_start_ns);
 
-        freshness
-            .last_parsed_ns
-            .store(2_000, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 2_000);
 
-        freshness
-            .last_published_ns
-            .store(3_000, Ordering::Relaxed);
+        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
     }
@@ -2247,10 +2249,8 @@ mod tests {
         // Test parsing Extended's /api/v1/info/markets/{market}/stats response format
         let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/fixtures/extended/public_market_stats.json");
-        let raw = std::fs::read_to_string(&fixture_path)
-            .expect("read fixture");
-        let value: Value = serde_json::from_str(&raw)
-            .expect("parse fixture JSON");
+        let raw = std::fs::read_to_string(&fixture_path).expect("read fixture");
+        let value: Value = serde_json::from_str(&raw).expect("parse fixture JSON");
 
         let cfg = ExtendedConfig {
             ws_url: "wss://example.invalid".to_string(),
@@ -2264,29 +2264,54 @@ mod tests {
             record_dir: None,
         };
 
-        let funding = parse_public_funding(&value, &cfg)
-            .expect("parse_public_funding should succeed");
+        let funding =
+            parse_public_funding(&value, &cfg).expect("parse_public_funding should succeed");
 
         // Verify rate parsing: fixture has fundingRate "0.000013" (hourly)
         // rate_8h should be 0.000013 * 8 = 0.000104
-        assert!(funding.funding_rate_native.is_some(), "native rate should be present");
+        assert!(
+            funding.funding_rate_native.is_some(),
+            "native rate should be present"
+        );
         let native = funding.funding_rate_native.unwrap();
-        assert!((native - 0.000013).abs() < 1e-10, "native rate mismatch: {}", native);
+        assert!(
+            (native - 0.000013).abs() < 1e-10,
+            "native rate mismatch: {}",
+            native
+        );
 
-        assert!(funding.funding_rate_8h.is_some(), "8h rate should be present");
+        assert!(
+            funding.funding_rate_8h.is_some(),
+            "8h rate should be present"
+        );
         let rate_8h = funding.funding_rate_8h.unwrap();
-        assert!((rate_8h - 0.000104).abs() < 1e-10, "8h rate mismatch: {}", rate_8h);
+        assert!(
+            (rate_8h - 0.000104).abs() < 1e-10,
+            "8h rate mismatch: {}",
+            rate_8h
+        );
 
         // Verify interval is detected as hourly (3600s)
-        assert_eq!(funding.interval_sec, Some(3600), "interval_sec should be 3600");
+        assert_eq!(
+            funding.interval_sec,
+            Some(3600),
+            "interval_sec should be 3600"
+        );
 
         // Verify next_funding_ms is extracted from "nextFundingRate" field
         // Fixture has: "nextFundingRate": 1770314400000
-        assert_eq!(funding.next_funding_ms, Some(1770314400000), "next_funding_ms mismatch");
+        assert_eq!(
+            funding.next_funding_ms,
+            Some(1770314400000),
+            "next_funding_ms mismatch"
+        );
 
         // Verify source and settlement
         assert!(matches!(funding.source, FundingSource::MarketDataRest));
-        assert_eq!(funding.settlement_price_kind, Some(SettlementPriceKind::Mark));
+        assert_eq!(
+            funding.settlement_price_kind,
+            Some(SettlementPriceKind::Mark)
+        );
 
         // Verify venue info
         assert_eq!(funding.venue_index, 0);

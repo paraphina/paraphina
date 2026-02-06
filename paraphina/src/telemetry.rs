@@ -1870,7 +1870,10 @@ mod tests {
 
         // Global stale_ms = 1000 (default).
         let global_stale_ms = cfg.book.stale_ms;
-        assert_eq!(global_stale_ms, 1000, "Default global stale_ms should be 1000");
+        assert_eq!(
+            global_stale_ms, 1000,
+            "Default global stale_ms should be 1000"
+        );
 
         // Venue 0: no override, use global threshold.
         // Set last update 500ms ago => should be healthy.

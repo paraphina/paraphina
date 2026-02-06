@@ -116,12 +116,28 @@ class WatchState:
     venue_ids: list[str] = field(default_factory=list)
     last_fill_ms: dict[str, int] = field(default_factory=dict)
     events: EventLog = field(default_factory=EventLog)
+    tick_count: int = 0
+    prev_venue_status: dict[str, str] = field(default_factory=dict)
+    venue_status_flips: dict[str, int] = field(default_factory=dict)
+    venue_stale_ticks: dict[str, int] = field(default_factory=dict)
 
     def update(self, record: dict[str, Any]) -> None:
         self.last_record = record
+        self.tick_count += 1
         venue_status = record.get("venue_status", [])
         venue_count = len(venue_status) if isinstance(venue_status, list) else 0
         self.venue_ids = parse_venue_ids(record, venue_count)
+
+        # Track per-venue stale% and status flips.
+        for idx, vid in enumerate(self.venue_ids):
+            cur = venue_status[idx] if isinstance(venue_status, list) and idx < len(venue_status) else None
+            if isinstance(cur, str):
+                if cur != "Healthy":
+                    self.venue_stale_ticks[vid] = self.venue_stale_ticks.get(vid, 0) + 1
+                prev = self.prev_venue_status.get(vid)
+                if prev is not None and cur != prev:
+                    self.venue_status_flips[vid] = self.venue_status_flips.get(vid, 0) + 1
+                self.prev_venue_status[vid] = cur
 
         now_ms = None
         treasury = record.get("treasury_guidance")
@@ -271,6 +287,11 @@ def render_frame(state: WatchState, max_events: int) -> str:
         health = format_status(status_val)
         tox_val = tox[idx] if isinstance(tox, list) and idx < len(tox) else None
         tox_str = f"{tox_val:.2f}" if isinstance(tox_val, (int, float)) else "n/a"
+        # Compute cumulative stale% and flip count for this venue.
+        stale_ticks = state.venue_stale_ticks.get(venue_id, 0)
+        stale_pct = (100.0 * stale_ticks / state.tick_count) if state.tick_count > 0 else 0.0
+        flips = state.venue_status_flips.get(venue_id, 0)
+        stale_flips_str = f"{stale_pct:.1f}%/{flips}"
         rows.append(
             [
                 venue_id,
@@ -284,6 +305,7 @@ def render_frame(state: WatchState, max_events: int) -> str:
                 str(open_orders),
                 last_fill_age,
                 f"{health} tox={tox_str}",
+                stale_flips_str,
             ]
         )
 
@@ -301,6 +323,7 @@ def render_frame(state: WatchState, max_events: int) -> str:
                 "orders",
                 "last_fill",
                 "health",
+                "stale%/flips",
             ],
             rows,
         )

@@ -14,6 +14,15 @@ const HL_INTERNAL_PUB_Q: usize = 256;
 const HL_DELTA_BOOTSTRAP_BUF: usize = 1024;
 const HL_DECODE_WARN_INTERVAL_MS: u64 = 10_000;
 
+/// Maximum time to wait for WS connect (TCP + TLS + upgrade).
+/// Prevents `connect_async` from hanging indefinitely on unresponsive hosts.
+/// Evidence: obs_5000_ticks_report — 76-min dead period, no reconnect logs.
+const HL_WS_CONNECT_TIMEOUT_MS_DEFAULT: u64 = 15_000;
+
+/// Maximum time to wait for a single WS frame before treating connection as dead.
+/// Prevents idle ESTABLISHED sockets from blocking the reconnect loop.
+const HL_WS_READ_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 
 fn mono_now_ns() -> u64 {
@@ -28,6 +37,36 @@ fn hl_stale_ms() -> u64 {
         .unwrap_or(HL_STALE_MS_DEFAULT)
 }
 
+fn hl_ws_connect_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("PARAPHINA_HL_WS_CONNECT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(HL_WS_CONNECT_TIMEOUT_MS_DEFAULT),
+    )
+}
+
+fn hl_ws_read_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("PARAPHINA_HL_WS_READ_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(HL_WS_READ_TIMEOUT_MS_DEFAULT),
+    )
+}
+
+/// Wrap a future with a timeout, returning an anyhow error on expiration.
+/// Testable helper — used for both connect and read timeouts.
+async fn with_timeout<T>(
+    duration: Duration,
+    label: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(duration, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("Hyperliquid {label} timed out after {duration:?}"))
+}
+
 fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
     now_ns.saturating_sub(then_ns) / 1_000_000
 }
@@ -39,6 +78,10 @@ struct Freshness {
     last_parsed_ns: AtomicU64,
     last_published_ns: AtomicU64,
     last_snapshot_resync_ns: AtomicU64,
+    /// FIX A3: Tracks the last time an l2Book event was decoded into a publishable
+    /// MarketDataEvent. Used by the watchdog to detect "WS alive but no book data"
+    /// scenarios where heartbeats keep last_ws_rx_ns fresh but no book updates flow.
+    last_book_event_ns: AtomicU64,
 }
 
 impl Freshness {
@@ -47,14 +90,17 @@ impl Freshness {
         self.last_data_rx_ns.store(0, Ordering::Relaxed);
         self.last_parsed_ns.store(0, Ordering::Relaxed);
         self.last_published_ns.store(0, Ordering::Relaxed);
-        self.last_snapshot_resync_ns
-            .store(0, Ordering::Relaxed);
+        self.last_snapshot_resync_ns.store(0, Ordering::Relaxed);
+        self.last_book_event_ns.store(0, Ordering::Relaxed);
     }
 
     fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
+        // FIX A3: Use last_book_event_ns as the primary watchdog anchor.
+        // This ensures the watchdog fires when book data stops flowing,
+        // even if non-book WS messages (heartbeats) keep last_ws_rx_ns fresh.
+        let last_book = self.last_book_event_ns.load(Ordering::Relaxed);
         let last_pub = self.last_published_ns.load(Ordering::Relaxed);
-        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
-        let anchor = last_pub.max(last_parsed);
+        let anchor = last_book.max(last_pub);
         if anchor == 0 {
             connect_start_ns
         } else {
@@ -189,7 +235,10 @@ impl HyperliquidConnector {
     ) -> Self {
         Self {
             cfg,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("hl http client build"),
             market_tx,
             exec_tx,
             account_tx: None,
@@ -238,11 +287,22 @@ impl HyperliquidConnector {
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
         let freshness = self.freshness.clone();
+        let connect_timeout = hl_ws_connect_timeout();
+        let read_timeout = hl_ws_read_timeout();
         eprintln!(
-            "INFO: Hyperliquid public WS connecting url={}",
+            "INFO: Hyperliquid public WS connecting url={} connect_timeout={connect_timeout:?}",
             self.cfg.ws_url
         );
-        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        // FIX A1: connect_async can hang indefinitely if the remote host is unreachable
+        // or accepts the TCP connection but never completes TLS/upgrade.
+        let (ws_stream, _) = with_timeout(
+            connect_timeout,
+            "public WS connect",
+            connect_async(self.cfg.ws_url.as_str()),
+        )
+        .await?
+        // Unwrap the inner Result from connect_async
+        .map_err(|e| anyhow::anyhow!("Hyperliquid public WS connect error: {e}"))?;
         eprintln!(
             "INFO: Hyperliquid public WS connected url={}",
             self.cfg.ws_url
@@ -338,9 +398,20 @@ impl HyperliquidConnector {
             tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
+                    eprintln!("WARN: Hyperliquid public WS watchdog: no publishable book update for {stale_ms}ms — reconnecting");
                     anyhow::bail!("Hyperliquid public WS stale: freshness exceeded {stale_ms}ms");
                 }
-                maybe = read.next() => {
+                // FIX A2: read timeout prevents idle ESTABLISHED sockets from blocking forever.
+                read_result = tokio::time::timeout(read_timeout, read.next()) => {
+                    let maybe = match read_result {
+                        Ok(m) => m,
+                        Err(_) => {
+                            eprintln!(
+                                "WARN: Hyperliquid public WS read timeout ({read_timeout:?}) — no frame received, reconnecting"
+                            );
+                            anyhow::bail!("Hyperliquid public WS read timeout after {read_timeout:?}");
+                        }
+                    };
                     let Some(msg) = maybe else { break; };
                     let msg = msg?;
                     freshness
@@ -431,9 +502,14 @@ impl HyperliquidConnector {
 
                         if let Some(snapshot) = decode_result.event {
                             // Update freshness ONLY when we produce a publishable event
+                            let now_ns = mono_now_ns();
                             freshness
                                 .last_parsed_ns
-                                .store(mono_now_ns(), Ordering::Relaxed);
+                                .store(now_ns, Ordering::Relaxed);
+                            // FIX A3: Track book-specific events for the watchdog
+                            freshness
+                                .last_book_event_ns
+                                .store(now_ns, Ordering::Relaxed);
                             have_baseline = true;
                             while let Some(buffered) = delta_buf.pop_front() {
                                 try_publish(buffered)?;
@@ -483,9 +559,14 @@ impl HyperliquidConnector {
                         );
                     }
                     if let Some(parsed) = parse_l2_message_value(&value, self.cfg.venue_index) {
+                        let now_ns = mono_now_ns();
                         freshness
                             .last_parsed_ns
-                            .store(mono_now_ns(), Ordering::Relaxed);
+                            .store(now_ns, Ordering::Relaxed);
+                        // FIX A3: Also update book event tracker for non-l2Book parseable events
+                        freshness
+                            .last_book_event_ns
+                            .store(now_ns, Ordering::Relaxed);
                         let outcome = tracker.on_message(parsed);
                         if let Some(seq) = outcome.refresh_snapshot {
                         if let Some(snapshot) = self.refresh_snapshot(seq).await {
@@ -574,7 +655,16 @@ impl HyperliquidConnector {
     }
 
     async fn private_ws_once(&self) -> anyhow::Result<()> {
-        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        let connect_timeout = hl_ws_connect_timeout();
+        let read_timeout = hl_ws_read_timeout();
+
+        let (ws_stream, _) = with_timeout(
+            connect_timeout,
+            "private WS connect",
+            connect_async(self.cfg.ws_url.as_str()),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("Hyperliquid private WS connect error: {e}"))?;
         let (mut write, mut read) = ws_stream.split();
         let sub_fills = json!({
             "method": "subscribe",
@@ -586,8 +676,17 @@ impl HyperliquidConnector {
             "subscription": { "type": "userEvents" }
         });
         write.send(Message::Text(sub_orders.to_string())).await?;
-        while let Some(msg) = read.next().await {
-            let msg = msg?;
+        loop {
+            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+                Ok(Some(msg)) => msg?,
+                Ok(None) => break,
+                Err(_) => {
+                    eprintln!(
+                        "WARN: Hyperliquid private WS read timeout ({read_timeout:?}) — reconnecting"
+                    );
+                    anyhow::bail!("Hyperliquid private WS read timeout after {read_timeout:?}");
+                }
+            };
             if let Message::Text(text) = msg {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                     for event in translate_private_events(&value) {
@@ -1355,7 +1454,6 @@ fn decode_l2book_snapshot_resilient(
     }
 }
 
-
 fn log_decode_miss(venue: &str, value: &serde_json::Value, payload: &str, count: usize, url: &str) {
     let keys = value
         .as_object()
@@ -1466,12 +1564,14 @@ async fn fetch_public_funding(
         .send()
         .await?;
     let value: serde_json::Value = resp.json().await?;
-    parse_public_funding(&value, cfg).ok_or_else(|| {
-        anyhow::anyhow!("invalid public funding response for coin={}", cfg.coin)
-    })
+    parse_public_funding(&value, cfg)
+        .ok_or_else(|| anyhow::anyhow!("invalid public funding response for coin={}", cfg.coin))
 }
 
-fn parse_public_funding(value: &serde_json::Value, cfg: &HyperliquidConfig) -> Option<FundingUpdate> {
+fn parse_public_funding(
+    value: &serde_json::Value,
+    cfg: &HyperliquidConfig,
+) -> Option<FundingUpdate> {
     let now_ms = now_ms();
     let mut universe: Option<&Vec<serde_json::Value>> = None;
     let mut ctxs: Option<&Vec<serde_json::Value>> = None;
@@ -1535,7 +1635,7 @@ fn parse_public_funding(value: &serde_json::Value, cfg: &HyperliquidConfig) -> O
         funding_rate_native: funding_rate,
         interval_sec,
         next_funding_ms,
-        settlement_price_kind: Some(SettlementPriceKind::Unknown),
+        settlement_price_kind: Some(SettlementPriceKind::Mark), // HL settles funding at mark price
         source: FundingSource::MarketDataRest,
     })
 }
@@ -1643,39 +1743,30 @@ mod tests {
     #[test]
     fn freshness_reset_and_anchor_behavior() {
         let freshness = Freshness::default();
-        freshness
-            .last_parsed_ns
-            .store(123, Ordering::Relaxed);
-        freshness
-            .last_published_ns
-            .store(456, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(123, Ordering::Relaxed);
+        freshness.last_published_ns.store(456, Ordering::Relaxed);
+        freshness.last_book_event_ns.store(789, Ordering::Relaxed);
         freshness.reset_for_new_connection();
+        assert_eq!(freshness.last_parsed_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(freshness.last_snapshot_resync_ns.load(Ordering::Relaxed), 0);
         assert_eq!(
-            freshness.last_parsed_ns.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            freshness.last_published_ns.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            freshness.last_snapshot_resync_ns.load(Ordering::Relaxed),
-            0
+            freshness.last_book_event_ns.load(Ordering::Relaxed),
+            0,
+            "last_book_event_ns must be reset on new connection"
         );
 
+        // After reset with no book events, anchor falls back to connect_start_ns
         let connect_start_ns = 1_000;
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, connect_start_ns);
 
-        freshness
-            .last_parsed_ns
-            .store(2_000, Ordering::Relaxed);
+        // FIX A3: anchor now uses last_book_event_ns (not last_parsed_ns)
+        freshness.last_book_event_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 2_000);
 
-        freshness
-            .last_published_ns
-            .store(3_000, Ordering::Relaxed);
+        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
     }
@@ -1704,6 +1795,12 @@ mod tests {
         assert_eq!(update.interval_sec, Some(28_800));
         assert_eq!(update.next_funding_ms, Some(1_700_003_600_000));
         assert_eq!(update.source, FundingSource::MarketDataRest);
+        // Fix C: HL settles funding at mark price (docs: https://hyperliquid.gitbook.io)
+        assert_eq!(
+            update.settlement_price_kind,
+            Some(SettlementPriceKind::Mark),
+            "Hyperliquid settlement must be Mark"
+        );
     }
 
     #[test]
@@ -1867,6 +1964,96 @@ mod tests {
         let bad_value: serde_json::Value = serde_json::from_str(bad_json).unwrap();
         let bad_result = parse_level_entry(&bad_value);
         assert!(bad_result.is_none());
+    }
+
+    // ───────── Fix A5: Deterministic timeout tests ─────────
+    // NOTE: Uses very short real timeouts (1 ms) since `test-util`
+    // (start_paused) is not available in this workspace's tokio features.
+
+    #[tokio::test]
+    async fn with_timeout_fires_on_pending_future() {
+        // A future that never resolves must trigger the timeout.
+        let result = with_timeout(
+            Duration::from_millis(1),
+            "test_connect",
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(result.is_err(), "expected timeout error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timed out"),
+            "error should mention timeout: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_timeout_passes_through_on_immediate_resolve() {
+        let result = with_timeout(Duration::from_secs(5), "test_connect", async { 42u64 }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn read_timeout_path_returns_error() {
+        // Simulate a WS read that hangs forever — the read timeout should fire.
+        let read_timeout = Duration::from_millis(1);
+        let result = tokio::time::timeout(read_timeout, std::future::pending::<Option<()>>()).await;
+        assert!(
+            result.is_err(),
+            "read loop should time out on a hanging stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_returns_error_msg() {
+        // with_timeout label must appear in the error message for operator diagnostics.
+        let err = with_timeout(
+            Duration::from_millis(1),
+            "public WS connect",
+            std::future::pending::<()>(),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("public WS connect"), "msg: {msg}");
+        assert!(msg.contains("1ms"), "msg should include duration: {msg}");
+    }
+
+    #[test]
+    fn freshness_book_event_ns_independent_of_parsed_ns() {
+        // Verify that last_book_event_ns and last_parsed_ns are independent:
+        // non-book WS messages that update last_parsed_ns should NOT affect
+        // the watchdog anchor (which uses last_book_event_ns).
+        let freshness = Freshness::default();
+
+        // Simulate: connect happened at 1000
+        let connect_start_ns = 1_000;
+
+        // Initially anchor = connect_start_ns (no book events)
+        assert_eq!(
+            freshness.anchor_with_connect_start(connect_start_ns),
+            connect_start_ns
+        );
+
+        // Simulate: a non-book message updates last_parsed_ns but NOT last_book_event_ns
+        freshness.last_parsed_ns.store(5_000, Ordering::Relaxed);
+
+        // Anchor should still be connect_start_ns because no BOOK events happened
+        assert_eq!(
+            freshness.anchor_with_connect_start(connect_start_ns),
+            connect_start_ns,
+            "non-book parsed events must not advance watchdog anchor"
+        );
+
+        // Simulate: a book event updates last_book_event_ns
+        freshness.last_book_event_ns.store(6_000, Ordering::Relaxed);
+
+        // NOW the anchor should advance
+        assert_eq!(
+            freshness.anchor_with_connect_start(connect_start_ns),
+            6_000,
+            "book events must advance watchdog anchor"
+        );
     }
 }
 

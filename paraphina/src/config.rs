@@ -641,9 +641,9 @@ impl Default for Config {
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
-                // Hyperliquid has higher latency (P95 ~1340ms), needs larger stale threshold.
-                // In live, consider setting to 2000ms via env override.
-                stale_ms_override: None,
+                // Hyperliquid WebSocket P50 ~1195ms, P95 ~1444ms (obs_5000_ticks_report).
+                // Default 1000ms causes 63.9% Stale / 1257 flaps in 83 min.
+                stale_ms_override: Some(2_000),
             },
             VenueConfig {
                 id: "aster".to_string(),
@@ -1455,8 +1455,9 @@ mod tests {
             "hyperliquid venue must exist in default config"
         );
         assert_eq!(
-            hl_baseline.unwrap().stale_ms_override, None,
-            "baseline hyperliquid stale_ms_override should be None"
+            hl_baseline.unwrap().stale_ms_override,
+            Some(2_000),
+            "baseline hyperliquid stale_ms_override should be Some(2000)"
         );
 
         // Set override and reload config.
@@ -1508,8 +1509,9 @@ mod tests {
             .find(|v| v.id == "hyperliquid")
             .expect("hyperliquid venue must exist");
         assert_eq!(
-            hl.stale_ms_override, None,
-            "invalid env value should be ignored"
+            hl.stale_ms_override,
+            Some(2_000),
+            "invalid env value should leave the compiled default (2000) unchanged"
         );
         // EnvGuard restores on drop.
     }
@@ -1537,7 +1539,8 @@ mod tests {
             "extended venue must exist in default config"
         );
         assert_eq!(
-            ext_baseline.unwrap().stale_ms_override, None,
+            ext_baseline.unwrap().stale_ms_override,
+            None,
             "baseline extended stale_ms_override should be None"
         );
 
@@ -1557,15 +1560,21 @@ mod tests {
             "extended stale_ms_override should be 1500"
         );
 
-        // Verify other venues are NOT affected.
+        // Verify other venues are NOT affected (except hyperliquid which has compiled default 2000).
         for venue in &cfg_with_override.venues {
-            if venue.id != "extended" {
-                assert_eq!(
-                    venue.stale_ms_override, None,
-                    "venue {} should not have stale_ms_override set",
-                    venue.id
-                );
+            if venue.id == "extended" {
+                continue;
             }
+            let expected = if venue.id == "hyperliquid" {
+                Some(2_000)
+            } else {
+                None
+            };
+            assert_eq!(
+                venue.stale_ms_override, expected,
+                "venue {} stale_ms_override mismatch",
+                venue.id
+            );
         }
         // EnvGuard restores on drop.
     }

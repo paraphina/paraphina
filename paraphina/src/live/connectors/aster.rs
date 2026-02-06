@@ -215,7 +215,10 @@ impl AsterConnector {
         );
         let connector = Self {
             cfg,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("aster http client build"),
             market_publisher,
             recorder,
             freshness,
@@ -286,7 +289,13 @@ impl AsterConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
-        let (ws_stream, _) = connect_async(self.cfg.ws_url.as_str()).await?;
+        let (ws_stream, _) = tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_async(self.cfg.ws_url.as_str()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Aster public WS connect timeout (15s)"))?
+        .map_err(|e| anyhow::anyhow!("Aster public WS connect error: {e}"))?;
         let (mut write, mut read) = ws_stream.split();
         let stream = format!("{}@depth@100ms", self.cfg.stream_symbol());
         let sub = serde_json::json!({
@@ -776,7 +785,10 @@ impl AsterRestClient {
     pub fn new(cfg: AsterConfig) -> Self {
         Self {
             cfg,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("aster rest http client build"),
             timestamp_fn: Arc::new(now_ms),
         }
     }
@@ -1109,8 +1121,8 @@ fn parse_account_snapshot(
 }
 
 async fn fetch_public_funding(client: &Client, cfg: &AsterConfig) -> anyhow::Result<FundingUpdate> {
-    let path = std::env::var("ASTER_FUNDING_PATH")
-        .unwrap_or_else(|_| "/fapi/v1/premiumIndex".to_string());
+    let path =
+        std::env::var("ASTER_FUNDING_PATH").unwrap_or_else(|_| "/fapi/v1/premiumIndex".to_string());
     let url = format!("{}{}", cfg.rest_url.trim_end_matches('/'), path);
     let resp = client
         .get(url)
@@ -1137,7 +1149,16 @@ fn parse_public_funding(value: &Value, cfg: &AsterConfig) -> Option<FundingUpdat
         .or_else(|| data.get("funding_interval_sec"))
         .or_else(|| data.get("fundingInterval"))
         .and_then(parse_i64_value)
-        .and_then(|v| if v > 0 { Some(v as u64) } else { None });
+        .and_then(|v| if v > 0 { Some(v as u64) } else { None })
+        .or_else(|| {
+            // Aster settles funding every 8h. Default to 28800s when API doesn't provide it.
+            // Ref: https://docs.asterdex.com/astherusex-orderbook-perp-guide/mark-price-oracle
+            if rate_native.is_some() {
+                Some(28_800)
+            } else {
+                None
+            }
+        });
     let next_funding_ms = data
         .get("nextFundingTime")
         .or_else(|| data.get("next_funding_time"))
@@ -1164,7 +1185,9 @@ fn parse_public_funding(value: &Value, cfg: &AsterConfig) -> Option<FundingUpdat
         funding_rate_native: rate_native,
         interval_sec,
         next_funding_ms,
-        settlement_price_kind: Some(SettlementPriceKind::Unknown),
+        // Aster uses mark price for funding: Mark = Median(Price1, Price2, ContractPrice).
+        // Ref: https://docs.asterdex.com/astherusex-orderbook-perp-guide/mark-price-oracle
+        settlement_price_kind: Some(SettlementPriceKind::Mark),
         source: FundingSource::MarketDataRest,
     })
 }
@@ -1738,8 +1761,7 @@ mod tests {
 
     #[test]
     fn parse_public_funding_fixture() {
-        let raw =
-            include_str!("../../../../tests/fixtures/aster/public_premium_index.json");
+        let raw = include_str!("../../../../tests/fixtures/aster/public_premium_index.json");
         let value: Value = serde_json::from_str(raw).expect("fixture json");
         let cfg = AsterConfig {
             ws_url: "wss://example".to_string(),
@@ -1757,6 +1779,18 @@ mod tests {
         assert_eq!(update.funding_rate_8h, Some(0.0002));
         assert_eq!(update.next_funding_ms, Some(1_700_003_600_000));
         assert_eq!(update.source, FundingSource::MarketDataRest);
+        // Fix: Aster interval_sec must be 28800 (8h funding period)
+        assert_eq!(
+            update.interval_sec,
+            Some(28_800),
+            "Aster interval_sec must be 28800"
+        );
+        // Fix C: Aster settles funding at mark price.
+        assert_eq!(
+            update.settlement_price_kind,
+            Some(SettlementPriceKind::Mark),
+            "Aster settlement must be Mark"
+        );
     }
 
     #[test]
@@ -2091,35 +2125,21 @@ mod tests {
     #[test]
     fn freshness_reset_and_anchor_behavior() {
         let freshness = Freshness::default();
-        freshness
-            .last_parsed_ns
-            .store(123, Ordering::Relaxed);
-        freshness
-            .last_published_ns
-            .store(456, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(123, Ordering::Relaxed);
+        freshness.last_published_ns.store(456, Ordering::Relaxed);
         freshness.reset_for_new_connection();
-        assert_eq!(
-            freshness.last_parsed_ns.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            freshness.last_published_ns.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(freshness.last_parsed_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
 
         let connect_start_ns = 1_000;
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, connect_start_ns);
 
-        freshness
-            .last_parsed_ns
-            .store(2_000, Ordering::Relaxed);
+        freshness.last_parsed_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 2_000);
 
-        freshness
-            .last_published_ns
-            .store(3_000, Ordering::Relaxed);
+        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
     }
