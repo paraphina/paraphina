@@ -526,6 +526,15 @@ pub struct GlobalState {
     pub size_mult: f64,
     pub band_mult: f64,
 
+    // ----- Vol diagnostics (tick-cadence-aware scaling) -----
+    /// Current vol_ratio after tick-cadence scaling is applied.
+    /// Mirrors the live `vol_ratio_clipped` value for telemetry/diagnostics.
+    pub shadow_vol_ratio: Option<f64>,
+    /// Current spread_mult under tick-cadence-scaled vol.
+    pub shadow_spread_mult: Option<f64>,
+    /// Current size_mult under tick-cadence-scaled vol.
+    pub shadow_size_mult: Option<f64>,
+
     // ----- Inventory & basis (whitepaper Section 8) -----
     /// Global net trading inventory q_t in TAO.
     pub q_global_tao: f64,
@@ -784,6 +793,11 @@ impl GlobalState {
             spread_mult: 1.0,
             size_mult: 1.0,
             band_mult: 1.0,
+
+            // Shadow vol diagnostics (Phase 1a)
+            shadow_vol_ratio: None,
+            shadow_spread_mult: None,
+            shadow_size_mult: None,
 
             // Inventory & basis
             q_global_tao: 0.0,

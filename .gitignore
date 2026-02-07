@@ -73,3 +73,6 @@ _reports/
 # allow fixture jsonl files (needed for CI tests)
 !tests/fixtures/**/*.jsonl
 live_audit/
+
+# Shadow / live run output artifacts
+out/

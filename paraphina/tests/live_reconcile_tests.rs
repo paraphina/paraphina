@@ -226,17 +226,17 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let telemetry_path = temp.path().join("telemetry.jsonl");
         let telemetry = LiveTelemetry {
-            sink: std::sync::Arc::new(std::sync::Mutex::new(TelemetrySink::from_config(
+            sink: paraphina::telemetry::TelemetrySinkHandle::Sync(std::sync::Arc::new(std::sync::Mutex::new(TelemetrySink::from_config(
                 TelemetryConfig {
                     mode: TelemetryMode::Jsonl,
                     path: Some(telemetry_path.clone()),
                     append: false,
                 },
-            ))),
+            )))),
             shadow_mode: false,
             execution_mode: "live",
             max_orders_per_tick: 200,
-            stats: std::sync::Arc::new(std::sync::Mutex::new(LiveTelemetryStats::default())),
+            stats: std::sync::Arc::new(LiveTelemetryStats::default()),
         };
 
         let (market_tx, market_rx) = mpsc::channel::<MarketDataEvent>(32);
@@ -321,17 +321,17 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let telemetry_path = temp.path().join("telemetry.jsonl");
         let telemetry = LiveTelemetry {
-            sink: std::sync::Arc::new(std::sync::Mutex::new(TelemetrySink::from_config(
+            sink: paraphina::telemetry::TelemetrySinkHandle::Sync(std::sync::Arc::new(std::sync::Mutex::new(TelemetrySink::from_config(
                 TelemetryConfig {
                     mode: TelemetryMode::Jsonl,
                     path: Some(telemetry_path.clone()),
                     append: false,
                 },
-            ))),
+            )))),
             shadow_mode: true,
             execution_mode: "shadow",
             max_orders_per_tick: 200,
-            stats: std::sync::Arc::new(std::sync::Mutex::new(LiveTelemetryStats::default())),
+            stats: std::sync::Arc::new(LiveTelemetryStats::default()),
         };
 
         let (market_tx, market_rx) = mpsc::channel::<MarketDataEvent>(32);

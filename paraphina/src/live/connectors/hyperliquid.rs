@@ -149,9 +149,12 @@ pub enum HyperliquidNetwork {
 #[derive(Debug, Clone)]
 pub struct HyperliquidConfig {
     pub network: HyperliquidNetwork,
-    pub ws_url: String,
-    pub rest_url: String,
-    pub info_url: String,
+    /// Ordered list of WebSocket URLs for failover rotation.
+    pub ws_urls: Vec<String>,
+    /// Ordered list of REST (exchange) URLs for failover rotation.
+    pub rest_urls: Vec<String>,
+    /// Ordered list of REST info URLs for failover rotation.
+    pub info_urls: Vec<String>,
     pub coin: String,
     pub n_sig_figs: u32,
     pub n_levels: u32,
@@ -159,6 +162,46 @@ pub struct HyperliquidConfig {
     pub paper_mode: bool,
     pub private_key_hex: Option<String>,
     pub vault_address: Option<String>,
+}
+
+impl HyperliquidConfig {
+    /// Return the current ws_url (first entry or default).
+    pub fn ws_url(&self) -> &str {
+        self.ws_urls.first().map(|s| s.as_str()).unwrap_or("")
+    }
+    /// Return the current rest_url (first entry or default).
+    pub fn rest_url(&self) -> &str {
+        self.rest_urls.first().map(|s| s.as_str()).unwrap_or("")
+    }
+    /// Return the current info_url (first entry or default).
+    pub fn info_url(&self) -> &str {
+        self.info_urls.first().map(|s| s.as_str()).unwrap_or("")
+    }
+}
+
+impl HyperliquidConfig {
+    /// Parse a comma-separated list of URLs from the given env var, or fall back
+    /// to the singular env var wrapped in a vec, or the default.
+    fn urls_from_env(plural_var: &str, singular_var: &str, default: &str) -> Vec<String> {
+        // Prefer the plural form (comma-separated list) if set.
+        if let Ok(raw) = std::env::var(plural_var) {
+            let urls: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !urls.is_empty() {
+                return urls;
+            }
+        }
+        // Fall back to the singular form for backward compatibility.
+        if let Ok(single) = std::env::var(singular_var) {
+            if !single.trim().is_empty() {
+                return vec![single.trim().to_string()];
+            }
+        }
+        vec![default.to_string()]
+    }
 }
 
 impl HyperliquidConfig {
@@ -183,9 +226,9 @@ impl HyperliquidConfig {
                 "https://api.hyperliquid-testnet.xyz/info",
             ),
         };
-        let ws_url = std::env::var("HL_WS_URL").unwrap_or_else(|_| default_ws.to_string());
-        let rest_url = std::env::var("HL_REST_URL").unwrap_or_else(|_| default_rest.to_string());
-        let info_url = std::env::var("HL_INFO_URL").unwrap_or_else(|_| default_info.to_string());
+        let ws_urls = Self::urls_from_env("HL_WS_URLS", "HL_WS_URL", default_ws);
+        let rest_urls = Self::urls_from_env("HL_REST_URLS", "HL_REST_URL", default_rest);
+        let info_urls = Self::urls_from_env("HL_INFO_URLS", "HL_INFO_URL", default_info);
         let coin = std::env::var("HL_COIN").unwrap_or_else(|_| "TAO".to_string());
         let n_sig_figs = std::env::var("HL_L2_SIGFIGS")
             .ok()
@@ -202,9 +245,9 @@ impl HyperliquidConfig {
         let vault_address = std::env::var("HL_VAULT_ADDRESS").ok();
         Self {
             network,
-            ws_url,
-            rest_url,
-            info_url,
+            ws_urls,
+            rest_urls,
+            info_urls,
             coin,
             n_sig_figs,
             n_levels,
@@ -227,6 +270,8 @@ pub struct HyperliquidConnector {
     freshness: Arc<Freshness>,
     /// Cached signing key parsed once at initialization (avoids per-call hex decode + key construction).
     signing_key: Option<SigningKey>,
+    /// Current endpoint index for round-robin rotation across ws_urls/rest_urls/info_urls.
+    endpoint_index: std::sync::atomic::AtomicUsize,
 }
 
 impl HyperliquidConnector {
@@ -267,6 +312,7 @@ impl HyperliquidConnector {
             asset_index: tokio::sync::Mutex::new(None),
             freshness: Arc::new(Freshness::default()),
             signing_key,
+            endpoint_index: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -275,7 +321,88 @@ impl HyperliquidConnector {
         self
     }
 
+    /// Return the current endpoint URLs without rotating.
+    fn current_endpoints(&self) -> (String, String, String) {
+        let idx = self.endpoint_index.load(std::sync::atomic::Ordering::Relaxed);
+        let ws = self.cfg.ws_urls[idx % self.cfg.ws_urls.len()].clone();
+        let rest = self.cfg.rest_urls[idx % self.cfg.rest_urls.len()].clone();
+        let info = self.cfg.info_urls[idx % self.cfg.info_urls.len()].clone();
+        (ws, rest, info)
+    }
+
+    /// Rotate to the next endpoint in the list. Returns the new (ws, rest, info) triple.
+    ///
+    /// NOTE (pool staleness): The shared `reqwest::Client` may hold idle pooled
+    /// connections to the previous host.  These stale connections are evicted
+    /// naturally by reqwest on first failed use — no explicit pool flush is
+    /// needed.  The first REST request to the new endpoint will establish a
+    /// fresh connection.
+    fn rotate_endpoint(&self) -> (String, String, String) {
+        let old_idx = self.endpoint_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let new_idx = old_idx + 1;
+        let ws = self.cfg.ws_urls[new_idx % self.cfg.ws_urls.len()].clone();
+        let rest = self.cfg.rest_urls[new_idx % self.cfg.rest_urls.len()].clone();
+        let info = self.cfg.info_urls[new_idx % self.cfg.info_urls.len()].clone();
+        eprintln!(
+            "INFO: HL endpoint rotated: ws={ws}, rest={rest}, info={info} (index {new_idx}; \
+             note: stale pooled connections to previous host will be evicted on first failed use)"
+        );
+        (ws, rest, info)
+    }
+
+    /// Return the current info URL (for REST calls).
+    fn current_info_url(&self) -> String {
+        let idx = self.endpoint_index.load(std::sync::atomic::Ordering::Relaxed);
+        self.cfg.info_urls[idx % self.cfg.info_urls.len()].clone()
+    }
+
+    /// Return the current REST (exchange) URL.
+    fn current_rest_url(&self) -> String {
+        let idx = self.endpoint_index.load(std::sync::atomic::Ordering::Relaxed);
+        self.cfg.rest_urls[idx % self.cfg.rest_urls.len()].clone()
+    }
+
+    /// Return the current WS URL (for connections).
+    fn current_ws_url(&self) -> String {
+        let idx = self.endpoint_index.load(std::sync::atomic::Ordering::Relaxed);
+        self.cfg.ws_urls[idx % self.cfg.ws_urls.len()].clone()
+    }
+
+    /// Lightweight HTTP health probe: GET the current info_url with a 3-second
+    /// timeout. Returns `true` if the endpoint responds with HTTP 200.
+    /// Used before WS reconnection to avoid wasting the WS connect timeout on
+    /// a known-dead endpoint.
+    async fn probe_info_endpoint(&self) -> bool {
+        let info_url = self.current_info_url();
+        let probe_timeout = Duration::from_secs(3);
+        match tokio::time::timeout(
+            probe_timeout,
+            self.http.post(&info_url).json(&serde_json::json!({"type": "meta"})).send(),
+        )
+        .await
+        {
+            Ok(Ok(resp)) if resp.status().is_success() => true,
+            Ok(Ok(resp)) => {
+                eprintln!(
+                    "WARN: HL health probe non-200: status={} url={info_url}",
+                    resp.status()
+                );
+                false
+            }
+            Ok(Err(err)) => {
+                eprintln!("WARN: HL health probe request error: {err} url={info_url}");
+                false
+            }
+            Err(_) => {
+                eprintln!("WARN: HL health probe timed out (3s) url={info_url}");
+                false
+            }
+        }
+    }
+
     pub async fn run_public_ws(&self) {
+        use rand::Rng;
+
         let mut backoff = Duration::from_secs(1);
         let mut consecutive_failures: u32 = 0;
 
@@ -288,6 +415,19 @@ impl HyperliquidConnector {
         );
 
         loop {
+            // After 3+ consecutive failures, probe the info endpoint before
+            // attempting a WS connection.  On probe failure, rotate to the
+            // next endpoint immediately (avoids wasting the WS connect timeout
+            // on a known-dead endpoint).
+            if consecutive_failures >= 3 {
+                if !self.probe_info_endpoint().await {
+                    let (ws, _rest, info) = self.rotate_endpoint();
+                    eprintln!(
+                        "INFO: HL public WS probe failed, rotated to ws={ws} info={info}"
+                    );
+                }
+            }
+
             let session_start = std::time::Instant::now();
 
             if let Err(err) = self.public_ws_once().await {
@@ -325,7 +465,11 @@ impl HyperliquidConnector {
                 _ => Duration::from_secs(120),
             };
 
-            tokio::time::sleep(backoff).await;
+            // Add jitter to prevent thundering-herd reconnection storms.
+            let jitter = Duration::from_millis(
+                rand::thread_rng().gen_range(0..=backoff.as_millis().max(1) as u64 / 4),
+            );
+            tokio::time::sleep(backoff + jitter).await;
             backoff = (backoff * 2).min(max_backoff);
         }
     }
@@ -334,23 +478,22 @@ impl HyperliquidConnector {
         let freshness = self.freshness.clone();
         let connect_timeout = hl_ws_connect_timeout();
         let read_timeout = hl_ws_read_timeout();
+        let ws_url = self.current_ws_url();
         eprintln!(
-            "INFO: Hyperliquid public WS connecting url={} connect_timeout={connect_timeout:?}",
-            self.cfg.ws_url
+            "INFO: Hyperliquid public WS connecting url={ws_url} connect_timeout={connect_timeout:?}",
         );
         // FIX A1: connect_async can hang indefinitely if the remote host is unreachable
         // or accepts the TCP connection but never completes TLS/upgrade.
         let (ws_stream, _) = with_timeout(
             connect_timeout,
             "public WS connect",
-            connect_async(self.cfg.ws_url.as_str()),
+            connect_async(ws_url.as_str()),
         )
         .await?
         // Unwrap the inner Result from connect_async
         .map_err(|e| anyhow::anyhow!("Hyperliquid public WS connect error: {e}"))?;
         eprintln!(
-            "INFO: Hyperliquid public WS connected url={}",
-            self.cfg.ws_url
+            "INFO: Hyperliquid public WS connected url={ws_url}",
         );
         let (mut write, mut read) = ws_stream.split();
         let sub = json!({
@@ -469,8 +612,7 @@ impl HyperliquidConnector {
                             Err(_) => {
                                 if !logged_non_utf8_binary {
                                     eprintln!(
-                                        "WARN: Hyperliquid public WS non-utf8 binary frame url={}",
-                                        self.cfg.ws_url
+                                        "WARN: Hyperliquid public WS non-utf8 binary frame url={ws_url}",
                                     );
                                     logged_non_utf8_binary = true;
                                 }
@@ -488,8 +630,7 @@ impl HyperliquidConnector {
                         Err(err) => {
                             let snippet: String = payload.chars().take(160).collect();
                             eprintln!(
-                                "WARN: Hyperliquid public WS parse error: {err} url={} snippet={}",
-                                self.cfg.ws_url, snippet
+                                "WARN: Hyperliquid public WS parse error: {err} url={ws_url} snippet={snippet}",
                             );
                             continue;
                         }
@@ -517,7 +658,7 @@ impl HyperliquidConnector {
                                 &value,
                                 &payload,
                                 decode_miss_count,
-                                self.cfg.ws_url.as_str(),
+                                ws_url.as_str(),
                             );
                         }
                         // Use resilient snapshot decoder that skips malformed levels
@@ -664,10 +805,13 @@ impl HyperliquidConnector {
         Ok(())
     }
     pub async fn run_private_ws(&self) {
+        use rand::Rng;
+
         if self.cfg.private_key_hex.is_none() {
             return;
         }
         let mut backoff = Duration::from_secs(1);
+        let mut consecutive_reconnects: u32 = 0;
 
         // FIX: Configurable healthy connection threshold for backoff reset
         let healthy_threshold = Duration::from_millis(
@@ -678,23 +822,45 @@ impl HyperliquidConnector {
         );
 
         loop {
+            // After 3+ consecutive reconnects, probe the info endpoint.
+            // On probe failure, rotate to the next endpoint.
+            if consecutive_reconnects >= 3 {
+                if !self.probe_info_endpoint().await {
+                    let (ws, _rest, info) = self.rotate_endpoint();
+                    eprintln!(
+                        "INFO: HL private WS probe failed, rotated to ws={ws} info={info}"
+                    );
+                }
+            }
+
             let session_start = std::time::Instant::now();
 
             if let Err(err) = self.private_ws_once().await {
-                eprintln!("Hyperliquid private WS error: {err}");
+                consecutive_reconnects += 1;
+                eprintln!(
+                    "Hyperliquid private WS error (consecutive_reconnects={consecutive_reconnects}): {err}"
+                );
             }
 
-            // FIX: Reset backoff if connection was healthy for long enough
+            // FIX: Reset backoff and reconnect counter if connection was healthy for long enough
             let session_duration = session_start.elapsed();
             if session_duration >= healthy_threshold {
-                eprintln!(
-                    "INFO: Hyperliquid private WS session was healthy for {:?}; resetting backoff",
-                    session_duration
-                );
+                if consecutive_reconnects > 0 {
+                    eprintln!(
+                        "INFO: Hyperliquid private WS session was healthy for {:?}; \
+                         resetting backoff and reconnect counter (was {})",
+                        session_duration, consecutive_reconnects
+                    );
+                }
+                consecutive_reconnects = 0;
                 backoff = Duration::from_secs(1);
             }
 
-            tokio::time::sleep(backoff).await;
+            // Add jitter to prevent thundering-herd reconnection storms.
+            let jitter = Duration::from_millis(
+                rand::thread_rng().gen_range(0..=backoff.as_millis().max(1) as u64 / 4),
+            );
+            tokio::time::sleep(backoff + jitter).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     }
@@ -702,11 +868,12 @@ impl HyperliquidConnector {
     async fn private_ws_once(&self) -> anyhow::Result<()> {
         let connect_timeout = hl_ws_connect_timeout();
         let read_timeout = hl_ws_read_timeout();
+        let ws_url = self.current_ws_url();
 
         let (ws_stream, _) = with_timeout(
             connect_timeout,
             "private WS connect",
-            connect_async(self.cfg.ws_url.as_str()),
+            connect_async(ws_url.as_str()),
         )
         .await?
         .map_err(|e| anyhow::anyhow!("Hyperliquid private WS connect error: {e}"))?;
@@ -755,7 +922,7 @@ impl HyperliquidConnector {
             let Some(account_tx) = self.account_tx.as_ref() else {
                 continue;
             };
-            match fetch_account_snapshot(&self.http, &self.cfg).await {
+            match fetch_account_snapshot(&self.http, &self.cfg, &self.current_info_url()).await {
                 Ok(snapshot) => {
                     let _ = account_tx.send(snapshot).await;
                 }
@@ -771,7 +938,7 @@ impl HyperliquidConnector {
         let mut seq: u64 = 0;
         loop {
             interval.tick().await;
-            match fetch_public_funding(&self.http, &self.cfg).await {
+            match fetch_public_funding(&self.http, &self.cfg, &self.current_info_url()).await {
                 Ok(mut update) => {
                     seq = seq.wrapping_add(1);
                     update.seq = seq;
@@ -803,7 +970,7 @@ impl HyperliquidConnector {
         self.freshness
             .last_snapshot_resync_ns
             .store(now, Ordering::Relaxed);
-        if let Ok(snapshot) = fetch_l2_snapshot(&self.http, &self.cfg).await {
+        if let Ok(snapshot) = fetch_l2_snapshot(&self.http, &self.cfg, &self.current_info_url()).await {
             return Some(snapshot);
         } else {
             eprintln!("Hyperliquid snapshot refresh failed at seq={seq}");
@@ -832,9 +999,10 @@ impl HyperliquidConnector {
             "signature": signature,
             "vaultAddress": self.cfg.vault_address,
         });
+        let rest_url = self.current_rest_url();
         let resp = self
             .http
-            .post(self.cfg.rest_url.as_str())
+            .post(rest_url.as_str())
             .json(&payload)
             .send()
             .await?;
@@ -867,9 +1035,10 @@ impl HyperliquidConnector {
             "signature": signature,
             "vaultAddress": self.cfg.vault_address,
         });
+        let rest_url = self.current_rest_url();
         let resp = self
             .http
-            .post(self.cfg.rest_url.as_str())
+            .post(rest_url.as_str())
             .json(&payload)
             .send()
             .await?;
@@ -898,9 +1067,10 @@ impl HyperliquidConnector {
             "signature": signature,
             "vaultAddress": self.cfg.vault_address,
         });
+        let rest_url = self.current_rest_url();
         let resp = self
             .http
-            .post(self.cfg.rest_url.as_str())
+            .post(rest_url.as_str())
             .json(&payload)
             .send()
             .await?;
@@ -919,7 +1089,7 @@ impl HyperliquidConnector {
                 return Ok(idx);
             }
         }
-        let idx = fetch_asset_index(&self.http, &self.cfg).await?;
+        let idx = fetch_asset_index(&self.http, &self.cfg, &self.current_info_url()).await?;
         let mut guard = self.asset_index.lock().await;
         *guard = Some(idx);
         Ok(idx)
@@ -1523,6 +1693,7 @@ fn log_decode_miss(venue: &str, value: &serde_json::Value, payload: &str, count:
 async fn fetch_l2_snapshot(
     client: &Client,
     cfg: &HyperliquidConfig,
+    info_url: &str,
 ) -> anyhow::Result<MarketDataEvent> {
     let payload = json!({
         "type": "l2Book",
@@ -1531,7 +1702,7 @@ async fn fetch_l2_snapshot(
         "nLevels": cfg.n_levels
     });
     let resp = client
-        .post(cfg.info_url.as_str())
+        .post(info_url)
         .json(&payload)
         .send()
         .await?;
@@ -1559,10 +1730,10 @@ async fn fetch_l2_snapshot(
     Ok(MarketDataEvent::L2Snapshot(snapshot))
 }
 
-async fn fetch_asset_index(client: &Client, cfg: &HyperliquidConfig) -> anyhow::Result<u32> {
+async fn fetch_asset_index(client: &Client, cfg: &HyperliquidConfig, info_url: &str) -> anyhow::Result<u32> {
     let payload = json!({ "type": "meta" });
     let resp = client
-        .post(cfg.info_url.as_str())
+        .post(info_url)
         .json(&payload)
         .send()
         .await?;
@@ -1587,6 +1758,7 @@ async fn fetch_asset_index(client: &Client, cfg: &HyperliquidConfig) -> anyhow::
 async fn fetch_account_snapshot(
     client: &Client,
     cfg: &HyperliquidConfig,
+    info_url: &str,
 ) -> anyhow::Result<AccountEvent> {
     let user = cfg
         .vault_address
@@ -1594,7 +1766,7 @@ async fn fetch_account_snapshot(
         .ok_or_else(|| anyhow::anyhow!("HL_VAULT_ADDRESS is required for account polling"))?;
     let payload = json!({ "type": "userState", "user": user });
     let resp = client
-        .post(cfg.info_url.as_str())
+        .post(info_url)
         .json(&payload)
         .send()
         .await?;
@@ -1607,10 +1779,11 @@ async fn fetch_account_snapshot(
 async fn fetch_public_funding(
     client: &Client,
     cfg: &HyperliquidConfig,
+    info_url: &str,
 ) -> anyhow::Result<FundingUpdate> {
     let payload = json!({ "type": "metaAndAssetCtxs" });
     let resp = client
-        .post(cfg.info_url.as_str())
+        .post(info_url)
         .json(&payload)
         .send()
         .await?;
@@ -1822,9 +1995,9 @@ mod tests {
 
         let cfg = HyperliquidConfig {
             network: HyperliquidNetwork::Testnet,
-            ws_url: "wss://example".to_string(),
-            rest_url,
-            info_url,
+            ws_urls: vec!["wss://example".to_string()],
+            rest_urls: vec![rest_url],
+            info_urls: vec![info_url],
             coin: "TAO".to_string(),
             n_sig_figs: 5,
             n_levels: 5,
@@ -1880,9 +2053,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
         let cfg = HyperliquidConfig {
             network: HyperliquidNetwork::Testnet,
-            ws_url: "wss://example".to_string(),
-            rest_url: "https://example".to_string(),
-            info_url: "https://example".to_string(),
+            ws_urls: vec!["wss://example".to_string()],
+            rest_urls: vec!["https://example".to_string()],
+            info_urls: vec!["https://example".to_string()],
             coin: "TAO".to_string(),
             n_sig_figs: 5,
             n_levels: 5,

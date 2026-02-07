@@ -17,13 +17,53 @@ use crate::state::{GlobalState, KillReason, RiskRegime};
 use crate::toxicity::update_toxicity_and_health;
 use crate::types::VenueStatus;
 
+/// Precomputed tick-cadence-scaled volatility reference values.
+///
+/// Since `main_loop_interval_ms`, `vol_ref`, `vol_ref_cadence_sec`, etc. are
+/// immutable at runtime, we compute the per-tick equivalents once at engine
+/// init to avoid per-tick `sqrt` calls.
+#[derive(Debug, Clone, Copy)]
+pub struct VolPrecomputed {
+    /// `vol_ref` scaled to per-tick cadence:
+    ///   vol_ref_tick = vol_ref * sqrt(tick_sec / vol_ref_cadence_sec)
+    pub vol_ref_tick: f64,
+    /// `sigma_min` scaled to per-tick cadence:
+    ///   sigma_min_tick = sigma_min * sqrt(tick_sec / sigma_min_cadence_sec)
+    pub sigma_min_tick: f64,
+}
+
+impl VolPrecomputed {
+    pub fn from_config(cfg: &Config) -> Self {
+        let tick_sec = cfg.main_loop_interval_ms as f64 / 1000.0;
+        let vol_cfg = &cfg.volatility;
+
+        let vol_ref_scale = if vol_cfg.vol_ref_cadence_sec > 0.0 {
+            (tick_sec / vol_cfg.vol_ref_cadence_sec).sqrt()
+        } else {
+            1.0
+        };
+        let sigma_min_scale = if vol_cfg.sigma_min_cadence_sec > 0.0 {
+            (tick_sec / vol_cfg.sigma_min_cadence_sec).sqrt()
+        } else {
+            1.0
+        };
+
+        VolPrecomputed {
+            vol_ref_tick: vol_cfg.vol_ref * vol_ref_scale,
+            sigma_min_tick: vol_cfg.sigma_min * sigma_min_scale,
+        }
+    }
+}
+
 pub struct Engine<'a> {
     cfg: &'a Config,
+    pub vol_pre: VolPrecomputed,
 }
 
 impl<'a> Engine<'a> {
     pub fn new(cfg: &'a Config) -> Self {
-        Self { cfg }
+        let vol_pre = VolPrecomputed::from_config(cfg);
+        Self { cfg, vol_pre }
     }
 
     /// Seed synthetic mids / spreads / depth for all venues and update
@@ -425,13 +465,17 @@ impl<'a> Engine<'a> {
         let vol_cfg = &self.cfg.volatility;
         let r2 = ret * ret;
 
+        // Tick-cadence-aware floors: use precomputed sigma_min_tick so the
+        // floor is scaled from the calibration cadence to the actual tick rate.
+        let sigma_min_tick = self.vol_pre.sigma_min_tick;
+
         // Short vol EWMA
         let var_short_prev = state.fv_short_vol * state.fv_short_vol;
         let var_short_new =
             (1.0 - vol_cfg.fv_vol_alpha_short) * var_short_prev + vol_cfg.fv_vol_alpha_short * r2;
         let mut sigma_short = var_short_new.max(0.0).sqrt();
         if !sigma_short.is_finite() {
-            sigma_short = vol_cfg.sigma_min;
+            sigma_short = sigma_min_tick;
         }
 
         // Long vol EWMA
@@ -440,22 +484,23 @@ impl<'a> Engine<'a> {
             (1.0 - vol_cfg.fv_vol_alpha_long) * var_long_prev + vol_cfg.fv_vol_alpha_long * r2;
         let mut sigma_long = var_long_new.max(0.0).sqrt();
         if !sigma_long.is_finite() {
-            sigma_long = vol_cfg.sigma_min;
+            sigma_long = sigma_min_tick;
         }
 
         state.fv_short_vol = sigma_short;
         state.fv_long_vol = sigma_long;
 
-        // Effective vol floor.
-        let mut sigma_eff = sigma_short.max(vol_cfg.sigma_min);
+        // Effective vol floor — tick-cadence-aware.
+        let mut sigma_eff = sigma_short.max(sigma_min_tick);
         if !sigma_eff.is_finite() || sigma_eff <= 0.0 {
-            sigma_eff = vol_cfg.sigma_min;
+            sigma_eff = sigma_min_tick;
         }
         state.sigma_eff = sigma_eff;
 
-        // vol_ratio and clipped.
-        let mut vol_ratio = if vol_cfg.vol_ref > 0.0 {
-            sigma_eff / vol_cfg.vol_ref
+        // vol_ratio and clipped — use tick-cadence-aware vol_ref.
+        let vol_ref_tick = self.vol_pre.vol_ref_tick;
+        let mut vol_ratio = if vol_ref_tick > 0.0 {
+            sigma_eff / vol_ref_tick
         } else {
             1.0
         };
@@ -475,6 +520,14 @@ impl<'a> Engine<'a> {
         state.spread_mult = 1.0 + vol_cfg.spread_vol_mult_coeff * bump;
         state.size_mult = 1.0 / (1.0 + vol_cfg.size_vol_mult_coeff * bump);
         state.band_mult = 1.0 / (1.0 + vol_cfg.band_vol_mult_coeff * bump);
+
+        // ----- Shadow diagnostics (logged only, no behavioral change) -----
+        // Still log the shadow values so telemetry can compare live vs shadow
+        // scalars. Now that sigma_min_tick and vol_ref_tick are active,
+        // the shadow fields will match the live values.
+        state.shadow_vol_ratio = Some(vol_ratio_clipped);
+        state.shadow_spread_mult = Some(state.spread_mult);
+        state.shadow_size_mult = Some(state.size_mult);
     }
 
     // ---------------------------------------------------------------------

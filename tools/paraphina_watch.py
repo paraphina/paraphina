@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import sys
 import time
 from collections import deque
@@ -355,6 +357,13 @@ class TailFollower:
         self.path = path
         self.offset = 0
 
+    def seek_end(self) -> None:
+        """Advance offset to end of file so subsequent reads only see new data."""
+        try:
+            self.offset = self.path.stat().st_size
+        except OSError:
+            self.offset = 0
+
     def read_new_lines(self) -> list[str]:
         if not self.path.exists():
             return []
@@ -394,9 +403,27 @@ def main() -> int:
         print(frame)
         return 0
 
+    is_tty = sys.stdout.isatty()
+
     initial_records = parse_lines(telemetry_path, max_events)
     state = build_state(initial_records, max_events)
     follower = TailFollower(telemetry_path)
+    # Advance follower past already-consumed data so we don't double-count.
+    follower.seek_end()
+
+    if is_tty:
+        # Hide cursor and clear screen once at startup.
+        sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
+        sys.stdout.flush()
+
+    def cleanup() -> None:
+        if is_tty:
+            sys.stdout.write("\x1b[?25h")  # Show cursor again.
+            sys.stdout.flush()
+
+    atexit.register(cleanup)
+    signal.signal(signal.SIGINT, lambda *_: (cleanup(), sys.exit(0)))
+    signal.signal(signal.SIGTERM, lambda *_: (cleanup(), sys.exit(0)))
 
     while True:
         for line in follower.read_new_lines():
@@ -407,9 +434,14 @@ def main() -> int:
             if isinstance(record, dict):
                 state.update(record)
         frame = render_frame(state, max_events)
-        if sys.stdout.isatty():
-            sys.stdout.write("\x1b[2J\x1b[H")
-        sys.stdout.write(frame + "\n")
+        if is_tty:
+            # Move cursor home, paint frame, then erase leftover lines below.
+            # This avoids the blank-flash caused by clearing the whole screen.
+            sys.stdout.write("\x1b[H")
+            sys.stdout.write(frame + "\n")
+            sys.stdout.write("\x1b[J")
+        else:
+            sys.stdout.write(frame + "\n")
         sys.stdout.flush()
         time.sleep(refresh_ms / 1000.0)
 
