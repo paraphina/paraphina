@@ -1253,6 +1253,20 @@ pub async fn run_live_loop(
         let snapshot_coalesce_now = l2_snapshot_coalesce && saw_ready_once;
         let mut saw_l2_snapshot_mask_this_tick: u64 = 0;
 
+        // Pre-scan pending_events for L2Snapshots consumed by the select! wakeup arm.
+        // Without this, snapshots received via market_rx.recv() (outside drain_ordered_events)
+        // would not update saw_l2_snapshot_mask_this_tick, causing the venue to remain
+        // permanently UNREADY in the coalescing logic and all its deltas to be silently dropped.
+        for ev in &pending_events {
+            if let CanonicalEvent::Market(super::types::MarketDataEvent::L2Snapshot(ref s)) =
+                ev.event
+            {
+                if s.venue_index < 64 {
+                    saw_l2_snapshot_mask_this_tick |= 1u64 << s.venue_index;
+                }
+            }
+        }
+
         // Drain ingress channels, canonicalize ordering, then apply.
         pending_events.extend(drain_ordered_events(
             &mut market_rx,
@@ -1297,13 +1311,14 @@ pub async fn run_live_loop(
                             event: EventLogPayload::MarketData(event.clone()),
                         });
                     }
-                    if let Err(_) = cache.apply_market_event(&event) {
-                        health_manager.record_api_error(match &event {
+                    if let Err(_e) = cache.apply_market_event(&event) {
+                        let vi = match &event {
                             super::types::MarketDataEvent::L2Snapshot(s) => s.venue_index,
                             super::types::MarketDataEvent::L2Delta(d) => d.venue_index,
                             super::types::MarketDataEvent::Trade(t) => t.venue_index,
                             super::types::MarketDataEvent::FundingUpdate(f) => f.venue_index,
-                        });
+                        };
+                        health_manager.record_api_error(vi);
                     } else {
                         apply_market_event_to_core(&mut state, cfg, &event, now_ms);
                         let venue_index = match &event {

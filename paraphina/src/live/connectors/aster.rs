@@ -250,18 +250,21 @@ impl AsterConnector {
         loop {
             let session_start = std::time::Instant::now();
 
-            if let Err(err) = self.public_ws_once().await {
-                consecutive_failures += 1;
-                let level = if consecutive_failures >= 20 {
-                    "ERROR"
-                } else if consecutive_failures >= 5 {
-                    "WARN"
-                } else {
-                    "INFO"
-                };
-                eprintln!(
-                    "{level}: Aster public WS error (consecutive_failures={consecutive_failures}): {err}"
-                );
+            match self.public_ws_once().await {
+                Ok(()) => {}
+                Err(err) => {
+                    consecutive_failures += 1;
+                    let level = if consecutive_failures >= 20 {
+                        "ERROR"
+                    } else if consecutive_failures >= 5 {
+                        "WARN"
+                    } else {
+                        "INFO"
+                    };
+                    eprintln!(
+                        "{level}: Aster public WS error (consecutive_failures={consecutive_failures}): {err}"
+                    );
+                }
             }
 
             // FIX: Reset backoff and failure counter if connection was healthy for long enough
@@ -638,7 +641,8 @@ impl AsterConnector {
                                 continue;
                             }
                             let current_last = last_update_id.unwrap_or_default();
-                            match seq_decision_lenient(current_last, &update) {
+                            let decision = seq_decision_lenient(current_last, &update);
+                            match decision {
                                 SeqDecision::Apply => {
                                     last_update_id = Some(update.end_id);
                                     self.freshness
