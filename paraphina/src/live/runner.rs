@@ -30,6 +30,7 @@ use crate::sim_eval::AblationSet;
 use crate::state::{FundingState, GlobalState, VenueState};
 use crate::telemetry::{
     ensure_schema_v1, ReconcileDriftRecord, TelemetryBuilder, TelemetryInputs, TelemetrySink,
+    TelemetrySinkHandle,
 };
 #[cfg(feature = "event_log")]
 use crate::telemetry::{TelemetryConfig, TelemetryMode};
@@ -43,6 +44,7 @@ use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache};
 use super::types::ExecutionEvent as LiveExecutionEvent;
 use serde_json::json;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 /// How the order handler should respond to a request.
@@ -88,23 +90,47 @@ pub struct LiveRuntimeHooks {
 
 #[derive(Clone)]
 pub struct LiveTelemetry {
-    pub sink: Arc<Mutex<TelemetrySink>>,
+    pub sink: TelemetrySinkHandle,
     pub shadow_mode: bool,
     pub execution_mode: &'static str,
     pub max_orders_per_tick: usize,
-    pub stats: Arc<Mutex<LiveTelemetryStats>>,
+    pub stats: Arc<LiveTelemetryStats>,
 }
 
-#[derive(Debug, Default)]
+/// Lock-free atomic counters for per-tick telemetry stats on the hot path.
+/// The simple counters use `AtomicU64` so the tick thread never contends
+/// with summary readers.  The purpose-tracking `HashMap`s live behind a
+/// separate `Mutex` that is only acquired when intents are non-empty.
+#[derive(Debug)]
 pub struct LiveTelemetryStats {
-    pub ticks_total: u64,
-    pub fv_available_ticks: u64,
-    pub venue_staleness_events: u64,
-    pub venue_disabled_events: u64,
-    pub kill_events: u64,
+    pub ticks_total: AtomicU64,
+    pub fv_available_ticks: AtomicU64,
+    pub venue_staleness_events: AtomicU64,
+    pub venue_disabled_events: AtomicU64,
+    pub kill_events: AtomicU64,
+    /// Purpose-tracking maps — behind a separate Mutex to keep atomics lock-free.
+    pub purpose_maps: Mutex<LiveTelemetryPurposeMaps>,
+}
+
+/// HashMap-based purpose tracking that requires a Mutex (only locked when intents are non-empty).
+#[derive(Debug, Default, Clone)]
+pub struct LiveTelemetryPurposeMaps {
     pub would_place_by_purpose: std::collections::HashMap<String, u64>,
     pub would_cancel_by_purpose: std::collections::HashMap<String, u64>,
     pub would_replace_by_purpose: std::collections::HashMap<String, u64>,
+}
+
+impl Default for LiveTelemetryStats {
+    fn default() -> Self {
+        Self {
+            ticks_total: AtomicU64::new(0),
+            fv_available_ticks: AtomicU64::new(0),
+            venue_staleness_events: AtomicU64::new(0),
+            venue_disabled_events: AtomicU64::new(0),
+            kill_events: AtomicU64::new(0),
+            purpose_maps: Mutex::new(LiveTelemetryPurposeMaps::default()),
+        }
+    }
 }
 
 fn parse_reconcile_interval_ms() -> Option<i64> {
@@ -2392,34 +2418,40 @@ fn update_live_telemetry_stats(
     kill_transition: bool,
     would_send_intents: &[OrderIntent],
 ) {
-    let mut guard = match telemetry.stats.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    guard.ticks_total += 1;
+    // Lock-free atomic counter updates — no Mutex contention on the hot path.
+    telemetry.stats.ticks_total.fetch_add(1, AtomicOrdering::Relaxed);
     if fv_available {
-        guard.fv_available_ticks += 1;
+        telemetry.stats.fv_available_ticks.fetch_add(1, AtomicOrdering::Relaxed);
     }
-    guard.venue_staleness_events += stale_count;
-    guard.venue_disabled_events += disabled_count;
+    if stale_count > 0 {
+        telemetry.stats.venue_staleness_events.fetch_add(stale_count, AtomicOrdering::Relaxed);
+    }
+    if disabled_count > 0 {
+        telemetry.stats.venue_disabled_events.fetch_add(disabled_count, AtomicOrdering::Relaxed);
+    }
     if kill_transition {
-        guard.kill_events += 1;
+        telemetry.stats.kill_events.fetch_add(1, AtomicOrdering::Relaxed);
     }
-    for intent in would_send_intents {
-        match intent {
-            OrderIntent::Place(place) => {
-                let key = format!("{:?}", place.purpose);
-                *guard.would_place_by_purpose.entry(key).or_insert(0) += 1;
-            }
-            OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => {
-                *guard
-                    .would_cancel_by_purpose
-                    .entry("unknown".to_string())
-                    .or_insert(0) += 1;
-            }
-            OrderIntent::Replace(replace) => {
-                let key = format!("{:?}", replace.purpose);
-                *guard.would_replace_by_purpose.entry(key).or_insert(0) += 1;
+    // Only acquire the Mutex for the purpose-tracking HashMaps when there are intents.
+    if !would_send_intents.is_empty() {
+        if let Ok(mut maps) = telemetry.stats.purpose_maps.lock() {
+            for intent in would_send_intents {
+                match intent {
+                    OrderIntent::Place(place) => {
+                        let key = format!("{:?}", place.purpose);
+                        *maps.would_place_by_purpose.entry(key).or_insert(0) += 1;
+                    }
+                    OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => {
+                        *maps
+                            .would_cancel_by_purpose
+                            .entry("unknown".to_string())
+                            .or_insert(0) += 1;
+                    }
+                    OrderIntent::Replace(replace) => {
+                        let key = format!("{:?}", replace.purpose);
+                        *maps.would_replace_by_purpose.entry(key).or_insert(0) += 1;
+                    }
+                }
             }
         }
     }
@@ -2511,9 +2543,7 @@ fn emit_live_telemetry(
             );
         }
     }
-    if let Ok(mut guard) = telemetry.sink.lock() {
-        guard.log_json(&record);
-    }
+    telemetry.sink.log_json(&record);
 }
 
 fn live_events_to_core(events: &[LiveExecutionEvent]) -> Vec<ExecutionEvent> {
@@ -2765,11 +2795,11 @@ pub fn replay_event_log(
     };
     let telemetry_sink = TelemetrySink::from_config(telemetry_cfg);
     let telemetry = LiveTelemetry {
-        sink: Arc::new(Mutex::new(telemetry_sink)),
+        sink: TelemetrySinkHandle::Sync(Arc::new(Mutex::new(telemetry_sink))),
         shadow_mode: false,
         execution_mode: "replay",
         max_orders_per_tick: 200,
-        stats: Arc::new(Mutex::new(LiveTelemetryStats::default())),
+        stats: Arc::new(LiveTelemetryStats::default()),
     };
     let mut telemetry_builder = TelemetryBuilder::new(cfg);
 

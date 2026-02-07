@@ -47,7 +47,9 @@ fn set_fresh_venue_data(h: &mut Harness, now_ms: i64, mid: f64) {
 #[test]
 fn sigma_eff_never_below_sigma_min() {
     let mut h = make_harness(RiskProfile::Balanced);
-    let sigma_min = h.cfg.volatility.sigma_min;
+    // After tick-cadence-aware scaling, the effective floor is sigma_min_tick
+    // (sigma_min scaled from calibration cadence to per-tick cadence).
+    let sigma_min_tick = h.engine.vol_pre.sigma_min_tick;
 
     // Run many ticks with zero price movement to minimize volatility
     let mid = 250.0;
@@ -58,12 +60,12 @@ fn sigma_eff_never_below_sigma_min() {
         set_fresh_venue_data(&mut h, now_ms, mid); // Same mid every tick => zero returns
         h.engine.main_tick(&mut h.state, now_ms);
 
-        // sigma_eff should never fall below sigma_min
+        // sigma_eff should never fall below the tick-cadence-aware floor
         assert!(
-            h.state.sigma_eff >= sigma_min,
-            "sigma_eff ({}) should never be below sigma_min ({}) at tick {}",
+            h.state.sigma_eff >= sigma_min_tick,
+            "sigma_eff ({}) should never be below sigma_min_tick ({}) at tick {}",
             h.state.sigma_eff,
-            sigma_min,
+            sigma_min_tick,
             t
         );
     }
@@ -73,17 +75,19 @@ fn sigma_eff_never_below_sigma_min() {
 fn sigma_eff_initialized_to_sigma_min() {
     let h = make_harness(RiskProfile::Balanced);
 
-    // Before any ticks, sigma_eff should be initialized to sigma_min
+    // Before any ticks, sigma_eff is initialized from Config::default/for_profile
+    // which uses the unscaled sigma_min. This is the initial state before the engine
+    // has run any ticks. The engine applies sigma_min_tick only during update_vol_and_scalars.
     assert_eq!(
         h.state.sigma_eff, h.cfg.volatility.sigma_min,
-        "sigma_eff should be initialized to sigma_min"
+        "sigma_eff should be initialized to sigma_min (unscaled, pre-engine)"
     );
 }
 
 #[test]
 fn sigma_eff_uses_floor_when_raw_vol_is_low() {
     let mut h = make_harness(RiskProfile::Balanced);
-    let sigma_min = h.cfg.volatility.sigma_min;
+    let sigma_min_tick = h.engine.vol_pre.sigma_min_tick;
 
     // Run a few ticks with constant price (zero volatility)
     let mid = 250.0;
@@ -96,29 +100,29 @@ fn sigma_eff_uses_floor_when_raw_vol_is_low() {
     }
 
     // After many zero-return ticks, raw sigma should have decayed
-    // but sigma_eff should stay at the floor
+    // but sigma_eff should stay at the tick-cadence-aware floor
     assert!(
-        h.state.fv_short_vol < sigma_min || (h.state.fv_short_vol - 0.0).abs() < 1e-9,
+        h.state.fv_short_vol < sigma_min_tick || (h.state.fv_short_vol - 0.0).abs() < 1e-9,
         "Raw short vol ({}) should be low after constant prices",
         h.state.fv_short_vol
     );
 
-    // sigma_eff should be exactly at the floor
+    // sigma_eff should be exactly at the tick-cadence-aware floor
     assert!(
-        (h.state.sigma_eff - sigma_min).abs() < 1e-12,
-        "sigma_eff ({}) should equal sigma_min ({}) when raw vol is below floor",
+        (h.state.sigma_eff - sigma_min_tick).abs() < 1e-12,
+        "sigma_eff ({}) should equal sigma_min_tick ({}) when raw vol is below floor",
         h.state.sigma_eff,
-        sigma_min
+        sigma_min_tick
     );
 }
 
 #[test]
 fn sigma_eff_equals_raw_vol_when_above_floor() {
     let mut h = make_harness(RiskProfile::Balanced);
-    let sigma_min = h.cfg.volatility.sigma_min;
+    let sigma_min_tick = h.engine.vol_pre.sigma_min_tick;
 
-    // Directly set fv_short_vol to a value above sigma_min to test the floor logic
-    let high_vol = sigma_min * 10.0; // 10x the floor
+    // Directly set fv_short_vol to a value above the tick-cadence floor
+    let high_vol = sigma_min_tick * 10.0; // 10x the floor
     h.state.fv_short_vol = high_vol;
 
     // Run a tick to trigger vol scalar updates
@@ -126,21 +130,17 @@ fn sigma_eff_equals_raw_vol_when_above_floor() {
     set_fresh_venue_data(&mut h, 0, 250.0);
     h.engine.main_tick(&mut h.state, 0);
 
-    // After a tick with high raw vol, sigma_eff should follow (be at or above raw vol)
-    // Note: The engine recomputes sigma_short from returns, so we need to verify
-    // that when fv_short_vol is high, sigma_eff follows.
-
-    // The key relationship: sigma_eff = max(sigma_short, sigma_min)
-    // After tick, sigma_eff should be at least sigma_min
+    // The key relationship: sigma_eff = max(sigma_short, sigma_min_tick)
+    // After tick, sigma_eff should be at least sigma_min_tick
     assert!(
-        h.state.sigma_eff >= sigma_min,
-        "sigma_eff ({}) should be at least sigma_min ({})",
+        h.state.sigma_eff >= sigma_min_tick,
+        "sigma_eff ({}) should be at least sigma_min_tick ({})",
         h.state.sigma_eff,
-        sigma_min
+        sigma_min_tick
     );
 
-    // If sigma_short is above sigma_min, sigma_eff should equal sigma_short
-    if h.state.fv_short_vol > sigma_min {
+    // If sigma_short is above the floor, sigma_eff should equal sigma_short
+    if h.state.fv_short_vol > sigma_min_tick {
         assert!(
             (h.state.sigma_eff - h.state.fv_short_vol).abs() < 1e-9,
             "sigma_eff ({}) should equal fv_short_vol ({}) when above floor",
@@ -152,28 +152,25 @@ fn sigma_eff_equals_raw_vol_when_above_floor() {
 
 #[test]
 fn sigma_eff_floor_logic_verified() {
-    // This test directly verifies the sigma_eff = max(sigma_short, sigma_min) logic
-    // by examining values below and above the floor
+    // Verifies sigma_eff = max(sigma_short, sigma_min_tick) after tick-cadence scaling.
 
     let mut h = make_harness(RiskProfile::Balanced);
-    let sigma_min = h.cfg.volatility.sigma_min;
+    let sigma_min_tick = h.engine.vol_pre.sigma_min_tick;
 
     // Test case 1: sigma_short below floor
-    // Initialize state so that after recompute, sigma_short stays low
     set_fresh_venue_data(&mut h, 0, 250.0);
     h.engine.main_tick(&mut h.state, 0);
 
     // With constant prices, sigma_short should be 0 or very small
-    // sigma_eff should be floored at sigma_min
+    // sigma_eff should be floored at sigma_min_tick
     assert!(
-        h.state.sigma_eff >= sigma_min,
-        "sigma_eff ({}) should be at least sigma_min ({}) when raw vol is low",
+        h.state.sigma_eff >= sigma_min_tick,
+        "sigma_eff ({}) should be at least sigma_min_tick ({}) when raw vol is low",
         h.state.sigma_eff,
-        sigma_min
+        sigma_min_tick
     );
 
     // Test case 2: Verify the max() relationship holds
-    // sigma_eff >= sigma_short always
     assert!(
         h.state.sigma_eff >= h.state.fv_short_vol,
         "sigma_eff ({}) should be >= fv_short_vol ({})",
@@ -181,12 +178,11 @@ fn sigma_eff_floor_logic_verified() {
         h.state.fv_short_vol
     );
 
-    // sigma_eff >= sigma_min always
     assert!(
-        h.state.sigma_eff >= sigma_min,
-        "sigma_eff ({}) should be >= sigma_min ({})",
+        h.state.sigma_eff >= sigma_min_tick,
+        "sigma_eff ({}) should be >= sigma_min_tick ({})",
         h.state.sigma_eff,
-        sigma_min
+        sigma_min_tick
     );
 }
 
@@ -204,11 +200,12 @@ fn vol_scalars_use_sigma_eff() {
     h.engine.main_tick(&mut h.state, 0);
 
     let sigma_eff = h.state.sigma_eff;
-    let vol_ref = h.cfg.volatility.vol_ref;
+    // Engine now uses tick-cadence-aware vol_ref_tick, not the raw config vol_ref.
+    let vol_ref_tick = h.engine.vol_pre.vol_ref_tick;
 
-    // Calculate expected vol_ratio
-    let expected_vol_ratio = if vol_ref > 0.0 {
-        sigma_eff / vol_ref
+    // Calculate expected vol_ratio using the tick-scaled reference
+    let expected_vol_ratio = if vol_ref_tick > 0.0 {
+        sigma_eff / vol_ref_tick
     } else {
         1.0
     };
@@ -219,7 +216,7 @@ fn vol_scalars_use_sigma_eff() {
 
     assert!(
         (h.state.vol_ratio_clipped - expected_clipped).abs() < 1e-9,
-        "vol_ratio_clipped ({}) should be derived from sigma_eff (expected {})",
+        "vol_ratio_clipped ({}) should be derived from sigma_eff/vol_ref_tick (expected {})",
         h.state.vol_ratio_clipped,
         expected_clipped
     );
@@ -329,10 +326,13 @@ fn sigma_eff_in_telemetry_matches_state() {
         h.state.sigma_eff
     );
 
-    // Should be at least sigma_min
+    // Should be at least sigma_min_tick (the tick-cadence-aware floor)
+    let sigma_min_tick = h.engine.vol_pre.sigma_min_tick;
     assert!(
-        h.state.sigma_eff >= h.cfg.volatility.sigma_min,
-        "sigma_eff should be at least sigma_min"
+        h.state.sigma_eff >= sigma_min_tick,
+        "sigma_eff ({}) should be at least sigma_min_tick ({})",
+        h.state.sigma_eff,
+        sigma_min_tick
     );
 }
 
@@ -357,9 +357,12 @@ fn sigma_eff_stable_under_nan_protection() {
         h.state.sigma_eff.is_finite(),
         "sigma_eff should recover to finite value after NaN injection"
     );
+    let sigma_min_tick = h.engine.vol_pre.sigma_min_tick;
     assert!(
-        h.state.sigma_eff >= h.cfg.volatility.sigma_min,
-        "sigma_eff should be at least sigma_min after recovery"
+        h.state.sigma_eff >= sigma_min_tick,
+        "sigma_eff ({}) should be at least sigma_min_tick ({}) after recovery",
+        h.state.sigma_eff,
+        sigma_min_tick
     );
 }
 

@@ -12,7 +12,7 @@ use paraphina::live::runner::{
 };
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
 use paraphina::live::{LiveTelemetry, LiveTelemetryStats};
-use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
+use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink, TelemetrySinkHandle};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
@@ -30,15 +30,17 @@ async fn live_telemetry_contract_passes_fixture_run() {
     let temp = tempdir().expect("tempdir");
     let telemetry_path = temp.path().join("telemetry.jsonl");
     let telemetry = LiveTelemetry {
-        sink: Arc::new(Mutex::new(TelemetrySink::from_config(TelemetryConfig {
-            mode: TelemetryMode::Jsonl,
-            path: Some(telemetry_path.clone()),
-            append: false,
-        }))),
+        sink: TelemetrySinkHandle::Sync(Arc::new(Mutex::new(TelemetrySink::from_config(
+            TelemetryConfig {
+                mode: TelemetryMode::Jsonl,
+                path: Some(telemetry_path.clone()),
+                append: false,
+            },
+        )))),
         shadow_mode: true,
         execution_mode: "shadow",
         max_orders_per_tick: 50,
-        stats: Arc::new(Mutex::new(LiveTelemetryStats::default())),
+        stats: Arc::new(LiveTelemetryStats::default()),
     };
 
     let (market_tx, market_rx) = mpsc::channel(1024);
@@ -98,8 +100,10 @@ async fn live_telemetry_contract_passes_fixture_run() {
     )
     .await;
 
-    if let Ok(mut guard) = telemetry.sink.lock() {
-        guard.flush();
+    if let TelemetrySinkHandle::Sync(ref sink) = telemetry.sink {
+        if let Ok(mut guard) = sink.lock() {
+            guard.flush();
+        }
     }
 
     let text = std::fs::read_to_string(&telemetry_path).expect("read telemetry");

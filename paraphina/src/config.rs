@@ -298,6 +298,15 @@ pub struct VolatilityConfig {
     pub size_vol_mult_coeff: f64,
     /// Coefficient c_band in band_mult(t).
     pub band_vol_mult_coeff: f64,
+    /// Timescale (seconds) that `vol_ref` was calibrated for.
+    /// Used to auto-scale `vol_ref` to per-tick cadence:
+    ///   vol_ref_tick = vol_ref * sqrt(tick_sec / vol_ref_cadence_sec)
+    /// Default: 86400.0 (1 day) — vol_ref = 0.028125 ≈ 44.6% annualized.
+    pub vol_ref_cadence_sec: f64,
+    /// Timescale (seconds) that `sigma_min` was calibrated for.
+    /// Same scaling logic as `vol_ref_cadence_sec`.
+    /// Default: 86400.0.
+    pub sigma_min_cadence_sec: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -758,6 +767,10 @@ impl Default for Config {
             spread_vol_mult_coeff: 1.0,
             size_vol_mult_coeff: 2.0,
             band_vol_mult_coeff: 1.0,
+            // Timescale for vol_ref / sigma_min auto-scaling.
+            // vol_ref = 0.028125 ≈ daily ETH vol (44.6% annualized).
+            vol_ref_cadence_sec: 86400.0,
+            sigma_min_cadence_sec: 86400.0,
         };
 
         // ----- Global risk config (Section 14) -----
@@ -1186,6 +1199,44 @@ impl Config {
                     eprintln!("[config] WARN: could not parse PARAPHINA_VOL_REF = {:?} as f64; using default {}",
                         raw,
                         cfg.volatility.vol_ref
+                    );
+                }
+            }
+        }
+
+        // Timescale (seconds) that vol_ref was calibrated for.
+        if let Ok(raw) = env::var("PARAPHINA_VOL_REF_CADENCE_SEC") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.volatility.vol_ref_cadence_sec = v.max(1e-3);
+                    eprintln!(
+                        "[config] PARAPHINA_VOL_REF_CADENCE_SEC = {} (overrode default)",
+                        cfg.volatility.vol_ref_cadence_sec
+                    );
+                }
+                Err(_) => {
+                    eprintln!("[config] WARN: could not parse PARAPHINA_VOL_REF_CADENCE_SEC = {:?} as f64; using default {}",
+                        raw,
+                        cfg.volatility.vol_ref_cadence_sec
+                    );
+                }
+            }
+        }
+
+        // Timescale (seconds) that sigma_min was calibrated for.
+        if let Ok(raw) = env::var("PARAPHINA_SIGMA_MIN_CADENCE_SEC") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.volatility.sigma_min_cadence_sec = v.max(1e-3);
+                    eprintln!(
+                        "[config] PARAPHINA_SIGMA_MIN_CADENCE_SEC = {} (overrode default)",
+                        cfg.volatility.sigma_min_cadence_sec
+                    );
+                }
+                Err(_) => {
+                    eprintln!("[config] WARN: could not parse PARAPHINA_SIGMA_MIN_CADENCE_SEC = {:?} as f64; using default {}",
+                        raw,
+                        cfg.volatility.sigma_min_cadence_sec
                     );
                 }
             }

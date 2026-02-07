@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::ToSocketAddrs;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +27,7 @@ use paraphina::live::shadow_adapter::ShadowAckAdapter;
 use paraphina::live::types::L2Snapshot;
 use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
-use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
+use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink, TelemetrySinkHandle};
 use serde::Deserialize;
 use std::path::PathBuf;
 use url::Url;
@@ -1093,13 +1093,13 @@ fn run_preflight(
                         &mut endpoint_details,
                         &mut endpoint_ok,
                         "hyperliquid",
-                        Some(cfg.ws_url.as_str()),
-                        Some(cfg.rest_url.as_str()),
+                        Some(cfg.ws_url()),
+                        Some(cfg.rest_url()),
                     );
-                    let (ok, status) = endpoint_dns_status(cfg.info_url.as_str());
+                    let (ok, status) = endpoint_dns_status(cfg.info_url());
                     endpoint_ok &= ok;
                     endpoint_details
-                        .push(format!("hyperliquid_info http={} {status}", cfg.info_url));
+                        .push(format!("hyperliquid_info http={} {status}", cfg.info_url()));
                 }
                 #[cfg(not(feature = "live_hyperliquid"))]
                 {
@@ -2589,12 +2589,13 @@ async fn main() {
         path: telemetry_path,
         append: TelemetryConfig::append_from_env(),
     };
+    let telemetry_sink = TelemetrySink::from_config(telemetry_cfg);
     let telemetry = LiveTelemetry {
-        sink: Arc::new(Mutex::new(TelemetrySink::from_config(telemetry_cfg))),
+        sink: TelemetrySinkHandle::Async(telemetry_sink.into_async()),
         shadow_mode: trade_mode.trade_mode == TradeMode::Shadow,
         execution_mode: trade_mode.trade_mode.as_str(),
         max_orders_per_tick,
-        stats: Arc::new(Mutex::new(LiveTelemetryStats::default())),
+        stats: Arc::new(LiveTelemetryStats::default()),
     };
     let hooks = LiveRuntimeHooks {
         metrics,
@@ -2865,16 +2866,24 @@ fn write_summary(
     trade_mode: TradeMode,
     connector: &str,
     summary: &paraphina::live::LiveRunSummary,
-    stats: Arc<Mutex<LiveTelemetryStats>>,
+    stats: Arc<LiveTelemetryStats>,
 ) {
-    let stats = match stats.lock() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let fv_rate = if stats.ticks_total > 0 {
-        stats.fv_available_ticks as f64 / stats.ticks_total as f64
+    use std::sync::atomic::Ordering as AO;
+    let ticks_total = stats.ticks_total.load(AO::Relaxed);
+    let fv_available_ticks = stats.fv_available_ticks.load(AO::Relaxed);
+    let venue_staleness_events = stats.venue_staleness_events.load(AO::Relaxed);
+    let venue_disabled_events = stats.venue_disabled_events.load(AO::Relaxed);
+    let kill_events = stats.kill_events.load(AO::Relaxed);
+    let maps = stats.purpose_maps.lock().ok().map(|g| g.clone());
+
+    let fv_rate = if ticks_total > 0 {
+        fv_available_ticks as f64 / ticks_total as f64
     } else {
         0.0
+    };
+    let (place_map, cancel_map, replace_map) = match maps {
+        Some(m) => (m.would_place_by_purpose, m.would_cancel_by_purpose, m.would_replace_by_purpose),
+        None => (Default::default(), Default::default(), Default::default()),
     };
     let payload = serde_json::json!({
         "trade_mode": trade_mode.as_str(),
@@ -2883,13 +2892,13 @@ fn write_summary(
         "venues": cfg.venues.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(),
         "ticks_run": summary.ticks_run,
         "run_duration_ms": summary.ticks_run as i64 * cfg.main_loop_interval_ms,
-        "would_place_by_purpose": stats.would_place_by_purpose,
-        "would_cancel_by_purpose": stats.would_cancel_by_purpose,
-        "would_replace_by_purpose": stats.would_replace_by_purpose,
+        "would_place_by_purpose": place_map,
+        "would_cancel_by_purpose": cancel_map,
+        "would_replace_by_purpose": replace_map,
         "fv_available_rate": fv_rate,
-        "venue_staleness_events": stats.venue_staleness_events,
-        "venue_disabled_events": stats.venue_disabled_events,
-        "kill_events": stats.kill_events,
+        "venue_staleness_events": venue_staleness_events,
+        "venue_disabled_events": venue_disabled_events,
+        "kill_events": kill_events,
     });
     let path = out_dir.join("summary.json");
     if let Ok(text) = serde_json::to_string_pretty(&payload) {

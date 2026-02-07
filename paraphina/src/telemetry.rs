@@ -317,6 +317,157 @@ impl TelemetrySink {
             let _ = writer.flush();
         }
     }
+
+    /// Consume this sync sink and convert it into an [`AsyncTelemetryWriter`]
+    /// backed by a bounded channel and a background writer task.
+    ///
+    /// Only available with the `live` feature (requires tokio runtime).
+    #[cfg(feature = "live")]
+    pub fn into_async(mut self) -> AsyncTelemetryWriter {
+        let cap: usize = std::env::var("PARAPHINA_TELEMETRY_CHANNEL_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(cap);
+        let error_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_clone = error_flag.clone();
+
+        // Ensure writer is opened before moving to background task.
+        let _ = self.ensure_writer();
+        let writer = self.writer.take();
+        let mode = self.mode;
+
+        if mode != TelemetryMode::Jsonl || writer.is_none() {
+            // Telemetry is off or could not open file. Return a no-op writer.
+            error_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            return AsyncTelemetryWriter {
+                sender: tx,
+                error_flag,
+            };
+        }
+
+        tokio::spawn(async move {
+            async_telemetry_bg_task(rx, writer.unwrap(), flag_clone).await;
+        });
+
+        AsyncTelemetryWriter {
+            sender: tx,
+            error_flag,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async telemetry writer (live feature only)
+// ---------------------------------------------------------------------------
+
+/// Background task that receives serialized JSON lines via a bounded channel
+/// and writes them to a `BufWriter<File>`. Flushes every 100 lines or every
+/// 1 second, whichever comes first. On write error, sets the error flag and
+/// stops writing (mirrors `TelemetrySink::log_json` disable-on-error behavior).
+#[cfg(feature = "live")]
+async fn async_telemetry_bg_task(
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+    mut writer: BufWriter<File>,
+    error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::Write as _;
+    let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut lines_since_flush: u64 = 0;
+
+    loop {
+        tokio::select! {
+            line_opt = rx.recv() => {
+                match line_opt {
+                    Some(line) => {
+                        if writeln!(writer, "{}", line).is_err() {
+                            error_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!("[telemetry] async writer: write error, disabling");
+                            // Drain remaining messages without writing.
+                            while rx.recv().await.is_some() {}
+                            return;
+                        }
+                        lines_since_flush += 1;
+                        if lines_since_flush >= 100 {
+                            let _ = writer.flush();
+                            lines_since_flush = 0;
+                        }
+                    }
+                    None => {
+                        // Channel closed (sender dropped). Flush and exit.
+                        let _ = writer.flush();
+                        return;
+                    }
+                }
+            }
+            _ = flush_interval.tick() => {
+                if lines_since_flush > 0 {
+                    let _ = writer.flush();
+                    lines_since_flush = 0;
+                }
+            }
+        }
+    }
+}
+
+/// A non-blocking telemetry writer that sends serialized JSON lines to a
+/// background task via a bounded channel.
+///
+/// This is the live-trading replacement for `TelemetrySink::log_json` that
+/// removes sync file I/O from the tick thread. Records are dropped silently
+/// if the channel is full (best-effort telemetry, not critical path).
+#[cfg(feature = "live")]
+#[derive(Clone)]
+pub struct AsyncTelemetryWriter {
+    sender: tokio::sync::mpsc::Sender<String>,
+    error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "live")]
+impl AsyncTelemetryWriter {
+    /// Try to send a pre-serialized JSON line to the background writer.
+    ///
+    /// Returns `true` if the line was enqueued, `false` if the channel is full
+    /// or telemetry has been disabled by a write error.
+    pub fn try_send(&self, line: String) -> bool {
+        if self.error_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        self.sender.try_send(line).is_ok()
+    }
+}
+
+/// Handle that can hold either a synchronous sink or an async writer.
+///
+/// The `Sync` variant is used for replay/backtest/strategy paths that run
+/// single-threaded without a tokio runtime. The `Async` variant is used for
+/// the live/shadow trading hot path.
+#[cfg(feature = "live")]
+#[derive(Clone)]
+pub enum TelemetrySinkHandle {
+    Sync(std::sync::Arc<std::sync::Mutex<TelemetrySink>>),
+    Async(AsyncTelemetryWriter),
+}
+
+#[cfg(feature = "live")]
+impl TelemetrySinkHandle {
+    /// Write a JSON record through whichever sink variant is active.
+    pub fn log_json(&self, value: &JsonValue) {
+        match self {
+            TelemetrySinkHandle::Async(writer) => {
+                if let Ok(line) = serde_json::to_string(value) {
+                    let _ = writer.try_send(line);
+                }
+            }
+            TelemetrySinkHandle::Sync(sink) => {
+                if let Ok(mut guard) = sink.lock() {
+                    guard.log_json(value);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -428,6 +579,9 @@ impl TelemetryBuilder {
             "kf_x_hat": state.kf_x_hat,
             "kf_last_update_ms": state.kf_last_update_ms,
             "regime_ratio": state.vol_ratio_clipped,
+            "shadow_vol_ratio": state.shadow_vol_ratio,
+            "shadow_spread_mult": state.shadow_spread_mult,
+            "shadow_size_mult": state.shadow_size_mult,
             "healthy_venues_used_count": healthy_venues_used_count,
             "healthy_venues_used": healthy_venues_used,
             "config_version_id": cfg.version,

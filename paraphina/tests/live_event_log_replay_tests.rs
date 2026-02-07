@@ -13,7 +13,7 @@ use paraphina::live::runner::{
     replay_event_log, run_live_loop, LiveChannels, LiveRunMode, LiveTelemetry, LiveTelemetryStats,
 };
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
-use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink};
+use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink, TelemetrySinkHandle};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -76,13 +76,13 @@ async fn live_event_log_replay_matches_telemetry() {
         append: false,
     };
     let telemetry = LiveTelemetry {
-        sink: std::sync::Arc::new(std::sync::Mutex::new(TelemetrySink::from_config(
-            telemetry_cfg,
+        sink: TelemetrySinkHandle::Sync(std::sync::Arc::new(std::sync::Mutex::new(
+            TelemetrySink::from_config(telemetry_cfg),
         ))),
         shadow_mode: false,
         execution_mode: "replay",
         max_orders_per_tick: 200,
-        stats: std::sync::Arc::new(std::sync::Mutex::new(LiveTelemetryStats::default())),
+        stats: std::sync::Arc::new(LiveTelemetryStats::default()),
     };
 
     let channels = LiveChannels {
