@@ -79,6 +79,9 @@ pub struct LiveChannels {
     pub account_reconcile_tx: Option<mpsc::Sender<LiveAccountRequest>>,
     pub order_tx: mpsc::Sender<LiveOrderRequest>,
     pub order_snapshot_rx: Option<mpsc::Receiver<super::types::OrderSnapshot>>,
+    /// Shared venue ages for cross-task health monitoring (Layer A + B).
+    /// If `None`, age broadcasting is disabled (e.g. in tests / fixtures).
+    pub shared_venue_ages: Option<super::shared_venue_ages::SharedVenueAges>,
 }
 
 #[derive(Clone)]
@@ -945,6 +948,7 @@ pub async fn run_live_loop(
     let mut telemetry_builder = TelemetryBuilder::new(cfg);
     let mut applied_book_logged: Vec<bool> = vec![false; cfg.venues.len()];
 
+    let shared_venue_ages = channels.shared_venue_ages;
     let mut market_rx = channels.market_rx;
     let mut account_rx = channels.account_rx;
     let mut exec_rx = channels.exec_rx;
@@ -1623,6 +1627,17 @@ pub async fn run_live_loop(
                 venue.status = VenueStatus::Healthy;
             }
             disabled.clear();
+        }
+        // Update SharedVenueAges for Layer A (enforcer) and Layer B (REST monitor).
+        if let Some(ref ages) = shared_venue_ages {
+            for (idx, venue) in state.venues.iter().enumerate() {
+                let age = match venue.last_mid_update_ms {
+                    None => i64::MAX,
+                    Some(ts) => (now_ms - ts).max(0),
+                };
+                ages.set_age(idx, age);
+            }
+            ages.mark_write(now_ms);
         }
         let stale_count = snapshot.market.iter().filter(|m| m.is_stale).count() as u64;
         if !disabled.is_empty() {

@@ -120,6 +120,7 @@ mod tests {
             account_reconcile_tx: None,
             order_tx,
             order_snapshot_rx: None,
+            shared_venue_ages: None,
         };
 
         let summary = run_live_loop(
@@ -195,6 +196,7 @@ mod tests {
             account_reconcile_tx: None,
             order_tx,
             order_snapshot_rx: None,
+            shared_venue_ages: None,
         };
 
         let summary = run_live_loop(
@@ -273,6 +275,7 @@ mod tests {
             account_reconcile_tx: None,
             order_tx,
             order_snapshot_rx: None,
+            shared_venue_ages: None,
         };
 
         let hooks = paraphina::live::runner::LiveRuntimeHooks {
@@ -367,6 +370,7 @@ mod tests {
             account_reconcile_tx: None,
             order_tx,
             order_snapshot_rx: None,
+            shared_venue_ages: None,
         };
 
         let hooks = paraphina::live::runner::LiveRuntimeHooks {

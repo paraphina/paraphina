@@ -92,6 +92,7 @@ async fn live_event_log_replay_matches_telemetry() {
         account_reconcile_tx: None,
         order_tx,
         order_snapshot_rx: None,
+            shared_venue_ages: None,
     };
 
     let summary = run_live_loop(

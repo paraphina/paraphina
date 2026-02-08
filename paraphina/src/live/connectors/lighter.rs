@@ -69,6 +69,10 @@ struct Freshness {
     last_data_rx_ns: AtomicU64,
     last_parsed_ns: AtomicU64,
     last_published_ns: AtomicU64,
+    /// Tracks the last time a book event (snapshot or delta) was decoded into a
+    /// publishable MarketDataEvent. Used by the watchdog to detect "WS alive but
+    /// no book data" scenarios where non-book messages keep last_ws_rx_ns fresh.
+    last_book_event_ns: AtomicU64,
 }
 
 impl Freshness {
@@ -77,12 +81,13 @@ impl Freshness {
         self.last_data_rx_ns.store(0, Ordering::Relaxed);
         self.last_parsed_ns.store(0, Ordering::Relaxed);
         self.last_published_ns.store(0, Ordering::Relaxed);
+        self.last_book_event_ns.store(0, Ordering::Relaxed);
     }
 
     fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
+        let last_book = self.last_book_event_ns.load(Ordering::Relaxed);
         let last_pub = self.last_published_ns.load(Ordering::Relaxed);
-        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
-        let anchor = last_pub.max(last_parsed);
+        let anchor = last_book.max(last_pub);
         if anchor == 0 {
             connect_start_ns
         } else {
@@ -484,32 +489,50 @@ impl LighterConnector {
         loop {
             let session_start = Instant::now();
 
-            if let Err(err) = self.public_ws_once().await {
-                consecutive_failures += 1;
-                let msg = err.to_string();
-                if msg.contains("Lighter subscribe failed") {
-                    subscribe_failures += 1;
-                    if subscribe_failures >= 3 && !logged_subscribe_failure {
-                        eprintln!(
-                            "WARN: Lighter subscribe failed {} times; backing off",
-                            subscribe_failures
-                        );
-                        logged_subscribe_failure = true;
-                    }
-                } else {
-                    subscribe_failures = 0;
-                    logged_subscribe_failure = false;
-                    let level = if consecutive_failures >= 20 {
-                        "ERROR"
-                    } else if consecutive_failures >= 5 {
-                        "WARN"
+            // Layer C: session-level timeout catches ALL hang scenarios.
+            let max_session = Duration::from_secs(
+                std::env::var("PARAPHINA_WS_MAX_SESSION_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(86_400), // 24h — Layer A enforcer handles stuck connections
+            );
+            let result = tokio::time::timeout(max_session, self.public_ws_once()).await;
+            match result {
+                Ok(Err(err)) => {
+                    consecutive_failures += 1;
+                    let msg = err.to_string();
+                    if msg.contains("Lighter subscribe failed") {
+                        subscribe_failures += 1;
+                        if subscribe_failures >= 3 && !logged_subscribe_failure {
+                            eprintln!(
+                                "WARN: Lighter subscribe failed {} times; backing off",
+                                subscribe_failures
+                            );
+                            logged_subscribe_failure = true;
+                        }
                     } else {
-                        "INFO"
-                    };
-                    eprintln!(
-                        "{level}: Lighter public WS error (consecutive_failures={consecutive_failures}): {err}"
-                    );
+                        subscribe_failures = 0;
+                        logged_subscribe_failure = false;
+                        let level = if consecutive_failures >= 20 {
+                            "ERROR"
+                        } else if consecutive_failures >= 5 {
+                            "WARN"
+                        } else {
+                            "INFO"
+                        };
+                        eprintln!(
+                            "{level}: Lighter public WS error (consecutive_failures={consecutive_failures}): {err}"
+                        );
+                    }
                 }
+                Err(_timeout) => {
+                    eprintln!(
+                        "ERROR: Lighter public WS session timeout ({}s) — force reconnect",
+                        max_session.as_secs()
+                    );
+                    consecutive_failures += 1;
+                }
+                Ok(Ok(())) => {}
             }
 
             // FIX: Reset backoff and failure counter if connection was healthy for long enough
@@ -801,9 +824,15 @@ impl LighterConnector {
                                 "INFO: Lighter L2 initial snapshot applied, switching to delta mode"
                             );
                         }
-                        self.freshness
-                            .last_parsed_ns
-                            .store(mono_now_ns(), Ordering::Relaxed);
+                        {
+                            let now_ns = mono_now_ns();
+                            self.freshness
+                                .last_parsed_ns
+                                .store(now_ns, Ordering::Relaxed);
+                            self.freshness
+                                .last_book_event_ns
+                                .store(now_ns, Ordering::Relaxed);
+                        }
                         if !first_book_update_logged {
                             eprintln!("INFO: Lighter public WS first book update");
                             first_book_update_logged = true;
@@ -1729,6 +1758,7 @@ mod tests {
         let freshness = Freshness::default();
         freshness.last_parsed_ns.store(123, Ordering::Relaxed);
         freshness.last_published_ns.store(456, Ordering::Relaxed);
+        freshness.last_book_event_ns.store(789, Ordering::Relaxed);
 
         // After reset, all timestamps should be 0
         freshness.reset_for_new_connection();
@@ -1736,21 +1766,34 @@ mod tests {
         assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
         assert_eq!(freshness.last_ws_rx_ns.load(Ordering::Relaxed), 0);
         assert_eq!(freshness.last_data_rx_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            freshness.last_book_event_ns.load(Ordering::Relaxed),
+            0,
+            "last_book_event_ns must be reset on new connection"
+        );
 
         // With anchor == 0, should use connect_start_ns
         let connect_start_ns = 1_000;
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, connect_start_ns);
 
-        // With last_parsed_ns set, should use it
+        // Non-book parsed events must NOT advance watchdog anchor
         freshness.last_parsed_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
-        assert_eq!(anchor, 2_000);
+        assert_eq!(
+            anchor, connect_start_ns,
+            "non-book parsed events must not advance watchdog anchor"
+        );
 
-        // With last_published_ns > last_parsed_ns, should use last_published_ns
-        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
+        // Book events advance the anchor
+        freshness.last_book_event_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
+
+        // last_published_ns also advances the anchor
+        freshness.last_published_ns.store(4_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 4_000);
     }
 
     #[test]
@@ -1788,15 +1831,15 @@ mod tests {
         // Simulate connect_start_ns at time 0
         let connect_start_ns: u64 = 0;
 
-        // Simulate receiving data at 5 seconds
+        // Simulate receiving a book event at 5 seconds
         let data_time_ns: u64 = 5_000_000_000;
         freshness
-            .last_parsed_ns
+            .last_book_event_ns
             .store(data_time_ns, Ordering::Relaxed);
 
-        // Check anchor uses last_parsed_ns
+        // Check anchor uses last_book_event_ns
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
-        assert_eq!(anchor, data_time_ns, "anchor should be last_parsed_ns");
+        assert_eq!(anchor, data_time_ns, "anchor should be last_book_event_ns");
 
         // Simulate "now" being 8 seconds (8_000_000_000 ns)
         let now_ns: u64 = 8_000_000_000;

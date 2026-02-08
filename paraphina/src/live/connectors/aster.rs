@@ -86,6 +86,10 @@ struct Freshness {
     last_data_rx_ns: AtomicU64,
     last_parsed_ns: AtomicU64,
     last_published_ns: AtomicU64,
+    /// Tracks the last time a book event (snapshot or delta) was decoded into a
+    /// publishable MarketDataEvent. Used by the watchdog to detect "WS alive but
+    /// no book data" scenarios where non-book messages keep last_ws_rx_ns fresh.
+    last_book_event_ns: AtomicU64,
 }
 
 impl Freshness {
@@ -94,12 +98,13 @@ impl Freshness {
         self.last_data_rx_ns.store(0, Ordering::Relaxed);
         self.last_parsed_ns.store(0, Ordering::Relaxed);
         self.last_published_ns.store(0, Ordering::Relaxed);
+        self.last_book_event_ns.store(0, Ordering::Relaxed);
     }
 
     fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
+        let last_book = self.last_book_event_ns.load(Ordering::Relaxed);
         let last_pub = self.last_published_ns.load(Ordering::Relaxed);
-        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
-        let anchor = last_pub.max(last_parsed);
+        let anchor = last_book.max(last_pub);
         if anchor == 0 {
             connect_start_ns
         } else {
@@ -250,9 +255,16 @@ impl AsterConnector {
         loop {
             let session_start = std::time::Instant::now();
 
-            match self.public_ws_once().await {
-                Ok(()) => {}
-                Err(err) => {
+            // Layer C: session-level timeout catches ALL hang scenarios.
+            let max_session = Duration::from_secs(
+                std::env::var("PARAPHINA_WS_MAX_SESSION_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(86_400), // 24h — Layer A enforcer handles stuck connections
+            );
+            let result = tokio::time::timeout(max_session, self.public_ws_once()).await;
+            match result {
+                Ok(Err(err)) => {
                     consecutive_failures += 1;
                     let level = if consecutive_failures >= 20 {
                         "ERROR"
@@ -265,6 +277,14 @@ impl AsterConnector {
                         "{level}: Aster public WS error (consecutive_failures={consecutive_failures}): {err}"
                     );
                 }
+                Err(_timeout) => {
+                    eprintln!(
+                        "ERROR: Aster public WS session timeout ({}s) — force reconnect",
+                        max_session.as_secs()
+                    );
+                    consecutive_failures += 1;
+                }
+                Ok(Ok(())) => {}
             }
 
             // FIX: Reset backoff and failure counter if connection was healthy for long enough
@@ -318,25 +338,34 @@ impl AsterConnector {
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
+        // Use URL-path style connection (stream embedded in URL) instead of
+        // JSON SUBSCRIBE.  This is more reliable for Binance-style futures APIs
+        // and avoids issues with subscribe ACK frames and silent subscription
+        // failures.
+        let stream = format!("{}@depth@100ms", self.cfg.stream_symbol());
+        let ws_url = format!(
+            "{}/{}",
+            self.cfg.ws_url.trim_end_matches('/'),
+            stream
+        );
+        eprintln!("INFO: Aster public WS connecting url={}", ws_url);
         let (ws_stream, _) = tokio::time::timeout(
             Duration::from_secs(15),
-            connect_async(self.cfg.ws_url.as_str()),
+            connect_async(ws_url.as_str()),
         )
         .await
         .map_err(|_| anyhow::anyhow!("Aster public WS connect timeout (15s)"))?
         .map_err(|e| anyhow::anyhow!("Aster public WS connect error: {e}"))?;
+        eprintln!("INFO: Aster public WS connected url={}", ws_url);
         let (mut write, mut read) = ws_stream.split();
-        let stream = format!("{}@depth@100ms", self.cfg.stream_symbol());
-        let sub = serde_json::json!({
-            "method": "SUBSCRIBE",
-            "params": [stream],
-            "id": 1
-        });
-        write.send(Message::Text(sub.to_string())).await?;
 
         const MAX_BUFFERED_UPDATES: usize = 1024;
         let mut buffered_updates: Vec<AsterDepthUpdate> = Vec::new();
         let mut last_update_id: Option<u64> = None;
+        // Tracks the snapshot's lastUpdateId after applying a REST snapshot,
+        // while waiting for a WS delta that bridges it.  Set when the snapshot
+        // has been applied but no buffered delta bridged yet.
+        let mut snapshot_last_id: Option<u64> = None;
         let mut snapshot_future: Option<SnapshotFuture<'_>> = Some(Box::pin(self.fetch_snapshot()));
         let mut last_gap_log = Instant::now() - Duration::from_secs(60);
         let mut last_snapshot_err_log = Instant::now() - Duration::from_secs(60);
@@ -355,6 +384,14 @@ impl AsterConnector {
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         const STALE_MS: u64 = 2_000;
         const COOLDOWN_MS: u64 = 7_000;
+        // WS-level ping timer to prevent idle connection drops.
+        let ping_interval_ms: u64 = std::env::var("PARAPHINA_ASTER_PING_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await; // skip first immediate tick
         let connect_start_ns = mono_now_ns();
         self.freshness.reset_for_new_connection();
         let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
@@ -444,23 +481,38 @@ impl AsterConnector {
                                 bids: snapshot.bids,
                                 asks: snapshot.asks,
                             });
-                        self.freshness
-                            .last_parsed_ns
-                            .store(mono_now_ns(), Ordering::Relaxed);
+                        {
+                            let now_ns = mono_now_ns();
+                            self.freshness
+                                .last_parsed_ns
+                                .store(now_ns, Ordering::Relaxed);
+                            self.freshness
+                                .last_book_event_ns
+                                .store(now_ns, Ordering::Relaxed);
+                        }
                         if self.publish_market(snapshot_event).await.is_ok() {
                             last_applied_at = Instant::now();
                         }
 
-                        let mut next_last = snapshot.last_update_id;
+                        let snap_id = snapshot.last_update_id;
+                        let mut next_last = snap_id;
                         let mut gap = false;
+                        let mut any_applied = false;
                         for update in buffered_updates.drain(..) {
                             // Stream is per-symbol; avoid dropping on formatting mismatch.
                             match seq_decision_lenient(next_last, &update) {
                                 SeqDecision::Apply => {
                                     next_last = update.end_id;
-                                    self.freshness
-                                        .last_parsed_ns
-                                        .store(mono_now_ns(), Ordering::Relaxed);
+                                    any_applied = true;
+                                    {
+                                        let now_ns = mono_now_ns();
+                                        self.freshness
+                                            .last_parsed_ns
+                                            .store(now_ns, Ordering::Relaxed);
+                                        self.freshness
+                                            .last_book_event_ns
+                                            .store(now_ns, Ordering::Relaxed);
+                                    }
                                     if self
                                         .publish_market(delta_event_from_update(
                                             &update,
@@ -476,6 +528,13 @@ impl AsterConnector {
                                 }
                                 SeqDecision::Stale => {}
                                 SeqDecision::Gap => {
+                                    if last_gap_log.elapsed() > Duration::from_secs(10) {
+                                        eprintln!(
+                                            "WARN: Aster loop1 seq gap in buffered drain; snap_id={} next_last={} update_start={} update_end={} update_prev={:?}",
+                                            snap_id, next_last, update.start_id, update.end_id, update.prev_id
+                                        );
+                                        last_gap_log = Instant::now();
+                                    }
                                     gap = true;
                                     break;
                                 }
@@ -484,10 +543,25 @@ impl AsterConnector {
                         if gap {
                             buffered_updates.clear();
                             last_update_id = None;
+                            snapshot_last_id = None;
                             snapshot_future = Some(Box::pin(self.fetch_snapshot()));
                             continue;
                         }
-                        last_update_id = Some(next_last);
+                        if any_applied {
+                            // At least one buffered delta bridged the snapshot —
+                            // transition to steady-state delta mode (loop 2).
+                            last_update_id = Some(next_last);
+                            snapshot_last_id = None;
+                        } else {
+                            // All buffered deltas were stale (none bridged).
+                            // Stay in loop 1 but remember the snapshot ID so
+                            // incoming WS frames can be checked for a bridge.
+                            snapshot_last_id = Some(snap_id);
+                            eprintln!(
+                                "INFO: Aster snapshot applied (snap_id={}), waiting for bridge delta on WS",
+                                snap_id
+                            );
+                        }
                             }
                             Err(err) => {
                                 if last_snapshot_err_log.elapsed() > Duration::from_secs(30) {
@@ -504,6 +578,7 @@ impl AsterConnector {
                                 snapshot_future = Some(Box::pin(self.fetch_snapshot()));
                                 buffered_updates.clear();
                                 last_update_id = None;
+                                snapshot_last_id = None;
                                 continue;
                             }
                         }
@@ -524,6 +599,7 @@ impl AsterConnector {
                             );
                             buffered_updates.clear();
                             last_update_id = None;
+                            snapshot_last_id = None;
                             snapshot_future = Some(Box::pin(self.fetch_snapshot()));
                             last_watchdog_trigger_at = Some(now);
                             continue;
@@ -537,19 +613,101 @@ impl AsterConnector {
                         self.freshness
                             .last_ws_rx_ns
                             .store(mono_now_ns(), Ordering::Relaxed);
-                        match msg {
-                            Message::Text(text) => {
-                                if let Some(recorder) = self.recorder.as_ref() {
-                                    let mut guard = recorder.lock().await;
-                                    let _ = guard.record_ws_frame(&text);
+                        // Helper: extract text payload from Text or Binary frames.
+                        let text_payload = match &msg {
+                            Message::Text(text) => Some(text.clone()),
+                            Message::Binary(bytes) => {
+                                match String::from_utf8(bytes.clone()) {
+                                    Ok(text) => Some(text),
+                                    Err(_) => {
+                                        if !logged_non_utf8_binary {
+                                            eprintln!(
+                                                "WARN: Aster public WS non-utf8 binary frame url={}",
+                                                self.cfg.ws_url
+                                            );
+                                            logged_non_utf8_binary = true;
+                                        }
+                                        None
+                                    }
                                 }
+                            }
+                            _ => None,
+                        };
+                        match msg {
+                            Message::Ping(payload) => {
+                                write.send(Message::Pong(payload)).await?;
+                            }
+                            Message::Close(_) => {
+                                eprintln!("Aster WS closed; reconnecting url={}", self.cfg.ws_url);
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                        if let Some(text) = text_payload {
+                            if let Some(recorder) = self.recorder.as_ref() {
+                                let mut guard = recorder.lock().await;
+                                let _ = guard.record_ws_frame(&text);
+                            }
+                            self.freshness
+                                .last_data_rx_ns
+                                .store(mono_now_ns(), Ordering::Relaxed);
+                            if let Some(update) = parse_depth_update(&text) {
                                 self.freshness
-                                    .last_data_rx_ns
+                                    .last_parsed_ns
                                     .store(mono_now_ns(), Ordering::Relaxed);
-                                if let Some(update) = parse_depth_update(&text) {
-                                    self.freshness
-                                        .last_parsed_ns
-                                        .store(mono_now_ns(), Ordering::Relaxed);
+
+                                // If we have a snapshot applied but are waiting
+                                // for a bridge delta, check incoming frames
+                                // directly instead of just buffering.
+                                if let Some(sid) = snapshot_last_id {
+                                    match seq_decision_lenient(sid, &update) {
+                                        SeqDecision::Apply => {
+                                            // Bridge found! Transition to loop 2.
+                                            let now_ns = mono_now_ns();
+                                            self.freshness
+                                                .last_parsed_ns
+                                                .store(now_ns, Ordering::Relaxed);
+                                            self.freshness
+                                                .last_book_event_ns
+                                                .store(now_ns, Ordering::Relaxed);
+                                            if self
+                                                .publish_market(delta_event_from_update(
+                                                    &update,
+                                                    self.cfg.venue_index,
+                                                    &self.cfg.venue_id,
+                                                    next_seq(),
+                                                ))
+                                                .await
+                                                .is_ok()
+                                            {
+                                                last_applied_at = Instant::now();
+                                            }
+                                            last_update_id = Some(update.end_id);
+                                            snapshot_last_id = None;
+                                            eprintln!(
+                                                "INFO: Aster bridge delta found after snapshot; snap_id={} delta_end={}",
+                                                sid, update.end_id
+                                            );
+                                        }
+                                        SeqDecision::Stale => {
+                                            // Still behind the snapshot, keep waiting.
+                                        }
+                                        SeqDecision::Gap => {
+                                            // WS jumped past the snapshot — re-fetch.
+                                            if last_gap_log.elapsed() > Duration::from_secs(10) {
+                                                eprintln!(
+                                                    "WARN: Aster loop1 bridge-wait gap; snap_id={} update_start={} update_end={} — re-fetching snapshot",
+                                                    sid, update.start_id, update.end_id
+                                                );
+                                                last_gap_log = Instant::now();
+                                            }
+                                            snapshot_last_id = None;
+                                            buffered_updates.clear();
+                                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
+                                        }
+                                    }
+                                } else {
+                                    // No snapshot yet — just buffer.
                                     buffered_updates.push(update);
                                     if buffered_updates.len() > MAX_BUFFERED_UPDATES {
                                         eprintln!(
@@ -561,48 +719,6 @@ impl AsterConnector {
                                     }
                                 }
                             }
-                            Message::Binary(bytes) => match String::from_utf8(bytes) {
-                                Ok(text) => {
-                                    if let Some(recorder) = self.recorder.as_ref() {
-                                        let mut guard = recorder.lock().await;
-                                        let _ = guard.record_ws_frame(&text);
-                                    }
-                                    self.freshness
-                                        .last_data_rx_ns
-                                        .store(mono_now_ns(), Ordering::Relaxed);
-                                    if let Some(update) = parse_depth_update(&text) {
-                                        self.freshness
-                                            .last_parsed_ns
-                                            .store(mono_now_ns(), Ordering::Relaxed);
-                                        buffered_updates.push(update);
-                                        if buffered_updates.len() > MAX_BUFFERED_UPDATES {
-                                            eprintln!(
-                                                "Aster WS buffer overflow; resyncing url={}",
-                                                self.cfg.ws_url
-                                            );
-                                            buffered_updates.clear();
-                                            snapshot_future = Some(Box::pin(self.fetch_snapshot()));
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    if !logged_non_utf8_binary {
-                                        eprintln!(
-                                            "WARN: Aster public WS non-utf8 binary frame url={}",
-                                            self.cfg.ws_url
-                                        );
-                                        logged_non_utf8_binary = true;
-                                    }
-                                }
-                            },
-                            Message::Ping(payload) => {
-                                write.send(Message::Pong(payload)).await?;
-                            }
-                            Message::Close(_) => {
-                                eprintln!("Aster WS closed; reconnecting url={}", self.cfg.ws_url);
-                                return Ok(());
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -614,8 +730,24 @@ impl AsterConnector {
                 _ = &mut stale_rx => {
                     anyhow::bail!("Aster public WS stale: freshness exceeded {}ms", stale_ms);
                 }
-                msg = read.next() => {
-                    let Some(msg) = msg else {
+                _ = ping_timer.tick() => {
+                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        eprintln!("WARN: Aster public WS ping send failed: {e} — reconnecting");
+                        anyhow::bail!("Aster public WS ping send failed: {e}");
+                    }
+                    continue;
+                }
+                read_result = tokio::time::timeout(Duration::from_secs(30), read.next()) => {
+                    let maybe = match read_result {
+                        Ok(m) => m,
+                        Err(_) => {
+                            eprintln!(
+                                "WARN: Aster public WS read timeout (30s) — no frame received, reconnecting"
+                            );
+                            anyhow::bail!("Aster public WS read timeout after 30s");
+                        }
+                    };
+                    let Some(msg) = maybe else {
                         return Ok(());
                     };
                     let msg = msg?;
@@ -645,9 +777,15 @@ impl AsterConnector {
                             match decision {
                                 SeqDecision::Apply => {
                                     last_update_id = Some(update.end_id);
-                                    self.freshness
-                                        .last_parsed_ns
-                                        .store(mono_now_ns(), Ordering::Relaxed);
+                                    {
+                                        let now_ns = mono_now_ns();
+                                        self.freshness
+                                            .last_parsed_ns
+                                            .store(now_ns, Ordering::Relaxed);
+                                        self.freshness
+                                            .last_book_event_ns
+                                            .store(now_ns, Ordering::Relaxed);
+                                    }
                                     if self
                                         .publish_market(delta_event_from_update(
                                             &update,
@@ -702,9 +840,15 @@ impl AsterConnector {
                                 match seq_decision_lenient(current_last, &update) {
                                     SeqDecision::Apply => {
                                         last_update_id = Some(update.end_id);
-                                        self.freshness
-                                            .last_parsed_ns
-                                            .store(mono_now_ns(), Ordering::Relaxed);
+                                        {
+                                            let now_ns = mono_now_ns();
+                                            self.freshness
+                                                .last_parsed_ns
+                                                .store(now_ns, Ordering::Relaxed);
+                                            self.freshness
+                                                .last_book_event_ns
+                                                .store(now_ns, Ordering::Relaxed);
+                                        }
                                         if self
                                             .publish_market(delta_event_from_update(
                                                 &update,
@@ -1311,7 +1455,7 @@ impl AsterSeqState {
             venue_index: self.venue_index,
             venue_id: self.venue_id.clone(),
             seq: update.end_id,
-            timestamp_ms: update.event_time.unwrap_or_else(now_ms),
+            timestamp_ms: now_ms(),
             changes,
         });
         Ok(Some(event))
@@ -1371,7 +1515,7 @@ fn delta_event_from_update(
         venue_index,
         venue_id: venue_id.to_string(),
         seq,
-        timestamp_ms: update.event_time.unwrap_or_else(now_ms),
+        timestamp_ms: now_ms(),
         changes,
     })
 }
@@ -2161,20 +2305,34 @@ mod tests {
         let freshness = Freshness::default();
         freshness.last_parsed_ns.store(123, Ordering::Relaxed);
         freshness.last_published_ns.store(456, Ordering::Relaxed);
+        freshness.last_book_event_ns.store(789, Ordering::Relaxed);
         freshness.reset_for_new_connection();
         assert_eq!(freshness.last_parsed_ns.load(Ordering::Relaxed), 0);
         assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            freshness.last_book_event_ns.load(Ordering::Relaxed),
+            0,
+            "last_book_event_ns must be reset on new connection"
+        );
 
         let connect_start_ns = 1_000;
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, connect_start_ns);
 
+        // Non-book parsed events must NOT advance watchdog anchor
         freshness.last_parsed_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
-        assert_eq!(anchor, 2_000);
+        assert_eq!(
+            anchor, connect_start_ns,
+            "non-book parsed events must not advance watchdog anchor"
+        );
 
-        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
+        freshness.last_book_event_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
+
+        freshness.last_published_ns.store(4_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 4_000);
     }
 }

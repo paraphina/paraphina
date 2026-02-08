@@ -140,6 +140,7 @@ async fn live_runner_consumes_hyperliquid_fixtures() {
             account_reconcile_tx: None,
             order_tx,
             order_snapshot_rx: Some(order_snapshot_rx),
+            shared_venue_ages: None,
         },
         LiveRunMode::Step {
             start_ms,

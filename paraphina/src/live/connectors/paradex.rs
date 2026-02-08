@@ -39,6 +39,10 @@ struct Freshness {
     last_data_rx_ns: AtomicU64,
     last_parsed_ns: AtomicU64,
     last_published_ns: AtomicU64,
+    /// Tracks the last time a book event (snapshot or delta) was decoded into a
+    /// publishable MarketDataEvent. Used by the watchdog to detect "WS alive but
+    /// no book data" scenarios where non-book messages keep last_ws_rx_ns fresh.
+    last_book_event_ns: AtomicU64,
 }
 
 impl Freshness {
@@ -47,12 +51,13 @@ impl Freshness {
         self.last_data_rx_ns.store(0, Ordering::Relaxed);
         self.last_parsed_ns.store(0, Ordering::Relaxed);
         self.last_published_ns.store(0, Ordering::Relaxed);
+        self.last_book_event_ns.store(0, Ordering::Relaxed);
     }
 
     fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
+        let last_book = self.last_book_event_ns.load(Ordering::Relaxed);
         let last_pub = self.last_published_ns.load(Ordering::Relaxed);
-        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
-        let anchor = last_pub.max(last_parsed);
+        let anchor = last_book.max(last_pub);
         if anchor == 0 {
             connect_start_ns
         } else {
@@ -176,7 +181,12 @@ impl ParadexConnector {
             PARADEX_MARKET_PUB_DRAIN_MAX,
             market_tx.clone(),
             Some(Arc::new(move || is_fixture || Self::fixture_mode_now())),
-            Arc::new(|event: &MarketDataEvent| matches!(event, MarketDataEvent::L2Delta(_))),
+            Arc::new(|event: &MarketDataEvent| {
+                matches!(
+                    event,
+                    MarketDataEvent::L2Delta(_) | MarketDataEvent::L2Snapshot(_)
+                )
+            }),
             Some(on_published),
             "paradex market_tx closed",
             "paradex market publish queue closed",
@@ -226,18 +236,36 @@ impl ParadexConnector {
         loop {
             let session_start = std::time::Instant::now();
 
-            if let Err(err) = self.public_ws_once().await {
-                consecutive_failures += 1;
-                let level = if consecutive_failures >= 20 {
-                    "ERROR"
-                } else if consecutive_failures >= 5 {
-                    "WARN"
-                } else {
-                    "INFO"
-                };
-                eprintln!(
-                    "{level}: Paradex public WS error (consecutive_failures={consecutive_failures}): {err}"
-                );
+            // Layer C: session-level timeout catches ALL hang scenarios.
+            let max_session = Duration::from_secs(
+                std::env::var("PARAPHINA_WS_MAX_SESSION_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(86_400), // 24h — Layer A enforcer handles stuck connections
+            );
+            let result = tokio::time::timeout(max_session, self.public_ws_once()).await;
+            match result {
+                Ok(Err(err)) => {
+                    consecutive_failures += 1;
+                    let level = if consecutive_failures >= 20 {
+                        "ERROR"
+                    } else if consecutive_failures >= 5 {
+                        "WARN"
+                    } else {
+                        "INFO"
+                    };
+                    eprintln!(
+                        "{level}: Paradex public WS error (consecutive_failures={consecutive_failures}): {err}"
+                    );
+                }
+                Err(_timeout) => {
+                    eprintln!(
+                        "ERROR: Paradex public WS session timeout ({}s) — force reconnect",
+                        max_session.as_secs()
+                    );
+                    consecutive_failures += 1;
+                }
+                Ok(Ok(())) => {}
             }
 
             // FIX: Reset backoff and failure counter if connection was healthy for long enough
@@ -318,6 +346,14 @@ impl ParadexConnector {
         let mut first_decoded_top_logged = false;
         let mut decode_miss_count = 0usize;
         let mut bbo_seq: u64 = 0;
+        // WS-level ping timer to prevent idle connection drops.
+        let ping_interval_ms: u64 = std::env::var("PARAPHINA_PARADEX_PING_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await; // skip first immediate tick
         let connect_start_ns = mono_now_ns();
         self.freshness.reset_for_new_connection();
         let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
@@ -456,9 +492,15 @@ impl ParadexConnector {
                     eprintln!("INFO: Paradex public WS first book update");
                     first_book_update_logged = true;
                 }
-                self.freshness
-                    .last_parsed_ns
-                    .store(mono_now_ns(), Ordering::Relaxed);
+                {
+                    let now_ns = mono_now_ns();
+                    self.freshness
+                        .last_parsed_ns
+                        .store(now_ns, Ordering::Relaxed);
+                    self.freshness
+                        .last_book_event_ns
+                        .store(now_ns, Ordering::Relaxed);
+                }
                 if let Err(err) = self.publish_market(snapshot).await {
                     eprintln!("Paradex public WS market send failed: {err}");
                 }
@@ -1199,12 +1241,7 @@ fn parse_delta(payload: &Value) -> Option<ParadexDelta> {
         .get("prev_seq")
         .or_else(|| payload.get("prevSequence"))
         .and_then(|v| v.as_u64());
-    let timestamp_ms = payload
-        .get("ts")
-        .or_else(|| payload.get("timestamp"))
-        .and_then(|v| v.as_i64())
-        .map(|v| v as TimestampMs)
-        .unwrap_or_else(now_ms);
+    let timestamp_ms = now_ms();
     let bids = parse_deltas_from_value(payload.get("bids")?, BookSide::Bid)?;
     let asks = parse_deltas_from_value(payload.get("asks")?, BookSide::Ask)?;
     Some(ParadexDelta {
@@ -1285,11 +1322,7 @@ fn decode_bbo_top_and_snapshot(
     if bid_sz <= 0.0 || ask_sz <= 0.0 {
         return None;
     }
-    let timestamp_ms = data
-        .get("ts")
-        .or_else(|| data.get("timestamp"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(now_ms);
+    let timestamp_ms = now_ms();
     *seq = seq.wrapping_add(1);
     let bids = vec![BookLevel {
         price: bid_px,
@@ -1923,21 +1956,35 @@ mod tests {
         let freshness = Freshness::default();
         freshness.last_parsed_ns.store(123, Ordering::Relaxed);
         freshness.last_published_ns.store(456, Ordering::Relaxed);
+        freshness.last_book_event_ns.store(789, Ordering::Relaxed);
         freshness.reset_for_new_connection();
         assert_eq!(freshness.last_parsed_ns.load(Ordering::Relaxed), 0);
         assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            freshness.last_book_event_ns.load(Ordering::Relaxed),
+            0,
+            "last_book_event_ns must be reset on new connection"
+        );
 
         let connect_start_ns = 1_000;
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, connect_start_ns);
 
+        // Non-book parsed events must NOT advance watchdog anchor
         freshness.last_parsed_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
-        assert_eq!(anchor, 2_000);
+        assert_eq!(
+            anchor, connect_start_ns,
+            "non-book parsed events must not advance watchdog anchor"
+        );
 
-        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
+        freshness.last_book_event_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
+
+        freshness.last_published_ns.store(4_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 4_000);
     }
 
     #[test]
