@@ -25,6 +25,7 @@ use paraphina::live::runner::{
 };
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
 use paraphina::live::types::L2Snapshot;
+use paraphina::live::supervision::spawn_supervised;
 use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
 use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink, TelemetrySinkHandle};
@@ -1889,29 +1890,38 @@ async fn main() {
                             .and_then(|v| v.parse::<u64>().ok())
                             .unwrap_or(5_000);
                         let hl_poll = hl_arc.clone();
-                        tokio::spawn(async move {
-                            hl_poll.run_account_polling(poll_ms).await;
+                        spawn_supervised("hyperliquid_account_poll", move || {
+                            let hl = hl_poll.clone();
+                            async move { hl.run_account_polling(poll_ms).await }
                         });
                         if hl_cfg.private_key_hex.is_some() {
                             let hl_private = hl_arc.clone();
-                            tokio::spawn(async move {
-                                hl_private.run_private_ws().await;
+                            spawn_supervised("hyperliquid_private_ws", move || {
+                                let hl = hl_private.clone();
+                                async move { hl.run_private_ws().await }
                             });
                         } else {
                             eprintln!("paraphina_live | private_ws_disabled=true reason=missing_hl_private_key connector=hyperliquid");
                         }
                     }
                     let hl_public = hl_arc.clone();
-                    tokio::spawn(async move {
-                        hl_public.run_public_ws().await;
+                    spawn_supervised("hyperliquid_public_ws", move || {
+                        let hl = hl_public.clone();
+                        async move { hl.run_public_ws().await }
                     });
                     let hl_funding = hl_arc.clone();
                     let funding_poll_ms = std::env::var("HL_FUNDING_POLL_MS")
                         .ok()
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(10_000);
-                    tokio::spawn(async move {
-                        hl_funding.run_funding_polling(funding_poll_ms).await;
+                    spawn_supervised("hyperliquid_funding_poll", move || {
+                        let hl = hl_funding.clone();
+                        async move { hl.run_funding_polling(funding_poll_ms).await }
+                    });
+                    let hl_rest_fallback = hl_arc.clone();
+                    spawn_supervised("hyperliquid_rest_book_fallback", move || {
+                        let hl = hl_rest_fallback.clone();
+                        async move { hl.run_rest_book_fallback().await }
                     });
                 }
                 #[cfg(not(feature = "live_hyperliquid"))]
@@ -2053,21 +2063,24 @@ async fn main() {
                                 .and_then(|v| v.parse::<u64>().ok())
                                 .unwrap_or(5_000);
                             let lighter_poll = lighter_arc.clone();
-                            tokio::spawn(async move {
-                                lighter_poll.run_account_polling(poll_ms).await;
+                            spawn_supervised("lighter_account_poll", move || {
+                                let l = lighter_poll.clone();
+                                async move { l.run_account_polling(poll_ms).await }
                             });
                         }
                         let lighter_public = lighter_arc.clone();
-                        tokio::spawn(async move {
-                            lighter_public.run_public_ws().await;
+                        spawn_supervised("lighter_public_ws", move || {
+                            let l = lighter_public.clone();
+                            async move { l.run_public_ws().await }
                         });
                         let lighter_funding = lighter_arc.clone();
                         let funding_poll_ms = std::env::var("LIGHTER_FUNDING_POLL_MS")
                             .ok()
                             .and_then(|v| v.parse::<u64>().ok())
                             .unwrap_or(10_000);
-                        tokio::spawn(async move {
-                            lighter_funding.run_funding_polling(funding_poll_ms).await;
+                        spawn_supervised("lighter_funding_poll", move || {
+                            let l = lighter_funding.clone();
+                            async move { l.run_funding_polling(funding_poll_ms).await }
                         });
                     }
                 }
@@ -2136,16 +2149,18 @@ async fn main() {
                             );
                         let extended_arc = Arc::new(extended);
                         let extended_public = extended_arc.clone();
-                        tokio::spawn(async move {
-                            extended_public.run_public_ws().await;
+                        spawn_supervised("extended_public_ws", move || {
+                            let e = extended_public.clone();
+                            async move { e.run_public_ws().await }
                         });
                         let extended_funding = extended_arc.clone();
                         let funding_poll_ms = std::env::var("EXTENDED_FUNDING_POLL_MS")
                             .ok()
                             .and_then(|v| v.parse::<u64>().ok())
                             .unwrap_or(10_000);
-                        tokio::spawn(async move {
-                            extended_funding.run_funding_polling(funding_poll_ms).await;
+                        spawn_supervised("extended_funding_poll", move || {
+                            let e = extended_funding.clone();
+                            async move { e.run_funding_polling(funding_poll_ms).await }
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {
@@ -2250,16 +2265,18 @@ async fn main() {
                         );
                         let aster_arc = Arc::new(aster);
                         let aster_public = aster_arc.clone();
-                        tokio::spawn(async move {
-                            aster_public.run_public_ws().await;
+                        spawn_supervised("aster_public_ws", move || {
+                            let a = aster_public.clone();
+                            async move { a.run_public_ws().await }
                         });
                         let aster_funding = aster_arc.clone();
                         let funding_poll_ms = std::env::var("ASTER_FUNDING_POLL_MS")
                             .ok()
                             .and_then(|v| v.parse::<u64>().ok())
                             .unwrap_or(10_000);
-                        tokio::spawn(async move {
-                            aster_funding.run_funding_polling(funding_poll_ms).await;
+                        spawn_supervised("aster_funding_poll", move || {
+                            let a = aster_funding.clone();
+                            async move { a.run_funding_polling(funding_poll_ms).await }
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {
@@ -2367,16 +2384,18 @@ async fn main() {
                         );
                         let paradex_arc = Arc::new(paradex);
                         let paradex_public = paradex_arc.clone();
-                        tokio::spawn(async move {
-                            paradex_public.run_public_ws().await;
+                        spawn_supervised("paradex_public_ws", move || {
+                            let p = paradex_public.clone();
+                            async move { p.run_public_ws().await }
                         });
                         let paradex_funding = paradex_arc.clone();
                         let funding_poll_ms = std::env::var("PARADEX_FUNDING_POLL_MS")
                             .ok()
                             .and_then(|v| v.parse::<u64>().ok())
                             .unwrap_or(10_000);
-                        tokio::spawn(async move {
-                            paradex_funding.run_funding_polling(funding_poll_ms).await;
+                        spawn_supervised("paradex_funding_poll", move || {
+                            let p = paradex_funding.clone();
+                            async move { p.run_funding_polling(funding_poll_ms).await }
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {

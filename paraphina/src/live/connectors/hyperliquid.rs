@@ -510,6 +510,18 @@ impl HyperliquidConnector {
             "INFO: Hyperliquid public WS subscribed coin={} nSigFigs={} nLevels={}",
             self.cfg.coin, self.cfg.n_sig_figs, self.cfg.n_levels
         );
+        // FIX: Application-level heartbeat per Hyperliquid docs.
+        // "The server will close any connection if it hasn't sent a message to it
+        //  in the last 60 seconds." Send {"method":"ping"} every 30s to prevent
+        //  server-side idle disconnection.
+        let ping_interval_ms: u64 = std::env::var("PARAPHINA_HL_PING_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the first immediate tick
+        ping_timer.tick().await;
         let connect_start_ns = mono_now_ns();
         freshness.reset_for_new_connection();
         let (stale_tx, mut stale_rx) = tokio::sync::oneshot::channel::<()>();
@@ -589,6 +601,13 @@ impl HyperliquidConnector {
                     eprintln!("WARN: Hyperliquid public WS watchdog: no publishable book update for {stale_ms}ms — reconnecting");
                     anyhow::bail!("Hyperliquid public WS stale: freshness exceeded {stale_ms}ms");
                 }
+                // FIX: Send application-level ping to prevent server-side idle disconnection.
+                _ = ping_timer.tick() => {
+                    if let Err(e) = write.send(Message::Text(r#"{"method":"ping"}"#.to_string())).await {
+                        eprintln!("WARN: Hyperliquid public WS ping send failed: {e} — reconnecting");
+                        anyhow::bail!("Hyperliquid public WS ping send failed: {e}");
+                    }
+                }
                 // FIX A2: read timeout prevents idle ESTABLISHED sockets from blocking forever.
                 read_result = tokio::time::timeout(read_timeout, read.next()) => {
                     let maybe = match read_result {
@@ -636,7 +655,7 @@ impl HyperliquidConnector {
                         }
                     };
                     let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-                    if channel == "subscriptionResponse" {
+                    if channel == "subscriptionResponse" || channel == "pong" {
                         continue;
                     }
                     if channel == "l2Book" {
@@ -928,6 +947,63 @@ impl HyperliquidConnector {
                 }
                 Err(err) => {
                     eprintln!("Hyperliquid account polling error: {err}");
+                }
+            }
+        }
+    }
+
+    /// REST-based book polling fallback: when the WS has been stale for longer
+    /// than `PARAPHINA_HL_REST_FALLBACK_STALE_MS` (default 15s), fetch the book
+    /// via REST API every `PARAPHINA_HL_REST_FALLBACK_POLL_MS` (default 2s).
+    /// This provides a completely independent data path that survives WS failures.
+    pub async fn run_rest_book_fallback(&self) {
+        let stale_threshold_ms: u64 = std::env::var("PARAPHINA_HL_REST_FALLBACK_STALE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15_000);
+        let poll_interval_ms: u64 = std::env::var("PARAPHINA_HL_REST_FALLBACK_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000);
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_interval_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut active_logged = false;
+        let mut inactive_logged = false;
+        loop {
+            interval.tick().await;
+            let now = mono_now_ns();
+            // Check if WS is stale: use the book event freshness as the indicator.
+            let last_book = self.freshness.last_book_event_ns.load(Ordering::Relaxed);
+            let ws_stale = if last_book == 0 {
+                // No book events ever received — could be startup, give WS time
+                false
+            } else {
+                age_ms(now, last_book) > stale_threshold_ms
+            };
+            if !ws_stale {
+                if active_logged && !inactive_logged {
+                    eprintln!("INFO: Hyperliquid REST book fallback deactivated (WS recovered)");
+                    inactive_logged = true;
+                    active_logged = false;
+                }
+                continue;
+            }
+            if !active_logged {
+                eprintln!(
+                    "WARN: Hyperliquid REST book fallback activated (WS stale for >{}ms)",
+                    stale_threshold_ms
+                );
+                active_logged = true;
+                inactive_logged = false;
+            }
+            match fetch_l2_snapshot(&self.http, &self.cfg, &self.current_info_url()).await {
+                Ok(snapshot) => {
+                    if self.market_tx.send(snapshot).await.is_err() {
+                        eprintln!("WARN: Hyperliquid REST book fallback: market_tx closed");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("WARN: Hyperliquid REST book fallback error: {err}");
                 }
             }
         }
