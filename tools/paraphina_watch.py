@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
+"""Terminal dashboard for paraphina_live telemetry.
+
+Displays a colour-coded, Unicode-styled live view of venue status,
+positions, fills, cancels, and kill events.  All rendering is pure
+display logic – no market-making behaviour is changed.
+"""
 from __future__ import annotations
 
 import argparse
 import atexit
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -14,13 +21,75 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Iterable
 
+# ── ANSI styling ──────────────────────────────────────────────────────────────
+
+_NO_COLOR = False  # flipped by --no-color / NO_COLOR env / non-TTY
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class S:
+    """ANSI escape sequences for styles and colours."""
+
+    RESET = "\x1b[0m"
+    BOLD = "\x1b[1m"
+    DIM = "\x1b[2m"
+    # foreground
+    RED = "\x1b[31m"
+    GREEN = "\x1b[32m"
+    YELLOW = "\x1b[33m"
+    BLUE = "\x1b[34m"
+    MAGENTA = "\x1b[35m"
+    CYAN = "\x1b[36m"
+    WHITE = "\x1b[37m"
+    GRAY = "\x1b[90m"
+    # bright foreground
+    B_RED = "\x1b[91m"
+    B_GREEN = "\x1b[92m"
+    B_YELLOW = "\x1b[93m"
+    B_CYAN = "\x1b[96m"
+    B_WHITE = "\x1b[97m"
+
+
+def _s(*codes: str) -> str:
+    """Join style codes (empty when colour is off)."""
+    return "" if _NO_COLOR else "".join(codes)
+
+
+def _r() -> str:
+    """Reset code (empty when colour is off)."""
+    return "" if _NO_COLOR else S.RESET
+
+
+def visible_len(text: str) -> int:
+    """Visible width of *text*, ignoring ANSI escapes."""
+    return len(_ANSI_RE.sub("", text))
+
+
+def styled(text: str, *codes: str) -> str:
+    """Wrap *text* in ANSI codes with auto-reset."""
+    if _NO_COLOR or not codes:
+        return text
+    return "".join(codes) + text + S.RESET
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Terminal dashboard for paraphina_live telemetry.")
+    parser = argparse.ArgumentParser(
+        description="Terminal dashboard for paraphina_live telemetry."
+    )
     parser.add_argument("--telemetry", required=True, help="Path to telemetry.jsonl")
     parser.add_argument("--refresh-ms", type=int, default=250)
     parser.add_argument("--max-events", type=int, default=50)
+    parser.add_argument(
+        "--no-color", action="store_true", help="Disable coloured output"
+    )
     return parser.parse_args()
+
+
+# ── Value helpers (unchanged logic) ───────────────────────────────────────────
 
 
 def safe_float(value: Any) -> float | None:
@@ -66,6 +135,64 @@ def format_status(value: Any) -> str:
     return "n/a"
 
 
+# ── Colour helpers ────────────────────────────────────────────────────────────
+
+_LABEL = lambda t: styled(t, S.GRAY)  # noqa: E731  dim label
+
+
+def color_health(status: str) -> str:
+    if status == "Healthy":
+        return styled(status, S.GREEN)
+    if status in ("Stale", "Disconnected", "Error"):
+        return styled(status, S.B_RED, S.BOLD)
+    return styled(status, S.YELLOW)
+
+
+def color_regime(regime: str) -> str:
+    if regime == "Normal":
+        return styled(regime, S.GREEN)
+    if regime in ("Emergency", "HardStop"):
+        return styled(regime, S.B_RED, S.BOLD)
+    return styled(regime, S.YELLOW)
+
+
+def color_kill(kill: bool) -> str:
+    if kill:
+        return styled("True", S.B_RED, S.BOLD)
+    return styled("False", S.GREEN)
+
+
+def _color_val(text: str, value: float | None, lo: float, hi: float) -> str:
+    """Colour a pre-formatted string based on absolute-value thresholds."""
+    if value is None:
+        return styled(text, S.GRAY)
+    v = abs(value)
+    if v >= hi:
+        return styled(text, S.B_RED)
+    if v >= lo:
+        return styled(text, S.YELLOW)
+    return text
+
+
+def color_tox(value: float | None, decimals: int = 4) -> str:
+    if value is None:
+        return styled("n/a", S.GRAY)
+    text = f"{value:.{decimals}f}"
+    return _color_val(text, value, 0.2, 0.5)
+
+
+def color_stale(pct: float) -> str:
+    text = f"{pct:.1f}%"
+    if pct >= 5.0:
+        return styled(text, S.B_RED)
+    if pct >= 1.0:
+        return styled(text, S.YELLOW)
+    return styled(text, S.GREEN)
+
+
+# ── Venue-ID parsing (unchanged logic) ───────────────────────────────────────
+
+
 def parse_venue_ids(record: dict[str, Any], fallback_count: int) -> list[str]:
     treasury = record.get("treasury_guidance")
     if isinstance(treasury, dict):
@@ -80,8 +207,14 @@ def parse_venue_ids(record: dict[str, Any], fallback_count: int) -> list[str]:
                 if idx is not None and isinstance(name, str):
                     mapping[idx] = name
             if mapping:
-                return [mapping.get(i, f"venue_{i}") for i in range(max(mapping.keys()) + 1)]
+                return [
+                    mapping.get(i, f"venue_{i}")
+                    for i in range(max(mapping.keys()) + 1)
+                ]
     return [f"venue_{i}" for i in range(fallback_count)]
+
+
+# ── Telemetry parsing (unchanged logic) ──────────────────────────────────────
 
 
 def parse_lines(path: Path, max_events: int) -> list[dict[str, Any]]:
@@ -103,6 +236,9 @@ def parse_lines(path: Path, max_events: int) -> list[dict[str, Any]]:
     except OSError:
         return []
     return list(records)
+
+
+# ── State tracking (unchanged logic) ─────────────────────────────────────────
 
 
 @dataclass
@@ -132,13 +268,21 @@ class WatchState:
 
         # Track per-venue stale% and status flips.
         for idx, vid in enumerate(self.venue_ids):
-            cur = venue_status[idx] if isinstance(venue_status, list) and idx < len(venue_status) else None
+            cur = (
+                venue_status[idx]
+                if isinstance(venue_status, list) and idx < len(venue_status)
+                else None
+            )
             if isinstance(cur, str):
                 if cur != "Healthy":
-                    self.venue_stale_ticks[vid] = self.venue_stale_ticks.get(vid, 0) + 1
+                    self.venue_stale_ticks[vid] = (
+                        self.venue_stale_ticks.get(vid, 0) + 1
+                    )
                 prev = self.prev_venue_status.get(vid)
                 if prev is not None and cur != prev:
-                    self.venue_status_flips[vid] = self.venue_status_flips.get(vid, 0) + 1
+                    self.venue_status_flips[vid] = (
+                        self.venue_status_flips.get(vid, 0) + 1
+                    )
                 self.prev_venue_status[vid] = cur
 
         now_ms = None
@@ -159,7 +303,11 @@ class WatchState:
                     size = fill.get("size")
                     price = fill.get("price")
                     side = fill.get("side", "?")
-                    age = f"{int((now_ms - fill_time) / 1000)}s" if now_ms and fill_time else "n/a"
+                    age = (
+                        f"{int((now_ms - fill_time) / 1000)}s"
+                        if now_ms and fill_time
+                        else "n/a"
+                    )
                     self.events.fills.appendleft(
                         f"{venue_id} {side} {size}@{price} age={age}"
                     )
@@ -193,22 +341,64 @@ def build_state(records: Iterable[dict[str, Any]], max_events: int) -> WatchStat
     return state
 
 
+# ── Table formatting (Unicode box-drawing) ───────────────────────────────────
+
+_DISPLAY_EVENT_LIMIT = 10  # max events shown per section in the dashboard
+
+
 def format_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Build an aligned table with Unicode separators.
+
+    Cell values may contain ANSI codes; ``visible_len`` is used for
+    width calculations so alignment is correct.
+    """
+    col_count = len(headers)
     widths = [len(h) for h in headers]
     for row in rows:
-        for idx, cell in enumerate(row):
-            widths[idx] = max(widths[idx], len(cell))
-    lines = []
-    header_line = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    sep_line = "-+-".join("-" * widths[i] for i in range(len(headers)))
-    lines.append(header_line)
-    lines.append(sep_line)
+        for idx in range(min(len(row), col_count)):
+            widths[idx] = max(widths[idx], visible_len(row[idx]))
+
+    dim = _s(S.DIM)
+    rst = _r()
+    col_sep = f" {dim}│{rst} "
+
+    # Header row
+    header_cells = [
+        styled(h.ljust(widths[i]), S.BOLD, S.CYAN) for i, h in enumerate(headers)
+    ]
+    header_line = col_sep.join(header_cells)
+
+    # Separator row
+    sep_parts = ["─" * widths[i] for i in range(col_count)]
+    sep_line = f"{dim}{'─┼─'.join(sep_parts)}{rst}"
+
+    # Data rows
+    lines = [header_line, sep_line]
     for row in rows:
-        lines.append(" | ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
+        cells = []
+        for i in range(col_count):
+            cell = row[i] if i < len(row) else ""
+            pad = widths[i] - visible_len(cell)
+            cells.append(cell + " " * pad)
+        lines.append(col_sep.join(cells))
+
     return "\n".join(lines)
 
 
-def render_frame(state: WatchState, max_events: int) -> str:
+# ── Section header ────────────────────────────────────────────────────────────
+
+
+def _section(title: str, width: int = 72) -> str:
+    """Render ``─── Title ────────────────``."""
+    prefix = "─── "
+    suffix_len = max(1, width - len(prefix) - len(title) - 1)
+    return styled(f"{prefix}{title} {'─' * suffix_len}", S.CYAN, S.BOLD)
+
+
+# ── Frame rendering ──────────────────────────────────────────────────────────
+
+
+def render_frame(state: WatchState, max_events: int) -> str:  # noqa: C901
     record = state.last_record or {}
     tick = record.get("t")
     now_ms = None
@@ -230,87 +420,150 @@ def render_frame(state: WatchState, max_events: int) -> str:
     tox_avg = sum(tox_values) / len(tox_values) if tox_values else None
     tox_max = max(tox_values) if tox_values else None
 
-    lines = [
-        "Paraphina Live Watch",
-        f"tick={tick} time={short_ts(now_ms)} mode={execution_mode} trade={trade_mode}",
-        f"regime={risk_regime} kill={kill_switch} reason={kill_reason}",
-        f"q_global={q_global} delta_usd={delta_usd} basis={basis} basis_gross={basis_gross}",
-        f"tox_avg={tox_avg:.4f}" if tox_avg is not None else "tox_avg=n/a",
-        f"tox_max={tox_max:.4f}" if tox_max is not None else "tox_max=n/a",
-        "",
-    ]
+    # ── Title bar ─────────────────────────────────────────────────────────
+    rule = styled("━" * 72, S.CYAN)
+    title = styled("  PARAPHINA LIVE WATCH", S.B_CYAN, S.BOLD)
 
+    # ── Header metrics ────────────────────────────────────────────────────
+    tick_str = styled(str(tick), S.B_WHITE) if tick is not None else styled("n/a", S.GRAY)
+    time_str = (
+        styled(short_ts(now_ms), S.B_WHITE, S.BOLD) if now_ms else styled("n/a", S.GRAY)
+    )
+    mode_str = styled(str(execution_mode), S.MAGENTA)
+    trade_str = styled(str(trade_mode), S.MAGENTA)
+    regime_str = color_regime(str(risk_regime))
+    kill_str = color_kill(bool(kill_switch))
+
+    hdr1 = (
+        f"  {_LABEL('tick')} {tick_str}   "
+        f"{_LABEL('time')} {time_str}   "
+        f"{_LABEL('mode')} {mode_str}   "
+        f"{_LABEL('trade')} {trade_str}"
+    )
+    hdr2 = f"  {_LABEL('regime')} {regime_str}   {_LABEL('kill')} {kill_str}"
+    if kill_switch and kill_reason and kill_reason != "n/a":
+        hdr2 += f"   {_LABEL('reason')} {styled(str(kill_reason), S.B_RED)}"
+
+    # Position / PnL
+    q_str = (
+        _color_val(f"{float(q_global):.4f}", safe_float(q_global), 0.1, 1.0)
+        if q_global is not None
+        else styled("0.0", S.DIM)
+    )
+    delta_str = str(delta_usd) if delta_usd is not None else "0.0"
+    basis_str = str(basis) if basis is not None else "0.0"
+    basis_g_str = str(basis_gross) if basis_gross is not None else "0.0"
+
+    hdr3 = (
+        f"  {_LABEL('q_global')} {q_str}   "
+        f"{_LABEL('Δ_usd')} {delta_str}   "
+        f"{_LABEL('basis')} {basis_str}   "
+        f"{_LABEL('basis_gross')} {basis_g_str}"
+    )
+
+    # Toxicity
+    hdr4 = (
+        f"  {_LABEL('tox_avg')} {color_tox(tox_avg)}   "
+        f"{_LABEL('tox_max')} {color_tox(tox_max)}"
+    )
+
+    lines: list[str] = [rule, title, rule, hdr1, hdr2, hdr3, hdr4, ""]
+
+    # ── Venue table ───────────────────────────────────────────────────────
     venue_ids = state.venue_ids
-    status = record.get("venue_status", [])
-    mid = record.get("venue_mid_usd", [])
-    spread = record.get("venue_spread_usd", [])
-    age = record.get("venue_age_ms", [])
-    pos = record.get("venue_position_tao", [])
-    funding_rate = record.get("venue_funding_rate_8h", [])
-    funding_age = record.get("venue_funding_age_ms", [])
-    funding_status = record.get("venue_funding_status", [])
-    orders = record.get("orders", [])
-    fills = record.get("fills", [])
-    if not isinstance(orders, list):
-        orders = []
-    if not isinstance(fills, list):
-        fills = []
-    order_counts = {}
-    for order in orders:
+    v_status = record.get("venue_status", [])
+    v_mid = record.get("venue_mid_usd", [])
+    v_spread = record.get("venue_spread_usd", [])
+    v_age = record.get("venue_age_ms", [])
+    v_pos = record.get("venue_position_tao", [])
+    v_fund_rate = record.get("venue_funding_rate_8h", [])
+    v_fund_age = record.get("venue_funding_age_ms", [])
+    v_fund_status = record.get("venue_funding_status", [])
+    orders_raw = record.get("orders", [])
+    fills_raw = record.get("fills", [])
+    if not isinstance(orders_raw, list):
+        orders_raw = []
+    if not isinstance(fills_raw, list):
+        fills_raw = []
+
+    order_counts: dict[str, int] = {}
+    for order in orders_raw:
         if not isinstance(order, dict):
             continue
-        venue_id = order.get("venue_id")
-        if isinstance(venue_id, str):
-            order_counts[venue_id] = order_counts.get(venue_id, 0) + 1
+        vid = order.get("venue_id")
+        if isinstance(vid, str):
+            order_counts[vid] = order_counts.get(vid, 0) + 1
 
-    fill_counts = {}
-    for fill in fills:
-        if not isinstance(fill, dict):
+    fill_counts: dict[str, int] = {}
+    for fill_item in fills_raw:
+        if not isinstance(fill_item, dict):
             continue
-        venue_id = fill.get("venue_id")
-        if isinstance(venue_id, str):
-            fill_counts[venue_id] = fill_counts.get(venue_id, 0) + 1
+        vid = fill_item.get("venue_id")
+        if isinstance(vid, str):
+            fill_counts[vid] = fill_counts.get(vid, 0) + 1
 
-    rows = []
+    rows: list[list[str]] = []
     for idx, venue_id in enumerate(venue_ids):
-        status_val = status[idx] if idx < len(status) else None
-        mid_val = mid[idx] if idx < len(mid) else None
-        spread_val = spread[idx] if idx < len(spread) else None
-        age_val = age[idx] if idx < len(age) else None
-        pos_val = pos[idx] if idx < len(pos) else None
-        funding_rate_val = funding_rate[idx] if idx < len(funding_rate) else None
-        funding_age_val = funding_age[idx] if idx < len(funding_age) else None
-        funding_status_val = funding_status[idx] if idx < len(funding_status) else None
+        status_val = v_status[idx] if idx < len(v_status) else None
+        mid_val = v_mid[idx] if idx < len(v_mid) else None
+        spread_val = v_spread[idx] if idx < len(v_spread) else None
+        age_val = v_age[idx] if idx < len(v_age) else None
+        pos_val = v_pos[idx] if idx < len(v_pos) else None
+        fund_rate_val = v_fund_rate[idx] if idx < len(v_fund_rate) else None
+        fund_age_val = v_fund_age[idx] if idx < len(v_fund_age) else None
+        fund_status_val = v_fund_status[idx] if idx < len(v_fund_status) else None
         open_orders = order_counts.get(venue_id, 0)
         last_fill_ms = state.last_fill_ms.get(venue_id)
-        last_fill_age = "n/a"
+        last_fill_age = styled("n/a", S.GRAY)
         if now_ms is not None and last_fill_ms is not None:
             last_fill_age = f"{int((now_ms - last_fill_ms) / 1000)}s"
-        health = format_status(status_val)
+
+        # Health + toxicity cell
+        health_s = color_health(format_status(status_val))
         tox_val = tox[idx] if isinstance(tox, list) and idx < len(tox) else None
-        tox_str = f"{tox_val:.2f}" if isinstance(tox_val, (int, float)) else "n/a"
-        # Compute cumulative stale% and flip count for this venue.
+        tox_s = color_tox(
+            tox_val if isinstance(tox_val, (int, float)) else None, decimals=2
+        )
+
+        # Stale% / flips cell
         stale_ticks = state.venue_stale_ticks.get(venue_id, 0)
-        stale_pct = (100.0 * stale_ticks / state.tick_count) if state.tick_count > 0 else 0.0
+        stale_pct = (
+            (100.0 * stale_ticks / state.tick_count) if state.tick_count > 0 else 0.0
+        )
         flips = state.venue_status_flips.get(venue_id, 0)
-        stale_flips_str = f"{stale_pct:.1f}%/{flips}"
+        stale_s = color_stale(stale_pct)
+
+        # Formatted cells (numbers first, then colour)
+        mid_f = format_num(mid_val, 10).strip()
+        spread_f = format_num(spread_val, 8).strip()
+        spread_f = _color_val(spread_f, safe_float(spread_val), 0.5, 2.0)
+        age_f = format_ms(age_val)
+        age_f = _color_val(age_f, safe_float(safe_int(age_val)), 2000, 5000)
+        pos_f = format_num(pos_val, 8).strip()
+        pos_f = _color_val(pos_f, safe_float(pos_val), 0.1, 1.0)
+        fund_rate_f = format_num(fund_rate_val, 8).strip()
+        fund_age_f = format_ms(fund_age_val)
+        fund_status_f = color_health(format_status(fund_status_val))
+        orders_f = str(open_orders)
+
         rows.append(
             [
-                venue_id,
-                format_num(mid_val, 10).strip(),
-                format_num(spread_val, 8).strip(),
-                format_ms(age_val),
-                format_num(pos_val, 8).strip(),
-                format_num(funding_rate_val, 8).strip(),
-                format_ms(funding_age_val),
-                format_status(funding_status_val),
-                str(open_orders),
+                styled(venue_id, S.BOLD, S.WHITE),
+                mid_f,
+                spread_f,
+                age_f,
+                pos_f,
+                fund_rate_f,
+                fund_age_f,
+                fund_status_f,
+                orders_f,
                 last_fill_age,
-                f"{health} tox={tox_str}",
-                stale_flips_str,
+                f"{health_s} {_LABEL('tox=')}{tox_s}",
+                f"{stale_s}{_LABEL('/')}{str(flips)}",
             ]
         )
 
+    lines.append(_section("Venues"))
     lines.append(
         format_table(
             [
@@ -331,25 +584,35 @@ def render_frame(state: WatchState, max_events: int) -> str:
         )
     )
 
-    lines.append("")
-    lines.append("recent fills:")
-    for item in list(state.events.fills)[:max_events]:
-        lines.append(f"  {item}")
-    if not state.events.fills:
-        lines.append("  (none)")
-    lines.append("")
-    lines.append("recent cancels:")
-    for item in list(state.events.cancels)[:max_events]:
-        lines.append(f"  {item}")
-    if not state.events.cancels:
-        lines.append("  (none)")
-    lines.append("")
-    lines.append("recent kill events:")
-    for item in list(state.events.kills)[:max_events]:
-        lines.append(f"  {item}")
-    if not state.events.kills:
-        lines.append("  (none)")
+    # ── Event logs ────────────────────────────────────────────────────────
+    def _event_section(
+        title: str,
+        events: Deque[str],
+        bullet_color: str,
+    ) -> None:
+        count = len(events)
+        lines.append("")
+        lines.append(_section(f"{title} ({count})"))
+        shown = list(events)[:_DISPLAY_EVENT_LIMIT]
+        if shown:
+            for item in shown:
+                lines.append(f"  {styled('●', bullet_color)} {item}")
+            remaining = count - len(shown)
+            if remaining > 0:
+                lines.append(
+                    f"  {styled(f'… and {remaining} more', S.GRAY)}"
+                )
+        else:
+            lines.append(f"  {styled('(none)', S.GRAY)}")
+
+    _event_section("Recent Fills", state.events.fills, S.GREEN)
+    _event_section("Recent Cancels", state.events.cancels, S.YELLOW)
+    _event_section("Recent Kills", state.events.kills, S.B_RED)
+
     return "\n".join(lines)
+
+
+# ── Tail follower (unchanged logic) ──────────────────────────────────────────
 
 
 class TailFollower:
@@ -385,6 +648,9 @@ class TailFollower:
         return [line for line in data.splitlines() if line.strip()]
 
 
+# ── Entry points ─────────────────────────────────────────────────────────────
+
+
 def render_once(path: Path, refresh_ms: int, max_events: int) -> str:
     records = parse_lines(path, max_events)
     state = build_state(records, max_events)
@@ -392,10 +658,14 @@ def render_once(path: Path, refresh_ms: int, max_events: int) -> str:
 
 
 def main() -> int:
+    global _NO_COLOR
     args = parse_args()
     telemetry_path = Path(args.telemetry)
     max_events = max(1, args.max_events)
     refresh_ms = max(1, args.refresh_ms)
+
+    if args.no_color or os.environ.get("NO_COLOR"):
+        _NO_COLOR = True
 
     one_shot = refresh_ms >= 999_999
     if one_shot:
@@ -404,6 +674,8 @@ def main() -> int:
         return 0
 
     is_tty = sys.stdout.isatty()
+    if not is_tty:
+        _NO_COLOR = True
 
     initial_records = parse_lines(telemetry_path, max_events)
     state = build_state(initial_records, max_events)
@@ -435,10 +707,12 @@ def main() -> int:
                 state.update(record)
         frame = render_frame(state, max_events)
         if is_tty:
-            # Move cursor home, paint frame, then erase leftover lines below.
-            # This avoids the blank-flash caused by clearing the whole screen.
+            # Move cursor home, then write each line with a clear-to-EOL
+            # escape so stale characters from longer previous lines are
+            # erased.  Finally clear everything below the frame.
             sys.stdout.write("\x1b[H")
-            sys.stdout.write(frame + "\n")
+            for fline in frame.split("\n"):
+                sys.stdout.write(fline + "\x1b[K\n")
             sys.stdout.write("\x1b[J")
         else:
             sys.stdout.write(frame + "\n")
