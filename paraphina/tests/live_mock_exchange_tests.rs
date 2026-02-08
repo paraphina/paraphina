@@ -50,6 +50,7 @@ mod tests {
             account_reconcile_tx: None,
             order_tx: handle.order_tx.clone(),
             order_snapshot_rx: None,
+            shared_venue_ages: None,
         };
 
         let ticks = 6_u64;

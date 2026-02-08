@@ -51,8 +51,17 @@ impl VenueHealthManager {
                 if let Some(val) = self.stale_counts.get_mut(idx) {
                     *val = val.saturating_add(1);
                 }
-            } else if let Some(val) = self.stale_counts.get_mut(idx) {
-                *val = 0;
+            } else {
+                // FIX D2: Reset stale_counts AND api_errors when venue is fresh.
+                // Without the api_errors reset, once api_errors >= api_error_limit,
+                // api_breached stays true forever, locking the venue in Disabled
+                // with no recovery path.
+                if let Some(val) = self.stale_counts.get_mut(idx) {
+                    *val = 0;
+                }
+                if let Some(val) = self.api_errors.get_mut(idx) {
+                    *val = 0;
+                }
             }
 
             if let (Some(mid), true) = (venue.mid, fair.is_finite() && fair > 0.0) {

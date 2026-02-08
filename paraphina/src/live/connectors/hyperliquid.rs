@@ -430,18 +430,37 @@ impl HyperliquidConnector {
 
             let session_start = std::time::Instant::now();
 
-            if let Err(err) = self.public_ws_once().await {
-                consecutive_failures += 1;
-                let level = if consecutive_failures >= 20 {
-                    "ERROR"
-                } else if consecutive_failures >= 5 {
-                    "WARN"
-                } else {
-                    "INFO"
-                };
-                eprintln!(
-                    "{level}: Hyperliquid public WS error (consecutive_failures={consecutive_failures}): {err}"
-                );
+            // Layer C: session-level timeout catches ALL hang scenarios.
+            let max_session = Duration::from_secs(
+                std::env::var("PARAPHINA_WS_MAX_SESSION_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(86_400), // 24h — Layer A enforcer handles stuck connections
+            );
+            let result = tokio::time::timeout(max_session, self.public_ws_once()).await;
+            match result {
+                Ok(Err(err)) => {
+                    consecutive_failures += 1;
+                    let level = if consecutive_failures >= 20 {
+                        "ERROR"
+                    } else if consecutive_failures >= 5 {
+                        "WARN"
+                    } else {
+                        "INFO"
+                    };
+                    eprintln!(
+                        "{level}: Hyperliquid public WS error (consecutive_failures={consecutive_failures}): {err}"
+                    );
+                }
+                Err(_timeout) => {
+                    // Session hung for >max_session — force restart.
+                    eprintln!(
+                        "ERROR: Hyperliquid public WS session timeout ({}s) — force reconnect",
+                        max_session.as_secs()
+                    );
+                    consecutive_failures += 1;
+                }
+                Ok(Ok(())) => {}
             }
 
             // FIX: Reset backoff and failure counter if connection was healthy for long enough
@@ -969,14 +988,25 @@ impl HyperliquidConnector {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut active_logged = false;
         let mut inactive_logged = false;
+        // FIX D1: Startup grace period.  During the first 60s of the process,
+        // `last_book_event_ns == 0` is expected (WS hasn't delivered yet).
+        // After the grace period, treat 0 as stale — this catches the bug where
+        // `reset_for_new_connection()` sets `last_book_event_ns` to 0 on reconnect,
+        // permanently disabling the fallback.
+        let startup_grace_ns: u64 = std::env::var("PARAPHINA_HL_REST_STARTUP_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60_000)
+            * 1_000_000; // convert ms → ns
         loop {
             interval.tick().await;
             let now = mono_now_ns();
             // Check if WS is stale: use the book event freshness as the indicator.
             let last_book = self.freshness.last_book_event_ns.load(Ordering::Relaxed);
             let ws_stale = if last_book == 0 {
-                // No book events ever received — could be startup, give WS time
-                false
+                // FIX D1: Only give WS grace during actual startup.
+                // After the grace period, treat zero as stale (reconnect scenario).
+                now >= startup_grace_ns
             } else {
                 age_ms(now, last_book) > stale_threshold_ms
             };
@@ -1766,7 +1796,7 @@ fn log_decode_miss(venue: &str, value: &serde_json::Value, payload: &str, count:
     );
 }
 
-async fn fetch_l2_snapshot(
+pub async fn fetch_l2_snapshot(
     client: &Client,
     cfg: &HyperliquidConfig,
     info_url: &str,

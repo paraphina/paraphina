@@ -40,6 +40,10 @@ struct Freshness {
     last_data_rx_ns: AtomicU64,
     last_parsed_ns: AtomicU64,
     last_published_ns: AtomicU64,
+    /// Tracks the last time a book event (snapshot or delta) was decoded into a
+    /// publishable MarketDataEvent. Used by the watchdog to detect "WS alive but
+    /// no book data" scenarios where non-book messages keep last_ws_rx_ns fresh.
+    last_book_event_ns: AtomicU64,
 }
 
 impl Freshness {
@@ -48,12 +52,16 @@ impl Freshness {
         self.last_data_rx_ns.store(0, Ordering::Relaxed);
         self.last_parsed_ns.store(0, Ordering::Relaxed);
         self.last_published_ns.store(0, Ordering::Relaxed);
+        self.last_book_event_ns.store(0, Ordering::Relaxed);
     }
 
     fn anchor_with_connect_start(&self, connect_start_ns: u64) -> u64 {
+        // Use last_book_event_ns as the primary watchdog anchor.
+        // This ensures the watchdog fires when book data stops flowing,
+        // even if non-book WS messages (heartbeats) keep last_ws_rx_ns fresh.
+        let last_book = self.last_book_event_ns.load(Ordering::Relaxed);
         let last_pub = self.last_published_ns.load(Ordering::Relaxed);
-        let last_parsed = self.last_parsed_ns.load(Ordering::Relaxed);
-        let anchor = last_pub.max(last_parsed);
+        let anchor = last_book.max(last_pub);
         if anchor == 0 {
             connect_start_ns
         } else {
@@ -241,18 +249,38 @@ impl ExtendedConnector {
         loop {
             let session_start = Instant::now();
 
-            if let Err(err) = self.public_ws_once(&mut last_snapshot_warn).await {
-                consecutive_failures += 1;
-                let level = if consecutive_failures >= 20 {
-                    "ERROR"
-                } else if consecutive_failures >= 5 {
-                    "WARN"
-                } else {
-                    "INFO"
-                };
-                eprintln!(
-                    "{level}: Extended public WS error (consecutive_failures={consecutive_failures}): {err}"
-                );
+            // Layer C: session-level timeout catches ALL hang scenarios.
+            let max_session = Duration::from_secs(
+                std::env::var("PARAPHINA_WS_MAX_SESSION_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(86_400), // 24h — Layer A enforcer handles stuck connections
+            );
+            let result =
+                tokio::time::timeout(max_session, self.public_ws_once(&mut last_snapshot_warn))
+                    .await;
+            match result {
+                Ok(Err(err)) => {
+                    consecutive_failures += 1;
+                    let level = if consecutive_failures >= 20 {
+                        "ERROR"
+                    } else if consecutive_failures >= 5 {
+                        "WARN"
+                    } else {
+                        "INFO"
+                    };
+                    eprintln!(
+                        "{level}: Extended public WS error (consecutive_failures={consecutive_failures}): {err}"
+                    );
+                }
+                Err(_timeout) => {
+                    eprintln!(
+                        "ERROR: Extended public WS session timeout ({}s) — force reconnect",
+                        max_session.as_secs()
+                    );
+                    consecutive_failures += 1;
+                }
+                Ok(Ok(())) => {}
             }
 
             // FIX: Reset backoff and failure counter if connection was healthy for long enough
@@ -352,9 +380,13 @@ impl ExtendedConnector {
             self.cfg.venue_index,
         );
         if let Some(snapshot) = snapshot_state {
+            let now_ns = mono_now_ns();
             self.freshness
                 .last_parsed_ns
-                .store(mono_now_ns(), Ordering::Relaxed);
+                .store(now_ns, Ordering::Relaxed);
+            self.freshness
+                .last_book_event_ns
+                .store(now_ns, Ordering::Relaxed);
             let snapshot_event = MarketDataEvent::L2Snapshot(super::super::types::L2Snapshot {
                 venue_index: self.cfg.venue_index,
                 venue_id: self.cfg.market.clone(),
@@ -395,6 +427,14 @@ impl ExtendedConnector {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
         let stale_ms = extended_stale_ms();
+        // WS-level ping timer to prevent idle connection drops.
+        let ping_interval_ms: u64 = std::env::var("PARAPHINA_EXTENDED_PING_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await; // skip first immediate tick
         if fixture_mode {
             eprintln!("INFO: Extended fixture mode detected; freshness watchdog disabled");
         } else {
@@ -420,6 +460,13 @@ impl ExtendedConnector {
                 biased;
                 _ = &mut stale_rx => {
                     anyhow::bail!("Extended public WS stale: freshness exceeded {stale_ms}ms");
+                }
+                _ = ping_timer.tick() => {
+                    if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        eprintln!("WARN: Extended public WS ping send failed: {e} — reconnecting");
+                        anyhow::bail!("Extended public WS ping send failed: {e}");
+                    }
+                    continue;
                 }
                 next = tokio::time::timeout(Duration::from_secs(10), read.next()) => next,
             };
@@ -512,9 +559,13 @@ impl ExtendedConnector {
                                     eprintln!("INFO: Extended public WS first book update");
                                     first_book_update_logged = true;
                                 }
+                                let now_ns = mono_now_ns();
                                 self.freshness
                                     .last_parsed_ns
-                                    .store(mono_now_ns(), Ordering::Relaxed);
+                                    .store(now_ns, Ordering::Relaxed);
+                                self.freshness
+                                    .last_book_event_ns
+                                    .store(now_ns, Ordering::Relaxed);
                                 if let Err(err) = self.publish_market(event).await {
                                     eprintln!("Extended public WS market send failed: {err}");
                                 }
@@ -581,6 +632,9 @@ impl ExtendedConnector {
                     let outcome = seq_state.apply_update(&update)?;
                     if let Some(event) = outcome {
                         consecutive_parse_errors = 0;
+                        self.freshness
+                            .last_book_event_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if !first_book_update_logged {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
@@ -662,9 +716,13 @@ impl ExtendedConnector {
                                     eprintln!("INFO: Extended public WS first book update");
                                     first_book_update_logged = true;
                                 }
+                                let now_ns = mono_now_ns();
                                 self.freshness
                                     .last_parsed_ns
-                                    .store(mono_now_ns(), Ordering::Relaxed);
+                                    .store(now_ns, Ordering::Relaxed);
+                                self.freshness
+                                    .last_book_event_ns
+                                    .store(now_ns, Ordering::Relaxed);
                                 if let Err(err) = self.publish_market(event).await {
                                     eprintln!("Extended public WS market send failed: {err}");
                                 }
@@ -731,6 +789,9 @@ impl ExtendedConnector {
                     let outcome = seq_state.apply_update(&update)?;
                     if let Some(event) = outcome {
                         consecutive_parse_errors = 0;
+                        self.freshness
+                            .last_book_event_ns
+                            .store(mono_now_ns(), Ordering::Relaxed);
                         if !first_book_update_logged {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
@@ -1321,7 +1382,7 @@ impl ExtendedSeqState {
             venue_index: self.venue_index,
             venue_id: update.symbol.clone(),
             seq: update.end_id,
-            timestamp_ms: update.event_time.unwrap_or_else(now_ms),
+            timestamp_ms: now_ms(),
             changes,
         });
         Ok(Some(event))
@@ -2257,21 +2318,38 @@ mod tests {
         let freshness = Freshness::default();
         freshness.last_parsed_ns.store(123, Ordering::Relaxed);
         freshness.last_published_ns.store(456, Ordering::Relaxed);
+        freshness.last_book_event_ns.store(789, Ordering::Relaxed);
         freshness.reset_for_new_connection();
         assert_eq!(freshness.last_parsed_ns.load(Ordering::Relaxed), 0);
         assert_eq!(freshness.last_published_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            freshness.last_book_event_ns.load(Ordering::Relaxed),
+            0,
+            "last_book_event_ns must be reset on new connection"
+        );
 
+        // After reset with no book events, anchor falls back to connect_start_ns
         let connect_start_ns = 1_000;
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, connect_start_ns);
 
+        // Non-book parsed events must NOT advance the watchdog anchor
         freshness.last_parsed_ns.store(2_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
-        assert_eq!(anchor, 2_000);
+        assert_eq!(
+            anchor, connect_start_ns,
+            "non-book parsed events must not advance watchdog anchor"
+        );
 
-        freshness.last_published_ns.store(3_000, Ordering::Relaxed);
+        // Book events advance the anchor
+        freshness.last_book_event_ns.store(3_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 3_000);
+
+        // last_published_ns also advances the anchor
+        freshness.last_published_ns.store(4_000, Ordering::Relaxed);
+        let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+        assert_eq!(anchor, 4_000);
     }
 
     #[test]

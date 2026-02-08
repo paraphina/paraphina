@@ -78,15 +78,13 @@ impl OrderBookL2 {
         asks: &[BookLevel],
         seq: u64,
     ) -> Result<(), OrderBookError> {
-        if seq <= self.last_seq {
-            return Err(OrderBookError::SeqOutOfOrder {
-                last_seq: self.last_seq,
-                incoming_seq: seq,
-            });
-        }
+        // Snapshots replace the full book.  Always accept them — the new
+        // state supersedes whatever was present.  Reset last_seq to 0 so
+        // that any subsequent delta (even with a small monotonic seq) is
+        // accepted.
         self.bids = validate_and_sort(bids, true)?;
         self.asks = validate_and_sort(asks, false)?;
-        self.last_seq = seq;
+        self.last_seq = 0;
         Ok(())
     }
 
@@ -95,14 +93,12 @@ impl OrderBookL2 {
         deltas: &[BookLevelDelta],
         seq: u64,
     ) -> Result<(), OrderBookError> {
+        // Allow any seq > last_seq (monotonically increasing).
+        // Strict contiguous (last_seq + 1) checks are too fragile when
+        // multiple seq sources exist (WS deltas, REST snapshots, REST
+        // health-monitor fallback).
         if seq <= self.last_seq {
             return Err(OrderBookError::SeqOutOfOrder {
-                last_seq: self.last_seq,
-                incoming_seq: seq,
-            });
-        }
-        if seq != self.last_seq + 1 {
-            return Err(OrderBookError::SeqGap {
                 last_seq: self.last_seq,
                 incoming_seq: seq,
             });
@@ -287,15 +283,21 @@ mod tests {
     #[test]
     fn seq_regression_rejected() {
         let mut book = OrderBookL2::new();
+        // Snapshots reset last_seq to 0, so any delta with seq > 0 succeeds.
         book.apply_snapshot(&[], &[], 5).unwrap();
-        let err = book.apply_delta(&[], 4).unwrap_err();
+        assert_eq!(book.last_seq(), 0); // snapshot resets to 0
+        // Delta with seq=4 is accepted since 4 > 0.
+        book.apply_delta(&[], 4).unwrap();
+        assert_eq!(book.last_seq(), 4);
+        // Delta with seq <= last_seq is still rejected.
+        let err = book.apply_delta(&[], 3).unwrap_err();
         match err {
             OrderBookError::SeqOutOfOrder {
                 last_seq,
                 incoming_seq,
             } => {
-                assert_eq!(last_seq, 5);
-                assert_eq!(incoming_seq, 4);
+                assert_eq!(last_seq, 4);
+                assert_eq!(incoming_seq, 3);
             }
             _ => panic!("unexpected error variant"),
         }

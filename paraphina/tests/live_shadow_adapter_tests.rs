@@ -146,6 +146,7 @@ mod tests {
             account_reconcile_tx: None,
             order_tx,
             order_snapshot_rx: Some(order_snapshot_rx),
+            shared_venue_ages: None,
         };
 
         let summary = run_live_loop(

@@ -951,7 +951,9 @@ fn spawn_connector_forwarders(
         let mut rx = market_rx;
         while let Some(event) = rx.recv().await {
             let event = rewrite_market_event(event, &venue_id_market, venue_index);
-            let _ = market_ingest_tx.send(event).await;
+            if market_ingest_tx.send(event).await.is_err() {
+                break;
+            }
         }
     });
     tokio::spawn(async move {
@@ -1708,10 +1710,13 @@ async fn main() {
             };
             if let Some(tx) = paper_market_tx.as_ref() {
                 if let Some(update) = paper_market_update_from_event(&event) {
-                    let _ = tx.send(update).await;
+                    // Non-blocking: drop paper update if channel full.
+                    let _ = tx.try_send(update);
                 }
             }
-            let _ = market_tx.send(event).await;
+            if market_tx.send(event).await.is_err() {
+                break;
+            }
         }
     });
     let (_account_tx, account_rx) = mpsc::channel::<paraphina::live::types::AccountEvent>(256);
@@ -1772,7 +1777,13 @@ async fn main() {
         connector_venues.insert(*connector, (venue_id, venue_index));
     }
 
+    // SharedVenueAges: created early so enforcer + REST monitor closures can reference it.
+    let shared_venue_ages =
+        paraphina::live::shared_venue_ages::SharedVenueAges::new(cfg.venues.len());
     let mut exec_clients: BTreeMap<String, Arc<dyn LiveRestClient>> = BTreeMap::new();
+    // Layer A + B: collect slots for the health enforcer and REST monitor.
+    let mut enforcer_slots: Vec<paraphina::live::venue_health_enforcer::ConnectorSlot> = Vec::new();
+    let mut rest_entries: Vec<paraphina::live::rest_health_monitor::VenueRestEntry> = Vec::new();
     for connector in &connectors {
         let support = connector_support(*connector);
         if matches!(support, ConnectorSupport::MissingFeature) {
@@ -1905,10 +1916,50 @@ async fn main() {
                         }
                     }
                     let hl_public = hl_arc.clone();
-                    spawn_supervised("hyperliquid_public_ws", move || {
+                    let hl_handle = spawn_supervised("hyperliquid_public_ws", move || {
                         let hl = hl_public.clone();
                         async move { hl.run_public_ws().await }
                     });
+                    // Layer A: enforcer slot for force-restart.
+                    {
+                        let hl_respawn = hl_arc.clone();
+                        enforcer_slots.push(paraphina::live::venue_health_enforcer::ConnectorSlot {
+                            name: "hyperliquid_public_ws".to_string(),
+                            venue_index,
+                            handle: hl_handle,
+                            respawn: Box::new(move || {
+                                let hl = hl_respawn.clone();
+                                spawn_supervised("hyperliquid_public_ws", move || {
+                                    let h = hl.clone();
+                                    async move { h.run_public_ws().await }
+                                })
+                            }),
+                            last_abort: None,
+                        });
+                    }
+                    // Layer B: REST monitor entry for Hyperliquid.
+                    {
+                        let hl_rest_cfg = hl_cfg.clone();
+                        let hl_rest_http = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(5))
+                            .build()
+                            .expect("hl rest http client");
+                        rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
+                            name: "hyperliquid".to_string(),
+                            venue_index,
+                            fetcher: Box::new(move || {
+                                let c = hl_rest_cfg.clone();
+                                let h = hl_rest_http.clone();
+                                let url = c.info_url().to_string();
+                                Box::pin(async move {
+                                    paraphina::live::connectors::hyperliquid::fetch_l2_snapshot(
+                                        &h, &c, &url,
+                                    )
+                                    .await
+                                })
+                            }),
+                        });
+                    }
                     let hl_funding = hl_arc.clone();
                     let funding_poll_ms = std::env::var("HL_FUNDING_POLL_MS")
                         .ok()
@@ -2137,6 +2188,10 @@ async fn main() {
                             extended_cfg =
                                 extended_cfg.with_record_dir(resolve_extended_record_dir());
                         }
+                        // Capture REST monitor values before extended_cfg is moved.
+                        let ext_rest_url = extended_cfg.rest_url.clone();
+                        let ext_market = extended_cfg.market.clone();
+                        let ext_depth_limit = extended_cfg.depth_limit;
                         let rest_client = Arc::new(
                             paraphina::live::connectors::extended::ExtendedRestClient::new(
                                 extended_cfg.clone(),
@@ -2149,10 +2204,53 @@ async fn main() {
                             );
                         let extended_arc = Arc::new(extended);
                         let extended_public = extended_arc.clone();
-                        spawn_supervised("extended_public_ws", move || {
+                        let ext_handle = spawn_supervised("extended_public_ws", move || {
                             let e = extended_public.clone();
                             async move { e.run_public_ws().await }
                         });
+                        // Layer A: enforcer slot.
+                        {
+                            let ext_respawn = extended_arc.clone();
+                            enforcer_slots.push(paraphina::live::venue_health_enforcer::ConnectorSlot {
+                                name: "extended_public_ws".to_string(),
+                                venue_index,
+                                handle: ext_handle,
+                                respawn: Box::new(move || {
+                                    let e = ext_respawn.clone();
+                                    spawn_supervised("extended_public_ws", move || {
+                                        let e2 = e.clone();
+                                        async move { e2.run_public_ws().await }
+                                    })
+                                }),
+                                last_abort: None,
+                            });
+                        }
+                        // Layer B: REST monitor entry.
+                        {
+                            let rest_url = ext_rest_url;
+                            let market = ext_market;
+                            let depth_limit = ext_depth_limit;
+                            let vi = venue_index;
+                            let ext_http = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5))
+                                .build()
+                                .expect("ext rest http client");
+                            rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
+                                name: "extended".to_string(),
+                                venue_index: vi,
+                                fetcher: Box::new(move || {
+                                    let h = ext_http.clone();
+                                    let ru = rest_url.clone();
+                                    let m = market.clone();
+                                    Box::pin(async move {
+                                        paraphina::live::rest_health_monitor::fetch_extended_l2_snapshot(
+                                            &h, &ru, &m, depth_limit, vi,
+                                        )
+                                        .await
+                                    })
+                                }),
+                            });
+                        }
                         let extended_funding = extended_arc.clone();
                         let funding_poll_ms = std::env::var("EXTENDED_FUNDING_POLL_MS")
                             .ok()
@@ -2255,6 +2353,10 @@ async fn main() {
                         if aster_record_enabled(&args) {
                             aster_cfg = aster_cfg.with_record_dir(resolve_aster_record_dir());
                         }
+                        // Capture REST monitor values before aster_cfg is moved.
+                        let ast_rest_url = aster_cfg.rest_url.clone();
+                        let ast_market = aster_cfg.market.clone();
+                        let ast_depth_limit = aster_cfg.depth_limit;
                         let rest_client =
                             Arc::new(paraphina::live::connectors::aster::AsterRestClient::new(
                                 aster_cfg.clone(),
@@ -2265,10 +2367,53 @@ async fn main() {
                         );
                         let aster_arc = Arc::new(aster);
                         let aster_public = aster_arc.clone();
-                        spawn_supervised("aster_public_ws", move || {
+                        let aster_handle = spawn_supervised("aster_public_ws", move || {
                             let a = aster_public.clone();
                             async move { a.run_public_ws().await }
                         });
+                        // Layer A: enforcer slot.
+                        {
+                            let aster_respawn = aster_arc.clone();
+                            enforcer_slots.push(paraphina::live::venue_health_enforcer::ConnectorSlot {
+                                name: "aster_public_ws".to_string(),
+                                venue_index,
+                                handle: aster_handle,
+                                respawn: Box::new(move || {
+                                    let a = aster_respawn.clone();
+                                    spawn_supervised("aster_public_ws", move || {
+                                        let a2 = a.clone();
+                                        async move { a2.run_public_ws().await }
+                                    })
+                                }),
+                                last_abort: None,
+                            });
+                        }
+                        // Layer B: REST monitor entry.
+                        {
+                            let rest_url = ast_rest_url;
+                            let market = ast_market;
+                            let depth_limit = ast_depth_limit;
+                            let vi = venue_index;
+                            let aster_http = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5))
+                                .build()
+                                .expect("aster rest http client");
+                            rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
+                                name: "aster".to_string(),
+                                venue_index: vi,
+                                fetcher: Box::new(move || {
+                                    let h = aster_http.clone();
+                                    let ru = rest_url.clone();
+                                    let m = market.clone();
+                                    Box::pin(async move {
+                                        paraphina::live::rest_health_monitor::fetch_aster_l2_snapshot(
+                                            &h, &ru, &m, depth_limit, vi,
+                                        )
+                                        .await
+                                    })
+                                }),
+                            });
+                        }
                         let aster_funding = aster_arc.clone();
                         let funding_poll_ms = std::env::var("ASTER_FUNDING_POLL_MS")
                             .ok()
@@ -2373,6 +2518,9 @@ async fn main() {
                         if paradex_record_enabled(&args) {
                             paradex_cfg = paradex_cfg.with_record_dir(resolve_paradex_record_dir());
                         }
+                        // Capture REST monitor values before paradex_cfg is moved.
+                        let pdx_rest_url = paradex_cfg.rest_url.clone();
+                        let pdx_market = paradex_cfg.market.clone();
                         let rest_client = Arc::new(
                             paraphina::live::connectors::paradex::ParadexRestClient::new(
                                 paradex_cfg.clone(),
@@ -2384,10 +2532,52 @@ async fn main() {
                         );
                         let paradex_arc = Arc::new(paradex);
                         let paradex_public = paradex_arc.clone();
-                        spawn_supervised("paradex_public_ws", move || {
+                        let paradex_handle = spawn_supervised("paradex_public_ws", move || {
                             let p = paradex_public.clone();
                             async move { p.run_public_ws().await }
                         });
+                        // Layer A: enforcer slot.
+                        {
+                            let pdx_respawn = paradex_arc.clone();
+                            enforcer_slots.push(paraphina::live::venue_health_enforcer::ConnectorSlot {
+                                name: "paradex_public_ws".to_string(),
+                                venue_index,
+                                handle: paradex_handle,
+                                respawn: Box::new(move || {
+                                    let p = pdx_respawn.clone();
+                                    spawn_supervised("paradex_public_ws", move || {
+                                        let p2 = p.clone();
+                                        async move { p2.run_public_ws().await }
+                                    })
+                                }),
+                                last_abort: None,
+                            });
+                        }
+                        // Layer B: REST monitor entry for Paradex.
+                        {
+                            let rest_url = pdx_rest_url;
+                            let market = pdx_market;
+                            let vi = venue_index;
+                            let pdx_http = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5))
+                                .build()
+                                .expect("paradex rest http client");
+                            rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
+                                name: "paradex".to_string(),
+                                venue_index: vi,
+                                fetcher: Box::new(move || {
+                                    let h = pdx_http.clone();
+                                    let ru = rest_url.clone();
+                                    let m = market.clone();
+                                    Box::pin(async move {
+                                        paraphina::live::rest_health_monitor::fetch_paradex_l2_snapshot(
+                                            &h, &ru, &m, 20, vi,
+                                        )
+                                        .await
+                                    })
+                                }),
+                            });
+                        }
                         let paradex_funding = paradex_arc.clone();
                         let funding_poll_ms = std::env::var("PARADEX_FUNDING_POLL_MS")
                             .ok()
@@ -2447,6 +2637,39 @@ async fn main() {
                 }
             }
         }
+    }
+
+    // ── Layer A: spawn the venue health enforcer ──────────────────────────
+    // Spawned as a plain tokio task because ConnectorSlot contains non-Clone
+    // JoinHandles.  The enforcer loops forever; if it panics we lose
+    // enforcement but connectors still have their own internal supervision.
+    if !enforcer_slots.is_empty() {
+        let enforcer_ages = shared_venue_ages.clone();
+        tokio::spawn(async move {
+            paraphina::live::venue_health_enforcer::run_venue_health_enforcer(
+                enforcer_ages,
+                enforcer_slots,
+                paraphina::live::venue_health_enforcer::EnforcerConfig::default(),
+            )
+            .await;
+        });
+    }
+
+    // ── Layer B: spawn the central REST health monitor ──────────────────
+    // Uses market_ingest_tx so events pass through the standard pipeline
+    // (timestamp override for paper mode, paper market updates, etc.)
+    if !rest_entries.is_empty() {
+        let rest_ages = shared_venue_ages.clone();
+        let rest_market_tx = market_ingest_tx.clone();
+        tokio::spawn(async move {
+            paraphina::live::rest_health_monitor::run_rest_health_monitor(
+                rest_ages,
+                rest_entries,
+                rest_market_tx,
+                paraphina::live::rest_health_monitor::RestMonitorConfig::default(),
+            )
+            .await;
+        });
     }
 
     let exec_enabled = allow_live_gateway && !exec_clients.is_empty();
@@ -2597,6 +2820,7 @@ async fn main() {
         account_reconcile_tx: None,
         order_tx,
         order_snapshot_rx: Some(order_snapshot_rx),
+        shared_venue_ages: Some(shared_venue_ages.clone()),
     };
     let max_orders_per_tick = std::env::var("PARAPHINA_LIVE_TELEMETRY_MAX_ORDERS")
         .ok()

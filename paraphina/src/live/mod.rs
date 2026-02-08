@@ -12,13 +12,16 @@ pub mod ops;
 pub mod order_state;
 pub mod orderbook_l2;
 pub mod paper_adapter;
+pub mod rest_health_monitor;
 pub mod runner;
 pub mod shadow_adapter;
+pub mod shared_venue_ages;
 pub mod state_cache;
 pub mod supervision;
 pub mod trade_mode;
 pub mod types;
 pub mod venue_health;
+pub mod venue_health_enforcer;
 pub mod venues;
 
 pub use gateway::{LiveGateway, LiveGatewayError, LiveGatewayErrorKind, LiveRestClient};
@@ -35,6 +38,7 @@ pub use shadow_adapter::ShadowAckAdapter;
 pub use state_cache::{
     CanonicalCacheSnapshot, ReconciliationReport, VenueAccountCache, VenueMarketCache,
 };
+pub use shared_venue_ages::SharedVenueAges;
 pub use supervision::{spawn_supervised, spawn_supervised_with_threshold};
 pub use trade_mode::{
     resolve_effective_trade_mode, EffectiveTradeMode, TradeMode, TradeModeSource,
