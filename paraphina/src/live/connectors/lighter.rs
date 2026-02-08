@@ -1831,15 +1831,15 @@ mod tests {
         // Simulate connect_start_ns at time 0
         let connect_start_ns: u64 = 0;
 
-        // Simulate receiving data at 5 seconds
+        // Simulate receiving a book event at 5 seconds
         let data_time_ns: u64 = 5_000_000_000;
         freshness
-            .last_parsed_ns
+            .last_book_event_ns
             .store(data_time_ns, Ordering::Relaxed);
 
-        // Check anchor uses last_parsed_ns
+        // Check anchor uses last_book_event_ns
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
-        assert_eq!(anchor, data_time_ns, "anchor should be last_parsed_ns");
+        assert_eq!(anchor, data_time_ns, "anchor should be last_book_event_ns");
 
         // Simulate "now" being 8 seconds (8_000_000_000 ns)
         let now_ns: u64 = 8_000_000_000;

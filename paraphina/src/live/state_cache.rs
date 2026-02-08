@@ -645,22 +645,41 @@ mod tests {
             .expect("apply snapshot");
 
         let snap = cache.snapshot(1_500, 1_000);
-        assert_eq!(snap.market[0].seq, 10);
+        // Snapshots reset the orderbook last_seq to 0 (snapshots replace the
+        // full book), so the cache seq should be 0.
+        assert_eq!(snap.market[0].seq, 0);
         assert!(!snap.market[0].is_stale);
         assert!(snap.market[0].mid.unwrap() > 0.0);
 
         let stale = cache.snapshot(3_500, 1_000);
         assert!(stale.market[0].is_stale);
 
-        let stale_delta = L2Delta {
+        // A delta with seq > 0 should succeed (since snapshot reset seq to 0).
+        let fresh_delta = L2Delta {
             venue_index: 0,
             venue_id: cfg.venues[0].id.clone(),
-            seq: 10,
+            seq: 1,
             timestamp_ms: 2_000,
             changes: vec![BookLevelDelta {
                 side: BookSide::Bid,
                 price: 98.0,
                 size: 1.0,
+            }],
+        };
+        cache
+            .apply_market_event(&MarketDataEvent::L2Delta(fresh_delta))
+            .expect("delta with seq=1 after snapshot should succeed");
+
+        // A delta with seq <= last_seq (now 1) should fail.
+        let stale_delta = L2Delta {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id.clone(),
+            seq: 1,
+            timestamp_ms: 2_500,
+            changes: vec![BookLevelDelta {
+                side: BookSide::Bid,
+                price: 97.0,
+                size: 0.5,
             }],
         };
         let err = cache

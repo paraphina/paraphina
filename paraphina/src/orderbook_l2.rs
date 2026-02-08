@@ -76,7 +76,7 @@ impl OrderBookL2 {
         &mut self,
         bids: &[BookLevel],
         asks: &[BookLevel],
-        seq: u64,
+        _seq: u64,
     ) -> Result<(), OrderBookError> {
         // Snapshots replace the full book.  Always accept them — the new
         // state supersedes whatever was present.  Reset last_seq to 0 so

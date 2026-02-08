@@ -13,14 +13,27 @@
 
 use std::time::Duration;
 
-use reqwest::Client;
-use serde_json::Value;
 use tokio::sync::mpsc;
 
-use super::orderbook_l2::BookLevel;
 use super::shared_venue_ages::SharedVenueAges;
-use super::types::{L2Snapshot, MarketDataEvent};
-use crate::types::TimestampMs;
+use super::types::MarketDataEvent;
+
+// reqwest-dependent REST fetch functions are only available when at least one
+// connector feature pulls in the reqwest crate.  Some items may appear unused
+// depending on which specific connector features are enabled.
+#[cfg(any(
+    feature = "live_aster",
+    feature = "live_extended",
+    feature = "live_paradex",
+))]
+#[allow(unused_imports)]
+use {
+    super::orderbook_l2::BookLevel,
+    super::types::L2Snapshot,
+    crate::types::TimestampMs,
+    reqwest::Client,
+    serde_json::Value,
+};
 
 // ─── per-venue REST fetcher trait ──────────────────────────────────────────
 
@@ -127,9 +140,13 @@ pub async fn run_rest_health_monitor(
 // ─── standalone REST fetch functions ───────────────────────────────────────
 // These are self-contained helpers that the paraphina_live.rs startup code
 // wraps into `RestFetcher` closures.
+//
+// Everything below requires `reqwest` which is only available when at least
+// one live_* connector feature is enabled.
 
 /// Fetch Extended L2 book via REST.
 /// URL: `{rest_url}/fapi/v1/depth?symbol={market}&limit={depth_limit}`
+#[cfg(feature = "live_extended")]
 pub async fn fetch_extended_l2_snapshot(
     client: &Client,
     rest_url: &str,
@@ -159,6 +176,7 @@ pub async fn fetch_extended_l2_snapshot(
 
 /// Fetch Aster L2 book via REST.
 /// URL: `{rest_url}/fapi/v1/depth?symbol={market}&limit={depth_limit}`
+#[cfg(feature = "live_aster")]
 pub async fn fetch_aster_l2_snapshot(
     client: &Client,
     rest_url: &str,
@@ -188,6 +206,7 @@ pub async fn fetch_aster_l2_snapshot(
 
 /// Fetch Paradex L2 book via REST.
 /// URL: `{rest_url}/orderbook/{market}?depth={depth}`
+#[cfg(feature = "live_paradex")]
 pub async fn fetch_paradex_l2_snapshot(
     client: &Client,
     rest_url: &str,
@@ -221,6 +240,7 @@ pub async fn fetch_paradex_l2_snapshot(
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
+#[cfg(any(feature = "live_aster", feature = "live_extended", feature = "live_paradex"))]
 fn wall_ms() -> TimestampMs {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -229,6 +249,7 @@ fn wall_ms() -> TimestampMs {
 }
 
 /// Parse Binance-style levels: `[["price_str", "size_str"], ...]`
+#[cfg(any(feature = "live_aster", feature = "live_extended"))]
 fn parse_binance_levels(
     value: Option<&Value>,
     label: &str,
@@ -258,6 +279,7 @@ fn parse_binance_levels(
 
 /// Parse Paradex-style levels: `[["price_str", "size_str"], ...]` where
 /// values may be strings.
+#[cfg(feature = "live_paradex")]
 fn parse_string_pair_levels(
     value: Option<&Value>,
     label: &str,
@@ -277,6 +299,7 @@ fn parse_string_pair_levels(
     Ok(out)
 }
 
+#[cfg(feature = "live_paradex")]
 fn parse_str_or_number(v: Option<&Value>, label: &str, field: &str) -> anyhow::Result<f64> {
     let v = v.ok_or_else(|| anyhow::anyhow!("{label} {field} missing"))?;
     if let Some(s) = v.as_str() {
