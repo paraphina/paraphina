@@ -1455,7 +1455,7 @@ impl AsterSeqState {
             venue_index: self.venue_index,
             venue_id: self.venue_id.clone(),
             seq: update.end_id,
-            timestamp_ms: now_ms(),
+            timestamp_ms: update.event_time.unwrap_or_else(now_ms),
             changes,
         });
         Ok(Some(event))
@@ -1515,7 +1515,7 @@ fn delta_event_from_update(
         venue_index,
         venue_id: venue_id.to_string(),
         seq,
-        timestamp_ms: now_ms(),
+        timestamp_ms: update.event_time.unwrap_or_else(now_ms),
         changes,
     })
 }
