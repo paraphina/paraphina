@@ -158,6 +158,10 @@ struct Args {
     /// Run configuration checks and exit with PASS/FAIL status.
     #[arg(long)]
     preflight: bool,
+    /// Validate config by loading it, constructing Engine + GlobalState,
+    /// running one synthetic tick, and exiting. Exit 0 on success, 1 on failure.
+    #[arg(long)]
+    validate_config: bool,
     /// Output directory for telemetry/audit artifacts.
     #[arg(long)]
     out_dir: Option<String>,
@@ -1032,6 +1036,48 @@ fn enforce_live_execution_guardrails(
     }
 }
 
+/// Validate config by constructing Engine + GlobalState and running one
+/// synthetic tick. Returns 0 on success, 1 on failure.
+fn run_validate_config(cfg: &Config) -> i32 {
+    use paraphina::engine::Engine;
+    use paraphina::state::GlobalState;
+
+    println!("paraphina_live validate-config: loading config and running dry-run tick...");
+
+    // Construct engine and state — this validates all config-derived parameters.
+    let engine = Engine::new(cfg);
+    let mut state = GlobalState::new(cfg);
+
+    // Run one synthetic tick at a fixed timestamp.
+    let now_ms: i64 = 1_700_000_000_000;
+    engine.seed_dummy_mids(&mut state, now_ms);
+    engine.main_tick(&mut state, now_ms);
+
+    // Verify no immediate kill switch tripped on first tick.
+    if state.kill_switch {
+        println!(
+            "FAIL: kill switch tripped on first tick (reason={:?})",
+            state.kill_reason
+        );
+        return 1;
+    }
+
+    // Sanity: config produced valid vol precomputed values.
+    if !engine.vol_pre.vol_ref_tick.is_finite() || !engine.vol_pre.sigma_min_tick.is_finite() {
+        println!("FAIL: vol precomputed values are not finite");
+        return 1;
+    }
+
+    // Verify fair value computation ran (may or may not be available depending
+    // on venue count, but the computation itself should not panic).
+    println!(
+        "  risk_regime={:?} kill_switch={} fv_available={} venues={}",
+        state.risk_regime, state.kill_switch, state.fv_available, state.venues.len()
+    );
+    println!("PASS: config validated successfully");
+    0
+}
+
 struct PreflightCheck {
     label: &'static str,
     ok: bool,
@@ -1639,6 +1685,9 @@ async fn main() {
             canary_settings.as_ref(),
         );
         std::process::exit(if ok { 0 } else { 1 });
+    }
+    if args.validate_config {
+        std::process::exit(run_validate_config(&cfg));
     }
     enforce_live_execution_guardrails(
         &args,

@@ -7,8 +7,26 @@ Type=simple
 User=paraphina
 Group=paraphina
 WorkingDirectory=/opt/paraphina
-EnvironmentFile=/etc/paraphina/paraphina_live.env
+
+# Config loaded via symlink managed by deploy/config_manager.py.
+# current.env -> <promoted_TIMESTAMP.env>
+# Fallback to legacy path if current.env symlink does not exist.
+EnvironmentFile=-/etc/paraphina/current.env
+EnvironmentFile=-/etc/paraphina/paraphina_live.env
+# Stage overlay written by deploy/deploy_orchestrator.py during graduated
+# deploy. Sets PARAPHINA_TRADE_MODE and PARAPHINA_CANARY_MODE per stage.
+# Loaded last so it overrides the values in current.env / paraphina_live.env.
+EnvironmentFile=-/etc/paraphina/stage_overlay.env
+
+# Pre-start validation: load config, construct Engine + GlobalState,
+# run one synthetic tick. Prevents starting with a pathological config.
+ExecStartPre=/opt/paraphina/paraphina_live --validate-config
+
 ExecStart=/opt/paraphina/paraphina_live
+
+# Record stop reason for deploy orchestrator rollback decisions.
+ExecStopPost=/bin/sh -c 'echo "{\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\",\"exit_code\":$EXIT_STATUS,\"service\":\"paraphina_live\"}" >> /var/log/paraphina/service_stops.jsonl'
+
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
