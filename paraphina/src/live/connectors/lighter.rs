@@ -17,6 +17,8 @@ const LIGHTER_WS_READ_TIMEOUT_MS_DEFAULT: u64 = 30_000;
 const LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES: usize = 10;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
+static LIGHTER_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
+static LIGHTER_TS_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
@@ -235,6 +237,44 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_timestamp_ms_nonzero() -> TimestampMs {
+    now_ms().max(1) as TimestampMs
+}
+
+fn lighter_ws_audit_enabled() -> bool {
+    *LIGHTER_WS_AUDIT_ENABLED.get_or_init(|| {
+        std::env::var("PARAPHINA_WS_AUDIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn decode_market_timestamp_ms(value: &serde_json::Value, context: &str) -> TimestampMs {
+    let raw = value
+        .get("timestamp")
+        .or_else(|| value.get("ts"))
+        .and_then(|v| v.as_i64());
+    if let Some(ts) = raw {
+        if ts > 0 {
+            return ts;
+        }
+    }
+    let fallback = now_timestamp_ms_nonzero();
+    if lighter_ws_audit_enabled() {
+        let fallback_count = LIGHTER_TS_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if fallback_count <= 3 || fallback_count % 100 == 0 {
+            let raw_value = raw
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "missing".to_string());
+            eprintln!(
+                "WS_AUDIT venue=lighter lighter_ts_fallback_count={} context={} raw_ts={} fallback_ts_ms={}",
+                fallback_count, context, raw_value, fallback
+            );
+        }
+    }
+    fallback
+}
+
 fn scale_to_i64(value: f64, decimals: u32, label: &str) -> anyhow::Result<i64> {
     if !value.is_finite() {
         anyhow::bail!("lighter: non-finite {label}");
@@ -274,7 +314,12 @@ impl LighterConnector {
             LIGHTER_MARKET_PUB_DRAIN_MAX,
             market_tx.clone(),
             Some(Arc::new(move || is_fixture)),
-            Arc::new(|event: &MarketDataEvent| matches!(event, MarketDataEvent::L2Delta(_))),
+            Arc::new(|event: &MarketDataEvent| {
+                matches!(
+                    event,
+                    MarketDataEvent::L2Delta(_) | MarketDataEvent::L2Snapshot(_)
+                )
+            }),
             None,
             "lighter market_tx closed",
             "lighter market publish queue closed",
@@ -1174,11 +1219,7 @@ fn parse_l2_message_value(
 ) -> Option<ParsedL2Message> {
     let msg_type = value.get("type")?.as_str()?;
     let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-    let timestamp_ms = value
-        .get("timestamp")
-        .or_else(|| value.get("ts"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let timestamp_ms = decode_market_timestamp_ms(value, "parse_l2_message_value");
     match msg_type {
         "l2_snapshot" => {
             let bids = parse_levels(value.get("bids")?)?;
@@ -1298,11 +1339,7 @@ fn decode_order_book_snapshot(
             *seq_fallback = seq_fallback.wrapping_add(1);
             *seq_fallback
         });
-    let timestamp_ms = value
-        .get("timestamp")
-        .or_else(|| value.get("ts"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let timestamp_ms = decode_market_timestamp_ms(value, "decode_order_book_snapshot");
     let snapshot = super::super::types::L2Snapshot {
         venue_index,
         venue_id: venue_id.to_string(),
@@ -1377,11 +1414,7 @@ fn decode_order_book_channel_message(
     };
     *seq_fallback = seq_fallback.wrapping_add(1);
     let seq = *seq_fallback;
-    let timestamp_ms = value
-        .get("timestamp")
-        .or_else(|| value.get("ts"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let timestamp_ms = decode_market_timestamp_ms(value, "decode_order_book_channel_message");
     // Emit L2Snapshot for the initial subscription message (full book state).
     let snapshot = super::super::types::L2Snapshot {
         venue_index,
@@ -1441,11 +1474,7 @@ fn decode_order_book_channel_delta(
     }
     *seq_fallback = seq_fallback.wrapping_add(1);
     let seq = *seq_fallback;
-    let timestamp_ms = value
-        .get("timestamp")
-        .or_else(|| value.get("ts"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let timestamp_ms = decode_market_timestamp_ms(value, "decode_order_book_channel_delta");
     let delta = super::super::types::L2Delta {
         venue_index,
         venue_id: venue_id.to_string(),
@@ -2328,6 +2357,30 @@ mod tests {
         match parsed.event {
             MarketDataEvent::L2Snapshot(snapshot) => {
                 assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn order_book_snapshot_zero_timestamp_falls_back_to_now() {
+        let value = serde_json::json!({
+            "type": "update/order_book",
+            "timestamp": 0i64,
+            "order_book": {
+                "bids": [{"price":"100","size":"2"}],
+                "asks": [{"price":"101","size":"3"}]
+            }
+        });
+        let before_ms = now_timestamp_ms_nonzero();
+        let mut seq = 0u64;
+        let parsed = decode_order_book_snapshot(&value, 3, "LIGHTER", &mut seq).expect("snap");
+        let after_ms = now_timestamp_ms_nonzero();
+        match parsed.event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert!(snapshot.timestamp_ms > 0);
+                assert!(snapshot.timestamp_ms >= before_ms);
+                assert!(snapshot.timestamp_ms <= after_ms + 2_000);
             }
             _ => panic!("expected snapshot"),
         }
