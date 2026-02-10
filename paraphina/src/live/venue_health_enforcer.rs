@@ -89,6 +89,10 @@ pub async fn run_venue_health_enforcer(
 
         for slot in slots.iter_mut() {
             let age = ages.age_ms(slot.venue_index);
+            // i64::MAX means "unknown/uninitialized age"; do not restart until first real update.
+            if age == i64::MAX {
+                continue;
+            }
             if age < ecfg.force_restart_ms {
                 continue;
             }

@@ -213,7 +213,12 @@ impl ExtendedConnector {
             EXTENDED_MARKET_PUB_DRAIN_MAX,
             market_tx.clone(),
             Some(Arc::new(move || is_fixture)),
-            Arc::new(|event: &MarketDataEvent| matches!(event, MarketDataEvent::L2Delta(_))),
+            Arc::new(|event: &MarketDataEvent| {
+                matches!(
+                    event,
+                    MarketDataEvent::L2Delta(_) | MarketDataEvent::L2Snapshot(_)
+                )
+            }),
             Some(on_published),
             "extended market_tx closed",
             "extended market publish queue closed",

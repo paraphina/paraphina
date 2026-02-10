@@ -24,8 +24,8 @@ use paraphina::live::runner::{
     run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRuntimeHooks, ResponseMode,
 };
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
-use paraphina::live::types::L2Snapshot;
 use paraphina::live::supervision::spawn_supervised;
+use paraphina::live::types::L2Snapshot;
 use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
 use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink, TelemetrySinkHandle};
@@ -1072,7 +1072,10 @@ fn run_validate_config(cfg: &Config) -> i32 {
     // on venue count, but the computation itself should not panic).
     println!(
         "  risk_regime={:?} kill_switch={} fv_available={} venues={}",
-        state.risk_regime, state.kill_switch, state.fv_available, state.venues.len()
+        state.risk_regime,
+        state.kill_switch,
+        state.fv_available,
+        state.venues.len()
     );
     println!("PASS: config validated successfully");
     0
@@ -1972,19 +1975,21 @@ async fn main() {
                     // Layer A: enforcer slot for force-restart.
                     {
                         let hl_respawn = hl_arc.clone();
-                        enforcer_slots.push(paraphina::live::venue_health_enforcer::ConnectorSlot {
-                            name: "hyperliquid_public_ws".to_string(),
-                            venue_index,
-                            handle: hl_handle,
-                            respawn: Box::new(move || {
-                                let hl = hl_respawn.clone();
-                                spawn_supervised("hyperliquid_public_ws", move || {
-                                    let h = hl.clone();
-                                    async move { h.run_public_ws().await }
-                                })
-                            }),
-                            last_abort: None,
-                        });
+                        enforcer_slots.push(
+                            paraphina::live::venue_health_enforcer::ConnectorSlot {
+                                name: "hyperliquid_public_ws".to_string(),
+                                venue_index,
+                                handle: hl_handle,
+                                respawn: Box::new(move || {
+                                    let hl = hl_respawn.clone();
+                                    spawn_supervised("hyperliquid_public_ws", move || {
+                                        let h = hl.clone();
+                                        async move { h.run_public_ws().await }
+                                    })
+                                }),
+                                last_abort: None,
+                            },
+                        );
                     }
                     // Layer B: REST monitor entry for Hyperliquid.
                     {
@@ -2153,6 +2158,8 @@ async fn main() {
                             );
                         }
                     } else {
+                        let ltr_rest_url = lighter_cfg.rest_url.clone();
+                        let ltr_market = lighter_cfg.market.clone();
                         if trade_mode.trade_mode != TradeMode::Shadow
                             && !lighter_cfg.paper_mode
                             && !use_fixture
@@ -2169,10 +2176,29 @@ async fn main() {
                             });
                         }
                         let lighter_public = lighter_arc.clone();
-                        spawn_supervised("lighter_public_ws", move || {
+                        let lighter_handle = spawn_supervised("lighter_public_ws", move || {
                             let l = lighter_public.clone();
                             async move { l.run_public_ws().await }
                         });
+                        // Layer A: enforcer slot.
+                        {
+                            let lighter_respawn = lighter_arc.clone();
+                            enforcer_slots.push(
+                                paraphina::live::venue_health_enforcer::ConnectorSlot {
+                                    name: "lighter_public_ws".to_string(),
+                                    venue_index,
+                                    handle: lighter_handle,
+                                    respawn: Box::new(move || {
+                                        let l = lighter_respawn.clone();
+                                        spawn_supervised("lighter_public_ws", move || {
+                                            let l2 = l.clone();
+                                            async move { l2.run_public_ws().await }
+                                        })
+                                    }),
+                                    last_abort: None,
+                                },
+                            );
+                        }
                         let lighter_funding = lighter_arc.clone();
                         let funding_poll_ms = std::env::var("LIGHTER_FUNDING_POLL_MS")
                             .ok()
@@ -2260,19 +2286,21 @@ async fn main() {
                         // Layer A: enforcer slot.
                         {
                             let ext_respawn = extended_arc.clone();
-                            enforcer_slots.push(paraphina::live::venue_health_enforcer::ConnectorSlot {
-                                name: "extended_public_ws".to_string(),
-                                venue_index,
-                                handle: ext_handle,
-                                respawn: Box::new(move || {
-                                    let e = ext_respawn.clone();
-                                    spawn_supervised("extended_public_ws", move || {
-                                        let e2 = e.clone();
-                                        async move { e2.run_public_ws().await }
-                                    })
-                                }),
-                                last_abort: None,
-                            });
+                            enforcer_slots.push(
+                                paraphina::live::venue_health_enforcer::ConnectorSlot {
+                                    name: "extended_public_ws".to_string(),
+                                    venue_index,
+                                    handle: ext_handle,
+                                    respawn: Box::new(move || {
+                                        let e = ext_respawn.clone();
+                                        spawn_supervised("extended_public_ws", move || {
+                                            let e2 = e.clone();
+                                            async move { e2.run_public_ws().await }
+                                        })
+                                    }),
+                                    last_abort: None,
+                                },
+                            );
                         }
                         // Layer B: REST monitor entry.
                         {
@@ -2423,19 +2451,21 @@ async fn main() {
                         // Layer A: enforcer slot.
                         {
                             let aster_respawn = aster_arc.clone();
-                            enforcer_slots.push(paraphina::live::venue_health_enforcer::ConnectorSlot {
-                                name: "aster_public_ws".to_string(),
-                                venue_index,
-                                handle: aster_handle,
-                                respawn: Box::new(move || {
-                                    let a = aster_respawn.clone();
-                                    spawn_supervised("aster_public_ws", move || {
-                                        let a2 = a.clone();
-                                        async move { a2.run_public_ws().await }
-                                    })
-                                }),
-                                last_abort: None,
-                            });
+                            enforcer_slots.push(
+                                paraphina::live::venue_health_enforcer::ConnectorSlot {
+                                    name: "aster_public_ws".to_string(),
+                                    venue_index,
+                                    handle: aster_handle,
+                                    respawn: Box::new(move || {
+                                        let a = aster_respawn.clone();
+                                        spawn_supervised("aster_public_ws", move || {
+                                            let a2 = a.clone();
+                                            async move { a2.run_public_ws().await }
+                                        })
+                                    }),
+                                    last_abort: None,
+                                },
+                            );
                         }
                         // Layer B: REST monitor entry.
                         {
@@ -2588,19 +2618,21 @@ async fn main() {
                         // Layer A: enforcer slot.
                         {
                             let pdx_respawn = paradex_arc.clone();
-                            enforcer_slots.push(paraphina::live::venue_health_enforcer::ConnectorSlot {
-                                name: "paradex_public_ws".to_string(),
-                                venue_index,
-                                handle: paradex_handle,
-                                respawn: Box::new(move || {
-                                    let p = pdx_respawn.clone();
-                                    spawn_supervised("paradex_public_ws", move || {
-                                        let p2 = p.clone();
-                                        async move { p2.run_public_ws().await }
-                                    })
-                                }),
-                                last_abort: None,
-                            });
+                            enforcer_slots.push(
+                                paraphina::live::venue_health_enforcer::ConnectorSlot {
+                                    name: "paradex_public_ws".to_string(),
+                                    venue_index,
+                                    handle: paradex_handle,
+                                    respawn: Box::new(move || {
+                                        let p = pdx_respawn.clone();
+                                        spawn_supervised("paradex_public_ws", move || {
+                                            let p2 = p.clone();
+                                            async move { p2.run_public_ws().await }
+                                        })
+                                    }),
+                                    last_abort: None,
+                                },
+                            );
                         }
                         // Layer B: REST monitor entry for Paradex.
                         {
@@ -3174,7 +3206,11 @@ fn write_summary(
         0.0
     };
     let (place_map, cancel_map, replace_map) = match maps {
-        Some(m) => (m.would_place_by_purpose, m.would_cancel_by_purpose, m.would_replace_by_purpose),
+        Some(m) => (
+            m.would_place_by_purpose,
+            m.would_cancel_by_purpose,
+            m.would_replace_by_purpose,
+        ),
         None => (Default::default(), Default::default(), Default::default()),
     };
     let payload = serde_json::json!({

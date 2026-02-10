@@ -28,18 +28,16 @@ use super::types::MarketDataEvent;
 ))]
 #[allow(unused_imports)]
 use {
-    super::orderbook_l2::BookLevel,
-    super::types::L2Snapshot,
-    crate::types::TimestampMs,
-    reqwest::Client,
-    serde_json::Value,
+    super::orderbook_l2::BookLevel, super::types::L2Snapshot, crate::types::TimestampMs,
+    reqwest::Client, serde_json::Value,
 };
 
 // ─── per-venue REST fetcher trait ──────────────────────────────────────────
 
 /// A type-erased async function that fetches a single L2 snapshot.
 pub type RestFetcher = Box<dyn Fn() -> BoxFut + Send + Sync>;
-type BoxFut = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<MarketDataEvent>> + Send>>;
+type BoxFut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<MarketDataEvent>> + Send>>;
 
 pub struct VenueRestEntry {
     /// Human-readable venue name for logging.
@@ -220,10 +218,7 @@ pub async fn fetch_paradex_l2_snapshot(
     let results = value.get("results").unwrap_or(&value);
     let bids = parse_string_pair_levels(results.get("bids"), "bids")?;
     let asks = parse_string_pair_levels(results.get("asks"), "asks")?;
-    let seq = results
-        .get("seq_no")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let seq = results.get("seq_no").and_then(|v| v.as_u64()).unwrap_or(0);
     let timestamp_ms = results
         .get("last_updated_at")
         .and_then(|v| v.as_i64())
@@ -240,7 +235,11 @@ pub async fn fetch_paradex_l2_snapshot(
 
 // ─── helpers ───────────────────────────────────────────────────────────────
 
-#[cfg(any(feature = "live_aster", feature = "live_extended", feature = "live_paradex"))]
+#[cfg(any(
+    feature = "live_aster",
+    feature = "live_extended",
+    feature = "live_paradex",
+))]
 fn wall_ms() -> TimestampMs {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -250,10 +249,7 @@ fn wall_ms() -> TimestampMs {
 
 /// Parse Binance-style levels: `[["price_str", "size_str"], ...]`
 #[cfg(any(feature = "live_aster", feature = "live_extended"))]
-fn parse_binance_levels(
-    value: Option<&Value>,
-    label: &str,
-) -> anyhow::Result<Vec<BookLevel>> {
+fn parse_binance_levels(value: Option<&Value>, label: &str) -> anyhow::Result<Vec<BookLevel>> {
     let arr = value
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow::anyhow!("missing or invalid {label} array"))?;
@@ -280,10 +276,7 @@ fn parse_binance_levels(
 /// Parse Paradex-style levels: `[["price_str", "size_str"], ...]` where
 /// values may be strings.
 #[cfg(feature = "live_paradex")]
-fn parse_string_pair_levels(
-    value: Option<&Value>,
-    label: &str,
-) -> anyhow::Result<Vec<BookLevel>> {
+fn parse_string_pair_levels(value: Option<&Value>, label: &str) -> anyhow::Result<Vec<BookLevel>> {
     let arr = value
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow::anyhow!("missing or invalid {label} array"))?;

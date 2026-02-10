@@ -15,6 +15,9 @@ const PARADEX_MARKET_PUB_QUEUE_CAP: usize = 256;
 const PARADEX_MARKET_PUB_DRAIN_MAX: usize = 64;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
+static PARADEX_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
+static PARADEX_PING_SENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PARADEX_PING_SEND_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
@@ -26,6 +29,14 @@ fn paradex_stale_ms() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(PARADEX_STALE_MS_DEFAULT)
+}
+
+fn paradex_ws_audit_enabled() -> bool {
+    *PARADEX_WS_AUDIT_ENABLED.get_or_init(|| {
+        std::env::var("PARAPHINA_WS_AUDIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 #[allow(dead_code)]
@@ -387,6 +398,33 @@ impl ParadexConnector {
                 biased;
                 _ = &mut stale_rx => {
                     anyhow::bail!("Paradex public WS stale: freshness exceeded {stale_ms}ms");
+                }
+                _ = ping_timer.tick() => {
+                    match write.send(Message::Ping(vec![b'p'].into())).await {
+                        Ok(()) => {
+                            if paradex_ws_audit_enabled() {
+                                let sent = PARADEX_PING_SENT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                                if sent <= 3 || sent % 100 == 0 {
+                                    eprintln!(
+                                        "WS_AUDIT venue=paradex paradex_ping_sent_count={} interval_ms={}",
+                                        sent, ping_interval_ms
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if paradex_ws_audit_enabled() {
+                                let fail =
+                                    PARADEX_PING_SEND_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                                eprintln!(
+                                    "WS_AUDIT venue=paradex paradex_ping_send_fail_count={} err={}",
+                                    fail, err
+                                );
+                            }
+                            anyhow::bail!("Paradex public WS ping send failed: {err}");
+                        }
+                    }
+                    continue;
                 }
                 read_result = tokio::time::timeout(Duration::from_secs(30), read.next()) => {
                     let maybe = match read_result {
