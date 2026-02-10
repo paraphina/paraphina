@@ -268,6 +268,26 @@ impl LiveMetrics {
         self.reconcile_mismatch_count.inc();
     }
 
+    /// Get the total tick count (for health detail endpoint).
+    pub fn get_tick_count(&self) -> u64 {
+        self.tick_total.get()
+    }
+
+    /// Get last tick timestamp in ms (for health detail endpoint).
+    pub fn get_last_tick_ms(&self) -> i64 {
+        self.last_tick_ms.get()
+    }
+
+    /// Get total errors (for health detail endpoint).
+    pub fn get_error_count(&self) -> u64 {
+        self.errors_total.get()
+    }
+
+    /// Get reconciliation mismatch count (for health detail endpoint).
+    pub fn get_reconcile_mismatch_count(&self) -> u64 {
+        self.reconcile_mismatch_count.get()
+    }
+
     pub fn add_market_rx_stats(&self, raw_drained: u64, out_emitted: u64, cap_hits: u64) {
         self.market_rx_raw_drained_total.inc_by(raw_drained);
         self.market_rx_out_emitted_total.inc_by(out_emitted);
@@ -289,6 +309,12 @@ pub fn start_metrics_server(
     health: HealthState,
     audit_dir: PathBuf,
 ) {
+    let start_time_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let trade_mode_str = std::env::var("PARAPHINA_TRADE_MODE").unwrap_or_default();
+    let config_id = std::env::var("PARAPHINA_CONFIG_ID").unwrap_or_default();
     let addr = addr.to_string();
     std::thread::spawn(move || {
         let Ok(server) = Server::http(addr.as_str()) else {
@@ -328,6 +354,46 @@ pub fn start_metrics_server(
                         Response::from_string("unhealthy").with_status_code(503)
                     }
                 }
+                "/health/detail" => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    let uptime_sec = (now_ms - start_time_ms) / 1000;
+                    let last_tick = metrics.get_last_tick_ms();
+                    let tick_age_ms = if last_tick > 0 { now_ms - last_tick } else { -1 };
+
+                    // Check for kill events in the audit dir.
+                    let kill_active = audit_dir.join("kill_events.jsonl").exists()
+                        && fs::metadata(audit_dir.join("kill_events.jsonl"))
+                            .map(|m| m.len() > 0)
+                            .unwrap_or(false);
+
+                    let detail = HealthDetail {
+                        healthy: health.is_healthy(),
+                        ready: health.is_ready(),
+                        uptime_seconds: uptime_sec,
+                        tick_count: metrics.get_tick_count(),
+                        last_tick_ms: last_tick,
+                        tick_age_ms,
+                        error_count: metrics.get_error_count(),
+                        reconcile_mismatch_count: metrics.get_reconcile_mismatch_count(),
+                        kill_events_present: kill_active,
+                        trade_mode: trade_mode_str.clone(),
+                        config_id: config_id.clone(),
+                    };
+                    let payload = serde_json::to_string(&detail).unwrap_or_default();
+                    let status = if health.is_healthy() { 200 } else { 503 };
+                    Response::from_string(payload)
+                        .with_status_code(status)
+                        .with_header(
+                            Header::from_bytes(
+                                &b"Content-Type"[..],
+                                &b"application/json"[..],
+                            )
+                            .unwrap(),
+                        )
+                }
                 "/ready" => {
                     if health.is_ready() {
                         Response::from_string("ready")
@@ -340,6 +406,23 @@ pub fn start_metrics_server(
             let _ = request.respond(response);
         }
     });
+}
+
+/// JSON payload for `/health/detail` endpoint.
+/// Used by the deploy orchestrator to poll service health during soak stages.
+#[derive(Debug, Serialize)]
+struct HealthDetail {
+    healthy: bool,
+    ready: bool,
+    uptime_seconds: i64,
+    tick_count: u64,
+    last_tick_ms: i64,
+    tick_age_ms: i64,
+    error_count: u64,
+    reconcile_mismatch_count: u64,
+    kill_events_present: bool,
+    trade_mode: String,
+    config_id: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -86,6 +86,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-color", action="store_true", help="Disable coloured output"
     )
+    parser.add_argument(
+        "--health-url", default="http://127.0.0.1:9898",
+        help="Base URL for /health/detail endpoint (default: http://127.0.0.1:9898)",
+    )
+    parser.add_argument(
+        "--config-dir", default="/etc/paraphina",
+        help="Config directory for deploy state (default: /etc/paraphina)",
+    )
+    parser.add_argument(
+        "--no-deploy-state", action="store_true",
+        help="Disable deploy state panel",
+    )
     return parser.parse_args()
 
 
@@ -188,6 +200,127 @@ def color_stale(pct: float) -> str:
     if pct >= 1.0:
         return styled(text, S.YELLOW)
     return styled(text, S.GREEN)
+
+
+# ── Deploy state & health detail ──────────────────────────────────────────────
+
+
+def read_deploy_state(config_dir: str) -> dict[str, Any] | None:
+    """Read deploy_state.json from the config directory."""
+    state_path = Path(config_dir) / "deploy_state.json"
+    try:
+        if state_path.exists():
+            return json.loads(state_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def fetch_health_detail(base_url: str) -> dict[str, Any] | None:
+    """Fetch /health/detail JSON (best-effort, no crash on failure)."""
+    import urllib.request
+    import urllib.error
+
+    url = f"{base_url}/health/detail"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status == 200:
+                return json.loads(resp.read().decode())
+    except Exception:
+        pass
+    return None
+
+
+def color_stage(stage: str | None) -> str:
+    """Colour-code the deploy stage."""
+    if not stage:
+        return styled("unknown", S.GRAY)
+    stage_colors = {
+        "shadow": S.BLUE,
+        "paper": S.YELLOW,
+        "canary": S.MAGENTA,
+        "live": S.GREEN,
+    }
+    color = stage_colors.get(stage, S.GRAY)
+    return styled(stage, color, S.BOLD)
+
+
+def render_deploy_section(
+    config_dir: str,
+    health_url: str,
+) -> list[str]:
+    """Render the deploy state section for the dashboard."""
+    lines: list[str] = []
+    deploy = read_deploy_state(config_dir)
+    health = fetch_health_detail(health_url)
+
+    if deploy is None and health is None:
+        return []
+
+    lines.append("")
+    lines.append(_section("Deploy"))
+
+    if deploy:
+        active = deploy.get("active_config", "n/a")
+        stage = deploy.get("current_stage")
+        rollbacks = deploy.get("rollback_count", 0)
+        ts = deploy.get("deploy_timestamp", "")
+        # Shorten timestamp for display
+        if ts and "T" in ts:
+            ts = ts.split("T")[1][:8] + "Z"
+
+        rb_str = styled(str(rollbacks), S.B_RED if rollbacks > 0 else S.GREEN)
+        deploy_line = (
+            f"  {_LABEL('config')} {styled(active, S.B_WHITE)}   "
+            f"{_LABEL('stage')} {color_stage(stage)}   "
+            f"{_LABEL('rollbacks')} {rb_str}"
+        )
+        if ts:
+            deploy_line += f"   {_LABEL('deployed')} {styled(ts, S.DIM)}"
+        lines.append(deploy_line)
+
+        last_rb_reason = deploy.get("last_rollback_reason")
+        if rollbacks > 0 and last_rb_reason:
+            lines.append(
+                f"  {_LABEL('last_rollback')} {styled(last_rb_reason, S.B_RED)}"
+            )
+    else:
+        lines.append(f"  {styled('(no deploy state)', S.GRAY)}")
+
+    if health:
+        uptime = health.get("uptime_seconds", 0)
+        ticks = health.get("tick_count", 0)
+        errors = health.get("error_count", 0)
+        recon = health.get("reconcile_mismatch_count", 0)
+        kills = health.get("kill_events_present", False)
+        config_id = health.get("config_id", "")
+
+        err_str = styled(str(errors), S.B_RED if errors > 5 else S.GREEN)
+        recon_str = styled(str(recon), S.B_RED if recon > 0 else S.GREEN)
+        kill_str = styled("YES", S.B_RED, S.BOLD) if kills else styled("no", S.GREEN)
+
+        health_line = (
+            f"  {_LABEL('uptime')} {uptime}s   "
+            f"{_LABEL('ticks')} {ticks}   "
+            f"{_LABEL('errors')} {err_str}   "
+            f"{_LABEL('recon')} {recon_str}   "
+            f"{_LABEL('kills')} {kill_str}"
+        )
+        lines.append(health_line)
+
+        # Config mismatch detection
+        if deploy and config_id:
+            active_config = deploy.get("active_config", "")
+            if active_config and config_id and config_id not in active_config:
+                lines.append(
+                    f"  {styled('CONFIG MISMATCH', S.B_RED, S.BOLD)} "
+                    f"state={active_config} process={config_id}"
+                )
+    else:
+        lines.append(f"  {_LABEL('health')} {styled('offline', S.B_RED)}")
+
+    return lines
 
 
 # ── Venue-ID parsing (unchanged logic) ───────────────────────────────────────
@@ -398,7 +531,12 @@ def _section(title: str, width: int = 72) -> str:
 # ── Frame rendering ──────────────────────────────────────────────────────────
 
 
-def render_frame(state: WatchState, max_events: int) -> str:  # noqa: C901
+def render_frame(  # noqa: C901
+    state: WatchState,
+    max_events: int,
+    config_dir: str | None = None,
+    health_url: str | None = None,
+) -> str:
     record = state.last_record or {}
     tick = record.get("t")
     now_ms = None
@@ -467,7 +605,14 @@ def render_frame(state: WatchState, max_events: int) -> str:  # noqa: C901
         f"{_LABEL('tox_max')} {color_tox(tox_max)}"
     )
 
-    lines: list[str] = [rule, title, rule, hdr1, hdr2, hdr3, hdr4, ""]
+    lines: list[str] = [rule, title, rule, hdr1, hdr2, hdr3, hdr4]
+
+    # ── Deploy state (optional) ───────────────────────────────────────────
+    if config_dir and health_url:
+        deploy_lines = render_deploy_section(config_dir, health_url)
+        lines.extend(deploy_lines)
+
+    lines.append("")
 
     # ── Venue table ───────────────────────────────────────────────────────
     venue_ids = state.venue_ids
@@ -651,10 +796,16 @@ class TailFollower:
 # ── Entry points ─────────────────────────────────────────────────────────────
 
 
-def render_once(path: Path, refresh_ms: int, max_events: int) -> str:
+def render_once(
+    path: Path,
+    refresh_ms: int,
+    max_events: int,
+    config_dir: str | None = None,
+    health_url: str | None = None,
+) -> str:
     records = parse_lines(path, max_events)
     state = build_state(records, max_events)
-    return render_frame(state, max_events)
+    return render_frame(state, max_events, config_dir=config_dir, health_url=health_url)
 
 
 def main() -> int:
@@ -667,9 +818,19 @@ def main() -> int:
     if args.no_color or os.environ.get("NO_COLOR"):
         _NO_COLOR = True
 
+    # Deploy state panel (disabled with --no-deploy-state).
+    deploy_config_dir: str | None = None
+    deploy_health_url: str | None = None
+    if not args.no_deploy_state:
+        deploy_config_dir = args.config_dir
+        deploy_health_url = args.health_url
+
     one_shot = refresh_ms >= 999_999
     if one_shot:
-        frame = render_once(telemetry_path, refresh_ms, max_events)
+        frame = render_once(
+            telemetry_path, refresh_ms, max_events,
+            config_dir=deploy_config_dir, health_url=deploy_health_url,
+        )
         print(frame)
         return 0
 
@@ -705,7 +866,10 @@ def main() -> int:
                 continue
             if isinstance(record, dict):
                 state.update(record)
-        frame = render_frame(state, max_events)
+        frame = render_frame(
+            state, max_events,
+            config_dir=deploy_config_dir, health_url=deploy_health_url,
+        )
         if is_tty:
             # Move cursor home, then write each line with a clear-to-EOL
             # escape so stale characters from longer previous lines are

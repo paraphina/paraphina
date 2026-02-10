@@ -20,10 +20,34 @@ on:
         description: 'Number of bootstrap samples'
         required: false
         default: '1000'
+      deploy:
+        description: 'Auto-deploy on PROMOTE (graduated pipeline)'
+        required: false
+        type: boolean
+        default: false
+      deploy_stop_before:
+        description: 'Stop deploy before this stage (paper|canary|live). Empty = full deploy.'
+        required: false
+        default: ''
+      shadow_soak:
+        description: 'Shadow soak duration in seconds'
+        required: false
+        default: '300'
+      paper_soak:
+        description: 'Paper soak duration in seconds'
+        required: false
+        default: '600'
+      canary_soak:
+        description: 'Canary soak duration in seconds'
+        required: false
+        default: '900'
 
 jobs:
   phase-ab-promotion-gate:
     runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","Linux","X64","vpsb-ci"]' || '["ubuntu-latest"]') }}
+    outputs:
+      decision: ${{ steps.gate.outputs.decision }}
+      exit_code: ${{ steps.gate.outputs.exit_code }}
     steps:
       - uses: actions/checkout@v4
 
@@ -190,5 +214,176 @@ jobs:
               f.write(summary)
 
           print("Job summary written successfully")
+          PYTHON_SCRIPT
+
+  # ---------------------------------------------------------------------------
+  # Auto-deploy job: runs only when gate decision is PROMOTE and deploy=true.
+  # Executes the graduated deploy pipeline (shadow -> paper -> canary -> live)
+  # on the self-hosted VPS runner.
+  # ---------------------------------------------------------------------------
+  auto-deploy:
+    needs: phase-ab-promotion-gate
+    if: >-
+      github.event.inputs.deploy == 'true' &&
+      needs.phase-ab-promotion-gate.outputs.decision == 'PROMOTE'
+    runs-on: ["self-hosted", "Linux", "X64", "vpsb-ci"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download gate artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: phase-ab-gate-artifacts
+          path: runs/ci/phase_ab_gate
+
+      - name: Generate promoted .env from gate manifest
+        run: |
+          python3 - << 'EXTRACT_SCRIPT'
+          import json, sys
+          from pathlib import Path
+
+          manifest_path = Path("runs/ci/phase_ab_gate/phase_ab_manifest.json")
+          if not manifest_path.exists():
+              print("ERROR: Gate manifest not found.")
+              sys.exit(1)
+
+          manifest = json.load(open(manifest_path))
+          decision = manifest.get("decision", "UNKNOWN")
+          print(f"Gate decision: {decision}")
+          if decision != "PROMOTE":
+              print(f"ERROR: Expected PROMOTE, got {decision}")
+              sys.exit(1)
+
+          # Look for the candidate's mc_summary.json to extract config knobs.
+          candidate_dir = Path(manifest["candidate_run_resolved"])
+          mc_dir = candidate_dir / "monte_carlo"
+          mc_summary = mc_dir / "mc_summary.json" if mc_dir.exists() else None
+
+          # Also check for a Phase A promoted env in the candidate dir.
+          promoted_envs = list(candidate_dir.glob("*.env"))
+
+          config_knobs = {}
+          if promoted_envs:
+              # Use the existing promoted .env file directly.
+              env_file = promoted_envs[0]
+              print(f"Found existing promoted env: {env_file}")
+              for line in env_file.read_text().splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  if line.startswith("export "):
+                      line = line[7:].strip()
+                  if "=" in line:
+                      k, v = line.split("=", 1)
+                      config_knobs[k.strip()] = v.strip()
+          elif mc_summary and mc_summary.exists():
+              # Extract config from mc_summary.json.
+              summary = json.load(open(mc_summary))
+              cfg = summary.get("config", {})
+              if "risk_profile" in cfg:
+                  config_knobs["PARAPHINA_RISK_PROFILE"] = cfg["risk_profile"]
+              for key in ["hedge_band_base", "mm_size_eta", "vol_ref",
+                          "daily_loss_limit", "init_q_tao", "hedge_max_step"]:
+                  if key in cfg:
+                      env_key = f"PARAPHINA_{key.upper()}"
+                      config_knobs[env_key] = str(cfg[key])
+          else:
+              print("WARNING: No config source found. Using default profile.")
+              config_knobs["PARAPHINA_RISK_PROFILE"] = "balanced"
+
+          # Write promoted.env
+          out_path = Path("runs/ci/phase_ab_gate/promoted.env")
+          with open(out_path, "w") as f:
+              f.write("# Auto-generated promoted config from Phase AB gate\n")
+              f.write(f"# Decision: {decision}\n")
+              f.write(f"# Candidate: {manifest.get('candidate_run_resolved', 'N/A')}\n")
+              f.write(f"# Timestamp: {manifest.get('timestamp', 'N/A')}\n\n")
+              for k, v in sorted(config_knobs.items()):
+                  f.write(f"{k}={v}\n")
+
+          print(f"Wrote promoted.env with {len(config_knobs)} config knobs")
+          for k, v in sorted(config_knobs.items()):
+              print(f"  {k}={v}")
+          EXTRACT_SCRIPT
+
+      - name: Run graduated deploy pipeline
+        id: deploy
+        run: |
+          STOP_BEFORE="${{ github.event.inputs.deploy_stop_before }}"
+          STOP_ARG=""
+          if [ -n "$STOP_BEFORE" ]; then
+            STOP_ARG="--stop-before $STOP_BEFORE"
+          fi
+
+          set +e
+          python3 deploy/deploy_orchestrator.py deploy \
+            runs/ci/phase_ab_gate/promoted.env \
+            --config-dir /etc/paraphina \
+            --health-url http://127.0.0.1:9898 \
+            --shadow-soak ${{ github.event.inputs.shadow_soak || '300' }} \
+            --paper-soak ${{ github.event.inputs.paper_soak || '600' }} \
+            --canary-soak ${{ github.event.inputs.canary_soak || '900' }} \
+            $STOP_ARG 2>&1 | tee deploy_output.log
+          DEPLOY_EXIT=$?
+          echo "deploy_exit_code=$DEPLOY_EXIT" >> $GITHUB_OUTPUT
+          exit $DEPLOY_EXIT
+
+      - name: Upload deploy logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-logs
+          path: |
+            deploy_output.log
+            runs/ci/phase_ab_gate/promoted.env
+
+      - name: Generate deploy summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - << 'PYTHON_SCRIPT'
+          import os
+
+          deploy_exit = "${{ steps.deploy.outputs.deploy_exit_code }}"
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if not summary_file:
+              exit(0)
+
+          if deploy_exit == "0":
+              status = "SUCCESS"
+              emoji = "✅"
+          else:
+              status = "FAILED (rolled back)"
+              emoji = "❌"
+
+          stop_before = "${{ github.event.inputs.deploy_stop_before }}" or "(none)"
+          shadow = "${{ github.event.inputs.shadow_soak }}" or "300"
+          paper = "${{ github.event.inputs.paper_soak }}" or "600"
+          canary = "${{ github.event.inputs.canary_soak }}" or "900"
+
+          summary = f"""
+          ## Auto-Deploy Result
+
+          | Field | Value |
+          |-------|-------|
+          | **Status** | {emoji} {status} |
+          | **Exit Code** | `{deploy_exit}` |
+          | **Stop Before** | `{stop_before}` |
+          | **Shadow Soak** | {shadow}s |
+          | **Paper Soak** | {paper}s |
+          | **Canary Soak** | {canary}s |
+
+          ---
+          *Generated by Auto-Deploy Pipeline*
+          """
+
+          with open(summary_file, "a") as f:
+              f.write(summary)
+          print("Deploy summary written")
           PYTHON_SCRIPT
 
