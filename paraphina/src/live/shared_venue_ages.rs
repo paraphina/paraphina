@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// Thread-safe, lock-free venue age tracking.
 ///
 /// The runner updates `ages[venue_index]` each tick with the current
-/// `age_ms = now_ms - last_mid_update_ms`.  Readers (health enforcer,
+/// `age_ms = now_ms - last_mid_apply_ms`.  Readers (health enforcer,
 /// REST monitor) can load these values at any time with `Relaxed`
 /// ordering — stale reads by a few ms are acceptable.
 #[derive(Clone)]
