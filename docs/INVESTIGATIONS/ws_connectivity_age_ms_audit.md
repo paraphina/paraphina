@@ -751,6 +751,22 @@ What to look for:
 - Lighter appears in Layer A/B stale-recovery logs similarly to other venues.
 - Fewer stale/bootstrap disruptions from dropped snapshots on Lighter/Extended.
 
+## Post-merge status (2026-02-10)
+
+### Implemented (on main)
+- Lighter timestamp fallback hardening.
+- Lighter + Extended snapshots lossless in `MarketPublisher` path.
+- Paradex periodic outbound WS ping + `PARAPHINA_WS_AUDIT` counters.
+- Lighter Layer A enforcer slot wiring.
+- Startup thrash fix: enforcer ignores `i64::MAX` unknown age until first real update.
+
+### Pending / Open
+- `age_ms` semantics normalization across venues (dual metrics: apply-time vs event-time).
+- Lighter Layer B REST fallback: still intentionally not wired pending evidence-based endpoint.
+- Broader instrumentation/soak metrics (reconnect reasons, rolling p50/p95/p99, queue pressure).
+
+Note: this addendum is intentionally non-code and reflects merged reality.
+
 ## 11) Reproducibility Appendix
 
 ### 11.1 Required environment + repo-state commands (run first) and output
