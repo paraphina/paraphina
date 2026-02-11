@@ -22,6 +22,7 @@ use super::types::MarketDataEvent;
 // connector feature pulls in the reqwest crate.  Some items may appear unused
 // depending on which specific connector features are enabled.
 #[cfg(any(
+    feature = "live_lighter",
     feature = "live_aster",
     feature = "live_extended",
     feature = "live_paradex",
@@ -69,6 +70,51 @@ impl Default for RestMonitorConfig {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct VenueRestAuditStats {
+    rest_check_count: u64,
+    rest_attempt_count: u64,
+    rest_success_count: u64,
+    rest_fail_count: u64,
+    rest_inject_count: u64,
+    last_log_ms: i64,
+}
+
+fn rest_monitor_ws_audit_enabled() -> bool {
+    std::env::var("PARAPHINA_WS_AUDIT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn maybe_log_rest_audit(
+    enabled: bool,
+    now_ms: i64,
+    venue: &VenueRestEntry,
+    age_ms: i64,
+    threshold_ms: i64,
+    stats: &mut VenueRestAuditStats,
+) {
+    if !enabled {
+        return;
+    }
+    let should_log = stats.rest_check_count <= 3 || now_ms.saturating_sub(stats.last_log_ms) >= 30_000;
+    if !should_log {
+        return;
+    }
+    stats.last_log_ms = now_ms;
+    eprintln!(
+        "WS_AUDIT subsystem=rest_monitor venue={} rest_check_count={} rest_attempt_count={} rest_success_count={} rest_fail_count={} rest_inject_count={} age_ms={} threshold_ms={}",
+        venue.name,
+        stats.rest_check_count,
+        stats.rest_attempt_count,
+        stats.rest_success_count,
+        stats.rest_fail_count,
+        stats.rest_inject_count,
+        age_ms,
+        threshold_ms
+    );
+}
+
 /// Run the monitor loop.  Never returns (designed to be spawned supervised).
 pub async fn run_rest_health_monitor(
     ages: SharedVenueAges,
@@ -76,6 +122,7 @@ pub async fn run_rest_health_monitor(
     market_tx: mpsc::Sender<MarketDataEvent>,
     cfg: RestMonitorConfig,
 ) {
+    let ws_audit_enabled = rest_monitor_ws_audit_enabled();
     let mut interval = tokio::time::interval(cfg.poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let monitor_start_ms = SystemTime::now()
@@ -85,6 +132,7 @@ pub async fn run_rest_health_monitor(
 
     // Track whether each venue was logged as active/inactive.
     let mut active: Vec<bool> = vec![false; venues.len()];
+    let mut audit: Vec<VenueRestAuditStats> = vec![VenueRestAuditStats::default(); venues.len()];
 
     loop {
         interval.tick().await;
@@ -94,6 +142,8 @@ pub async fn run_rest_health_monitor(
             .as_millis() as i64;
 
         for (i, venue) in venues.iter().enumerate() {
+            let stats = &mut audit[i];
+            stats.rest_check_count += 1;
             let raw_age = ages.age_ms(venue.venue_index);
             // i64::MAX means "unknown/uninitialized"; avoid instant startup fallback.
             // Treat unknown as elapsed time since monitor start so fallback can still
@@ -111,6 +161,14 @@ pub async fn run_rest_health_monitor(
                     );
                     active[i] = false;
                 }
+                maybe_log_rest_audit(
+                    ws_audit_enabled,
+                    now_ms,
+                    venue,
+                    age,
+                    cfg.rest_threshold_ms,
+                    stats,
+                );
                 continue;
             }
 
@@ -124,22 +182,29 @@ pub async fn run_rest_health_monitor(
 
             // Fetch with a per-request timeout to avoid blocking the monitor.
             let fetch_timeout = Duration::from_secs(5);
+            stats.rest_attempt_count += 1;
             match tokio::time::timeout(fetch_timeout, (venue.fetcher)()).await {
                 Ok(Ok(event)) => {
+                    stats.rest_success_count += 1;
                     if market_tx.send(event).await.is_err() {
+                        stats.rest_fail_count += 1;
                         eprintln!(
                             "WARN: REST health monitor: market_tx closed for {}",
                             venue.name
                         );
+                    } else {
+                        stats.rest_inject_count += 1;
                     }
                 }
                 Ok(Err(err)) => {
+                    stats.rest_fail_count += 1;
                     eprintln!(
                         "WARN: REST health monitor: {} REST fetch error: {err}",
                         venue.name
                     );
                 }
                 Err(_) => {
+                    stats.rest_fail_count += 1;
                     eprintln!(
                         "WARN: REST health monitor: {} REST fetch timed out ({}s)",
                         venue.name,
@@ -147,6 +212,14 @@ pub async fn run_rest_health_monitor(
                     );
                 }
             }
+            maybe_log_rest_audit(
+                ws_audit_enabled,
+                now_ms,
+                venue,
+                age,
+                cfg.rest_threshold_ms,
+                stats,
+            );
         }
     }
 }
@@ -186,6 +259,59 @@ pub async fn fetch_extended_l2_snapshot(
         bids,
         asks,
     }))
+}
+
+/// Fetch Lighter L2 book via REST.
+/// URLs attempted (in order): `{rest_url}/api/v1/orderBooks`, `{rest_url}/api/v1/orderbooks`
+#[cfg(feature = "live_lighter")]
+pub async fn fetch_lighter_l2_snapshot(
+    client: &Client,
+    rest_url: &str,
+    market: &str,
+    venue_index: usize,
+) -> anyhow::Result<MarketDataEvent> {
+    let base = rest_url.trim_end_matches('/');
+    let endpoints = ["/api/v1/orderBooks", "/api/v1/orderbooks"];
+    let mut last_error: Option<String> = None;
+    for endpoint in endpoints {
+        let url = format!("{base}{endpoint}");
+        let response = match client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                last_error = Some(format!("request error url={url} err={err}"));
+                continue;
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let snippet: String = body.chars().take(160).collect();
+            last_error = Some(format!(
+                "non-success status={} url={} snippet={}",
+                status, url, snippet
+            ));
+            continue;
+        }
+        let value: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(err) => {
+                last_error = Some(format!("json parse error url={url} err={err}"));
+                continue;
+            }
+        };
+        match parse_lighter_snapshot_response(&value, market, venue_index) {
+            Ok(event) => return Ok(event),
+            Err(err) => {
+                last_error = Some(format!("parse snapshot error url={url} err={err}"));
+                continue;
+            }
+        }
+    }
+    anyhow::bail!(
+        "lighter REST snapshot fetch failed market={} reason={}",
+        market,
+        last_error.unwrap_or_else(|| "unknown".to_string())
+    )
 }
 
 /// Fetch Aster L2 book via REST.
@@ -252,6 +378,7 @@ pub async fn fetch_paradex_l2_snapshot(
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 #[cfg(any(
+    feature = "live_lighter",
     feature = "live_aster",
     feature = "live_extended",
     feature = "live_paradex",
@@ -261,6 +388,130 @@ fn wall_ms() -> TimestampMs {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as TimestampMs
+}
+
+#[cfg(feature = "live_lighter")]
+fn parse_lighter_snapshot_response(
+    value: &Value,
+    market: &str,
+    venue_index: usize,
+) -> anyhow::Result<MarketDataEvent> {
+    let entries = value
+        .as_array()
+        .or_else(|| value.get("data").and_then(|v| v.as_array()))
+        .or_else(|| value.get("order_books").and_then(|v| v.as_array()))
+        .or_else(|| value.get("orderBooks").and_then(|v| v.as_array()))
+        .ok_or_else(|| anyhow::anyhow!("missing orderBooks array"))?;
+    let matched = entries
+        .iter()
+        .find(|entry| {
+            entry
+                .get("symbol")
+                .or_else(|| entry.get("market"))
+                .and_then(|v| v.as_str())
+                .map(|symbol| lighter_symbol_matches(symbol, market))
+                .unwrap_or(false)
+        })
+        .or_else(|| entries.first())
+        .ok_or_else(|| anyhow::anyhow!("empty orderBooks array"))?;
+    let symbol = matched
+        .get("symbol")
+        .or_else(|| matched.get("market"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(market)
+        .to_string();
+    let book = matched
+        .get("order_book")
+        .or_else(|| matched.get("orderBook"))
+        .unwrap_or(matched);
+    let bids = parse_lighter_levels(book.get("bids"), "bids")?;
+    let asks = parse_lighter_levels(book.get("asks"), "asks")?;
+    let seq = book
+        .get("seq")
+        .or_else(|| book.get("sequence"))
+        .or_else(|| book.get("lastUpdateId"))
+        .or_else(|| matched.get("seq"))
+        .or_else(|| matched.get("sequence"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let timestamp_ms = book
+        .get("timestamp")
+        .or_else(|| book.get("ts"))
+        .or_else(|| book.get("updated_at"))
+        .or_else(|| book.get("last_updated_at"))
+        .or_else(|| matched.get("timestamp"))
+        .or_else(|| matched.get("ts"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(wall_ms);
+    Ok(MarketDataEvent::L2Snapshot(L2Snapshot {
+        venue_index,
+        venue_id: symbol,
+        seq,
+        timestamp_ms,
+        bids,
+        asks,
+    }))
+}
+
+#[cfg(feature = "live_lighter")]
+fn lighter_symbol_matches(symbol: &str, market: &str) -> bool {
+    if symbol.eq_ignore_ascii_case(market) {
+        return true;
+    }
+    fn normalize(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }
+    normalize(symbol) == normalize(market)
+}
+
+#[cfg(feature = "live_lighter")]
+fn parse_lighter_levels(value: Option<&Value>, label: &str) -> anyhow::Result<Vec<BookLevel>> {
+    let arr = value
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid {label} array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        if let Some(obj) = entry.as_object() {
+            let price = parse_lighter_str_or_number(
+                obj.get("price").or_else(|| obj.get("px")),
+                label,
+                "price",
+            )?;
+            let size = parse_lighter_str_or_number(
+                obj.get("size").or_else(|| obj.get("sz")),
+                label,
+                "size",
+            )?;
+            out.push(BookLevel { price, size });
+            continue;
+        }
+        let pair = entry
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("invalid {label} entry"))?;
+        let price = parse_lighter_str_or_number(pair.first(), label, "price")?;
+        let size = parse_lighter_str_or_number(pair.get(1), label, "size")?;
+        out.push(BookLevel { price, size });
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "live_lighter")]
+fn parse_lighter_str_or_number(v: Option<&Value>, label: &str, field: &str) -> anyhow::Result<f64> {
+    let v = v.ok_or_else(|| anyhow::anyhow!("{label} {field} missing"))?;
+    if let Some(s) = v.as_str() {
+        Ok(s.parse()?)
+    } else if let Some(n) = v.as_f64() {
+        Ok(n)
+    } else if let Some(n) = v.as_i64() {
+        Ok(n as f64)
+    } else if let Some(n) = v.as_u64() {
+        Ok(n as f64)
+    } else {
+        anyhow::bail!("{label} {field} is neither string nor number")
+    }
 }
 
 /// Parse Binance-style levels: `[["price_str", "size_str"], ...]`
