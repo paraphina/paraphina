@@ -57,6 +57,7 @@ jobs:
           PARAPHINA_MARKET_RX_STATS_PATH="$OUT_DIR/market_rx_stats.log" \
           PARAPHINA_TELEMETRY_MODE=jsonl \
           PARAPHINA_TELEMETRY_PATH="$OUT_DIR/telemetry.jsonl" \
+          PARAPHINA_LIGHTER_WS_READONLY=1 \
           PARAPHINA_LIGHTER_PING_INTERVAL_MS=${{ inputs.lighter_ping_interval_ms }} \
           PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS=${{ inputs.extended_ws_read_timeout_ms }} \
           timeout ${{ inputs.duration_minutes }}m cargo run --release -p paraphina --bin paraphina_live --features "live_hyperliquid live_lighter live_extended live_aster live_paradex" -- \
