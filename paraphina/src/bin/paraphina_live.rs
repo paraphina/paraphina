@@ -2199,6 +2199,31 @@ async fn main() {
                                 },
                             );
                         }
+                        // Layer B: REST monitor entry for Lighter.
+                        {
+                            let rest_url = ltr_rest_url;
+                            let market = ltr_market;
+                            let vi = venue_index;
+                            let ltr_http = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(5))
+                                .build()
+                                .expect("lighter rest http client");
+                            rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
+                                name: "lighter".to_string(),
+                                venue_index: vi,
+                                fetcher: Box::new(move || {
+                                    let h = ltr_http.clone();
+                                    let ru = rest_url.clone();
+                                    let m = market.clone();
+                                    Box::pin(async move {
+                                        paraphina::live::rest_health_monitor::fetch_lighter_l2_snapshot(
+                                            &h, &ru, &m, vi,
+                                        )
+                                        .await
+                                    })
+                                }),
+                            });
+                        }
                         let lighter_funding = lighter_arc.clone();
                         let funding_poll_ms = std::env::var("LIGHTER_FUNDING_POLL_MS")
                             .ok()
