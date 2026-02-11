@@ -1,10 +1,34 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::Mutex;
 
 use super::types::MarketDataEvent;
+
+static MARKET_PUBLISHER_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
+static MP_TRY_SEND_FULL_COUNT: AtomicU64 = AtomicU64::new(0);
+static MP_PENDING_LATEST_REPLACED_COUNT: AtomicU64 = AtomicU64::new(0);
+static MP_LOSSLESS_WAIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn market_publisher_ws_audit_enabled() -> bool {
+    *MARKET_PUBLISHER_WS_AUDIT_ENABLED.get_or_init(|| {
+        std::env::var("PARAPHINA_WS_AUDIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn market_publisher_audit_counter(name: &str, count: u64) {
+    if !market_publisher_ws_audit_enabled() {
+        return;
+    }
+    if count <= 3 || count % 1000 == 0 {
+        eprintln!("WS_AUDIT component=market_publisher {}={}", name, count);
+    }
+}
 
 pub(crate) struct MarketPublisher {
     market_pub_tx: mpsc::Sender<MarketDataEvent>,
@@ -99,6 +123,10 @@ impl MarketPublisher {
             return Ok(());
         }
         if (self.is_lossless)(&event) {
+            if self.market_pub_tx.capacity() == 0 {
+                let count = MP_LOSSLESS_WAIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                market_publisher_audit_counter("mp_lossless_wait_count", count);
+            }
             self.market_pub_tx
                 .send(event)
                 .await
@@ -108,7 +136,17 @@ impl MarketPublisher {
         match self.market_pub_tx.try_send(event) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(event)) => {
+                let full_count = MP_TRY_SEND_FULL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                market_publisher_audit_counter("mp_try_send_full_count", full_count);
                 let mut pending = self.pending_latest.lock().await;
+                if pending.is_some() {
+                    let replaced_count =
+                        MP_PENDING_LATEST_REPLACED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    market_publisher_audit_counter(
+                        "mp_pending_latest_replaced_count",
+                        replaced_count,
+                    );
+                }
                 *pending = Some(event);
                 Ok(())
             }

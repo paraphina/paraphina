@@ -1,11 +1,12 @@
 //! Aster connector (public WS market data + fixtures, feature-gated).
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, OnceLock,
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -49,6 +50,8 @@ const ASTER_MARKET_PUB_QUEUE_CAP_FIXTURE: usize = 4096;
 const ASTER_MARKET_PUB_DRAIN_MAX: usize = 64;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
+static ASTER_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
+static ASTER_RECONNECT_COUNTS: OnceLock<StdMutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
 
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
@@ -78,6 +81,32 @@ fn is_aster_fixture_mode_now() -> bool {
     env_is_true("ASTER_FIXTURE_MODE")
         || std::env::var_os("ASTER_FIXTURE_DIR").is_some()
         || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some()
+}
+
+fn aster_ws_audit_enabled() -> bool {
+    *ASTER_WS_AUDIT_ENABLED.get_or_init(|| {
+        std::env::var("PARAPHINA_WS_AUDIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn aster_audit_reconnect(reason: &'static str) {
+    if !aster_ws_audit_enabled() {
+        return;
+    }
+    let mut counts = ASTER_RECONNECT_COUNTS
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+        .expect("aster reconnect audit mutex poisoned");
+    let count = counts
+        .entry(reason)
+        .and_modify(|value| *value += 1)
+        .or_insert(1);
+    eprintln!(
+        "WS_AUDIT venue=aster reconnect_reason={} count={}",
+        reason, *count
+    );
 }
 
 #[derive(Debug, Default)]
@@ -278,6 +307,7 @@ impl AsterConnector {
                     );
                 }
                 Err(_timeout) => {
+                    aster_audit_reconnect("session_timeout");
                     eprintln!(
                         "ERROR: Aster public WS session timeout ({}s) — force reconnect",
                         max_session.as_secs()
@@ -343,19 +373,13 @@ impl AsterConnector {
         // and avoids issues with subscribe ACK frames and silent subscription
         // failures.
         let stream = format!("{}@depth@100ms", self.cfg.stream_symbol());
-        let ws_url = format!(
-            "{}/{}",
-            self.cfg.ws_url.trim_end_matches('/'),
-            stream
-        );
+        let ws_url = format!("{}/{}", self.cfg.ws_url.trim_end_matches('/'), stream);
         eprintln!("INFO: Aster public WS connecting url={}", ws_url);
-        let (ws_stream, _) = tokio::time::timeout(
-            Duration::from_secs(15),
-            connect_async(ws_url.as_str()),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Aster public WS connect timeout (15s)"))?
-        .map_err(|e| anyhow::anyhow!("Aster public WS connect error: {e}"))?;
+        let (ws_stream, _) =
+            tokio::time::timeout(Duration::from_secs(15), connect_async(ws_url.as_str()))
+                .await
+                .map_err(|_| anyhow::anyhow!("Aster public WS connect timeout (15s)"))?
+                .map_err(|e| anyhow::anyhow!("Aster public WS connect error: {e}"))?;
         eprintln!("INFO: Aster public WS connected url={}", ws_url);
         let (mut write, mut read) = ws_stream.split();
 
@@ -427,6 +451,7 @@ impl AsterConnector {
                 tokio::select! {
                     biased;
                     _ = &mut stale_rx => {
+                        aster_audit_reconnect("stale_watchdog");
                         anyhow::bail!("Aster public WS stale: freshness exceeded {}ms", stale_ms);
                     }
                     snapshot = future => {
@@ -528,6 +553,7 @@ impl AsterConnector {
                                 }
                                 SeqDecision::Stale => {}
                                 SeqDecision::Gap => {
+                                    aster_audit_reconnect("seq_gap");
                                     if last_gap_log.elapsed() > Duration::from_secs(10) {
                                         eprintln!(
                                             "WARN: Aster loop1 seq gap in buffered drain; snap_id={} next_last={} update_start={} update_end={} update_prev={:?}",
@@ -592,6 +618,7 @@ impl AsterConnector {
                         if stale > Duration::from_millis(STALE_MS)
                             && (cooldown_ok || stale >= Duration::from_millis(15_000))
                         {
+                            aster_audit_reconnect("stale_watchdog");
                             eprintln!(
                                 "WARN: Aster WS stale; resyncing url={} stale_ms={}",
                                 self.cfg.ws_url,
@@ -693,6 +720,7 @@ impl AsterConnector {
                                             // Still behind the snapshot, keep waiting.
                                         }
                                         SeqDecision::Gap => {
+                                            aster_audit_reconnect("seq_gap");
                                             // WS jumped past the snapshot — re-fetch.
                                             if last_gap_log.elapsed() > Duration::from_secs(10) {
                                                 eprintln!(
@@ -728,10 +756,12 @@ impl AsterConnector {
             tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
+                    aster_audit_reconnect("stale_watchdog");
                     anyhow::bail!("Aster public WS stale: freshness exceeded {}ms", stale_ms);
                 }
                 _ = ping_timer.tick() => {
                     if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        aster_audit_reconnect("ping_send_fail");
                         eprintln!("WARN: Aster public WS ping send failed: {e} — reconnecting");
                         anyhow::bail!("Aster public WS ping send failed: {e}");
                     }
@@ -741,6 +771,7 @@ impl AsterConnector {
                     let maybe = match read_result {
                         Ok(m) => m,
                         Err(_) => {
+                            aster_audit_reconnect("read_timeout");
                             eprintln!(
                                 "WARN: Aster public WS read timeout (30s) — no frame received, reconnecting"
                             );
@@ -801,6 +832,7 @@ impl AsterConnector {
                                 }
                                 SeqDecision::Stale => {}
                                 SeqDecision::Gap => {
+                                    aster_audit_reconnect("seq_gap");
                                     if last_gap_log.elapsed() > Duration::from_secs(30) {
                                         eprintln!(
                                             "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
@@ -864,6 +896,7 @@ impl AsterConnector {
                                     }
                                     SeqDecision::Stale => {}
                                     SeqDecision::Gap => {
+                                        aster_audit_reconnect("seq_gap");
                                         if last_gap_log.elapsed() > Duration::from_secs(30) {
                                             eprintln!(
                                                 "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
@@ -910,6 +943,7 @@ impl AsterConnector {
                     if stale > Duration::from_millis(STALE_MS)
                         && (cooldown_ok || stale >= Duration::from_millis(15_000))
                     {
+                        aster_audit_reconnect("stale_watchdog");
                         eprintln!(
                             "WARN: Aster WS stale; resyncing url={} stale_ms={}",
                             self.cfg.ws_url,
