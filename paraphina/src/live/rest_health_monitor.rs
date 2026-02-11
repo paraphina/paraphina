@@ -11,7 +11,7 @@
 //! connectors — it reads ages from the runner and fetches data
 //! independently.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
@@ -78,15 +78,31 @@ pub async fn run_rest_health_monitor(
 ) {
     let mut interval = tokio::time::interval(cfg.poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let monitor_start_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
 
     // Track whether each venue was logged as active/inactive.
     let mut active: Vec<bool> = vec![false; venues.len()];
 
     loop {
         interval.tick().await;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
 
         for (i, venue) in venues.iter().enumerate() {
-            let age = ages.age_ms(venue.venue_index);
+            let raw_age = ages.age_ms(venue.venue_index);
+            // i64::MAX means "unknown/uninitialized"; avoid instant startup fallback.
+            // Treat unknown as elapsed time since monitor start so fallback can still
+            // activate if no real updates arrive within threshold.
+            let age = if raw_age == i64::MAX {
+                (now_ms - monitor_start_ms).max(0)
+            } else {
+                raw_age
+            };
             if age < cfg.rest_threshold_ms {
                 if active[i] {
                     eprintln!(

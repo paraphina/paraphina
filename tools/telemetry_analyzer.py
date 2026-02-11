@@ -238,6 +238,8 @@ class TelemetryAccumulator:
         self.venue_status_counts: list[Counter] = [Counter() for _ in range(NUM_VENUES)]
         self.venue_age_stats: list[OnlineStats] = [OnlineStats() for _ in range(NUM_VENUES)]
         self.venue_age_windows: list[WindowAccumulator] = [WindowAccumulator() for _ in range(NUM_VENUES)]
+        self.venue_age_event_stats: list[OnlineStats] = [OnlineStats() for _ in range(NUM_VENUES)]
+        self.venue_age_event_windows: list[WindowAccumulator] = [WindowAccumulator() for _ in range(NUM_VENUES)]
         self.venue_status_flips: list[int] = [0] * NUM_VENUES
         self.venue_prev_status: list[str | None] = [None] * NUM_VENUES
         self.venue_consecutive_stale: list[int] = [0] * NUM_VENUES
@@ -382,6 +384,7 @@ class TelemetryAccumulator:
         # === Dimension 1: Venue Health ===
         venue_status = rec.get("venue_status", [])
         venue_age = rec.get("venue_age_ms", [])
+        venue_age_event = rec.get("venue_age_event_ms", [])
         stale_this_tick = 0
 
         for i in range(NUM_VENUES):
@@ -409,6 +412,15 @@ class TelemetryAccumulator:
             if age_f is not None and age_f >= 0:
                 self.venue_age_stats[i].push(age_f)
                 self.venue_age_windows[i].push(age_f)
+
+            age_event_f = safe_float(
+                venue_age_event[i]
+                if isinstance(venue_age_event, list) and i < len(venue_age_event)
+                else None
+            )
+            if age_event_f is not None and age_event_f >= 0:
+                self.venue_age_event_stats[i].push(age_event_f)
+                self.venue_age_event_windows[i].push(age_event_f)
 
         if stale_this_tick >= 2:
             self.multi_stale_ticks += 1
@@ -875,6 +887,11 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     for i in range(NUM_VENUES):
         lines.append(acc.venue_age_stats[i].summary_line(VENUE_NAMES[i], "ms"))
 
+    if any(stat.n > 0 for stat in acc.venue_age_event_stats):
+        subsection("Venue Event Age (ms) Statistics")
+        for i in range(NUM_VENUES):
+            lines.append(acc.venue_age_event_stats[i].summary_line(VENUE_NAMES[i], "ms"))
+
     lines.append(f"\n  Correlated staleness (2+ venues stale simultaneously): {acc.multi_stale_ticks} ticks ({pct(acc.multi_stale_ticks, acc.tick_count)})")
 
     # Dimension 2: Tick Timing
@@ -1297,6 +1314,24 @@ def generate_report(acc: TelemetryAccumulator) -> str:
                 ])
             lines.append(format_table(headers_a, rows_a))
 
+    if any(w.current_window.n > 0 for w in acc.venue_age_event_windows):
+        section("APPENDIX: VENUE EVENT AGE TREND (per window)")
+        for i in range(NUM_VENUES):
+            trend_age_event = acc.venue_age_event_windows[i].trend_summary()
+            if trend_age_event:
+                lines.append(f"\n  {VENUE_NAMES[i]}:")
+                headers_ae = ["Window", "Mean_ms", "P95_ms", "P99_ms", "Max_ms"]
+                rows_ae = []
+                for w in trend_age_event:
+                    rows_ae.append([
+                        f"{w['tick_start']}-{w['tick_end']}",
+                        fmt_f(w.get("mean"), 1),
+                        fmt_f(w.get("p95"), 1),
+                        fmt_f(w.get("p99"), 1),
+                        fmt_f(w.get("max"), 1),
+                    ])
+                lines.append(format_table(headers_ae, rows_ae))
+
     lines.append("")
     lines.append("=" * 80)
     lines.append("  END OF REPORT")
@@ -1359,6 +1394,9 @@ def save_checkpoint(acc: TelemetryAccumulator, path: Path) -> None:
         snapshot["venue_health"][VENUE_NAMES[i]] = {
             "healthy_pct": round(100.0 * healthy / total, 4) if total > 0 else 0,
             "age_p95": round(acc.venue_age_stats[i].percentile(95), 2) if acc.venue_age_stats[i].n > 0 else None,
+            "age_event_p95": round(acc.venue_age_event_stats[i].percentile(95), 2)
+            if acc.venue_age_event_stats[i].n > 0
+            else None,
             "flips": acc.venue_status_flips[i],
         }
 
@@ -1441,6 +1479,7 @@ def regression_scorecard(prev_path: Path, curr_snapshot: dict) -> str:
         cvh = curr_snapshot.get("venue_health", {}).get(vn, {})
         lines.append(compare(f"{vn} healthy%", pvh.get("healthy_pct"), cvh.get("healthy_pct"), lower_is_better=False))
         lines.append(compare(f"{vn} age p95", pvh.get("age_p95"), cvh.get("age_p95")))
+        lines.append(compare(f"{vn} age_event p95", pvh.get("age_event_p95"), cvh.get("age_event_p95")))
 
     # Anomalies
     pa = prev.get("anomalies", {})

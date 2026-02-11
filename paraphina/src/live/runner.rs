@@ -1628,10 +1628,11 @@ pub async fn run_live_loop(
             }
             disabled.clear();
         }
-        // Update SharedVenueAges for Layer A (enforcer) and Layer B (REST monitor).
+        // Update SharedVenueAges for Layer A (enforcer) and Layer B (REST monitor)
+        // using local apply-age semantics.
         if let Some(ref ages) = shared_venue_ages {
             for (idx, venue) in state.venues.iter().enumerate() {
-                let age = match venue.last_mid_update_ms {
+                let age = match venue.last_mid_apply_ms {
                     None => i64::MAX,
                     Some(ts) => (now_ms - ts).max(0),
                 };
@@ -2360,7 +2361,7 @@ fn apply_market_event_to_core(
     match event {
         super::types::MarketDataEvent::L2Snapshot(snapshot) => {
             if let Some(v) = state.venues.get_mut(snapshot.venue_index) {
-                let _ = v.apply_l2_snapshot(
+                if let Ok(metrics) = v.apply_l2_snapshot(
                     &snapshot.bids,
                     &snapshot.asks,
                     snapshot.seq,
@@ -2368,19 +2369,27 @@ fn apply_market_event_to_core(
                     max_levels,
                     alpha_short,
                     alpha_long,
-                );
+                ) {
+                    if metrics.mid.is_some() && metrics.spread.is_some() {
+                        v.last_mid_apply_ms = Some(now_ms);
+                    }
+                }
             }
         }
         super::types::MarketDataEvent::L2Delta(delta) => {
             if let Some(v) = state.venues.get_mut(delta.venue_index) {
-                let _ = v.apply_l2_delta(
+                if let Ok(metrics) = v.apply_l2_delta(
                     &delta.changes,
                     delta.seq,
                     delta.timestamp_ms,
                     max_levels,
                     alpha_short,
                     alpha_long,
-                );
+                ) {
+                    if metrics.mid.is_some() && metrics.spread.is_some() {
+                        v.last_mid_apply_ms = Some(now_ms);
+                    }
+                }
             }
         }
         super::types::MarketDataEvent::Trade(_) => {}

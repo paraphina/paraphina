@@ -620,6 +620,7 @@ def render_frame(  # noqa: C901
     v_mid = record.get("venue_mid_usd", [])
     v_spread = record.get("venue_spread_usd", [])
     v_age = record.get("venue_age_ms", [])
+    v_age_event = record.get("venue_age_event_ms", [])
     v_pos = record.get("venue_position_tao", [])
     v_fund_rate = record.get("venue_funding_rate_8h", [])
     v_fund_age = record.get("venue_funding_age_ms", [])
@@ -646,6 +647,8 @@ def render_frame(  # noqa: C901
         vid = fill_item.get("venue_id")
         if isinstance(vid, str):
             fill_counts[vid] = fill_counts.get(vid, 0) + 1
+
+    show_age_event = isinstance(v_age_event, list) and len(v_age_event) > 0
 
     rows: list[list[str]] = []
     for idx, venue_id in enumerate(venue_ids):
@@ -684,6 +687,9 @@ def render_frame(  # noqa: C901
         spread_f = _color_val(spread_f, safe_float(spread_val), 0.5, 2.0)
         age_f = format_ms(age_val)
         age_f = _color_val(age_f, safe_float(safe_int(age_val)), 2000, 5000)
+        age_event_val = v_age_event[idx] if idx < len(v_age_event) else None
+        age_event_f = format_ms(age_event_val)
+        age_event_f = _color_val(age_event_f, safe_float(safe_int(age_event_val)), 2000, 5000)
         pos_f = format_num(pos_val, 8).strip()
         pos_f = _color_val(pos_f, safe_float(pos_val), 0.1, 1.0)
         fund_rate_f = format_num(fund_rate_val, 8).strip()
@@ -691,12 +697,16 @@ def render_frame(  # noqa: C901
         fund_status_f = color_health(format_status(fund_status_val))
         orders_f = str(open_orders)
 
-        rows.append(
+        row = [
+            styled(venue_id, S.BOLD, S.WHITE),
+            mid_f,
+            spread_f,
+            age_f,
+        ]
+        if show_age_event:
+            row.append(age_event_f)
+        row.extend(
             [
-                styled(venue_id, S.BOLD, S.WHITE),
-                mid_f,
-                spread_f,
-                age_f,
                 pos_f,
                 fund_rate_f,
                 fund_age_f,
@@ -707,27 +717,30 @@ def render_frame(  # noqa: C901
                 f"{stale_s}{_LABEL('/')}{str(flips)}",
             ]
         )
+        rows.append(row)
 
     lines.append(_section("Venues"))
-    lines.append(
-        format_table(
-            [
-                "venue",
-                "mid",
-                "spread",
-                "age_ms",
-                "pos",
-                "fund_8h",
-                "fund_age",
-                "fund_status",
-                "orders",
-                "last_fill",
-                "health",
-                "stale%/flips",
-            ],
-            rows,
-        )
+    headers = [
+        "venue",
+        "mid",
+        "spread",
+        "age_ms",
+    ]
+    if show_age_event:
+        headers.append("age_event_ms")
+    headers.extend(
+        [
+            "pos",
+            "fund_8h",
+            "fund_age",
+            "fund_status",
+            "orders",
+            "last_fill",
+            "health",
+            "stale%/flips",
+        ]
     )
+    lines.append(format_table(headers, rows))
 
     # ── Event logs ────────────────────────────────────────────────────────
     def _event_section(

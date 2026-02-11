@@ -182,8 +182,10 @@ pub struct VenueState {
     pub spread: Option<f64>,
     /// Depth near mid (sum within top-K levels).
     pub depth_near_mid: f64,
-    /// Last time (ms) we updated the mid / spread.
+    /// Last connector/event timestamp (ms) used to update mid/spread.
     pub last_mid_update_ms: Option<TimestampMs>,
+    /// Last local apply timestamp (ms) when runner applied valid mid/spread.
+    pub last_mid_apply_ms: Option<TimestampMs>,
     /// Last time (ms) we applied a book snapshot or delta.
     pub last_book_update_ms: Option<TimestampMs>,
     /// Core L2 order book (bounded).
@@ -730,6 +732,7 @@ impl GlobalState {
                 spread: None,
                 depth_near_mid: 0.0,
                 last_mid_update_ms: None,
+                last_mid_apply_ms: None,
                 last_book_update_ms: None,
                 orderbook_l2: OrderBookL2::new(),
                 local_vol_short: 0.0,

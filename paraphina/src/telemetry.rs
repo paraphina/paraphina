@@ -913,7 +913,7 @@ fn compute_healthy_venues_used(
         if fixture_mode {
             // Fixture mode: skip staleness gating due to async timing skew.
             // Just check that venue has received at least one book update.
-            if venue.last_mid_update_ms.is_some() {
+            if venue.last_mid_apply_ms.is_some() {
                 out.push(idx);
             }
         } else {
@@ -923,7 +923,7 @@ fn compute_healthy_venues_used(
                 .get(idx)
                 .map(|v| v.effective_stale_ms(global_stale_ms))
                 .unwrap_or(global_stale_ms);
-            let age_ms = compute_age_ms(effective_now, venue.last_mid_update_ms);
+            let age_ms = compute_age_ms(effective_now, venue.last_mid_apply_ms);
             if age_ms >= 0 && age_ms <= venue_stale_ms {
                 out.push(idx);
             }
@@ -1613,6 +1613,7 @@ fn build_venue_metrics(
     let mut venue_status = Vec::new();
     let mut venue_toxicity = Vec::new();
     let mut venue_age_ms = Vec::new();
+    let mut venue_age_event_ms = Vec::new();
     let mut venue_position = Vec::new();
     let mut venue_dist_liq_sigma = Vec::new();
     let mut venue_funding_8h = Vec::new();
@@ -1637,7 +1638,8 @@ fn build_venue_metrics(
         venue_mid.push(venue.mid.unwrap_or(0.0));
         venue_spread.push(venue.spread.unwrap_or(0.0));
         venue_depth.push(venue.depth_near_mid);
-        let age = compute_age_ms(effective_now, venue.last_mid_update_ms);
+        let age_apply = compute_age_ms(effective_now, venue.last_mid_apply_ms);
+        let age_event = compute_age_ms(effective_now, venue.last_mid_update_ms);
         // Fail-closed in live mode: report "Stale" if age exceeds per-venue threshold.
         // In fixture mode: skip staleness override due to async timing skew.
         let venue_stale_ms = cfg
@@ -1647,7 +1649,7 @@ fn build_venue_metrics(
             .unwrap_or(global_stale_ms);
         let effective_status = if matches!(venue.status, VenueStatus::Disabled) {
             "Disabled".to_string()
-        } else if !fixture_mode && (age < 0 || age > venue_stale_ms) {
+        } else if !fixture_mode && (age_apply < 0 || age_apply > venue_stale_ms) {
             // Fail-closed in live mode only: override to "Stale" if age exceeds threshold.
             "Stale".to_string()
         } else {
@@ -1655,7 +1657,8 @@ fn build_venue_metrics(
         };
         venue_status.push(effective_status);
         venue_toxicity.push(venue.toxicity);
-        venue_age_ms.push(age);
+        venue_age_ms.push(age_apply);
+        venue_age_event_ms.push(age_event);
         venue_position.push(venue.position_tao);
         venue_dist_liq_sigma.push(venue.dist_liq_sigma);
         venue_funding_8h.push(venue.funding_8h);
@@ -1712,6 +1715,10 @@ fn build_venue_metrics(
             serde_json::json!(venue_toxicity),
         ),
         ("venue_age_ms".to_string(), serde_json::json!(venue_age_ms)),
+        (
+            "venue_age_event_ms".to_string(),
+            serde_json::json!(venue_age_event_ms),
+        ),
         (
             "venue_position_tao".to_string(),
             serde_json::json!(venue_position),
@@ -1848,6 +1855,7 @@ mod tests {
             venue.spread = Some(0.5);
             venue.depth_near_mid = 10.0 + idx as f64;
             venue.last_mid_update_ms = Some(1_000);
+            venue.last_mid_apply_ms = Some(1_000);
         }
         let stale_ms = cfg.book.stale_ms;
         let metrics = build_venue_metrics(&cfg, &state, 1_050, stale_ms);
@@ -1861,6 +1869,11 @@ mod tests {
             .find(|(k, _)| k == "venue_age_ms")
             .and_then(|(_, v)| v.as_array())
             .expect("venue_age_ms");
+        let age_event = metrics
+            .iter()
+            .find(|(k, _)| k == "venue_age_event_ms")
+            .and_then(|(_, v)| v.as_array())
+            .expect("venue_age_event_ms");
         let depth = metrics
             .iter()
             .find(|(k, _)| k == "venue_depth_near_mid_usd")
@@ -1869,6 +1882,7 @@ mod tests {
         for idx in 0..cfg.venues.len() {
             assert!(mid[idx].as_f64().unwrap_or(0.0) > 0.0);
             assert!(age[idx].as_i64().unwrap_or(-1) >= 0);
+            assert!(age_event[idx].as_i64().unwrap_or(-1) >= 0);
             assert!(depth[idx].as_f64().unwrap_or(0.0) > 0.0);
         }
     }
@@ -1894,6 +1908,7 @@ mod tests {
             venue.status = status;
             if matches!(venue.status, VenueStatus::Healthy) {
                 venue.last_mid_update_ms = Some(900);
+                venue.last_mid_apply_ms = Some(900);
             }
         }
         let mut builder = TelemetryBuilder::new(&cfg);
@@ -1935,8 +1950,10 @@ mod tests {
 
         state.venues[0].status = VenueStatus::Healthy;
         state.venues[0].last_mid_update_ms = Some(now_ms + 500);
+        state.venues[0].last_mid_apply_ms = Some(now_ms + 500);
         state.venues[1].status = VenueStatus::Healthy;
         state.venues[1].last_mid_update_ms = None;
+        state.venues[1].last_mid_apply_ms = None;
 
         let metrics = build_venue_metrics(&cfg, &state, now_ms, stale_ms);
         let age = metrics
@@ -1962,17 +1979,20 @@ mod tests {
         state.venues[0].status = VenueStatus::Healthy;
         state.venues[0].mid = Some(100.0);
         state.venues[0].last_mid_update_ms = Some(now_ms - 50);
+        state.venues[0].last_mid_apply_ms = Some(now_ms - 50);
 
         // Venue 1: stale (updated 5000ms ago, beyond stale_ms=1000)
         // Internal status is still Healthy, but telemetry should report Stale.
         state.venues[1].status = VenueStatus::Healthy;
         state.venues[1].mid = Some(100.0);
         state.venues[1].last_mid_update_ms = Some(now_ms - 5000);
+        state.venues[1].last_mid_apply_ms = Some(now_ms - 5000);
 
         // Venue 2: Disabled (should remain Disabled regardless of age)
         state.venues[2].status = VenueStatus::Disabled;
         state.venues[2].mid = Some(100.0);
         state.venues[2].last_mid_update_ms = Some(now_ms - 50);
+        state.venues[2].last_mid_apply_ms = Some(now_ms - 50);
 
         // Check build_venue_metrics reports correct status.
         let metrics = build_venue_metrics(&cfg, &state, now_ms, stale_ms);
@@ -2034,6 +2054,7 @@ mod tests {
         state.venues[0].status = VenueStatus::Healthy;
         state.venues[0].mid = Some(100.0);
         state.venues[0].last_mid_update_ms = Some(now_ms - 500);
+        state.venues[0].last_mid_apply_ms = Some(now_ms - 500);
 
         // Venue 1: override to 3000ms (simulating high-latency venue).
         // Set last update 2000ms ago => would be stale with global, but healthy with override.
@@ -2041,11 +2062,13 @@ mod tests {
         state.venues[1].status = VenueStatus::Healthy;
         state.venues[1].mid = Some(100.0);
         state.venues[1].last_mid_update_ms = Some(now_ms - 2000);
+        state.venues[1].last_mid_apply_ms = Some(now_ms - 2000);
 
         // Venue 2: no override, 1500ms old => stale with global threshold.
         state.venues[2].status = VenueStatus::Healthy;
         state.venues[2].mid = Some(100.0);
         state.venues[2].last_mid_update_ms = Some(now_ms - 1500);
+        state.venues[2].last_mid_apply_ms = Some(now_ms - 1500);
 
         // Check compute_healthy_venues_used respects per-venue threshold.
         let healthy = compute_healthy_venues_used(&cfg, &state, now_ms, global_stale_ms);
