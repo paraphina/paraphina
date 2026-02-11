@@ -65,3 +65,17 @@ This writes and prints:
 ## Notes
 - If a criterion fails, keep mode in `shadow`, adjust thresholds/ping/read-timeout knobs, and rerun the 90m soak.
 - Always compare reports using the same venue set and duration window.
+
+## Last known good CI shadow soak baseline (90m)
+- Artifact/run id: ws_shadow_soak_21913438356
+- Coverage: all 5 venues present (non-zero samples)
+- Apply-age p95/p99 (ms):
+  - aster: 0 / 0
+  - extended: 250 / 501
+  - hyperliquid: 501 / 751
+  - lighter: 0 / 0
+  - paradex: 250 / 500
+- Reconnects: none observed
+- Runner pressure: cap_hits = 0
+- Stale plateaus: none at 10s or 30s thresholds
+
