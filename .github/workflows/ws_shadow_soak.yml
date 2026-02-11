@@ -1,0 +1,91 @@
+name: ws-shadow-soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Soak duration in minutes"
+        required: true
+        default: "10"
+        type: choice
+        options:
+          - "10"
+          - "90"
+      lighter_ping_interval_ms:
+        description: "PARAPHINA_LIGHTER_PING_INTERVAL_MS"
+        required: true
+        default: "10000"
+      extended_ws_read_timeout_ms:
+        description: "PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS"
+        required: true
+        default: "45000"
+      connectors:
+        description: "Connector list passed to --connectors"
+        required: true
+        default: "hyperliquid,lighter,extended,aster,paradex"
+
+permissions:
+  contents: read
+
+jobs:
+  shadow-soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Prepare output directory
+        shell: bash
+        run: |
+          OUT_DIR="${{ runner.temp }}/ws_soak_${{ github.run_id }}"
+          mkdir -p "$OUT_DIR"
+          echo "OUT_DIR=$OUT_DIR" >> "$GITHUB_ENV"
+          echo "Using OUT_DIR=$OUT_DIR"
+
+      - name: Build and run shadow soak
+        shell: bash
+        run: |
+          PARAPHINA_LIVE_MODE=1 \
+          PARAPHINA_LIVE_PREFLIGHT_OK=1 \
+          PARAPHINA_WS_AUDIT=1 \
+          PARAPHINA_MARKET_RX_STATS=1 \
+          PARAPHINA_MARKET_RX_STATS_PATH="$OUT_DIR/market_rx_stats.log" \
+          PARAPHINA_TELEMETRY_MODE=jsonl \
+          PARAPHINA_TELEMETRY_PATH="$OUT_DIR/telemetry.jsonl" \
+          PARAPHINA_LIGHTER_PING_INTERVAL_MS=${{ inputs.lighter_ping_interval_ms }} \
+          PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS=${{ inputs.extended_ws_read_timeout_ms }} \
+          timeout ${{ inputs.duration_minutes }}m cargo run --release -p paraphina --bin paraphina_live --features "live_hyperliquid live_lighter live_extended live_aster live_paradex" -- \
+            --trade-mode shadow \
+            --connectors ${{ inputs.connectors }} \
+            --out-dir "$OUT_DIR" \
+            2>&1 | tee "$OUT_DIR/run.log" || true
+
+      - name: Generate soak report
+        if: always()
+        shell: bash
+        run: |
+          python3 tools/ws_soak_report.py --out-dir "$OUT_DIR" | tee "$OUT_DIR/ws_soak_report.stdout" || true
+
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ws_shadow_soak_${{ github.run_id }}
+          path: ${{ runner.temp }}/ws_soak_${{ github.run_id }}/*
+          if-no-files-found: warn
+
+      - name: Log summary
+        if: always()
+        shell: bash
+        run: |
+          ls -la "$OUT_DIR"
+          if [ -f "$OUT_DIR/ws_soak_report.md" ]; then
+            head -n 80 "$OUT_DIR/ws_soak_report.md"
+          else
+            echo "ws_soak_report.md not present"
+          fi
