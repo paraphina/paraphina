@@ -1,0 +1,51 @@
+# WS Frontier Status (Shadow Soak Runbook)
+
+## Scope
+- Mode is `shadow` only.
+- This runbook is for collecting soak evidence and preparing threshold tuning.
+
+## How To Run A 90m Soak
+```bash
+OUT_DIR=/tmp/ws_frontier_90m_$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$OUT_DIR"
+
+PARAPHINA_LIVE_MODE=1 \
+PARAPHINA_LIVE_PREFLIGHT_OK=1 \
+PARAPHINA_WS_AUDIT=1 \
+PARAPHINA_MARKET_RX_STATS=1 \
+PARAPHINA_MARKET_RX_STATS_PATH="$OUT_DIR/market_rx_stats.log" \
+PARAPHINA_TELEMETRY_MODE=jsonl \
+PARAPHINA_TELEMETRY_PATH="$OUT_DIR/telemetry.jsonl" \
+PARAPHINA_LIGHTER_PING_INTERVAL_MS=10000 \
+PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS=45000 \
+timeout 90m cargo run --release -p paraphina --bin paraphina_live \
+  --features "live_hyperliquid live_lighter live_extended live_aster live_paradex" -- \
+  --trade-mode shadow \
+  --connectors hyperliquid,lighter,extended,aster,paradex \
+  --out-dir "$OUT_DIR" \
+  2>&1 | tee "$OUT_DIR/run.log"
+```
+
+## How To Generate The Report
+```bash
+python3 tools/ws_soak_report.py --out-dir "$OUT_DIR"
+```
+
+This writes and prints:
+- `$OUT_DIR/ws_soak_report.md`
+
+## Frontier Readiness Acceptance Criteria
+
+| Category | Metric | Acceptance |
+| --- | --- | --- |
+| Coverage | All 5 venues present in `venue_age_ms` and `venue_age_event_ms` tables | Pass if all venues have non-zero sample counts |
+| Apply-age tail | `venue_age_ms` p95/p99 per venue | Pass if no venue exceeds p95 `10,000ms` or p99 `30,000ms` |
+| Event-age tail | `venue_age_event_ms` p95/p99 per venue | Pass if no venue exceeds p95 `12,000ms` or p99 `35,000ms` |
+| Stale plateaus | Max plateau duration at `threshold_ms=30000` | Pass if max plateau duration is `0s` for every venue |
+| Reconnect stability | Reconnect reasons (`stale_watchdog`, `read_timeout`, `ping_send_fail`, `session_timeout`) | Pass if no venue has combined count `> 3` for any single reason |
+| Publisher pressure | `WS_AUDIT component=market_publisher` counters | Pass if `mp_try_send_full_count` and `mp_pending_latest_replaced_count` stay at `0` |
+| Runner pressure | `market_rx_stats.log` cap hits | Pass if estimated total `cap_hits == 0` and worst burst is `+0` |
+
+## Notes
+- If a criterion fails, keep mode in `shadow`, adjust thresholds/ping/read-timeout knobs, and rerun the 90m soak.
+- Always compare reports using the same venue set and duration window.
