@@ -61,6 +61,30 @@ fn lighter_ping_interval_ms() -> u64 {
         .unwrap_or(LIGHTER_PING_INTERVAL_MS_DEFAULT)
 }
 
+fn env_is_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn lighter_ws_readonly_enabled() -> bool {
+    env_is_true("PARAPHINA_LIGHTER_WS_READONLY")
+        || std::env::var("PARAPHINA_TRADE_MODE")
+            .map(|v| v.eq_ignore_ascii_case("shadow"))
+            .unwrap_or(false)
+}
+
+fn lighter_public_ws_url(base: &str, readonly: bool) -> String {
+    if !readonly || base.contains("readonly=") {
+        return base.to_string();
+    }
+    if base.contains('?') {
+        format!("{base}&readonly=true")
+    } else {
+        format!("{base}?readonly=true")
+    }
+}
+
 /// Wrap a future with a timeout, returning an anyhow error on expiration.
 async fn with_timeout<T>(
     duration: Duration,
@@ -642,6 +666,8 @@ impl LighterConnector {
         let connect_timeout = lighter_ws_connect_timeout();
         let read_timeout = lighter_ws_read_timeout();
         let ping_interval_ms = lighter_ping_interval_ms();
+        let readonly = lighter_ws_readonly_enabled();
+        let ws_url = lighter_public_ws_url(&self.cfg.ws_url, readonly);
 
         let (market_symbol, market_id) = self.resolve_market_id_and_symbol().await?;
 
@@ -672,15 +698,18 @@ impl LighterConnector {
             });
         }
 
-        eprintln!("INFO: Lighter public WS connecting url={}", self.cfg.ws_url);
+        eprintln!(
+            "INFO: Lighter public WS connecting readonly={} url={}",
+            readonly, ws_url
+        );
         let (ws_stream, _) = with_timeout(
             connect_timeout,
             "public WS connect",
-            connect_async(self.cfg.ws_url.as_str()),
+            connect_async(ws_url.as_str()),
         )
         .await?
         .map_err(|e| anyhow::anyhow!("Lighter public WS connect error: {e}"))?;
-        eprintln!("INFO: Lighter public WS connected url={}", self.cfg.ws_url);
+        eprintln!("INFO: Lighter public WS connected url={}", ws_url);
         let (mut write, mut read) = ws_stream.split();
         let channel = build_order_book_channel(market_id);
         let sub = json!({
