@@ -12,6 +12,7 @@ const LIGHTER_WATCHDOG_TICK_MS: u64 = 200;
 const LIGHTER_DECODE_WARN_INTERVAL_MS: u64 = 10_000;
 const LIGHTER_WS_CONNECT_TIMEOUT_MS_DEFAULT: u64 = 15_000;
 const LIGHTER_WS_READ_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+const LIGHTER_PING_INTERVAL_MS_DEFAULT: u64 = 30_000;
 /// Maximum consecutive delta decode failures before forcing a reconnect to
 /// obtain a fresh full snapshot.  Protects against book drift from missed deltas.
 const LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES: usize = 10;
@@ -19,6 +20,9 @@ const LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES: usize = 10;
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 static LIGHTER_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
 static LIGHTER_TS_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIGHTER_PING_SENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIGHTER_PING_SEND_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIGHTER_RECONNECT_COUNTS: OnceLock<StdMutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
 
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
@@ -48,6 +52,13 @@ fn lighter_ws_read_timeout() -> Duration {
             .and_then(|v| v.parse().ok())
             .unwrap_or(LIGHTER_WS_READ_TIMEOUT_MS_DEFAULT),
     )
+}
+
+fn lighter_ping_interval_ms() -> u64 {
+    std::env::var("PARAPHINA_LIGHTER_PING_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LIGHTER_PING_INTERVAL_MS_DEFAULT)
 }
 
 /// Wrap a future with a timeout, returning an anyhow error on expiration.
@@ -98,10 +109,11 @@ impl Freshness {
     }
 }
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, OnceLock,
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -247,6 +259,24 @@ fn lighter_ws_audit_enabled() -> bool {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
+}
+
+fn lighter_audit_reconnect(reason: &'static str) {
+    if !lighter_ws_audit_enabled() {
+        return;
+    }
+    let mut counts = LIGHTER_RECONNECT_COUNTS
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lighter reconnect audit mutex poisoned");
+    let count = counts
+        .entry(reason)
+        .and_modify(|value| *value += 1)
+        .or_insert(1);
+    eprintln!(
+        "WS_AUDIT venue=lighter reconnect_reason={} count={}",
+        reason, *count
+    );
 }
 
 fn decode_market_timestamp_ms(value: &serde_json::Value, context: &str) -> TimestampMs {
@@ -547,6 +577,7 @@ impl LighterConnector {
                     consecutive_failures += 1;
                     let msg = err.to_string();
                     if msg.contains("Lighter subscribe failed") {
+                        lighter_audit_reconnect("subscribe_error");
                         subscribe_failures += 1;
                         if subscribe_failures >= 3 && !logged_subscribe_failure {
                             eprintln!(
@@ -571,6 +602,7 @@ impl LighterConnector {
                     }
                 }
                 Err(_timeout) => {
+                    lighter_audit_reconnect("session_timeout");
                     eprintln!(
                         "ERROR: Lighter public WS session timeout ({}s) — force reconnect",
                         max_session.as_secs()
@@ -609,6 +641,7 @@ impl LighterConnector {
     async fn public_ws_once(&self) -> anyhow::Result<()> {
         let connect_timeout = lighter_ws_connect_timeout();
         let read_timeout = lighter_ws_read_timeout();
+        let ping_interval_ms = lighter_ping_interval_ms();
 
         let (market_symbol, market_id) = self.resolve_market_id_and_symbol().await?;
 
@@ -673,16 +706,51 @@ impl LighterConnector {
         let mut seq_fallback: u64 = 0;
         // Rate-limited logging for decode failures
         let mut last_decode_fail_warn_ns: u64 = 0;
+        let ping_enabled = ping_interval_ms > 0;
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms.max(1)));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        if ping_enabled {
+            ping_timer.tick().await;
+        }
         loop {
             let msg = tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
+                    lighter_audit_reconnect("stale_watchdog");
                     anyhow::bail!("Lighter public WS stale: freshness exceeded {stale_ms}ms");
+                }
+                _ = ping_timer.tick(), if ping_enabled => {
+                    match write.send(Message::Ping(vec![b'p'].into())).await {
+                        Ok(()) => {
+                            if lighter_ws_audit_enabled() {
+                                let sent = LIGHTER_PING_SENT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                                if sent <= 3 || sent % 100 == 0 {
+                                    eprintln!(
+                                        "WS_AUDIT venue=lighter lighter_ping_sent_count={} interval_ms={}",
+                                        sent, ping_interval_ms
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            lighter_audit_reconnect("ping_send_fail");
+                            if lighter_ws_audit_enabled() {
+                                let fail = LIGHTER_PING_SEND_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                                eprintln!(
+                                    "WS_AUDIT venue=lighter lighter_ping_send_fail_count={} err={}",
+                                    fail, err
+                                );
+                            }
+                            anyhow::bail!("Lighter public WS ping send failed: {err}");
+                        }
+                    }
+                    continue;
                 }
                 read_result = tokio::time::timeout(read_timeout, read.next()) => {
                     let maybe = match read_result {
                         Ok(m) => m,
                         Err(_) => {
+                            lighter_audit_reconnect("read_timeout");
                             eprintln!(
                                 "WARN: Lighter public WS read timeout ({read_timeout:?}) — no frame received, reconnecting"
                             );
@@ -779,6 +847,7 @@ impl LighterConnector {
             if !subscribed {
                 if let Some(code) = lighter_error_code(&value) {
                     if code == 30005 {
+                        lighter_audit_reconnect("subscribe_error");
                         anyhow::bail!("Lighter subscribe failed: invalid channel");
                     }
                 }
@@ -896,6 +965,7 @@ impl LighterConnector {
                     if initial_snapshot_applied {
                         consecutive_delta_failures += 1;
                         if consecutive_delta_failures >= LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES {
+                            lighter_audit_reconnect("decode_fail_loop");
                             anyhow::bail!(
                                 "Lighter: {} consecutive delta decode failures — \
                                  forcing reconnect for fresh snapshot",

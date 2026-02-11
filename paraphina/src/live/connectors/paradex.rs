@@ -18,6 +18,7 @@ static MONO_START: OnceLock<Instant> = OnceLock::new();
 static PARADEX_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
 static PARADEX_PING_SENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PARADEX_PING_SEND_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static PARADEX_RECONNECT_COUNTS: OnceLock<StdMutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
 
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
@@ -37,6 +38,24 @@ fn paradex_ws_audit_enabled() -> bool {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
+}
+
+fn paradex_audit_reconnect(reason: &'static str) {
+    if !paradex_ws_audit_enabled() {
+        return;
+    }
+    let mut counts = PARADEX_RECONNECT_COUNTS
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+        .expect("paradex reconnect audit mutex poisoned");
+    let count = counts
+        .entry(reason)
+        .and_modify(|value| *value += 1)
+        .or_insert(1);
+    eprintln!(
+        "WS_AUDIT venue=paradex reconnect_reason={} count={}",
+        reason, *count
+    );
 }
 
 #[allow(dead_code)]
@@ -77,10 +96,11 @@ impl Freshness {
     }
 }
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, OnceLock,
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -270,6 +290,7 @@ impl ParadexConnector {
                     );
                 }
                 Err(_timeout) => {
+                    paradex_audit_reconnect("session_timeout");
                     eprintln!(
                         "ERROR: Paradex public WS session timeout ({}s) — force reconnect",
                         max_session.as_secs()
@@ -397,6 +418,7 @@ impl ParadexConnector {
             let msg = tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
+                    paradex_audit_reconnect("stale_watchdog");
                     anyhow::bail!("Paradex public WS stale: freshness exceeded {stale_ms}ms");
                 }
                 _ = ping_timer.tick() => {
@@ -413,6 +435,7 @@ impl ParadexConnector {
                             }
                         }
                         Err(err) => {
+                            paradex_audit_reconnect("ping_send_fail");
                             if paradex_ws_audit_enabled() {
                                 let fail =
                                     PARADEX_PING_SEND_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -430,6 +453,7 @@ impl ParadexConnector {
                     let maybe = match read_result {
                         Ok(m) => m,
                         Err(_) => {
+                            paradex_audit_reconnect("read_timeout");
                             eprintln!(
                                 "WARN: Paradex public WS read timeout (30s) — \
                                  no frame received, reconnecting"
@@ -502,6 +526,7 @@ impl ParadexConnector {
             }
             if !subscribed {
                 if paradex_subscribe_error(&value) {
+                    paradex_audit_reconnect("subscribe_error");
                     if let Some(err) = value.get("error") {
                         eprintln!("WARN: Paradex subscribe error: {err}");
                     }
@@ -566,7 +591,21 @@ impl ParadexConnector {
                     );
                 }
             }
-            if let Some(event) = parse_orderbook_message_value(&value, &mut tracker)? {
+            let event = match parse_orderbook_message_value(&value, &mut tracker) {
+                Ok(event) => event,
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("seq gap") {
+                        paradex_audit_reconnect("seq_gap");
+                    } else if msg.contains("seq mismatch") {
+                        paradex_audit_reconnect("seq_mismatch");
+                    } else {
+                        paradex_audit_reconnect("parse_error");
+                    }
+                    return Err(err);
+                }
+            };
+            if let Some(event) = event {
                 if !first_book_update_logged {
                     eprintln!("INFO: Paradex public WS first book update");
                     first_book_update_logged = true;
