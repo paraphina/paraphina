@@ -11,11 +11,14 @@ pub const SUPPORTS_EXECUTION: bool = true;
 
 const EXTENDED_STALE_MS_DEFAULT: u64 = 10_000;
 const EXTENDED_WATCHDOG_TICK_MS: u64 = 200;
+const EXTENDED_WS_READ_TIMEOUT_MS_DEFAULT: u64 = 10_000;
 const EXTENDED_MARKET_PUB_QUEUE_CAP_LIVE: usize = 256;
 const EXTENDED_MARKET_PUB_QUEUE_CAP_FIXTURE: usize = 4096;
 const EXTENDED_MARKET_PUB_DRAIN_MAX: usize = 64;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
+static EXTENDED_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
+static EXTENDED_RECONNECT_COUNTS: OnceLock<StdMutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
 
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
@@ -27,6 +30,41 @@ fn extended_stale_ms() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(EXTENDED_STALE_MS_DEFAULT)
+}
+
+fn extended_ws_read_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(EXTENDED_WS_READ_TIMEOUT_MS_DEFAULT),
+    )
+}
+
+fn extended_ws_audit_enabled() -> bool {
+    *EXTENDED_WS_AUDIT_ENABLED.get_or_init(|| {
+        std::env::var("PARAPHINA_WS_AUDIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn extended_audit_reconnect(reason: &'static str) {
+    if !extended_ws_audit_enabled() {
+        return;
+    }
+    let mut counts = EXTENDED_RECONNECT_COUNTS
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+        .expect("extended reconnect audit mutex poisoned");
+    let count = counts
+        .entry(reason)
+        .and_modify(|value| *value += 1)
+        .or_insert(1);
+    eprintln!(
+        "WS_AUDIT venue=extended reconnect_reason={} count={}",
+        reason, *count
+    );
 }
 
 #[allow(dead_code)]
@@ -70,10 +108,11 @@ impl Freshness {
     }
 }
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, OnceLock,
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -279,6 +318,7 @@ impl ExtendedConnector {
                     );
                 }
                 Err(_timeout) => {
+                    extended_audit_reconnect("session_timeout");
                     eprintln!(
                         "ERROR: Extended public WS session timeout ({}s) — force reconnect",
                         max_session.as_secs()
@@ -404,6 +444,7 @@ impl ExtendedConnector {
         }
 
         let ws_url = self.cfg.orderbook_ws_url();
+        let read_timeout = extended_ws_read_timeout();
         eprintln!("INFO: Extended public WS connecting url={}", ws_url);
         let mut request = ws_url.as_str().into_client_request()?;
         request
@@ -414,6 +455,12 @@ impl ExtendedConnector {
             .map_err(|_| anyhow::anyhow!("Extended public WS connect timeout (15s)"))?
             .map_err(|e| anyhow::anyhow!("Extended public WS connect error: {e}"))?;
         eprintln!("INFO: Extended public WS connected url={}", ws_url);
+        if extended_ws_audit_enabled() {
+            eprintln!(
+                "WS_AUDIT venue=extended extended_read_timeout_ms={}",
+                read_timeout.as_millis()
+            );
+        }
         let (mut write, mut read) = ws_stream.split();
 
         const MAX_PARSE_ERRORS: usize = 25;
@@ -464,25 +511,28 @@ impl ExtendedConnector {
             let next = tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
+                    extended_audit_reconnect("stale_watchdog");
                     anyhow::bail!("Extended public WS stale: freshness exceeded {stale_ms}ms");
                 }
                 _ = ping_timer.tick() => {
                     if let Err(e) = write.send(Message::Ping(vec![])).await {
+                        extended_audit_reconnect("ping_send_fail");
                         eprintln!("WARN: Extended public WS ping send failed: {e} — reconnecting");
                         anyhow::bail!("Extended public WS ping send failed: {e}");
                     }
                     continue;
                 }
-                next = tokio::time::timeout(Duration::from_secs(10), read.next()) => next,
+                next = tokio::time::timeout(read_timeout, read.next()) => next,
             };
             let msg = match next {
                 Ok(Some(msg)) => msg?,
                 Ok(None) => break,
                 Err(_) => {
+                    extended_audit_reconnect("read_timeout");
                     if !first_message_logged {
                         eprintln!(
-                            "WARN: Extended WS received no messages after 10s url={}",
-                            ws_url
+                            "WARN: Extended WS received no messages after {:?} url={}",
+                            read_timeout, ws_url
                         );
                         break;
                     }
@@ -543,6 +593,7 @@ impl ExtendedConnector {
                                 );
                             }
                             if consecutive_parse_errors > MAX_PARSE_ERRORS {
+                                extended_audit_reconnect("parse_error");
                                 eprintln!(
                                     "Extended public WS too many parse errors; reconnecting url={}",
                                     ws_url
@@ -634,7 +685,20 @@ impl ExtendedConnector {
                     if !symbol_matches(&update.symbol, &self.cfg.market) {
                         continue;
                     }
-                    let outcome = seq_state.apply_update(&update)?;
+                    let outcome = match seq_state.apply_update(&update) {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            let msg = err.to_string();
+                            if msg.contains("seq gap") {
+                                extended_audit_reconnect("seq_gap");
+                            } else if msg.contains("seq mismatch") {
+                                extended_audit_reconnect("seq_mismatch");
+                            } else {
+                                extended_audit_reconnect("parse_error");
+                            }
+                            return Err(err);
+                        }
+                    };
                     if let Some(event) = outcome {
                         consecutive_parse_errors = 0;
                         self.freshness
@@ -700,6 +764,7 @@ impl ExtendedConnector {
                                 );
                             }
                             if consecutive_parse_errors > MAX_PARSE_ERRORS {
+                                extended_audit_reconnect("parse_error");
                                 eprintln!(
                                     "Extended public WS too many parse errors; reconnecting url={}",
                                     ws_url
@@ -791,7 +856,20 @@ impl ExtendedConnector {
                     if !symbol_matches(&update.symbol, &self.cfg.market) {
                         continue;
                     }
-                    let outcome = seq_state.apply_update(&update)?;
+                    let outcome = match seq_state.apply_update(&update) {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            let msg = err.to_string();
+                            if msg.contains("seq gap") {
+                                extended_audit_reconnect("seq_gap");
+                            } else if msg.contains("seq mismatch") {
+                                extended_audit_reconnect("seq_mismatch");
+                            } else {
+                                extended_audit_reconnect("parse_error");
+                            }
+                            return Err(err);
+                        }
+                    };
                     if let Some(event) = outcome {
                         consecutive_parse_errors = 0;
                         self.freshness
