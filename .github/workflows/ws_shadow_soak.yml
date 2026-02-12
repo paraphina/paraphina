@@ -88,9 +88,11 @@ jobs:
       - name: Generate soak report
         if: always()
         shell: bash
+        env:
+          EXPECTED_CONNECTORS: ${{ github.event.inputs.connectors || 'hyperliquid,lighter,extended,aster,paradex' }}
         run: |
           set -o pipefail
-          python3 tools/ws_soak_report.py --out-dir "$OUT_DIR" | tee "$OUT_DIR/ws_soak_report.stdout"
+          python3 tools/ws_soak_report.py --out-dir "$OUT_DIR" --gate --expected-connectors "$EXPECTED_CONNECTORS" | tee "$OUT_DIR/ws_soak_report.stdout"
 
       - name: Upload soak artifacts
         if: always()
