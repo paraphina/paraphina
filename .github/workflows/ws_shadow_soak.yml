@@ -1,6 +1,8 @@
 name: ws-shadow-soak
 
 on:
+  schedule:
+    - cron: "0 4 * * 6"
   workflow_dispatch:
     inputs:
       duration_minutes:
@@ -27,6 +29,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ws-shadow-soak
+  cancel-in-progress: false
+
 jobs:
   shadow-soak:
     runs-on: ubuntu-latest
@@ -49,6 +55,11 @@ jobs:
 
       - name: Build and run shadow soak
         shell: bash
+        env:
+          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '90' }}
+          LIGHTER_PING_INTERVAL_MS: ${{ github.event.inputs.lighter_ping_interval_ms || '10000' }}
+          EXTENDED_WS_READ_TIMEOUT_MS: ${{ github.event.inputs.extended_ws_read_timeout_ms || '45000' }}
+          CONNECTORS: ${{ github.event.inputs.connectors || 'hyperliquid,lighter,extended,aster,paradex' }}
         run: |
           PARAPHINA_LIVE_MODE=1 \
           PARAPHINA_LIVE_PREFLIGHT_OK=1 \
@@ -58,11 +69,11 @@ jobs:
           PARAPHINA_TELEMETRY_MODE=jsonl \
           PARAPHINA_TELEMETRY_PATH="$OUT_DIR/telemetry.jsonl" \
           PARAPHINA_LIGHTER_WS_READONLY=1 \
-          PARAPHINA_LIGHTER_PING_INTERVAL_MS=${{ inputs.lighter_ping_interval_ms }} \
-          PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS=${{ inputs.extended_ws_read_timeout_ms }} \
-          timeout ${{ inputs.duration_minutes }}m cargo run --release -p paraphina --bin paraphina_live --features "live_hyperliquid live_lighter live_extended live_aster live_paradex" -- \
+          PARAPHINA_LIGHTER_PING_INTERVAL_MS=$LIGHTER_PING_INTERVAL_MS \
+          PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS=$EXTENDED_WS_READ_TIMEOUT_MS \
+          timeout ${DURATION_MINUTES}m cargo run --release -p paraphina --bin paraphina_live --features "live_hyperliquid live_lighter live_extended live_aster live_paradex" -- \
             --trade-mode shadow \
-            --connectors ${{ inputs.connectors }} \
+            --connectors $CONNECTORS \
             --out-dir "$OUT_DIR" \
             2>&1 | tee "$OUT_DIR/run.log" || true
 
