@@ -27,6 +27,22 @@ from typing import Any
 PLATEAU_THRESHOLDS_MS = (10_000, 30_000)
 PLATEAU_MIN_TICKS = 3
 VENUE_HINTS = ("extended", "hyperliquid", "aster", "lighter", "paradex")
+APPLY_P95_MAX_MS = 10_000.0
+APPLY_P99_MAX_MS = 30_000.0
+EVENT_P95_MAX_MS = 12_000.0
+EVENT_P99_MAX_MS = 35_000.0
+PLATEAU_GATE_THRESHOLD_MS = 30_000
+RECONNECT_GATE_MAX = 3
+RECONNECT_GATE_REASONS = (
+    "stale_watchdog",
+    "read_timeout",
+    "ping_send_fail",
+    "session_timeout",
+)
+PUBLISHER_GATE_COUNTERS = (
+    "mp_try_send_full_count",
+    "mp_pending_latest_replaced_count",
+)
 
 
 @dataclass
@@ -182,6 +198,18 @@ def md_table(headers: list[str], rows: list[list[str]]) -> str:
     for row in rows:
         out.append("| " + " | ".join(sanitize_cell(c) for c in row) + " |")
     return "\n".join(out)
+
+
+def parse_expected_connectors(raw: str) -> list[str]:
+    connectors: list[str] = []
+    seen: set[str] = set()
+    for token in raw.split(","):
+        name = token.strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        connectors.append(name)
+    return connectors
 
 
 def update_plateau(
@@ -470,6 +498,108 @@ def parse_market_rx_stats(path: Path) -> CapHitsSummary:
     return summary
 
 
+def combined_reconnect_count(
+    audit_reconnect: dict[tuple[str, str], int],
+    signature_reconnect: dict[tuple[str, str], int],
+    venue: str,
+    reason: str,
+) -> int:
+    audit_count = audit_reconnect.get((venue, reason), 0)
+    signature_count = signature_reconnect.get((venue, reason), 0)
+    combined = audit_count if audit_count > 0 else signature_count
+    if audit_count > 0 and signature_count > audit_count:
+        combined = signature_count
+    return combined
+
+
+def evaluate_frontier_gate(
+    apply_values: dict[str, list[float]],
+    event_values: dict[str, list[float]],
+    max_plateaus: dict[tuple[str, int], PlateauMax],
+    audit_reconnect: dict[tuple[str, str], int],
+    signature_reconnect: dict[tuple[str, str], int],
+    market_publisher_counters: dict[str, int],
+    cap_hits_summary: CapHitsSummary | None,
+    expected_connectors: list[str],
+    require_event_age: bool,
+) -> list[str]:
+    failures: list[str] = []
+
+    for venue in expected_connectors:
+        apply = apply_values.get(venue, [])
+        if not apply:
+            failures.append(f"missing apply-age coverage for venue '{venue}' (apply_n=0)")
+            continue
+        apply_p95 = percentile(apply, 95.0)
+        apply_p99 = percentile(apply, 99.0)
+        if apply_p95 is not None and apply_p95 > APPLY_P95_MAX_MS:
+            failures.append(
+                f"apply-age p95 above threshold for venue '{venue}' ({apply_p95:.1f}ms > {APPLY_P95_MAX_MS:.0f}ms)"
+            )
+        if apply_p99 is not None and apply_p99 > APPLY_P99_MAX_MS:
+            failures.append(
+                f"apply-age p99 above threshold for venue '{venue}' ({apply_p99:.1f}ms > {APPLY_P99_MAX_MS:.0f}ms)"
+            )
+
+        plateau = max_plateaus.get((venue, PLATEAU_GATE_THRESHOLD_MS), PlateauMax())
+        if plateau.duration_ms is not None and plateau.duration_ms > 0:
+            failures.append(
+                f"stale plateau at {PLATEAU_GATE_THRESHOLD_MS}ms for venue '{venue}' (max_duration_s={plateau.duration_ms / 1000.0:.2f})"
+            )
+        elif plateau.duration_ms is None and plateau.ticks > 0:
+            failures.append(
+                f"stale plateau at {PLATEAU_GATE_THRESHOLD_MS}ms for venue '{venue}' has non-zero ticks without duration"
+            )
+
+        for reason in RECONNECT_GATE_REASONS:
+            combined = combined_reconnect_count(
+                audit_reconnect=audit_reconnect,
+                signature_reconnect=signature_reconnect,
+                venue=venue,
+                reason=reason,
+            )
+            if combined > RECONNECT_GATE_MAX:
+                failures.append(
+                    f"reconnect threshold exceeded for venue '{venue}', reason '{reason}' (combined={combined} > {RECONNECT_GATE_MAX})"
+                )
+
+    if require_event_age:
+        for venue in expected_connectors:
+            event = event_values.get(venue, [])
+            if not event:
+                failures.append(f"missing event-age coverage for venue '{venue}' (event_n=0)")
+                continue
+            event_p95 = percentile(event, 95.0)
+            event_p99 = percentile(event, 99.0)
+            if event_p95 is not None and event_p95 > EVENT_P95_MAX_MS:
+                failures.append(
+                    f"event-age p95 above threshold for venue '{venue}' ({event_p95:.1f}ms > {EVENT_P95_MAX_MS:.0f}ms)"
+                )
+            if event_p99 is not None and event_p99 > EVENT_P99_MAX_MS:
+                failures.append(
+                    f"event-age p99 above threshold for venue '{venue}' ({event_p99:.1f}ms > {EVENT_P99_MAX_MS:.0f}ms)"
+                )
+
+    for name in PUBLISHER_GATE_COUNTERS:
+        value = market_publisher_counters.get(name)
+        if value is None:
+            failures.append(f"missing market_publisher counter '{name}'")
+        elif value != 0:
+            failures.append(f"market_publisher counter '{name}' is non-zero ({value})")
+
+    if cap_hits_summary is None:
+        failures.append("missing market_rx_stats.log (cap_hits evidence unavailable)")
+    else:
+        if cap_hits_summary.total_cap_hits_est != 0:
+            failures.append(
+                f"runner cap_hits total is non-zero ({cap_hits_summary.total_cap_hits_est})"
+            )
+        if cap_hits_summary.max_burst != 0:
+            failures.append(f"runner cap_hits max burst is non-zero (+{cap_hits_summary.max_burst})")
+
+    return failures
+
+
 def build_report(
     out_dir: Path,
     telemetry_summary: TelemetrySummary,
@@ -640,6 +770,18 @@ def build_report(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a markdown WS soak report from run artifacts.")
     parser.add_argument("--out-dir", required=True, help="Run output directory containing telemetry.jsonl and run.log")
+    parser.add_argument("--gate", action="store_true", help="Evaluate frontier readiness gate and return non-zero on failure.")
+    parser.add_argument(
+        "--expected-connectors",
+        default="",
+        help="Comma-separated connector list used for venue coverage/tail checks.",
+    )
+    parser.add_argument(
+        "--require-event-age",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require event-age coverage and thresholds when gate is enabled (default: true).",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -678,6 +820,28 @@ def main() -> int:
     report_path.write_text(report, encoding="utf-8")
     print(report, end="")
     print(f"\n_report saved to `{report_path}`_")
+
+    if args.gate:
+        expected_connectors = parse_expected_connectors(args.expected_connectors)
+        gate_failures = evaluate_frontier_gate(
+            apply_values={k.lower(): v for k, v in apply_values.items()},
+            event_values={k.lower(): v for k, v in event_values.items()},
+            max_plateaus={(venue.lower(), threshold): plateau for (venue, threshold), plateau in max_plateaus.items()},
+            audit_reconnect={(venue.lower(), reason.lower()): count for (venue, reason), count in audit_reconnect.items()},
+            signature_reconnect={
+                (venue.lower(), reason.lower()): count for (venue, reason), count in signature_reconnect.items()
+            },
+            market_publisher_counters=market_publisher,
+            cap_hits_summary=cap_hits,
+            expected_connectors=expected_connectors,
+            require_event_age=args.require_event_age,
+        )
+        if gate_failures:
+            print("GATE: FAIL")
+            for reason in gate_failures:
+                print(f"  - {reason}")
+            return 2
+        print("GATE: PASS")
     return 0
 
 
