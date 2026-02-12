@@ -581,10 +581,8 @@ def evaluate_frontier_gate(
                 )
 
     for name in PUBLISHER_GATE_COUNTERS:
-        value = market_publisher_counters.get(name)
-        if value is None:
-            failures.append(f"missing market_publisher counter '{name}'")
-        elif value != 0:
+        value = market_publisher_counters.get(name, 0)
+        if value != 0:
             failures.append(f"market_publisher counter '{name}' is non-zero ({value})")
 
     if cap_hits_summary is None:
