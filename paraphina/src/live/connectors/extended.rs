@@ -198,10 +198,16 @@ impl ExtendedConfig {
     }
 
     pub fn orderbook_ws_url(&self) -> String {
+        let depth_levels = std::env::var("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1);
         format!(
-            "{}/orderbooks/{}?depth=1",
+            "{}/orderbooks/{}?depth={}",
             self.ws_url.trim_end_matches('/'),
-            self.market
+            self.market,
+            depth_levels
         )
     }
 }

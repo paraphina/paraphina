@@ -361,14 +361,30 @@ impl ParadexConnector {
         eprintln!("INFO: Paradex public WS connected url={}", self.cfg.ws_url);
         let (mut write, mut read) = ws_stream.split();
         let mut subscribed = false;
-        let channel = format!("bbo.{}", self.cfg.market);
-        let subscribe =
-            ParadexSubscribeCandidate::new("subscribe", serde_json::json!({ "channel": channel }));
-        send_paradex_subscribe(&mut write, &subscribe).await?;
-        eprintln!(
-            "INFO: Paradex subscribed channel={}",
-            format!("bbo.{}", self.cfg.market)
-        );
+        let public_feed =
+            std::env::var("PARAPHINA_PARADEX_PUBLIC_FEED").unwrap_or_else(|_| "bbo".to_string());
+        if public_feed.eq_ignore_ascii_case("orderbook") {
+            let subscribe = ParadexSubscribeCandidate::new(
+                "subscribe",
+                serde_json::json!({ "channel": "orderbook", "market": self.cfg.market.as_str() }),
+            );
+            send_paradex_subscribe(&mut write, &subscribe).await?;
+            eprintln!(
+                "INFO: Paradex subscribed channel=orderbook market={}",
+                self.cfg.market
+            );
+        } else {
+            let channel = format!("bbo.{}", self.cfg.market);
+            let subscribe = ParadexSubscribeCandidate::new(
+                "subscribe",
+                serde_json::json!({ "channel": channel }),
+            );
+            send_paradex_subscribe(&mut write, &subscribe).await?;
+            eprintln!(
+                "INFO: Paradex subscribed channel={}",
+                format!("bbo.{}", self.cfg.market)
+            );
+        }
 
         let mut tracker = ParadexSeqState::new(self.cfg.venue_index);
         let mut first_book_update_logged = false;
