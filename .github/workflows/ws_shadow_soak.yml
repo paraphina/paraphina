@@ -21,6 +21,18 @@ on:
         description: "PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS"
         required: true
         default: "45000"
+      paradex_public_feed:
+        description: "PARAPHINA_PARADEX_PUBLIC_FEED"
+        required: true
+        default: "bbo"
+        type: choice
+        options:
+          - "bbo"
+          - "orderbook"
+      extended_ws_depth_levels:
+        description: "PARAPHINA_EXTENDED_WS_DEPTH_LEVELS"
+        required: true
+        default: "1"
       connectors:
         description: "Connector list passed to --connectors"
         required: true
@@ -59,6 +71,8 @@ jobs:
           DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '90' }}
           LIGHTER_PING_INTERVAL_MS: ${{ github.event.inputs.lighter_ping_interval_ms || '10000' }}
           EXTENDED_WS_READ_TIMEOUT_MS: ${{ github.event.inputs.extended_ws_read_timeout_ms || '45000' }}
+          PARADEX_PUBLIC_FEED: ${{ github.event.inputs.paradex_public_feed || 'bbo' }}
+          EXTENDED_WS_DEPTH_LEVELS: ${{ github.event.inputs.extended_ws_depth_levels || '1' }}
           CONNECTORS: ${{ github.event.inputs.connectors || 'hyperliquid,lighter,extended,aster,paradex' }}
         run: |
           set -o pipefail
@@ -73,6 +87,8 @@ jobs:
           PARAPHINA_LIGHTER_WS_READONLY=1 \
           PARAPHINA_LIGHTER_PING_INTERVAL_MS=$LIGHTER_PING_INTERVAL_MS \
           PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS=$EXTENDED_WS_READ_TIMEOUT_MS \
+          PARAPHINA_PARADEX_PUBLIC_FEED=$PARADEX_PUBLIC_FEED \
+          PARAPHINA_EXTENDED_WS_DEPTH_LEVELS=$EXTENDED_WS_DEPTH_LEVELS \
           timeout ${DURATION_MINUTES}m cargo run --release -p paraphina --bin paraphina_live --features "live_hyperliquid live_lighter live_extended live_aster live_paradex" -- \
             --trade-mode shadow \
             --connectors $CONNECTORS \
