@@ -203,12 +203,19 @@ impl ExtendedConfig {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(1)
             .max(1);
-        format!(
-            "{}/orderbooks/{}?depth={}",
-            self.ws_url.trim_end_matches('/'),
-            self.market,
-            depth_levels
-        )
+        if depth_levels <= 1 {
+            format!(
+                "{}/orderbooks/{}?depth=1",
+                self.ws_url.trim_end_matches('/'),
+                self.market
+            )
+        } else {
+            format!(
+                "{}/orderbooks/{}",
+                self.ws_url.trim_end_matches('/'),
+                self.market
+            )
+        }
     }
 }
 
