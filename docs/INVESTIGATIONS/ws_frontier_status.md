@@ -80,3 +80,23 @@ This writes and prints:
 - Runner pressure: cap_hits = 0
 - Stale plateaus: none at 10s or 30s thresholds
 
+## Last known good experimental uniform-depth profile (90m, defaults unchanged)
+- Workflow run: https://github.com/paraphina/paraphina/actions/runs/22017700807
+- Artifact/run id: ws_shadow_soak_22017700807
+- Workflow inputs (experimental):
+  - duration_minutes=90
+  - connectors=hyperliquid,lighter,extended,aster,paradex
+  - lighter_ping_interval_ms=10000
+  - extended_ws_read_timeout_ms=45000
+  - paradex_public_feed=orderbook
+  - extended_ws_depth_levels=10
+- Coverage: all 5 venues present (non-zero samples)
+- Apply-age p95/p99 (ms):
+  - aster: 0 / 0
+  - extended: 1250 / 2251
+  - hyperliquid: 500 / 501
+  - lighter: 0 / 0
+  - paradex: 0 / 0
+- Reconnects: none observed
+- Runner pressure: cap_hits = 0
+- Stale plateaus: none at 10s or 30s thresholds
