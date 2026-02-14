@@ -363,16 +363,15 @@ impl ParadexConnector {
         let mut subscribed = false;
         let public_feed =
             std::env::var("PARAPHINA_PARADEX_PUBLIC_FEED").unwrap_or_else(|_| "bbo".to_string());
-        if public_feed.eq_ignore_ascii_case("orderbook") {
+        let is_orderbook_mode = public_feed.eq_ignore_ascii_case("orderbook");
+        if is_orderbook_mode {
+            let channel = format!("order_book.{}.snapshot@15@100ms", self.cfg.market);
             let subscribe = ParadexSubscribeCandidate::new(
                 "subscribe",
-                serde_json::json!({ "channel": "orderbook", "market": self.cfg.market.as_str() }),
+                serde_json::json!({ "channel": channel.clone() }),
             );
             send_paradex_subscribe(&mut write, &subscribe).await?;
-            eprintln!(
-                "INFO: Paradex subscribed channel=orderbook market={}",
-                self.cfg.market
-            );
+            eprintln!("INFO: Paradex subscribed channel={channel}");
         } else {
             let channel = format!("bbo.{}", self.cfg.market);
             let subscribe = ParadexSubscribeCandidate::new(
@@ -584,7 +583,7 @@ impl ParadexConnector {
                     eprintln!("Paradex public WS market send failed: {err}");
                 }
             }
-            if subscribed {
+            if subscribed && !is_orderbook_mode {
                 if !has_paradex_book_fields(&value) {
                     continue;
                 }
@@ -924,13 +923,6 @@ impl ParadexSeqState {
                     if delta.seq <= last {
                         return Ok(None);
                     }
-                    if delta.seq > last + 1 {
-                        return Err(anyhow::anyhow!(
-                            "paradex seq gap last_seq={} next_seq={}",
-                            last,
-                            delta.seq
-                        ));
-                    }
                 }
                 self.last_seq = Some(delta.seq);
                 let mut changes = Vec::with_capacity(delta.bids.len() + delta.asks.len());
@@ -1266,14 +1258,21 @@ fn parse_orderbook_message_value(
     let payload = value
         .get("params")
         .or_else(|| value.get("data"))
-        .unwrap_or(&value);
+        .unwrap_or(value);
     let channel = payload
         .get("channel")
         .and_then(|v| v.as_str())
         .or_else(|| value.get("channel").and_then(|v| v.as_str()))
         .unwrap_or("");
-    if channel != "orderbook" && channel != "order_book" {
+    let is_legacy_channel = channel == "orderbook" || channel == "order_book";
+    let is_new_channel = channel.starts_with("order_book.");
+    if !is_legacy_channel && !is_new_channel {
         return Ok(None);
+    }
+    if is_new_channel {
+        if let Some(message) = parse_orderbook_structured_message(payload) {
+            return tracker.apply(message);
+        }
     }
     let message_type = payload
         .get("type")
@@ -1291,6 +1290,102 @@ fn parse_orderbook_message_value(
         return tracker.apply(message);
     }
     Ok(None)
+}
+
+fn parse_orderbook_structured_message(payload: &Value) -> Option<ParadexBookMessage> {
+    let data = payload.get("data")?;
+    let updates = data.get("updates").and_then(|v| v.as_array());
+    let inserts = data.get("inserts").and_then(|v| v.as_array());
+    let deletes = data.get("deletes").and_then(|v| v.as_array());
+    if updates.is_none() && inserts.is_none() && deletes.is_none() {
+        return None;
+    }
+
+    let market = data.get("market").and_then(|v| v.as_str())?.to_string();
+    let seq = data.get("seq_no").and_then(parse_u64_value)?;
+    let update_type = data.get("update_type").and_then(|v| v.as_str())?;
+    let timestamp_ms = now_ms();
+
+    let mut upserts = parse_orderbook_entries(updates)?;
+    upserts.extend(parse_orderbook_entries(inserts)?);
+
+    let update_type_lc = update_type.to_ascii_lowercase();
+    let is_snapshot_like = update_type_lc == "snapshot" || update_type_lc.starts_with('s');
+    if is_snapshot_like {
+        let mut bids = Vec::new();
+        let mut asks = Vec::new();
+        for (side, price, size) in upserts {
+            match side {
+                BookSide::Bid => bids.push(BookLevel { price, size }),
+                BookSide::Ask => asks.push(BookLevel { price, size }),
+            }
+        }
+        return Some(ParadexBookMessage::Snapshot(ParadexSnapshot {
+            market,
+            seq,
+            timestamp_ms,
+            bids,
+            asks,
+        }));
+    }
+
+    let mut bids = Vec::new();
+    let mut asks = Vec::new();
+    for (side, price, size) in upserts {
+        let level = BookLevelDelta { side, price, size };
+        match level.side {
+            BookSide::Bid => bids.push(level),
+            BookSide::Ask => asks.push(level),
+        }
+    }
+    for (side, price, _size) in parse_orderbook_entries(deletes)? {
+        let level = BookLevelDelta {
+            side,
+            price,
+            size: 0.0,
+        };
+        match level.side {
+            BookSide::Bid => bids.push(level),
+            BookSide::Ask => asks.push(level),
+        }
+    }
+
+    Some(ParadexBookMessage::Delta(ParadexDelta {
+        market,
+        seq,
+        prev_seq: None,
+        timestamp_ms,
+        bids,
+        asks,
+    }))
+}
+
+fn parse_orderbook_entries(entries: Option<&Vec<Value>>) -> Option<Vec<(BookSide, f64, f64)>> {
+    let Some(entries) = entries else {
+        return Some(Vec::new());
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        out.push(parse_orderbook_entry(entry)?);
+    }
+    Some(out)
+}
+
+fn parse_orderbook_entry(entry: &Value) -> Option<(BookSide, f64, f64)> {
+    let side = parse_orderbook_side(entry.get("side").and_then(|v| v.as_str())?)?;
+    let price = entry.get("price").and_then(parse_f64)?;
+    let size = entry.get("size").and_then(parse_f64)?;
+    Some((side, price, size))
+}
+
+fn parse_orderbook_side(side: &str) -> Option<BookSide> {
+    if side.eq_ignore_ascii_case("buy") || side.eq_ignore_ascii_case("bid") {
+        return Some(BookSide::Bid);
+    }
+    if side.eq_ignore_ascii_case("sell") || side.eq_ignore_ascii_case("ask") {
+        return Some(BookSide::Ask);
+    }
+    None
 }
 
 fn parse_snapshot(payload: &Value) -> Option<ParadexSnapshot> {
@@ -1510,7 +1605,7 @@ fn is_paradex_orderbook_message(value: &Value) -> bool {
         .and_then(|v| v.as_str())
         .or_else(|| value.get("channel").and_then(|v| v.as_str()))
         .unwrap_or("");
-    channel == "orderbook" || channel == "order_book"
+    channel == "orderbook" || channel == "order_book" || channel.starts_with("order_book.")
 }
 
 fn parse_levels_from_value(value: &Value) -> Option<Vec<BookLevel>> {
@@ -1585,6 +1680,19 @@ fn parse_i64_value(value: &Value) -> Option<i64> {
     }
     if let Some(s) = value.as_str() {
         return s.parse::<i64>().ok();
+    }
+    None
+}
+
+fn parse_u64_value(value: &Value) -> Option<u64> {
+    if let Some(v) = value.as_u64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return (v >= 0).then_some(v as u64);
+    }
+    if let Some(s) = value.as_str() {
+        return s.parse::<u64>().ok();
     }
     None
 }
