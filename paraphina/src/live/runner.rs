@@ -1035,6 +1035,9 @@ pub async fn run_live_loop(
     let ws_audit_enabled = std::env::var("PARAPHINA_WS_AUDIT")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let ext_apply_any = std::env::var("PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let market_rx_stats_every = std::env::var("PARAPHINA_MARKET_RX_STATS_EVERY_TICKS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1433,7 +1436,7 @@ pub async fn run_live_loop(
                         } else {
                             None
                         };
-                        apply_market_event_to_core(&mut state, cfg, &event, now_ms);
+                        apply_market_event_to_core(&mut state, cfg, &event, now_ms, ext_apply_any);
                         if is_extended_event {
                             let new_ext_mid_apply_ms = state
                                 .venues
@@ -2567,7 +2570,9 @@ fn apply_market_event_to_core(
     cfg: &Config,
     event: &super::types::MarketDataEvent,
     now_ms: TimestampMs,
+    ext_apply_any: bool,
 ) {
+    const EXTENDED_IDX: usize = 0;
     let max_levels = cfg.book.depth_levels.max(1) as usize;
     let alpha_short = cfg.volatility.fv_vol_alpha_short;
     let alpha_long = cfg.volatility.fv_vol_alpha_long;
@@ -2583,7 +2588,9 @@ fn apply_market_event_to_core(
                     alpha_short,
                     alpha_long,
                 ) {
-                    if metrics.mid.is_some() && metrics.spread.is_some() {
+                    if ext_apply_any && snapshot.venue_index == EXTENDED_IDX {
+                        v.last_mid_apply_ms = Some(now_ms);
+                    } else if metrics.mid.is_some() && metrics.spread.is_some() {
                         v.last_mid_apply_ms = Some(now_ms);
                     }
                 }
@@ -2599,7 +2606,9 @@ fn apply_market_event_to_core(
                     alpha_short,
                     alpha_long,
                 ) {
-                    if metrics.mid.is_some() && metrics.spread.is_some() {
+                    if ext_apply_any && delta.venue_index == EXTENDED_IDX {
+                        v.last_mid_apply_ms = Some(now_ms);
+                    } else if metrics.mid.is_some() && metrics.spread.is_some() {
                         v.last_mid_apply_ms = Some(now_ms);
                     }
                 }
@@ -3031,6 +3040,9 @@ pub fn replay_event_log(
     telemetry_path: &std::path::Path,
     max_ticks: Option<u64>,
 ) -> LiveRunSummary {
+    let ext_apply_any = std::env::var("PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let records = read_event_log(event_log_path).unwrap_or_default();
     let engine = Engine::new(cfg);
     let mut state = GlobalState::new(cfg);
@@ -3105,7 +3117,7 @@ pub fn replay_event_log(
             }
             EventLogPayload::MarketData(event) => {
                 let _ = cache.apply_market_event(event);
-                apply_market_event_to_core(&mut state, cfg, event, current_now_ms);
+                apply_market_event_to_core(&mut state, cfg, event, current_now_ms, ext_apply_any);
             }
             EventLogPayload::Account(event) => {
                 let _ = cache.apply_account_event(event);
@@ -3382,6 +3394,7 @@ mod tests {
             &cfg,
             &types::MarketDataEvent::FundingUpdate(update),
             now_ms,
+            false,
         );
         assert_eq!(state.venues[0].funding_state.rate_8h, Some(0.001));
 

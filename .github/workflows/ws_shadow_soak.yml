@@ -33,6 +33,11 @@ on:
         description: "PARAPHINA_EXTENDED_WS_DEPTH_LEVELS"
         required: true
         default: "1"
+      extended_apply_age_on_any_l2:
+        description: "PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2"
+        required: true
+        default: "0"
+        type: string
       connectors:
         description: "Connector list passed to --connectors"
         required: true
@@ -48,6 +53,8 @@ concurrency:
 jobs:
   shadow-soak:
     runs-on: ubuntu-latest
+    env:
+      PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2: ${{ inputs.extended_apply_age_on_any_l2 }}
     steps:
       - uses: actions/checkout@v4
 
