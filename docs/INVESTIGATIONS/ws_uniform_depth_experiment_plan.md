@@ -116,6 +116,9 @@ nl -ba tools/ws_soak_report.py | sed -n '771,842p'
 - Baseline (current defaults): 10 minutes.
   - Evidence for 10-minute option in workflow_dispatch: `.github/workflows/ws_shadow_soak.yml:8-15` (`Cmd P2`).
 - Experimental (flags ON): 10 minutes.
+- Experimental profile note:
+  - For Extended full orderbook mode (`extended_ws_depth_levels>1`), set `extended_apply_age_on_any_l2=1` so apply-age freshness reflects successful L2 applies even when mid/spread are unchanged.
+  - 90m main proof run: `22081536066`.
 - If experimental 10-minute run is clean, run experimental 90 minutes.
   - Evidence for 90-minute option in workflow_dispatch: `.github/workflows/ws_shadow_soak.yml:13-15` (`Cmd P2`).
 - Use same connector set and gate invocation path:
