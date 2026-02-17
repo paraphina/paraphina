@@ -520,16 +520,97 @@ impl ExtendedConnector {
                 }
             });
         }
+        let ws_msg_audit_enabled = extended_ws_audit_enabled();
+        let mut frames_text: u64 = 0;
+        let mut frames_binary: u64 = 0;
+        let mut frames_ping: u64 = 0;
+        let mut frames_pong: u64 = 0;
+        let mut frames_close: u64 = 0;
+        let mut frames_other: u64 = 0;
+        let mut cleaned_payload: u64 = 0;
+        let mut parse_update_ok: u64 = 0;
+        let mut parse_update_err: u64 = 0;
+        let mut ws_snapshot_parsed: u64 = 0;
+        let mut ws_delta_outcome_some: u64 = 0;
+        let mut ws_delta_outcome_none: u64 = 0;
+        let mut publish_ok: u64 = 0;
+        let mut publish_err: u64 = 0;
+        let mut last_rx_mono_ns: u64 = 0;
+        let mut max_gap_ms: u64 = 0;
+        let mut last_audit_instant = Instant::now();
+        macro_rules! emit_ws_msg_audit {
+            ($reason:expr) => {{
+                if ws_msg_audit_enabled {
+                    let now_ns = mono_now_ns();
+                    let age_ws_rx_ms =
+                        age_ms(now_ns, self.freshness.last_ws_rx_ns.load(Ordering::Relaxed));
+                    let age_data_rx_ms = age_ms(
+                        now_ns,
+                        self.freshness.last_data_rx_ns.load(Ordering::Relaxed),
+                    );
+                    let age_parsed_ms = age_ms(
+                        now_ns,
+                        self.freshness.last_parsed_ns.load(Ordering::Relaxed),
+                    );
+                    let age_book_event_ms = age_ms(
+                        now_ns,
+                        self.freshness.last_book_event_ns.load(Ordering::Relaxed),
+                    );
+                    let age_published_ms = age_ms(
+                        now_ns,
+                        self.freshness.last_published_ns.load(Ordering::Relaxed),
+                    );
+                    let reason = $reason.unwrap_or("periodic");
+                    eprintln!(
+                        concat!(
+                            "WS_AUDIT venue=extended component=ws_msg reason={} interval_ms=1000 ",
+                            "frames_text={} frames_bin={} ping={} pong={} close={} other={} ",
+                            "cleaned={} parse_ok={} parse_err={} snap_evt={} delta_evt={} ",
+                            "delta_none={} publish_ok={} publish_err={} max_gap_ms={} ",
+                            "age_ws_rx_ms={} age_data_rx_ms={} age_parsed_ms={} ",
+                            "age_book_event_ms={} age_published_ms={}",
+                        ),
+                        reason,
+                        frames_text,
+                        frames_binary,
+                        frames_ping,
+                        frames_pong,
+                        frames_close,
+                        frames_other,
+                        cleaned_payload,
+                        parse_update_ok,
+                        parse_update_err,
+                        ws_snapshot_parsed,
+                        ws_delta_outcome_some,
+                        ws_delta_outcome_none,
+                        publish_ok,
+                        publish_err,
+                        max_gap_ms,
+                        age_ws_rx_ms,
+                        age_data_rx_ms,
+                        age_parsed_ms,
+                        age_book_event_ms,
+                        age_published_ms
+                    );
+                }
+            }};
+        }
         loop {
+            if ws_msg_audit_enabled && last_audit_instant.elapsed() >= Duration::from_millis(1000) {
+                emit_ws_msg_audit!(None::<&str>);
+                last_audit_instant = Instant::now();
+            }
             let next = tokio::select! {
                 biased;
                 _ = &mut stale_rx => {
                     extended_audit_reconnect("stale_watchdog");
+                    emit_ws_msg_audit!(Some("stale_watchdog"));
                     anyhow::bail!("Extended public WS stale: freshness exceeded {stale_ms}ms");
                 }
                 _ = ping_timer.tick() => {
                     if let Err(e) = write.send(Message::Ping(vec![])).await {
                         extended_audit_reconnect("ping_send_fail");
+                        emit_ws_msg_audit!(Some("ping_send_fail"));
                         eprintln!("WARN: Extended public WS ping send failed: {e} — reconnecting");
                         anyhow::bail!("Extended public WS ping send failed: {e}");
                     }
@@ -547,16 +628,26 @@ impl ExtendedConnector {
                             "WARN: Extended WS received no messages after {:?} url={}",
                             read_timeout, ws_url
                         );
+                        emit_ws_msg_audit!(Some("read_timeout"));
                         break;
                     }
                     continue;
                 }
             };
+            let now_ns = mono_now_ns();
+            if last_rx_mono_ns != 0 {
+                let gap_ms = age_ms(now_ns, last_rx_mono_ns);
+                if gap_ms > max_gap_ms {
+                    max_gap_ms = gap_ms;
+                }
+            }
+            last_rx_mono_ns = now_ns;
             self.freshness
                 .last_ws_rx_ns
-                .store(mono_now_ns(), Ordering::Relaxed);
+                .store(now_ns, Ordering::Relaxed);
             match msg {
                 Message::Text(text) => {
+                    frames_text += 1;
                     if !first_message_logged {
                         eprintln!("INFO: Extended public WS first message received");
                         first_message_logged = true;
@@ -564,6 +655,7 @@ impl ExtendedConnector {
                     let Some(cleaned) = clean_ws_payload(&text) else {
                         continue;
                     };
+                    cleaned_payload += 1;
                     self.freshness
                         .last_data_rx_ns
                         .store(mono_now_ns(), Ordering::Relaxed);
@@ -593,8 +685,12 @@ impl ExtendedConnector {
                         let _ = guard.record_ws_frame(cleaned);
                     }
                     let update = match parse_depth_update(cleaned) {
-                        Ok(update) => update,
+                        Ok(update) => {
+                            parse_update_ok += 1;
+                            update
+                        }
                         Err(err) => {
+                            parse_update_err += 1;
                             consecutive_parse_errors += 1;
                             if consecutive_parse_errors == 1
                                 || consecutive_parse_errors.is_multiple_of(10)
@@ -607,6 +703,7 @@ impl ExtendedConnector {
                             }
                             if consecutive_parse_errors > MAX_PARSE_ERRORS {
                                 extended_audit_reconnect("parse_error");
+                                emit_ws_msg_audit!(Some("parse_error"));
                                 eprintln!(
                                     "Extended public WS too many parse errors; reconnecting url={}",
                                     ws_url
@@ -624,6 +721,7 @@ impl ExtendedConnector {
                                 self.cfg.venue_index,
                                 &mut ws_snapshot_seq,
                             ) {
+                                ws_snapshot_parsed += 1;
                                 if !first_book_update_logged {
                                     eprintln!("INFO: Extended public WS first book update");
                                     first_book_update_logged = true;
@@ -635,8 +733,14 @@ impl ExtendedConnector {
                                 self.freshness
                                     .last_book_event_ns
                                     .store(now_ns, Ordering::Relaxed);
-                                if let Err(err) = self.publish_market(event).await {
-                                    eprintln!("Extended public WS market send failed: {err}");
+                                match self.publish_market(event).await {
+                                    Ok(()) => {
+                                        publish_ok += 1;
+                                    }
+                                    Err(err) => {
+                                        publish_err += 1;
+                                        eprintln!("Extended public WS market send failed: {err}");
+                                    }
                                 }
                             }
                             if !first_decoded_top_logged {
@@ -708,11 +812,13 @@ impl ExtendedConnector {
                                 extended_audit_reconnect("seq_mismatch");
                             } else {
                                 extended_audit_reconnect("parse_error");
+                                emit_ws_msg_audit!(Some("parse_error"));
                             }
                             return Err(err);
                         }
                     };
                     if let Some(event) = outcome {
+                        ws_delta_outcome_some += 1;
                         consecutive_parse_errors = 0;
                         self.freshness
                             .last_book_event_ns
@@ -721,12 +827,21 @@ impl ExtendedConnector {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
                         }
-                        if let Err(err) = self.publish_market(event).await {
-                            eprintln!("Extended public WS market send failed: {err}");
+                        match self.publish_market(event).await {
+                            Ok(()) => {
+                                publish_ok += 1;
+                            }
+                            Err(err) => {
+                                publish_err += 1;
+                                eprintln!("Extended public WS market send failed: {err}");
+                            }
                         }
+                    } else {
+                        ws_delta_outcome_none += 1;
                     }
                 }
                 Message::Binary(bytes) => {
+                    frames_binary += 1;
                     if !first_message_logged {
                         eprintln!("INFO: Extended public WS first message received");
                         first_message_logged = true;
@@ -735,6 +850,7 @@ impl ExtendedConnector {
                     let Some(cleaned) = clean_ws_payload(&text) else {
                         continue;
                     };
+                    cleaned_payload += 1;
                     self.freshness
                         .last_data_rx_ns
                         .store(mono_now_ns(), Ordering::Relaxed);
@@ -764,8 +880,12 @@ impl ExtendedConnector {
                         let _ = guard.record_ws_frame(cleaned);
                     }
                     let update = match parse_depth_update(cleaned) {
-                        Ok(update) => update,
+                        Ok(update) => {
+                            parse_update_ok += 1;
+                            update
+                        }
                         Err(err) => {
+                            parse_update_err += 1;
                             consecutive_parse_errors += 1;
                             if consecutive_parse_errors == 1
                                 || consecutive_parse_errors.is_multiple_of(10)
@@ -778,6 +898,7 @@ impl ExtendedConnector {
                             }
                             if consecutive_parse_errors > MAX_PARSE_ERRORS {
                                 extended_audit_reconnect("parse_error");
+                                emit_ws_msg_audit!(Some("parse_error"));
                                 eprintln!(
                                     "Extended public WS too many parse errors; reconnecting url={}",
                                     ws_url
@@ -795,6 +916,7 @@ impl ExtendedConnector {
                                 self.cfg.venue_index,
                                 &mut ws_snapshot_seq,
                             ) {
+                                ws_snapshot_parsed += 1;
                                 if !first_book_update_logged {
                                     eprintln!("INFO: Extended public WS first book update");
                                     first_book_update_logged = true;
@@ -806,8 +928,14 @@ impl ExtendedConnector {
                                 self.freshness
                                     .last_book_event_ns
                                     .store(now_ns, Ordering::Relaxed);
-                                if let Err(err) = self.publish_market(event).await {
-                                    eprintln!("Extended public WS market send failed: {err}");
+                                match self.publish_market(event).await {
+                                    Ok(()) => {
+                                        publish_ok += 1;
+                                    }
+                                    Err(err) => {
+                                        publish_err += 1;
+                                        eprintln!("Extended public WS market send failed: {err}");
+                                    }
                                 }
                             }
                             if !first_decoded_top_logged {
@@ -879,11 +1007,13 @@ impl ExtendedConnector {
                                 extended_audit_reconnect("seq_mismatch");
                             } else {
                                 extended_audit_reconnect("parse_error");
+                                emit_ws_msg_audit!(Some("parse_error"));
                             }
                             return Err(err);
                         }
                     };
                     if let Some(event) = outcome {
+                        ws_delta_outcome_some += 1;
                         consecutive_parse_errors = 0;
                         self.freshness
                             .last_book_event_ns
@@ -892,20 +1022,35 @@ impl ExtendedConnector {
                             eprintln!("INFO: Extended public WS first book update");
                             first_book_update_logged = true;
                         }
-                        if let Err(err) = self.publish_market(event).await {
-                            eprintln!("Extended public WS market send failed: {err}");
+                        match self.publish_market(event).await {
+                            Ok(()) => {
+                                publish_ok += 1;
+                            }
+                            Err(err) => {
+                                publish_err += 1;
+                                eprintln!("Extended public WS market send failed: {err}");
+                            }
                         }
+                    } else {
+                        ws_delta_outcome_none += 1;
                     }
                 }
                 Message::Ping(payload) => {
+                    frames_ping += 1;
                     write.send(Message::Pong(payload)).await?;
                 }
-                Message::Pong(_) => {}
+                Message::Pong(_) => {
+                    frames_pong += 1;
+                }
                 Message::Close(_) => {
+                    frames_close += 1;
+                    emit_ws_msg_audit!(Some("close"));
                     eprintln!("Extended WS closed; reconnecting url={}", ws_url);
                     break;
                 }
-                _ => {}
+                _ => {
+                    frames_other += 1;
+                }
             }
             if !first_decoded_top_logged
                 && !no_book_warned

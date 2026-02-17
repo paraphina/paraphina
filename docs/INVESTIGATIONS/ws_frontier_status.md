@@ -100,3 +100,17 @@ This writes and prints:
 - Reconnects: none observed
 - Runner pressure: cap_hits = 0
 - Stale plateaus: none at 10s or 30s thresholds
+- Additional experimental evidence (90m):
+  - Run: 22075956007 (branch `audit/extended-ws-msg-audit`)
+  - Workflow run: https://github.com/paraphina/paraphina/actions/runs/22075956007
+  - Workflow inputs (experimental):
+    - paradex_public_feed=orderbook
+    - extended_ws_depth_levels=10
+    - extended_apply_age_on_any_l2=1
+  - Key result:
+    - extended apply_p95=0, apply_p99=250
+    - extended event_p95=2108.5, event_p99=3446.5
+  - Reconnects: none observed
+  - Runner pressure: cap_hits = 0
+  - Stale plateaus: none at 10s or 30s thresholds
+  - Note: This flag changes apply-age semantics for Extended only (refresh `last_mid_apply_ms` on any successful L2 apply), defaults unchanged (flag OFF by default).
