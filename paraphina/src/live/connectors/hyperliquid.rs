@@ -623,23 +623,26 @@ impl HyperliquidConnector {
                 }
             }
         });
-        let hl_pubq_audit_enabled = hl_ws_audit_enabled();
-        let mut hl_pubq_last_emit = Instant::now();
-        let mut hl_pubq_queued_hiwater: usize = 0;
-        let mut hl_pubq_pending_latest_present: u8 = 0;
-        let mut hl_pubq_pending_overwrite: u64 = 0;
-        let mut hl_pubq_try_send_ok: u64 = 0;
-        let mut hl_pubq_try_send_full: u64 = 0;
-        let mut maybe_emit_hl_pubq_audit = || {
-            if !hl_pubq_audit_enabled {
+        fn maybe_emit_hl_pubq_audit(
+            enabled: bool,
+            tx_int: &mpsc::Sender<MarketDataEvent>,
+            pending_latest: &tokio::sync::Mutex<Option<MarketDataEvent>>,
+            last_emit: &mut Instant,
+            queued_hiwater: &mut usize,
+            pending_latest_present: &mut u8,
+            pending_overwrite: &mut u64,
+            try_send_ok: &mut u64,
+            try_send_full: &mut u64,
+        ) {
+            if !enabled {
                 return;
             }
             let queued_len = HL_INTERNAL_PUB_Q.saturating_sub(tx_int.capacity());
-            hl_pubq_queued_hiwater = hl_pubq_queued_hiwater.max(queued_len);
+            *queued_hiwater = (*queued_hiwater).max(queued_len);
             if let Ok(guard) = pending_latest.try_lock() {
-                hl_pubq_pending_latest_present = u8::from(guard.is_some());
+                *pending_latest_present = u8::from(guard.is_some());
             }
-            let emit_since_ms = hl_pubq_last_emit.elapsed().as_millis() as u64;
+            let emit_since_ms = last_emit.elapsed().as_millis() as u64;
             if emit_since_ms < HL_WS_AUDIT_INTERVAL_MS {
                 return;
             }
@@ -649,25 +652,42 @@ queue_cap={} queued_len={} queued_hiwater={} pending_latest_present={} pending_o
 try_send_ok={} try_send_full={} emit_since_ms={}",
                 HL_INTERNAL_PUB_Q,
                 queued_len,
-                hl_pubq_queued_hiwater.max(queued_len),
-                hl_pubq_pending_latest_present,
-                hl_pubq_pending_overwrite,
-                hl_pubq_try_send_ok,
-                hl_pubq_try_send_full,
+                (*queued_hiwater).max(queued_len),
+                *pending_latest_present,
+                *pending_overwrite,
+                *try_send_ok,
+                *try_send_full,
                 emit_since_ms,
             );
-            hl_pubq_last_emit = Instant::now();
-            hl_pubq_queued_hiwater = queued_len;
-            hl_pubq_pending_overwrite = 0;
-            hl_pubq_try_send_ok = 0;
-            hl_pubq_try_send_full = 0;
-        };
+            *last_emit = Instant::now();
+            *queued_hiwater = queued_len;
+            *pending_overwrite = 0;
+            *try_send_ok = 0;
+            *try_send_full = 0;
+        }
+        let hl_pubq_audit_enabled = hl_ws_audit_enabled();
+        let mut hl_pubq_last_emit = Instant::now();
+        let mut hl_pubq_queued_hiwater: usize = 0;
+        let mut hl_pubq_pending_latest_present: u8 = 0;
+        let mut hl_pubq_pending_overwrite: u64 = 0;
+        let mut hl_pubq_try_send_ok: u64 = 0;
+        let mut hl_pubq_try_send_full: u64 = 0;
         let mut try_publish = |event: MarketDataEvent| -> anyhow::Result<()> {
             match tx_int.try_send(event) {
                 Ok(()) => {
                     if hl_pubq_audit_enabled {
                         hl_pubq_try_send_ok = hl_pubq_try_send_ok.saturating_add(1);
-                        maybe_emit_hl_pubq_audit();
+                        maybe_emit_hl_pubq_audit(
+                            hl_pubq_audit_enabled,
+                            &tx_int,
+                            pending_latest.as_ref(),
+                            &mut hl_pubq_last_emit,
+                            &mut hl_pubq_queued_hiwater,
+                            &mut hl_pubq_pending_latest_present,
+                            &mut hl_pubq_pending_overwrite,
+                            &mut hl_pubq_try_send_ok,
+                            &mut hl_pubq_try_send_full,
+                        );
                     }
                     Ok(())
                 }
@@ -685,7 +705,17 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                         }
                     }
                     if hl_pubq_audit_enabled {
-                        maybe_emit_hl_pubq_audit();
+                        maybe_emit_hl_pubq_audit(
+                            hl_pubq_audit_enabled,
+                            &tx_int,
+                            pending_latest.as_ref(),
+                            &mut hl_pubq_last_emit,
+                            &mut hl_pubq_queued_hiwater,
+                            &mut hl_pubq_pending_latest_present,
+                            &mut hl_pubq_pending_overwrite,
+                            &mut hl_pubq_try_send_ok,
+                            &mut hl_pubq_try_send_full,
+                        );
                     }
                     Ok(())
                 }
