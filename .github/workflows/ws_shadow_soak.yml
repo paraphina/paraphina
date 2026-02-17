@@ -33,6 +33,10 @@ on:
         description: "PARAPHINA_EXTENDED_WS_DEPTH_LEVELS"
         required: true
         default: "1"
+      hl_l2_levels:
+        description: "HL_L2_LEVELS"
+        required: true
+        default: "20"
       extended_apply_age_on_any_l2:
         description: "PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2"
         required: true
@@ -55,6 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2: ${{ inputs.extended_apply_age_on_any_l2 }}
+      HL_L2_LEVELS: ${{ inputs.hl_l2_levels }}
     steps:
       - uses: actions/checkout@v4
 
