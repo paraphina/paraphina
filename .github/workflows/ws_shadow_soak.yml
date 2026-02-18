@@ -42,6 +42,11 @@ on:
         required: true
         default: "0"
         type: string
+      arb_extended_max_apply_age_ms:
+        description: "PARAPHINA_ARB_EXTENDED_MAX_APPLY_AGE_MS"
+        required: false
+        default: ""
+        type: string
       connectors:
         description: "Connector list passed to --connectors"
         required: true
@@ -85,6 +90,7 @@ jobs:
           EXTENDED_WS_READ_TIMEOUT_MS: ${{ github.event.inputs.extended_ws_read_timeout_ms || '45000' }}
           PARADEX_PUBLIC_FEED: ${{ github.event.inputs.paradex_public_feed || 'bbo' }}
           EXTENDED_WS_DEPTH_LEVELS: ${{ github.event.inputs.extended_ws_depth_levels || '1' }}
+          ARB_EXTENDED_MAX_APPLY_AGE_MS: ${{ github.event.inputs.arb_extended_max_apply_age_ms || '' }}
           CONNECTORS: ${{ github.event.inputs.connectors || 'hyperliquid,lighter,extended,aster,paradex' }}
         run: |
           set -o pipefail
@@ -94,6 +100,10 @@ jobs:
           echo "RUN_INPUT PARADEX_PUBLIC_FEED=$PARADEX_PUBLIC_FEED"
           echo "RUN_INPUT EXTENDED_WS_DEPTH_LEVELS=$EXTENDED_WS_DEPTH_LEVELS"
           echo "RUN_INPUT PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2=${PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2:-}"
+          if [ -n "${ARB_EXTENDED_MAX_APPLY_AGE_MS:-}" ]; then
+            export PARAPHINA_ARB_EXTENDED_MAX_APPLY_AGE_MS="$ARB_EXTENDED_MAX_APPLY_AGE_MS"
+            echo "RUN_INPUT PARAPHINA_ARB_EXTENDED_MAX_APPLY_AGE_MS=$PARAPHINA_ARB_EXTENDED_MAX_APPLY_AGE_MS"
+          fi
           PARAPHINA_LIVE_MODE=1 \
           PARAPHINA_LIVE_PREFLIGHT_OK=1 \
           PARAPHINA_WS_AUDIT=1 \
