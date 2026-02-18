@@ -29,76 +29,13 @@
 // - Deterministic tie-breaking: when two venues have similar edge, prefer actions that
 //   reduce fragmentation/basis risk (proven via unit tests).
 
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::state::{funding_rate_for_decision, GlobalState, RiskRegime, VenueState};
 use crate::types::{
     OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs, VenueStatus,
 };
-
-const EXTENDED_VENUE_INDEX: usize = 0;
-const ARB_GATE_AUDIT_INTERVAL_MS: u64 = 1_000;
-
-fn ws_audit_enabled() -> bool {
-    static WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
-    *WS_AUDIT_ENABLED.get_or_init(|| {
-        std::env::var("PARAPHINA_WS_AUDIT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-fn arb_extended_max_apply_age_ms() -> Option<TimestampMs> {
-    static EXT_MAX_APPLY_AGE_MS: OnceLock<Option<TimestampMs>> = OnceLock::new();
-    *EXT_MAX_APPLY_AGE_MS.get_or_init(|| {
-        std::env::var("PARAPHINA_ARB_EXTENDED_MAX_APPLY_AGE_MS")
-            .ok()
-            .and_then(|v| v.parse::<TimestampMs>().ok())
-            .filter(|v| *v >= 0)
-    })
-}
-
-#[derive(Debug)]
-struct ArbGateAuditState {
-    last_emit: Instant,
-    gated_ticks: u64,
-    last_apply_age_ms: TimestampMs,
-}
-
-fn arb_gate_audit_state() -> &'static Mutex<ArbGateAuditState> {
-    static STATE: OnceLock<Mutex<ArbGateAuditState>> = OnceLock::new();
-    STATE.get_or_init(|| {
-        Mutex::new(ArbGateAuditState {
-            last_emit: Instant::now(),
-            gated_ticks: 0,
-            last_apply_age_ms: -1,
-        })
-    })
-}
-
-fn maybe_emit_arb_gate_audit(threshold_ms: TimestampMs, apply_age_ms: TimestampMs, gated: bool) {
-    if !ws_audit_enabled() {
-        return;
-    }
-    let mut state = arb_gate_audit_state()
-        .lock()
-        .expect("arb gate audit mutex poisoned");
-    state.last_apply_age_ms = apply_age_ms;
-    if gated {
-        state.gated_ticks = state.gated_ticks.saturating_add(1);
-    }
-    if state.last_emit.elapsed() < Duration::from_millis(ARB_GATE_AUDIT_INTERVAL_MS) {
-        return;
-    }
-    eprintln!(
-        "WS_AUDIT subsystem=arb_gate venue=extended reason=periodic interval_ms=1000 gated_ticks={} last_apply_age_ms={} threshold_ms={}",
-        state.gated_ticks, state.last_apply_age_ms, threshold_ms
-    );
-    state.gated_ticks = 0;
-    state.last_emit = Instant::now();
-}
 
 #[derive(Debug, Clone)]
 struct Candidate {
@@ -486,24 +423,9 @@ pub fn compute_exit_intents_into(
     let current_positions: Vec<f64> = state.venues.iter().map(|v| v.position_tao).collect();
     let _current_frag_score = compute_fragmentation_score(&current_positions, 1.0);
 
-    let extended_stale_gate = arb_extended_max_apply_age_ms().map(|threshold_ms| {
-        let apply_age_ms = state
-            .venues
-            .get(EXTENDED_VENUE_INDEX)
-            .and_then(|venue| venue.last_mid_apply_ms)
-            .map(|ts| (now_ms - ts).max(0))
-            .unwrap_or(i64::MAX);
-        let gated = apply_age_ms > threshold_ms;
-        maybe_emit_arb_gate_audit(threshold_ms, apply_age_ms, gated);
-        gated
-    });
-
     let mut cands: Vec<Candidate> = Vec::new();
 
     for (j, vcfg) in cfg.venues.iter().enumerate() {
-        if j == EXTENDED_VENUE_INDEX && extended_stale_gate.unwrap_or(false) {
-            continue;
-        }
         let v = &state.venues[j];
 
         // --- Eligibility gating (spec-like) ---
