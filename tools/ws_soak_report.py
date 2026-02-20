@@ -377,6 +377,44 @@ WS_AUDIT_RECONNECT_RE = re.compile(
 MP_COUNTER_RE = re.compile(r"\b(mp_[a-z0-9_]*_count)=(\d+)\b")
 
 
+def parse_kv_tokens(line: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for token in line.split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        if not key:
+            continue
+        pairs[key] = value.rstrip(",")
+    return pairs
+
+
+def update_max_stat(stats: dict[str, Any], key: str, value: int | None) -> None:
+    if value is None:
+        return
+    prev = safe_int(stats.get(key))
+    if prev is None or value > prev:
+        stats[key] = value
+
+
+def update_max_numeric_token(stats: dict[str, Any], key: str, raw: str | None) -> None:
+    if raw is None:
+        return
+    int_value = safe_int(raw)
+    field = f"max_{key}"
+    if int_value is not None:
+        prev = safe_int(stats.get(field))
+        if prev is None or int_value > prev:
+            stats[field] = int_value
+        return
+    float_value = safe_float(raw)
+    if float_value is None:
+        return
+    prev = safe_float(stats.get(field))
+    if prev is None or float_value > prev:
+        stats[field] = float_value
+
+
 def infer_venue_from_line(lower_line: str) -> str | None:
     for venue in VENUE_HINTS:
         if venue in lower_line:
@@ -416,14 +454,35 @@ def infer_reason_from_line(lower_line: str) -> str | None:
 
 def parse_run_log(
     run_log_path: Path,
-) -> tuple[dict[tuple[str, str], int], dict[tuple[str, str], int], dict[str, int]]:
+) -> tuple[
+    dict[tuple[str, str], int],
+    dict[tuple[str, str], int],
+    dict[str, int],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
     audit_reconnect_counts: dict[tuple[str, str], int] = defaultdict(int)
     signature_reconnect_counts: dict[tuple[str, str], int] = defaultdict(int)
     market_publisher_counters: dict[str, int] = defaultdict(int)
+    runner_apply_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    rest_monitor_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    arb_gate_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    hl_pubq_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_ws_msg_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_cfg_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    ping_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    lighter_ts_fallback_stats: dict[str, dict[str, Any]] = defaultdict(dict)
 
     with run_log_path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if "WS_AUDIT" in line:
+                pairs = parse_kv_tokens(line)
                 reconnect_match = WS_AUDIT_RECONNECT_RE.search(line)
                 if reconnect_match:
                     venue = reconnect_match.group("venue").lower()
@@ -441,6 +500,122 @@ def parse_run_log(
                         if count > market_publisher_counters[name]:
                             market_publisher_counters[name] = count
 
+                if "component=runner_apply" in line:
+                    venue = str(pairs.get("venue", "unknown")).lower()
+                    stats = runner_apply_stats[venue]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    update_max_stat(stats, "max_cache_err", safe_int(pairs.get("cache_err")))
+                    update_max_stat(stats, "max_ext_future", safe_int(pairs.get("ext_future")))
+                    age_apply = safe_float(pairs.get("age_apply_ms"))
+                    if age_apply is not None:
+                        stats["last_age_apply_ms"] = age_apply
+                    age_event = safe_float(pairs.get("age_event_ms"))
+                    if age_event is not None:
+                        stats["last_age_event_ms"] = age_event
+
+                if "subsystem=rest_monitor" in line:
+                    venue = str(pairs.get("venue", "unknown")).lower()
+                    stats = rest_monitor_stats[venue]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    for field in (
+                        "rest_check_count",
+                        "rest_attempt_count",
+                        "rest_success_count",
+                        "rest_fail_count",
+                        "rest_inject_count",
+                    ):
+                        update_max_stat(stats, f"max_{field}", safe_int(pairs.get(field)))
+                    age_ms = safe_float(pairs.get("age_ms"))
+                    if age_ms is not None:
+                        stats["last_age_ms"] = age_ms
+                    threshold_ms = safe_int(pairs.get("threshold_ms"))
+                    if threshold_ms is not None:
+                        stats["last_threshold_ms"] = threshold_ms
+
+                if "subsystem=arb_gate" in line:
+                    venue = str(pairs.get("venue", "unknown")).lower()
+                    stats = arb_gate_stats[venue]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    update_max_stat(stats, "max_gated_ticks", safe_int(pairs.get("gated_ticks")))
+                    last_apply_age_ms = safe_int(pairs.get("last_apply_age_ms"))
+                    if last_apply_age_ms is not None:
+                        stats["last_apply_age_ms"] = last_apply_age_ms
+                    threshold_ms = safe_int(pairs.get("threshold_ms"))
+                    if threshold_ms is not None:
+                        stats["threshold_ms"] = threshold_ms
+
+                if "component=hl_pubq" in line:
+                    venue = str(pairs.get("venue", "unknown")).lower()
+                    stats = hl_pubq_stats[venue]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    for field in (
+                        "try_send_full",
+                        "pending_overwrite",
+                        "queued_hiwater",
+                        "queued_len",
+                    ):
+                        update_max_stat(stats, f"max_{field}", safe_int(pairs.get(field)))
+
+                if "component=ws_msg" in line and "venue=extended" in line:
+                    stats = extended_ws_msg_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    reason = pairs.get("reason")
+                    if reason:
+                        stats["last_reason"] = reason
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "extended_read_timeout_ms=" in line and "venue=extended" in line:
+                    stats = extended_cfg_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    timeout_ms = safe_int(pairs.get("extended_read_timeout_ms"))
+                    if timeout_ms is not None:
+                        stats["last_extended_read_timeout_ms"] = timeout_ms
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "venue=lighter" in line and "lighter_ts_fallback_count=" in line:
+                    stats = lighter_ts_fallback_stats["lighter"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    context = pairs.get("context")
+                    if context:
+                        stats["last_context"] = context
+                    raw_ts = pairs.get("raw_ts")
+                    if raw_ts:
+                        stats["last_raw_ts"] = raw_ts
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "venue=lighter" in line and (
+                    "lighter_ping_sent_count=" in line or "lighter_ping_send_fail_count=" in line
+                ):
+                    stats = ping_stats["lighter"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    err = pairs.get("err")
+                    if err:
+                        stats["last_err"] = err
+                    sent = safe_int(pairs.get("lighter_ping_sent_count"))
+                    fail = safe_int(pairs.get("lighter_ping_send_fail_count"))
+                    update_max_stat(stats, "max_ping_sent_count", sent)
+                    update_max_stat(stats, "max_ping_send_fail_count", fail)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "venue=paradex" in line and (
+                    "paradex_ping_sent_count=" in line or "paradex_ping_send_fail_count=" in line
+                ):
+                    stats = ping_stats["paradex"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    err = pairs.get("err")
+                    if err:
+                        stats["last_err"] = err
+                    sent = safe_int(pairs.get("paradex_ping_sent_count"))
+                    fail = safe_int(pairs.get("paradex_ping_send_fail_count"))
+                    update_max_stat(stats, "max_ping_sent_count", sent)
+                    update_max_stat(stats, "max_ping_send_fail_count", fail)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
             lower = line.lower()
             reason = infer_reason_from_line(lower)
             if reason is None:
@@ -448,7 +623,19 @@ def parse_run_log(
             venue = infer_venue_from_line(lower) or "unknown"
             signature_reconnect_counts[(venue, reason)] += 1
 
-    return audit_reconnect_counts, signature_reconnect_counts, market_publisher_counters
+    return (
+        audit_reconnect_counts,
+        signature_reconnect_counts,
+        market_publisher_counters,
+        runner_apply_stats,
+        rest_monitor_stats,
+        arb_gate_stats,
+        hl_pubq_stats,
+        extended_ws_msg_stats,
+        extended_cfg_stats,
+        ping_stats,
+        lighter_ts_fallback_stats,
+    )
 
 
 KV_TOKEN_RE = re.compile(r"\b([a-zA-Z0-9_]+)=([^\s]+)\b")
@@ -607,6 +794,14 @@ def build_report(
     audit_reconnect: dict[tuple[str, str], int],
     signature_reconnect: dict[tuple[str, str], int],
     market_publisher_counters: dict[str, int],
+    runner_apply_stats: dict[str, dict[str, Any]],
+    rest_monitor_stats: dict[str, dict[str, Any]],
+    arb_gate_stats: dict[str, dict[str, Any]],
+    hl_pubq_stats: dict[str, dict[str, Any]],
+    extended_ws_msg_stats: dict[str, dict[str, Any]],
+    extended_cfg_stats: dict[str, dict[str, Any]],
+    ping_stats: dict[str, dict[str, Any]],
+    lighter_ts_fallback_stats: dict[str, dict[str, Any]],
     cap_hits_summary: CapHitsSummary | None,
 ) -> str:
     lines: list[str] = []
@@ -700,6 +895,226 @@ def build_report(
         lines.append(md_table(["counter", "max_count"], rows))
     else:
         lines.append("_No `component=market_publisher` counters found in run.log._")
+    lines.append("")
+
+    lines.append("## Runner Apply Audit (WS_AUDIT)")
+    if runner_apply_stats:
+        rows: list[list[str]] = []
+        for venue, stats in sorted(runner_apply_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("max_cache_err"))),
+                    fmt_int(safe_int(stats.get("max_ext_future"))),
+                    fmt_ms(safe_float(stats.get("last_age_apply_ms"))),
+                    fmt_ms(safe_float(stats.get("last_age_event_ms"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                ["venue", "samples", "max_cache_err", "max_ext_future", "last_age_apply_ms", "last_age_event_ms"],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=runner_apply` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## REST Monitor Audit (WS_AUDIT)")
+    if rest_monitor_stats:
+        rows = []
+        for venue, stats in sorted(rest_monitor_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("max_rest_success_count"))),
+                    fmt_int(safe_int(stats.get("max_rest_fail_count"))),
+                    fmt_int(safe_int(stats.get("max_rest_inject_count"))),
+                    fmt_ms(safe_float(stats.get("last_age_ms"))),
+                    fmt_int(safe_int(stats.get("last_threshold_ms"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "venue",
+                    "samples",
+                    "max_rest_success_count",
+                    "max_rest_fail_count",
+                    "max_rest_inject_count",
+                    "last_age_ms",
+                    "last_threshold_ms",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `subsystem=rest_monitor` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Arb Gate Audit (WS_AUDIT)")
+    if arb_gate_stats:
+        rows = []
+        for venue, stats in sorted(arb_gate_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("max_gated_ticks"))),
+                    fmt_int(safe_int(stats.get("last_apply_age_ms"))),
+                    fmt_int(safe_int(stats.get("threshold_ms"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                ["venue", "samples", "max_gated_ticks", "last_apply_age_ms", "threshold_ms"],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `subsystem=arb_gate` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## HL PubQ Audit (WS_AUDIT)")
+    if hl_pubq_stats:
+        rows = []
+        for venue, stats in sorted(hl_pubq_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("max_try_send_full"))),
+                    fmt_int(safe_int(stats.get("max_pending_overwrite"))),
+                    fmt_int(safe_int(stats.get("max_queued_hiwater"))),
+                    fmt_int(safe_int(stats.get("max_queued_len"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "venue",
+                    "samples",
+                    "max_try_send_full",
+                    "max_pending_overwrite",
+                    "max_queued_hiwater",
+                    "max_queued_len",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=hl_pubq` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended WS Msg Audit (WS_AUDIT)")
+    if extended_ws_msg_stats:
+        rows = []
+        for venue, stats in sorted(extended_ws_msg_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    str(stats.get("last_reason", "n/a")),
+                    fmt_int(safe_int(stats.get("max_parse_err"))),
+                    fmt_int(safe_int(stats.get("max_publish_err"))),
+                    fmt_int(safe_int(stats.get("max_max_gap_ms"))),
+                    fmt_int(safe_int(stats.get("max_age_published_ms"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "venue",
+                    "samples",
+                    "last_reason",
+                    "max_parse_err",
+                    "max_publish_err",
+                    "max_max_gap_ms",
+                    "max_age_published_ms",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=ws_msg` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended WS Read Timeout Audit (WS_AUDIT)")
+    if extended_cfg_stats:
+        rows = []
+        for venue, stats in sorted(extended_cfg_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("last_extended_read_timeout_ms"))),
+                    fmt_int(safe_int(stats.get("max_extended_read_timeout_ms"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                ["venue", "samples", "last_extended_read_timeout_ms", "max_extended_read_timeout_ms"],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `extended_read_timeout_ms` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Ping Audit (WS_AUDIT)")
+    if ping_stats:
+        rows = []
+        for venue, stats in sorted(ping_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("max_ping_sent_count"))),
+                    fmt_int(safe_int(stats.get("max_ping_send_fail_count"))),
+                    str(stats.get("last_err", "n/a")),
+                ]
+            )
+        lines.append(
+            md_table(
+                ["venue", "samples", "max_ping_sent_count", "max_ping_send_fail_count", "last_err"],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No ping audit entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Lighter Timestamp Fallback Audit (WS_AUDIT)")
+    if lighter_ts_fallback_stats:
+        rows = []
+        for venue, stats in sorted(lighter_ts_fallback_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("max_lighter_ts_fallback_count"))),
+                    str(stats.get("last_context", "n/a")),
+                    str(stats.get("last_raw_ts", "n/a")),
+                    fmt_int(safe_int(stats.get("max_fallback_ts_ms"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "venue",
+                    "samples",
+                    "max_lighter_ts_fallback_count",
+                    "last_context",
+                    "last_raw_ts",
+                    "max_fallback_ts_ms",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `lighter_ts_fallback_count` entries found in run.log._")
     lines.append("")
 
     lines.append("## Runner cap_hits Summary")
@@ -796,7 +1211,19 @@ def main() -> int:
 
     try:
         telemetry_summary, apply_values, event_values, max_plateaus = parse_telemetry(telemetry_path)
-        audit_reconnect, signature_reconnect, market_publisher = parse_run_log(run_log_path)
+        (
+            audit_reconnect,
+            signature_reconnect,
+            market_publisher,
+            runner_apply_stats,
+            rest_monitor_stats,
+            arb_gate_stats,
+            hl_pubq_stats,
+            extended_ws_msg_stats,
+            extended_cfg_stats,
+            ping_stats,
+            lighter_ts_fallback_stats,
+        ) = parse_run_log(run_log_path)
         cap_hits = parse_market_rx_stats(market_rx_path) if market_rx_path.exists() else None
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -811,6 +1238,14 @@ def main() -> int:
         audit_reconnect=audit_reconnect,
         signature_reconnect=signature_reconnect,
         market_publisher_counters=market_publisher,
+        runner_apply_stats=runner_apply_stats,
+        rest_monitor_stats=rest_monitor_stats,
+        arb_gate_stats=arb_gate_stats,
+        hl_pubq_stats=hl_pubq_stats,
+        extended_ws_msg_stats=extended_ws_msg_stats,
+        extended_cfg_stats=extended_cfg_stats,
+        ping_stats=ping_stats,
+        lighter_ts_fallback_stats=lighter_ts_fallback_stats,
         cap_hits_summary=cap_hits,
     )
 
