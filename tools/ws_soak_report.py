@@ -551,6 +551,10 @@ def parse_run_log(
                     for field in (
                         "try_send_full",
                         "pending_overwrite",
+                        "pending_lock_fail",
+                        "ts_zero_count",
+                        "pub_age_ms",
+                        "book_age_ms",
                         "queued_hiwater",
                         "queued_len",
                     ):
@@ -987,6 +991,10 @@ def build_report(
                     fmt_int(safe_int(stats.get("samples"))),
                     fmt_int(safe_int(stats.get("max_try_send_full"))),
                     fmt_int(safe_int(stats.get("max_pending_overwrite"))),
+                    fmt_int(safe_int(stats.get("max_pending_lock_fail"))),
+                    fmt_int(safe_int(stats.get("max_ts_zero_count"))),
+                    fmt_int(safe_int(stats.get("max_pub_age_ms"))),
+                    fmt_int(safe_int(stats.get("max_book_age_ms"))),
                     fmt_int(safe_int(stats.get("max_queued_hiwater"))),
                     fmt_int(safe_int(stats.get("max_queued_len"))),
                 ]
@@ -998,6 +1006,10 @@ def build_report(
                     "samples",
                     "max_try_send_full",
                     "max_pending_overwrite",
+                    "max_pending_lock_fail",
+                    "max_ts_zero_count",
+                    "max_pub_age_ms",
+                    "max_book_age_ms",
                     "max_queued_hiwater",
                     "max_queued_len",
                 ],
