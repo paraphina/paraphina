@@ -32,12 +32,12 @@ mod extended_ws_defaults_tests {
 
     #[test]
     fn default_orderbook_ws_url_uses_starknet_mainnet() {
-        let _guard = EnvGuard::clear(&["EXTENDED_WS_URL"]);
+        let _guard = EnvGuard::clear(&["EXTENDED_WS_URL", "PARAPHINA_EXTENDED_WS_DEPTH_LEVELS"]);
         let cfg = ExtendedConfig::from_env();
         let ws_url = cfg.orderbook_ws_url();
         assert_eq!(
             ws_url,
-            "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/BTC-USD?depth=1"
+            "wss://api.starknet.extended.exchange/stream.extended.exchange/v1/orderbooks/BTC-USD"
         );
     }
 }
