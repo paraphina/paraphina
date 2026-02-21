@@ -1824,16 +1824,59 @@ fn parse_depth_snapshot_from_ws(
         .and_then(|v| v.as_str())
         .unwrap_or(market)
         .to_string();
-    Some(MarketDataEvent::L2Snapshot(
-        super::super::types::L2Snapshot {
-            venue_index,
-            venue_id,
-            seq,
-            timestamp_ms,
-            bids,
-            asks,
-        },
-    ))
+    let has_bids = has_effective_levels(&bids);
+    let has_asks = has_effective_levels(&asks);
+
+    if has_bids && has_asks {
+        return Some(MarketDataEvent::L2Snapshot(
+            super::super::types::L2Snapshot {
+                venue_index,
+                venue_id,
+                seq,
+                timestamp_ms,
+                bids,
+                asks,
+            },
+        ));
+    }
+
+    // Guard against one-sided/empty WS "snapshot" frames: applying them as a
+    // full snapshot would clear the opposite side and collapse depth to zero.
+    let mut changes = Vec::new();
+    if has_bids {
+        changes.extend(levels_to_positive_deltas(&bids, BookSide::Bid));
+    }
+    if has_asks {
+        changes.extend(levels_to_positive_deltas(&asks, BookSide::Ask));
+    }
+    if changes.is_empty() {
+        return None;
+    }
+    Some(MarketDataEvent::L2Delta(super::super::types::L2Delta {
+        venue_index,
+        venue_id,
+        seq,
+        timestamp_ms,
+        changes,
+    }))
+}
+
+fn has_effective_levels(levels: &[BookLevel]) -> bool {
+    levels
+        .iter()
+        .any(|lvl| lvl.price.is_finite() && lvl.size.is_finite() && lvl.size > 0.0)
+}
+
+fn levels_to_positive_deltas(levels: &[BookLevel], side: BookSide) -> Vec<BookLevelDelta> {
+    levels
+        .iter()
+        .filter(|lvl| lvl.price.is_finite() && lvl.size.is_finite() && lvl.size > 0.0)
+        .map(|lvl| BookLevelDelta {
+            side,
+            price: lvl.price,
+            size: lvl.size,
+        })
+        .collect()
 }
 
 fn best_level_from_value(value: &Value, is_bid: bool) -> Option<BookLevel> {
@@ -2218,10 +2261,49 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::state::GlobalState;
+    use crate::toxicity::update_toxicity_and_health;
+    use crate::types::VenueStatus;
     use httpmock::Method::{DELETE, POST};
     use httpmock::MockServer;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
+
+    fn apply_market_event_to_test_state(state: &mut GlobalState, cfg: &Config, event: &MarketDataEvent) {
+        let venue = state.venues.get_mut(0).expect("extended venue");
+        let max_levels = cfg.book.depth_levels.max(1) as usize;
+        match event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                venue
+                    .apply_l2_snapshot(
+                        &snapshot.bids,
+                        &snapshot.asks,
+                        snapshot.seq,
+                        snapshot.timestamp_ms,
+                        max_levels,
+                        cfg.volatility.fv_vol_alpha_short,
+                        cfg.volatility.fv_vol_alpha_long,
+                    )
+                    .expect("apply l2 snapshot");
+            }
+            MarketDataEvent::L2Delta(delta) => {
+                venue
+                    .apply_l2_delta(
+                        &delta.changes,
+                        delta.seq,
+                        delta.timestamp_ms,
+                        max_levels,
+                        cfg.volatility.fv_vol_alpha_short,
+                        cfg.volatility.fv_vol_alpha_long,
+                    )
+                    .expect("apply l2 delta");
+            }
+            MarketDataEvent::Trade(_) | MarketDataEvent::FundingUpdate(_) => {
+                panic!("unexpected market event variant in test");
+            }
+        }
+    }
 
     #[test]
     fn fixture_snapshot_parses() {
@@ -2544,6 +2626,82 @@ mod tests {
         assert_eq!(top.best_bid_sz, 2.0);
         assert_eq!(top.best_ask_px, 101.0);
         assert_eq!(top.best_ask_sz, 3.0);
+    }
+
+    #[test]
+    fn ws_one_sided_snapshot_keeps_opposite_side_and_depth() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let mut fallback_seq = 0_u64;
+
+        let full_snapshot = serde_json::json!({
+            "type": "SNAPSHOT",
+            "seq": 100_u64,
+            "ts": 1_700_000_000_000_i64,
+            "data": {
+                "m": "ETH-USD",
+                "b": [{"p":"2000.0","q":"2.5"}],
+                "a": [{"p":"2000.1","q":"3.0"}]
+            }
+        });
+        let initial = parse_depth_snapshot_from_ws(&full_snapshot, "ETH-USD", 0, &mut fallback_seq)
+            .expect("initial ws snapshot event");
+        apply_market_event_to_test_state(&mut state, &cfg, &initial);
+        assert!(state.venues[0].orderbook_l2.best_bid().is_some());
+        assert!(state.venues[0].orderbook_l2.best_ask().is_some());
+        assert!(
+            state.venues[0].depth_near_mid > 0.0,
+            "initial snapshot should set positive depth"
+        );
+
+        let one_sided_snapshot = serde_json::json!({
+            "type": "SNAPSHOT",
+            "seq": 101_u64,
+            "ts": 1_700_000_000_200_i64,
+            "data": {
+                "m": "ETH-USD",
+                "b": [{"p":"2000.0","q":"1.5"}],
+                "a": [{"p":"2000.1","q":"0"}]
+            }
+        });
+        let guarded =
+            parse_depth_snapshot_from_ws(&one_sided_snapshot, "ETH-USD", 0, &mut fallback_seq)
+                .expect("guarded ws event");
+        match &guarded {
+            MarketDataEvent::L2Delta(delta) => {
+                assert!(
+                    !delta.changes.is_empty(),
+                    "one-sided snapshot should still produce a side update"
+                );
+                assert!(
+                    delta.changes.iter().all(|change| change.side == BookSide::Bid),
+                    "empty ask side must not clear the existing ask book"
+                );
+            }
+            other => panic!("expected L2Delta for guarded one-sided snapshot, got {other:?}"),
+        }
+        apply_market_event_to_test_state(&mut state, &cfg, &guarded);
+
+        let venue = &state.venues[0];
+        assert!(
+            venue.orderbook_l2.best_bid().is_some(),
+            "bid side must remain present"
+        );
+        assert!(
+            venue.orderbook_l2.best_ask().is_some(),
+            "ask side must remain present"
+        );
+        assert!(
+            venue.depth_near_mid > 0.0,
+            "depth must stay positive after one-sided snapshot frame"
+        );
+
+        update_toxicity_and_health(&mut state, &cfg, 1_700_000_002_000_i64);
+        assert_ne!(
+            state.venues[0].status,
+            VenueStatus::Disabled,
+            "one-sided snapshot frame must not disable venue solely via depth collapse"
+        );
     }
 
     #[test]
