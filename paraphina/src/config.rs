@@ -1448,6 +1448,24 @@ impl Config {
             }
         }
 
+        if let Ok(raw) = env::var("PARAPHINA_DEPTH_FALLBACK_GRACE_MS") {
+            match raw.parse::<u64>() {
+                Ok(v) => {
+                    cfg.toxicity.depth_fallback_grace_ms = v.min(i64::MAX as u64) as i64;
+                    eprintln!(
+                        "[config] PARAPHINA_DEPTH_FALLBACK_GRACE_MS = {} (overrode default)",
+                        cfg.toxicity.depth_fallback_grace_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_DEPTH_FALLBACK_GRACE_MS = {:?} as u64; using default {}",
+                        raw, cfg.toxicity.depth_fallback_grace_ms
+                    );
+                }
+            }
+        }
+
         if let Ok(raw) = env::var("PARAPHINA_FUNDING_AVOID_WINDOW_MS") {
             match raw.parse::<i64>() {
                 Ok(v) => {
@@ -1745,5 +1763,59 @@ mod tests {
             "invalid env value should be ignored"
         );
         // EnvGuard restores on drop.
+    }
+
+    #[test]
+    fn depth_fallback_grace_env_unset_keeps_default() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_DEPTH_FALLBACK_GRACE_MS";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::remove_var(ENV_KEY);
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(
+            cfg.toxicity.depth_fallback_grace_ms, 500,
+            "default depth_fallback_grace_ms should remain 500 when env is unset"
+        );
+    }
+
+    #[test]
+    fn depth_fallback_grace_env_set_applies() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_DEPTH_FALLBACK_GRACE_MS";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "1500");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(
+            cfg.toxicity.depth_fallback_grace_ms, 1500,
+            "PARAPHINA_DEPTH_FALLBACK_GRACE_MS should override depth_fallback_grace_ms"
+        );
+    }
+
+    #[test]
+    fn depth_fallback_grace_env_invalid_keeps_default() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_DEPTH_FALLBACK_GRACE_MS";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "not_a_number");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(
+            cfg.toxicity.depth_fallback_grace_ms, 500,
+            "invalid PARAPHINA_DEPTH_FALLBACK_GRACE_MS should leave default unchanged"
+        );
     }
 }
