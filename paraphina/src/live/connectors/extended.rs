@@ -41,6 +41,14 @@ fn extended_ws_read_timeout() -> Duration {
     )
 }
 
+fn extended_ws_depth_levels() -> u32 {
+    std::env::var("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
 fn extended_ws_audit_enabled() -> bool {
     *EXTENDED_WS_AUDIT_ENABLED.get_or_init(|| {
         std::env::var("PARAPHINA_WS_AUDIT")
@@ -198,11 +206,7 @@ impl ExtendedConfig {
     }
 
     pub fn orderbook_ws_url(&self) -> String {
-        let depth_levels = std::env::var("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(1)
-            .max(1);
+        let depth_levels = extended_ws_depth_levels();
         if depth_levels <= 1 {
             format!(
                 "{}/orderbooks/{}?depth=1",
@@ -429,7 +433,10 @@ impl ExtendedConnector {
             .unwrap_or(true)
         {
             *last_snapshot_warn = Some(Instant::now());
-            eprintln!("WARN: Extended REST snapshot skipped; relying on WS depth=1");
+            eprintln!(
+                "WARN: Extended REST snapshot skipped; relying on WS orderbook stream depth_levels={}",
+                extended_ws_depth_levels()
+            );
         }
         let mut seq_state = ExtendedSeqState::new(
             snapshot_state
@@ -2269,6 +2276,92 @@ mod tests {
     use httpmock::MockServer;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.value.as_deref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn test_ws_cfg() -> ExtendedConfig {
+        ExtendedConfig {
+            ws_url: "wss://api.extended.test/stream/".to_string(),
+            rest_url: "https://api.extended.test".to_string(),
+            market: "BTC-USD".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            api_key: None,
+            api_secret: None,
+            recv_window: None,
+            record_dir: None,
+        }
+    }
+
+    #[test]
+    fn orderbook_ws_url_defaults_to_depth_two_when_env_unset() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = EnvVarGuard::new("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS");
+        std::env::remove_var("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS");
+
+        let cfg = test_ws_cfg();
+        assert_eq!(
+            cfg.orderbook_ws_url(),
+            "wss://api.extended.test/stream/orderbooks/BTC-USD"
+        );
+    }
+
+    #[test]
+    fn orderbook_ws_url_uses_depth_one_endpoint_when_env_is_one() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = EnvVarGuard::new("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS");
+        std::env::set_var("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS", "1");
+
+        let cfg = test_ws_cfg();
+        assert_eq!(
+            cfg.orderbook_ws_url(),
+            "wss://api.extended.test/stream/orderbooks/BTC-USD?depth=1"
+        );
+    }
+
+    #[test]
+    fn orderbook_ws_url_uses_full_book_endpoint_when_env_is_two_or_higher() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = EnvVarGuard::new("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS");
+
+        let cfg = test_ws_cfg();
+        std::env::set_var("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS", "2");
+        assert_eq!(
+            cfg.orderbook_ws_url(),
+            "wss://api.extended.test/stream/orderbooks/BTC-USD"
+        );
+
+        std::env::set_var("PARAPHINA_EXTENDED_WS_DEPTH_LEVELS", "7");
+        assert_eq!(
+            cfg.orderbook_ws_url(),
+            "wss://api.extended.test/stream/orderbooks/BTC-USD"
+        );
+    }
 
     fn apply_market_event_to_test_state(state: &mut GlobalState, cfg: &Config, event: &MarketDataEvent) {
         let venue = state.venues.get_mut(0).expect("extended venue");

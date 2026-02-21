@@ -32,7 +32,7 @@ on:
       extended_ws_depth_levels:
         description: "PARAPHINA_EXTENDED_WS_DEPTH_LEVELS"
         required: true
-        default: "1"
+        default: "2"
       hl_l2_levels:
         description: "HL_L2_LEVELS"
         required: true
@@ -89,7 +89,7 @@ jobs:
           LIGHTER_PING_INTERVAL_MS: ${{ github.event.inputs.lighter_ping_interval_ms || '10000' }}
           EXTENDED_WS_READ_TIMEOUT_MS: ${{ github.event.inputs.extended_ws_read_timeout_ms || '45000' }}
           PARADEX_PUBLIC_FEED: ${{ github.event.inputs.paradex_public_feed || 'bbo' }}
-          EXTENDED_WS_DEPTH_LEVELS: ${{ github.event.inputs.extended_ws_depth_levels || '1' }}
+          EXTENDED_WS_DEPTH_LEVELS: ${{ github.event.inputs.extended_ws_depth_levels || '2' }}
           ARB_EXTENDED_MAX_APPLY_AGE_MS: ${{ github.event.inputs.arb_extended_max_apply_age_ms || '' }}
           CONNECTORS: ${{ github.event.inputs.connectors || 'hyperliquid,lighter,extended,aster,paradex' }}
         run: |
