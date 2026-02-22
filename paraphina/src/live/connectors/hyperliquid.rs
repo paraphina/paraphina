@@ -100,6 +100,84 @@ fn age_ms(now_ns: u64, then_ns: u64) -> u64 {
     now_ns.saturating_sub(then_ns) / 1_000_000
 }
 
+fn atomic_max_u64(cell: &AtomicU64, value: u64) {
+    let mut observed = cell.load(Ordering::Relaxed);
+    while value > observed {
+        match cell.compare_exchange_weak(observed, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct HlForwardAudit {
+    send_block_max_ms: AtomicU64,
+    send_block_gt_5ms: AtomicU64,
+    send_block_gt_50ms: AtomicU64,
+    send_block_gt_250ms: AtomicU64,
+    forward_send_count: AtomicU64,
+    forward_send_err_count: AtomicU64,
+    coalesced_drop_count: AtomicU64,
+    pending_take_count: AtomicU64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct HlForwardAuditSnapshot {
+    send_block_max_ms: u64,
+    send_block_gt_5ms: u64,
+    send_block_gt_50ms: u64,
+    send_block_gt_250ms: u64,
+    forward_send_count: u64,
+    forward_send_err_count: u64,
+    coalesced_drop_count: u64,
+    pending_take_count: u64,
+}
+
+impl HlForwardAudit {
+    fn observe_send_block_ms(&self, block_ms: u64) {
+        self.forward_send_count.fetch_add(1, Ordering::Relaxed);
+        atomic_max_u64(&self.send_block_max_ms, block_ms);
+        if block_ms > 5 {
+            self.send_block_gt_5ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if block_ms > 50 {
+            self.send_block_gt_50ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if block_ms > 250 {
+            self.send_block_gt_250ms.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn observe_send_err(&self) {
+        self.forward_send_err_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_coalesced_drop(&self, count: u64) {
+        if count > 0 {
+            self.coalesced_drop_count
+                .fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    fn observe_pending_take(&self) {
+        self.pending_take_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot_and_reset(&self) -> HlForwardAuditSnapshot {
+        HlForwardAuditSnapshot {
+            send_block_max_ms: self.send_block_max_ms.swap(0, Ordering::Relaxed),
+            send_block_gt_5ms: self.send_block_gt_5ms.swap(0, Ordering::Relaxed),
+            send_block_gt_50ms: self.send_block_gt_50ms.swap(0, Ordering::Relaxed),
+            send_block_gt_250ms: self.send_block_gt_250ms.swap(0, Ordering::Relaxed),
+            forward_send_count: self.forward_send_count.swap(0, Ordering::Relaxed),
+            forward_send_err_count: self.forward_send_err_count.swap(0, Ordering::Relaxed),
+            coalesced_drop_count: self.coalesced_drop_count.swap(0, Ordering::Relaxed),
+            pending_take_count: self.pending_take_count.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Freshness {
     last_ws_rx_ns: AtomicU64,
@@ -608,24 +686,38 @@ impl HyperliquidConnector {
         let forward_market_tx = self.market_tx.clone();
         let forward_freshness = self.freshness.clone();
         let forward_pending = pending_latest.clone();
+        let forward_audit = Arc::new(HlForwardAudit::default());
+        let forward_audit_task = forward_audit.clone();
         tokio::spawn(async move {
             while let Some(mut event) = rx_int.recv().await {
+                let mut coalesced_drops = 0u64;
                 while let Ok(next) = rx_int.try_recv() {
                     event = next;
+                    coalesced_drops = coalesced_drops.saturating_add(1);
+                }
+                if coalesced_drops > 0 {
+                    forward_audit_task.observe_coalesced_drop(coalesced_drops);
                 }
                 if let Some(pending) = forward_pending.lock().await.take() {
                     event = pending;
+                    forward_audit_task.observe_pending_take();
                 }
-                if forward_market_tx.send(event).await.is_ok() {
+                let send_started = Instant::now();
+                let send_ok = forward_market_tx.send(event).await.is_ok();
+                forward_audit_task.observe_send_block_ms(send_started.elapsed().as_millis() as u64);
+                if send_ok {
                     forward_freshness
                         .last_published_ns
                         .store(mono_now_ns(), Ordering::Relaxed);
+                } else {
+                    forward_audit_task.observe_send_err();
                 }
             }
         });
         fn maybe_emit_hl_pubq_audit(
             enabled: bool,
             freshness: &Freshness,
+            forward_audit: &HlForwardAudit,
             tx_int: &mpsc::Sender<MarketDataEvent>,
             pending_latest: &tokio::sync::Mutex<Option<MarketDataEvent>>,
             last_emit: &mut Instant,
@@ -650,13 +742,19 @@ impl HyperliquidConnector {
                 return;
             }
             let now_ns = mono_now_ns();
+            let ws_rx_age_ms = age_ms(now_ns, freshness.last_ws_rx_ns.load(Ordering::Relaxed));
+            let data_rx_age_ms = age_ms(now_ns, freshness.last_data_rx_ns.load(Ordering::Relaxed));
             let pub_age_ms = age_ms(now_ns, freshness.last_published_ns.load(Ordering::Relaxed));
             let book_age_ms = age_ms(now_ns, freshness.last_book_event_ns.load(Ordering::Relaxed));
+            let pub_minus_book_age_ms = pub_age_ms.saturating_sub(book_age_ms);
+            let forward = forward_audit.snapshot_and_reset();
             eprintln!(
                 "WS_AUDIT venue=hyperliquid component=hl_pubq reason=periodic interval_ms=1000 \
 queue_cap={} queued_len={} queued_hiwater={} pending_latest_present={} pending_overwrite={} \
-pending_lock_fail={} ts_zero_count={} pub_age_ms={} book_age_ms={} \
-try_send_ok={} try_send_full={} emit_since_ms={}",
+pending_lock_fail={} ts_zero_count={} ws_rx_age_ms={} data_rx_age_ms={} pub_age_ms={} book_age_ms={} \
+pub_minus_book_age_ms={} send_block_max_ms={} send_block_gt_5ms={} send_block_gt_50ms={} \
+send_block_gt_250ms={} forward_send_count={} forward_send_err_count={} coalesced_drop_count={} \
+pending_take_count={} try_send_ok={} try_send_full={} emit_since_ms={}",
                 HL_INTERNAL_PUB_Q,
                 queued_len,
                 (*queued_hiwater).max(queued_len),
@@ -664,8 +762,19 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                 *pending_overwrite,
                 *pending_lock_fail,
                 *ts_zero_count,
+                ws_rx_age_ms,
+                data_rx_age_ms,
                 pub_age_ms,
                 book_age_ms,
+                pub_minus_book_age_ms,
+                forward.send_block_max_ms,
+                forward.send_block_gt_5ms,
+                forward.send_block_gt_50ms,
+                forward.send_block_gt_250ms,
+                forward.forward_send_count,
+                forward.forward_send_err_count,
+                forward.coalesced_drop_count,
+                forward.pending_take_count,
                 *try_send_ok,
                 *try_send_full,
                 emit_since_ms,
@@ -703,6 +812,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                         maybe_emit_hl_pubq_audit(
                             hl_pubq_audit_enabled,
                             freshness.as_ref(),
+                            forward_audit.as_ref(),
                             &tx_int,
                             pending_latest.as_ref(),
                             &mut hl_pubq_last_emit,
@@ -739,6 +849,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                         maybe_emit_hl_pubq_audit(
                             hl_pubq_audit_enabled,
                             freshness.as_ref(),
+                            forward_audit.as_ref(),
                             &tx_int,
                             pending_latest.as_ref(),
                             &mut hl_pubq_last_emit,
@@ -2595,6 +2706,39 @@ mod tests {
             6_000,
             "book events must advance watchdog anchor"
         );
+    }
+
+    #[test]
+    fn hl_forward_audit_snapshot_resets_interval_counters() {
+        let stats = HlForwardAudit::default();
+        stats.observe_send_block_ms(2);
+        stats.observe_send_block_ms(9);
+        stats.observe_send_block_ms(80);
+        stats.observe_send_block_ms(300);
+        stats.observe_send_err();
+        stats.observe_coalesced_drop(3);
+        stats.observe_pending_take();
+        stats.observe_pending_take();
+
+        let first = stats.snapshot_and_reset();
+        assert_eq!(first.send_block_max_ms, 300);
+        assert_eq!(first.send_block_gt_5ms, 3);
+        assert_eq!(first.send_block_gt_50ms, 2);
+        assert_eq!(first.send_block_gt_250ms, 1);
+        assert_eq!(first.forward_send_count, 4);
+        assert_eq!(first.forward_send_err_count, 1);
+        assert_eq!(first.coalesced_drop_count, 3);
+        assert_eq!(first.pending_take_count, 2);
+
+        let second = stats.snapshot_and_reset();
+        assert_eq!(second.send_block_max_ms, 0);
+        assert_eq!(second.send_block_gt_5ms, 0);
+        assert_eq!(second.send_block_gt_50ms, 0);
+        assert_eq!(second.send_block_gt_250ms, 0);
+        assert_eq!(second.forward_send_count, 0);
+        assert_eq!(second.forward_send_err_count, 0);
+        assert_eq!(second.coalesced_drop_count, 0);
+        assert_eq!(second.pending_take_count, 0);
     }
 }
 
