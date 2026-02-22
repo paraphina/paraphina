@@ -14,6 +14,8 @@ const HL_INTERNAL_PUB_Q: usize = 256;
 const HL_DELTA_BOOTSTRAP_BUF: usize = 1024;
 const HL_DECODE_WARN_INTERVAL_MS: u64 = 10_000;
 const HL_WS_AUDIT_INTERVAL_MS: u64 = 1_000;
+const HL_TS_MAX_PAST_SKEW_MS_DEFAULT: u64 = 1_500;
+const HL_TS_MAX_FUTURE_SKEW_MS_DEFAULT: u64 = 250;
 
 /// Maximum time to wait for WS connect (TCP + TLS + upgrade).
 /// Prevents `connect_async` from hanging indefinitely on unresponsive hosts.
@@ -58,12 +60,37 @@ fn hl_ws_read_timeout() -> Duration {
     )
 }
 
+fn env_bool(var: &str) -> bool {
+    std::env::var(var)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn hl_ws_audit_enabled() -> bool {
-    *HL_WS_AUDIT_ENABLED.get_or_init(|| {
-        std::env::var("PARAPHINA_WS_AUDIT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *HL_WS_AUDIT_ENABLED.get_or_init(|| env_bool("PARAPHINA_WS_AUDIT"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HlTimestampPolicy {
+    enabled: bool,
+    max_past_skew_ms: u64,
+    max_future_skew_ms: u64,
+}
+
+impl HlTimestampPolicy {
+    fn from_env() -> Self {
+        Self {
+            enabled: env_bool("PARAPHINA_HL_TS_HARDENING"),
+            max_past_skew_ms: std::env::var("PARAPHINA_HL_TS_MAX_PAST_SKEW_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(HL_TS_MAX_PAST_SKEW_MS_DEFAULT),
+            max_future_skew_ms: std::env::var("PARAPHINA_HL_TS_MAX_FUTURE_SKEW_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(HL_TS_MAX_FUTURE_SKEW_MS_DEFAULT),
+        }
+    }
 }
 
 fn hl_audit_reconnect(reason: &'static str) {
@@ -120,6 +147,13 @@ struct HlForwardAudit {
     forward_send_err_count: AtomicU64,
     coalesced_drop_count: AtomicU64,
     pending_take_count: AtomicU64,
+    ts_missing_or_zero_count: AtomicU64,
+    ts_clamped_past_skew_count: AtomicU64,
+    ts_clamped_future_skew_count: AtomicU64,
+    ts_policy_applied_count: AtomicU64,
+    ts_kept_exchange_count: AtomicU64,
+    ts_past_skew_max_ms: AtomicU64,
+    ts_future_skew_max_ms: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -132,6 +166,13 @@ struct HlForwardAuditSnapshot {
     forward_send_err_count: u64,
     coalesced_drop_count: u64,
     pending_take_count: u64,
+    ts_missing_or_zero_count: u64,
+    ts_clamped_past_skew_count: u64,
+    ts_clamped_future_skew_count: u64,
+    ts_policy_applied_count: u64,
+    ts_kept_exchange_count: u64,
+    ts_past_skew_max_ms: u64,
+    ts_future_skew_max_ms: u64,
 }
 
 impl HlForwardAudit {
@@ -164,6 +205,36 @@ impl HlForwardAudit {
         self.pending_take_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn observe_ts_missing_or_zero(&self) {
+        self.ts_missing_or_zero_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_ts_clamped_past_skew(&self) {
+        self.ts_clamped_past_skew_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.ts_policy_applied_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_ts_clamped_future_skew(&self) {
+        self.ts_clamped_future_skew_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.ts_policy_applied_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_ts_kept_exchange(&self) {
+        self.ts_kept_exchange_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_ts_policy_applied(&self) {
+        self.ts_policy_applied_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn observe_ts_skew(&self, past_skew_ms: u64, future_skew_ms: u64) {
+        atomic_max_u64(&self.ts_past_skew_max_ms, past_skew_ms);
+        atomic_max_u64(&self.ts_future_skew_max_ms, future_skew_ms);
+    }
+
     fn snapshot_and_reset(&self) -> HlForwardAuditSnapshot {
         HlForwardAuditSnapshot {
             send_block_max_ms: self.send_block_max_ms.swap(0, Ordering::Relaxed),
@@ -174,7 +245,79 @@ impl HlForwardAudit {
             forward_send_err_count: self.forward_send_err_count.swap(0, Ordering::Relaxed),
             coalesced_drop_count: self.coalesced_drop_count.swap(0, Ordering::Relaxed),
             pending_take_count: self.pending_take_count.swap(0, Ordering::Relaxed),
+            ts_missing_or_zero_count: self.ts_missing_or_zero_count.swap(0, Ordering::Relaxed),
+            ts_clamped_past_skew_count: self.ts_clamped_past_skew_count.swap(0, Ordering::Relaxed),
+            ts_clamped_future_skew_count: self
+                .ts_clamped_future_skew_count
+                .swap(0, Ordering::Relaxed),
+            ts_policy_applied_count: self.ts_policy_applied_count.swap(0, Ordering::Relaxed),
+            ts_kept_exchange_count: self.ts_kept_exchange_count.swap(0, Ordering::Relaxed),
+            ts_past_skew_max_ms: self.ts_past_skew_max_ms.swap(0, Ordering::Relaxed),
+            ts_future_skew_max_ms: self.ts_future_skew_max_ms.swap(0, Ordering::Relaxed),
         }
+    }
+}
+
+fn apply_hl_l2_timestamp_policy(
+    exchange_ts_ms: TimestampMs,
+    rx_now_ms: TimestampMs,
+    policy: HlTimestampPolicy,
+    audit: &HlForwardAudit,
+) -> TimestampMs {
+    if exchange_ts_ms <= 0 {
+        audit.observe_ts_missing_or_zero();
+        if policy.enabled {
+            audit.observe_ts_policy_applied();
+            return rx_now_ms;
+        }
+        return exchange_ts_ms;
+    }
+
+    let past_skew_ms = if rx_now_ms > exchange_ts_ms {
+        (rx_now_ms - exchange_ts_ms) as u64
+    } else {
+        0
+    };
+    let future_skew_ms = if exchange_ts_ms > rx_now_ms {
+        (exchange_ts_ms - rx_now_ms) as u64
+    } else {
+        0
+    };
+    audit.observe_ts_skew(past_skew_ms, future_skew_ms);
+
+    if policy.enabled {
+        if past_skew_ms > policy.max_past_skew_ms {
+            audit.observe_ts_clamped_past_skew();
+            return rx_now_ms;
+        }
+        if future_skew_ms > policy.max_future_skew_ms {
+            audit.observe_ts_clamped_future_skew();
+            return rx_now_ms;
+        }
+        audit.observe_ts_kept_exchange();
+    }
+
+    exchange_ts_ms
+}
+
+fn apply_hl_l2_event_ts_policy(
+    event: MarketDataEvent,
+    rx_now_ms: TimestampMs,
+    policy: HlTimestampPolicy,
+    audit: &HlForwardAudit,
+) -> MarketDataEvent {
+    match event {
+        MarketDataEvent::L2Snapshot(mut snapshot) => {
+            snapshot.timestamp_ms =
+                apply_hl_l2_timestamp_policy(snapshot.timestamp_ms, rx_now_ms, policy, audit);
+            MarketDataEvent::L2Snapshot(snapshot)
+        }
+        MarketDataEvent::L2Delta(mut delta) => {
+            delta.timestamp_ms =
+                apply_hl_l2_timestamp_policy(delta.timestamp_ms, rx_now_ms, policy, audit);
+            MarketDataEvent::L2Delta(delta)
+        }
+        other => other,
     }
 }
 
@@ -687,6 +830,7 @@ impl HyperliquidConnector {
         let forward_freshness = self.freshness.clone();
         let forward_pending = pending_latest.clone();
         let forward_audit = Arc::new(HlForwardAudit::default());
+        let hl_ts_policy = HlTimestampPolicy::from_env();
         let forward_audit_task = forward_audit.clone();
         tokio::spawn(async move {
             while let Some(mut event) = rx_int.recv().await {
@@ -716,6 +860,7 @@ impl HyperliquidConnector {
         });
         fn maybe_emit_hl_pubq_audit(
             enabled: bool,
+            ts_policy_enabled: bool,
             freshness: &Freshness,
             forward_audit: &HlForwardAudit,
             tx_int: &mpsc::Sender<MarketDataEvent>,
@@ -753,8 +898,10 @@ impl HyperliquidConnector {
 queue_cap={} queued_len={} queued_hiwater={} pending_latest_present={} pending_overwrite={} \
 pending_lock_fail={} ts_zero_count={} ws_rx_age_ms={} data_rx_age_ms={} pub_age_ms={} book_age_ms={} \
 pub_minus_book_age_ms={} send_block_max_ms={} send_block_gt_5ms={} send_block_gt_50ms={} \
-send_block_gt_250ms={} forward_send_count={} forward_send_err_count={} coalesced_drop_count={} \
-pending_take_count={} try_send_ok={} try_send_full={} emit_since_ms={}",
+send_block_gt_250ms={} forward_send_count={} forward_send_err_count={} coalesced_drop_count={} pending_take_count={} \
+ts_missing_or_zero_count={} ts_clamped_past_skew_count={} ts_clamped_future_skew_count={} \
+ts_policy_enabled={} ts_policy_applied_count={} ts_kept_exchange_count={} ts_past_skew_max_ms={} ts_future_skew_max_ms={} \
+try_send_ok={} try_send_full={} emit_since_ms={}",
                 HL_INTERNAL_PUB_Q,
                 queued_len,
                 (*queued_hiwater).max(queued_len),
@@ -775,6 +922,14 @@ pending_take_count={} try_send_ok={} try_send_full={} emit_since_ms={}",
                 forward.forward_send_err_count,
                 forward.coalesced_drop_count,
                 forward.pending_take_count,
+                forward.ts_missing_or_zero_count,
+                forward.ts_clamped_past_skew_count,
+                forward.ts_clamped_future_skew_count,
+                u8::from(ts_policy_enabled),
+                forward.ts_policy_applied_count,
+                forward.ts_kept_exchange_count,
+                forward.ts_past_skew_max_ms,
+                forward.ts_future_skew_max_ms,
                 *try_send_ok,
                 *try_send_full,
                 emit_since_ms,
@@ -811,6 +966,7 @@ pending_take_count={} try_send_ok={} try_send_full={} emit_since_ms={}",
                         hl_pubq_try_send_ok = hl_pubq_try_send_ok.saturating_add(1);
                         maybe_emit_hl_pubq_audit(
                             hl_pubq_audit_enabled,
+                            hl_ts_policy.enabled,
                             freshness.as_ref(),
                             forward_audit.as_ref(),
                             &tx_int,
@@ -848,6 +1004,7 @@ pending_take_count={} try_send_ok={} try_send_full={} emit_since_ms={}",
                     if hl_pubq_audit_enabled {
                         maybe_emit_hl_pubq_audit(
                             hl_pubq_audit_enabled,
+                            hl_ts_policy.enabled,
                             freshness.as_ref(),
                             forward_audit.as_ref(),
                             &tx_int,
@@ -999,6 +1156,13 @@ pending_take_count={} try_send_ok={} try_send_full={} emit_since_ms={}",
                         }
 
                         if let Some(snapshot) = decode_result.event {
+                            let rx_now_ms = now_ms();
+                            let snapshot = apply_hl_l2_event_ts_policy(
+                                snapshot,
+                                rx_now_ms,
+                                hl_ts_policy,
+                                forward_audit.as_ref(),
+                            );
                             // Update freshness ONLY when we produce a publishable event
                             let now_ns = mono_now_ns();
                             freshness
@@ -1082,6 +1246,12 @@ pending_take_count={} try_send_ok={} try_send_full={} emit_since_ms={}",
                         }
                         }
                         if let Some(event) = outcome.event {
+                            let event = apply_hl_l2_event_ts_policy(
+                                event,
+                                now_ms(),
+                                hl_ts_policy,
+                                forward_audit.as_ref(),
+                            );
                             if !first_book_update_logged {
                                 eprintln!("INFO: Hyperliquid public WS first book update");
                                 first_book_update_logged = true;
@@ -2347,6 +2517,33 @@ fn build_cancel_all_action(asset_index: u32) -> serde_json::Value {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.value.as_deref() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn hyperliquid_cancel_all_smoke() {
@@ -2719,6 +2916,11 @@ mod tests {
         stats.observe_coalesced_drop(3);
         stats.observe_pending_take();
         stats.observe_pending_take();
+        stats.observe_ts_missing_or_zero();
+        stats.observe_ts_clamped_past_skew();
+        stats.observe_ts_clamped_future_skew();
+        stats.observe_ts_kept_exchange();
+        stats.observe_ts_skew(1_250, 450);
 
         let first = stats.snapshot_and_reset();
         assert_eq!(first.send_block_max_ms, 300);
@@ -2729,6 +2931,13 @@ mod tests {
         assert_eq!(first.forward_send_err_count, 1);
         assert_eq!(first.coalesced_drop_count, 3);
         assert_eq!(first.pending_take_count, 2);
+        assert_eq!(first.ts_missing_or_zero_count, 1);
+        assert_eq!(first.ts_clamped_past_skew_count, 1);
+        assert_eq!(first.ts_clamped_future_skew_count, 1);
+        assert_eq!(first.ts_policy_applied_count, 2);
+        assert_eq!(first.ts_kept_exchange_count, 1);
+        assert_eq!(first.ts_past_skew_max_ms, 1_250);
+        assert_eq!(first.ts_future_skew_max_ms, 450);
 
         let second = stats.snapshot_and_reset();
         assert_eq!(second.send_block_max_ms, 0);
@@ -2739,6 +2948,89 @@ mod tests {
         assert_eq!(second.forward_send_err_count, 0);
         assert_eq!(second.coalesced_drop_count, 0);
         assert_eq!(second.pending_take_count, 0);
+        assert_eq!(second.ts_missing_or_zero_count, 0);
+        assert_eq!(second.ts_clamped_past_skew_count, 0);
+        assert_eq!(second.ts_clamped_future_skew_count, 0);
+        assert_eq!(second.ts_policy_applied_count, 0);
+        assert_eq!(second.ts_kept_exchange_count, 0);
+        assert_eq!(second.ts_past_skew_max_ms, 0);
+        assert_eq!(second.ts_future_skew_max_ms, 0);
+    }
+
+    #[test]
+    fn hl_timestamp_policy_defaults_to_disabled_when_env_unset() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard_enabled = EnvVarGuard::new("PARAPHINA_HL_TS_HARDENING");
+        let _guard_past = EnvVarGuard::new("PARAPHINA_HL_TS_MAX_PAST_SKEW_MS");
+        let _guard_future = EnvVarGuard::new("PARAPHINA_HL_TS_MAX_FUTURE_SKEW_MS");
+        std::env::remove_var("PARAPHINA_HL_TS_HARDENING");
+        std::env::remove_var("PARAPHINA_HL_TS_MAX_PAST_SKEW_MS");
+        std::env::remove_var("PARAPHINA_HL_TS_MAX_FUTURE_SKEW_MS");
+
+        let policy = HlTimestampPolicy::from_env();
+        assert!(!policy.enabled);
+        assert_eq!(policy.max_past_skew_ms, HL_TS_MAX_PAST_SKEW_MS_DEFAULT);
+        assert_eq!(policy.max_future_skew_ms, HL_TS_MAX_FUTURE_SKEW_MS_DEFAULT);
+    }
+
+    #[test]
+    fn hl_timestamp_policy_disabled_preserves_exchange_timestamp() {
+        let audit = HlForwardAudit::default();
+        let policy = HlTimestampPolicy {
+            enabled: false,
+            max_past_skew_ms: 10,
+            max_future_skew_ms: 10,
+        };
+
+        assert_eq!(apply_hl_l2_timestamp_policy(0, 20_000, policy, &audit), 0);
+        assert_eq!(
+            apply_hl_l2_timestamp_policy(15_000, 20_000, policy, &audit),
+            15_000
+        );
+
+        let snapshot = audit.snapshot_and_reset();
+        assert_eq!(snapshot.ts_missing_or_zero_count, 1);
+        assert_eq!(snapshot.ts_clamped_past_skew_count, 0);
+        assert_eq!(snapshot.ts_clamped_future_skew_count, 0);
+        assert_eq!(snapshot.ts_policy_applied_count, 0);
+        assert_eq!(snapshot.ts_kept_exchange_count, 0);
+        assert_eq!(snapshot.ts_past_skew_max_ms, 5_000);
+    }
+
+    #[test]
+    fn hl_timestamp_policy_enabled_clamps_zero_past_and_future_skew() {
+        let audit = HlForwardAudit::default();
+        let policy = HlTimestampPolicy {
+            enabled: true,
+            max_past_skew_ms: 1_000,
+            max_future_skew_ms: 250,
+        };
+
+        assert_eq!(
+            apply_hl_l2_timestamp_policy(0, 20_000, policy, &audit),
+            20_000
+        );
+        assert_eq!(
+            apply_hl_l2_timestamp_policy(14_000, 20_500, policy, &audit),
+            20_500
+        );
+        assert_eq!(
+            apply_hl_l2_timestamp_policy(21_000, 20_500, policy, &audit),
+            20_500
+        );
+        assert_eq!(
+            apply_hl_l2_timestamp_policy(20_450, 20_500, policy, &audit),
+            20_450
+        );
+
+        let snapshot = audit.snapshot_and_reset();
+        assert_eq!(snapshot.ts_missing_or_zero_count, 1);
+        assert_eq!(snapshot.ts_clamped_past_skew_count, 1);
+        assert_eq!(snapshot.ts_clamped_future_skew_count, 1);
+        assert_eq!(snapshot.ts_policy_applied_count, 3);
+        assert_eq!(snapshot.ts_kept_exchange_count, 1);
+        assert_eq!(snapshot.ts_past_skew_max_ms, 6_500);
+        assert_eq!(snapshot.ts_future_skew_max_ms, 500);
     }
 }
 
