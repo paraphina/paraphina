@@ -37,6 +37,18 @@ on:
         description: "HL_L2_LEVELS"
         required: true
         default: "20"
+      hl_ts_hardening:
+        description: "PARAPHINA_HL_TS_HARDENING (0/1)"
+        required: true
+        default: "0"
+      hl_ts_max_past_skew_ms:
+        description: "PARAPHINA_HL_TS_MAX_PAST_SKEW_MS"
+        required: true
+        default: "1500"
+      hl_ts_max_future_skew_ms:
+        description: "PARAPHINA_HL_TS_MAX_FUTURE_SKEW_MS"
+        required: true
+        default: "250"
       extended_apply_age_on_any_l2:
         description: "PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2"
         required: true
@@ -90,6 +102,9 @@ jobs:
           EXTENDED_WS_READ_TIMEOUT_MS: ${{ github.event.inputs.extended_ws_read_timeout_ms || '45000' }}
           PARADEX_PUBLIC_FEED: ${{ github.event.inputs.paradex_public_feed || 'bbo' }}
           EXTENDED_WS_DEPTH_LEVELS: ${{ github.event.inputs.extended_ws_depth_levels || '2' }}
+          HL_TS_HARDENING: ${{ github.event.inputs.hl_ts_hardening || '0' }}
+          HL_TS_MAX_PAST_SKEW_MS: ${{ github.event.inputs.hl_ts_max_past_skew_ms || '1500' }}
+          HL_TS_MAX_FUTURE_SKEW_MS: ${{ github.event.inputs.hl_ts_max_future_skew_ms || '250' }}
           ARB_EXTENDED_MAX_APPLY_AGE_MS: ${{ github.event.inputs.arb_extended_max_apply_age_ms || '' }}
           CONNECTORS: ${{ github.event.inputs.connectors || 'hyperliquid,lighter,extended,aster,paradex' }}
         run: |
@@ -97,6 +112,9 @@ jobs:
           set +e
           echo "RUN_INPUT DURATION_MINUTES=$DURATION_MINUTES"
           echo "RUN_INPUT HL_L2_LEVELS=${HL_L2_LEVELS:-}"
+          echo "RUN_INPUT PARAPHINA_HL_TS_HARDENING=${HL_TS_HARDENING:-}"
+          echo "RUN_INPUT PARAPHINA_HL_TS_MAX_PAST_SKEW_MS=${HL_TS_MAX_PAST_SKEW_MS:-}"
+          echo "RUN_INPUT PARAPHINA_HL_TS_MAX_FUTURE_SKEW_MS=${HL_TS_MAX_FUTURE_SKEW_MS:-}"
           echo "RUN_INPUT PARADEX_PUBLIC_FEED=$PARADEX_PUBLIC_FEED"
           echo "RUN_INPUT EXTENDED_WS_DEPTH_LEVELS=$EXTENDED_WS_DEPTH_LEVELS"
           echo "RUN_INPUT PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2=${PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2:-}"
@@ -116,6 +134,9 @@ jobs:
           PARAPHINA_EXTENDED_WS_READ_TIMEOUT_MS=$EXTENDED_WS_READ_TIMEOUT_MS \
           PARAPHINA_PARADEX_PUBLIC_FEED=$PARADEX_PUBLIC_FEED \
           PARAPHINA_EXTENDED_WS_DEPTH_LEVELS=$EXTENDED_WS_DEPTH_LEVELS \
+          PARAPHINA_HL_TS_HARDENING=$HL_TS_HARDENING \
+          PARAPHINA_HL_TS_MAX_PAST_SKEW_MS=$HL_TS_MAX_PAST_SKEW_MS \
+          PARAPHINA_HL_TS_MAX_FUTURE_SKEW_MS=$HL_TS_MAX_FUTURE_SKEW_MS \
           timeout ${DURATION_MINUTES}m cargo run --release -p paraphina --bin paraphina_live --features "live_hyperliquid live_lighter live_extended live_aster live_paradex" -- \
             --trade-mode shadow \
             --connectors $CONNECTORS \
