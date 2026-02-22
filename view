@@ -105,4 +105,8 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 127
 fi
 
+if [ -t 1 ]; then
+    printf '\n'
+fi
+
 exec python3 tools/paraphina_watch.py "$@"

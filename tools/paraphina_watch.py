@@ -1259,6 +1259,12 @@ def _compact_tape_payload(text: str, width: int) -> str:
     return normalized[: width - 3] + "..."
 
 
+QUOTE_FOOTER = (
+    "'all history present in that visage, the child the father of the man' - "
+    "McCarthy (c.1985; 1933 - 2023 AD)"
+)
+
+
 def _extract_net_pos_usd(record: dict[str, Any]) -> float | None:
     return _pick_number(
         [record],
@@ -1280,6 +1286,22 @@ def _extract_max_pos_cap_usd(record: dict[str, Any]) -> float | None:
             "position_cap_usd",
             "max_abs_position_usd",
             "delta_limit_usd",
+        ),
+    )
+
+
+def _extract_pnl_usd(record: dict[str, Any]) -> float | None:
+    return _pick_number(
+        [record],
+        (
+            "pnl_total",
+            "pnl_total_usd",
+            "pnl_usd",
+            "pnl_unrealised",
+            "pnl_unrealized",
+            "unrealized_pnl_usd",
+            "pnl_realised",
+            "pnl_realized",
         ),
     )
 
@@ -2012,7 +2034,7 @@ def render_frame_simple(
     ui_mode: str | None = None,
     render_ms: int | None = None,
 ) -> Any:
-    del max_events, term_height, config_dir, health_url, layout_debug, ui_mode, render_ms
+    del max_events, config_dir, health_url, layout_debug, ui_mode, render_ms
     state.frame_count += 1
     record = state.last_record or {}
     now_mono = time.monotonic()
@@ -2039,7 +2061,7 @@ def render_frame_simple(
     )
     header.append(" // ")
     header.append(now_hhmm_utc, style="white")
-    header.append(" // ")
+    header.append(" \\ ")
     header.append(str(tick_value), style="white")
 
     legend = Text(
@@ -2106,12 +2128,40 @@ def render_frame_simple(
         else:
             pos_style = "white"
 
+    pnl_value: float | None = None
+    if not in_shadow:
+        pnl_value = _extract_pnl_usd(record)
+    pnl_text = _format_signed_dollars(pnl_value)
+    pnl_style = "dim"
+    if pnl_value is not None:
+        if pnl_value > 0:
+            pnl_style = "green"
+        elif pnl_value < 0:
+            pnl_style = "red"
+        else:
+            pnl_style = "white"
+
     footer = Text("Δ ")
     footer.append(delta_text, style=delta_style)
-    footer.append(" // POS ")
+    footer.append(" // ")
+    footer.append("POS", style="bold red")
+    footer.append(" ")
     footer.append(pos_text, style=pos_style)
+    footer.append(" \\ ")
+    footer.append("PNL", style="bold red")
+    footer.append(" ")
+    footer.append(pnl_text, style=pnl_style)
 
-    return Group(header, legend, *tape_lines, footer)
+    frame_lines: list[Text] = [header, legend, *tape_lines]
+    rows_remaining = term_height - (len(frame_lines) + 1)
+    quote_line = Text(QUOTE_FOOTER, style="dim italic")
+    if rows_remaining >= 3:
+        frame_lines.append(Text(""))
+        frame_lines.append(quote_line)
+        frame_lines.append(Text(""))
+    frame_lines.append(footer)
+
+    return Group(*frame_lines)
 
 
 def render_frame_rich(

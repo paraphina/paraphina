@@ -79,6 +79,7 @@ Watch UI notes:
 - In shadow mode, graph-strip `PNL` and `POS` render as inactive (`— (shadow)`), not zero.
 - `ageE` is event freshness (`venue ts -> rx`) when telemetry provides `venue_age_event_ms`; otherwise watch uses an `ageA` proxy.
 - `ageA` is apply/publish freshness (`rx -> publish/apply`) from `venue_age_ms`.
+- Simple page includes a static quote footer below `Δ // POS` when terminal height allows; it is omitted on small terminals.
 - BUY/SELL flashes use TTL row/tape highlight (`--flash-ms`, default 650ms), not ANSI blink.
 - `--layout-debug` prints rich layout row allocation once (useful for terminal fit verification).
 - Path shortcuts: `--run-dir DIR` (reads `DIR/telemetry.jsonl`) and `--latest` (reads `/tmp/paraphina_shadow_latest`).
