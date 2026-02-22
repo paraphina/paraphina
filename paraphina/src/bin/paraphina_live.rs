@@ -548,6 +548,62 @@ fn env_present(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn connector_execution_mode_checks(
+    trade_mode: TradeMode,
+    connectors: &[ConnectorArg],
+) -> (bool, String) {
+    if !matches!(trade_mode, TradeMode::Live | TradeMode::Testnet) {
+        return (true, "not_required".to_string());
+    }
+
+    let mut ok = true;
+    let mut details: Vec<String> = Vec::new();
+    for connector in connectors {
+        match connector {
+            ConnectorArg::Hyperliquid => {
+                #[cfg(feature = "live_hyperliquid")]
+                {
+                    let cfg =
+                        paraphina::live::connectors::hyperliquid::HyperliquidConfig::from_env();
+                    let mode_ok = !cfg.paper_mode;
+                    ok &= mode_ok;
+                    details.push(format!(
+                        "hyperliquid:paper_mode={} required=false",
+                        cfg.paper_mode
+                    ));
+                }
+                #[cfg(not(feature = "live_hyperliquid"))]
+                {
+                    ok = false;
+                    details.push("hyperliquid:feature_disabled".to_string());
+                }
+            }
+            ConnectorArg::Lighter => {
+                #[cfg(feature = "live_lighter")]
+                {
+                    let cfg = paraphina::live::connectors::lighter::LighterConfig::from_env();
+                    let mode_ok = !cfg.paper_mode;
+                    ok &= mode_ok;
+                    details.push(format!(
+                        "lighter:paper_mode={} required=false",
+                        cfg.paper_mode
+                    ));
+                }
+                #[cfg(not(feature = "live_lighter"))]
+                {
+                    ok = false;
+                    details.push("lighter:feature_disabled".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    if details.is_empty() {
+        details.push("not_applicable".to_string());
+    }
+    (ok, details.join(" "))
+}
+
 #[derive(Debug, Clone)]
 struct ReconcileEnvState {
     enabled: bool,
@@ -587,6 +643,29 @@ fn parse_reconcile_env() -> ReconcileEnvState {
         enabled: false,
         detail: format!("invalid value={}", raw),
     }
+}
+
+fn parse_reconcile_interval_ms() -> Option<u64> {
+    let account_var = std::env::var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS").ok();
+    let legacy_var = std::env::var("PARAPHINA_LIVE_RECONCILE_MS").ok();
+    let raw = if let Some(val) = account_var {
+        val
+    } else if let Some(val) = legacy_var {
+        eprintln!(
+            "paraphina_live | warn=reconcile_env_legacy_only var=PARAPHINA_LIVE_RECONCILE_MS preferred=PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS"
+        );
+        val
+    } else {
+        return None;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "false" | "off" | "no") {
+        return None;
+    }
+    raw.parse::<i64>()
+        .ok()
+        .filter(|ms| *ms > 0)
+        .map(|ms| ms as u64)
 }
 
 fn endpoint_dns_status(url: &str) -> (bool, String) {
@@ -995,6 +1074,15 @@ fn enforce_live_execution_guardrails(
         eprintln!(
             "paraphina_live | error=live_mode_connector_invalid connectors={} (use --trade-mode shadow for safe runs)",
             connectors_label(connectors)
+        );
+        std::process::exit(2);
+    }
+
+    let (exec_mode_ok, exec_mode_details) = connector_execution_mode_checks(trade_mode, connectors);
+    if !exec_mode_ok {
+        eprintln!(
+            "paraphina_live | error=live_mode_execution_mode_invalid detail=\"{}\" (set HL_PAPER_MODE=false and LIGHTER_PAPER_MODE=false)",
+            exec_mode_details
         );
         std::process::exit(2);
     }
@@ -1580,6 +1668,13 @@ fn run_preflight(
         details: creds_detail,
     });
 
+    let (exec_mode_ok, exec_mode_details) = connector_execution_mode_checks(trade_mode, connectors);
+    checks.push(PreflightCheck {
+        label: "execution_modes",
+        ok: exec_mode_ok,
+        details: exec_mode_details,
+    });
+
     let live_guard_ok = if trade_mode == TradeMode::Live {
         connectors_allowed_for_live_mode(connectors)
             && args.enable_live_execution
@@ -1776,18 +1871,16 @@ async fn main() {
     let (_order_snapshot_tx, order_snapshot_rx) =
         mpsc::channel::<paraphina::live::types::OrderSnapshot>(128);
 
-    if let Ok(val) = std::env::var("PARAPHINA_LIVE_RECONCILE_MS") {
-        if let Ok(ms) = val.parse::<u64>() {
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(ms.max(100)));
-                loop {
-                    interval.tick().await;
-                    // Connector-provided snapshots should be sent on this channel.
-                    // Stub binary logs only.
-                    println!("paraphina_live | reconcile_tick_ms={}", ms);
-                }
-            });
-        }
+    if let Some(ms) = parse_reconcile_interval_ms() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(ms.max(100)));
+            loop {
+                interval.tick().await;
+                // Connector-provided snapshots should be sent on this channel.
+                // Stub binary logs only.
+                println!("paraphina_live | reconcile_tick_ms={}", ms);
+            }
+        });
     }
     let (order_tx, mut order_rx) = mpsc::channel::<LiveOrderRequest>(256);
 
@@ -1940,7 +2033,11 @@ async fn main() {
                     }
                     let hl_arc = Arc::new(hl);
                     if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
-                        if hl_cfg.private_key_hex.is_some() {
+                        if hl_cfg.paper_mode {
+                            eprintln!(
+                                "paraphina_live | exec_disabled=true reason=hl_paper_mode connector=hyperliquid"
+                            );
+                        } else if hl_cfg.private_key_hex.is_some() {
                             exec_clients.insert(venue_id.clone(), hl_arc.clone());
                         } else {
                             eprintln!("paraphina_live | exec_disabled=true reason=missing_hl_private_key connector=hyperliquid");

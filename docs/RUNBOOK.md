@@ -32,8 +32,8 @@ See "Migration to new VPS" for the concrete checklist.
 - **All-5 Connected (Market)**: all five venues emit non-stale market data and
   telemetry shows `healthy_venues_used_count=5`.
 - **All-5 Connected (Execution)**: live execution is enabled for all venues that
-  support it (currently Hyperliquid + Lighter), with market connectivity for
-  the remaining venues.
+  support it (Hyperliquid, Lighter, Extended, Aster, Paradex), with valid auth
+  and live guardrails enabled.
 
 ## All-5 Live Shadow Market Data
 
@@ -58,6 +58,30 @@ Right pane (watch telemetry):
 ```
 python3 tools/paraphina_watch.py --telemetry "$(cat /tmp/paraphina_last_outdir.txt)/telemetry.jsonl" --refresh-ms 1000
 ```
+
+Quick launcher (repo root):
+
+```
+./view
+./view y
+./view --run-dir <dir>
+./view --telemetry <path>
+```
+
+Watch UI notes:
+- Default rich page is `simple` (ultra-light); press `X` for `simple` and `Y` for `expanded`.
+- Use `--page simple|expanded` to pick startup page (useful in non-TTY runs where key input is unavailable).
+- Use `--classic` for legacy ANSI layout.
+- Rich layout uses bottom tabs: `1/2/3` (or `t/k/a`) to switch `TAPE/KEYS/ALERTS`; `←/→` cycles tabs.
+- Venue IDs in the table are compact `VN` codes: `HL` (hyperliquid), `AS` (aster), `EX` (extended), `PA` (paradex), `LG` (lighter). Press `?` in rich mode to show the mapping inline.
+- `Δmid` is per-venue basis points vs the median mid computed from healthy venues only; missing/invalid mids are excluded from the median and shown as `—`.
+- Graph strip `SYS Δmid max` is max absolute `Δmid` across venues with valid `Δmid`.
+- In shadow mode, graph-strip `PNL` and `POS` render as inactive (`— (shadow)`), not zero.
+- `ageE` is event freshness (`venue ts -> rx`) when telemetry provides `venue_age_event_ms`; otherwise watch uses an `ageA` proxy.
+- `ageA` is apply/publish freshness (`rx -> publish/apply`) from `venue_age_ms`.
+- BUY/SELL flashes use TTL row/tape highlight (`--flash-ms`, default 650ms), not ANSI blink.
+- `--layout-debug` prints rich layout row allocation once (useful for terminal fit verification).
+- Path shortcuts: `--run-dir DIR` (reads `DIR/telemetry.jsonl`) and `--latest` (reads `/tmp/paraphina_shadow_latest`).
 
 Endpoint overrides (optional):
 - `LIGHTER_WS_URL` and `LIGHTER_HTTP_BASE_URL` override Lighter public endpoints.
@@ -86,6 +110,11 @@ PARAPHINA_LIVE_OUT_DIR=./live_runs/all5_shadow_live \
 PARAPHINA_TELEMETRY_MODE=jsonl \
 cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex
 ```
+
+Live env template (all 5 connectors + required secret keys):
+
+- `deploy/env/roadmap_b_live.env.example`
+- Deploy target path: `/etc/paraphina/current.env` (systemd template loads this file)
 
 ## All-5 PaperExec (Offline)
 
@@ -170,13 +199,38 @@ gating and quote staleness guards (NOT connector watchdog timeouts).
 
 Canary live requires credentials and explicit live execution gates. Run manually only:
 
+1) Preflight:
+
 ```
 PARAPHINA_TRADE_MODE=live \
 PARAPHINA_LIVE_CONNECTORS=hyperliquid,lighter,extended,aster,paradex \
-PARAPHINA_LIVE_EXEC_ENABLE=1 PARAPHINA_LIVE_EXECUTION_CONFIRM=YES \
 PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS=5000 \
---enable-live-execution \
-cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex
+PARAPHINA_LIVE_CANARY_PROFILE=prod_canary \
+PARAPHINA_LIVE_EXEC_ENABLE=1 PARAPHINA_LIVE_EXECUTION_CONFIRM=YES \
+HL_PAPER_MODE=false LIGHTER_PAPER_MODE=false \
+cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex -- \
+  --preflight \
+  --trade-mode live \
+  --connectors hyperliquid,lighter,extended,aster,paradex \
+  --canary-profile prod_canary \
+  --enable-live-execution
+```
+
+2) Launch live only after preflight passes:
+
+```
+PARAPHINA_TRADE_MODE=live \
+PARAPHINA_LIVE_CONNECTORS=hyperliquid,lighter,extended,aster,paradex \
+PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS=5000 \
+PARAPHINA_LIVE_CANARY_PROFILE=prod_canary \
+PARAPHINA_LIVE_PREFLIGHT_OK=1 \
+PARAPHINA_LIVE_EXEC_ENABLE=1 PARAPHINA_LIVE_EXECUTION_CONFIRM=YES \
+HL_PAPER_MODE=false LIGHTER_PAPER_MODE=false \
+cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex -- \
+  --trade-mode live \
+  --connectors hyperliquid,lighter,extended,aster,paradex \
+  --canary-profile prod_canary \
+  --enable-live-execution
 ```
 
 ## Live Execution Guardrails
@@ -189,6 +243,11 @@ Live mode requires all of the following to start:
 - `--enable-live-execution`
 - `PARAPHINA_LIVE_EXEC_ENABLE=1` (or `true`)
 - `PARAPHINA_LIVE_EXECUTION_CONFIRM=YES`
+- `PARAPHINA_LIVE_PREFLIGHT_OK=1` (set only after successful `--preflight`)
+- `PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS>0`
+- `--canary-profile <path>` or `PARAPHINA_LIVE_CANARY_PROFILE`
+- `HL_PAPER_MODE=false` when using Hyperliquid execution (`HL_PAPER_MODE` defaults to `true` if unset)
+- `LIGHTER_PAPER_MODE=false` when using Lighter execution (`LIGHTER_PAPER_MODE` defaults to `true` if unset)
 - Required venue credentials are present
 
 If any requirement is missing, the binary refuses to start and suggests running
@@ -310,14 +369,14 @@ after cancel‑all.
 ## Reconciliation
 
 - On WS gaps, request REST snapshot and reconcile open orders.
-- Periodic reconciliation cadence via `PARAPHINA_LIVE_RECONCILE_MS`.
+- Periodic reconciliation cadence via `PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS`.
 
 ## Reconciliation Required (Live)
 
 Live mode requires reconciliation to prevent silent drift between internal state
 and venue state. Configure:
 
-- `PARAPHINA_LIVE_RECONCILE_MS=<ms>` to schedule account reconciliation requests.
+- `PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS=<ms>` to schedule account reconciliation requests.
 - `PARAPHINA_RECONCILE_POS_TAO_TOL` and `PARAPHINA_RECONCILE_BALANCE_USD_TOL` for tolerances.
 - `PARAPHINA_RECONCILE_ORDER_COUNT_TOL` for open-order drift tolerance.
 
@@ -325,6 +384,7 @@ and venue state. Configure:
 
 - [ ] Run preflight and export `PARAPHINA_LIVE_PREFLIGHT_OK=1`.
 - [ ] Select canary profile (`--canary-profile prod_canary` or `PARAPHINA_LIVE_CANARY_PROFILE`).
+- [ ] Verify `configs/prod_canary.toml` exists and contains limits caps.
 - [ ] Enable reconciliation (`PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS`).
 - [ ] Verify rate limit vars set (from canary profile).
 - [ ] Confirm telemetry path + out-dir are writable.
@@ -510,4 +570,3 @@ intentional changes to `docs/WHITEPAPER.md`.
 ```bash
 SCREEN -S paraphina_shadow -dm bash -lc cd ~/code/paraphina && export HL_COIN=ETH LIGHTER_MARKET=ETH-USD PARADEX_MARKET=ETH-USD-PERP ASTER_MARKET=ETHUSDT EXTENDED_MARKET=ETH-USD EXTENDED_REST_URL=https://api.starknet.extended.exchange EXTENDED_FUNDING_PATH=/api/v1/info/markets/ETH-USD/stats PARAPHINA_TELEMETRY_MODE=jsonl PARAPHINA_TELEMETRY_PATH=/tmp/paraphina_live_shadow/telemetry.jsonl PARAPHINA_HL_STATE_STALE_MS_OVERRIDE=1500 PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE=1500 PARAPHINA_FUNDING_STALE_MS=600000 PARAPHINA_FUNDING_AVOID_WINDOW_MS=120000 HL_FUNDING_POLL_MS=5000 PARADEX_FUNDING_POLL_MS=5000 LIGHTER_FUNDING_POLL_MS=5000 EXTENDED_FUNDING_POLL_MS=5000 ASTER_FUNDING_POLL_MS=5000; RUST_LOG=info ./target/debug/paraphina_live --trade-mode shadow --connectors extended,hyperliquid,aster,lighter,paradex --out-dir /tmp/paraphina_live_shadow
 ```
-

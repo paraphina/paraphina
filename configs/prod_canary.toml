@@ -1,0 +1,19 @@
+# Paraphina production canary profile.
+# This file is intentionally conservative and should be tuned before scale-up.
+
+[limits]
+# Required for live guardrails.
+max_position_tao = 0.5
+max_open_orders = 20
+
+[rate_limit]
+enabled = true
+rps = 8.0
+burst = 12
+
+[enforcement]
+post_only = true
+reduce_only = false
+
+[kill]
+stale_max_ticks = 4

@@ -1,0 +1,108 @@
+#!/bin/sh
+
+# One-command launcher for the Paraphina watch UI.
+# Defaults to the SIMPLE page and auto-detects telemetry source.
+
+set -u
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || {
+    echo "error: failed to determine script directory." >&2
+    exit 1
+}
+REPO_ROOT="$SCRIPT_DIR"
+
+cd "$REPO_ROOT" || {
+    echo "error: failed to cd to repo root: $REPO_ROOT" >&2
+    exit 1
+}
+
+if [ -f ".venv/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    . ".venv/bin/activate" || echo "warning: failed to activate .venv; using current python." >&2
+else
+    echo "info: .venv not found; using system python3." >&2
+fi
+
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        y|Y)
+            shift
+            set -- --page expanded "$@"
+            ;;
+        x|X)
+            shift
+            set -- --page simple "$@"
+            ;;
+    esac
+fi
+
+has_target=0
+has_refresh=0
+has_page=0
+for arg in "$@"; do
+    case "$arg" in
+        --telemetry|--telemetry=*|--run-dir|--run-dir=*|--latest)
+            has_target=1
+            ;;
+    esac
+    case "$arg" in
+        --refresh-ms|--refresh-ms=*)
+            has_refresh=1
+            ;;
+    esac
+    case "$arg" in
+        --page|--page=*)
+            has_page=1
+            ;;
+    esac
+done
+
+if [ "$has_page" -eq 0 ]; then
+    set -- --page simple "$@"
+fi
+
+if [ "$has_refresh" -eq 0 ]; then
+    set -- --refresh-ms 50 "$@"
+fi
+
+if [ "$has_target" -eq 0 ]; then
+    if [ -f "/tmp/paraphina_live_shadow/telemetry.jsonl" ]; then
+        set -- --run-dir "/tmp/paraphina_live_shadow" "$@"
+    elif [ -f "/tmp/paraphina_shadow_latest/telemetry.jsonl" ]; then
+        set -- --latest "$@"
+    elif [ -f "/tmp/paraphina_last_outdir.txt" ]; then
+        last_outdir=$(head -n 1 "/tmp/paraphina_last_outdir.txt" 2>/dev/null)
+        if [ -n "${last_outdir:-}" ] && [ -f "$last_outdir/telemetry.jsonl" ]; then
+            set -- --run-dir "$last_outdir" "$@"
+        fi
+    fi
+fi
+
+has_target=0
+for arg in "$@"; do
+    case "$arg" in
+        --telemetry|--telemetry=*|--run-dir|--run-dir=*|--latest)
+            has_target=1
+            break
+            ;;
+    esac
+done
+
+if [ "$has_target" -eq 0 ]; then
+    cat >&2 <<'EOF'
+No telemetry source found.
+
+Usage:
+  ./view --run-dir <dir>
+  ./view --telemetry <path>
+  ./view y
+EOF
+    exit 2
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: python3 not found in PATH." >&2
+    exit 127
+fi
+
+exec python3 tools/paraphina_watch.py "$@"

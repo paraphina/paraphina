@@ -9,23 +9,63 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import errno
 import json
 import os
 import re
 import signal
+import shutil
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Deque, Iterable
+from typing import Any, Deque, Iterable, Mapping
+
+try:
+    from rich import box
+    from rich.console import Console, Group
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    _RICH_AVAILABLE = True
+except ImportError:
+    _RICH_AVAILABLE = False
+
+try:
+    import fcntl
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - non-Unix fallback
+    fcntl = None
+    termios = None
+    tty = None
 
 # ── ANSI styling ──────────────────────────────────────────────────────────────
 
 _NO_COLOR = False  # flipped by --no-color / NO_COLOR env / non-TTY
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+_VENUE_CODE_MAP = {
+    "hyperliquid": "HL",
+    "aster": "AS",
+    "extended": "EX",
+    "paradex": "PA",
+    "lighter": "LG",
+}
+
+_TAB_TAPE = 0
+_TAB_KEYS = 1
+_TAB_ALERTS = 2
+
+_PAGE_SIMPLE = "simple"
+_PAGE_EXPANDED = "expanded"
 
 
 class S:
@@ -78,11 +118,64 @@ def styled(text: str, *codes: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Terminal dashboard for paraphina_live telemetry."
+        description="Terminal dashboard for paraphina_live telemetry.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Freshness semantics:\n"
+            "  ageE = event age (venue timestamp -> rx)\n"
+            "  ageA = apply age (rx -> publish/apply)\n"
+            "Flash semantics:\n"
+            "  BUY flashes green, SELL flashes red via TTL highlight (no ANSI blink).\n"
+            "Path helpers:\n"
+            "  --run-dir DIR   -> reads DIR/telemetry.jsonl\n"
+            "  --latest        -> resolves /tmp/paraphina_shadow_latest[/telemetry.jsonl]\n"
+        ),
     )
-    parser.add_argument("--telemetry", required=True, help="Path to telemetry.jsonl")
+    path_group = parser.add_mutually_exclusive_group(required=True)
+    path_group.add_argument("--telemetry", help="Path to telemetry.jsonl")
+    path_group.add_argument(
+        "--run-dir",
+        help="Run directory containing telemetry.jsonl",
+    )
+    path_group.add_argument(
+        "--latest",
+        action="store_true",
+        help="Use /tmp/paraphina_shadow_latest symlink convention",
+    )
     parser.add_argument("--refresh-ms", type=int, default=250)
+    parser.add_argument(
+        "--render-ms",
+        type=int,
+        default=None,
+        help=(
+            "Render cadence in milliseconds (default: refresh-ms, or "
+            "max(refresh-ms,120) when VS Code mode auto-detects)"
+        ),
+    )
     parser.add_argument("--max-events", type=int, default=50)
+    parser.add_argument(
+        "--sort",
+        choices=("agee", "stale", "venue"),
+        default="agee",
+        help="Venue sort mode for rich UI (default: agee/worst-first)",
+    )
+    parser.add_argument(
+        "--classic",
+        action="store_true",
+        help="Use the legacy classic renderer",
+    )
+    parser.add_argument(
+        "--page",
+        choices=(_PAGE_SIMPLE, _PAGE_EXPANDED),
+        default=_PAGE_SIMPLE,
+        help="Startup page for rich UI (default: simple)",
+    )
+    parser.add_argument(
+        "--flash-ms",
+        type=int,
+        default=650,
+        help="BUY/SELL flash TTL in milliseconds (default: 650)",
+    )
     parser.add_argument(
         "--no-color", action="store_true", help="Disable coloured output"
     )
@@ -98,7 +191,56 @@ def parse_args() -> argparse.Namespace:
         "--no-deploy-state", action="store_true",
         help="Disable deploy state panel",
     )
+    parser.add_argument(
+        "--layout-debug",
+        action="store_true",
+        help="Print rich layout row allocation once",
+    )
+    vscode_group = parser.add_mutually_exclusive_group()
+    vscode_group.add_argument(
+        "--vscode",
+        action="store_true",
+        help="Force VS Code render mode on",
+    )
+    vscode_group.add_argument(
+        "--no-vscode",
+        action="store_true",
+        help="Force VS Code render mode off",
+    )
     return parser.parse_args()
+
+
+def resolve_telemetry_path(args: argparse.Namespace) -> Path:
+    if args.telemetry:
+        return Path(args.telemetry)
+    if args.run_dir:
+        return Path(args.run_dir) / "telemetry.jsonl"
+    if args.latest:
+        latest = Path("/tmp/paraphina_shadow_latest")
+        if latest.exists():
+            if latest.is_dir():
+                return latest / "telemetry.jsonl"
+            return latest
+        last_outdir = Path("/tmp/paraphina_last_outdir.txt")
+        if last_outdir.exists():
+            try:
+                outdir = last_outdir.read_text(encoding="utf-8").strip()
+                if outdir:
+                    return Path(outdir) / "telemetry.jsonl"
+            except OSError:
+                pass
+        raise FileNotFoundError(
+            "latest path missing: /tmp/paraphina_shadow_latest "
+            "(and /tmp/paraphina_last_outdir.txt unavailable)"
+        )
+    raise ValueError("no telemetry path source selected")
+
+
+def detect_vscode_terminal(env: Mapping[str, str] | None = None) -> bool:
+    source = env if env is not None else os.environ
+    if source.get("TERM_PROGRAM") == "vscode":
+        return True
+    return any(key.startswith("VSCODE_") for key in source)
 
 
 # ── Value helpers (unchanged logic) ───────────────────────────────────────────
@@ -145,6 +287,56 @@ def format_status(value: Any) -> str:
     if isinstance(value, str):
         return value
     return "n/a"
+
+
+def venue_code(venue_id: str) -> str:
+    return _VENUE_CODE_MAP.get(venue_id, (venue_id[:2] if venue_id else "??").upper())
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def compute_delta_mid_bps_map(
+    venue_ids: list[str],
+    venue_status: list[Any],
+    venue_mid: list[Any],
+) -> tuple[float | None, dict[str, float | None]]:
+    healthy_mids: list[float] = []
+    parsed_mid: dict[str, float | None] = {}
+    parsed_status: dict[str, str] = {}
+    for idx, venue_id in enumerate(venue_ids):
+        status = (
+            str(venue_status[idx])
+            if isinstance(venue_status, list) and idx < len(venue_status)
+            else "Unknown"
+        )
+        mid = (
+            safe_float(venue_mid[idx])
+            if isinstance(venue_mid, list) and idx < len(venue_mid)
+            else None
+        )
+        parsed_mid[venue_id] = mid
+        parsed_status[venue_id] = status
+        if status == "Healthy" and mid is not None:
+            healthy_mids.append(mid)
+
+    median_mid = _median(healthy_mids)
+    out: dict[str, float | None] = {}
+    for venue_id in venue_ids:
+        mid = parsed_mid.get(venue_id)
+        status = parsed_status.get(venue_id, "Unknown")
+        if status != "Healthy" or mid is None or median_mid is None or median_mid == 0:
+            out[venue_id] = None
+            continue
+        out[venue_id] = ((mid - median_mid) / median_mid) * 10000.0
+    return median_mid, out
 
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
@@ -347,7 +539,7 @@ def parse_venue_ids(record: dict[str, Any], fallback_count: int) -> list[str]:
     return [f"venue_{i}" for i in range(fallback_count)]
 
 
-# ── Telemetry parsing (unchanged logic) ──────────────────────────────────────
+# ── Telemetry parsing ─────────────────────────────────────────────────────────
 
 
 def parse_lines(path: Path, max_events: int) -> list[dict[str, Any]]:
@@ -355,23 +547,40 @@ def parse_lines(path: Path, max_events: int) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict):
-                    records.append(record)
+        # Read only the tail so startup remains fast on large telemetry files.
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size <= 0:
+                return []
+            data = b""
+            pos = size
+            block_size = 64 * 1024
+            target = max(4, max_events * 2)
+            lines: list[bytes] = []
+            while pos > 0 and len(lines) <= target:
+                step = block_size if pos >= block_size else pos
+                pos -= step
+                handle.seek(pos, os.SEEK_SET)
+                data = handle.read(step) + data
+                lines = data.splitlines()
+            tail_lines = lines[-max_events:]
+        for raw_line in tail_lines:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
     except OSError:
         return []
     return list(records)
 
 
-# ── State tracking (unchanged logic) ─────────────────────────────────────────
+# ── State tracking ────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -382,15 +591,107 @@ class EventLog:
 
 
 @dataclass
+class TapeEvent:
+    event_id: str
+    kind: str
+    text: str
+    venue_id: str | None = None
+    ts_ms: int | None = None
+    flash_until_mono: float = 0.0
+
+
+@dataclass
 class WatchState:
+    sort_mode: str = "agee"
+    flash_ttl_s: float = 0.65
+    history_len: int = 90
     last_record: dict[str, Any] | None = None
     venue_ids: list[str] = field(default_factory=list)
     last_fill_ms: dict[str, int] = field(default_factory=dict)
     events: EventLog = field(default_factory=EventLog)
+    tape: Deque[TapeEvent] = field(default_factory=lambda: deque(maxlen=50))
+    alerts: Deque[str] = field(default_factory=lambda: deque(maxlen=12))
+    venue_age_e_history: dict[str, Deque[float]] = field(default_factory=dict)
+    venue_age_a_history: dict[str, Deque[float]] = field(default_factory=dict)
+    venue_delta_mid_history: dict[str, Deque[float]] = field(default_factory=dict)
+    venue_reconnects: dict[str, int] = field(default_factory=dict)
+    venue_cap_hits: dict[str, int] = field(default_factory=dict)
+    venue_flash_until: dict[str, tuple[float, str]] = field(default_factory=dict)
+    sys_age_e_max_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    sys_delta_mid_max_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    rx_rate_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    pnl_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    pos_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    rx_rate_ema: float | None = None
+    _last_update_mono: float | None = None
     tick_count: int = 0
     prev_venue_status: dict[str, str] = field(default_factory=dict)
     venue_status_flips: dict[str, int] = field(default_factory=dict)
     venue_stale_ticks: dict[str, int] = field(default_factory=dict)
+    global_cap_hits: int = 0
+    frame_count: int = 0
+    active_tab: int = _TAB_TAPE
+    active_page: str = _PAGE_SIMPLE
+    show_vn_map_until: float = 0.0
+    layout_debug_printed: bool = False
+    _seen_event_ids: Deque[str] = field(default_factory=deque)
+    _seen_event_set: set[str] = field(default_factory=set)
+
+    def _remember_event_id(self, event_id: str) -> bool:
+        if event_id in self._seen_event_set:
+            return False
+        if len(self._seen_event_ids) >= 4096:
+            old = self._seen_event_ids.popleft()
+            self._seen_event_set.discard(old)
+        self._seen_event_ids.append(event_id)
+        self._seen_event_set.add(event_id)
+        return True
+
+    def _append_tape(
+        self,
+        *,
+        event_id: str,
+        kind: str,
+        text: str,
+        venue_id: str | None,
+        ts_ms: int | None,
+    ) -> None:
+        if not self._remember_event_id(event_id):
+            return
+        flash_kind = kind in {"buy", "sell", "cancel", "warn", "error", "kill"}
+        flash_until = time.monotonic() + self.flash_ttl_s if flash_kind else 0.0
+        self.tape.appendleft(
+            TapeEvent(
+                event_id=event_id,
+                kind=kind,
+                text=text,
+                venue_id=venue_id,
+                ts_ms=ts_ms,
+                flash_until_mono=flash_until,
+            )
+        )
+        if venue_id and flash_until > 0.0:
+            self.venue_flash_until[venue_id] = (flash_until, kind)
+        if kind in {"error", "kill"}:
+            self.alerts.appendleft(text)
+
+    def _append_history(
+        self,
+        history: dict[str, Deque[float]],
+        venue_id: str,
+        value: float | None,
+    ) -> None:
+        if value is None:
+            return
+        bucket = history.get(venue_id)
+        if bucket is None:
+            bucket = deque(maxlen=self.history_len)
+            history[venue_id] = bucket
+        bucket.append(value)
+
+    def _append_series(self, bucket: Deque[float], value: float | None) -> None:
+        if value is not None:
+            bucket.append(float(value))
 
     def update(self, record: dict[str, Any]) -> None:
         self.last_record = record
@@ -398,13 +699,50 @@ class WatchState:
         venue_status = record.get("venue_status", [])
         venue_count = len(venue_status) if isinstance(venue_status, list) else 0
         self.venue_ids = parse_venue_ids(record, venue_count)
+        venue_age_a = record.get("venue_age_ms", [])
+        venue_age_e = record.get("venue_age_event_ms", [])
+        venue_mid = record.get("venue_mid_usd", [])
 
-        # Track per-venue stale% and status flips.
+        now_ms = None
+        treasury = record.get("treasury_guidance")
+        if isinstance(treasury, dict):
+            now_ms = safe_int(treasury.get("as_of_ms"))
+
+        _, delta_mid_map = compute_delta_mid_bps_map(
+            self.venue_ids,
+            venue_status if isinstance(venue_status, list) else [],
+            venue_mid if isinstance(venue_mid, list) else [],
+        )
+        age_e_values: list[float] = []
+
+        # Track per-venue stale%, status flips, and age trends.
         for idx, vid in enumerate(self.venue_ids):
             cur = (
                 venue_status[idx]
                 if isinstance(venue_status, list) and idx < len(venue_status)
                 else None
+            )
+            age_a_val = (
+                safe_float(venue_age_a[idx])
+                if isinstance(venue_age_a, list) and idx < len(venue_age_a)
+                else None
+            )
+            raw_age_e = (
+                venue_age_e[idx]
+                if isinstance(venue_age_e, list) and idx < len(venue_age_e)
+                else None
+            )
+            age_e_val = safe_float(raw_age_e)
+            if age_e_val is None:
+                age_e_val = age_a_val
+            if age_e_val is not None:
+                age_e_values.append(age_e_val)
+            self._append_history(self.venue_age_a_history, vid, age_a_val)
+            self._append_history(self.venue_age_e_history, vid, age_e_val)
+            self._append_history(
+                self.venue_delta_mid_history,
+                vid,
+                delta_mid_map.get(vid),
             )
             if isinstance(cur, str):
                 if cur != "Healthy":
@@ -416,16 +754,109 @@ class WatchState:
                     self.venue_status_flips[vid] = (
                         self.venue_status_flips.get(vid, 0) + 1
                     )
+                    if cur in {"Stale", "Disconnected", "Error", "Disabled"}:
+                        tick = record.get("t", "n/a")
+                        self._append_tape(
+                            event_id=f"status:{vid}:{prev}->{cur}:{tick}",
+                            kind="warn" if cur == "Stale" else "error",
+                            text=f"{vid} status {prev}->{cur}",
+                            venue_id=vid,
+                            ts_ms=now_ms,
+                        )
                 self.prev_venue_status[vid] = cur
 
-        now_ms = None
-        treasury = record.get("treasury_guidance")
-        if isinstance(treasury, dict):
-            now_ms = safe_int(treasury.get("as_of_ms"))
+        sys_age_e_max = max(age_e_values) if age_e_values else None
+        sys_delta_mid_max = max(
+            (abs(value) for value in delta_mid_map.values() if value is not None),
+            default=None,
+        )
+        self._append_series(self.sys_age_e_max_history, sys_age_e_max)
+        self._append_series(self.sys_delta_mid_max_history, sys_delta_mid_max)
+
+        now_mono = time.monotonic()
+        if self._last_update_mono is not None:
+            dt = now_mono - self._last_update_mono
+            if dt > 0:
+                inst_rate = min(250.0, 1.0 / dt)
+                if self.rx_rate_ema is None:
+                    self.rx_rate_ema = inst_rate
+                else:
+                    self.rx_rate_ema = (0.4 * inst_rate) + (0.6 * self.rx_rate_ema)
+                self._append_series(self.rx_rate_history, self.rx_rate_ema)
+        self._last_update_mono = now_mono
+
+        pnl_value = _pick_number(
+            [record],
+            (
+                "pnl_total_usd",
+                "pnl_usd",
+                "unrealized_pnl_usd",
+            ),
+        )
+        pos_value = _pick_number(
+            [record],
+            (
+                "q_global_tao",
+                "net_position_tao",
+                "position_tao",
+            ),
+        )
+        self._append_series(self.pnl_history, pnl_value)
+        self._append_series(self.pos_history, pos_value)
+
+        risk_events = record.get("risk_events", [])
+        if isinstance(risk_events, list):
+            for item in risk_events:
+                if not isinstance(item, dict):
+                    continue
+                event_type = str(item.get("event_type", "risk_event"))
+                event_l = event_type.lower()
+                event_ts = safe_int(item.get("timestamp_ms")) or now_ms
+                venue_idx = safe_int(item.get("venue_index"))
+                venue_id = (
+                    self.venue_ids[venue_idx]
+                    if venue_idx is not None and 0 <= venue_idx < len(self.venue_ids)
+                    else None
+                )
+                suffix = f" ({venue_id})" if venue_id else ""
+                event_id = f"risk:{event_type}:{event_ts}:{venue_id}"
+                if any(k in event_l for k in ("reconnect", "timeout", "watchdog")):
+                    if venue_id:
+                        self.venue_reconnects[venue_id] = (
+                            self.venue_reconnects.get(venue_id, 0) + 1
+                        )
+                    self._append_tape(
+                        event_id=event_id,
+                        kind="error" if "timeout" in event_l else "warn",
+                        text=f"{event_type}{suffix}",
+                        venue_id=venue_id,
+                        ts_ms=event_ts,
+                    )
+                elif "cap" in event_l:
+                    self.global_cap_hits += 1
+                    if venue_id:
+                        self.venue_cap_hits[venue_id] = (
+                            self.venue_cap_hits.get(venue_id, 0) + 1
+                        )
+                    self._append_tape(
+                        event_id=event_id,
+                        kind="warn",
+                        text=f"{event_type}{suffix}",
+                        venue_id=venue_id,
+                        ts_ms=event_ts,
+                    )
+                elif "error" in event_l:
+                    self._append_tape(
+                        event_id=event_id,
+                        kind="error",
+                        text=f"{event_type}{suffix}",
+                        venue_id=venue_id,
+                        ts_ms=event_ts,
+                    )
 
         fills = record.get("fills", [])
         if isinstance(fills, list):
-            for fill in fills:
+            for fill_idx, fill in enumerate(fills):
                 if not isinstance(fill, dict):
                     continue
                 venue_id = fill.get("venue_id")
@@ -435,40 +866,107 @@ class WatchState:
                         self.last_fill_ms[venue_id] = fill_time
                     size = fill.get("size")
                     price = fill.get("price")
-                    side = fill.get("side", "?")
+                    side_raw = str(fill.get("side", "?")).upper()
+                    side = (
+                        "BUY"
+                        if side_raw.startswith("B")
+                        else "SELL"
+                        if side_raw.startswith("S")
+                        else side_raw
+                    )
                     age = (
                         f"{int((now_ms - fill_time) / 1000)}s"
                         if now_ms and fill_time
                         else "n/a"
                     )
-                    self.events.fills.appendleft(
-                        f"{venue_id} {side} {size}@{price} age={age}"
+                    fill_text = f"{venue_id} {side} {size}@{price} age={age}"
+                    self.events.fills.appendleft(fill_text)
+                    fill_key = (
+                        f"fill:{fill.get('id') or fill.get('order_id') or fill_idx}:"
+                        f"{venue_id}:{side}:{size}:{price}:{fill_time}"
+                    )
+                    self._append_tape(
+                        event_id=fill_key,
+                        kind="buy" if side == "BUY" else "sell" if side == "SELL" else "warn",
+                        text=fill_text,
+                        venue_id=venue_id,
+                        ts_ms=fill_time or now_ms,
                     )
 
         orders = record.get("orders", [])
         if isinstance(orders, list):
-            for order in orders:
+            for order_idx, order in enumerate(orders):
                 if not isinstance(order, dict):
                     continue
+                venue_id = order.get("venue_id", "n/a")
                 if order.get("action") == "cancel" and order.get("status") == "ack":
-                    venue_id = order.get("venue_id", "n/a")
                     reason = order.get("reason", "")
                     suffix = f" reason={reason}" if reason else ""
-                    self.events.cancels.appendleft(f"{venue_id} cancel{suffix}")
+                    cancel_text = f"{venue_id} cancel{suffix}"
+                    self.events.cancels.appendleft(cancel_text)
+                    cancel_key = (
+                        f"cancel:{order.get('order_id') or order_idx}:"
+                        f"{venue_id}:{reason}:{record.get('t')}"
+                    )
+                    self._append_tape(
+                        event_id=cancel_key,
+                        kind="cancel",
+                        text=cancel_text,
+                        venue_id=venue_id if isinstance(venue_id, str) else None,
+                        ts_ms=now_ms,
+                    )
+                reason = str(order.get("reason", "")).lower()
+                if "cap" in reason:
+                    self.global_cap_hits += 1
+                    if isinstance(venue_id, str):
+                        self.venue_cap_hits[venue_id] = (
+                            self.venue_cap_hits.get(venue_id, 0) + 1
+                        )
 
         if record.get("kill_switch"):
             reason = record.get("kill_reason", "unknown")
             tick = record.get("t", "n/a")
-            self.events.kills.appendleft(f"tick={tick} reason={reason}")
+            kill_text = f"tick={tick} reason={reason}"
+            self.events.kills.appendleft(kill_text)
+            self._append_tape(
+                event_id=f"kill:{tick}:{reason}",
+                kind="kill",
+                text=f"KILL {kill_text}",
+                venue_id=None,
+                ts_ms=now_ms,
+            )
+
+        if record.get("would_send_orders_truncated"):
+            tick = record.get("t", "n/a")
+            self.global_cap_hits += 1
+            self._append_tape(
+                event_id=f"would_send_orders_truncated:{tick}",
+                kind="warn",
+                text="would_send_orders truncated",
+                venue_id=None,
+                ts_ms=now_ms,
+            )
 
 
-def build_state(records: Iterable[dict[str, Any]], max_events: int) -> WatchState:
-    state = WatchState()
+def build_state(
+    records: Iterable[dict[str, Any]],
+    max_events: int,
+    *,
+    sort_mode: str = "agee",
+    flash_ms: int = 650,
+    page: str = _PAGE_SIMPLE,
+) -> WatchState:
+    state = WatchState(
+        sort_mode=sort_mode,
+        flash_ttl_s=max(0.05, flash_ms / 1000.0),
+        active_page=page if page in {_PAGE_SIMPLE, _PAGE_EXPANDED} else _PAGE_SIMPLE,
+    )
     state.events = EventLog(
         fills=deque(maxlen=max_events),
         cancels=deque(maxlen=max_events),
         kills=deque(maxlen=max_events),
     )
+    state.tape = deque(maxlen=max_events)
     for record in records:
         state.update(record)
     return state
@@ -528,10 +1026,1135 @@ def _section(title: str, width: int = 72) -> str:
     return styled(f"{prefix}{title} {'─' * suffix_len}", S.CYAN, S.BOLD)
 
 
-# ── Frame rendering ──────────────────────────────────────────────────────────
+# ── Rich rendering ───────────────────────────────────────────────────────────
 
 
-def render_frame(  # noqa: C901
+_HEALTH_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+
+
+def fetch_health_detail_cached(
+    base_url: str | None,
+    ttl_s: float = 1.0,
+) -> dict[str, Any] | None:
+    if not base_url:
+        return None
+    now = time.monotonic()
+    cached = _HEALTH_CACHE.get(base_url)
+    if cached and (now - cached[0]) < ttl_s:
+        return cached[1]
+    detail = fetch_health_detail(base_url)
+    _HEALTH_CACHE[base_url] = (now, detail)
+    return detail
+
+
+def _status_short(status: str) -> str:
+    if status == "Healthy":
+        return "OK"
+    if status in {"Stale", "Disconnected", "Error"}:
+        return "STALE"
+    return "WARN"
+
+
+def _status_style(status: str) -> str:
+    if status == "Healthy":
+        return "green"
+    if status in {"Stale", "Disconnected", "Error"}:
+        return "bold red"
+    return "yellow"
+
+
+def _status_rank(status: str) -> int:
+    if status in {"Stale", "Disconnected", "Error"}:
+        return 3
+    if status == "Healthy":
+        return 1
+    return 2
+
+
+def _sparkline(values: list[float], width: int) -> str:
+    if width <= 0:
+        return ""
+    if not values:
+        return "·" * min(width, 4)
+    sample = values[-width:]
+    lo = min(sample)
+    hi = max(sample)
+    if hi <= lo:
+        return "▅" * len(sample)
+    chars = "▁▂▃▄▅▆▇█"
+    out: list[str] = []
+    for value in sample:
+        ratio = (value - lo) / (hi - lo)
+        idx = max(0, min(len(chars) - 1, int(ratio * (len(chars) - 1))))
+        out.append(chars[idx])
+    return "".join(out)
+
+
+def _trend_text(
+    value_ms: float | None,
+    history: list[float],
+    *,
+    compact: bool,
+) -> Text:
+    bar_width = 5 if compact else 7
+    vmax = 5000.0
+    ratio = 0.0
+    if value_ms is not None:
+        ratio = max(0.0, min(1.0, value_ms / vmax))
+    filled = int(round(bar_width * ratio))
+    gauge = ("█" * filled) + ("░" * (bar_width - filled))
+    style = "green"
+    if value_ms is not None and value_ms >= 5000:
+        style = "bold red"
+    elif value_ms is not None and value_ms >= 2000:
+        style = "yellow"
+    text = Text(gauge, style=style)
+    if not compact:
+        text.append(" ")
+        text.append(_sparkline(history, width=8), style="cyan")
+    return text
+
+
+def _flash_style(kind: str, pulse: bool) -> str | None:
+    strong = pulse
+    if kind == "buy":
+        return "black on bright_green" if strong else "black on green"
+    if kind == "sell":
+        return "white on bright_red" if strong else "white on red"
+    if kind in {"cancel", "warn"}:
+        return "black on bright_yellow" if strong else "black on yellow"
+    if kind in {"error", "kill"}:
+        return "white on bright_red" if strong else "bold white on red"
+    return None
+
+
+def _event_kind_style(kind: str) -> str:
+    if kind == "buy":
+        return "green"
+    if kind == "sell":
+        return "red"
+    if kind in {"cancel", "warn"}:
+        return "yellow"
+    if kind in {"error", "kill"}:
+        return "bold red"
+    return "white"
+
+
+def _event_kind_label(kind: str) -> str:
+    if kind == "buy":
+        return "BUY"
+    if kind == "sell":
+        return "SELL"
+    if kind == "cancel":
+        return "CXL"
+    if kind == "warn":
+        return "WARN"
+    if kind == "error":
+        return "ERR"
+    if kind == "kill":
+        return "KILL"
+    return "EVT"
+
+
+def _pick_number(sources: Iterable[dict[str, Any]], keys: Iterable[str]) -> float | None:
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            number = safe_float(value)
+            if number is not None:
+                return number
+    return None
+
+
+def _mode_token(record: dict[str, Any]) -> str:
+    mode = str(record.get("execution_mode", "n/a"))
+    trade = str(record.get("trade_mode") or mode)
+    token = trade.strip()
+    return token.lower() if token else mode.lower()
+
+
+def _is_shadow_mode(record: dict[str, Any]) -> bool:
+    return "shadow" in _mode_token(record)
+
+
+def _simple_eage_bounds(
+    state: WatchState,
+    record: dict[str, Any],
+) -> tuple[float | None, float | None]:
+    venue_status = record.get("venue_status", [])
+    venue_age_a = record.get("venue_age_ms", [])
+    venue_age_e = record.get("venue_age_event_ms", [])
+    venue_count = len(state.venue_ids)
+    if venue_count <= 0:
+        venue_count = len(venue_status) if isinstance(venue_status, list) else 0
+    if venue_count <= 0:
+        venue_count = max(
+            len(venue_age_a) if isinstance(venue_age_a, list) else 0,
+            len(venue_age_e) if isinstance(venue_age_e, list) else 0,
+        )
+
+    values: list[float] = []
+    for idx in range(venue_count):
+        status = (
+            str(venue_status[idx])
+            if isinstance(venue_status, list) and idx < len(venue_status)
+            else "Unknown"
+        )
+        if status != "Healthy":
+            continue
+        raw_age_e = (
+            venue_age_e[idx]
+            if isinstance(venue_age_e, list) and idx < len(venue_age_e)
+            else None
+        )
+        age_e = safe_float(raw_age_e)
+        if age_e is None:
+            age_e = (
+                safe_float(venue_age_a[idx])
+                if isinstance(venue_age_a, list) and idx < len(venue_age_a)
+                else None
+            )
+        if age_e is None or age_e < 0:
+            continue
+        values.append(age_e)
+
+    if not values:
+        return None, None
+    return min(values), max(values)
+
+
+def _format_simple_age_ms(value: float | None) -> str:
+    if value is None:
+        return "---"
+    ivalue = max(0, int(round(value)))
+    if ivalue < 1000:
+        return f"{ivalue:03d}"
+    return str(ivalue)
+
+
+def _simple_tape_tag(kind: str) -> tuple[str, str]:
+    if kind == "buy":
+        return "BUY", "green"
+    if kind == "sell":
+        return "SELL", "red"
+    if kind == "cancel":
+        return "CXL", "yellow"
+    if kind in {"error", "kill"}:
+        return "WARN", "bold red"
+    if kind == "warn":
+        return "WARN", "yellow"
+    return "INFO", "dim"
+
+
+def _compact_tape_payload(text: str, width: int) -> str:
+    normalized = " ".join(str(text).strip().split())
+    if not normalized:
+        normalized = "-"
+    if width <= 0:
+        return normalized
+    if len(normalized) <= width:
+        return normalized
+    if width <= 3:
+        return normalized[:width]
+    return normalized[: width - 3] + "..."
+
+
+def _extract_net_pos_usd(record: dict[str, Any]) -> float | None:
+    return _pick_number(
+        [record],
+        (
+            "net_position_usd",
+            "position_usd",
+            "dollar_delta_usd",
+        ),
+    )
+
+
+def _extract_max_pos_cap_usd(record: dict[str, Any]) -> float | None:
+    return _pick_number(
+        [record],
+        (
+            "max_pos_cap_usd",
+            "max_position_cap_usd",
+            "max_position_usd",
+            "position_cap_usd",
+            "max_abs_position_usd",
+            "delta_limit_usd",
+        ),
+    )
+
+
+def _format_signed_dollars(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{int(round(value)):+,d}"
+
+
+def _delta_pct_style(value: float | None) -> str:
+    if value is None:
+        return "dim"
+    if value >= 75.0:
+        return "bold red"
+    if value >= 35.0:
+        return "yellow"
+    return "green"
+
+
+def _compute_gate(record: dict[str, Any]) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if record.get("kill_switch"):
+        reasons.append("kill")
+    regime = str(record.get("risk_regime", "")).lower()
+    if regime in {"emergency", "hardstop"}:
+        reasons.append(regime)
+    healthy = safe_int(record.get("healthy_venues_used_count"))
+    if healthy is not None and healthy <= 0:
+        reasons.append("healthy=0")
+    return (len(reasons) == 0, reasons)
+
+
+def _build_venue_rows(state: WatchState, record: dict[str, Any]) -> list[dict[str, Any]]:
+    venue_status = record.get("venue_status", [])
+    venue_mid = record.get("venue_mid_usd", [])
+    venue_spread = record.get("venue_spread_usd", [])
+    venue_age_a = record.get("venue_age_ms", [])
+    venue_age_e = record.get("venue_age_event_ms", [])
+    _, delta_mid_map = compute_delta_mid_bps_map(
+        state.venue_ids,
+        venue_status if isinstance(venue_status, list) else [],
+        venue_mid if isinstance(venue_mid, list) else [],
+    )
+    rows: list[dict[str, Any]] = []
+    for idx, venue_id in enumerate(state.venue_ids):
+        status = (
+            venue_status[idx]
+            if isinstance(venue_status, list) and idx < len(venue_status)
+            else "Unknown"
+        )
+        mid = (
+            safe_float(venue_mid[idx])
+            if isinstance(venue_mid, list) and idx < len(venue_mid)
+            else None
+        )
+        spread_usd = (
+            safe_float(venue_spread[idx])
+            if isinstance(venue_spread, list) and idx < len(venue_spread)
+            else None
+        )
+        age_a = (
+            safe_float(venue_age_a[idx])
+            if isinstance(venue_age_a, list) and idx < len(venue_age_a)
+            else None
+        )
+        raw_age_e = (
+            venue_age_e[idx]
+            if isinstance(venue_age_e, list) and idx < len(venue_age_e)
+            else None
+        )
+        age_e = safe_float(raw_age_e)
+        if age_e is None:
+            age_e = age_a
+        spread_bps = None
+        if mid and spread_usd is not None and mid != 0:
+            spread_bps = (spread_usd / mid) * 10000.0
+        stale_ticks = state.venue_stale_ticks.get(venue_id, 0)
+        stale_pct = (100.0 * stale_ticks / state.tick_count) if state.tick_count > 0 else 0.0
+        rows.append(
+            {
+                "venue": venue_id,
+                "status": status,
+                "status_short": _status_short(str(status)),
+                "age_e": age_e,
+                "age_a": age_a,
+                "spread_bps": spread_bps,
+                "mid": mid,
+                "delta_mid_bps": delta_mid_map.get(venue_id),
+                "flips": state.venue_status_flips.get(venue_id, 0),
+                "stale_pct": stale_pct,
+                "recon": state.venue_reconnects.get(venue_id, 0),
+                "cap": state.venue_cap_hits.get(venue_id, 0),
+                "history_e": list(state.venue_age_e_history.get(venue_id, [])),
+                "history_delta_mid": list(state.venue_delta_mid_history.get(venue_id, [])),
+            }
+        )
+
+    if state.sort_mode == "stale":
+        rows.sort(
+            key=lambda row: (
+                row["stale_pct"],
+                _status_rank(str(row["status"])),
+                row["age_e"] if row["age_e"] is not None else -1.0,
+            ),
+            reverse=True,
+        )
+    elif state.sort_mode == "venue":
+        rows.sort(key=lambda row: str(row["venue"]))
+    else:
+        rows.sort(
+            key=lambda row: (
+                row["age_e"] if row["age_e"] is not None else -1.0,
+                row["stale_pct"],
+                _status_rank(str(row["status"])),
+            ),
+            reverse=True,
+        )
+    return rows
+
+
+def _quantize_for_key(value: float | None, digits: int) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def _build_frame_key(state: WatchState, now_mono: float) -> tuple[Any, ...]:
+    record = state.last_record or {}
+    if state.active_page == _PAGE_SIMPLE:
+        min_age_e, max_age_e = _simple_eage_bounds(state, record)
+        tape_events = list(state.tape)[:8]
+        return (
+            _PAGE_SIMPLE,
+            record.get("t"),
+            _is_shadow_mode(record),
+            int(datetime.now(timezone.utc).timestamp() // 60),
+            int(min_age_e) if min_age_e is not None else None,
+            int(max_age_e) if max_age_e is not None else None,
+            tuple(
+                (
+                    event.event_id,
+                    event.ts_ms,
+                    now_mono < event.flash_until_mono,
+                )
+                for event in tape_events
+            ),
+            _quantize_for_key(_extract_net_pos_usd(record), 0),
+            _quantize_for_key(_extract_max_pos_cap_usd(record), 0),
+        )
+
+    venue_status = record.get("venue_status", [])
+    venue_mid = record.get("venue_mid_usd", [])
+    venue_age_a = record.get("venue_age_ms", [])
+    venue_age_e = record.get("venue_age_event_ms", [])
+    _, delta_mid_map = compute_delta_mid_bps_map(
+        state.venue_ids,
+        venue_status if isinstance(venue_status, list) else [],
+        venue_mid if isinstance(venue_mid, list) else [],
+    )
+    rows: list[dict[str, Any]] = []
+    for idx, venue_id in enumerate(state.venue_ids):
+        status = (
+            str(venue_status[idx])
+            if isinstance(venue_status, list) and idx < len(venue_status)
+            else "Unknown"
+        )
+        age_a = (
+            safe_float(venue_age_a[idx])
+            if isinstance(venue_age_a, list) and idx < len(venue_age_a)
+            else None
+        )
+        raw_age_e = (
+            venue_age_e[idx]
+            if isinstance(venue_age_e, list) and idx < len(venue_age_e)
+            else None
+        )
+        age_e = safe_float(raw_age_e)
+        if age_e is None:
+            age_e = age_a
+        mid = (
+            safe_float(venue_mid[idx])
+            if isinstance(venue_mid, list) and idx < len(venue_mid)
+            else None
+        )
+        stale_ticks = state.venue_stale_ticks.get(venue_id, 0)
+        stale_pct = (100.0 * stale_ticks / state.tick_count) if state.tick_count > 0 else 0.0
+        rows.append(
+            {
+                "venue": venue_id,
+                "status": status,
+                "age_e": age_e,
+                "stale_pct": stale_pct,
+                "row": (
+                    venue_id,
+                    status,
+                    int(age_e) if age_e is not None else None,
+                    int(age_a) if age_a is not None else None,
+                    _quantize_for_key(mid, 4),
+                    _quantize_for_key(delta_mid_map.get(venue_id), 2),
+                    _quantize_for_key(stale_pct, 1),
+                    int(state.venue_reconnects.get(venue_id, 0)),
+                    int(state.venue_cap_hits.get(venue_id, 0)),
+                ),
+            }
+        )
+    if state.sort_mode == "stale":
+        rows.sort(
+            key=lambda row: (
+                row["stale_pct"],
+                _status_rank(str(row["status"])),
+                row["age_e"] if row["age_e"] is not None else -1.0,
+            ),
+            reverse=True,
+        )
+    elif state.sort_mode == "venue":
+        rows.sort(key=lambda row: str(row["venue"]))
+    else:
+        rows.sort(
+            key=lambda row: (
+                row["age_e"] if row["age_e"] is not None else -1.0,
+                row["stale_pct"],
+                _status_rank(str(row["status"])),
+            ),
+            reverse=True,
+        )
+
+    latest_tape = state.tape[0] if state.tape else None
+    return (
+        _PAGE_EXPANDED,
+        record.get("t"),
+        tuple(row["row"] for row in rows),
+        latest_tape.event_id if latest_tape else None,
+        latest_tape.ts_ms if latest_tape else None,
+        state.active_tab,
+        now_mono < state.show_vn_map_until,
+    )
+
+
+def _format_ms_short(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{int(value)}ms"
+
+
+def _format_bps_short(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.1f}bps"
+
+
+def _format_rate_short(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.1f}"
+
+
+def _format_pnl_short(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if abs(value) >= 1000:
+        return f"{value/1000.0:+.1f}k"
+    return f"{value:+.0f}"
+
+
+def _format_pos_short(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.3f}"
+
+
+def _format_mid_cell(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if abs(value) >= 1000:
+        return f"{value:,.2f}"
+    return f"{value:,.4f}"
+
+
+def _format_cell_age(value: float | None) -> Text:
+    if value is None:
+        return Text("—", style="dim")
+    style = "white"
+    if value >= 5000:
+        style = "bold red"
+    elif value >= 2000:
+        style = "yellow"
+    return Text(f"{int(value)}", style=style)
+
+
+def _format_cell_bps(value: float | None, *, signed: bool = False) -> Text:
+    if value is None:
+        return Text("—", style="dim")
+    style = "white"
+    abs_v = abs(value)
+    if abs_v >= 20:
+        style = "bold red"
+    elif abs_v >= 5:
+        style = "yellow"
+    text = f"{value:+.2f}" if signed else f"{value:.2f}"
+    return Text(text, style=style)
+
+
+def _format_cell_stale(pct: float) -> Text:
+    style = "green"
+    if pct >= 5.0:
+        style = "bold red"
+    elif pct >= 1.0:
+        style = "yellow"
+    return Text(f"{pct:4.1f}%", style=style)
+
+
+def _tabs_line(active_tab: int) -> Text:
+    text = Text()
+    labels = ("TAPE", "KEYS", "ALERTS")
+    for idx, label in enumerate(labels):
+        if idx > 0:
+            text.append(" / ", style="dim")
+        style = "underline bold cyan" if idx == active_tab else "dim"
+        text.append(label, style=style)
+    return text
+
+
+def _compute_layout_rows(term_height: int) -> dict[str, int]:
+    rows = {
+        "header_rows": 3,
+        "legend_rows": 1,
+        "graph_rows": 3,
+        "venues_rows": 9,  # panel + status strip + header + 5 venues
+        "tabs_rows": 4,
+    }
+
+    fixed = (
+        rows["header_rows"]
+        + rows["legend_rows"]
+        + rows["graph_rows"]
+        + rows["venues_rows"]
+    )
+    if term_height > fixed:
+        rows["tabs_rows"] = max(4, term_height - fixed)
+    else:
+        deficit = (fixed + rows["tabs_rows"]) - term_height
+        for key, minimum in (
+            ("tabs_rows", 2),
+            ("graph_rows", 2),
+            ("legend_rows", 0),
+            ("tabs_rows", 1),
+            ("graph_rows", 1),
+            ("venues_rows", 7),
+            ("header_rows", 2),
+            ("venues_rows", 5),
+        ):
+            if deficit <= 0:
+                break
+            value = rows[key]
+            reducible = max(0, value - minimum)
+            take = min(deficit, reducible)
+            rows[key] = value - take
+            deficit -= take
+        if deficit > 0:
+            rows["tabs_rows"] = max(1, rows["tabs_rows"] - deficit)
+
+    out = {
+        "header": max(1, rows["header_rows"]),
+        "legend": max(0, rows["legend_rows"]),
+        "graph": max(1, rows["graph_rows"]),
+        "venues": max(1, rows["venues_rows"]),
+        "tabs": max(1, rows["tabs_rows"]),
+    }
+    while (
+        out["header"] + out["legend"] + out["graph"] + out["venues"] + out["tabs"]
+    ) > max(1, term_height):
+        for key in ("tabs", "graph", "legend", "header", "venues"):
+            minimum = 0 if key == "legend" else 1
+            if out[key] > minimum:
+                out[key] -= 1
+                break
+        else:
+            break
+    return out
+
+
+def render_frame_expanded(
+    state: WatchState,
+    max_events: int,
+    *,
+    term_width: int,
+    term_height: int,
+    config_dir: str | None = None,
+    health_url: str | None = None,
+    layout_debug: bool = False,
+    ui_mode: str | None = None,
+    render_ms: int | None = None,
+) -> Any:
+    state.frame_count += 1
+    record = state.last_record or {}
+    health = fetch_health_detail_cached(health_url) if health_url else None
+    now_mono = time.monotonic()
+    pulse = (state.frame_count % 2) == 0
+
+    treasury = record.get("treasury_guidance")
+    now_ms = None
+    if isinstance(treasury, dict):
+        now_ms = safe_int(treasury.get("as_of_ms"))
+
+    rows = _build_venue_rows(state, record)
+    gate_pass, gate_reasons = _compute_gate(record)
+    run_id = str(record.get("config_version_id") or "n/a")
+    run_limit = 20 if term_width < 120 else 28
+    if len(run_id) > run_limit:
+        run_id = run_id[: run_limit - 1] + "…"
+    mode_token = _mode_token(record)
+    in_shadow = "shadow" in mode_token
+    gate_text = "PASS" if gate_pass else f"FAIL({','.join(gate_reasons)})"
+    tick_value = record.get("t", "n/a")
+    time_text = short_ts(now_ms) if now_ms else "n/a"
+    recon_total = sum(state.venue_reconnects.values())
+    cap_hits = state.global_cap_hits
+
+    ws_audit_raw = record.get("ws_audit")
+    if ws_audit_raw is None:
+        ws_audit_raw = os.environ.get("PARAPHINA_WS_AUDIT")
+    ws_audit_text = "UNK"
+    if isinstance(ws_audit_raw, bool):
+        ws_audit_text = "ON" if ws_audit_raw else "OFF"
+    elif isinstance(ws_audit_raw, str):
+        ws_audit_text = "ON" if ws_audit_raw.strip().lower() in {"1", "true", "yes", "on"} else "OFF"
+
+    worst_age_e = max((row for row in rows if row["age_e"] is not None), key=lambda row: row["age_e"], default=None)
+    worst_age_a = max((row for row in rows if row["age_a"] is not None), key=lambda row: row["age_a"], default=None)
+    worst_dmid = max(
+        (row for row in rows if row["delta_mid_bps"] is not None),
+        key=lambda row: abs(float(row["delta_mid_bps"])),
+        default=None,
+    )
+
+    layout_rows = _compute_layout_rows(term_height)
+    if layout_debug and not state.layout_debug_printed:
+        print(
+            (
+                f"[layout] h={term_height} header={layout_rows['header']} "
+                f"legend={layout_rows['legend']} graph={layout_rows['graph']} "
+                f"venues={layout_rows['venues']} tabs={layout_rows['tabs']}"
+            ),
+            file=sys.stderr,
+        )
+        state.layout_debug_printed = True
+
+    header_grid = Table.grid(expand=True)
+    header_grid.add_column(ratio=1, justify="left")
+    header_grid.add_column(justify="right", no_wrap=True)
+    left_header = Text("paraphina v1.1", style="bold cyan")
+    left_header.append("  watch", style="bold white")
+    right_header = Text()
+    right_header.append(mode_token, style="magenta")
+    right_header.append("  GATE ", style="dim")
+    right_header.append(gate_text, style="bold green" if gate_pass else "bold red")
+    right_header.append(f"  t {tick_value} {time_text}", style="white")
+    right_header.append(f"  {run_id}", style="dim")
+    header_grid.add_row(left_header, right_header)
+    header_panel = Panel(
+        header_grid,
+        box=box.SQUARE,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+    legend_line = Text(
+        "ageE(ts→rx)  ageA(rx→publish)  stale%=pct beyond SLA  flips=mid flips  Δmid(bps)=mid−median(mid_all)",
+        style="dim",
+    )
+
+    spark_w = 8 if term_width >= 140 else 6 if term_width >= 110 else 5
+    sys_age_e_now = worst_age_e["age_e"] if worst_age_e else None
+    sys_dmid_now = abs(float(worst_dmid["delta_mid_bps"])) if worst_dmid else None
+    rx_now = state.rx_rate_history[-1] if state.rx_rate_history else None
+    pnl_now = state.pnl_history[-1] if state.pnl_history else None
+    pos_now = state.pos_history[-1] if state.pos_history else None
+    flat_hist = [0.0] * max(4, spark_w)
+
+    graph_segments: list[Text] = []
+    seg1 = Text("SYS ageE max ", style="dim")
+    seg1.append(_format_ms_short(sys_age_e_now), style="white")
+    seg1.append(" ")
+    seg1.append(_sparkline(list(state.sys_age_e_max_history), width=spark_w), style="cyan")
+    graph_segments.append(seg1)
+
+    seg2 = Text("SYS Δmid max ", style="dim")
+    seg2.append(_format_bps_short(sys_dmid_now), style="white")
+    seg2.append(" ")
+    seg2.append(_sparkline(list(state.sys_delta_mid_max_history), width=spark_w), style="cyan")
+    graph_segments.append(seg2)
+
+    seg3 = Text("RX/s ", style="dim")
+    seg3.append(_format_rate_short(rx_now), style="white")
+    seg3.append(" ")
+    seg3.append(_sparkline(list(state.rx_rate_history), width=spark_w), style="cyan")
+    graph_segments.append(seg3)
+
+    seg4 = Text("PNL ", style="dim")
+    if in_shadow:
+        seg4.append("— (shadow)", style="dim")
+        seg4.append(" ")
+        seg4.append(_sparkline(flat_hist, width=spark_w), style="dim")
+    else:
+        seg4.append(_format_pnl_short(pnl_now), style="white")
+        seg4.append(" ")
+        seg4.append(_sparkline(list(state.pnl_history), width=spark_w), style="cyan")
+    graph_segments.append(seg4)
+
+    seg5 = Text("POS ", style="dim")
+    if in_shadow:
+        seg5.append("— (shadow)", style="dim")
+        seg5.append(" ")
+        seg5.append(_sparkline(flat_hist, width=spark_w), style="dim")
+    else:
+        seg5.append(_format_pos_short(pos_now), style="white")
+        seg5.append(" ")
+        seg5.append(_sparkline(list(state.pos_history), width=spark_w), style="cyan")
+    graph_segments.append(seg5)
+
+    graph_line = Text()
+    for idx, segment in enumerate(graph_segments):
+        if idx > 0:
+            graph_line.append(" │ ", style="dim")
+        graph_line.append_text(segment)
+    graph_panel = Panel(
+        graph_line,
+        box=box.SQUARE,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+    status_strip = Text()
+    status_strip.append("gate ", style="dim")
+    status_strip.append("PASS" if gate_pass else "FAIL", style="green" if gate_pass else "bold red")
+    status_strip.append("  ws ", style="dim")
+    status_strip.append(ws_audit_text, style="green" if ws_audit_text == "ON" else "yellow")
+    status_strip.append("  worstE ", style="dim")
+    if worst_age_e:
+        status_strip.append(f"{int(worst_age_e['age_e'])}ms@{venue_code(str(worst_age_e['venue']))}", style="white")
+    else:
+        status_strip.append("—", style="dim")
+    status_strip.append("  worstA ", style="dim")
+    if worst_age_a:
+        status_strip.append(f"{int(worst_age_a['age_a'])}ms@{venue_code(str(worst_age_a['venue']))}", style="white")
+    else:
+        status_strip.append("—", style="dim")
+    status_strip.append("  worstΔ ", style="dim")
+    if worst_dmid:
+        status_strip.append(
+            f"{float(worst_dmid['delta_mid_bps']):+.1f}bps@{venue_code(str(worst_dmid['venue']))}",
+            style="white",
+        )
+    else:
+        status_strip.append("—", style="dim")
+    status_strip.append(f"  cap {cap_hits}", style="dim")
+    status_strip.append(f"  recon {recon_total}", style="dim")
+    status_strip.append(f"  alerts {len(state.alerts)}", style="dim")
+    if ui_mode:
+        status_strip.append(f"  ui={ui_mode}", style="dim")
+    if render_ms is not None:
+        status_strip.append(f"  render={int(render_ms)}ms", style="dim")
+    status_strip.append("  ?=VN map", style="dim")
+
+    venue_table = Table(
+        box=None,
+        show_header=True,
+        header_style="bold cyan",
+        expand=True,
+        pad_edge=False,
+    )
+    venue_table.add_column("VN", no_wrap=True, width=2, justify="left")
+    venue_table.add_column("st", no_wrap=True, width=2, justify="left")
+    venue_table.add_column("ageE", no_wrap=True, justify="right")
+    venue_table.add_column("ageA", no_wrap=True, justify="right")
+    venue_table.add_column("spr(bps)", no_wrap=True, justify="right")
+    venue_table.add_column("mid", no_wrap=True, justify="right")
+    venue_table.add_column("Δmid", no_wrap=True, justify="right")
+    venue_table.add_column("flips", no_wrap=True, justify="right")
+    venue_table.add_column("stale%", no_wrap=True, justify="right")
+    venue_table.add_column("recon", no_wrap=True, justify="right")
+    venue_table.add_column("cap", no_wrap=True, justify="right")
+    trend_w = 7 if term_width >= 130 else 5
+    venue_table.add_column("trendE", no_wrap=True, justify="left")
+    venue_table.add_column("trendΔmid", no_wrap=True, justify="left")
+
+    display_rows = list(rows[:5])
+    while len(display_rows) < 5:
+        display_rows.append(
+            {
+                "venue": "--",
+                "status": "Unknown",
+                "status_short": "--",
+                "age_e": None,
+                "age_a": None,
+                "spread_bps": None,
+                "mid": None,
+                "delta_mid_bps": None,
+                "flips": 0,
+                "stale_pct": 0.0,
+                "recon": 0,
+                "cap": 0,
+                "history_e": [],
+                "history_delta_mid": [],
+            }
+        )
+
+    for row in display_rows:
+        status = str(row["status"])
+        vn = venue_code(str(row["venue"])) if row["venue"] != "--" else "--"
+        vn_style = "bold bright_blue"
+        flash_meta = state.venue_flash_until.get(str(row["venue"]))
+        if flash_meta and now_mono < flash_meta[0]:
+            vn_style = _flash_style(flash_meta[1], pulse) or vn_style
+        trend_e_text = Text(_sparkline(list(row["history_e"]), width=trend_w), style="cyan")
+        trend_d_values = [
+            abs(float(value))
+            for value in row["history_delta_mid"]
+            if isinstance(value, (int, float))
+        ]
+        trend_d_text = Text(_sparkline(trend_d_values, width=trend_w), style="cyan")
+        venue_table.add_row(
+            Text(vn, style=vn_style),
+            Text(row["status_short"], style=_status_style(status)),
+            _format_cell_age(row["age_e"]),
+            _format_cell_age(row["age_a"]),
+            _format_cell_bps(row["spread_bps"]),
+            Text(_format_mid_cell(row["mid"]), style="white" if row["mid"] is not None else "dim"),
+            _format_cell_bps(row["delta_mid_bps"], signed=True),
+            Text(str(int(row["flips"])), style="white"),
+            _format_cell_stale(float(row["stale_pct"])),
+            Text(str(int(row["recon"])), style="white"),
+            Text(str(int(row["cap"])), style="white"),
+            trend_e_text,
+            trend_d_text,
+        )
+
+    venues_content = [status_strip]
+    if not rows:
+        venues_content.append(Text("waiting for telemetry…", style="dim"))
+    venues_content.append(venue_table)
+    venues_panel = Panel(
+        Group(*venues_content),
+        title="VENUES (worst-first)",
+        box=box.SQUARE,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+    active_tab = state.active_tab if state.active_tab in {_TAB_TAPE, _TAB_KEYS, _TAB_ALERTS} else _TAB_TAPE
+    tabs_budget = max(1, layout_rows["tabs"] - 3)
+    show_map = now_mono < state.show_vn_map_until
+    tabs_lines: list[Text] = []
+    if show_map and tabs_budget > 0:
+        tabs_lines.append(
+            Text("VN map: HL=hyperliquid AS=aster EX=extended PA=paradex LG=lighter", style="dim")
+        )
+    remaining = max(1, tabs_budget - len(tabs_lines))
+    if active_tab == _TAB_TAPE:
+        tape_limit = max(1, min(max_events, remaining))
+        tape_events = list(state.tape)[:tape_limit]
+        if tape_events:
+            for event in tape_events:
+                ts = short_ts(event.ts_ms) if event.ts_ms else "--:--:--"
+                line = Text(f"{ts} ", style="dim")
+                label = _event_kind_label(event.kind)
+                if now_mono < event.flash_until_mono:
+                    style = _flash_style(event.kind, pulse) or _event_kind_style(event.kind)
+                    line.append(f"{label:<5} {event.text}", style=style)
+                else:
+                    line.append(f"{label:<5}", style=_event_kind_style(event.kind))
+                    line.append(f" {event.text}", style="white")
+                tabs_lines.append(line)
+        else:
+            tabs_lines.append(Text("waiting for telemetry…", style="dim"))
+    elif active_tab == _TAB_KEYS:
+        key_lines = [
+            Text("1/2/3 or t/k/a: switch tabs", style="white"),
+            Text("←/→: cycle tabs", style="white"),
+            Text("?: show VN map", style="white"),
+            Text("Ctrl-C: exit", style="white"),
+        ]
+        tabs_lines.extend(key_lines[:remaining])
+    else:
+        alert_items = list(state.alerts)[:remaining]
+        if alert_items:
+            for item in alert_items:
+                tabs_lines.append(Text(item, style="bold red"))
+        else:
+            tabs_lines.append(Text("no active alerts", style="dim"))
+    tabs_lines = tabs_lines[: max(1, tabs_budget)]
+
+    tabs_grid = Table.grid(expand=True)
+    tabs_grid.add_column(ratio=1)
+    tabs_grid.add_row(_tabs_line(active_tab))
+    for line in tabs_lines:
+        tabs_grid.add_row(line)
+    tabs_panel = Panel(
+        tabs_grid,
+        box=box.SQUARE,
+        border_style="cyan",
+        padding=(0, 1),
+    )
+
+    root = Layout()
+    sections: list[Layout] = [Layout(header_panel, size=layout_rows["header"])]
+    if layout_rows["legend"] > 0:
+        sections.append(Layout(legend_line, size=layout_rows["legend"]))
+    sections.extend(
+        [
+            Layout(graph_panel, size=layout_rows["graph"]),
+            Layout(venues_panel, size=layout_rows["venues"]),
+            Layout(tabs_panel, size=layout_rows["tabs"]),
+        ]
+    )
+    root.split_column(*sections)
+    return root
+
+
+def render_frame_simple(
+    state: WatchState,
+    max_events: int,
+    *,
+    term_width: int,
+    term_height: int,
+    config_dir: str | None = None,
+    health_url: str | None = None,
+    layout_debug: bool = False,
+    ui_mode: str | None = None,
+    render_ms: int | None = None,
+) -> Any:
+    del max_events, term_height, config_dir, health_url, layout_debug, ui_mode, render_ms
+    state.frame_count += 1
+    record = state.last_record or {}
+    now_mono = time.monotonic()
+    pulse = (state.frame_count % 2) == 0
+
+    in_shadow = _is_shadow_mode(record)
+    mode_label = "SHA" if in_shadow else "LIVE"
+    mode_style = "bold red" if in_shadow else "bold green"
+    min_age_e, max_age_e = _simple_eage_bounds(state, record)
+    tick_value = record.get("t", "n/a")
+    now_hhmm_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    header = Text("www.paraphina.com // 1.89 // ")
+    header.append(mode_label, style=mode_style)
+    header.append(" // ")
+    header.append(
+        _format_simple_age_ms(min_age_e),
+        style="white" if min_age_e is not None else "dim",
+    )
+    header.append(" // ")
+    header.append(
+        _format_simple_age_ms(max_age_e),
+        style="white" if max_age_e is not None else "dim",
+    )
+    header.append(" // ")
+    header.append(now_hhmm_utc, style="white")
+    header.append(" // ")
+    header.append(str(tick_value), style="white")
+
+    legend = Text(
+        "EAGE (ts-rx)  AAGE (rx-publish)  PNL - n/a  POS n/a",
+        style="dim italic",
+    )
+
+    tape_prefix = "tape / "
+    tape_indent = " " * len(tape_prefix)
+    tape_payload_width = max(16, term_width - len(tape_prefix) - 18)
+    tape_events = list(state.tape)[:8]
+    tape_lines: list[Text] = []
+    if not tape_events:
+        tape_lines.append(Text("tape / --:--:-- INFO waiting for telemetry...", style="dim"))
+    else:
+        for idx, event in enumerate(tape_events):
+            ts_text = short_ts(event.ts_ms) if event.ts_ms else "--:--:--"
+            tag_text, tag_style = _simple_tape_tag(event.kind)
+            payload = _compact_tape_payload(event.text, tape_payload_width)
+            line = Text(tape_prefix if idx == 0 else tape_indent, style="dim")
+            line.append(f"{ts_text} ", style="white")
+
+            flash_style = None
+            if now_mono < event.flash_until_mono:
+                flash_style = _flash_style(event.kind, pulse)
+
+            if flash_style:
+                line.append(tag_text, style=flash_style)
+                line.append(" ")
+                line.append(payload, style=flash_style)
+            else:
+                line.append(tag_text, style=tag_style)
+                line.append(" ", style="dim")
+                payload_style = "dim" if tag_text == "INFO" else "white"
+                if event.kind in {"error", "kill"}:
+                    payload_style = "bold red"
+                line.append(payload, style=payload_style)
+            tape_lines.append(line)
+
+    pos_value: float | None = None
+    cap_value: float | None = None
+    if not in_shadow:
+        pos_value = _extract_net_pos_usd(record)
+        cap_value = _extract_max_pos_cap_usd(record)
+    pos_text = _format_signed_dollars(pos_value) if not in_shadow else "n/a"
+
+    delta_pct: float | None = None
+    if (
+        not in_shadow
+        and pos_value is not None
+        and cap_value is not None
+        and cap_value > 0
+    ):
+        delta_pct = 100.0 * abs(pos_value) / max(1.0, cap_value)
+    delta_text = f"{delta_pct:.1f}%" if delta_pct is not None else "n/a"
+    delta_style = _delta_pct_style(delta_pct) if not in_shadow else "dim"
+
+    pos_style = "dim"
+    if pos_value is not None and not in_shadow:
+        if pos_value > 0:
+            pos_style = "green"
+        elif pos_value < 0:
+            pos_style = "red"
+        else:
+            pos_style = "white"
+
+    footer = Text("Δ ")
+    footer.append(delta_text, style=delta_style)
+    footer.append(" // POS ")
+    footer.append(pos_text, style=pos_style)
+
+    return Group(header, legend, *tape_lines, footer)
+
+
+def render_frame_rich(
+    state: WatchState,
+    max_events: int,
+    *,
+    term_width: int,
+    term_height: int,
+    config_dir: str | None = None,
+    health_url: str | None = None,
+    layout_debug: bool = False,
+    ui_mode: str | None = None,
+    render_ms: int | None = None,
+) -> Any:
+    if state.active_page == _PAGE_EXPANDED:
+        return render_frame_expanded(
+            state,
+            max_events,
+            term_width=term_width,
+            term_height=term_height,
+            config_dir=config_dir,
+            health_url=health_url,
+            layout_debug=layout_debug,
+            ui_mode=ui_mode,
+            render_ms=render_ms,
+        )
+    return render_frame_simple(
+        state,
+        max_events,
+        term_width=term_width,
+        term_height=term_height,
+        config_dir=config_dir,
+        health_url=health_url,
+        layout_debug=layout_debug,
+        ui_mode=ui_mode,
+        render_ms=render_ms,
+    )
+
+
+# ── Classic frame rendering ─────────────────────────────────────────────────
+
+
+def render_frame_classic(  # noqa: C901
     state: WatchState,
     max_events: int,
     config_dir: str | None = None,
@@ -560,7 +2183,7 @@ def render_frame(  # noqa: C901
 
     # ── Title bar ─────────────────────────────────────────────────────────
     rule = styled("━" * 72, S.CYAN)
-    title = styled("  PARAPHINA LIVE WATCH", S.B_CYAN, S.BOLD)
+    title = styled("  paraphina v1.1 watch", S.B_CYAN, S.BOLD)
 
     # ── Header metrics ────────────────────────────────────────────────────
     tick_str = styled(str(tick), S.B_WHITE) if tick is not None else styled("n/a", S.GRAY)
@@ -806,6 +2429,147 @@ class TailFollower:
         return [line for line in data.splitlines() if line.strip()]
 
 
+def _decode_key_stream(raw: str) -> tuple[list[str], str]:
+    keys: list[str] = []
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == "\x1b":
+            if i + 1 >= len(raw):
+                return keys, raw[i:]
+            if raw[i + 1] == "[":
+                if i + 2 >= len(raw):
+                    return keys, raw[i:]
+                code = raw[i + 2]
+                if code == "D":
+                    keys.append("LEFT")
+                elif code == "C":
+                    keys.append("RIGHT")
+                i += 3
+                continue
+            i += 1
+            continue
+        keys.append(ch)
+        i += 1
+    return keys, ""
+
+
+def _apply_watch_key(state: WatchState, key: str) -> None:
+    low = key.lower()
+    if low in {"1", "t"}:
+        state.active_tab = _TAB_TAPE
+    elif low in {"2", "k"}:
+        state.active_tab = _TAB_KEYS
+    elif low in {"3", "a"}:
+        state.active_tab = _TAB_ALERTS
+    elif key == "LEFT":
+        state.active_tab = (state.active_tab - 1) % 3
+    elif key == "RIGHT":
+        state.active_tab = (state.active_tab + 1) % 3
+    elif key == "?":
+        state.show_vn_map_until = time.monotonic() + 8.0
+    elif low == "x":
+        state.active_page = _PAGE_SIMPLE
+    elif low == "y":
+        state.active_page = _PAGE_EXPANDED
+
+
+class RichKeyReader:
+    def __init__(self) -> None:
+        self.enabled = False
+        self._fd: int | None = None
+        self._old_term = None
+        self._old_flags: int | None = None
+        self._term_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._buffer: Deque[str] = deque()
+        self._lock = threading.Lock()
+        self._pending = ""
+
+    def start(self) -> None:
+        if not sys.stdin.isatty() or termios is None or tty is None or fcntl is None:
+            return
+        self._stop.clear()
+        try:
+            fd = sys.stdin.fileno()
+            old_term = termios.tcgetattr(fd)
+            old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            with self._term_lock:
+                self._fd = fd
+                self._old_term = old_term
+                self._old_flags = old_flags
+            tty.setcbreak(fd)
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+        except Exception:
+            self.stop()
+            return
+        self.enabled = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _restore_terminal(self) -> None:
+        if termios is None or fcntl is None:
+            return
+        with self._term_lock:
+            fd = self._fd
+            old_term = self._old_term
+            old_flags = self._old_flags
+            self._fd = None
+            self._old_term = None
+            self._old_flags = None
+        if fd is None:
+            return
+        try:
+            if old_term is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+            if old_flags is not None:
+                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = os.read(fd, 64)
+                except BlockingIOError:
+                    time.sleep(0.05)
+                    continue
+                except OSError:
+                    break
+                if not data:
+                    time.sleep(0.05)
+                    continue
+                text = data.decode("utf-8", errors="ignore")
+                with self._lock:
+                    self._buffer.append(text)
+        finally:
+            self._stop.set()
+            self._restore_terminal()
+
+    def read_keys(self) -> list[str]:
+        if not self.enabled:
+            return []
+        chunks: list[str] = []
+        with self._lock:
+            while self._buffer:
+                chunks.append(self._buffer.popleft())
+        raw = self._pending + "".join(chunks)
+        keys, self._pending = _decode_key_stream(raw)
+        return keys
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.2)
+        self._restore_terminal()
+        self.enabled = False
+
+
 # ── Entry points ─────────────────────────────────────────────────────────────
 
 
@@ -813,23 +2577,77 @@ def render_once(
     path: Path,
     refresh_ms: int,
     max_events: int,
+    *,
+    sort_mode: str = "agee",
+    flash_ms: int = 650,
+    use_rich: bool = False,
     config_dir: str | None = None,
     health_url: str | None = None,
-) -> str:
+    page: str = _PAGE_SIMPLE,
+) -> str | Any:
     records = parse_lines(path, max_events)
-    state = build_state(records, max_events)
-    return render_frame(state, max_events, config_dir=config_dir, health_url=health_url)
+    state = build_state(
+        records,
+        max_events,
+        sort_mode=sort_mode,
+        flash_ms=flash_ms,
+        page=page,
+    )
+    if use_rich and _RICH_AVAILABLE:
+        term_size = shutil.get_terminal_size((140, 40))
+        return render_frame_rich(
+            state,
+            max_events,
+            term_width=term_size.columns,
+            term_height=term_size.lines,
+            config_dir=config_dir,
+            health_url=health_url,
+        )
+    return render_frame_classic(
+        state,
+        max_events,
+        config_dir=config_dir,
+        health_url=health_url,
+    )
 
 
 def main() -> int:
     global _NO_COLOR
     args = parse_args()
-    telemetry_path = Path(args.telemetry)
+    try:
+        telemetry_path = resolve_telemetry_path(args)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     max_events = max(1, args.max_events)
     refresh_ms = max(1, args.refresh_ms)
+    flash_ms = max(150, args.flash_ms)
+    use_rich = not args.classic
+    auto_vscode_mode = detect_vscode_terminal()
+    if args.vscode:
+        vscode_mode = True
+    elif args.no_vscode:
+        vscode_mode = False
+    else:
+        vscode_mode = auto_vscode_mode
+    render_ms = (
+        max(1, args.render_ms)
+        if args.render_ms is not None
+        else (max(refresh_ms, 120) if vscode_mode else refresh_ms)
+    )
+    ui_mode = "vscode" if vscode_mode else None
 
     if args.no_color or os.environ.get("NO_COLOR"):
         _NO_COLOR = True
+
+    if use_rich and not _RICH_AVAILABLE:
+        print(
+            "rich is not installed; falling back to classic renderer. "
+            "Install with: pip install rich",
+            file=sys.stderr,
+        )
+        use_rich = False
 
     # Deploy state panel (disabled with --no-deploy-state).
     deploy_config_dir: str | None = None
@@ -838,24 +2656,229 @@ def main() -> int:
         deploy_config_dir = args.config_dir
         deploy_health_url = args.health_url
 
-    one_shot = refresh_ms >= 999_999
-    if one_shot:
-        frame = render_once(
-            telemetry_path, refresh_ms, max_events,
-            config_dir=deploy_config_dir, health_url=deploy_health_url,
-        )
-        print(frame)
-        return 0
+    if not telemetry_path.exists():
+        print(f"warning: telemetry path not found yet: {telemetry_path}", file=sys.stderr)
 
+    one_shot = refresh_ms >= 999_999
     is_tty = sys.stdout.isatty()
     if not is_tty:
         _NO_COLOR = True
 
     initial_records = parse_lines(telemetry_path, max_events)
-    state = build_state(initial_records, max_events)
+    state = build_state(
+        initial_records,
+        max_events,
+        sort_mode=args.sort,
+        flash_ms=flash_ms,
+        page=args.page,
+    )
     follower = TailFollower(telemetry_path)
     # Advance follower past already-consumed data so we don't double-count.
     follower.seek_end()
+
+    if one_shot:
+        if use_rich:
+            console = Console(no_color=_NO_COLOR, force_terminal=is_tty, highlight=False)
+            console.print(
+                render_frame_rich(
+                    state,
+                    max_events,
+                    term_width=console.size.width,
+                    term_height=console.size.height,
+                    config_dir=deploy_config_dir,
+                    health_url=deploy_health_url,
+                    layout_debug=args.layout_debug,
+                    ui_mode=ui_mode,
+                    render_ms=render_ms,
+                )
+            )
+        else:
+            print(
+                render_frame_classic(
+                    state,
+                    max_events,
+                    config_dir=deploy_config_dir,
+                    health_url=deploy_health_url,
+                )
+            )
+        return 0
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    if use_rich:
+        console = Console(no_color=_NO_COLOR, force_terminal=is_tty, highlight=False)
+        key_reader = RichKeyReader()
+        if is_tty:
+            key_reader.start()
+        refresh_interval_s = refresh_ms / 1000.0
+        base_render_interval_s = render_ms / 1000.0
+        drop_backoff_s = 0.015
+        heartbeat_interval_s = 1.0
+        vscode_min_render_interval_s = 0.150
+        vscode_drop_cooldown_s = 2.0
+        next_render_ts = 0.0
+        next_heartbeat_ts = time.monotonic() + heartbeat_interval_s
+        render_cooldown_until = 0.0
+        last_rendered_key: tuple[Any, ...] | None = None
+
+        def _effective_render_interval(now_mono: float) -> float:
+            interval_s = base_render_interval_s
+            if vscode_mode and now_mono < render_cooldown_until:
+                interval_s = max(interval_s, vscode_min_render_interval_s)
+            return interval_s
+
+        def _ingest_new_records() -> None:
+            for line in follower.read_new_lines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    state.update(record)
+
+        try:
+            if is_tty:
+                for key in key_reader.read_keys():
+                    _apply_watch_key(state, key)
+                initial = render_frame_rich(
+                    state,
+                    max_events,
+                    term_width=console.size.width,
+                    term_height=console.size.height,
+                    config_dir=deploy_config_dir,
+                    health_url=deploy_health_url,
+                    layout_debug=args.layout_debug,
+                    ui_mode=ui_mode,
+                    render_ms=render_ms,
+                )
+                with Live(
+                    initial,
+                    console=console,
+                    auto_refresh=False,
+                    transient=False,
+                    screen=False,
+                ) as live:
+                    now = time.monotonic()
+                    last_rendered_key = _build_frame_key(state, now)
+                    next_render_ts = now + _effective_render_interval(now)
+                    next_heartbeat_ts = now + heartbeat_interval_s
+                    while True:
+                        loop_started = time.monotonic()
+                        _ingest_new_records()
+                        key_seen = False
+                        for key in key_reader.read_keys():
+                            _apply_watch_key(state, key)
+                            key_seen = True
+                        now = time.monotonic()
+                        if key_seen:
+                            next_render_ts = 0.0
+                        if now >= next_render_ts:
+                            frame_key = _build_frame_key(state, now)
+                            force_render = key_seen or now >= next_heartbeat_ts
+                            interval_s = _effective_render_interval(now)
+                            if force_render or frame_key != last_rendered_key:
+                                frame_dropped = False
+                                try:
+                                    live.update(
+                                        render_frame_rich(
+                                            state,
+                                            max_events,
+                                            term_width=console.size.width,
+                                            term_height=console.size.height,
+                                            config_dir=deploy_config_dir,
+                                            health_url=deploy_health_url,
+                                            layout_debug=args.layout_debug,
+                                            ui_mode=ui_mode,
+                                            render_ms=render_ms,
+                                        ),
+                                        refresh=False,
+                                    )
+                                    live.refresh()
+                                except BlockingIOError:
+                                    frame_dropped = True
+                                except OSError as exc:
+                                    if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                                        frame_dropped = True
+                                    else:
+                                        raise
+
+                                now = time.monotonic()
+                                if frame_dropped:
+                                    if vscode_mode:
+                                        render_cooldown_until = max(
+                                            render_cooldown_until,
+                                            now + vscode_drop_cooldown_s,
+                                        )
+                                    interval_s = _effective_render_interval(now)
+                                    next_render_ts = now + max(drop_backoff_s, interval_s)
+                                else:
+                                    last_rendered_key = frame_key
+                                    next_heartbeat_ts = now + heartbeat_interval_s
+                                    next_render_ts = now + interval_s
+                            else:
+                                next_render_ts = now + interval_s
+
+                        sleep_s = refresh_interval_s - (time.monotonic() - loop_started)
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
+            else:
+                while True:
+                    loop_started = time.monotonic()
+                    _ingest_new_records()
+                    now = time.monotonic()
+                    if now >= next_render_ts:
+                        frame_key = _build_frame_key(state, now)
+                        force_render = now >= next_heartbeat_ts
+                        interval_s = _effective_render_interval(now)
+                        if force_render or frame_key != last_rendered_key:
+                            term_size = shutil.get_terminal_size((140, 40))
+                            frame_dropped = False
+                            try:
+                                console.print(
+                                    render_frame_rich(
+                                        state,
+                                        max_events,
+                                        term_width=term_size.columns,
+                                        term_height=term_size.lines,
+                                        config_dir=deploy_config_dir,
+                                        health_url=deploy_health_url,
+                                        layout_debug=args.layout_debug,
+                                        ui_mode=ui_mode,
+                                        render_ms=render_ms,
+                                    )
+                                )
+                            except BlockingIOError:
+                                frame_dropped = True
+                            except OSError as exc:
+                                if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                                    frame_dropped = True
+                                else:
+                                    raise
+
+                            now = time.monotonic()
+                            if frame_dropped:
+                                if vscode_mode:
+                                    render_cooldown_until = max(
+                                        render_cooldown_until,
+                                        now + vscode_drop_cooldown_s,
+                                    )
+                                interval_s = _effective_render_interval(now)
+                                next_render_ts = now + max(drop_backoff_s, interval_s)
+                            else:
+                                last_rendered_key = frame_key
+                                next_heartbeat_ts = now + heartbeat_interval_s
+                                next_render_ts = now + interval_s
+                        else:
+                            next_render_ts = now + interval_s
+
+                    sleep_s = refresh_interval_s - (time.monotonic() - loop_started)
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            key_reader.stop()
+        return 0
 
     if is_tty:
         # Hide cursor and clear screen once at startup.
@@ -879,8 +2902,9 @@ def main() -> int:
                 continue
             if isinstance(record, dict):
                 state.update(record)
-        frame = render_frame(
-            state, max_events,
+        frame = render_frame_classic(
+            state,
+            max_events,
             config_dir=deploy_config_dir, health_url=deploy_health_url,
         )
         if is_tty:
