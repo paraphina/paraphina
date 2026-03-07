@@ -1,0 +1,22 @@
+# Paraphina ETH all-5 micro canary profile.
+# This keeps the live path real while forcing notionals down near venue minimums.
+
+[venue]
+base_order_size = 0.01
+max_order_size = 0.01
+
+[limits]
+max_position_tao = 0.05
+max_open_orders = 12
+
+[rate_limit]
+enabled = true
+rps = 4.0
+burst = 6
+
+[enforcement]
+post_only = true
+reduce_only = false
+
+[kill]
+stale_max_ticks = 4

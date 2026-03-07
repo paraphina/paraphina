@@ -1,5 +1,6 @@
 # Rust / Cargo build artefacts
 /target/
+/.cargo-target/
 
 # Python virtual environment
 .venv/

@@ -66,15 +66,8 @@ if [ "$has_refresh" -eq 0 ]; then
 fi
 
 if [ "$has_target" -eq 0 ]; then
-    if [ -f "/tmp/paraphina_live_shadow/telemetry.jsonl" ]; then
-        set -- --run-dir "/tmp/paraphina_live_shadow" "$@"
-    elif [ -f "/tmp/paraphina_shadow_latest/telemetry.jsonl" ]; then
+    if [ -e "/tmp/paraphina_shadow_latest" ] || [ -f "/tmp/paraphina_last_outdir.txt" ] || [ -f "/tmp/paraphina_live_shadow/telemetry.jsonl" ]; then
         set -- --latest "$@"
-    elif [ -f "/tmp/paraphina_last_outdir.txt" ]; then
-        last_outdir=$(head -n 1 "/tmp/paraphina_last_outdir.txt" 2>/dev/null)
-        if [ -n "${last_outdir:-}" ] && [ -f "$last_outdir/telemetry.jsonl" ]; then
-            set -- --run-dir "$last_outdir" "$@"
-        fi
     fi
 fi
 

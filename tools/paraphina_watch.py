@@ -128,7 +128,7 @@ def parse_args() -> argparse.Namespace:
             "  BUY flashes green, SELL flashes red via TTL highlight (no ANSI blink).\n"
             "Path helpers:\n"
             "  --run-dir DIR   -> reads DIR/telemetry.jsonl\n"
-            "  --latest        -> resolves /tmp/paraphina_shadow_latest[/telemetry.jsonl]\n"
+            "  --latest        -> follows the freshest automatic target\n"
         ),
     )
     path_group = parser.add_mutually_exclusive_group(required=True)
@@ -140,7 +140,7 @@ def parse_args() -> argparse.Namespace:
     path_group.add_argument(
         "--latest",
         action="store_true",
-        help="Use /tmp/paraphina_shadow_latest symlink convention",
+        help="Follow the freshest automatic telemetry target",
     )
     parser.add_argument("--refresh-ms", type=int, default=250)
     parser.add_argument(
@@ -210,29 +210,59 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _auto_target_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        if path not in candidates:
+            candidates.append(path)
+
+    latest = Path("/tmp/paraphina_shadow_latest")
+    if latest.exists():
+        if latest.is_dir():
+            add_candidate(latest / "telemetry.jsonl")
+        else:
+            add_candidate(latest)
+
+    last_outdir = Path("/tmp/paraphina_last_outdir.txt")
+    if last_outdir.exists():
+        try:
+            outdir = last_outdir.read_text(encoding="utf-8").strip()
+        except OSError:
+            outdir = ""
+        if outdir:
+            add_candidate(Path(outdir) / "telemetry.jsonl")
+
+    add_candidate(Path("/tmp/paraphina_live_shadow/telemetry.jsonl"))
+    return candidates
+
+
+def resolve_latest_telemetry_path() -> Path:
+    best_path: Path | None = None
+    best_mtime_ns = -1
+    for candidate in _auto_target_candidates():
+        try:
+            stat_result = candidate.stat()
+        except OSError:
+            continue
+        if stat_result.st_mtime_ns > best_mtime_ns:
+            best_path = candidate
+            best_mtime_ns = stat_result.st_mtime_ns
+    if best_path is not None:
+        return best_path
+    raise FileNotFoundError(
+        "latest path missing: /tmp/paraphina_shadow_latest, "
+        "/tmp/paraphina_last_outdir.txt, and /tmp/paraphina_live_shadow"
+    )
+
+
 def resolve_telemetry_path(args: argparse.Namespace) -> Path:
     if args.telemetry:
         return Path(args.telemetry)
     if args.run_dir:
         return Path(args.run_dir) / "telemetry.jsonl"
     if args.latest:
-        latest = Path("/tmp/paraphina_shadow_latest")
-        if latest.exists():
-            if latest.is_dir():
-                return latest / "telemetry.jsonl"
-            return latest
-        last_outdir = Path("/tmp/paraphina_last_outdir.txt")
-        if last_outdir.exists():
-            try:
-                outdir = last_outdir.read_text(encoding="utf-8").strip()
-                if outdir:
-                    return Path(outdir) / "telemetry.jsonl"
-            except OSError:
-                pass
-        raise FileNotFoundError(
-            "latest path missing: /tmp/paraphina_shadow_latest "
-            "(and /tmp/paraphina_last_outdir.txt unavailable)"
-        )
+        return resolve_latest_telemetry_path()
     raise ValueError("no telemetry path source selected")
 
 
@@ -265,6 +295,174 @@ def short_ts(ms: int | None) -> str:
         return "n/a"
     dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
     return dt.strftime("%H:%M:%S")
+
+
+def wall_clock_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%SZ")
+
+
+def heartbeat_glyph(frame_count: int) -> str:
+    glyphs = "|/-\\"
+    return glyphs[frame_count % len(glyphs)]
+
+
+def source_age_label(state: "WatchState", now_mono: float) -> tuple[str, str]:
+    if state._last_update_mono is None:
+        return ("src n/a", "dim")
+    age_s = max(0.0, now_mono - state._last_update_mono)
+    if age_s < 1.0:
+        return (f"src {int(age_s * 1000)}ms", "green")
+    if age_s < 5.0:
+        return (f"src {age_s:.1f}s", "white")
+    if age_s < 15.0:
+        return (f"src {age_s:.1f}s", "yellow")
+    return (f"src {age_s:.1f}s", "bold red")
+
+
+@dataclass
+class RunnerStatus:
+    state: str = "unknown"
+    runner_pid: int | None = None
+    supervisor_pid: int | None = None
+    session_name: str | None = None
+    outdir: str | None = None
+    started_at: str | None = None
+    stopped_at: str | None = None
+    exit_code: int | None = None
+    signal_num: int | None = None
+    alive: bool = False
+    status_path: str | None = None
+
+
+def _safe_parse_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _read_kv_file(path: Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return data
+    for line in raw.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip()] = value.strip()
+    return data
+
+
+def _pid_is_shadow_runner(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ")
+    except OSError:
+        return False
+    text = cmdline.decode("utf-8", errors="ignore")
+    return "paraphina_live" in text and "--trade-mode shadow" in text
+
+
+def load_runner_status(telemetry_path: Path) -> RunnerStatus | None:
+    candidates = [
+        telemetry_path.parent / "runner.state",
+        Path("/tmp/paraphina_shadow_runner.state"),
+    ]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        data = _read_kv_file(candidate)
+        status = RunnerStatus(
+            state=data.get("state") or "unknown",
+            runner_pid=_safe_parse_int(data.get("runner_pid")),
+            supervisor_pid=_safe_parse_int(data.get("supervisor_pid")),
+            session_name=data.get("session_name") or None,
+            outdir=data.get("outdir") or None,
+            started_at=data.get("started_at") or None,
+            stopped_at=data.get("stopped_at") or None,
+            exit_code=_safe_parse_int(data.get("exit_code")),
+            signal_num=_safe_parse_int(data.get("signal")),
+            status_path=str(candidate),
+        )
+        if status.outdir and status.outdir != str(telemetry_path.parent):
+            continue
+        status.alive = _pid_is_shadow_runner(status.runner_pid)
+        return status
+
+    local_pid_file = telemetry_path.parent / "runner.pid"
+    if local_pid_file.exists():
+        pid = _safe_parse_int(local_pid_file.read_text(encoding="utf-8").strip())
+        return RunnerStatus(
+            state="running" if _pid_is_shadow_runner(pid) else "unknown",
+            runner_pid=pid,
+            outdir=str(telemetry_path.parent),
+            alive=_pid_is_shadow_runner(pid),
+            status_path=str(local_pid_file),
+        )
+
+    pid_file = Path("/tmp/paraphina_shadow_runner.pid")
+    if pid_file.exists():
+        try:
+            last_outdir = Path("/tmp/paraphina_last_outdir.txt").read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            last_outdir = ""
+        if last_outdir == str(telemetry_path.parent):
+            pid = _safe_parse_int(pid_file.read_text(encoding="utf-8").strip())
+            return RunnerStatus(
+                state="running" if _pid_is_shadow_runner(pid) else "unknown",
+                runner_pid=pid,
+                outdir=str(telemetry_path.parent),
+                alive=_pid_is_shadow_runner(pid),
+                status_path=str(pid_file),
+            )
+    return None
+
+
+def runner_status_label(state: "WatchState") -> tuple[str, str]:
+    status = state.runner_status
+    if status is None:
+        return ("runner ?", "dim")
+    pid_text = f" pid {status.runner_pid}" if status.runner_pid is not None else ""
+    if status.alive:
+        if status.state == "starting":
+            return (f"runner starting{pid_text}", "yellow")
+        if status.state == "stopping":
+            return (f"runner stopping{pid_text}", "yellow")
+        return (f"runner live{pid_text}", "green")
+    if status.state == "exited":
+        if status.signal_num is not None:
+            return (f"runner dead sig {status.signal_num}", "bold red")
+        if status.exit_code is not None:
+            return (f"runner dead exit {status.exit_code}", "bold red")
+    if status.state == "stopping":
+        return (f"runner stopping{pid_text}", "yellow")
+    if status.runner_pid is not None:
+        return (f"runner dead{pid_text}", "bold red")
+    return ("runner dead", "bold red")
+
+
+def seed_state_source_age_from_path(state: "WatchState", telemetry_path: Path) -> None:
+    if state.last_record is None:
+        return
+    try:
+        age_s = max(0.0, time.time() - telemetry_path.stat().st_mtime)
+    except OSError:
+        return
+    state._last_update_mono = max(0.0, time.monotonic() - age_s)
 
 
 def format_num(value: Any, width: int = 8) -> str:
@@ -634,6 +832,7 @@ class WatchState:
     active_page: str = _PAGE_SIMPLE
     show_vn_map_until: float = 0.0
     layout_debug_printed: bool = False
+    runner_status: RunnerStatus | None = None
     _seen_event_ids: Deque[str] = field(default_factory=deque)
     _seen_event_set: set[str] = field(default_factory=set)
 
@@ -969,6 +1168,28 @@ def build_state(
     state.tape = deque(maxlen=max_events)
     for record in records:
         state.update(record)
+    return state
+
+
+def rebuild_state_for_target(
+    prior_state: WatchState,
+    records: Iterable[dict[str, Any]],
+    max_events: int,
+    *,
+    flash_ms: int,
+) -> WatchState:
+    state = build_state(
+        records,
+        max_events,
+        sort_mode=prior_state.sort_mode,
+        flash_ms=flash_ms,
+        page=prior_state.active_page,
+    )
+    state.active_tab = prior_state.active_tab
+    state.show_vn_map_until = prior_state.show_vn_map_until
+    state.layout_debug_printed = prior_state.layout_debug_printed
+    state.frame_count = prior_state.frame_count
+    state.runner_status = prior_state.runner_status
     return state
 
 
@@ -1718,6 +1939,10 @@ def render_frame_expanded(
     gate_text = "PASS" if gate_pass else f"FAIL({','.join(gate_reasons)})"
     tick_value = record.get("t", "n/a")
     time_text = short_ts(now_ms) if now_ms else "n/a"
+    wall_time_text = wall_clock_utc()
+    src_age_text, src_age_style = source_age_label(state, now_mono)
+    runner_text, runner_style = runner_status_label(state)
+    heartbeat = heartbeat_glyph(state.frame_count)
     recon_total = sum(state.venue_reconnects.values())
     cap_hits = state.global_cap_hits
 
@@ -1759,7 +1984,12 @@ def render_frame_expanded(
     right_header.append(mode_token, style="magenta")
     right_header.append("  GATE ", style="dim")
     right_header.append(gate_text, style="bold green" if gate_pass else "bold red")
-    right_header.append(f"  t {tick_value} {time_text}", style="white")
+    right_header.append(f"  t {tick_value}", style="white")
+    right_header.append(f"  rec {time_text}", style="dim")
+    right_header.append(f"  {src_age_text}", style=src_age_style)
+    right_header.append(f"  {runner_text}", style=runner_style)
+    right_header.append(f"  now {wall_time_text}", style="white")
+    right_header.append(f"  {heartbeat}", style="cyan")
     right_header.append(f"  {run_id}", style="dim")
     header_grid.add_row(left_header, right_header)
     header_panel = Panel(
@@ -2045,7 +2275,10 @@ def render_frame_simple(
     mode_style = "bold red" if in_shadow else "bold green"
     min_age_e, max_age_e = _simple_eage_bounds(state, record)
     tick_value = record.get("t", "n/a")
-    now_hhmm_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    wall_time_text = wall_clock_utc()
+    src_age_text, src_age_style = source_age_label(state, now_mono)
+    runner_text, runner_style = runner_status_label(state)
+    heartbeat = heartbeat_glyph(state.frame_count)
 
     header = Text("www.paraphina.com // 1.89 // ")
     header.append(mode_label, style=mode_style)
@@ -2060,9 +2293,14 @@ def render_frame_simple(
         style="white" if max_age_e is not None else "dim",
     )
     header.append(" // ")
-    header.append(now_hhmm_utc, style="white")
+    header.append(wall_time_text, style="white")
+    header.append(" // ")
+    header.append(src_age_text, style=src_age_style)
+    header.append(" // ")
+    header.append(runner_text, style=runner_style)
     header.append(" \\ ")
     header.append(str(tick_value), style="white")
+    header.append(f" {heartbeat}", style="cyan")
 
     legend = Text(
         "EAGE (ts-rx)  AAGE (rx-publish)  PNL - n/a  POS n/a",
@@ -2075,7 +2313,25 @@ def render_frame_simple(
     tape_events = list(state.tape)[:8]
     tape_lines: list[Text] = []
     if not tape_events:
-        tape_lines.append(Text("tape / --:--:-- INFO waiting for telemetry...", style="dim"))
+        if state.last_record is None:
+            line = Text("tape / --:--:-- ", style="dim")
+            line.append("INFO", style="white")
+            if state.runner_status is not None and not state.runner_status.alive:
+                line.append(" runner is not live", style="bold red")
+                line.append(f" ({runner_text})", style=runner_style)
+            else:
+                line.append(" waiting for telemetry...", style="dim")
+                line.append(f" ({runner_text})", style=runner_style)
+            tape_lines.append(line)
+        else:
+            src_age_text, src_age_style = source_age_label(state, now_mono)
+            line = Text("tape / --:--:-- ", style="dim")
+            line.append("INFO", style="white")
+            line.append(" no recent actions", style="dim")
+            line.append(f" ({src_age_text})", style=src_age_style)
+            line.append(" ", style="dim")
+            line.append(f"[{runner_text}]", style=runner_style)
+            tape_lines.append(line)
     else:
         for idx, event in enumerate(tape_events):
             ts_text = short_ts(event.ts_ms) if event.ts_ms else "--:--:--"
@@ -2210,6 +2466,7 @@ def render_frame_classic(  # noqa: C901
     config_dir: str | None = None,
     health_url: str | None = None,
 ) -> str:
+    state.frame_count += 1
     record = state.last_record or {}
     tick = record.get("t")
     now_ms = None
@@ -2240,6 +2497,11 @@ def render_frame_classic(  # noqa: C901
     time_str = (
         styled(short_ts(now_ms), S.B_WHITE, S.BOLD) if now_ms else styled("n/a", S.GRAY)
     )
+    wall_time_str = styled(wall_clock_utc(), S.B_WHITE)
+    src_age_text, src_age_style = source_age_label(state, time.monotonic())
+    runner_text, runner_style = runner_status_label(state)
+    src_age_str = styled(src_age_text, getattr(S, "YELLOW") if src_age_style == "yellow" else getattr(S, "B_RED") if src_age_style == "bold red" else getattr(S, "GREEN") if src_age_style == "green" else getattr(S, "WHITE") if src_age_style == "white" else S.DIM)
+    runner_str = styled(runner_text, getattr(S, "YELLOW") if runner_style == "yellow" else getattr(S, "B_RED") if runner_style == "bold red" else getattr(S, "GREEN") if runner_style == "green" else getattr(S, "WHITE") if runner_style == "white" else S.DIM)
     mode_str = styled(str(execution_mode), S.MAGENTA)
     trade_str = styled(str(trade_mode), S.MAGENTA)
     regime_str = color_regime(str(risk_regime))
@@ -2248,10 +2510,16 @@ def render_frame_classic(  # noqa: C901
     hdr1 = (
         f"  {_LABEL('tick')} {tick_str}   "
         f"{_LABEL('time')} {time_str}   "
-        f"{_LABEL('mode')} {mode_str}   "
-        f"{_LABEL('trade')} {trade_str}"
+        f"{src_age_str}   "
+        f"{runner_str}   "
+        f"{_LABEL('now')} {wall_time_str}   "
+        f"{_LABEL('hb')} {styled(heartbeat_glyph(state.frame_count), S.CYAN)}   "
+        f"{_LABEL('mode')} {mode_str}"
     )
-    hdr2 = f"  {_LABEL('regime')} {regime_str}   {_LABEL('kill')} {kill_str}"
+    hdr2 = (
+        f"  {_LABEL('trade')} {trade_str}   "
+        f"{_LABEL('regime')} {regime_str}   {_LABEL('kill')} {kill_str}"
+    )
     if kill_switch and kill_reason and kill_reason != "n/a":
         hdr2 += f"   {_LABEL('reason')} {styled(str(kill_reason), S.B_RED)}"
 
@@ -2643,6 +2911,7 @@ def render_once(
         flash_ms=flash_ms,
         page=page,
     )
+    seed_state_source_age_from_path(state, path)
     if use_rich and _RICH_AVAILABLE:
         term_size = shutil.get_terminal_size((140, 40))
         return render_frame_rich(
@@ -2722,9 +2991,48 @@ def main() -> int:
         flash_ms=flash_ms,
         page=args.page,
     )
+    seed_state_source_age_from_path(state, telemetry_path)
+    state.runner_status = load_runner_status(telemetry_path)
     follower = TailFollower(telemetry_path)
     # Advance follower past already-consumed data so we don't double-count.
     follower.seek_end()
+    latest_check_interval_s = 1.0
+    next_latest_check_ts = 0.0
+
+    def _ingest_new_records() -> None:
+        for line in follower.read_new_lines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                state.update(record)
+
+    def _refresh_runner_status() -> None:
+        state.runner_status = load_runner_status(telemetry_path)
+
+    def _maybe_switch_latest_target(now_mono: float) -> None:
+        nonlocal telemetry_path, follower, state, next_latest_check_ts
+        if not args.latest or now_mono < next_latest_check_ts:
+            return
+        next_latest_check_ts = now_mono + latest_check_interval_s
+        try:
+            latest_path = resolve_latest_telemetry_path()
+        except FileNotFoundError:
+            return
+        if latest_path == telemetry_path:
+            return
+        state = rebuild_state_for_target(
+            state,
+            parse_lines(latest_path, max_events),
+            max_events,
+            flash_ms=flash_ms,
+        )
+        seed_state_source_age_from_path(state, latest_path)
+        telemetry_path = latest_path
+        follower = TailFollower(telemetry_path)
+        follower.seek_end()
+        _refresh_runner_status()
 
     if one_shot:
         if use_rich:
@@ -2777,15 +3085,6 @@ def main() -> int:
                 interval_s = max(interval_s, vscode_min_render_interval_s)
             return interval_s
 
-        def _ingest_new_records() -> None:
-            for line in follower.read_new_lines():
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict):
-                    state.update(record)
-
         try:
             if is_tty:
                 for key in key_reader.read_keys():
@@ -2814,7 +3113,9 @@ def main() -> int:
                     next_heartbeat_ts = now + heartbeat_interval_s
                     while True:
                         loop_started = time.monotonic()
+                        _maybe_switch_latest_target(loop_started)
                         _ingest_new_records()
+                        _refresh_runner_status()
                         key_seen = False
                         for key in key_reader.read_keys():
                             _apply_watch_key(state, key)
@@ -2874,7 +3175,9 @@ def main() -> int:
             else:
                 while True:
                     loop_started = time.monotonic()
+                    _maybe_switch_latest_target(loop_started)
                     _ingest_new_records()
+                    _refresh_runner_status()
                     now = time.monotonic()
                     if now >= next_render_ts:
                         frame_key = _build_frame_key(state, now)
@@ -2945,6 +3248,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: (cleanup(), sys.exit(0)))
 
     while True:
+        _maybe_switch_latest_target(time.monotonic())
         for line in follower.read_new_lines():
             try:
                 record = json.loads(line)
@@ -2952,6 +3256,7 @@ def main() -> int:
                 continue
             if isinstance(record, dict):
                 state.update(record)
+        _refresh_runner_status()
         frame = render_frame_classic(
             state,
             max_events,

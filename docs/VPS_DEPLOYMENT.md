@@ -28,14 +28,16 @@ sudo mkdir -p /opt/paraphina
 sudo chown -R $USER:$USER /opt/paraphina
 git clone https://github.com/<org>/paraphina /opt/paraphina
 cd /opt/paraphina
-cargo build -p paraphina --bin paraphina_live --features live,live_hyperliquid --release
+cargo build -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex --release
+sudo install -d -o paraphina -g paraphina /var/lib/paraphina/out /var/log/paraphina /etc/paraphina
+sudo install -m 755 target/release/paraphina_live /opt/paraphina/paraphina_live
 ```
 
 Install systemd unit + env file:
 
 ```
 sudo cp deploy/systemd/paraphina_live.service.template /etc/systemd/system/paraphina_live.service
-sudo cp deploy/env/roadmap_b_shadow.env.example /etc/paraphina/paraphina_live.env
+sudo cp deploy/env/roadmap_b_shadow.env.example /etc/paraphina/current.env
 sudo systemctl daemon-reload
 sudo systemctl enable paraphina_live
 sudo systemctl start paraphina_live
@@ -56,7 +58,16 @@ docker compose -f deploy/docker-compose.yml up -d
 
 ```
 PARAPHINA_TRADE_MODE=shadow \
-PARAPHINA_LIVE_CONNECTOR=hyperliquid \
+PARAPHINA_LIVE_CONNECTORS=hyperliquid,lighter,extended,aster,paradex \
+HL_COIN=ETH \
+LIGHTER_MARKET=ETH-USD \
+EXTENDED_MARKET=ETH-USD \
+EXTENDED_REST_URL=https://api.starknet.extended.exchange \
+EXTENDED_FUNDING_PATH=/api/v1/info/markets/ETH-USD/stats \
+ASTER_MARKET=ETHUSDT \
+PARADEX_MARKET=ETH-USD-PERP \
+PARAPHINA_PARADEX_PUBLIC_FEED=orderbook \
+PARAPHINA_PARADEX_STATE_STALE_MS_OVERRIDE=3000 \
 PARAPHINA_LIVE_OUT_DIR=/var/lib/paraphina/out \
 PARAPHINA_TELEMETRY_MODE=jsonl \
 paraphina_live
