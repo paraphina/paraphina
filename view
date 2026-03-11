@@ -66,9 +66,7 @@ if [ "$has_refresh" -eq 0 ]; then
 fi
 
 if [ "$has_target" -eq 0 ]; then
-    if [ -e "/tmp/paraphina_shadow_latest" ] || [ -f "/tmp/paraphina_last_outdir.txt" ] || [ -f "/tmp/paraphina_live_shadow/telemetry.jsonl" ]; then
-        set -- --latest "$@"
-    fi
+    set -- --latest "$@"
 fi
 
 has_target=0
@@ -80,18 +78,6 @@ for arg in "$@"; do
             ;;
     esac
 done
-
-if [ "$has_target" -eq 0 ]; then
-    cat >&2 <<'EOF'
-No telemetry source found.
-
-Usage:
-  ./view --run-dir <dir>
-  ./view --telemetry <path>
-  ./view y
-EOF
-    exit 2
-fi
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "error: python3 not found in PATH." >&2

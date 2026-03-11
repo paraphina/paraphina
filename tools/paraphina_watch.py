@@ -67,6 +67,13 @@ _TAB_ALERTS = 2
 _PAGE_SIMPLE = "simple"
 _PAGE_EXPANDED = "expanded"
 
+_WATCH_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SYSTEMD_TELEMETRY_PATH = Path("/var/lib/paraphina/out/telemetry.jsonl")
+_AUTO_TARGET_GLOB_ROOTS: tuple[tuple[Path, tuple[str, ...]], ...] = (
+    (Path("/tmp"), ("*/telemetry.jsonl", "*/*/telemetry.jsonl")),
+    (_WATCH_REPO_ROOT / "runs", ("*/telemetry.jsonl", "*/*/telemetry.jsonl")),
+)
+
 
 class S:
     """ANSI escape sequences for styles and colours."""
@@ -233,11 +240,28 @@ def _auto_target_candidates() -> list[Path]:
         if outdir:
             add_candidate(Path(outdir) / "telemetry.jsonl")
 
+    add_candidate(_SYSTEMD_TELEMETRY_PATH)
     add_candidate(Path("/tmp/paraphina_live_shadow/telemetry.jsonl"))
+
+    for root, patterns in _AUTO_TARGET_GLOB_ROOTS:
+        if not root.exists():
+            continue
+        for pattern in patterns:
+            try:
+                matches = root.glob(pattern)
+            except OSError:
+                continue
+            for candidate in matches:
+                if candidate.is_file():
+                    add_candidate(candidate)
     return candidates
 
 
 def resolve_latest_telemetry_path() -> Path:
+    current_path = _infer_current_telemetry_path_from_processes()
+    if current_path is not None:
+        return current_path
+
     best_path: Path | None = None
     best_mtime_ns = -1
     for candidate in _auto_target_candidates():
@@ -251,8 +275,9 @@ def resolve_latest_telemetry_path() -> Path:
     if best_path is not None:
         return best_path
     raise FileNotFoundError(
-        "latest path missing: /tmp/paraphina_shadow_latest, "
-        "/tmp/paraphina_last_outdir.txt, and /tmp/paraphina_live_shadow"
+        "no telemetry source found; checked current-run markers, "
+        "/var/lib/paraphina/out/telemetry.jsonl, /tmp telemetry runs, "
+        "and repo runs/*/telemetry.jsonl"
     )
 
 
@@ -360,19 +385,106 @@ def _read_kv_file(path: Path) -> dict[str, str]:
     return data
 
 
-def _pid_is_shadow_runner(pid: int | None) -> bool:
+def _read_cmdline_tokens(pid: int) -> list[str] | None:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    parts = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\x00") if part]
+    return parts or None
+
+
+def _pid_is_paraphina_runner(pid: int | None) -> bool:
     if pid is None or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\x00", b" ")
-    except OSError:
+    cmdline = _read_cmdline_tokens(pid)
+    if not cmdline:
         return False
-    text = cmdline.decode("utf-8", errors="ignore")
-    return "paraphina_live" in text and "--trade-mode shadow" in text
+    return any("paraphina_live" in token for token in cmdline)
+
+
+def _extract_cmd_arg(cmdline: list[str], flag: str) -> str | None:
+    prefix = f"{flag}="
+    for idx, token in enumerate(cmdline):
+        if token == flag and idx + 1 < len(cmdline):
+            return cmdline[idx + 1]
+        if token.startswith(prefix):
+            return token[len(prefix):]
+    return None
+
+
+def _iter_running_paraphina_live() -> Iterable[tuple[int, list[str]]]:
+    proc_root = Path("/proc")
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        cmdline = _read_cmdline_tokens(pid)
+        if not cmdline:
+            continue
+        if any("paraphina_live" in token for token in cmdline):
+            yield pid, cmdline
+
+
+def _normalize_path(path: str | Path) -> Path:
+    return Path(path).expanduser().resolve(strict=False)
+
+
+def _infer_current_telemetry_path_from_processes() -> Path | None:
+    telemetry_paths: list[Path] = []
+
+    def add_path(path: Path) -> None:
+        normalized = _normalize_path(path)
+        if normalized not in telemetry_paths:
+            telemetry_paths.append(normalized)
+
+    for _pid, cmdline in _iter_running_paraphina_live():
+        outdir = _extract_cmd_arg(cmdline, "--out-dir")
+        if outdir:
+            add_path(Path(outdir) / "telemetry.jsonl")
+        else:
+            add_path(_SYSTEMD_TELEMETRY_PATH)
+
+    if len(telemetry_paths) == 1:
+        return telemetry_paths[0]
+    return None
+
+
+def _infer_runner_status_from_processes(telemetry_path: Path) -> RunnerStatus | None:
+    target_outdir = _normalize_path(telemetry_path.parent)
+    default_outdir = _normalize_path(_SYSTEMD_TELEMETRY_PATH.parent)
+    fallback_pid: int | None = None
+    for pid, cmdline in _iter_running_paraphina_live():
+        outdir = _extract_cmd_arg(cmdline, "--out-dir")
+        if outdir is not None:
+            if _normalize_path(outdir) != target_outdir:
+                continue
+            return RunnerStatus(
+                state="running",
+                runner_pid=pid,
+                outdir=str(target_outdir),
+                alive=True,
+                status_path=f"/proc/{pid}/cmdline",
+            )
+        if target_outdir == default_outdir and fallback_pid is None:
+            fallback_pid = pid
+    if fallback_pid is None:
+        return None
+    return RunnerStatus(
+        state="running",
+        runner_pid=fallback_pid,
+        outdir=str(target_outdir),
+        alive=True,
+        status_path=f"/proc/{fallback_pid}/cmdline",
+    )
 
 
 def load_runner_status(telemetry_path: Path) -> RunnerStatus | None:
@@ -398,17 +510,17 @@ def load_runner_status(telemetry_path: Path) -> RunnerStatus | None:
         )
         if status.outdir and status.outdir != str(telemetry_path.parent):
             continue
-        status.alive = _pid_is_shadow_runner(status.runner_pid)
+        status.alive = _pid_is_paraphina_runner(status.runner_pid)
         return status
 
     local_pid_file = telemetry_path.parent / "runner.pid"
     if local_pid_file.exists():
         pid = _safe_parse_int(local_pid_file.read_text(encoding="utf-8").strip())
         return RunnerStatus(
-            state="running" if _pid_is_shadow_runner(pid) else "unknown",
+            state="running" if _pid_is_paraphina_runner(pid) else "unknown",
             runner_pid=pid,
             outdir=str(telemetry_path.parent),
-            alive=_pid_is_shadow_runner(pid),
+            alive=_pid_is_paraphina_runner(pid),
             status_path=str(local_pid_file),
         )
 
@@ -423,13 +535,13 @@ def load_runner_status(telemetry_path: Path) -> RunnerStatus | None:
         if last_outdir == str(telemetry_path.parent):
             pid = _safe_parse_int(pid_file.read_text(encoding="utf-8").strip())
             return RunnerStatus(
-                state="running" if _pid_is_shadow_runner(pid) else "unknown",
+                state="running" if _pid_is_paraphina_runner(pid) else "unknown",
                 runner_pid=pid,
                 outdir=str(telemetry_path.parent),
-                alive=_pid_is_shadow_runner(pid),
+                alive=_pid_is_paraphina_runner(pid),
                 status_path=str(pid_file),
             )
-    return None
+    return _infer_runner_status_from_processes(telemetry_path)
 
 
 def runner_status_label(state: "WatchState") -> tuple[str, str]:
