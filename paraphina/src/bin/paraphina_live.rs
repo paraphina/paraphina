@@ -29,8 +29,8 @@ use paraphina::live::types::L2Snapshot;
 use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
 use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink, TelemetrySinkHandle};
-use serde::Deserialize;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use url::Url;
 
 use tokio::sync::mpsc;
@@ -508,6 +508,100 @@ fn resolve_telemetry_path(out_dir: Option<&std::path::PathBuf>) -> Option<std::p
         }
     }
     telemetry_path
+}
+
+const CURRENT_RUN_POINTER_PATH: &str = "/tmp/paraphina_current_run.json";
+const CURRENT_RUNS_DIR: &str = "/tmp/paraphina_current_runs";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CurrentRunManifest {
+    pid: u32,
+    started_at: String,
+    started_at_unix_ms: u64,
+    trade_mode: String,
+    telemetry_path: String,
+    out_dir: Option<String>,
+    manifest_path: String,
+}
+
+#[derive(Debug)]
+struct CurrentRunRegistration {
+    pid: u32,
+    manifest_path: PathBuf,
+    pointer_path: PathBuf,
+}
+
+impl Drop for CurrentRunRegistration {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.manifest_path);
+        let current = std::fs::read_to_string(&self.pointer_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<CurrentRunManifest>(&text).ok());
+        if current
+            .as_ref()
+            .is_some_and(|manifest| manifest.pid == self.pid)
+        {
+            let _ = std::fs::remove_file(&self.pointer_path);
+        }
+    }
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path has no parent: {}", path.display()),
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("current_run.json");
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    let text = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp_path, text)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn register_current_run(
+    trade_mode: TradeMode,
+    telemetry_path: Option<&PathBuf>,
+    out_dir: Option<&PathBuf>,
+) -> Option<CurrentRunRegistration> {
+    let telemetry_path = telemetry_path?;
+    let started_at_unix_ms = now_ms().max(0) as u64;
+    let started_at = started_at_unix_ms.to_string();
+    let manifest_path = Path::new(CURRENT_RUNS_DIR).join(format!("{}.json", std::process::id()));
+    let pointer_path = PathBuf::from(CURRENT_RUN_POINTER_PATH);
+    let manifest = CurrentRunManifest {
+        pid: std::process::id(),
+        started_at,
+        started_at_unix_ms,
+        trade_mode: trade_mode.as_str().to_string(),
+        telemetry_path: telemetry_path.display().to_string(),
+        out_dir: out_dir.map(|path| path.display().to_string()),
+        manifest_path: manifest_path.display().to_string(),
+    };
+    if let Err(err) = write_json_atomic(&manifest_path, &manifest) {
+        eprintln!(
+            "paraphina_live | current_run_manifest_write_error path={} err={err}",
+            manifest_path.display()
+        );
+        return None;
+    }
+    if let Err(err) = write_json_atomic(&pointer_path, &manifest) {
+        eprintln!(
+            "paraphina_live | current_run_pointer_write_error path={} err={err}",
+            pointer_path.display()
+        );
+    }
+    Some(CurrentRunRegistration {
+        pid: manifest.pid,
+        manifest_path,
+        pointer_path,
+    })
 }
 
 fn enforce_roadmap_b_gate() {
@@ -1730,6 +1824,7 @@ async fn main() {
     let connector_selection = resolve_connectors(&args);
     let connectors = connector_selection.connectors.clone();
     let out_dir = resolve_out_dir(args.out_dir.clone());
+    let telemetry_path = resolve_telemetry_path(out_dir.as_ref());
     let paper_mode = trade_mode.trade_mode == TradeMode::Paper;
     let paper_route_sandbox = env_is_true("PARAPHINA_PAPER_ROUTE_SANDBOX");
     let canary_profile = resolve_canary_profile(args.canary_profile.clone());
@@ -1817,6 +1912,11 @@ async fn main() {
     if let Err(err) = write_audit_files(&audit_dir, &cfg, &build_info) {
         eprintln!("paraphina_live | audit_write_error={err}");
     }
+    let _current_run_registration = register_current_run(
+        trade_mode.trade_mode,
+        telemetry_path.as_ref(),
+        out_dir.as_ref(),
+    );
     let specs = InstrumentSpec::from_config(&cfg);
     if let Err(errors) = validate_specs(&specs) {
         for err in errors {
@@ -3029,10 +3129,9 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(200);
-    let telemetry_path = resolve_telemetry_path(out_dir.as_ref());
     let telemetry_cfg = TelemetryConfig {
         mode: TelemetryMode::from_env(),
-        path: telemetry_path,
+        path: telemetry_path.clone(),
         append: TelemetryConfig::append_from_env(),
     };
     let telemetry_sink = TelemetrySink::from_config(telemetry_cfg);

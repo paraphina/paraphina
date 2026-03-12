@@ -96,4 +96,4 @@ fi
 printf 'pid=%s\n' "$pid"
 printf 'outdir=%s\n' "$OUTDIR"
 printf 'launcher=%s\n' "$launcher"
-printf 'watch=./view\n'
+printf 'watch=%s/view\n' "${HOME:-$REPO_ROOT}"

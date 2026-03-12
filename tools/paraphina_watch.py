@@ -69,6 +69,12 @@ _PAGE_EXPANDED = "expanded"
 
 _WATCH_REPO_ROOT = Path(__file__).resolve().parent.parent
 _SYSTEMD_TELEMETRY_PATH = Path("/var/lib/paraphina/out/telemetry.jsonl")
+_CURRENT_RUN_POINTER_PATH = Path("/tmp/paraphina_current_run.json")
+_CURRENT_RUNS_DIR = Path("/tmp/paraphina_current_runs")
+_SHADOW_LATEST_PATH = Path("/tmp/paraphina_shadow_latest")
+_SHADOW_LAST_OUTDIR_PATH = Path("/tmp/paraphina_last_outdir.txt")
+_SHADOW_STATE_PATH = Path("/tmp/paraphina_shadow_runner.state")
+_SHADOW_PID_PATH = Path("/tmp/paraphina_shadow_runner.pid")
 _AUTO_TARGET_GLOB_ROOTS: tuple[tuple[Path, tuple[str, ...]], ...] = (
     (Path("/tmp"), ("*/telemetry.jsonl", "*/*/telemetry.jsonl")),
     (_WATCH_REPO_ROOT / "runs", ("*/telemetry.jsonl", "*/*/telemetry.jsonl")),
@@ -134,6 +140,8 @@ def parse_args() -> argparse.Namespace:
             "Flash semantics:\n"
             "  BUY flashes green, SELL flashes red via TTL highlight (no ANSI blink).\n"
             "Path helpers:\n"
+            "  --current-run   -> follows the active live/shadow run\n"
+            "  --current-shadow -> follows the active repo-managed shadow run\n"
             "  --run-dir DIR   -> reads DIR/telemetry.jsonl\n"
             "  --latest        -> follows the freshest automatic target\n"
         ),
@@ -143,6 +151,16 @@ def parse_args() -> argparse.Namespace:
     path_group.add_argument(
         "--run-dir",
         help="Run directory containing telemetry.jsonl",
+    )
+    path_group.add_argument(
+        "--current-run",
+        action="store_true",
+        help="Follow the active live/shadow run",
+    )
+    path_group.add_argument(
+        "--current-shadow",
+        action="store_true",
+        help="Follow the active repo-managed shadow run",
     )
     path_group.add_argument(
         "--latest",
@@ -224,14 +242,14 @@ def _auto_target_candidates() -> list[Path]:
         if path not in candidates:
             candidates.append(path)
 
-    latest = Path("/tmp/paraphina_shadow_latest")
+    latest = _SHADOW_LATEST_PATH
     if latest.exists():
         if latest.is_dir():
             add_candidate(latest / "telemetry.jsonl")
         else:
             add_candidate(latest)
 
-    last_outdir = Path("/tmp/paraphina_last_outdir.txt")
+    last_outdir = _SHADOW_LAST_OUTDIR_PATH
     if last_outdir.exists():
         try:
             outdir = last_outdir.read_text(encoding="utf-8").strip()
@@ -255,6 +273,146 @@ def _auto_target_candidates() -> list[Path]:
                 if candidate.is_file():
                     add_candidate(candidate)
     return candidates
+
+
+def _shadow_telemetry_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        normalized = _normalize_path(path)
+        if normalized not in candidates:
+            candidates.append(normalized)
+
+    latest = _SHADOW_LATEST_PATH
+    if latest.exists():
+        if latest.is_dir():
+            add_candidate(latest / "telemetry.jsonl")
+        else:
+            add_candidate(latest)
+
+    last_outdir = _SHADOW_LAST_OUTDIR_PATH
+    if last_outdir.exists():
+        try:
+            outdir = last_outdir.read_text(encoding="utf-8").strip()
+        except OSError:
+            outdir = ""
+        if outdir:
+            add_candidate(Path(outdir) / "telemetry.jsonl")
+    return candidates
+
+
+def _resolve_shadow_state_target(state_path: Path) -> Path:
+    data = _read_kv_file(state_path)
+    state = data.get("state") or "unknown"
+    runner_pid = _safe_parse_int(data.get("runner_pid"))
+    telemetry_raw = data.get("telemetry_path")
+    outdir = data.get("outdir")
+    if telemetry_raw:
+        telemetry_path = _normalize_path(telemetry_raw)
+    elif outdir:
+        telemetry_path = _normalize_path(Path(outdir) / "telemetry.jsonl")
+    else:
+        raise FileNotFoundError(
+            f"shadow runner state missing telemetry target: {state_path}"
+        )
+    if state not in {"running", "starting"}:
+        raise FileNotFoundError(
+            f"shadow runner is not active (state={state}) per {state_path}"
+        )
+    if not _pid_is_paraphina_runner(runner_pid):
+        runner_text = "unknown" if runner_pid is None else str(runner_pid)
+        raise FileNotFoundError(
+            f"shadow runner pid {runner_text} is not active per {state_path}"
+        )
+    return telemetry_path
+
+
+@dataclass
+class CurrentRunRecord:
+    pid: int
+    telemetry_path: Path
+    started_at_unix_ms: int = 0
+    trade_mode: str | None = None
+    manifest_path: str | None = None
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _parse_current_run_record(
+    raw: Mapping[str, Any] | None, source_path: Path
+) -> CurrentRunRecord | None:
+    if not isinstance(raw, Mapping):
+        return None
+    pid = safe_int(raw.get("pid"))
+    telemetry_raw = raw.get("telemetry_path")
+    if pid is None or not isinstance(telemetry_raw, str) or not telemetry_raw.strip():
+        return None
+    if not _pid_is_paraphina_runner(pid):
+        return None
+    started_at_unix_ms = safe_int(raw.get("started_at_unix_ms")) or 0
+    trade_mode = raw.get("trade_mode")
+    manifest_path = raw.get("manifest_path")
+    return CurrentRunRecord(
+        pid=pid,
+        telemetry_path=_normalize_path(telemetry_raw),
+        started_at_unix_ms=started_at_unix_ms,
+        trade_mode=str(trade_mode) if trade_mode is not None else None,
+        manifest_path=str(manifest_path) if manifest_path is not None else str(source_path),
+    )
+
+
+def _resolve_current_run_from_registry() -> CurrentRunRecord | None:
+    pointer_record = _parse_current_run_record(
+        _read_json_file(_CURRENT_RUN_POINTER_PATH),
+        _CURRENT_RUN_POINTER_PATH,
+    )
+    if pointer_record is not None:
+        return pointer_record
+
+    candidates: list[CurrentRunRecord] = []
+    try:
+        entries = sorted(_CURRENT_RUNS_DIR.glob("*.json"))
+    except OSError:
+        entries = []
+    for candidate in entries:
+        record = _parse_current_run_record(_read_json_file(candidate), candidate)
+        if record is not None:
+            candidates.append(record)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda record: (record.started_at_unix_ms, record.pid))
+
+
+def resolve_current_run_telemetry_path() -> Path:
+    current_record = _resolve_current_run_from_registry()
+    if current_record is not None:
+        return current_record.telemetry_path
+
+    current_path = _infer_current_telemetry_path_from_processes()
+    if current_path is not None:
+        return current_path
+
+    return resolve_latest_telemetry_path()
+
+
+def resolve_current_shadow_telemetry_path() -> Path:
+    if _SHADOW_STATE_PATH.exists():
+        return _resolve_shadow_state_target(_SHADOW_STATE_PATH)
+
+    for telemetry_path in _shadow_telemetry_candidates():
+        status = load_runner_status(telemetry_path)
+        if status is not None and status.alive:
+            return telemetry_path
+
+    raise FileNotFoundError(
+        "no active shadow run found; checked "
+        f"{_SHADOW_STATE_PATH}, {_SHADOW_LAST_OUTDIR_PATH}, and {_SHADOW_LATEST_PATH}"
+    )
 
 
 def resolve_latest_telemetry_path() -> Path:
@@ -286,6 +444,10 @@ def resolve_telemetry_path(args: argparse.Namespace) -> Path:
         return Path(args.telemetry)
     if args.run_dir:
         return Path(args.run_dir) / "telemetry.jsonl"
+    if args.current_run:
+        return resolve_current_run_telemetry_path()
+    if args.current_shadow:
+        return resolve_current_shadow_telemetry_path()
     if args.latest:
         return resolve_latest_telemetry_path()
     raise ValueError("no telemetry path source selected")
@@ -490,7 +652,7 @@ def _infer_runner_status_from_processes(telemetry_path: Path) -> RunnerStatus | 
 def load_runner_status(telemetry_path: Path) -> RunnerStatus | None:
     candidates = [
         telemetry_path.parent / "runner.state",
-        Path("/tmp/paraphina_shadow_runner.state"),
+        _SHADOW_STATE_PATH,
     ]
     for candidate in candidates:
         if not candidate.exists():
@@ -524,10 +686,10 @@ def load_runner_status(telemetry_path: Path) -> RunnerStatus | None:
             status_path=str(local_pid_file),
         )
 
-    pid_file = Path("/tmp/paraphina_shadow_runner.pid")
+    pid_file = _SHADOW_PID_PATH
     if pid_file.exists():
         try:
-            last_outdir = Path("/tmp/paraphina_last_outdir.txt").read_text(
+            last_outdir = _SHADOW_LAST_OUTDIR_PATH.read_text(
                 encoding="utf-8"
             ).strip()
         except OSError:
@@ -3123,13 +3285,19 @@ def main() -> int:
     def _refresh_runner_status() -> None:
         state.runner_status = load_runner_status(telemetry_path)
 
-    def _maybe_switch_latest_target(now_mono: float) -> None:
+    def _maybe_switch_auto_target(now_mono: float) -> None:
         nonlocal telemetry_path, follower, state, next_latest_check_ts
-        if not args.latest or now_mono < next_latest_check_ts:
+        if now_mono < next_latest_check_ts:
+            return
+        if args.current_run:
+            resolver = resolve_current_run_telemetry_path
+        elif args.latest:
+            resolver = resolve_latest_telemetry_path
+        else:
             return
         next_latest_check_ts = now_mono + latest_check_interval_s
         try:
-            latest_path = resolve_latest_telemetry_path()
+            latest_path = resolver()
         except FileNotFoundError:
             return
         if latest_path == telemetry_path:
@@ -3225,7 +3393,7 @@ def main() -> int:
                     next_heartbeat_ts = now + heartbeat_interval_s
                     while True:
                         loop_started = time.monotonic()
-                        _maybe_switch_latest_target(loop_started)
+                        _maybe_switch_auto_target(loop_started)
                         _ingest_new_records()
                         _refresh_runner_status()
                         key_seen = False
@@ -3287,7 +3455,7 @@ def main() -> int:
             else:
                 while True:
                     loop_started = time.monotonic()
-                    _maybe_switch_latest_target(loop_started)
+                    _maybe_switch_auto_target(loop_started)
                     _ingest_new_records()
                     _refresh_runner_status()
                     now = time.monotonic()
@@ -3360,7 +3528,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: (cleanup(), sys.exit(0)))
 
     while True:
-        _maybe_switch_latest_target(time.monotonic())
+        _maybe_switch_auto_target(time.monotonic())
         for line in follower.read_new_lines():
             try:
                 record = json.loads(line)
