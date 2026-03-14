@@ -13,6 +13,7 @@ const PARADEX_STALE_MS_DEFAULT: u64 = 10_000;
 const PARADEX_WATCHDOG_TICK_MS: u64 = 200;
 const PARADEX_MARKET_PUB_QUEUE_CAP: usize = 256;
 const PARADEX_MARKET_PUB_DRAIN_MAX: usize = 64;
+const PARADEX_TOKEN_REFRESH_DEFAULT_SECS: u64 = 240;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 static PARADEX_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -98,6 +99,7 @@ impl Freshness {
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
@@ -135,7 +137,9 @@ pub struct ParadexConfig {
     pub order_path: String,
     pub venue_index: usize,
     pub jwt: Option<String>,
+    pub jwt_cmd: Option<String>,
     pub auth_payload_json: Option<Value>,
+    pub token_refresh_secs: u64,
     pub record_dir: Option<PathBuf>,
 }
 
@@ -153,9 +157,18 @@ impl ParadexConfig {
         let order_path =
             std::env::var("PARADEX_ORDER_PATH").unwrap_or_else(|_| "/orders".to_string());
         let jwt = std::env::var("PARADEX_JWT").ok();
+        let jwt_cmd = std::env::var("PARADEX_JWT_CMD")
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty());
         let auth_payload_json = std::env::var("PARADEX_AUTH_PAYLOAD_JSON")
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+        let token_refresh_secs = std::env::var("PARADEX_TOKEN_REFRESH_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|raw| *raw > 0)
+            .unwrap_or(PARADEX_TOKEN_REFRESH_DEFAULT_SECS);
         Self {
             ws_url,
             rest_url,
@@ -165,7 +178,9 @@ impl ParadexConfig {
             order_path,
             venue_index: 0,
             jwt,
+            jwt_cmd,
             auth_payload_json,
+            token_refresh_secs,
             record_dir: None,
         }
     }
@@ -176,7 +191,11 @@ impl ParadexConfig {
     }
 
     pub fn has_auth(&self) -> bool {
-        self.jwt.is_some() || self.auth_payload_json.is_some()
+        self.jwt.is_some() || self.jwt_cmd.is_some() || self.auth_payload_json.is_some()
+    }
+
+    pub fn has_refreshable_auth(&self) -> bool {
+        self.jwt_cmd.is_some() || self.auth_payload_json.is_some()
     }
 }
 
@@ -651,7 +670,7 @@ fn has_paradex_book_fields(value: &Value) -> bool {
 pub struct ParadexRestClient {
     cfg: ParadexConfig,
     http: Client,
-    token_cache: Arc<Mutex<Option<ParadexAuthToken>>>,
+    token_cache: Arc<Mutex<Option<CachedParadexToken>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -666,6 +685,12 @@ struct ParadexAuthToken {
     expires_in: Option<u64>,
     #[serde(default)]
     expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedParadexToken {
+    token: ParadexAuthToken,
+    fetched_unix_s: u64,
 }
 
 impl ParadexRestClient {
@@ -693,19 +718,56 @@ impl ParadexRestClient {
             return Ok(jwt.clone());
         }
         let mut guard = self.token_cache.lock().await;
-        if let Some(token) = guard.as_ref() {
-            if let Some(jwt) = token_token(token) {
-                return Ok(jwt);
+        if let Some(cached) = guard.as_ref() {
+            if !cached_token_stale(cached, self.cfg.token_refresh_secs) {
+                if let Some(jwt) = token_token(&cached.token) {
+                    return Ok(jwt);
+                }
             }
         }
-        let token = self.fetch_token().await?;
+        let token = if self.cfg.jwt_cmd.is_some() {
+            self.fetch_token_from_cmd().await?
+        } else {
+            self.fetch_token_from_payload().await?
+        };
         let jwt = token_token(&token)
             .ok_or_else(|| LiveGatewayError::fatal("paradex auth token missing access_token"))?;
-        *guard = Some(token);
+        *guard = Some(CachedParadexToken {
+            token,
+            fetched_unix_s: unix_now_secs(),
+        });
         Ok(jwt)
     }
 
-    async fn fetch_token(&self) -> LiveResult<ParadexAuthToken> {
+    async fn fetch_token_from_cmd(&self) -> LiveResult<ParadexAuthToken> {
+        let cmd = self
+            .cfg
+            .jwt_cmd
+            .as_ref()
+            .ok_or_else(|| LiveGatewayError::fatal("paradex jwt command missing"))?;
+        let output = StdCommand::new("/bin/bash")
+            .arg("-lc")
+            .arg(cmd)
+            .env_remove("PARADEX_JWT")
+            .output()
+            .map_err(|err| LiveGatewayError::retryable(format!("paradex jwt command error: {err}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("exit_status={}", output.status)
+            } else {
+                format!("exit_status={} stderr={stderr}", output.status)
+            };
+            return Err(LiveGatewayError::fatal(format!(
+                "paradex jwt command failed: {detail}"
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_token_output(stdout.trim())
+            .ok_or_else(|| LiveGatewayError::fatal("paradex jwt command returned no token"))
+    }
+
+    async fn fetch_token_from_payload(&self) -> LiveResult<ParadexAuthToken> {
         let payload = self
             .cfg
             .auth_payload_json
@@ -727,7 +789,12 @@ impl ParadexRestClient {
             .ok_or_else(|| LiveGatewayError::fatal("paradex auth token parse error"))
     }
 
-    async fn send_authed_request(
+    async fn invalidate_cached_token(&self) {
+        let mut guard = self.token_cache.lock().await;
+        *guard = None;
+    }
+
+    async fn send_authed_request_once(
         &self,
         method: Method,
         path: &str,
@@ -746,6 +813,22 @@ impl ParadexRestClient {
             .send()
             .await
             .map_err(|err| LiveGatewayError::retryable(format!("rest_error: {err}")))
+    }
+
+    async fn send_authed_request(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<Value>,
+    ) -> LiveResult<reqwest::Response> {
+        let response = self
+            .send_authed_request_once(method.clone(), path, payload.clone())
+            .await?;
+        if response.status().as_u16() == 401 && self.cfg.has_refreshable_auth() {
+            self.invalidate_cached_token().await;
+            return self.send_authed_request_once(method, path, payload).await;
+        }
+        Ok(response)
     }
 
     async fn fetch_account_snapshot(
@@ -953,6 +1036,50 @@ fn token_token(token: &ParadexAuthToken) -> Option<String> {
         return Some(token.jwt.clone());
     }
     None
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cached_token_stale(cached: &CachedParadexToken, refresh_secs: u64) -> bool {
+    let now = unix_now_secs();
+    if let Some(expires_at) = cached.token.expires_at {
+        if now.saturating_add(30) >= expires_at {
+            return true;
+        }
+    }
+    if let Some(expires_in) = cached.token.expires_in {
+        let early_refresh = expires_in.saturating_sub(30).max(1);
+        let refresh_after = refresh_secs.max(1).min(early_refresh);
+        return now >= cached.fetched_unix_s.saturating_add(refresh_after);
+    }
+    now >= cached.fetched_unix_s.saturating_add(refresh_secs.max(1))
+}
+
+fn parse_token_output(raw: &str) -> Option<ParadexAuthToken> {
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(token) = parse_auth_token(raw) {
+        return Some(token);
+    }
+    let jwt = raw
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .to_string();
+    Some(ParadexAuthToken {
+        access_token: jwt,
+        token: String::new(),
+        jwt: String::new(),
+        expires_in: None,
+        expires_at: None,
+    })
 }
 
 fn parse_auth_token(body: &str) -> Option<ParadexAuthToken> {
@@ -2071,6 +2198,27 @@ mod tests {
         assert_eq!(token_token(&token).unwrap(), "test.jwt");
     }
 
+    #[tokio::test]
+    async fn jwt_command_returns_token() {
+        let cfg = ParadexConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "https://example.invalid".to_string(),
+            auth_url: "https://example.invalid/auth/token".to_string(),
+            market: "BTC-USD-PERP".to_string(),
+            account_path: "/account".to_string(),
+            order_path: "/orders".to_string(),
+            venue_index: 0,
+            jwt: None,
+            jwt_cmd: Some("printf 'cmd.jwt\\n'".to_string()),
+            auth_payload_json: None,
+            token_refresh_secs: 240,
+            record_dir: None,
+        };
+        let client = ParadexRestClient::new(cfg);
+        let token = client.ensure_token().await.expect("jwt from command");
+        assert_eq!(token, "cmd.jwt");
+    }
+
     #[test]
     fn bbo_decode_emits_top() {
         let mut seq = 0u64;
@@ -2108,7 +2256,9 @@ mod tests {
             order_path: "/orders".to_string(),
             venue_index: 0,
             jwt: Some("test.jwt".to_string()),
+            jwt_cmd: None,
             auth_payload_json: None,
+            token_refresh_secs: 240,
             record_dir: None,
         };
         let client = ParadexRestClient::new(cfg);
@@ -2207,7 +2357,9 @@ mod tests {
             order_path: "/orders".to_string(),
             venue_index: 4,
             jwt: None,
+            jwt_cmd: None,
             auth_payload_json: None,
+            token_refresh_secs: 240,
             record_dir: None,
         };
 

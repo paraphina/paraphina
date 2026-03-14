@@ -9,8 +9,9 @@ pub struct LighterSignerClient {
 
 impl LighterSignerClient {
     pub fn new(base_url: String) -> Self {
+        let base_url = normalize_signer_base_url(&base_url);
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .tcp_nodelay(true)
@@ -71,6 +72,7 @@ pub struct SignCreateOrderRequest {
     pub is_ask: u8,
     pub order_type: String,
     pub time_in_force: String,
+    pub post_only: u8,
     pub reduce_only: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_price: Option<i64>,
@@ -85,6 +87,7 @@ pub struct SignCancelOrderRequest {
     pub account_index: u64,
     pub api_key_index: u64,
     pub nonce: u64,
+    pub market_index: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_index: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,4 +112,38 @@ struct SignerResponse {
     tx_info: Value,
     #[serde(default)]
     tx_hash: Option<String>,
+}
+
+fn normalize_signer_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    trimmed
+        .strip_suffix("/sign")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_signer_base_url;
+
+    #[test]
+    fn normalize_signer_base_url_accepts_base_or_sign_path() {
+        assert_eq!(
+            normalize_signer_base_url("http://127.0.0.1:9001"),
+            "http://127.0.0.1:9001"
+        );
+        assert_eq!(
+            normalize_signer_base_url("http://127.0.0.1:9001/"),
+            "http://127.0.0.1:9001"
+        );
+        assert_eq!(
+            normalize_signer_base_url("http://127.0.0.1:9001/sign"),
+            "http://127.0.0.1:9001"
+        );
+        assert_eq!(
+            normalize_signer_base_url("http://127.0.0.1:9001/sign/"),
+            "http://127.0.0.1:9001"
+        );
+    }
 }

@@ -18,6 +18,11 @@ Canonical registry: `paraphina/src/live/venues.rs`
 2. **Paper/Testnet**: paper and testnet execution, keep live execution disabled.
 3. **Live**: enable live execution only after the safety gates below pass.
 
+For ETH market making, the intended live rollout is all-5 venue connectivity
+with a micro-canary profile. Scale live by increasing inventory/order caps, not
+by reducing venue count, because the MM strategy relies on multi-venue fair
+value.
+
 ## Explicit safety gates
 
 - `PARAPHINA_LIVE_EXEC_ENABLE=1` is required for any live execution.
@@ -25,3 +30,6 @@ Canonical registry: `paraphina/src/live/venues.rs`
 - Per-venue allowlist must be explicitly approved before live execution on that venue.
 
 These gates are additive and must remain intact as Roadmap-B progresses.
+
+Legacy config and telemetry fields ending in `_tao` still denote base-asset
+inventory units in the current ETH deployment, not TAO market selection.

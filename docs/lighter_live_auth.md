@@ -1,12 +1,15 @@
-# Lighter Live Auth (PR2 Spec)
+# Lighter Live Auth
 
-## A) Why PR2 exists (repo-proven current state)
-- `lighter.rs` currently uses unsigned placeholder REST endpoints:
-  - `GET {rest_url}/account`
-  - `POST {rest_url}/orders`, `POST {rest_url}/cancel`, `POST {rest_url}/cancel_all`
-- Market data via WS is implemented and works; authenticated account snapshots and execution are not real.
+## A) Current live path
+- Account snapshot: `GET /api/v1/account`
+- Execution submit: `POST /api/v1/sendTx`
+- Signing: local bridge service backed by the official `lighter-sdk`
 
-## B) Authoritative endpoints we will implement (names only)
+The Rust connector expects `LIGHTER_SIGNER_URL` to point at the signer bridge
+base URL, for example `http://127.0.0.1:9001`. The connector appends `/sign`
+itself and also tolerates the legacy `.../sign` env value.
+
+## B) Authoritative endpoints
 - REST base: `https://mainnet.zklighter.elliot.ai`
 - Account: `GET /api/v1/account` (by account index or L1 address)
 - Transactions: `POST /api/v1/sendTx` and `POST /api/v1/sendTxBatch`
@@ -14,13 +17,24 @@
 
 Hard requirement: **must sign tx body before sending**.
 
-## C) Required env vars (for PR2)
+## C) Required env vars
 - `LIGHTER_API_KEY_INDEX` (u64)
 - `LIGHTER_ACCOUNT_INDEX` (u64)
 - `LIGHTER_API_PRIVATE_KEY_HEX` (hex string)
 - `LIGHTER_AUTH_TOKEN` (optional; only if required by some endpoints)
 - `LIGHTER_NONCE_PATH` (optional persistence)
-- `LIGHTER_SIGNER_URL` (optional fallback if signer bridge is used)
+- `LIGHTER_SIGNER_URL` (signer bridge base URL, e.g. `http://127.0.0.1:9001`)
+- `LIGHTER_MARKET` or `LIGHTER_MARKET_ID` (used by the signer bridge to resolve market id)
+- `LIGHTER_NETWORK` (`mainnet` or `testnet`)
+
+The shipped bridge entrypoint is:
+
+```bash
+/opt/paraphina/.venv_lighter/bin/python3 /opt/paraphina/tools/lighter_signer_service.py --host 127.0.0.1 --port 9001
+```
+
+There is also a systemd template at
+`deploy/systemd/lighter_signer.service.template`.
 
 ## D) Nonce strategy
 - Nonce must be strictly increasing.
@@ -36,33 +50,13 @@ Hard requirement: **must sign tx body before sending**.
   - If absent, define a safe fallback strategy (e.g., return `None` and rely on later
     account snapshot reconciliation or an explicit mapping from client_order_id).
 
-## F) Implementation plan (two options)
-### Option 1: Native Rust signer (preferred long-term)
-**Pros**
-- No external dependency, simpler deployment.
-- Lower latency and fewer failure modes.
-
-**Cons**
-- Requires correct crypto implementation and careful key handling.
-
-**Required tests (mock server)**
-- Mock `sendTx` / `sendTxBatch` accept signed payloads.
-- Verify signature presence and per-request nonce monotonicity.
-
-### Option 2: Signer bridge (fastest)
-Call an external signer service/binary to obtain a signed tx blob, then submit to `sendTx`.
-
-**Pros**
-- Faster to ship; signing logic isolated from Paraphina.
-- Easier to update signer independently.
-
-**Cons**
-- External dependency and additional operational surface.
-- Requires signer availability and secure transport.
-
-**Required tests (mock server)**
-- Mock signer responses for valid/invalid signatures.
-- Mock `sendTx` / `sendTxBatch` submission with signed blob.
+## F) Execution mapping
+- `create_order`: market id comes from `LIGHTER_MARKET_ID` or `LIGHTER_MARKET`
+  lookup; `post_only` is preserved and mapped to Lighter's post-only TIF.
+- `cancel_order`: Paraphina now includes `market_index` in signer requests so the
+  bridge can call the official signer path without guessing.
+- `cancel_all`: uses the bridge `cancel_all` request and Rust still submits the
+  signed payload to `sendTx`.
 
 ## G) Test plan (mock-only)
 - Mock endpoints:

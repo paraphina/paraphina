@@ -118,6 +118,7 @@ impl Freshness {
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex as StdMutex, OnceLock,
@@ -125,12 +126,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use hmac::{Hmac, Mac};
 use reqwest::Client;
-use reqwest::Method;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::Sha256;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -158,8 +156,7 @@ pub struct ExtendedConfig {
     pub depth_limit: usize,
     pub venue_index: usize,
     pub api_key: Option<String>,
-    pub api_secret: Option<String>,
-    pub recv_window: Option<u64>,
+    pub trader_cmd: Option<String>,
     pub record_dir: Option<PathBuf>,
 }
 
@@ -178,11 +175,10 @@ impl ExtendedConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(100);
         let api_key = std::env::var("EXTENDED_API_KEY").ok();
-        let api_secret = std::env::var("EXTENDED_API_SECRET").ok();
-        let recv_window = std::env::var("EXTENDED_RECV_WINDOW")
+        let trader_cmd = std::env::var("EXTENDED_TRADER_CMD")
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .or(Some(5_000));
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty());
         Self {
             ws_url,
             rest_url,
@@ -190,8 +186,7 @@ impl ExtendedConfig {
             depth_limit,
             venue_index: 0,
             api_key,
-            api_secret,
-            recv_window,
+            trader_cmd,
             record_dir: None,
         }
     }
@@ -201,8 +196,12 @@ impl ExtendedConfig {
         self
     }
 
-    pub fn has_auth(&self) -> bool {
-        self.api_key.is_some() && self.api_secret.is_some()
+    pub fn has_account_auth(&self) -> bool {
+        self.api_key.is_some() && self.trader_cmd.is_some()
+    }
+
+    pub fn has_execution_auth(&self) -> bool {
+        self.api_key.is_some() && self.trader_cmd.is_some()
     }
 
     pub fn orderbook_ws_url(&self) -> String {
@@ -1091,20 +1090,17 @@ impl ExtendedConnector {
     }
 }
 
-type HmacSha256 = Hmac<Sha256>;
-
 #[derive(Clone)]
 pub struct ExtendedRestClient {
     cfg: ExtendedConfig,
-    http: Client,
-    timestamp_fn: Arc<dyn Fn() -> TimestampMs + Send + Sync>,
+    _http: Client,
 }
 
 impl ExtendedRestClient {
     pub fn new(cfg: ExtendedConfig) -> Self {
         Self {
             cfg,
-            http: Client::builder()
+            _http: Client::builder()
                 .user_agent("paraphina")
                 .timeout(Duration::from_secs(10))
                 .tcp_nodelay(true)
@@ -1113,61 +1109,78 @@ impl ExtendedRestClient {
                 .pool_max_idle_per_host(5)
                 .build()
                 .expect("extended rest http client build"),
-            timestamp_fn: Arc::new(now_ms),
         }
     }
 
-    pub fn with_timestamp_fn(
-        mut self,
-        timestamp_fn: Arc<dyn Fn() -> TimestampMs + Send + Sync>,
-    ) -> Self {
-        self.timestamp_fn = timestamp_fn;
-        self
+    pub fn has_account_auth(&self) -> bool {
+        self.cfg.has_account_auth()
     }
 
-    pub fn has_auth(&self) -> bool {
-        self.cfg.has_auth()
+    pub fn has_execution_auth(&self) -> bool {
+        self.cfg.has_execution_auth()
     }
 
-    fn signed_query(&self, mut params: Vec<(String, String)>) -> Result<String, LiveGatewayError> {
-        let api_secret = self
-            .cfg
-            .api_secret
-            .as_ref()
-            .ok_or_else(|| LiveGatewayError::fatal("extended api secret missing"))?;
-        let timestamp = (self.timestamp_fn)();
-        params.push(("timestamp".to_string(), timestamp.to_string()));
-        if let Some(recv_window) = self.cfg.recv_window {
-            params.push(("recvWindow".to_string(), recv_window.to_string()));
-        }
-        params.sort_by(|a, b| a.0.cmp(&b.0));
-        let canonical = canonical_query(&params);
-        // Signing per Extended API docs: https://docs.extended.exchange (HMAC SHA256 + X-MBX-APIKEY + timestamp/signature).
-        let signature = sign_query(api_secret, &canonical);
-        Ok(format!("{canonical}&signature={signature}"))
-    }
-
-    async fn send_signed_request(
+    async fn run_bridge_command(
         &self,
-        method: Method,
-        path: &str,
-        params: Vec<(String, String)>,
-    ) -> LiveResult<reqwest::Response> {
-        let api_key = self
+        op: &str,
+        payload: Value,
+    ) -> LiveResult<String> {
+        let trader_cmd = self
             .cfg
-            .api_key
-            .as_ref()
-            .ok_or_else(|| LiveGatewayError::fatal("extended api key missing"))?;
-        let query = self.signed_query(params)?;
-        let url = format!("{}{}?{}", self.cfg.rest_url, path, query);
-        let resp = self
-            .http
-            .request(method, url)
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
-            .map_err(|err| LiveGatewayError::retryable(format!("rest_error: {err}")))?;
-        Ok(resp)
+            .trader_cmd
+            .clone()
+            .ok_or_else(|| LiveGatewayError::fatal("extended trader cmd missing"))?;
+        let payload_raw = serde_json::to_string(&payload)
+            .map_err(|err| LiveGatewayError::fatal(format!("extended bridge payload encode error: {err}")))?;
+        let op = op.to_string();
+        let op_for_child = op.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            StdCommand::new("bash")
+                .arg("-lc")
+                .arg(trader_cmd)
+                .env("PARAPHINA_EXTENDED_BRIDGE_OP", op_for_child)
+                .env("PARAPHINA_EXTENDED_BRIDGE_PAYLOAD", payload_raw)
+                .output()
+        })
+        .await
+        .map_err(|err| LiveGatewayError::retryable(format!("extended bridge join error: {err}")))?
+        .map_err(|err| LiveGatewayError::retryable(format!("extended bridge spawn error: {err}")))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            let message = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!(
+                    "extended bridge failed op={} status={}",
+                    op,
+                    output.status
+                )
+            };
+            return Err(map_rest_error(400, &message));
+        }
+        if stdout.is_empty() {
+            return Err(LiveGatewayError::fatal(format!(
+                "extended bridge returned empty output for op={op}"
+            )));
+        }
+        Ok(stdout)
+    }
+
+    async fn run_bridge_json<T: DeserializeOwned>(
+        &self,
+        op: &str,
+        payload: Value,
+    ) -> LiveResult<T> {
+        let raw = self.run_bridge_command(op, payload).await?;
+        serde_json::from_str::<T>(&raw).map_err(|err| {
+            LiveGatewayError::fatal(format!(
+                "extended bridge {} parse error: {} body={}",
+                op, err, raw
+            ))
+        })
     }
 
     async fn fetch_account_snapshot(
@@ -1175,20 +1188,15 @@ impl ExtendedRestClient {
         venue_id: &str,
         venue_index: usize,
     ) -> LiveResult<AccountSnapshot> {
-        let resp = self
-            .send_signed_request(Method::GET, "/fapi/v2/account", Vec::new())
+        let snapshot: ExtendedBridgeSnapshot = self
+            .run_bridge_json(
+                "snapshot",
+                json!({
+                    "market": self.cfg.market,
+                }),
+            )
             .await?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(map_rest_error(status.as_u16(), &body));
-        }
-        let value: Value = serde_json::from_str(&body).map_err(|err| {
-            LiveGatewayError::fatal(format!("extended account parse error: {err}"))
-        })?;
-        parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
-            LiveGatewayError::fatal("extended account snapshot missing required fields")
-        })
+        Ok(snapshot.into_account_snapshot(venue_id, venue_index))
     }
 
     pub async fn run_account_polling(
@@ -1221,30 +1229,25 @@ impl LiveRestClient for ExtendedRestClient {
         req: LiveRestPlaceRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
-            let mut params = vec![
-                ("symbol".to_string(), self.cfg.market.clone()),
-                ("side".to_string(), map_side(req.side).to_string()),
-                ("type".to_string(), "LIMIT".to_string()),
-                (
-                    "timeInForce".to_string(),
-                    map_time_in_force(req.time_in_force, req.post_only).to_string(),
-                ),
-                ("price".to_string(), format_f64(req.price)),
-                ("quantity".to_string(), format_f64(req.size)),
-                ("newClientOrderId".to_string(), req.client_order_id.clone()),
-            ];
-            if req.reduce_only {
-                params.push(("reduceOnly".to_string(), "true".to_string()));
-            }
-            let resp = self
-                .send_signed_request(Method::POST, "/fapi/v1/order", params)
+            let response: ExtendedBridgePlaceResponse = self
+                .run_bridge_json(
+                    "place",
+                    json!({
+                        "market": self.cfg.market,
+                        "side": map_side(req.side),
+                        "price": req.price,
+                        "size": req.size,
+                        "post_only": req.post_only,
+                        "reduce_only": req.reduce_only,
+                        "time_in_force": map_time_in_force(req.time_in_force),
+                        "client_order_id": req.client_order_id,
+                    }),
+                )
                 .await?;
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return Err(map_rest_error(status.as_u16(), &body));
-            }
-            let order_id = parse_order_id(&body).or(Some(req.client_order_id));
+            let order_id = response
+                .order_id
+                .or(response.client_order_id)
+                .or(Some(req.client_order_id));
             Ok(LiveRestResponse { order_id })
         })
     }
@@ -1254,19 +1257,17 @@ impl LiveRestClient for ExtendedRestClient {
         req: LiveRestCancelRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
-            let params = vec![
-                ("symbol".to_string(), self.cfg.market.clone()),
-                ("origClientOrderId".to_string(), req.order_id),
-            ];
-            let resp = self
-                .send_signed_request(Method::DELETE, "/fapi/v1/order", params)
+            let response: ExtendedBridgeCancelResponse = self
+                .run_bridge_json(
+                    "cancel",
+                    json!({
+                        "order_id": req.order_id,
+                    }),
+                )
                 .await?;
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return Err(map_rest_error(status.as_u16(), &body));
-            }
-            Ok(LiveRestResponse { order_id: None })
+            Ok(LiveRestResponse {
+                order_id: response.order_id,
+            })
         })
     }
 
@@ -1275,49 +1276,17 @@ impl LiveRestClient for ExtendedRestClient {
         _req: LiveRestCancelAllRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
-            let params = vec![("symbol".to_string(), self.cfg.market.clone())];
-            let resp = self
-                .send_signed_request(Method::DELETE, "/fapi/v1/allOpenOrders", params)
+            let _: ExtendedBridgeCancelAllResponse = self
+                .run_bridge_json(
+                    "cancel_all",
+                    json!({
+                        "market": self.cfg.market,
+                    }),
+                )
                 .await?;
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return Err(map_rest_error(status.as_u16(), &body));
-            }
             Ok(LiveRestResponse { order_id: None })
         })
     }
-}
-
-fn canonical_query(params: &[(String, String)]) -> String {
-    params
-        .iter()
-        .map(|(k, v)| format!("{}={}", encode_component(k), encode_component(v)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn encode_component(raw: &str) -> String {
-    raw.as_bytes()
-        .iter()
-        .map(|b| {
-            let c = *b as char;
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
-                c.to_string()
-            } else {
-                format!("%{:02X}", b)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn sign_query(secret: &str, query: &str) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(query.as_bytes());
-    let bytes = mac.finalize().into_bytes();
-    hex::encode(bytes)
 }
 
 fn map_side(side: Side) -> &'static str {
@@ -1327,122 +1296,98 @@ fn map_side(side: Side) -> &'static str {
     }
 }
 
-fn map_time_in_force(time_in_force: TimeInForce, post_only: bool) -> &'static str {
-    if post_only {
-        return "GTX";
-    }
+fn map_time_in_force(time_in_force: TimeInForce) -> &'static str {
     match time_in_force {
         TimeInForce::Ioc => "IOC",
-        TimeInForce::Gtc => "GTC",
+        TimeInForce::Gtc => "GTT",
     }
 }
 
-fn format_f64(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value}")
-    } else {
-        "0".to_string()
-    }
+#[derive(Debug, Deserialize)]
+struct ExtendedBridgePlaceResponse {
+    order_id: Option<String>,
+    client_order_id: Option<String>,
 }
 
-fn parse_order_id(body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    if let Some(order_id) = value.get("orderId") {
-        if let Some(raw) = order_id.as_i64() {
-            return Some(raw.to_string());
+#[derive(Debug, Deserialize)]
+struct ExtendedBridgeCancelResponse {
+    order_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtendedBridgeCancelAllResponse {
+    #[serde(default)]
+    count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtendedBridgePosition {
+    market: String,
+    size: f64,
+    entry_price: f64,
+    liquidation_price: Option<f64>,
+    updated_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtendedBridgeSnapshot {
+    timestamp_ms: Option<i64>,
+    collateral_asset: Option<String>,
+    balance_usd: f64,
+    used_usd: f64,
+    available_usd: f64,
+    #[serde(default)]
+    positions: Vec<ExtendedBridgePosition>,
+}
+
+impl ExtendedBridgeSnapshot {
+    fn into_account_snapshot(self, venue_id: &str, venue_index: usize) -> AccountSnapshot {
+        let position_ts = self
+            .positions
+            .iter()
+            .filter_map(|position| position.updated_at)
+            .max();
+        let timestamp_ms = self.timestamp_ms.or(position_ts).unwrap_or_else(now_ms);
+        let asset = self
+            .collateral_asset
+            .unwrap_or_else(|| "USD".to_string());
+        let liquidation = LiquidationSnapshot {
+            price_liq: self
+                .positions
+                .iter()
+                .find_map(|position| position.liquidation_price),
+            dist_liq_sigma: None,
+        };
+        let positions = self
+            .positions
+            .into_iter()
+            .map(|position| PositionSnapshot {
+                symbol: position.market,
+                size: position.size,
+                entry_price: position.entry_price,
+            })
+            .collect::<Vec<_>>();
+        let balances = vec![BalanceSnapshot {
+            asset,
+            total: self.balance_usd,
+            available: self.available_usd,
+        }];
+        AccountSnapshot {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq: timestamp_ms.max(0) as u64,
+            timestamp_ms,
+            positions,
+            balances,
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: self.balance_usd,
+                used_usd: self.used_usd,
+                available_usd: self.available_usd,
+            },
+            liquidation,
         }
-        if let Some(raw) = order_id.as_str() {
-            return Some(raw.to_string());
-        }
     }
-    value
-        .get("clientOrderId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-fn parse_account_snapshot(
-    value: &Value,
-    venue_id: &str,
-    venue_index: usize,
-) -> Option<AccountSnapshot> {
-    let seq = value
-        .get("updateTime")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let timestamp_ms = value
-        .get("updateTime")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let positions = value
-        .get("positions")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|pos| {
-                    let symbol = pos.get("symbol")?.as_str()?.to_string();
-                    let size = parse_f64(pos.get("positionAmt")?)?;
-                    let entry_price = parse_f64(pos.get("entryPrice")?)?;
-                    Some(PositionSnapshot {
-                        symbol,
-                        size,
-                        entry_price,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let balances = value
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|bal| {
-                    let asset = bal.get("asset")?.as_str()?.to_string();
-                    let total = parse_f64(bal.get("walletBalance")?)?;
-                    let available = parse_f64(bal.get("availableBalance")?)?;
-                    Some(BalanceSnapshot {
-                        asset,
-                        total,
-                        available,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let margin = MarginSnapshot {
-        balance_usd: value
-            .get("totalWalletBalance")
-            .and_then(parse_f64)
-            .unwrap_or(0.0),
-        used_usd: value
-            .get("totalPositionInitialMargin")
-            .and_then(parse_f64)
-            .unwrap_or(0.0),
-        available_usd: value
-            .get("availableBalance")
-            .and_then(parse_f64)
-            .unwrap_or(0.0),
-    };
-    let liquidation = LiquidationSnapshot {
-        price_liq: None,
-        dist_liq_sigma: None,
-    };
-
-    Some(AccountSnapshot {
-        venue_index,
-        venue_id: venue_id.to_string(),
-        seq,
-        timestamp_ms,
-        positions,
-        balances,
-        funding_8h: None,
-        margin,
-        liquidation,
-    })
 }
 
 async fn fetch_public_funding(
@@ -2272,11 +2217,12 @@ mod tests {
     use crate::state::GlobalState;
     use crate::toxicity::update_toxicity_and_health;
     use crate::types::VenueStatus;
-    use httpmock::Method::{DELETE, POST};
-    use httpmock::MockServer;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -2312,10 +2258,18 @@ mod tests {
             depth_limit: 10,
             venue_index: 0,
             api_key: None,
-            api_secret: None,
-            recv_window: None,
+            trader_cmd: None,
             record_dir: None,
         }
+    }
+
+    fn write_bridge_script(tmp: &TempDir, body: &str) -> String {
+        let path = tmp.path().join("extended_bridge.sh");
+        fs::write(&path, body).expect("write bridge script");
+        let mut perms = fs::metadata(&path).expect("bridge metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod bridge script");
+        path.display().to_string()
     }
 
     #[test]
@@ -2520,53 +2474,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn signing_matches_known_vector() {
-        let query = "price=100&quantity=0.1&recvWindow=5000&side=BUY&symbol=BTCUSDT&timeInForce=GTC&timestamp=1700000000000&type=LIMIT";
-        let signature = sign_query("testsecret", query);
-        assert_eq!(
-            signature,
-            "7ce35481df1c771813dfdf305ecf8a94804816bdc818eeb0404e79a58c887f66"
-        );
-    }
-
     #[tokio::test]
-    async fn rest_place_order_post_only_is_signed() {
-        let server = MockServer::start_async().await;
+    async fn rest_place_order_uses_bridge_command() {
+        let tmp = TempDir::new().expect("temp dir");
+        let trader_cmd = write_bridge_script(
+            &tmp,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PARAPHINA_EXTENDED_BRIDGE_OP}" != "place" ]]; then
+  echo "unexpected op=${PARAPHINA_EXTENDED_BRIDGE_OP}" >&2
+  exit 1
+fi
+if [[ "${PARAPHINA_EXTENDED_BRIDGE_PAYLOAD}" != *'"client_order_id":"co_post_only"'* ]]; then
+  echo "payload missing client_order_id" >&2
+  exit 2
+fi
+if [[ "${PARAPHINA_EXTENDED_BRIDGE_PAYLOAD}" != *'"post_only":true'* ]]; then
+  echo "payload missing post_only=true" >&2
+  exit 3
+fi
+printf '%s\n' '{"order_id":"12345","client_order_id":"co_post_only"}'
+"#,
+        );
         let cfg = ExtendedConfig {
             ws_url: "wss://example.invalid".to_string(),
-            rest_url: server.base_url(),
-            market: "BTCUSDT".to_string(),
+            rest_url: "https://api.starknet.extended.exchange".to_string(),
+            market: "BTC-USD".to_string(),
             depth_limit: 10,
             venue_index: 0,
             api_key: Some("test-key".to_string()),
-            api_secret: Some("testsecret".to_string()),
-            recv_window: Some(5000),
+            trader_cmd: Some(trader_cmd),
             record_dir: None,
         };
-        let client = ExtendedRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+        let client = ExtendedRestClient::new(cfg);
 
-        let expected_signature = "4b0927aa17b493de48e207d2e891485c491aefb6c6ed0bd374259b42a21a1284";
-        let mock = server
-            .mock_async(|when, then| {
-                when.method(POST)
-                    .path("/fapi/v1/order")
-                    .header("X-MBX-APIKEY", "test-key")
-                    .query_param("symbol", "BTCUSDT")
-                    .query_param("side", "BUY")
-                    .query_param("type", "LIMIT")
-                    .query_param("timeInForce", "GTX")
-                    .query_param("price", "100")
-                    .query_param("quantity", "0.1")
-                    .query_param("newClientOrderId", "co_post_only")
-                    .query_param("recvWindow", "5000")
-                    .query_param("timestamp", "1700000000000")
-                    .query_param("signature", expected_signature);
-                then.status(200).body("{\"orderId\": 12345}");
-            })
-            .await;
-
-        let _ = client
+        let resp = client
             .place_order(LiveRestPlaceRequest {
                 venue_index: 0,
                 venue_id: "extended".to_string(),
@@ -2581,95 +2523,38 @@ mod tests {
             })
             .await
             .expect("place order");
-
-        mock.assert_async().await;
+        assert_eq!(resp.order_id.as_deref(), Some("12345"));
     }
 
     #[tokio::test]
-    async fn rest_place_order_ioc_reduce_only_is_signed() {
-        let server = MockServer::start_async().await;
+    async fn rest_cancel_all_uses_bridge_command() {
+        let tmp = TempDir::new().expect("temp dir");
+        let trader_cmd = write_bridge_script(
+            &tmp,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PARAPHINA_EXTENDED_BRIDGE_OP}" != "cancel_all" ]]; then
+  echo "unexpected op=${PARAPHINA_EXTENDED_BRIDGE_OP}" >&2
+  exit 1
+fi
+if [[ "${PARAPHINA_EXTENDED_BRIDGE_PAYLOAD}" != *'"market":"BTC-USD"'* ]]; then
+  echo "payload missing market" >&2
+  exit 2
+fi
+printf '%s\n' '{"count":2}'
+"#,
+        );
         let cfg = ExtendedConfig {
             ws_url: "wss://example.invalid".to_string(),
-            rest_url: server.base_url(),
-            market: "BTCUSDT".to_string(),
+            rest_url: "https://api.starknet.extended.exchange".to_string(),
+            market: "BTC-USD".to_string(),
             depth_limit: 10,
             venue_index: 0,
             api_key: Some("test-key".to_string()),
-            api_secret: Some("testsecret".to_string()),
-            recv_window: Some(5000),
+            trader_cmd: Some(trader_cmd),
             record_dir: None,
         };
-        let client = ExtendedRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
-
-        let expected_signature = "fb231bb1595dd627ceab277d9d9b6f9ff238ad515830ba44ea5717e01ff578ad";
-        let mock = server
-            .mock_async(|when, then| {
-                when.method(POST)
-                    .path("/fapi/v1/order")
-                    .header("X-MBX-APIKEY", "test-key")
-                    .query_param("symbol", "BTCUSDT")
-                    .query_param("side", "SELL")
-                    .query_param("type", "LIMIT")
-                    .query_param("timeInForce", "IOC")
-                    .query_param("price", "101")
-                    .query_param("quantity", "0.2")
-                    .query_param("newClientOrderId", "co_ioc_ro")
-                    .query_param("reduceOnly", "true")
-                    .query_param("recvWindow", "5000")
-                    .query_param("timestamp", "1700000000000")
-                    .query_param("signature", expected_signature);
-                then.status(200).body("{\"orderId\": 67890}");
-            })
-            .await;
-
-        let _ = client
-            .place_order(LiveRestPlaceRequest {
-                venue_index: 0,
-                venue_id: "extended".to_string(),
-                side: Side::Sell,
-                price: 101.0,
-                size: 0.2,
-                purpose: crate::types::OrderPurpose::Mm,
-                time_in_force: TimeInForce::Ioc,
-                post_only: false,
-                reduce_only: true,
-                client_order_id: "co_ioc_ro".to_string(),
-            })
-            .await
-            .expect("place order");
-
-        mock.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn rest_cancel_all_is_signed() {
-        let server = MockServer::start_async().await;
-        let cfg = ExtendedConfig {
-            ws_url: "wss://example.invalid".to_string(),
-            rest_url: server.base_url(),
-            market: "BTCUSDT".to_string(),
-            depth_limit: 10,
-            venue_index: 0,
-            api_key: Some("test-key".to_string()),
-            api_secret: Some("testsecret".to_string()),
-            recv_window: Some(5000),
-            record_dir: None,
-        };
-        let client = ExtendedRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
-
-        let expected_signature = "c848f23c14e1e39ab9b87af2e2b433ebc78ab2393952b62660e5229c0c979fdf";
-        let mock = server
-            .mock_async(|when, then| {
-                when.method(DELETE)
-                    .path("/fapi/v1/allOpenOrders")
-                    .header("X-MBX-APIKEY", "test-key")
-                    .query_param("symbol", "BTCUSDT")
-                    .query_param("recvWindow", "5000")
-                    .query_param("timestamp", "1700000000000")
-                    .query_param("signature", expected_signature);
-                then.status(200).body("{}");
-            })
-            .await;
+        let client = ExtendedRestClient::new(cfg);
 
         let _ = client
             .cancel_all(LiveRestCancelAllRequest {
@@ -2678,8 +2563,47 @@ mod tests {
             })
             .await
             .expect("cancel_all");
+    }
 
-        mock.assert_async().await;
+    #[tokio::test]
+    async fn account_snapshot_uses_bridge_command() {
+        let tmp = TempDir::new().expect("temp dir");
+        let trader_cmd = write_bridge_script(
+            &tmp,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PARAPHINA_EXTENDED_BRIDGE_OP}" != "snapshot" ]]; then
+  echo "unexpected op=${PARAPHINA_EXTENDED_BRIDGE_OP}" >&2
+  exit 1
+fi
+printf '%s\n' '{"timestamp_ms":1700000000000,"collateral_asset":"USDC","balance_usd":100.0,"used_usd":12.5,"available_usd":87.5,"positions":[{"market":"BTC-USD","size":0.01,"entry_price":2500.0,"liquidation_price":2000.0,"updated_at":1700000000100}]}'
+"#,
+        );
+        let cfg = ExtendedConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "https://api.starknet.extended.exchange".to_string(),
+            market: "BTC-USD".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            api_key: Some("test-key".to_string()),
+            trader_cmd: Some(trader_cmd),
+            record_dir: None,
+        };
+        let client = ExtendedRestClient::new(cfg);
+        let snapshot = client
+            .fetch_account_snapshot("extended", 3)
+            .await
+            .expect("snapshot");
+        assert_eq!(snapshot.venue_index, 3);
+        assert_eq!(snapshot.venue_id, "extended");
+        assert_eq!(snapshot.margin.balance_usd, 100.0);
+        assert_eq!(snapshot.margin.used_usd, 12.5);
+        assert_eq!(snapshot.margin.available_usd, 87.5);
+        assert_eq!(snapshot.balances[0].asset, "USDC");
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].symbol, "BTC-USD");
+        assert_eq!(snapshot.positions[0].size, 0.01);
+        assert_eq!(snapshot.liquidation.price_liq, Some(2000.0));
     }
 
     #[test]
@@ -2859,8 +2783,7 @@ mod tests {
             depth_limit: 10,
             venue_index: 0,
             api_key: None,
-            api_secret: None,
-            recv_window: None,
+            trader_cmd: None,
             record_dir: None,
         };
 

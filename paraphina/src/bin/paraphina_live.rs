@@ -1663,18 +1663,20 @@ fn run_preflight(
                     let ws_ok = is_valid_ws_url(&paradex_ws_url());
                     let market_ok = is_valid_symbol(&paradex_market_symbol());
                     let jwt_present = env_present("PARADEX_JWT");
+                    let jwt_cmd_present = env_present("PARADEX_JWT_CMD");
                     let payload_present = env_present("PARADEX_AUTH_PAYLOAD_JSON");
                     let needs_auth = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
                     if needs_auth {
-                        creds_ok = creds_ok && (jwt_present || payload_present);
+                        creds_ok = creds_ok && (jwt_present || jwt_cmd_present || payload_present);
                     }
                     creds_ok = creds_ok && ws_ok && market_ok;
                     let detail = format!(
-                        "{}:public_ws=true ws_url_ok={} market_ok={} jwt={} auth_payload={}",
+                        "{}:public_ws=true ws_url_ok={} market_ok={} jwt={} jwt_cmd={} auth_payload={}",
                         connector.as_str(),
                         ws_ok,
                         market_ok,
                         jwt_present,
+                        jwt_cmd_present,
                         payload_present
                     );
                     creds_detail.push_str(&detail);
@@ -1699,19 +1701,30 @@ fn run_preflight(
                     let ws_ok = is_valid_ws_url(&extended_ws_url());
                     let market_ok = is_valid_symbol(&extended_market_symbol());
                     let key_present = env_present("EXTENDED_API_KEY");
-                    let secret_present = env_present("EXTENDED_API_SECRET");
+                    let trader_cmd_present = env_present("EXTENDED_TRADER_CMD");
+                    let stark_private_present = env_present("EXTENDED_STARK_PRIVATE_KEY");
+                    let stark_public_present = env_present("EXTENDED_STARK_PUBLIC_KEY");
+                    let l2_vault_present = env_present("EXTENDED_L2_VAULT");
                     let needs_keys = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
                     if needs_keys {
-                        creds_ok = creds_ok && key_present && secret_present;
+                        creds_ok = creds_ok
+                            && key_present
+                            && trader_cmd_present
+                            && stark_private_present
+                            && stark_public_present
+                            && l2_vault_present;
                     }
                     creds_ok = creds_ok && ws_ok && market_ok;
                     let detail = format!(
-                        "{}:public_ws=true ws_url_ok={} market_ok={} api_key={} api_secret={}",
+                        "{}:public_ws=true ws_url_ok={} market_ok={} api_key={} trader_cmd={} stark_private={} stark_public={} l2_vault={}",
                         connector.as_str(),
                         ws_ok,
                         market_ok,
                         key_present,
-                        secret_present
+                        trader_cmd_present,
+                        stark_private_present,
+                        stark_public_present,
+                        l2_vault_present
                     );
                     creds_detail.push_str(&detail);
                 }
@@ -2560,7 +2573,7 @@ async fn main() {
                             async move { e.run_funding_polling(funding_poll_ms).await }
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
-                            if rest_client.has_auth() {
+                            if rest_client.has_account_auth() {
                                 let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
                                     .ok()
                                     .and_then(|v| v.parse::<u64>().ok())
@@ -2580,7 +2593,7 @@ async fn main() {
                                 });
                             } else {
                                 eprintln!(
-                                    "paraphina_live | account_snapshots_disabled=true reason=missing_extended_api_keys connector=extended"
+                                    "paraphina_live | account_snapshots_disabled=true reason=missing_extended_bridge_auth connector=extended"
                                 );
                                 if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
                                     send_unavailable_account_snapshot_for(
@@ -2592,11 +2605,11 @@ async fn main() {
                             }
                         }
                         if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
-                            if rest_client.has_auth() {
+                            if rest_client.has_execution_auth() {
                                 exec_clients.insert(venue_id.clone(), rest_client.clone());
                             } else {
                                 eprintln!(
-                                    "paraphina_live | exec_disabled=true reason=missing_extended_api_keys connector=extended"
+                                    "paraphina_live | exec_disabled=true reason=missing_extended_bridge_auth connector=extended"
                                 );
                             }
                         }

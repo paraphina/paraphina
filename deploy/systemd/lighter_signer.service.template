@@ -1,0 +1,28 @@
+[Unit]
+Description=Paraphina Lighter Signer Bridge (template)
+After=network.target
+
+[Service]
+Type=simple
+User=paraphina
+Group=paraphina
+WorkingDirectory=/opt/paraphina
+
+EnvironmentFile=-/etc/paraphina/current.env
+EnvironmentFile=-/etc/paraphina/paraphina_live.env
+EnvironmentFile=-/etc/paraphina/stage_overlay.env
+
+ExecStart=/opt/paraphina/.venv_lighter/bin/python3 /opt/paraphina/tools/lighter_signer_service.py --host 127.0.0.1 --port 9001
+
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/paraphina /etc/paraphina
+StandardOutput=append:/var/log/paraphina/lighter_signer.log
+StandardError=append:/var/log/paraphina/lighter_signer.err
+
+[Install]
+WantedBy=multi-user.target

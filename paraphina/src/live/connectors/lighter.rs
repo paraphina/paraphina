@@ -2198,7 +2198,8 @@ mod tests {
                     .body_contains("\"market_index\":7")
                     .body_contains("\"client_order_index\":42")
                     .body_contains("\"price\":10012")
-                    .body_contains("\"base_amount\":1234");
+                    .body_contains("\"base_amount\":1234")
+                    .body_contains("\"post_only\":1");
                 then.status(200)
                     .json_body(serde_json::json!({"tx_type":14,"tx_info":{"signed":true}}));
             })
@@ -2238,7 +2239,7 @@ mod tests {
             size: 1.234,
             purpose: OrderPurpose::Mm,
             time_in_force: TimeInForce::Gtc,
-            post_only: false,
+            post_only: true,
             reduce_only: false,
             client_order_id: "42".to_string(),
         };
@@ -2253,6 +2254,21 @@ mod tests {
     async fn lighter_cancel_order_calls_signer_then_sendtx() {
         let api = MockServer::start_async().await;
         let signer = MockServer::start_async().await;
+        let orderbooks = api
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "order_books": [
+                        {
+                            "symbol": "BTC-USD",
+                            "market_id": 7,
+                            "price_decimals": 2,
+                            "size_decimals": 3
+                        }
+                    ]
+                }));
+            })
+            .await;
         let sign = signer
             .mock_async(|when, then| {
                 when.method(POST)
@@ -2260,6 +2276,7 @@ mod tests {
                     .body_contains("\"op\":\"cancel_order\"")
                     .body_contains("\"account_index\":123")
                     .body_contains("\"api_key_index\":1")
+                    .body_contains("\"market_index\":7")
                     .body_contains("\"order_index\":55");
                 then.status(200)
                     .json_body(serde_json::json!({"tx_type":15,"tx_info":{"signed":true}}));
@@ -2298,6 +2315,7 @@ mod tests {
         };
         let resp = connector.cancel_order(req).await.expect("cancel");
         assert!(resp.order_id.is_none());
+        orderbooks.assert_hits_async(1).await;
         sign.assert_async().await;
         sendtx.assert_async().await;
     }
@@ -3507,6 +3525,7 @@ impl LiveRestClient for LighterConnector {
                 is_ask: if req.side == Side::Sell { 1 } else { 0 },
                 order_type: "limit".to_string(),
                 time_in_force: format!("{:?}", req.time_in_force),
+                post_only: if req.post_only { 1 } else { 0 },
                 reduce_only: if req.reduce_only { 1 } else { 0 },
                 trigger_price: None,
                 order_expiry: None,
@@ -3554,12 +3573,16 @@ impl LiveRestClient for LighterConnector {
             let order_index = req.order_id.parse::<u64>().map_err(|_| {
                 LiveGatewayError::fatal("lighter: order_id must be numeric for signer bridge")
             })?;
+            let (_, market_id) = self.resolve_market_id_and_symbol().await.map_err(|err| {
+                LiveGatewayError::fatal(format!("lighter market_id error: {err}"))
+            })?;
             let expired_at = now_ms().saturating_add(60_000);
             let sign_req = SignCancelOrderRequest {
                 op: "cancel_order".to_string(),
                 account_index,
                 api_key_index,
                 nonce: self.next_nonce(),
+                market_index: market_id,
                 order_index: Some(order_index),
                 client_order_index: None,
                 expired_at,

@@ -1,6 +1,8 @@
 [Unit]
 Description=Paraphina Live Runner (template)
 After=network.target
+Wants=lighter_signer.service
+After=lighter_signer.service
 
 [Service]
 Type=simple

@@ -3,7 +3,8 @@
 This runbook covers operational controls for live trading. It is designed for
 offline CI safety and manual use in production-like environments.
 
-See `docs/DEPLOYMENT_CHAIN.md` for the end-to-end release → VPS → canary chain.
+See `docs/adr/001-auto-deploy-policy.md` and `deploy/deploy_orchestrator.py`
+for the end-to-end release → VPS → canary chain.
 
 ## Trade Modes
 
@@ -21,8 +22,12 @@ Progression (all venues unless noted):
 
 1) Shadow (all venues) with fixtures and/or public feeds.
 2) Paper (all venues) with fixture-driven cancel-all and telemetry contract checks.
-3) Canary live (single venue) once preflight gates are green and readiness report shows no feature gaps.
-4) Scale live (add venues one at a time) after sustained canary stability.
+3) Canary live (all 5 ETH venues) once preflight gates are green and readiness report shows no feature gaps.
+4) Scale live by increasing caps gradually (order size, max position, open orders) after sustained canary stability.
+
+For the current ETH deployment, the MM strategy depends on multi-venue fair value.
+Launching fewer than `min_healthy_for_kf` venues can suppress quoting, so the
+live canary axis is size/caps, not venue count.
 
 Move to the new VPS after Shadow + Paper runs are green and before Canary live.
 See "Migration to new VPS" for the concrete checklist.
@@ -34,6 +39,21 @@ See "Migration to new VPS" for the concrete checklist.
 - **All-5 Connected (Execution)**: live execution is enabled for all venues that
   support it (Hyperliquid, Lighter, Extended, Aster, Paradex), with valid auth
   and live guardrails enabled.
+
+## ETH Deployment Terminology
+
+The live deployment in this runbook targets ETH markets:
+
+- `HL_COIN=ETH`
+- `LIGHTER_MARKET=ETH-USD`
+- `EXTENDED_MARKET=ETH-USD`
+- `ASTER_MARKET=ETHUSDT`
+- `PARADEX_MARKET=ETH-USD-PERP`
+
+Legacy config and telemetry fields ending in `_tao` still refer to base-asset
+inventory units for this deployment, not TAO market selection. For ETH live,
+read `q_global_tao`, `max_position_tao`, `lot_size_tao`, and `size_step_tao`
+as ETH units.
 
 ## All-5 Live Shadow Market Data
 
@@ -200,20 +220,37 @@ gating and quote staleness guards (NOT connector watchdog timeouts).
 
 Canary live requires credentials and explicit live execution gates. Run manually only:
 
+For the first ETH live deployment, prefer the micro-canary profile
+`configs/prod_canary_eth_min.toml`.
+The recommended day-1 env template is
+`deploy/env/eth_all5_day1_live.env.example`, which layers
+`PARAPHINA_RISK_PROFILE=conservative` with `PARAPHINA_DAILY_LOSS_LIMIT=15`
+for a minimal-capital launch.
+
 1) Preflight:
 
 ```
 PARAPHINA_TRADE_MODE=live \
 PARAPHINA_LIVE_CONNECTORS=hyperliquid,lighter,extended,aster,paradex \
 PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS=5000 \
-PARAPHINA_LIVE_CANARY_PROFILE=prod_canary \
+PARAPHINA_LIVE_CANARY_PROFILE=configs/prod_canary_eth_min.toml \
+PARAPHINA_HL_STATE_STALE_MS_OVERRIDE=1500 \
+PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE=1500 \
+PARAPHINA_PARADEX_STATE_STALE_MS_OVERRIDE=3000 \
 PARAPHINA_LIVE_EXEC_ENABLE=1 PARAPHINA_LIVE_EXECUTION_CONFIRM=YES \
 HL_PAPER_MODE=false LIGHTER_PAPER_MODE=false \
+HL_COIN=ETH \
+LIGHTER_MARKET=ETH-USD \
+EXTENDED_MARKET=ETH-USD \
+EXTENDED_REST_URL=https://api.starknet.extended.exchange \
+EXTENDED_FUNDING_PATH=/api/v1/info/markets/ETH-USD/stats \
+ASTER_MARKET=ETHUSDT \
+PARADEX_MARKET=ETH-USD-PERP \
 cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex -- \
   --preflight \
   --trade-mode live \
   --connectors hyperliquid,lighter,extended,aster,paradex \
-  --canary-profile prod_canary \
+  --canary-profile configs/prod_canary_eth_min.toml \
   --enable-live-execution
 ```
 
@@ -223,14 +260,24 @@ cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,liv
 PARAPHINA_TRADE_MODE=live \
 PARAPHINA_LIVE_CONNECTORS=hyperliquid,lighter,extended,aster,paradex \
 PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS=5000 \
-PARAPHINA_LIVE_CANARY_PROFILE=prod_canary \
+PARAPHINA_LIVE_CANARY_PROFILE=configs/prod_canary_eth_min.toml \
 PARAPHINA_LIVE_PREFLIGHT_OK=1 \
+PARAPHINA_HL_STATE_STALE_MS_OVERRIDE=1500 \
+PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE=1500 \
+PARAPHINA_PARADEX_STATE_STALE_MS_OVERRIDE=3000 \
 PARAPHINA_LIVE_EXEC_ENABLE=1 PARAPHINA_LIVE_EXECUTION_CONFIRM=YES \
 HL_PAPER_MODE=false LIGHTER_PAPER_MODE=false \
+HL_COIN=ETH \
+LIGHTER_MARKET=ETH-USD \
+EXTENDED_MARKET=ETH-USD \
+EXTENDED_REST_URL=https://api.starknet.extended.exchange \
+EXTENDED_FUNDING_PATH=/api/v1/info/markets/ETH-USD/stats \
+ASTER_MARKET=ETHUSDT \
+PARADEX_MARKET=ETH-USD-PERP \
 cargo run -p paraphina --bin paraphina_live --features live,live_hyperliquid,live_lighter,live_extended,live_aster,live_paradex -- \
   --trade-mode live \
   --connectors hyperliquid,lighter,extended,aster,paradex \
-  --canary-profile prod_canary \
+  --canary-profile configs/prod_canary_eth_min.toml \
   --enable-live-execution
 ```
 
@@ -384,8 +431,9 @@ and venue state. Configure:
 ## Canary Live Checklist
 
 - [ ] Run preflight and export `PARAPHINA_LIVE_PREFLIGHT_OK=1`.
-- [ ] Select canary profile (`--canary-profile prod_canary` or `PARAPHINA_LIVE_CANARY_PROFILE`).
-- [ ] Verify `configs/prod_canary.toml` exists and contains limits caps.
+- [ ] Select canary profile (`--canary-profile <path>` or `PARAPHINA_LIVE_CANARY_PROFILE`).
+- [ ] For first ETH live, use `configs/prod_canary_eth_min.toml`.
+- [ ] Verify the selected canary profile exists and contains limits caps.
 - [ ] Enable reconciliation (`PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS`).
 - [ ] Verify rate limit vars set (from canary profile).
 - [ ] Confirm telemetry path + out-dir are writable.
@@ -400,10 +448,10 @@ and venue state. Configure:
 
 ## Scaling Plan
 
-1. Canary live with `prod_canary.toml` for a fixed window.
+1. Canary live with `configs/prod_canary_eth_min.toml` (or another explicitly selected canary profile) for a fixed window.
 2. Review burn‑in report + reconcile drift logs.
 3. Gradually increase limits (order size, max position, open orders).
-4. Expand venues one at a time with the same canary process.
+4. Keep the full venue set live for ETH MM and scale by caps, not by reducing venue count.
 
 ## Incident Checklist
 

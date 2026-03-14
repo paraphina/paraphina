@@ -34,8 +34,9 @@ See `docs/PARADEX_FIXTURES.md` for the fixture schema.
   - `PARADEX_AUTH_URL=https://api.prod.paradex.trade/v1/auth/token`
   - `PARADEX_ACCOUNT_PATH=/account`
   - `PARADEX_ORDER_PATH=/orders`
-  - `PARADEX_JWT=...` (optional)
-  - `PARADEX_AUTH_PAYLOAD_JSON=...` (optional, Starknet auth payload)
+  - `PARADEX_JWT_CMD="/opt/paraphina/.venv_paradex/bin/python3 /opt/paraphina/tools/paradex_jwt.py"` (preferred for long-lived live sessions; command prints a fresh JWT)
+  - `PARADEX_JWT=...` (static fallback)
+  - `PARADEX_AUTH_PAYLOAD_JSON=...` (legacy fallback, Starknet auth payload)
 - Recording (manual only, no CI):
   - `--record-fixtures` or `PARADEX_RECORD_FIXTURES=1`
   - Optional `PARADEX_RECORD_DIR=/path/to/tests/fixtures/roadmap_b/paradex_live_recording`
@@ -45,6 +46,11 @@ See `docs/PARADEX_FIXTURES.md` for the fixture schema.
 
 - Paradex uses bearer token auth (JWT) with optional Starknet-signed payloads
   (see https://docs.paradex.trade).
+- For long-lived live sessions, prefer `PARADEX_JWT_CMD` over a static
+  `PARADEX_JWT`. The connector refreshes command-based tokens automatically.
+- Install the official SDK into the dedicated helper venv:
+  - `python3 -m venv /opt/paraphina/.venv_paradex`
+  - `/opt/paraphina/.venv_paradex/bin/pip install paradex_py`
 - Execution endpoints (from docs):
   - `POST /orders`
   - `DELETE /orders/{order_id}`
