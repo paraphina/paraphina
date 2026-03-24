@@ -109,6 +109,7 @@ impl From<RiskRegime> for RiskRegimeObs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KillReasonObs {
     None,
+    StartupPnlBaselineBreach,
     PnlHardBreach,
     DeltaHardBreach,
     BasisHardBreach,
@@ -122,6 +123,7 @@ impl From<KillReason> for KillReasonObs {
     fn from(reason: KillReason) -> Self {
         match reason {
             KillReason::None => KillReasonObs::None,
+            KillReason::StartupPnlBaselineBreach => KillReasonObs::StartupPnlBaselineBreach,
             KillReason::PnlHardBreach => KillReasonObs::PnlHardBreach,
             KillReason::DeltaHardBreach => KillReasonObs::DeltaHardBreach,
             KillReason::BasisHardBreach => KillReasonObs::BasisHardBreach,

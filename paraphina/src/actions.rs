@@ -191,6 +191,11 @@ impl ActionIdGenerator {
         }
     }
 
+    /// Return the tick index backing this generator.
+    pub fn tick_index(&self) -> u64 {
+        self.tick_index
+    }
+
     /// Generate a deterministic action ID.
     ///
     /// Format: `t{tick}_{purpose}_{venue}_{seq}`

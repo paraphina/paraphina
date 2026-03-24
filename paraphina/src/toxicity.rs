@@ -117,6 +117,9 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
     let sigma_eff: f64 = state.sigma_eff.max(sigma_min);
 
     for venue in state.venues.iter_mut() {
+        let bootstrap_pending =
+            venue.last_mid_apply_ms.is_none() && venue.mid.is_none() && venue.depth_near_mid <= 0.0;
+
         // --- 1) Process pending markouts in a single pass ---
         // Opt17: Use cached next_eval_ms to skip deque access when no markouts are ready.
         if venue.pending_markouts_next_eval_ms <= now_ms {
@@ -193,7 +196,15 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
                 .map_or(i64::MAX, |pm| pm.t_eval_ms);
         }
 
-        // --- 2) Shadow-mode warmup override ---
+        // --- 2) Startup bootstrap override ---
+        // Before we have ever applied a valid book for a venue, lack of mid/depth
+        // is an initialization condition, not a toxicity signal. Stay neutral and
+        // let existing quote/readiness checks block on missing books.
+        if bootstrap_pending {
+            venue.toxicity = 0.0;
+        }
+
+        // --- 2.1) Shadow-mode warmup override ---
         if shadow_mode
             && venue.last_mid_update_ms.is_some()
             && venue.mid.unwrap_or(0.0) > 0.0
@@ -230,10 +241,10 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
                     now_ms.saturating_sub(last_ms) > cfg.toxicity.depth_fallback_grace_ms
                 })
                 .unwrap_or(true);
-        if venue.mid.is_none() || depth_zero_prolonged {
+        if !bootstrap_pending && (venue.mid.is_none() || depth_zero_prolonged) {
             // No valid book data -> treat as highly toxic
             venue.toxicity = 1.0;
-        } else if !shadow_mode && vol_tox_scale > 0.0 && sigma_eff > 0.0 {
+        } else if !bootstrap_pending && !shadow_mode && vol_tox_scale > 0.0 && sigma_eff > 0.0 {
             // Optionally blend in volatility-based feature for extra signal
             // (only if local vol is significantly elevated)
             let local: f64 = venue.local_vol_short.max(sigma_min);
@@ -817,6 +828,76 @@ mod tests {
 
         assert_eq!(state.venues[0].toxicity, 0.0);
         assert!(matches!(state.venues[0].status, VenueStatus::Healthy));
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+    }
+
+    #[test]
+    fn live_startup_missing_book_keeps_toxicity_neutral() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_TRADE_MODE", "live");
+
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+        let venue = &mut state.venues[0];
+        venue.mid = None;
+        venue.spread = None;
+        venue.depth_near_mid = 0.0;
+        venue.last_mid_update_ms = None;
+        venue.last_mid_apply_ms = None;
+        venue.toxicity = 0.4;
+
+        update_toxicity_and_health(&mut state, &cfg, 1_000);
+
+        assert_eq!(state.venues[0].toxicity, 0.0);
+        assert!(matches!(state.venues[0].status, VenueStatus::Healthy));
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+    }
+
+    #[test]
+    fn live_startup_recovers_cleanly_on_first_valid_book() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_TRADE_MODE", "live");
+
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+
+        update_toxicity_and_health(&mut state, &cfg, 1_000);
+        assert_eq!(state.venues[0].toxicity, 0.0);
+
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10_000.0;
+        venue.last_mid_update_ms = Some(1_250);
+        venue.last_mid_apply_ms = Some(1_250);
+
+        update_toxicity_and_health(&mut state, &cfg, 1_250);
+
+        assert_eq!(state.venues[0].toxicity, 0.0);
+        assert!(matches!(state.venues[0].status, VenueStatus::Healthy));
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+    }
+
+    #[test]
+    fn live_post_bootstrap_missing_book_still_disables() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_TRADE_MODE", "live");
+
+        let mut cfg = make_test_config();
+        cfg.toxicity.depth_fallback_grace_ms = 500;
+        let mut state = GlobalState::new(&cfg);
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 0.0;
+        venue.last_mid_update_ms = Some(1_000);
+        venue.last_mid_apply_ms = Some(1_000);
+        venue.toxicity = 0.0;
+
+        update_toxicity_and_health(&mut state, &cfg, 2_000);
+
+        assert_eq!(state.venues[0].toxicity, 1.0);
+        assert!(matches!(state.venues[0].status, VenueStatus::Disabled));
         std::env::remove_var("PARAPHINA_TRADE_MODE");
     }
 

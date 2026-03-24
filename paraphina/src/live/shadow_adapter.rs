@@ -130,6 +130,9 @@ impl ShadowAckAdapter {
                     seq: self.seq,
                     timestamp_ms: now_ms,
                     order_id: place.client_order_id.clone(),
+                    client_order_id: place.client_order_id.clone(),
+                    purpose: Some(place.purpose),
+                    reduce_only: Some(place.reduce_only),
                     reason: "min_notional_usd".to_string(),
                 }));
                 return events;
@@ -144,6 +147,9 @@ impl ShadowAckAdapter {
                 seq: self.seq,
                 timestamp_ms: now_ms,
                 order_id: place.client_order_id.clone(),
+                client_order_id: place.client_order_id.clone(),
+                purpose: Some(place.purpose),
+                reduce_only: Some(place.reduce_only),
                 reason: "post_only_cross".to_string(),
             }));
             return events;

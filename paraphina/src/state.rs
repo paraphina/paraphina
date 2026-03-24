@@ -168,6 +168,74 @@ pub struct FillRecord {
     pub realised_pnl_usd: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VenueUtilityTier {
+    Full,
+    Reduced,
+    AnchorOnly,
+    Suppressed,
+}
+
+impl VenueUtilityTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VenueUtilityTier::Full => "full",
+            VenueUtilityTier::Reduced => "reduced",
+            VenueUtilityTier::AnchorOnly => "anchor_only",
+            VenueUtilityTier::Suppressed => "suppressed",
+        }
+    }
+}
+
+impl Default for VenueUtilityTier {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VenueUtilityReason {
+    Healthy,
+    LowConversion,
+    SpreadPathology,
+    AdverseSelection,
+    RejectPressure,
+}
+
+impl VenueUtilityReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VenueUtilityReason::Healthy => "healthy",
+            VenueUtilityReason::LowConversion => "low_conversion",
+            VenueUtilityReason::SpreadPathology => "spread_pathology",
+            VenueUtilityReason::AdverseSelection => "adverse_selection",
+            VenueUtilityReason::RejectPressure => "reject_pressure",
+        }
+    }
+}
+
+impl Default for VenueUtilityReason {
+    fn default() -> Self {
+        Self::Healthy
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VenueUtilityState {
+    pub mm_ack_ewma: f64,
+    pub mm_reject_ewma: f64,
+    pub mm_fill_count_ewma: f64,
+    pub mm_fill_base_ewma: f64,
+    pub mm_fill_credit_ewma: f64,
+    pub mm_fillless_ack_pressure: f64,
+    pub spread_gate_hit_ewma: f64,
+    pub score: f64,
+    pub tier: VenueUtilityTier,
+    pub reason: VenueUtilityReason,
+}
+
 /// Per-venue state (one per perp venue / subaccount).
 #[derive(Debug, Clone)]
 pub struct VenueState {
@@ -180,6 +248,12 @@ pub struct VenueState {
     pub mid: Option<f64>,
     /// Current best spread from order book (if any).
     pub spread: Option<f64>,
+    /// Previous best spread from the prior valid book update, used for fast
+    /// microstructure guards without reaching into the live runner.
+    pub prev_spread: Option<f64>,
+    /// Previous best ask from the prior valid book update, used by venue-local
+    /// passivity guards that need one-tick touch motion without live runner state.
+    pub prev_best_ask: Option<f64>,
     /// Depth near mid (sum within top-K levels).
     pub depth_near_mid: f64,
     /// Last connector/event timestamp (ms) used to update mid/spread.
@@ -209,6 +283,8 @@ pub struct VenueState {
     pub pending_markouts_next_eval_ms: TimestampMs,
     /// Running EWMA of markout in USD/TAO for telemetry/debugging.
     pub markout_ewma_usd_per_tao: f64,
+    /// Short-horizon rolling venue utility used to tier live quote allocation.
+    pub utility: VenueUtilityState,
 
     // ----- Order ledger (whitepaper §4.3) -----
     /// Open orders keyed by order_id (BTreeMap for deterministic iteration).
@@ -303,8 +379,10 @@ impl VenueState {
         alpha_short: f64,
         alpha_long: f64,
     ) -> Result<DerivedBookMetrics, OrderBookError> {
+        let prev_best_ask = self.orderbook_l2.best_ask().map(|level| level.price);
         self.orderbook_l2.apply_snapshot(bids, asks, seq)?;
         self.orderbook_l2.trim_levels(max_levels);
+        self.prev_best_ask = prev_best_ask;
         let metrics = self.orderbook_l2.compute_mid_spread_depth(DepthConfig {
             levels: max_levels.max(1),
             include_imbalance: false,
@@ -312,6 +390,7 @@ impl VenueState {
         self.last_book_update_ms = Some(timestamp_ms);
         self.depth_near_mid = top_of_book_notional(&self.orderbook_l2);
         if let (Some(mid), Some(spread)) = (metrics.mid, metrics.spread) {
+            self.prev_spread = self.spread;
             self.mid = Some(mid);
             self.spread = Some(spread);
             self.last_mid_update_ms = Some(timestamp_ms);
@@ -329,8 +408,10 @@ impl VenueState {
         alpha_short: f64,
         alpha_long: f64,
     ) -> Result<DerivedBookMetrics, OrderBookError> {
+        let prev_best_ask = self.orderbook_l2.best_ask().map(|level| level.price);
         self.orderbook_l2.apply_delta(deltas, seq)?;
         self.orderbook_l2.trim_levels(max_levels);
+        self.prev_best_ask = prev_best_ask;
         let metrics = self.orderbook_l2.compute_mid_spread_depth(DepthConfig {
             levels: max_levels.max(1),
             include_imbalance: false,
@@ -338,6 +419,7 @@ impl VenueState {
         self.last_book_update_ms = Some(timestamp_ms);
         self.depth_near_mid = top_of_book_notional(&self.orderbook_l2);
         if let (Some(mid), Some(spread)) = (metrics.mid, metrics.spread) {
+            self.prev_spread = self.spread;
             self.mid = Some(mid);
             self.spread = Some(spread);
             self.last_mid_update_ms = Some(timestamp_ms);
@@ -429,6 +511,8 @@ pub enum RiskRegime {
 pub enum KillReason {
     /// No kill triggered (default state).
     None,
+    /// Startup inherited position / PnL baseline is unsafe before quoting begins.
+    StartupPnlBaselineBreach,
     /// Daily PnL loss limit breached.
     PnlHardBreach,
     /// Volatility-scaled delta limit breached.
@@ -730,6 +814,8 @@ impl GlobalState {
 
                 mid: None,
                 spread: None,
+                prev_spread: None,
+                prev_best_ask: None,
                 depth_near_mid: 0.0,
                 last_mid_update_ms: None,
                 last_mid_apply_ms: None,
@@ -744,6 +830,7 @@ impl GlobalState {
                 pending_markouts: VecDeque::new(),
                 pending_markouts_next_eval_ms: i64::MAX,
                 markout_ewma_usd_per_tao: 0.0,
+                utility: VenueUtilityState::default(),
 
                 open_orders: BTreeMap::new(),
                 recent_fills: VecDeque::new(),

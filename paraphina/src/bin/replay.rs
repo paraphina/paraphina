@@ -75,7 +75,9 @@ fn log_telemetry(
         shadow_mode: false,
         execution_mode: "replay",
         reconcile_drift: &[],
+        account_position_syncs: &[],
         max_orders_per_tick: 200,
+        venue_health_diagnostics: &[],
     });
     ensure_schema_v1(&mut record);
     telemetry.log_json(&record);

@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-telemetry_analyzer.py — Comprehensive 15-dimension telemetry analysis for paraphina shadow runs.
+telemetry_analyzer.py — Comprehensive 15-dimension telemetry analysis.
 
 Streaming single-pass architecture: reads JSONL line-by-line, accumulates statistics
-via online algorithms, and outputs a structured text report.
+via online algorithms, and outputs a structured text report. It also supports
+preserved canary artifacts whose telemetry may contain multiple concatenated JSON
+objects on a single physical line.
 
 Usage:
     python3 tools/telemetry_analyzer.py --telemetry /tmp/shadow_eth_post_fix/telemetry.jsonl
     python3 tools/telemetry_analyzer.py --telemetry /path/to/telemetry.jsonl --max-ticks 10000
     python3 tools/telemetry_analyzer.py --telemetry /path/to/telemetry.jsonl --checkpoint-json out/cp_10k.json
+    python3 tools/telemetry_analyzer.py --telemetry /path/to/telemetry.jsonl --execution-mode live
+    python3 tools/telemetry_analyzer.py --telemetry /var/lib/paraphina/out/telemetry.jsonl --execution-mode live --last-segment --tail-bytes 134217728
 
 stdlib only — no external dependencies.
 """
@@ -31,6 +35,14 @@ from typing import Any, TextIO
 VENUE_NAMES = ["extended", "hyperliquid", "aster", "lighter", "paradex"]
 NUM_VENUES = 5
 WINDOW_SIZE = 10_000  # ticks per trend window
+DEFAULT_SAFE_TAIL_BYTES = 128 * 1024 * 1024
+SAFE_PRODUCTION_SCAN_LIMIT_BYTES = 256 * 1024 * 1024
+PRODUCTION_ROLLING_TELEMETRY = Path("/var/lib/paraphina/out/telemetry.jsonl")
+PNL_BASELINE_MAX_DISPERSION_USD = 5.0
+PNL_BASELINE_FINAL_PNL_TOL_USD = 5.0
+PNL_BASELINE_FLAT_Q_TAO = 0.05
+PNL_BASELINE_LARGE_UNREALISED_USD = 5.0
+PNL_BASELINE_RECON_MISMATCH_TOL_USD = 0.05
 
 # Staleness thresholds (from config)
 STALE_MS = {
@@ -68,10 +80,13 @@ def pct(num: int, denom: int) -> str:
     return f"{100.0 * num / denom:.2f}%"
 
 
-def fmt_f(v: float | None, decimals: int = 4) -> str:
-    if v is None:
-        return "n/a"
-    return f"{v:.{decimals}f}"
+def fmt_f(v: Any, decimals: int = 4) -> str:
+    f = safe_float(v)
+    if f is not None:
+        return f"{f:.{decimals}f}"
+    if isinstance(v, str) and v:
+        return v
+    return "n/a"
 
 
 def fmt_i(v: int | None) -> str:
@@ -84,6 +99,124 @@ def ts_str(ms: int | None) -> str:
     if ms is None:
         return "n/a"
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%H:%M:%S")
+
+
+def ts_iso(ms: int | None) -> str:
+    if ms is None:
+        return "n/a"
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat()
+
+
+def iter_json_objects(path: Path) -> Any:
+    """Yield dict records from JSONL, tolerating concatenated objects per line."""
+    decoder = json.JSONDecoder()
+    with path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            while line:
+                try:
+                    record, idx = decoder.raw_decode(line)
+                except json.JSONDecodeError:
+                    break
+                if isinstance(record, dict):
+                    yield record
+                line = line[idx:].lstrip()
+
+
+def iter_json_objects_from_tail(path: Path, tail_bytes: int) -> Any:
+    """Yield dict records from the last tail_bytes of a JSONL file.
+
+    This mode is intentionally approximate and meant for production-safe triage on
+    very large rolling telemetry files. If the starting offset lands mid-line, the
+    first partial physical line is discarded before parsing.
+    """
+    if tail_bytes <= 0:
+        yield from iter_json_objects(path)
+        return
+
+    decoder = json.JSONDecoder()
+    with path.open("rb") as raw_fh:
+        raw_fh.seek(0, 2)
+        file_size = raw_fh.tell()
+        start = max(file_size - tail_bytes, 0)
+        raw_fh.seek(start)
+        if start > 0:
+            raw_fh.readline()
+        chunk = raw_fh.read().decode("utf-8", errors="ignore")
+
+    for raw_line in chunk.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        while line:
+            try:
+                record, idx = decoder.raw_decode(line)
+            except json.JSONDecodeError:
+                break
+            if isinstance(record, dict):
+                yield record
+            line = line[idx:].lstrip()
+
+
+def last_execution_segment(path: Path, execution_mode: str) -> list[dict[str, Any]]:
+    """Return the last contiguous segment for a given execution_mode."""
+    last: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for record in iter_json_objects(path):
+        if record.get("execution_mode") == execution_mode:
+            current.append(record)
+        elif current:
+            last = current
+            current = []
+    if current:
+        last = current
+    return last
+
+
+def last_execution_segment_from_iter(records: Any, execution_mode: str) -> list[dict[str, Any]]:
+    """Return the last contiguous execution_mode segment from an arbitrary iterator."""
+    last: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("execution_mode") == execution_mode:
+            current.append(record)
+        elif current:
+            last = current
+            current = []
+    if current:
+        last = current
+    return last
+
+
+def guard_unsafe_live_scan(path: Path, tail_bytes: int, unsafe_allow_large_live_file: bool) -> None:
+    """Refuse dangerous full scans of the rolling production telemetry file by default."""
+    try:
+        resolved = path.resolve()
+        size_bytes = path.stat().st_size
+    except OSError:
+        return
+
+    if resolved != PRODUCTION_ROLLING_TELEMETRY:
+        return
+    if unsafe_allow_large_live_file:
+        return
+    if tail_bytes > 0:
+        return
+    if size_bytes <= SAFE_PRODUCTION_SCAN_LIMIT_BYTES:
+        return
+
+    mib = size_bytes / (1024 * 1024)
+    limit_mib = SAFE_PRODUCTION_SCAN_LIMIT_BYTES / (1024 * 1024)
+    suggested_tail = DEFAULT_SAFE_TAIL_BYTES
+    raise ValueError(
+        "refusing full scan of rolling production telemetry "
+        f"({mib:.1f} MiB > safe limit {limit_mib:.0f} MiB). "
+        "Use a preserved artifact, copy the file elsewhere, or rerun with "
+        f"--tail-bytes {suggested_tail} for bounded triage. "
+        "If you truly intend the full scan, pass --unsafe-allow-large-live-file."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,13 +261,13 @@ class OnlineStats:
     def percentile(self, p: float) -> float:
         if not self._vals:
             return float("nan")
-        self._vals.sort()  # lazy sort
-        k = (len(self._vals) - 1) * p / 100.0
+        vals = sorted(self._vals)
+        k = (len(vals) - 1) * p / 100.0
         f = math.floor(k)
         c = math.ceil(k)
         if f == c:
-            return self._vals[int(k)]
-        return self._vals[f] * (c - k) + self._vals[c] * (k - f)
+            return vals[int(k)]
+        return vals[f] * (c - k) + vals[c] * (k - f)
 
     def summary(self) -> dict:
         if self.n == 0:
@@ -220,6 +353,30 @@ class AnomalyCollector:
 
     def by_severity(self, severity: str) -> list[Anomaly]:
         return [a for a in self.items if a.severity == severity]
+
+
+@dataclass
+class DecisionContribution:
+    decision_id: str
+    mm_venue_index: int | None = None
+    mm_venue_id: str | None = None
+    mm_fill_count: int = 0
+    mm_fill_base: float = 0.0
+    mm_fill_notional_usd: float = 0.0
+    mm_gross_before_fee_usd: float = 0.0
+    mm_fee_usd: float = 0.0
+    mm_realised_net_usd: float = 0.0
+    mm_markout_short_usd: float = 0.0
+    hedge_record_count: int = 0
+    hedge_fill_count: int = 0
+    hedge_fill_notional_usd: float = 0.0
+    hedge_fill_fee_usd: float = 0.0
+    hedge_exec_cost_model_usd: float = 0.0
+    hedge_total_cost_model_usd: float = 0.0
+
+    @property
+    def net_after_hedge_exec_model_usd(self) -> float:
+        return self.mm_realised_net_usd - self.hedge_exec_cost_model_usd
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +468,11 @@ class TelemetryAccumulator:
         # --- Dimension 9: Hedges ---
         self.hedges_tick_count = 0
         self.hedge_delta_stats = OnlineStats()
+        self.hedge_record_total = 0
+        self.hedge_source_attributed_count = 0
+        self.hedge_source_fill_age_stats = OnlineStats()
+        self.hedge_fill_attributed_count = 0
+        self.hedge_fill_unattributed_count = 0
 
         # --- Dimension 10: Margin ---
         self.venue_margin_util_stats: list[OnlineStats] = [OnlineStats() for _ in range(NUM_VENUES)]
@@ -337,6 +499,7 @@ class TelemetryAccumulator:
         self.risk_regime_prev: str | None = None
         self.risk_regime_transitions: int = 0
         self.kill_switch_count = 0
+        self.kill_reason_counts: Counter = Counter()
         self.would_send_count_stats = OnlineStats()
         self.would_send_zero_ticks = 0
         self.would_send_consecutive_zero = 0
@@ -346,6 +509,42 @@ class TelemetryAccumulator:
         self.risk_event_counts: Counter = Counter()
         self.order_action_counts: Counter = Counter()
         self.orders_per_venue: list[int] = [0] * NUM_VENUES
+        self.mm_keep_count_stats = OnlineStats()
+        self.mm_replace_count_stats = OnlineStats()
+        self.mm_place_count_stats = OnlineStats()
+        self.mm_cancel_count_stats = OnlineStats()
+        self.mm_keep_total = 0
+        self.mm_replace_total = 0
+        self.mm_place_total = 0
+        self.mm_cancel_total = 0
+        self.mm_keep_reason_counts: Counter = Counter()
+        self.mm_replace_reason_counts: Counter = Counter()
+        self.mm_keep_utility_tier_counts: Counter = Counter()
+        self.mm_replace_utility_tier_counts: Counter = Counter()
+        self.mm_keep_venue_role_counts: Counter = Counter()
+        self.mm_replace_venue_role_counts: Counter = Counter()
+        self.mm_decisions_by_venue: list[Counter] = [Counter() for _ in range(NUM_VENUES)]
+        self.mm_inventory_reducing_counts: Counter = Counter()
+        self.mm_decision_record_total = 0
+        self.mm_decision_order_link_total = 0
+        self.mm_fill_attributed_count = 0
+        self.mm_fill_unattributed_count = 0
+        self.mm_fill_attributed_by_venue: list[int] = [0] * NUM_VENUES
+        self.mm_fill_decision_markout_short_stats = OnlineStats()
+        self.mm_fill_decision_realised_pnl_stats = OnlineStats()
+        self.mm_decision_fill_counts: Counter = Counter()
+        self.decision_contributions: dict[str, DecisionContribution] = {}
+        self.mm_gross_before_fee_attributed_usd = 0.0
+        self.mm_fee_attributed_usd = 0.0
+        self.mm_realised_net_attributed_usd = 0.0
+        self.mm_realised_net_unattributed_usd = 0.0
+        self.mm_fee_unattributed_usd = 0.0
+        self.hedge_fill_fee_attributed_usd = 0.0
+        self.hedge_fill_fee_unattributed_usd = 0.0
+        self.hedge_exec_cost_model_attributed_usd = 0.0
+        self.hedge_exec_cost_model_unattributed_usd = 0.0
+        self.hedge_total_cost_model_attributed_usd = 0.0
+        self.hedge_total_cost_model_unattributed_usd = 0.0
 
         # --- Dimension 14: Anomalies ---
         self.anomalies = AnomalyCollector()
@@ -358,9 +557,24 @@ class TelemetryAccumulator:
         # --- PnL ---
         self.pnl_total_stats = OnlineStats()
         self.pnl_realised_stats = OnlineStats()
+        self.final_pnl_total: float | None = None
+        self.final_pnl_realised: float | None = None
+        self.final_pnl_unrealised: float | None = None
+        self.final_q_global_tao: float | None = None
+        self.pnl_reconstruction_mismatch_stats = OnlineStats()
+        self.flat_inventory_large_unrealised_ticks = 0
 
         # --- Correlated staleness detection ---
         self.multi_stale_ticks = 0  # ticks where 2+ venues are stale simultaneously
+        self.execution_mode_counts: Counter = Counter()
+        self.soft_governor_ticks = 0
+        self.soft_governor_reason_counts: Counter = Counter()
+        self.soft_governor_blocked_ticks: list[int] = [0] * NUM_VENUES
+        self.order_status_action_counts: list[Counter] = [Counter() for _ in range(NUM_VENUES)]
+        self.venue_fill_counts: list[int] = [0] * NUM_VENUES
+        self.venue_fill_size_base: list[float] = [0.0] * NUM_VENUES
+        self.drift_kind_counts: Counter = Counter()
+        self.drift_kind_by_venue: list[Counter] = [Counter() for _ in range(NUM_VENUES)]
 
     def process(self, rec: dict) -> None:
         tick = safe_int(rec.get("t"))
@@ -368,6 +582,9 @@ class TelemetryAccumulator:
             return
 
         self.tick_count += 1
+        exec_mode = rec.get("execution_mode")
+        if isinstance(exec_mode, str):
+            self.execution_mode_counts[exec_mode] += 1
         if self.first_tick is None:
             self.first_tick = tick
         self.last_tick = tick
@@ -632,6 +849,48 @@ class TelemetryAccumulator:
         hedges = rec.get("hedges", [])
         if isinstance(hedges, list) and hedges:
             self.hedges_tick_count += 1
+            for hedge in hedges:
+                if not isinstance(hedge, dict):
+                    continue
+                self.hedge_record_total += 1
+                source_decision_id = hedge.get("source_decision_id")
+                intended_size = abs(
+                    safe_float(hedge.get("filled_size"))
+                    or safe_float(hedge.get("intended_size"))
+                    or safe_float(hedge.get("delta_h_v"))
+                    or 0.0
+                )
+                cost_components = hedge.get("cost_components")
+                hedge_exec_cost_model = None
+                hedge_total_cost_model = None
+                if isinstance(cost_components, dict):
+                    exec_cost = safe_float(cost_components.get("exec_cost"))
+                    total_cost = safe_float(cost_components.get("total_cost"))
+                    if exec_cost is not None:
+                        hedge_exec_cost_model = exec_cost * intended_size
+                    if total_cost is not None:
+                        hedge_total_cost_model = total_cost * intended_size
+                if isinstance(source_decision_id, str) and source_decision_id:
+                    self.hedge_source_attributed_count += 1
+                    decision = self.decision_contributions.setdefault(
+                        source_decision_id,
+                        DecisionContribution(decision_id=source_decision_id),
+                    )
+                    decision.hedge_record_count += 1
+                    if hedge_exec_cost_model is not None:
+                        decision.hedge_exec_cost_model_usd += hedge_exec_cost_model
+                        self.hedge_exec_cost_model_attributed_usd += hedge_exec_cost_model
+                    if hedge_total_cost_model is not None:
+                        decision.hedge_total_cost_model_usd += hedge_total_cost_model
+                        self.hedge_total_cost_model_attributed_usd += hedge_total_cost_model
+                else:
+                    if hedge_exec_cost_model is not None:
+                        self.hedge_exec_cost_model_unattributed_usd += hedge_exec_cost_model
+                    if hedge_total_cost_model is not None:
+                        self.hedge_total_cost_model_unattributed_usd += hedge_total_cost_model
+                source_fill_age_ms = safe_float(hedge.get("source_fill_age_ms"))
+                if source_fill_age_ms is not None:
+                    self.hedge_source_fill_age_stats.push(source_fill_age_ms)
 
         hedge_delta = safe_float(rec.get("hedge_delta_h_t"))
         if hedge_delta is not None:
@@ -690,8 +949,13 @@ class TelemetryAccumulator:
             for d in drift:
                 if isinstance(d, dict):
                     vi = safe_int(d.get("venue_index"))
+                    kind = d.get("kind", "unknown")
+                    if isinstance(kind, str):
+                        self.drift_kind_counts[kind] += 1
                     if vi is not None and 0 <= vi < NUM_VENUES:
                         self.drift_by_venue[vi] += 1
+                        if isinstance(kind, str):
+                            self.drift_kind_by_venue[vi][kind] += 1
 
         # === Dimension 13: Risk & Order Flow ===
         risk_regime = rec.get("risk_regime")
@@ -704,6 +968,9 @@ class TelemetryAccumulator:
         kill = rec.get("kill_switch", False)
         if kill:
             self.kill_switch_count += 1
+            kill_reason = rec.get("kill_reason")
+            if isinstance(kill_reason, str):
+                self.kill_reason_counts[kill_reason] += 1
             self.anomalies.add(tick, "kill_switch", "Critical",
                 f"Kill switch activated: {rec.get('kill_reason', 'unknown')}",
                 {"reason": rec.get("kill_reason")})
@@ -726,6 +993,19 @@ class TelemetryAccumulator:
         qg = safe_float(rec.get("q_global_tao"))
         if qg is not None:
             self.q_global_stats.push(qg)
+            self.final_q_global_tao = qg
+
+        inv_soft = rec.get("inventory_soft_governor")
+        if isinstance(inv_soft, dict) and inv_soft.get("triggered"):
+            self.soft_governor_ticks += 1
+            for reason in inv_soft.get("global_reasons", []):
+                if isinstance(reason, str):
+                    self.soft_governor_reason_counts[reason] += 1
+            for blocked in inv_soft.get("blocked_venues", []):
+                if isinstance(blocked, dict):
+                    vi = safe_int(blocked.get("venue_index"))
+                    if vi is not None and 0 <= vi < NUM_VENUES:
+                        self.soft_governor_blocked_ticks[vi] += 1
 
         risk_events = rec.get("risk_events", [])
         if isinstance(risk_events, list):
@@ -743,6 +1023,86 @@ class TelemetryAccumulator:
                     vi = safe_int(o.get("venue_index"))
                     if vi is not None and 0 <= vi < NUM_VENUES:
                         self.orders_per_venue[vi] += 1
+                        status = o.get("status", "unknown")
+                        if isinstance(status, str):
+                            self.order_status_action_counts[vi][f"{action}_{status}"] += 1
+
+        mm_order_management = rec.get("mm_order_management")
+        if isinstance(mm_order_management, dict):
+            for key, stats_acc in [
+                ("keep_count", self.mm_keep_count_stats),
+                ("replace_count", self.mm_replace_count_stats),
+                ("place_count", self.mm_place_count_stats),
+                ("cancel_count", self.mm_cancel_count_stats),
+            ]:
+                value = safe_int(mm_order_management.get(key))
+                if value is not None:
+                    stats_acc.push(float(value))
+
+            keep_count = safe_int(mm_order_management.get("keep_count"))
+            replace_count = safe_int(mm_order_management.get("replace_count"))
+            place_count = safe_int(mm_order_management.get("place_count"))
+            cancel_count = safe_int(mm_order_management.get("cancel_count"))
+            if keep_count is not None:
+                self.mm_keep_total += keep_count
+            if replace_count is not None:
+                self.mm_replace_total += replace_count
+            if place_count is not None:
+                self.mm_place_total += place_count
+            if cancel_count is not None:
+                self.mm_cancel_total += cancel_count
+
+            for raw_counts, target in [
+                (mm_order_management.get("keep_by_reason"), self.mm_keep_reason_counts),
+                (mm_order_management.get("replace_by_reason"), self.mm_replace_reason_counts),
+                (
+                    mm_order_management.get("keep_by_utility_tier"),
+                    self.mm_keep_utility_tier_counts,
+                ),
+                (
+                    mm_order_management.get("replace_by_utility_tier"),
+                    self.mm_replace_utility_tier_counts,
+                ),
+                (
+                    mm_order_management.get("keep_by_venue_role"),
+                    self.mm_keep_venue_role_counts,
+                ),
+                (
+                    mm_order_management.get("replace_by_venue_role"),
+                    self.mm_replace_venue_role_counts,
+                ),
+            ]:
+                if isinstance(raw_counts, dict):
+                    for raw_key, raw_count in raw_counts.items():
+                        count = safe_int(raw_count)
+                        if isinstance(raw_key, str) and count is not None:
+                            target[raw_key] += count
+
+            replace_decisions = mm_order_management.get("replace_decisions")
+            if isinstance(replace_decisions, list):
+                for decision in replace_decisions:
+                    if not isinstance(decision, dict):
+                        continue
+                    venue_index = safe_int(decision.get("venue_index"))
+                    outcome = decision.get("outcome")
+                    if (
+                        venue_index is not None
+                        and 0 <= venue_index < NUM_VENUES
+                        and isinstance(outcome, str)
+                    ):
+                        self.mm_decisions_by_venue[venue_index][outcome] += 1
+                        if decision.get("inventory_reducing") is True:
+                            self.mm_inventory_reducing_counts[outcome] += 1
+
+            decision_records = mm_order_management.get("decision_records")
+            if isinstance(decision_records, list):
+                for decision in decision_records:
+                    if not isinstance(decision, dict):
+                        continue
+                    self.mm_decision_record_total += 1
+                    client_order_id = decision.get("client_order_id")
+                    if isinstance(client_order_id, str) and client_order_id:
+                        self.mm_decision_order_link_total += 1
 
         # === Dimension 14: Anomaly Detection ===
         # Age spikes
@@ -791,10 +1151,91 @@ class TelemetryAccumulator:
         # PnL
         pnl_t = safe_float(rec.get("pnl_total"))
         pnl_r = safe_float(rec.get("pnl_realised"))
+        pnl_u = safe_float(rec.get("pnl_unrealised"))
         if pnl_t is not None:
             self.pnl_total_stats.push(pnl_t)
+            self.final_pnl_total = pnl_t
         if pnl_r is not None:
             self.pnl_realised_stats.push(pnl_r)
+            self.final_pnl_realised = pnl_r
+        if pnl_u is not None:
+            self.final_pnl_unrealised = pnl_u
+        if pnl_t is not None and pnl_r is not None and pnl_u is not None:
+            mismatch = abs(pnl_t - (pnl_r + pnl_u))
+            self.pnl_reconstruction_mismatch_stats.push(mismatch)
+        if (
+            qg is not None
+            and pnl_u is not None
+            and abs(qg) <= PNL_BASELINE_FLAT_Q_TAO
+            and abs(pnl_u) > PNL_BASELINE_LARGE_UNREALISED_USD
+        ):
+            self.flat_inventory_large_unrealised_ticks += 1
+
+        fills = rec.get("fills", [])
+        if isinstance(fills, list):
+            for fill in fills:
+                if isinstance(fill, dict):
+                    vi = safe_int(fill.get("venue_index"))
+                    price = safe_float(fill.get("price")) or 0.0
+                    size = abs(safe_float(fill.get("size")) or 0.0)
+                    fee_bps = safe_float(fill.get("fee_bps")) or 0.0
+                    fee_usd = price * size * (fee_bps / 10_000.0)
+                    if vi is not None and 0 <= vi < NUM_VENUES:
+                        self.venue_fill_counts[vi] += 1
+                        if size:
+                            self.venue_fill_size_base[vi] += size
+                    if fill.get("purpose") == "Mm":
+                        decision_id = fill.get("decision_id")
+                        realised_pnl = safe_float(fill.get("realised_pnl_usd")) or 0.0
+                        if isinstance(decision_id, str) and decision_id:
+                            self.mm_fill_attributed_count += 1
+                            self.mm_decision_fill_counts[decision_id] += 1
+                            decision = self.decision_contributions.setdefault(
+                                decision_id,
+                                DecisionContribution(decision_id=decision_id),
+                            )
+                            decision.mm_fill_count += 1
+                            decision.mm_fill_base += size
+                            decision.mm_fill_notional_usd += price * size
+                            decision.mm_fee_usd += fee_usd
+                            decision.mm_realised_net_usd += realised_pnl
+                            decision.mm_gross_before_fee_usd += realised_pnl + fee_usd
+                            if decision.mm_venue_index is None:
+                                decision.mm_venue_index = vi
+                            if decision.mm_venue_id is None:
+                                venue_id = fill.get("venue_id")
+                                if isinstance(venue_id, str) and venue_id:
+                                    decision.mm_venue_id = venue_id
+                            self.mm_gross_before_fee_attributed_usd += realised_pnl + fee_usd
+                            self.mm_fee_attributed_usd += fee_usd
+                            self.mm_realised_net_attributed_usd += realised_pnl
+                            if vi is not None and 0 <= vi < NUM_VENUES:
+                                self.mm_fill_attributed_by_venue[vi] += 1
+                            markout_short = safe_float(fill.get("markout_pnl_short"))
+                            if markout_short is not None:
+                                self.mm_fill_decision_markout_short_stats.push(markout_short)
+                                decision.mm_markout_short_usd += markout_short
+                            if safe_float(fill.get("realised_pnl_usd")) is not None:
+                                self.mm_fill_decision_realised_pnl_stats.push(realised_pnl)
+                        else:
+                            self.mm_fill_unattributed_count += 1
+                            self.mm_realised_net_unattributed_usd += realised_pnl
+                            self.mm_fee_unattributed_usd += fee_usd
+                    elif fill.get("purpose") == "Hedge":
+                        source_decision_id = fill.get("source_decision_id")
+                        if isinstance(source_decision_id, str) and source_decision_id:
+                            self.hedge_fill_attributed_count += 1
+                            decision = self.decision_contributions.setdefault(
+                                source_decision_id,
+                                DecisionContribution(decision_id=source_decision_id),
+                            )
+                            decision.hedge_fill_count += 1
+                            decision.hedge_fill_notional_usd += price * size
+                            decision.hedge_fill_fee_usd += fee_usd
+                            self.hedge_fill_fee_attributed_usd += fee_usd
+                        else:
+                            self.hedge_fill_unattributed_count += 1
+                            self.hedge_fill_fee_unattributed_usd += fee_usd
 
 
 # ---------------------------------------------------------------------------
@@ -820,7 +1261,91 @@ def format_table(headers: list[str], rows: list[list[str]], indent: int = 2) -> 
     return "\n".join(lines)
 
 
-def generate_report(acc: TelemetryAccumulator) -> str:
+def measurement_validity_lines(
+    acc: TelemetryAccumulator,
+    validation_profile: str,
+) -> tuple[list[str], list[str]]:
+    lines: list[str] = []
+    failures: list[str] = []
+
+    lines.append(f"  Validation profile: {validation_profile}")
+    lines.append(
+        "  Cross-venue dispersion max: "
+        f"{fmt_f(acc.cross_venue_dispersion._max if acc.cross_venue_dispersion.n > 0 else None, 4)} USD"
+    )
+    lines.append(
+        "  PnL identity max abs(total-realised-unrealised): "
+        f"{fmt_f(acc.pnl_reconstruction_mismatch_stats._max if acc.pnl_reconstruction_mismatch_stats.n > 0 else None, 4)} USD"
+    )
+    lines.append(f"  Final q_global_tao: {fmt_f(acc.final_q_global_tao, 6)}")
+    lines.append(f"  Final pnl_total: {fmt_f(acc.final_pnl_total, 4)} USD")
+    lines.append(f"  Final pnl_realised: {fmt_f(acc.final_pnl_realised, 4)} USD")
+    lines.append(f"  Final pnl_unrealised: {fmt_f(acc.final_pnl_unrealised, 4)} USD")
+    lines.append(
+        "  Flat-inventory large-unrealised ticks: "
+        f"{acc.flat_inventory_large_unrealised_ticks}"
+    )
+    if acc.kill_reason_counts:
+        lines.append(
+            "  Kill reasons: "
+            + ", ".join(
+                f"{reason}={count}" for reason, count in acc.kill_reason_counts.most_common()
+            )
+        )
+    else:
+        lines.append("  Kill reasons: none")
+    lines.append(
+        "  MM decision totals: "
+        f"place={acc.mm_place_total} keep={acc.mm_keep_total} replace={acc.mm_replace_total} "
+        f"cancel={acc.mm_cancel_total}"
+    )
+
+    if validation_profile == "pnl-baseline":
+        if (
+            acc.cross_venue_dispersion.n > 0
+            and acc.cross_venue_dispersion._max > PNL_BASELINE_MAX_DISPERSION_USD
+        ):
+            failures.append(
+                "cross-venue dispersion exceeded "
+                f"{PNL_BASELINE_MAX_DISPERSION_USD:.2f} USD"
+            )
+        if acc.pnl_reconstruction_mismatch_stats.n > 0 and (
+            acc.pnl_reconstruction_mismatch_stats._max > PNL_BASELINE_RECON_MISMATCH_TOL_USD
+        ):
+            failures.append(
+                "PnL identity mismatch exceeded "
+                f"{PNL_BASELINE_RECON_MISMATCH_TOL_USD:.2f} USD"
+            )
+        if acc.kill_reason_counts.get("BasisHardBreach", 0) > 0:
+            failures.append("basis hard breach kill observed")
+        if (
+            acc.final_q_global_tao is not None
+            and abs(acc.final_q_global_tao) <= PNL_BASELINE_FLAT_Q_TAO
+            and acc.final_pnl_unrealised is not None
+            and abs(acc.final_pnl_unrealised) > PNL_BASELINE_LARGE_UNREALISED_USD
+        ):
+            failures.append("large unrealised PnL observed while inventory stayed near flat")
+        for label, value in [
+            ("final pnl_total", acc.final_pnl_total),
+            ("final pnl_realised", acc.final_pnl_realised),
+            ("final pnl_unrealised", acc.final_pnl_unrealised),
+        ]:
+            if value is not None and abs(value) > PNL_BASELINE_FINAL_PNL_TOL_USD:
+                failures.append(
+                    f"{label} exceeded {PNL_BASELINE_FINAL_PNL_TOL_USD:.2f} USD"
+                )
+    elif validation_profile == "mm-churn-probe":
+        if acc.mm_place_total <= 0:
+            failures.append("no MM place decisions observed")
+        if (acc.mm_keep_total + acc.mm_replace_total) <= 0:
+            failures.append("no MM keep/replace decisions observed")
+        if acc.kill_reason_counts.get("BasisHardBreach", 0) > 0:
+            failures.append("basis hard breach kill observed")
+
+    return lines, failures
+
+
+def generate_report(acc: TelemetryAccumulator, validation_profile: str = "none") -> str:
     lines: list[str] = []
 
     def section(title: str) -> None:
@@ -845,11 +1370,32 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     lines.append(f"  Ticks analyzed: {acc.tick_count} (tick {acc.first_tick} -> {acc.last_tick})")
     lines.append(f"  Time range: {ts_str(acc.first_ts_ms)} -> {ts_str(acc.last_ts_ms)} ({elapsed_s:.0f}s / {elapsed_s/3600:.2f}h)")
     lines.append(f"  Tick rate: {tick_rate:.2f} ticks/sec")
+    lines.append(f"  Segment UTC: {ts_iso(acc.first_ts_ms)} -> {ts_iso(acc.last_ts_ms)}")
     lines.append(f"  Venues: {', '.join(VENUE_NAMES)}")
+    if acc.execution_mode_counts:
+        modes = ", ".join(
+            f"{mode}={count}" for mode, count in sorted(acc.execution_mode_counts.items())
+        )
+        lines.append(f"  Execution modes: {modes}")
     lines.append(f"  Anomalies detected: {len(acc.anomalies.items)} "
                  f"(Critical={len(acc.anomalies.by_severity('Critical'))}, "
                  f"Warning={len(acc.anomalies.by_severity('Warning'))}, "
                  f"Info={len(acc.anomalies.by_severity('Info'))})")
+
+    if validation_profile != "none":
+        section("MEASUREMENT VALIDITY")
+        validity_lines, validity_failures = measurement_validity_lines(
+            acc,
+            validation_profile,
+        )
+        lines.extend(validity_lines)
+        if validity_failures:
+            lines.append("  Status: FAIL")
+            lines.append("  Failure reasons:")
+            for failure in validity_failures:
+                lines.append(f"    - {failure}")
+        else:
+            lines.append("  Status: PASS")
 
     # =====================================================================
     # CATEGORY A: Infrastructure & Connectivity
@@ -1011,9 +1557,9 @@ def generate_report(acc: TelemetryAccumulator) -> str:
         for w in trend_kf:
             rows_kf.append([
                 f"{w['tick_start']}-{w['tick_end']}",
-                f"{w.get('mean', 0):.8f}",
-                f"{w.get('p95', 0):.8f}",
-                f"{w.get('max', 0):.8f}",
+                fmt_f(w.get("mean"), 8),
+                fmt_f(w.get("p95"), 8),
+                fmt_f(w.get("max"), 8),
             ])
         lines.append(format_table(headers_kf, rows_kf))
 
@@ -1102,6 +1648,23 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     subsection("Dimension 9: Hedge Controller Performance")
     lines.append(f"  Ticks with hedges: {acc.hedges_tick_count} ({pct(acc.hedges_tick_count, acc.tick_count)})")
     lines.append(acc.hedge_delta_stats.summary_line("hedge_delta_h_t"))
+    if acc.hedge_record_total > 0:
+        lines.append(
+            f"  Hedge source attribution: records={acc.hedge_record_total} "
+            f"attributed={acc.hedge_source_attributed_count} "
+            f"coverage={pct(acc.hedge_source_attributed_count, acc.hedge_record_total)}"
+        )
+        if acc.hedge_source_fill_age_stats.n > 0:
+            lines.append(
+                acc.hedge_source_fill_age_stats.summary_line("hedge source_fill_age_ms", "ms")
+            )
+    hedge_fill_total = acc.hedge_fill_attributed_count + acc.hedge_fill_unattributed_count
+    if hedge_fill_total > 0:
+        lines.append(
+            f"  Hedge fill source attribution: attributed={acc.hedge_fill_attributed_count} "
+            f"unattributed={acc.hedge_fill_unattributed_count} "
+            f"coverage={pct(acc.hedge_fill_attributed_count, hedge_fill_total)}"
+        )
     if acc.hedges_tick_count == 0:
         lines.append("  NOTE: No hedges detected (expected in shadow mode)")
 
@@ -1182,7 +1745,15 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     if acc.reconcile_drift_tick_count > 0:
         lines.append("  Drift events per venue:")
         for i in range(NUM_VENUES):
-            lines.append(f"    {VENUE_NAMES[i]}: {acc.drift_by_venue[i]}")
+            top_kind = ""
+            if acc.drift_kind_by_venue[i]:
+                kind, count = acc.drift_kind_by_venue[i].most_common(1)[0]
+                top_kind = f" (top={kind}:{count})"
+            lines.append(f"    {VENUE_NAMES[i]}: {acc.drift_by_venue[i]}{top_kind}")
+        if acc.drift_kind_counts:
+            lines.append("  Drift events by kind:")
+            for kind, count in acc.drift_kind_counts.most_common():
+                lines.append(f"    {kind}: {count}")
     else:
         lines.append("  No reconcile drift events detected.")
 
@@ -1207,6 +1778,17 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     lines.append("")
     lines.append(acc.dollar_delta_stats.summary_line("dollar_delta_usd", "USD"))
     lines.append(acc.q_global_stats.summary_line("q_global_tao", "tao"))
+    lines.append(
+        f"  Soft-governor triggered ticks: {acc.soft_governor_ticks} "
+        f"({pct(acc.soft_governor_ticks, acc.tick_count)})"
+    )
+    if acc.soft_governor_reason_counts:
+        lines.append("  Soft-governor reasons:")
+        for reason, count in acc.soft_governor_reason_counts.most_common():
+            lines.append(f"    {reason}: {count}")
+        lines.append("  Soft-governor blocked venue ticks:")
+        for i in range(NUM_VENUES):
+            lines.append(f"    {VENUE_NAMES[i]}: {acc.soft_governor_blocked_ticks[i]}")
 
     lines.append("")
     lines.append("  Order Action Counts:")
@@ -1214,9 +1796,245 @@ def generate_report(acc: TelemetryAccumulator) -> str:
         lines.append(f"    {action}: {count}")
 
     lines.append("")
+    lines.append("  MM Order Management:")
+    lines.append(acc.mm_keep_count_stats.summary_line("mm keep_count"))
+    lines.append(acc.mm_replace_count_stats.summary_line("mm replace_count"))
+    lines.append(acc.mm_place_count_stats.summary_line("mm place_count"))
+    lines.append(acc.mm_cancel_count_stats.summary_line("mm cancel_count"))
+    mm_decision_total = acc.mm_keep_total + acc.mm_replace_total
+    lines.append(
+        f"  MM decision totals: keep={acc.mm_keep_total} replace={acc.mm_replace_total} "
+        f"replace_share={pct(acc.mm_replace_total, mm_decision_total)}"
+    )
+    if acc.mm_inventory_reducing_counts:
+        lines.append(
+            "  Inventory-reducing MM decisions: "
+            + ", ".join(
+                f"{outcome}={count}"
+                for outcome, count in acc.mm_inventory_reducing_counts.most_common()
+            )
+        )
+    if acc.mm_keep_reason_counts:
+        lines.append("  Top keep reasons:")
+        for reason, count in acc.mm_keep_reason_counts.most_common(5):
+            lines.append(f"    {reason}: {count}")
+    if acc.mm_replace_reason_counts:
+        lines.append("  Top replace reasons:")
+        for reason, count in acc.mm_replace_reason_counts.most_common(5):
+            lines.append(f"    {reason}: {count}")
+    if acc.mm_keep_utility_tier_counts or acc.mm_replace_utility_tier_counts:
+        lines.append("  MM utility tiers:")
+        tier_keys = sorted(
+            set(acc.mm_keep_utility_tier_counts.keys())
+            | set(acc.mm_replace_utility_tier_counts.keys())
+        )
+        for tier in tier_keys:
+            lines.append(
+                f"    {tier}: keep={acc.mm_keep_utility_tier_counts.get(tier, 0)} "
+                f"replace={acc.mm_replace_utility_tier_counts.get(tier, 0)}"
+            )
+    if acc.mm_keep_venue_role_counts or acc.mm_replace_venue_role_counts:
+        lines.append("  MM venue roles:")
+        role_keys = sorted(
+            set(acc.mm_keep_venue_role_counts.keys())
+            | set(acc.mm_replace_venue_role_counts.keys())
+        )
+        for role in role_keys:
+            lines.append(
+                f"    {role}: keep={acc.mm_keep_venue_role_counts.get(role, 0)} "
+                f"replace={acc.mm_replace_venue_role_counts.get(role, 0)}"
+            )
+    lines.append("  MM attribution coverage:")
+    lines.append(
+        f"    decision_records={acc.mm_decision_record_total} "
+        f"with_order_lineage={acc.mm_decision_order_link_total} "
+        f"({pct(acc.mm_decision_order_link_total, acc.mm_decision_record_total)})"
+    )
+    mm_fill_total = acc.mm_fill_attributed_count + acc.mm_fill_unattributed_count
+    lines.append(
+        f"    mm_fills_attributed={acc.mm_fill_attributed_count} "
+        f"unattributed={acc.mm_fill_unattributed_count} "
+        f"coverage={pct(acc.mm_fill_attributed_count, mm_fill_total)}"
+    )
+    if acc.mm_fill_decision_markout_short_stats.n > 0:
+        lines.append(
+            acc.mm_fill_decision_markout_short_stats.summary_line(
+                "mm attributable markout_pnl_short", "USD"
+            )
+        )
+    if acc.mm_fill_decision_realised_pnl_stats.n > 0:
+        lines.append(
+            acc.mm_fill_decision_realised_pnl_stats.summary_line(
+                "mm attributable realised_pnl_usd", "USD"
+            )
+        )
+
+    decision_contributions = [
+        contribution
+        for contribution in acc.decision_contributions.values()
+        if contribution.mm_fill_count > 0
+        or contribution.hedge_record_count > 0
+        or contribution.hedge_fill_count > 0
+    ]
+    if decision_contributions:
+        lines.append("")
+        lines.append("  Decision-Level Contribution:")
+        lines.append(
+            "    mm_gross_before_fee_usd = mm_realised_net_usd + mm_fee_usd; "
+            "hedge_exec_cost_model_usd uses hedge intent exec_cost * size"
+        )
+        headers_dc = [
+            "Decision",
+            "Venue",
+            "MmFills",
+            "MmGross",
+            "MmFees",
+            "MmNet",
+            "HedgeFills",
+            "HedgeExecModel",
+            "NetAfterHedge",
+        ]
+        rows_dc = []
+        ranked_decisions = sorted(
+            decision_contributions,
+            key=lambda contribution: (
+                abs(contribution.net_after_hedge_exec_model_usd),
+                abs(contribution.mm_realised_net_usd),
+                contribution.decision_id,
+            ),
+            reverse=True,
+        )
+        for contribution in ranked_decisions[:10]:
+            rows_dc.append([
+                contribution.decision_id,
+                contribution.mm_venue_id or "n/a",
+                str(contribution.mm_fill_count),
+                fmt_f(contribution.mm_gross_before_fee_usd, 4),
+                fmt_f(contribution.mm_fee_usd, 4),
+                fmt_f(contribution.mm_realised_net_usd, 4),
+                str(contribution.hedge_fill_count),
+                fmt_f(contribution.hedge_exec_cost_model_usd, 4),
+                fmt_f(contribution.net_after_hedge_exec_model_usd, 4),
+            ])
+        lines.append(format_table(headers_dc, rows_dc))
+        if len(ranked_decisions) > len(rows_dc):
+            lines.append(
+                f"    showing top {len(rows_dc)} of {len(ranked_decisions)} decisions by "
+                "|net_after_hedge_exec_model_usd|"
+            )
+
+        lines.append("")
+        lines.append("  Venue Contribution After Hedge:")
+        headers_vc = [
+            "Venue",
+            "Decisions",
+            "MmGross",
+            "MmFees",
+            "MmNet",
+            "HedgeFee",
+            "HedgeExecModel",
+            "NetAfterHedge",
+        ]
+        venue_contrib: dict[str, dict[str, float]] = defaultdict(
+            lambda: {
+                "decisions": 0.0,
+                "mm_gross": 0.0,
+                "mm_fees": 0.0,
+                "mm_net": 0.0,
+                "hedge_fee": 0.0,
+                "hedge_exec_model": 0.0,
+                "net_after_hedge": 0.0,
+            }
+        )
+        for contribution in decision_contributions:
+            venue_key = contribution.mm_venue_id or "unassigned"
+            bucket = venue_contrib[venue_key]
+            bucket["decisions"] += 1.0
+            bucket["mm_gross"] += contribution.mm_gross_before_fee_usd
+            bucket["mm_fees"] += contribution.mm_fee_usd
+            bucket["mm_net"] += contribution.mm_realised_net_usd
+            bucket["hedge_fee"] += contribution.hedge_fill_fee_usd
+            bucket["hedge_exec_model"] += contribution.hedge_exec_cost_model_usd
+            bucket["net_after_hedge"] += contribution.net_after_hedge_exec_model_usd
+
+        rows_vc = []
+        for venue_key, bucket in sorted(
+            venue_contrib.items(),
+            key=lambda item: item[1]["net_after_hedge"],
+            reverse=True,
+        ):
+            rows_vc.append([
+                venue_key,
+                str(int(bucket["decisions"])),
+                fmt_f(bucket["mm_gross"], 4),
+                fmt_f(bucket["mm_fees"], 4),
+                fmt_f(bucket["mm_net"], 4),
+                fmt_f(bucket["hedge_fee"], 4),
+                fmt_f(bucket["hedge_exec_model"], 4),
+                fmt_f(bucket["net_after_hedge"], 4),
+            ])
+        lines.append(format_table(headers_vc, rows_vc))
+
+        lines.append("")
+        lines.append("  Unattributed residual:")
+        lines.append(
+            f"    mm_realised_net_unattributed={fmt_f(acc.mm_realised_net_unattributed_usd, 4)} USD"
+        )
+        lines.append(f"    mm_fee_unattributed={fmt_f(acc.mm_fee_unattributed_usd, 4)} USD")
+        lines.append(
+            f"    hedge_fill_fee_unattributed={fmt_f(acc.hedge_fill_fee_unattributed_usd, 4)} USD"
+        )
+        lines.append(
+            "    hedge_exec_cost_model_unattributed="
+            f"{fmt_f(acc.hedge_exec_cost_model_unattributed_usd, 4)} USD"
+        )
+
+    lines.append("")
     lines.append("  Orders Per Venue:")
     for i in range(NUM_VENUES):
         lines.append(f"    {VENUE_NAMES[i]}: {acc.orders_per_venue[i]}")
+
+    lines.append("")
+    lines.append("  Execution Scorecard:")
+    headers_exec = [
+        "Venue",
+        "PlaceI",
+        "ReplaceI",
+        "CancelI",
+        "PlaceAck",
+        "CancelAck",
+        "PlaceRej",
+        "Fills",
+        "FillBase",
+    ]
+    rows_exec = []
+    for i, venue in enumerate(VENUE_NAMES):
+        counts = acc.order_status_action_counts[i]
+        rows_exec.append([
+            venue,
+            str(counts.get("place_intent", 0)),
+            str(counts.get("replace_intent", 0)),
+            str(counts.get("cancel_intent", 0)),
+            str(counts.get("place_ack", 0)),
+            str(counts.get("cancel_ack", 0)),
+            str(counts.get("place_reject", 0)),
+            str(acc.venue_fill_counts[i]),
+            fmt_f(acc.venue_fill_size_base[i], 4),
+        ])
+    lines.append(format_table(headers_exec, rows_exec))
+
+    if any(acc.mm_decisions_by_venue):
+        lines.append("")
+        lines.append("  MM Keep/Replace By Venue:")
+        headers_mm = ["Venue", "KeepD", "ReplaceD"]
+        rows_mm = []
+        for i, venue in enumerate(VENUE_NAMES):
+            rows_mm.append([
+                venue,
+                str(acc.mm_decisions_by_venue[i].get("keep", 0)),
+                str(acc.mm_decisions_by_venue[i].get("replace", 0)),
+            ])
+        lines.append(format_table(headers_mm, rows_mm))
 
     lines.append("")
     lines.append("  Risk Event Types:")
@@ -1231,7 +2049,13 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     lines.append(acc.pnl_total_stats.summary_line("pnl_total", "USD"))
     lines.append(acc.pnl_realised_stats.summary_line("pnl_realised", "USD"))
     if acc.pnl_total_stats.n > 0:
-        lines.append(f"  Final pnl_total: {fmt_f(acc.pnl_total_stats._vals[-1] if acc.pnl_total_stats._vals else None, 4)} USD")
+        lines.append(f"  Peak pnl_total: {fmt_f(acc.pnl_total_stats._max, 4)} USD")
+        lines.append(f"  Trough pnl_total: {fmt_f(acc.pnl_total_stats._min, 4)} USD")
+        lines.append(f"  Final pnl_total: {fmt_f(acc.final_pnl_total, 4)} USD")
+    if acc.final_pnl_realised is not None:
+        lines.append(f"  Final pnl_realised: {fmt_f(acc.final_pnl_realised, 4)} USD")
+    if acc.final_pnl_unrealised is not None:
+        lines.append(f"  Final pnl_unrealised: {fmt_f(acc.final_pnl_unrealised, 4)} USD")
 
     # Dimension 14
     subsection("Dimension 14: Anomaly Summary")
@@ -1343,29 +2167,40 @@ def generate_report(acc: TelemetryAccumulator) -> str:
 # Streaming reader
 # ---------------------------------------------------------------------------
 
-def stream_records(path: Path, max_ticks: int = 0) -> TelemetryAccumulator:
+def stream_records(
+    path: Path,
+    max_ticks: int = 0,
+    execution_mode: str = "all",
+    last_segment: bool = False,
+    tail_bytes: int = 0,
+) -> TelemetryAccumulator:
     acc = TelemetryAccumulator()
     count = 0
     t0 = time.monotonic()
 
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            acc.process(rec)
-            count += 1
-            if max_ticks > 0 and count >= max_ticks:
-                break
-            if count % 10000 == 0:
-                elapsed = time.monotonic() - t0
-                print(f"  ... processed {count} ticks ({elapsed:.1f}s)", file=sys.stderr)
+    base_records = (
+        iter_json_objects_from_tail(path, tail_bytes)
+        if tail_bytes > 0
+        else iter_json_objects(path)
+    )
+
+    if last_segment:
+        if execution_mode == "all":
+            raise ValueError("--last-segment requires --execution-mode to be set")
+        records = last_execution_segment_from_iter(base_records, execution_mode)
+    else:
+        records = base_records
+
+    for rec in records:
+        if execution_mode != "all" and rec.get("execution_mode") != execution_mode:
+            continue
+        acc.process(rec)
+        count += 1
+        if max_ticks > 0 and count >= max_ticks:
+            break
+        if count % 10000 == 0:
+            elapsed = time.monotonic() - t0
+            print(f"  ... processed {count} ticks ({elapsed:.1f}s)", file=sys.stderr)
 
     elapsed = time.monotonic() - t0
     print(f"  Processed {count} ticks in {elapsed:.1f}s ({count/elapsed:.0f} ticks/sec)", file=sys.stderr)
@@ -1416,8 +2251,23 @@ def save_checkpoint(acc: TelemetryAccumulator, path: Path) -> None:
 
     snapshot["risk"] = {
         "kill_switch_count": acc.kill_switch_count,
+        "kill_reasons": dict(acc.kill_reason_counts),
         "regime_transitions": acc.risk_regime_transitions,
         "would_send_zero_pct": round(100.0 * acc.would_send_zero_ticks / acc.tick_count, 4) if acc.tick_count > 0 else 0,
+    }
+
+    snapshot["pnl_validity"] = {
+        "final_q_global_tao": round(acc.final_q_global_tao, 6) if acc.final_q_global_tao is not None else None,
+        "final_pnl_total": round(acc.final_pnl_total, 6) if acc.final_pnl_total is not None else None,
+        "final_pnl_realised": round(acc.final_pnl_realised, 6) if acc.final_pnl_realised is not None else None,
+        "final_pnl_unrealised": round(acc.final_pnl_unrealised, 6) if acc.final_pnl_unrealised is not None else None,
+        "pnl_reconstruction_mismatch_max": round(acc.pnl_reconstruction_mismatch_stats._max, 6)
+        if acc.pnl_reconstruction_mismatch_stats.n > 0
+        else None,
+        "flat_inventory_large_unrealised_ticks": acc.flat_inventory_large_unrealised_ticks,
+        "mm_place_total": acc.mm_place_total,
+        "mm_keep_total": acc.mm_keep_total,
+        "mm_replace_total": acc.mm_replace_total,
     }
 
     snapshot["anomalies"] = {
@@ -1496,9 +2346,47 @@ def regression_scorecard(prev_path: Path, curr_snapshot: dict) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Comprehensive 15-dimension telemetry analyzer.")
     parser.add_argument("--telemetry", required=True, help="Path to telemetry.jsonl")
+    parser.add_argument(
+        "--execution-mode",
+        choices=("all", "shadow", "paper", "live"),
+        default="all",
+        help="Filter rows by execution_mode before analysis (default: all)",
+    )
+    parser.add_argument(
+        "--last-segment",
+        action="store_true",
+        help="Only analyze the last contiguous segment for the chosen execution mode",
+    )
     parser.add_argument("--max-ticks", type=int, default=0, help="Max ticks to process (0=all)")
+    parser.add_argument(
+        "--tail-bytes",
+        type=int,
+        default=0,
+        help=(
+            "Only analyze the last N bytes of the telemetry file. "
+            "Use this for production-safe triage on large rolling files."
+        ),
+    )
+    parser.add_argument(
+        "--unsafe-allow-large-live-file",
+        action="store_true",
+        help=(
+            "Allow a full scan of the rolling production telemetry file even when it is very large. "
+            "This is intentionally unsafe on the live host."
+        ),
+    )
     parser.add_argument("--checkpoint-json", type=str, default=None, help="Path to save checkpoint JSON")
     parser.add_argument("--prev-checkpoint", type=str, default=None, help="Path to previous checkpoint JSON for regression comparison")
+    parser.add_argument(
+        "--validation-profile",
+        choices=("none", "pnl-baseline", "mm-churn-probe"),
+        default="none",
+        help=(
+            "Apply measurement validity checks for a specific artifact type. "
+            "Use pnl-baseline for coherent flat paper baselines and mm-churn-probe "
+            "for decision-exercising paper/shadow probes."
+        ),
+    )
     parser.add_argument("--output", type=str, default=None, help="Path to write report (default: stdout)")
     return parser.parse_args()
 
@@ -1511,14 +2399,34 @@ def main() -> int:
         print(f"ERROR: telemetry file not found: {telemetry_path}", file=sys.stderr)
         return 1
 
+    try:
+        guard_unsafe_live_scan(
+            telemetry_path,
+            tail_bytes=args.tail_bytes,
+            unsafe_allow_large_live_file=args.unsafe_allow_large_live_file,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     print(f"Analyzing {telemetry_path} ...", file=sys.stderr)
-    acc = stream_records(telemetry_path, max_ticks=args.max_ticks)
+    try:
+        acc = stream_records(
+            telemetry_path,
+            max_ticks=args.max_ticks,
+            execution_mode=args.execution_mode,
+            last_segment=args.last_segment,
+            tail_bytes=args.tail_bytes,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     if acc.tick_count == 0:
         print("ERROR: no ticks found in telemetry", file=sys.stderr)
         return 1
 
-    report = generate_report(acc)
+    report = generate_report(acc, validation_profile=args.validation_profile)
 
     # Checkpoint
     if args.checkpoint_json:

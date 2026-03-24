@@ -466,6 +466,7 @@ def parse_run_log(
     dict[str, dict[str, Any]],
     dict[str, dict[str, Any]],
     dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
 ]:
     audit_reconnect_counts: dict[tuple[str, str], int] = defaultdict(int)
     signature_reconnect_counts: dict[tuple[str, str], int] = defaultdict(int)
@@ -478,6 +479,7 @@ def parse_run_log(
     extended_cfg_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     ping_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     lighter_ts_fallback_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    aster_book_recovery_stats: dict[str, dict[str, Any]] = defaultdict(dict)
 
     with run_log_path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -523,6 +525,7 @@ def parse_run_log(
                         "rest_success_count",
                         "rest_fail_count",
                         "rest_inject_count",
+                        "rest_suppressed_count",
                     ):
                         update_max_stat(stats, f"max_{field}", safe_int(pairs.get(field)))
                     age_ms = safe_float(pairs.get("age_ms"))
@@ -639,6 +642,19 @@ def parse_run_log(
                     for key, raw in pairs.items():
                         update_max_numeric_token(stats, key, raw)
 
+                if "component=book_recovery" in line and "venue=aster" in line:
+                    stage = str(pairs.get("stage", "unknown"))
+                    phase = str(pairs.get("phase", "unknown"))
+                    stats = aster_book_recovery_stats[f"{stage}/{phase}"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    stats["stage"] = stage
+                    stats["phase"] = phase
+                    failure_class = pairs.get("failure_class")
+                    if failure_class:
+                        stats["last_failure_class"] = failure_class
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
             lower = line.lower()
             reason = infer_reason_from_line(lower)
             if reason is None:
@@ -658,6 +674,7 @@ def parse_run_log(
         extended_cfg_stats,
         ping_stats,
         lighter_ts_fallback_stats,
+        aster_book_recovery_stats,
     )
 
 
@@ -825,6 +842,7 @@ def build_report(
     extended_cfg_stats: dict[str, dict[str, Any]],
     ping_stats: dict[str, dict[str, Any]],
     lighter_ts_fallback_stats: dict[str, dict[str, Any]],
+    aster_book_recovery_stats: dict[str, dict[str, Any]],
     cap_hits_summary: CapHitsSummary | None,
 ) -> str:
     lines: list[str] = []
@@ -955,6 +973,7 @@ def build_report(
                     fmt_int(safe_int(stats.get("max_rest_success_count"))),
                     fmt_int(safe_int(stats.get("max_rest_fail_count"))),
                     fmt_int(safe_int(stats.get("max_rest_inject_count"))),
+                    fmt_int(safe_int(stats.get("max_rest_suppressed_count"))),
                     fmt_ms(safe_float(stats.get("last_age_ms"))),
                     fmt_int(safe_int(stats.get("last_threshold_ms"))),
                 ]
@@ -967,6 +986,7 @@ def build_report(
                     "max_rest_success_count",
                     "max_rest_fail_count",
                     "max_rest_inject_count",
+                    "max_rest_suppressed_count",
                     "last_age_ms",
                     "last_threshold_ms",
                 ],
@@ -1155,6 +1175,55 @@ def build_report(
         lines.append("_No ping audit entries found in run.log._")
     lines.append("")
 
+    lines.append("## Aster Book Recovery Audit (WS_AUDIT)")
+    if aster_book_recovery_stats:
+        rows = []
+        for stage_phase, stats in sorted(aster_book_recovery_stats.items()):
+            rows.append(
+                [
+                    stage_phase,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    str(stats.get("last_failure_class") or "n/a"),
+                    fmt_int(safe_int(stats.get("max_http_status"))),
+                    fmt_int(safe_int(stats.get("max_fail_streak"))),
+                    fmt_int(safe_int(stats.get("max_cooldown_ms"))),
+                    fmt_int(safe_int(stats.get("max_weight_1m"))),
+                    fmt_int(safe_int(stats.get("max_buffered_before"))),
+                    fmt_int(safe_int(stats.get("max_applied_count"))),
+                    fmt_int(safe_int(stats.get("max_snap_id"))),
+                    fmt_int(safe_int(stats.get("max_update_end"))),
+                    fmt_int(safe_int(stats.get("max_current_last"))),
+                    fmt_int(safe_int(stats.get("max_stale_ms"))),
+                    fmt_int(safe_int(stats.get("max_anchor_age_ms"))),
+                    fmt_int(safe_int(stats.get("max_book_age_ms"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "stage/phase",
+                    "samples",
+                    "last_failure_class",
+                    "max_http_status",
+                    "max_fail_streak",
+                    "max_cooldown_ms",
+                    "max_weight_1m",
+                    "max_buffered_before",
+                    "max_applied_count",
+                    "max_snap_id",
+                    "max_update_end",
+                    "max_current_last",
+                    "max_stale_ms",
+                    "max_anchor_age_ms",
+                    "max_book_age_ms",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=book_recovery` entries found in run.log._")
+    lines.append("")
+
     lines.append("## Lighter Timestamp Fallback Audit (WS_AUDIT)")
     if lighter_ts_fallback_stats:
         rows = []
@@ -1292,6 +1361,7 @@ def main() -> int:
             extended_cfg_stats,
             ping_stats,
             lighter_ts_fallback_stats,
+            aster_book_recovery_stats,
         ) = parse_run_log(run_log_path)
         cap_hits = parse_market_rx_stats(market_rx_path) if market_rx_path.exists() else None
     except ValueError as exc:
@@ -1315,6 +1385,7 @@ def main() -> int:
         extended_cfg_stats=extended_cfg_stats,
         ping_stats=ping_stats,
         lighter_ts_fallback_stats=lighter_ts_fallback_stats,
+        aster_book_recovery_stats=aster_book_recovery_stats,
         cap_hits_summary=cap_hits,
     )
 

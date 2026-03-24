@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::UNIX_EPOCH;
 
 use prometheus::{Encoder, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
 use serde::Serialize;
@@ -315,6 +316,9 @@ pub fn start_metrics_server(
         .as_millis() as i64;
     let trade_mode_str = std::env::var("PARAPHINA_TRADE_MODE").unwrap_or_default();
     let config_id = std::env::var("PARAPHINA_CONFIG_ID").unwrap_or_default();
+    let initial_kill_events_len = fs::metadata(audit_dir.join("kill_events.jsonl"))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let addr = addr.to_string();
     std::thread::spawn(move || {
         let Ok(server) = Server::http(addr.as_str()) else {
@@ -361,13 +365,19 @@ pub fn start_metrics_server(
                         .as_millis() as i64;
                     let uptime_sec = (now_ms - start_time_ms) / 1000;
                     let last_tick = metrics.get_last_tick_ms();
-                    let tick_age_ms = if last_tick > 0 { now_ms - last_tick } else { -1 };
+                    let tick_age_ms = if last_tick > 0 {
+                        now_ms - last_tick
+                    } else {
+                        -1
+                    };
 
-                    // Check for kill events in the audit dir.
-                    let kill_active = audit_dir.join("kill_events.jsonl").exists()
-                        && fs::metadata(audit_dir.join("kill_events.jsonl"))
-                            .map(|m| m.len() > 0)
-                            .unwrap_or(false);
+                    // Only report kills from the current process session so stale
+                    // historical artifacts do not fail a fresh soak.
+                    let kill_active = kill_events_active_for_session(
+                        &audit_dir,
+                        start_time_ms,
+                        initial_kill_events_len,
+                    );
 
                     let detail = HealthDetail {
                         healthy: health.is_healthy(),
@@ -387,11 +397,8 @@ pub fn start_metrics_server(
                     Response::from_string(payload)
                         .with_status_code(status)
                         .with_header(
-                            Header::from_bytes(
-                                &b"Content-Type"[..],
-                                &b"application/json"[..],
-                            )
-                            .unwrap(),
+                            Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                                .unwrap(),
                         )
                 }
                 "/ready" => {
@@ -597,4 +604,126 @@ pub fn default_audit_dir() -> PathBuf {
         }
     }
     PathBuf::from("./live_audit")
+}
+
+fn kill_events_active_for_session(
+    audit_dir: &Path,
+    start_time_ms: i64,
+    initial_kill_events_len: u64,
+) -> bool {
+    let path = audit_dir.join("kill_events.jsonl");
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() == 0 {
+        return false;
+    }
+    if metadata.len() > initial_kill_events_len {
+        return true;
+    }
+    match metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+    {
+        Some(modified_ms) => modified_ms >= start_time_ms,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kill_events_active_for_session, start_metrics_server, HealthState, LiveMetrics};
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::sleep;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn stale_nonempty_kill_file_is_not_active_for_new_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("kill_events.jsonl");
+        fs::write(&path, "{\"kill_reason\":\"old\"}\n").expect("write kill file");
+        let modified_ms = fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime epoch")
+            .as_millis() as i64;
+
+        assert!(!kill_events_active_for_session(
+            dir.path(),
+            modified_ms + 1,
+            fs::metadata(&path).expect("metadata").len(),
+        ));
+    }
+
+    #[test]
+    fn current_session_kill_file_is_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let start_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("now")
+            .as_millis() as i64;
+        sleep(Duration::from_millis(5));
+        fs::write(
+            dir.path().join("kill_events.jsonl"),
+            "{\"kill_reason\":\"new\"}\n",
+        )
+        .expect("write kill file");
+
+        assert!(kill_events_active_for_session(dir.path(), start_time_ms, 0));
+    }
+
+    #[test]
+    fn empty_kill_file_is_not_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("kill_events.jsonl"), "").expect("write empty kill file");
+
+        assert!(!kill_events_active_for_session(dir.path(), 0, 0));
+    }
+
+    #[test]
+    fn health_detail_ignores_stale_historical_kill_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("kill_events.jsonl"),
+            "{\"kill_reason\":\"historical\"}\n",
+        )
+        .expect("write stale kill file");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind port");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        let health = HealthState::new();
+        health.set_ready(true);
+        let metrics = LiveMetrics::new();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("now")
+            .as_millis() as i64;
+        metrics.inc_tick(now_ms);
+        start_metrics_server(&addr.to_string(), metrics, health, dir.path().to_path_buf());
+
+        let mut payload = String::new();
+        for _ in 0..20 {
+            if let Ok(mut stream) = TcpStream::connect(addr) {
+                stream
+                    .write_all(b"GET /health/detail HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                    .expect("write request");
+                stream.read_to_string(&mut payload).expect("read response");
+                break;
+            }
+            sleep(Duration::from_millis(25));
+        }
+
+        assert!(
+            payload.contains("\"kill_events_present\":false"),
+            "unexpected health response: {payload}"
+        );
+    }
 }

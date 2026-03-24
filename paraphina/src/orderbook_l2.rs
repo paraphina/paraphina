@@ -286,7 +286,7 @@ mod tests {
         // Snapshots reset last_seq to 0, so any delta with seq > 0 succeeds.
         book.apply_snapshot(&[], &[], 5).unwrap();
         assert_eq!(book.last_seq(), 0); // snapshot resets to 0
-        // Delta with seq=4 is accepted since 4 > 0.
+                                        // Delta with seq=4 is accepted since 4 > 0.
         book.apply_delta(&[], 4).unwrap();
         assert_eq!(book.last_seq(), 4);
         // Delta with seq <= last_seq is still rejected.

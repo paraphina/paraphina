@@ -27,8 +27,9 @@ use super::super::gateway::{
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, FundingUpdate, LiquidationSnapshot,
-    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
+    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, OpenOrderSnapshot, OrderSnapshot,
+    PositionSnapshot, TopOfBook,
 };
 use crate::live::MarketPublisher;
 use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
@@ -107,6 +108,222 @@ fn aster_audit_reconnect(reason: &'static str) {
         "WS_AUDIT venue=aster reconnect_reason={} count={}",
         reason, *count
     );
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FreshnessAges {
+    ws_rx_age_ms: u64,
+    data_rx_age_ms: u64,
+    parsed_age_ms: u64,
+    pub_age_ms: u64,
+    book_age_ms: u64,
+    anchor_age_ms: u64,
+}
+
+fn aster_freshness_ages(freshness: &Freshness, connect_start_ns: u64) -> FreshnessAges {
+    let now = mono_now_ns();
+    let ws_rx = freshness.last_ws_rx_ns.load(Ordering::Relaxed);
+    let data_rx = freshness.last_data_rx_ns.load(Ordering::Relaxed);
+    let parsed = freshness.last_parsed_ns.load(Ordering::Relaxed);
+    let published = freshness.last_published_ns.load(Ordering::Relaxed);
+    let book = freshness.last_book_event_ns.load(Ordering::Relaxed);
+    let anchor = freshness.anchor_with_connect_start(connect_start_ns);
+    FreshnessAges {
+        ws_rx_age_ms: if ws_rx == 0 { 0 } else { age_ms(now, ws_rx) },
+        data_rx_age_ms: if data_rx == 0 {
+            0
+        } else {
+            age_ms(now, data_rx)
+        },
+        parsed_age_ms: if parsed == 0 { 0 } else { age_ms(now, parsed) },
+        pub_age_ms: if published == 0 {
+            0
+        } else {
+            age_ms(now, published)
+        },
+        book_age_ms: if book == 0 { 0 } else { age_ms(now, book) },
+        anchor_age_ms: if anchor == 0 { 0 } else { age_ms(now, anchor) },
+    }
+}
+
+fn aster_audit_book_recovery(stage: &'static str, phase: &'static str, fields: &[(&str, String)]) {
+    if !aster_ws_audit_enabled() {
+        return;
+    }
+    let mut line = format!(
+        "WS_AUDIT venue=aster component=book_recovery stage={} phase={}",
+        stage, phase
+    );
+    for (key, value) in fields {
+        line.push(' ');
+        line.push_str(key);
+        line.push('=');
+        line.push_str(value);
+    }
+    eprintln!("{line}");
+}
+
+fn aster_audit_funding_ws(stage: &'static str, fields: &[(&str, String)]) {
+    if !aster_ws_audit_enabled() {
+        return;
+    }
+    let mut line = format!("WS_AUDIT venue=aster component=funding_ws stage={stage}");
+    for (key, value) in fields {
+        line.push(' ');
+        line.push_str(key);
+        line.push('=');
+        line.push_str(value);
+    }
+    eprintln!("{line}");
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AsterPublicRestBudgetState {
+    pub fail_streak: u32,
+    pub next_allowed_ns: u64,
+    pub last_http_status: Option<u16>,
+    pub last_weight_1m: Option<u64>,
+    pub last_cooldown_ms: u64,
+    pub last_failure_class: &'static str,
+    pub shared_cooldown_until_ns: u64,
+    pub shared_cooldown_ms: u64,
+    pub shared_http_status: Option<u16>,
+    pub shared_weight_1m: Option<u64>,
+    pub shared_consumer: &'static str,
+    pub shared_priority: &'static str,
+    pub recovery_active: bool,
+}
+
+impl Default for AsterPublicRestBudgetState {
+    fn default() -> Self {
+        Self {
+            fail_streak: 0,
+            next_allowed_ns: 0,
+            last_http_status: None,
+            last_weight_1m: None,
+            last_cooldown_ms: 0,
+            last_failure_class: "",
+            shared_cooldown_until_ns: 0,
+            shared_cooldown_ms: 0,
+            shared_http_status: None,
+            shared_weight_1m: None,
+            shared_consumer: "",
+            shared_priority: "",
+            recovery_active: false,
+        }
+    }
+}
+
+pub type AsterPublicRestBudgetHandle = Arc<StdMutex<AsterPublicRestBudgetState>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsterProbeBudgetDecision {
+    Allow,
+    Suppressed {
+        reason: &'static str,
+        cooldown_ms: u64,
+        fail_streak: u32,
+        shared_consumer: &'static str,
+        shared_priority: &'static str,
+    },
+}
+
+fn classify_snapshot_failure(status: Option<u16>) -> &'static str {
+    match status {
+        Some(418) => "ip_banned",
+        Some(429) => "rate_limited",
+        Some(code) if (500..=599).contains(&code) => "upstream_5xx",
+        Some(code) if (400..=499).contains(&code) => "http_4xx",
+        Some(_) => "http_other",
+        None => "transport_or_parse",
+    }
+}
+
+fn snapshot_backoff_ms(status: Option<u16>, fail_streak: u32, jitter_seed_ns: u64) -> u64 {
+    let (base_ms, max_ms) = match status {
+        Some(418) => (30_000_u64, 120_000_u64),
+        Some(429) => (1_000_u64, 15_000_u64),
+        Some(code) if (500..=599).contains(&code) => (500_u64, 5_000_u64),
+        Some(code) if (400..=499).contains(&code) => (750_u64, 5_000_u64),
+        Some(_) => (500_u64, 3_000_u64),
+        None => (500_u64, 3_000_u64),
+    };
+    let exp = base_ms.saturating_mul(1_u64 << fail_streak.saturating_sub(1).min(6));
+    let capped = exp.min(max_ms);
+    let jitter_window = (capped / 3).max(1);
+    capped
+        .saturating_add(jitter_seed_ns % (jitter_window + 1))
+        .min(max_ms)
+}
+
+fn shared_public_rest_backoff_ms(
+    status: Option<u16>,
+    fail_streak: u32,
+    jitter_seed_ns: u64,
+) -> u64 {
+    match status {
+        Some(418) | Some(429) => snapshot_backoff_ms(status, fail_streak.max(1), jitter_seed_ns),
+        _ => 0,
+    }
+}
+
+fn snapshot_weight_1m(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers.iter().find_map(|(name, value)| {
+        if name.as_str().eq_ignore_ascii_case("x-mbx-used-weight-1m") {
+            value.to_str().ok().and_then(|raw| raw.parse::<u64>().ok())
+        } else {
+            None
+        }
+    })
+}
+
+pub fn aster_probe_budget_decision(
+    handle: &AsterPublicRestBudgetHandle,
+) -> AsterProbeBudgetDecision {
+    let state = *handle
+        .lock()
+        .expect("aster public rest budget mutex poisoned");
+    let now_ns = mono_now_ns();
+    if state.shared_cooldown_until_ns > now_ns {
+        return AsterProbeBudgetDecision::Suppressed {
+            reason: "shared_cooldown",
+            cooldown_ms: age_ms(state.shared_cooldown_until_ns, now_ns),
+            fail_streak: state.fail_streak,
+            shared_consumer: state.shared_consumer,
+            shared_priority: state.shared_priority,
+        };
+    }
+    if state.recovery_active || state.fail_streak > 0 {
+        return AsterProbeBudgetDecision::Suppressed {
+            reason: "recovery_active",
+            cooldown_ms: 0,
+            fail_streak: state.fail_streak,
+            shared_consumer: state.shared_consumer,
+            shared_priority: state.shared_priority,
+        };
+    }
+    AsterProbeBudgetDecision::Allow
+}
+
+pub fn aster_note_probe_rate_limit(
+    handle: &AsterPublicRestBudgetHandle,
+    status: u16,
+    weight_1m: Option<u64>,
+) -> AsterPublicRestBudgetState {
+    let mut state = handle
+        .lock()
+        .expect("aster public rest budget mutex poisoned");
+    let cooldown_ms = shared_public_rest_backoff_ms(Some(status), state.fail_streak, mono_now_ns());
+    if cooldown_ms > 0 {
+        state.shared_cooldown_ms = cooldown_ms;
+        state.shared_cooldown_until_ns =
+            mono_now_ns().saturating_add(cooldown_ms.saturating_mul(1_000_000));
+    }
+    state.shared_http_status = Some(status);
+    state.shared_weight_1m = weight_1m;
+    state.shared_consumer = "probe";
+    state.shared_priority = "optional";
+    *state
 }
 
 #[derive(Debug, Default)]
@@ -209,6 +426,7 @@ pub struct AsterConnector {
     market_publisher: MarketPublisher,
     recorder: Option<Mutex<AsterRecorder>>,
     freshness: Arc<Freshness>,
+    snapshot_recovery: AsterPublicRestBudgetHandle,
     is_fixture: bool,
 }
 
@@ -226,12 +444,6 @@ impl AsterConnector {
             ASTER_MARKET_PUB_QUEUE_CAP_LIVE
         };
         let freshness = Arc::new(Freshness::default());
-        let publish_freshness = freshness.clone();
-        let on_published = Arc::new(move || {
-            publish_freshness
-                .last_published_ns
-                .store(mono_now_ns(), Ordering::Relaxed);
-        });
         let market_publisher = MarketPublisher::new(
             cap,
             ASTER_MARKET_PUB_DRAIN_MAX,
@@ -243,7 +455,7 @@ impl AsterConnector {
                     MarketDataEvent::L2Delta(_) | MarketDataEvent::L2Snapshot(_)
                 )
             }),
-            Some(on_published),
+            None,
             "aster market_tx closed",
             "aster market publish queue closed",
         );
@@ -260,13 +472,102 @@ impl AsterConnector {
             market_publisher,
             recorder,
             freshness,
+            snapshot_recovery: Arc::new(StdMutex::new(AsterPublicRestBudgetState::default())),
             is_fixture,
         };
         connector
     }
 
+    fn snapshot_recovery_state(&self) -> AsterPublicRestBudgetState {
+        *self
+            .snapshot_recovery
+            .lock()
+            .expect("aster snapshot recovery mutex poisoned")
+    }
+
+    pub fn public_rest_budget(&self) -> AsterPublicRestBudgetHandle {
+        self.snapshot_recovery.clone()
+    }
+
+    fn mark_snapshot_recovery_active(&self) {
+        let mut recovery = self
+            .snapshot_recovery
+            .lock()
+            .expect("aster snapshot recovery mutex poisoned");
+        recovery.recovery_active = true;
+        recovery.shared_consumer = "snapshot";
+        recovery.shared_priority = "critical";
+    }
+
+    fn mark_book_live(&self) {
+        let mut recovery = self
+            .snapshot_recovery
+            .lock()
+            .expect("aster snapshot recovery mutex poisoned");
+        recovery.recovery_active = false;
+        recovery.shared_consumer = "snapshot";
+        recovery.shared_priority = "critical";
+    }
+
+    fn record_snapshot_failure(
+        &self,
+        status: Option<u16>,
+        weight_1m: Option<u64>,
+    ) -> AsterPublicRestBudgetState {
+        let mut recovery = self
+            .snapshot_recovery
+            .lock()
+            .expect("aster snapshot recovery mutex poisoned");
+        recovery.fail_streak = recovery.fail_streak.saturating_add(1);
+        recovery.last_http_status = status;
+        recovery.last_weight_1m = weight_1m;
+        recovery.last_failure_class = classify_snapshot_failure(status);
+        recovery.last_cooldown_ms =
+            snapshot_backoff_ms(status, recovery.fail_streak, mono_now_ns());
+        recovery.next_allowed_ns =
+            mono_now_ns().saturating_add(recovery.last_cooldown_ms.saturating_mul(1_000_000));
+        recovery.recovery_active = true;
+        recovery.shared_consumer = "snapshot";
+        recovery.shared_priority = "critical";
+        let shared_cooldown_ms =
+            shared_public_rest_backoff_ms(status, recovery.fail_streak, mono_now_ns());
+        if shared_cooldown_ms > 0 {
+            recovery.shared_cooldown_ms = shared_cooldown_ms;
+            recovery.shared_cooldown_until_ns =
+                mono_now_ns().saturating_add(shared_cooldown_ms.saturating_mul(1_000_000));
+            recovery.shared_http_status = status;
+            recovery.shared_weight_1m = weight_1m;
+        }
+        *recovery
+    }
+
+    fn reset_snapshot_recovery(&self, weight_1m: Option<u64>) {
+        let mut recovery = self
+            .snapshot_recovery
+            .lock()
+            .expect("aster snapshot recovery mutex poisoned");
+        recovery.fail_streak = 0;
+        recovery.next_allowed_ns = 0;
+        recovery.last_http_status = Some(200);
+        recovery.last_weight_1m = weight_1m;
+        recovery.last_cooldown_ms = 0;
+        recovery.last_failure_class = "";
+        recovery.shared_consumer = "snapshot";
+        recovery.shared_priority = "critical";
+    }
+
     async fn publish_market(&self, event: MarketDataEvent) -> anyhow::Result<()> {
-        self.market_publisher.publish_market(event).await
+        let book_event = matches!(
+            &event,
+            MarketDataEvent::L2Delta(_) | MarketDataEvent::L2Snapshot(_)
+        );
+        let result = self.market_publisher.publish_market(event).await;
+        if result.is_ok() && book_event {
+            self.freshness
+                .last_published_ns
+                .store(mono_now_ns(), Ordering::Relaxed);
+        }
+        result
     }
 
     pub async fn run_public_ws(&self) {
@@ -345,6 +646,7 @@ impl AsterConnector {
 
     pub async fn run_funding_polling(&self, poll_ms: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut seq: u64 = 0;
         loop {
             interval.tick().await;
@@ -362,6 +664,179 @@ impl AsterConnector {
                 }
                 Err(err) => {
                     eprintln!("Aster funding polling error: {err}");
+                }
+            }
+        }
+    }
+
+    pub async fn run_mark_price_ws(&self) {
+        let mut backoff = Duration::from_secs(1);
+        let mut consecutive_failures = 0u32;
+        let healthy_threshold = Duration::from_secs(60);
+        loop {
+            let session_start = Instant::now();
+            match self.mark_price_ws_once().await {
+                Err(err) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    aster_audit_funding_ws(
+                        "session_error",
+                        &[
+                            ("consecutive_failures", consecutive_failures.to_string()),
+                            ("err", err.to_string().replace(' ', "_")),
+                        ],
+                    );
+                    let level = if consecutive_failures <= 3 {
+                        "WARN"
+                    } else {
+                        "ERROR"
+                    };
+                    eprintln!(
+                        "{level}: Aster funding WS error (consecutive_failures={consecutive_failures}): {err}"
+                    );
+                }
+                Ok(()) => {}
+            }
+
+            let session_duration = session_start.elapsed();
+            if session_duration >= healthy_threshold {
+                if consecutive_failures > 0 {
+                    eprintln!(
+                        "INFO: Aster funding WS session was healthy for {:?}; resetting backoff and failure counter (was {})",
+                        session_duration, consecutive_failures
+                    );
+                }
+                consecutive_failures = 0;
+                backoff = Duration::from_secs(1);
+            }
+
+            let max_backoff = match consecutive_failures {
+                0..=10 => Duration::from_secs(30),
+                11..=20 => Duration::from_secs(60),
+                _ => Duration::from_secs(120),
+            };
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(max_backoff);
+        }
+    }
+
+    async fn mark_price_ws_once(&self) -> anyhow::Result<()> {
+        let stream = format!("{}@markPrice@1s", self.cfg.stream_symbol());
+        let ws_url = format!("{}/{}", self.cfg.ws_url.trim_end_matches('/'), stream);
+        eprintln!("INFO: Aster funding WS connecting url={}", ws_url);
+        let (ws_stream, _) =
+            tokio::time::timeout(Duration::from_secs(15), connect_async(ws_url.as_str()))
+                .await
+                .map_err(|_| anyhow::anyhow!("Aster funding WS connect timeout (15s)"))?
+                .map_err(|e| anyhow::anyhow!("Aster funding WS connect error: {e}"))?;
+        eprintln!("INFO: Aster funding WS connected url={}", ws_url);
+        aster_audit_funding_ws("connected", &[("url", ws_url.clone())]);
+        let (mut write, mut read) = ws_stream.split();
+        let ping_interval_ms: u64 = std::env::var("PARAPHINA_ASTER_PING_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await;
+        let mut seq: u64 = 0;
+        let mut parse_error_count: u64 = 0;
+        let mut publish_error_count: u64 = 0;
+
+        loop {
+            tokio::select! {
+                _ = ping_timer.tick() => {
+                    if let Err(err) = write.send(Message::Ping(vec![].into())).await {
+                        anyhow::bail!("Aster funding WS ping send failed: {err}");
+                    }
+                }
+                read_result = tokio::time::timeout(Duration::from_secs(30), read.next()) => {
+                    let maybe = match read_result {
+                        Ok(msg) => msg,
+                        Err(_) => {
+                            anyhow::bail!("Aster funding WS read timeout after 30s");
+                        }
+                    };
+                    let Some(msg) = maybe else {
+                        return Ok(());
+                    };
+                    match msg? {
+                        Message::Text(text) => {
+                            match parse_mark_price_update(&text, &self.cfg) {
+                                Ok(Some(mut update)) => {
+                                    seq = seq.wrapping_add(1);
+                                    update.seq = seq;
+                                    if let Err(err) = self.publish_market(MarketDataEvent::FundingUpdate(update)).await {
+                                        publish_error_count = publish_error_count.saturating_add(1);
+                                        aster_audit_funding_ws(
+                                            "publish_error",
+                                            &[
+                                                ("count", publish_error_count.to_string()),
+                                                ("err", err.to_string().replace(' ', "_")),
+                                            ],
+                                        );
+                                        eprintln!("Aster funding WS publish error: {err}");
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    parse_error_count = parse_error_count.saturating_add(1);
+                                    aster_audit_funding_ws(
+                                        "parse_error",
+                                        &[
+                                            ("count", parse_error_count.to_string()),
+                                            ("err", err.to_string().replace(' ', "_")),
+                                        ],
+                                    );
+                                    if parse_error_count <= 3 || parse_error_count % 25 == 0 {
+                                        eprintln!("WARN: Aster funding WS parse error: {err}");
+                                    }
+                                }
+                            }
+                        }
+                        Message::Binary(bytes) => {
+                            let text = String::from_utf8(bytes)
+                                .map_err(|_| anyhow::anyhow!("Aster funding WS non-utf8 binary frame"))?;
+                            match parse_mark_price_update(&text, &self.cfg) {
+                                Ok(Some(mut update)) => {
+                                    seq = seq.wrapping_add(1);
+                                    update.seq = seq;
+                                    if let Err(err) = self.publish_market(MarketDataEvent::FundingUpdate(update)).await {
+                                        publish_error_count = publish_error_count.saturating_add(1);
+                                        aster_audit_funding_ws(
+                                            "publish_error",
+                                            &[
+                                                ("count", publish_error_count.to_string()),
+                                                ("err", err.to_string().replace(' ', "_")),
+                                            ],
+                                        );
+                                        eprintln!("Aster funding WS publish error: {err}");
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    parse_error_count = parse_error_count.saturating_add(1);
+                                    aster_audit_funding_ws(
+                                        "parse_error",
+                                        &[
+                                            ("count", parse_error_count.to_string()),
+                                            ("err", err.to_string().replace(' ', "_")),
+                                        ],
+                                    );
+                                    if parse_error_count <= 3 || parse_error_count % 25 == 0 {
+                                        eprintln!("WARN: Aster funding WS parse error: {err}");
+                                    }
+                                }
+                            }
+                        }
+                        Message::Ping(payload) => {
+                            write.send(Message::Pong(payload)).await?;
+                        }
+                        Message::Close(_) => {
+                            eprintln!("Aster funding WS closed; reconnecting url={}", self.cfg.ws_url);
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -523,12 +998,15 @@ impl AsterConnector {
                         let mut next_last = snap_id;
                         let mut gap = false;
                         let mut any_applied = false;
+                        let mut applied_count = 0usize;
+                        let buffered_before = buffered_updates.len();
                         for update in buffered_updates.drain(..) {
                             // Stream is per-symbol; avoid dropping on formatting mismatch.
                             match seq_decision_lenient(next_last, &update) {
                                 SeqDecision::Apply => {
                                     next_last = update.end_id;
                                     any_applied = true;
+                                    applied_count = applied_count.saturating_add(1);
                                     {
                                         let now_ns = mono_now_ns();
                                         self.freshness
@@ -554,6 +1032,24 @@ impl AsterConnector {
                                 SeqDecision::Stale => {}
                                 SeqDecision::Gap => {
                                     aster_audit_reconnect("seq_gap");
+                                    aster_audit_book_recovery(
+                                        "seq_gap",
+                                        "buffered_drain",
+                                        &[
+                                            ("snap_id", snap_id.to_string()),
+                                            ("next_last", next_last.to_string()),
+                                            ("update_start", update.start_id.to_string()),
+                                            ("update_end", update.end_id.to_string()),
+                                            (
+                                                "update_prev",
+                                                update
+                                                    .prev_id
+                                                    .map(|value| value.to_string())
+                                                    .unwrap_or_else(|| "none".to_string()),
+                                            ),
+                                            ("buffered_before", buffered_before.to_string()),
+                                        ],
+                                    );
                                     if last_gap_log.elapsed() > Duration::from_secs(10) {
                                         eprintln!(
                                             "WARN: Aster loop1 seq gap in buffered drain; snap_id={} next_last={} update_start={} update_end={} update_prev={:?}",
@@ -578,11 +1074,30 @@ impl AsterConnector {
                             // transition to steady-state delta mode (loop 2).
                             last_update_id = Some(next_last);
                             snapshot_last_id = None;
+                            aster_audit_book_recovery(
+                                "snapshot_applied",
+                                "buffered_drain",
+                                &[
+                                    ("snap_id", snap_id.to_string()),
+                                    ("buffered_before", buffered_before.to_string()),
+                                    ("applied_count", applied_count.to_string()),
+                                    ("next_last", next_last.to_string()),
+                                ],
+                            );
+                            self.mark_book_live();
                         } else {
                             // All buffered deltas were stale (none bridged).
                             // Stay in loop 1 but remember the snapshot ID so
                             // incoming WS frames can be checked for a bridge.
                             snapshot_last_id = Some(snap_id);
+                            aster_audit_book_recovery(
+                                "snapshot_wait_bridge",
+                                "loop1",
+                                &[
+                                    ("snap_id", snap_id.to_string()),
+                                    ("buffered_before", buffered_before.to_string()),
+                                ],
+                            );
                             eprintln!(
                                 "INFO: Aster snapshot applied (snap_id={}), waiting for bridge delta on WS",
                                 snap_id
@@ -590,14 +1105,49 @@ impl AsterConnector {
                         }
                             }
                             Err(err) => {
+                                let recovery = self.snapshot_recovery_state();
+                                aster_audit_book_recovery(
+                                    "snapshot_fetch_failed",
+                                    "loop1",
+                                    &[
+                                        ("buffered_before", buffered_updates.len().to_string()),
+                                        ("err_len", err.to_string().len().to_string()),
+                                        ("fail_streak", recovery.fail_streak.to_string()),
+                                        ("cooldown_ms", recovery.last_cooldown_ms.to_string()),
+                                        (
+                                            "http_status",
+                                            recovery
+                                                .last_http_status
+                                                .map(|value| value.to_string())
+                                                .unwrap_or_else(|| "0".to_string()),
+                                        ),
+                                        (
+                                            "weight_1m",
+                                            recovery
+                                                .last_weight_1m
+                                                .map(|value| value.to_string())
+                                                .unwrap_or_else(|| "0".to_string()),
+                                        ),
+                                        (
+                                            "failure_class",
+                                            recovery.last_failure_class.to_string(),
+                                        ),
+                                    ],
+                                );
                                 if last_snapshot_err_log.elapsed() > Duration::from_secs(30) {
                                     let url = format!(
                                         "{}/fapi/v1/depth?symbol={}&limit={}",
                                         self.cfg.rest_url, self.cfg.market, self.cfg.depth_limit
                                     );
                                     eprintln!(
-                                        "WARN: Aster snapshot fetch failed; url={} err={}",
-                                        url, err
+                                        "WARN: Aster snapshot fetch failed; url={} failure_class={} http_status={:?} fail_streak={} cooldown_ms={} weight_1m={:?} err={}",
+                                        url,
+                                        recovery.last_failure_class,
+                                        recovery.last_http_status,
+                                        recovery.fail_streak,
+                                        recovery.last_cooldown_ms,
+                                        recovery.last_weight_1m,
+                                        err
                                     );
                                     last_snapshot_err_log = Instant::now();
                                 }
@@ -619,6 +1169,22 @@ impl AsterConnector {
                             && (cooldown_ok || stale >= Duration::from_millis(15_000))
                         {
                             aster_audit_reconnect("stale_watchdog");
+                            let ages = aster_freshness_ages(&self.freshness, connect_start_ns);
+                            aster_audit_book_recovery(
+                                "stale_watchdog",
+                                "loop1",
+                                &[
+                                    ("stale_ms", stale.as_millis().to_string()),
+                                    ("buffered_before", buffered_updates.len().to_string()),
+                                    ("cooldown_ok", if cooldown_ok { "1" } else { "0" }.to_string()),
+                                    ("anchor_age_ms", ages.anchor_age_ms.to_string()),
+                                    ("ws_rx_age_ms", ages.ws_rx_age_ms.to_string()),
+                                    ("data_rx_age_ms", ages.data_rx_age_ms.to_string()),
+                                    ("parsed_age_ms", ages.parsed_age_ms.to_string()),
+                                    ("pub_age_ms", ages.pub_age_ms.to_string()),
+                                    ("book_age_ms", ages.book_age_ms.to_string()),
+                                ],
+                            );
                             eprintln!(
                                 "WARN: Aster WS stale; resyncing url={} stale_ms={}",
                                 self.cfg.ws_url,
@@ -706,21 +1272,54 @@ impl AsterConnector {
                                                 ))
                                                 .await
                                                 .is_ok()
-                                            {
-                                                last_applied_at = Instant::now();
-                                            }
-                                            last_update_id = Some(update.end_id);
-                                            snapshot_last_id = None;
-                                            eprintln!(
-                                                "INFO: Aster bridge delta found after snapshot; snap_id={} delta_end={}",
-                                                sid, update.end_id
+                                        {
+                                            last_applied_at = Instant::now();
+                                        }
+                                        last_update_id = Some(update.end_id);
+                                        snapshot_last_id = None;
+                                        aster_audit_book_recovery(
+                                            "bridge_found",
+                                            "bridge_wait",
+                                            &[
+                                                ("snap_id", sid.to_string()),
+                                                ("update_start", update.start_id.to_string()),
+                                                ("update_end", update.end_id.to_string()),
+                                                (
+                                                    "update_prev",
+                                                    update
+                                                        .prev_id
+                                                        .map(|value| value.to_string())
+                                                        .unwrap_or_else(|| "none".to_string()),
+                                                ),
+                                            ],
+                                        );
+                                        eprintln!(
+                                            "INFO: Aster bridge delta found after snapshot; snap_id={} delta_end={}",
+                                            sid, update.end_id
                                             );
+                                        self.mark_book_live();
                                         }
                                         SeqDecision::Stale => {
                                             // Still behind the snapshot, keep waiting.
                                         }
                                         SeqDecision::Gap => {
                                             aster_audit_reconnect("seq_gap");
+                                            aster_audit_book_recovery(
+                                                "seq_gap",
+                                                "bridge_wait",
+                                                &[
+                                                    ("snap_id", sid.to_string()),
+                                                    ("update_start", update.start_id.to_string()),
+                                                    ("update_end", update.end_id.to_string()),
+                                                    (
+                                                        "update_prev",
+                                                        update
+                                                            .prev_id
+                                                            .map(|value| value.to_string())
+                                                            .unwrap_or_else(|| "none".to_string()),
+                                                    ),
+                                                ],
+                                            );
                                             // WS jumped past the snapshot — re-fetch.
                                             if last_gap_log.elapsed() > Duration::from_secs(10) {
                                                 eprintln!(
@@ -738,6 +1337,11 @@ impl AsterConnector {
                                     // No snapshot yet — just buffer.
                                     buffered_updates.push(update);
                                     if buffered_updates.len() > MAX_BUFFERED_UPDATES {
+                                        aster_audit_book_recovery(
+                                            "buffer_overflow",
+                                            "pre_snapshot",
+                                            &[("buffered_before", buffered_updates.len().to_string())],
+                                        );
                                         eprintln!(
                                             "Aster WS buffer overflow; resyncing url={}",
                                             self.cfg.ws_url
@@ -757,6 +1361,19 @@ impl AsterConnector {
                 biased;
                 _ = &mut stale_rx => {
                     aster_audit_reconnect("stale_watchdog");
+                    let ages = aster_freshness_ages(&self.freshness, connect_start_ns);
+                    aster_audit_book_recovery(
+                        "stale_watchdog",
+                        "global_watchdog",
+                        &[
+                            ("anchor_age_ms", ages.anchor_age_ms.to_string()),
+                            ("ws_rx_age_ms", ages.ws_rx_age_ms.to_string()),
+                            ("data_rx_age_ms", ages.data_rx_age_ms.to_string()),
+                            ("parsed_age_ms", ages.parsed_age_ms.to_string()),
+                            ("pub_age_ms", ages.pub_age_ms.to_string()),
+                            ("book_age_ms", ages.book_age_ms.to_string()),
+                        ],
+                    );
                     anyhow::bail!("Aster public WS stale: freshness exceeded {}ms", stale_ms);
                 }
                 _ = ping_timer.tick() => {
@@ -772,6 +1389,18 @@ impl AsterConnector {
                         Ok(m) => m,
                         Err(_) => {
                             aster_audit_reconnect("read_timeout");
+                            let ages = aster_freshness_ages(&self.freshness, connect_start_ns);
+                            aster_audit_book_recovery(
+                                "read_timeout",
+                                "steady_state",
+                                &[
+                                    ("ws_rx_age_ms", ages.ws_rx_age_ms.to_string()),
+                                    ("data_rx_age_ms", ages.data_rx_age_ms.to_string()),
+                                    ("parsed_age_ms", ages.parsed_age_ms.to_string()),
+                                    ("pub_age_ms", ages.pub_age_ms.to_string()),
+                                    ("book_age_ms", ages.book_age_ms.to_string()),
+                                ],
+                            );
                             eprintln!(
                                 "WARN: Aster public WS read timeout (30s) — no frame received, reconnecting"
                             );
@@ -833,6 +1462,22 @@ impl AsterConnector {
                                 SeqDecision::Stale => {}
                                 SeqDecision::Gap => {
                                     aster_audit_reconnect("seq_gap");
+                                    aster_audit_book_recovery(
+                                        "seq_gap",
+                                        "steady_state",
+                                        &[
+                                            ("current_last", current_last.to_string()),
+                                            ("update_start", update.start_id.to_string()),
+                                            ("update_end", update.end_id.to_string()),
+                                            (
+                                                "update_prev",
+                                                update
+                                                    .prev_id
+                                                    .map(|value| value.to_string())
+                                                    .unwrap_or_else(|| "none".to_string()),
+                                            ),
+                                        ],
+                                    );
                                     if last_gap_log.elapsed() > Duration::from_secs(30) {
                                         eprintln!(
                                             "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
@@ -897,6 +1542,22 @@ impl AsterConnector {
                                     SeqDecision::Stale => {}
                                     SeqDecision::Gap => {
                                         aster_audit_reconnect("seq_gap");
+                                        aster_audit_book_recovery(
+                                            "seq_gap",
+                                            "steady_state",
+                                            &[
+                                                ("current_last", current_last.to_string()),
+                                                ("update_start", update.start_id.to_string()),
+                                                ("update_end", update.end_id.to_string()),
+                                                (
+                                                    "update_prev",
+                                                    update
+                                                        .prev_id
+                                                        .map(|value| value.to_string())
+                                                        .unwrap_or_else(|| "none".to_string()),
+                                                ),
+                                            ],
+                                        );
                                         if last_gap_log.elapsed() > Duration::from_secs(30) {
                                             eprintln!(
                                                 "Aster WS seq gap; resyncing last={} prev={:?} start={} end={} url={}",
@@ -961,21 +1622,124 @@ impl AsterConnector {
     }
 
     async fn fetch_snapshot(&self) -> anyhow::Result<(String, AsterDepthSnapshot)> {
+        self.mark_snapshot_recovery_active();
         let url = format!(
             "{}/fapi/v1/depth?symbol={}&limit={}",
             self.cfg.rest_url, self.cfg.market, self.cfg.depth_limit
         );
-        let resp = self
+        let recovery = self.snapshot_recovery_state();
+        let now_ns = mono_now_ns();
+        let next_allowed_ns = recovery
+            .next_allowed_ns
+            .max(recovery.shared_cooldown_until_ns);
+        if next_allowed_ns > now_ns {
+            let wait_ms = age_ms(next_allowed_ns, now_ns);
+            aster_audit_book_recovery(
+                "snapshot_backoff_wait",
+                "fetch",
+                &[
+                    ("cooldown_ms", wait_ms.to_string()),
+                    ("fail_streak", recovery.fail_streak.to_string()),
+                    (
+                        "http_status",
+                        recovery
+                            .last_http_status
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "0".to_string()),
+                    ),
+                    (
+                        "weight_1m",
+                        recovery
+                            .last_weight_1m
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "0".to_string()),
+                    ),
+                    ("shared_consumer", recovery.shared_consumer.to_string()),
+                    ("shared_priority", recovery.shared_priority.to_string()),
+                ],
+            );
+            tokio::time::sleep(Duration::from_millis(wait_ms.max(1))).await;
+        }
+
+        let resp = match self
             .http
-            .get(url)
+            .get(&url)
             .timeout(Duration::from_secs(2))
             .send()
-            .await?
-            .error_for_status()?;
-        let raw = resp.text().await?;
-        let value: Value = serde_json::from_str(&raw)?;
-        let snapshot = parse_depth_snapshot(&value)
-            .ok_or_else(|| anyhow::anyhow!("aster snapshot parse failed"))?;
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                let recovery = self.record_snapshot_failure(None, None);
+                return Err(anyhow::anyhow!(
+                    "aster snapshot request failed class={} fail_streak={} cooldown_ms={} err={}",
+                    recovery.last_failure_class,
+                    recovery.fail_streak,
+                    recovery.last_cooldown_ms,
+                    err
+                ));
+            }
+        };
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let weight_1m = snapshot_weight_1m(&headers);
+        if !status.is_success() {
+            let recovery = self.record_snapshot_failure(Some(status.as_u16()), weight_1m);
+            let body = resp.text().await.unwrap_or_default();
+            let body_snippet: String = body.chars().take(160).collect();
+            return Err(anyhow::anyhow!(
+                "aster snapshot http_status={} class={} fail_streak={} cooldown_ms={} weight_1m={} body={}",
+                status.as_u16(),
+                recovery.last_failure_class,
+                recovery.fail_streak,
+                recovery.last_cooldown_ms,
+                recovery
+                    .last_weight_1m
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "0".to_string()),
+                body_snippet
+            ));
+        }
+
+        let raw = match resp.text().await {
+            Ok(raw) => raw,
+            Err(err) => {
+                let recovery = self.record_snapshot_failure(None, weight_1m);
+                return Err(anyhow::anyhow!(
+                    "aster snapshot body read failed class={} fail_streak={} cooldown_ms={} err={}",
+                    recovery.last_failure_class,
+                    recovery.fail_streak,
+                    recovery.last_cooldown_ms,
+                    err
+                ));
+            }
+        };
+        let value: Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(err) => {
+                let recovery = self.record_snapshot_failure(None, weight_1m);
+                return Err(anyhow::anyhow!(
+                    "aster snapshot json parse failed class={} fail_streak={} cooldown_ms={} err={}",
+                    recovery.last_failure_class,
+                    recovery.fail_streak,
+                    recovery.last_cooldown_ms,
+                    err
+                ));
+            }
+        };
+        let snapshot = match parse_depth_snapshot(&value) {
+            Some(snapshot) => snapshot,
+            None => {
+                let recovery = self.record_snapshot_failure(None, weight_1m);
+                return Err(anyhow::anyhow!(
+                    "aster snapshot parse failed class={} fail_streak={} cooldown_ms={}",
+                    recovery.last_failure_class,
+                    recovery.fail_streak,
+                    recovery.last_cooldown_ms
+                ));
+            }
+        };
+        self.reset_snapshot_recovery(weight_1m);
         Ok((raw, snapshot))
     }
 }
@@ -987,6 +1751,8 @@ pub struct AsterRestClient {
     cfg: AsterConfig,
     http: Client,
     timestamp_fn: Arc<dyn Fn() -> TimestampMs + Send + Sync>,
+    price_tick_size: Arc<Mutex<Option<f64>>>,
+    poll_seq: Arc<AtomicU64>,
 }
 
 impl AsterRestClient {
@@ -1002,6 +1768,8 @@ impl AsterRestClient {
                 .build()
                 .expect("aster rest http client build"),
             timestamp_fn: Arc::new(now_ms),
+            price_tick_size: Arc::new(Mutex::new(None)),
+            poll_seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -1015,6 +1783,46 @@ impl AsterRestClient {
 
     pub fn has_auth(&self) -> bool {
         self.cfg.has_auth()
+    }
+
+    async fn resolve_price_tick_size(&self) -> LiveResult<f64> {
+        {
+            let guard = self.price_tick_size.lock().await;
+            if let Some(tick_size) = *guard {
+                return Ok(tick_size);
+            }
+        }
+
+        let url = format!(
+            "{}/fapi/v1/exchangeInfo",
+            self.cfg.rest_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("symbol", self.cfg.market.as_str())])
+            .send()
+            .await
+            .map_err(|err| {
+                LiveGatewayError::retryable(format!("aster exchangeInfo error: {err}"))
+            })?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("aster exchangeInfo parse error: {err}"))
+        })?;
+        let tick_size =
+            parse_exchange_info_price_tick_size(&value, &self.cfg.market).ok_or_else(|| {
+                LiveGatewayError::fatal(format!(
+                    "aster exchangeInfo missing price tick size for {}",
+                    self.cfg.market
+                ))
+            })?;
+        let mut guard = self.price_tick_size.lock().await;
+        Ok(*guard.get_or_insert(tick_size))
     }
 
     fn signed_query(&self, mut params: Vec<(String, String)>) -> Result<String, LiveGatewayError> {
@@ -1073,8 +1881,40 @@ impl AsterRestClient {
         }
         let value: Value = serde_json::from_str(&body)
             .map_err(|err| LiveGatewayError::fatal(format!("aster account parse error: {err}")))?;
-        parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
-            LiveGatewayError::fatal("aster account snapshot missing required fields")
+        let mut snapshot =
+            parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
+                LiveGatewayError::fatal("aster account snapshot missing required fields")
+            })?;
+        // Treat freshness as the time we successfully polled the venue. Aster's
+        // `updateTime` reflects the last account mutation and can remain unchanged
+        // for long periods, which would make a fresh poll look stale downstream.
+        snapshot.timestamp_ms = (self.timestamp_fn)();
+        Ok(snapshot)
+    }
+
+    async fn fetch_open_order_snapshot(
+        &self,
+        venue_id: &str,
+        venue_index: usize,
+    ) -> LiveResult<OrderSnapshot> {
+        let params = vec![("symbol".to_string(), self.cfg.market.clone())];
+        let resp = self
+            .send_signed_request(Method::GET, "/fapi/v1/openOrders", params)
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("aster open orders parse error: {err}"))
+        })?;
+        Ok(OrderSnapshot {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq: self.poll_seq.fetch_add(1, Ordering::Relaxed),
+            timestamp_ms: (self.timestamp_fn)(),
+            open_orders: parse_open_orders(&value, &self.cfg.market),
         })
     }
 
@@ -1086,6 +1926,7 @@ impl AsterRestClient {
         poll_ms: u64,
     ) {
         let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             match self.fetch_account_snapshot(&venue_id, venue_index).await {
@@ -1094,6 +1935,28 @@ impl AsterRestClient {
                 }
                 Err(err) => {
                     eprintln!("Aster account snapshot error: {}", err.message);
+                }
+            }
+        }
+    }
+
+    pub async fn run_order_polling(
+        self: Arc<Self>,
+        exec_tx: mpsc::Sender<ExecutionEvent>,
+        venue_id: String,
+        venue_index: usize,
+        poll_ms: u64,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match self.fetch_open_order_snapshot(&venue_id, venue_index).await {
+                Ok(snapshot) => {
+                    let _ = exec_tx.send(ExecutionEvent::OrderSnapshot(snapshot)).await;
+                }
+                Err(err) => {
+                    eprintln!("Aster open order snapshot error: {}", err.message);
                 }
             }
         }
@@ -1108,6 +1971,8 @@ impl LiveRestClient for AsterRestClient {
         req: LiveRestPlaceRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
+            let price_tick_size = self.resolve_price_tick_size().await?;
+            let price = snap_price_to_tick(req.price, price_tick_size, req.side, req.post_only);
             let mut params = vec![
                 ("symbol".to_string(), self.cfg.market.clone()),
                 ("side".to_string(), map_side(req.side).to_string()),
@@ -1116,7 +1981,7 @@ impl LiveRestClient for AsterRestClient {
                     "timeInForce".to_string(),
                     map_time_in_force(req.time_in_force, req.post_only).to_string(),
                 ),
-                ("price".to_string(), format_f64(req.price)),
+                ("price".to_string(), format_f64(price)),
                 ("quantity".to_string(), format_f64(req.size)),
                 ("newClientOrderId".to_string(), req.client_order_id.clone()),
             ];
@@ -1141,16 +2006,23 @@ impl LiveRestClient for AsterRestClient {
         req: LiveRestCancelRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
-            let params = vec![
-                ("symbol".to_string(), self.cfg.market.clone()),
-                ("origClientOrderId".to_string(), req.order_id),
-            ];
+            let mut params = vec![("symbol".to_string(), self.cfg.market.clone())];
+            if is_numeric_order_id(&req.order_id) {
+                params.push(("orderId".to_string(), req.order_id.clone()));
+            } else {
+                params.push(("origClientOrderId".to_string(), req.order_id.clone()));
+            }
             let resp = self
                 .send_signed_request(Method::DELETE, "/fapi/v1/order", params)
                 .await?;
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if !status.is_success() {
+                if is_aster_unknown_order(&body) {
+                    return Ok(LiveRestResponse {
+                        order_id: Some(req.order_id),
+                    });
+                }
                 return Err(map_rest_error(status.as_u16(), &body));
             }
             Ok(LiveRestResponse { order_id: None })
@@ -1225,11 +2097,69 @@ fn map_time_in_force(time_in_force: TimeInForce, post_only: bool) -> &'static st
 }
 
 fn format_f64(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value}")
-    } else {
-        "0".to_string()
+    if !value.is_finite() {
+        return "0".to_string();
     }
+    let mut formatted = format!("{value:.12}");
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    if formatted == "-0" {
+        formatted = "0".to_string();
+    }
+    formatted
+}
+
+fn snap_price_to_tick(price: f64, tick_size: f64, side: Side, post_only: bool) -> f64 {
+    if !price.is_finite() || !tick_size.is_finite() || tick_size <= 0.0 {
+        return price;
+    }
+    let ticks = price / tick_size;
+    let epsilon = 1e-9;
+    let snapped_ticks = if post_only {
+        match side {
+            Side::Buy => (ticks + epsilon).floor(),
+            Side::Sell => (ticks - epsilon).ceil(),
+        }
+    } else {
+        ticks.round()
+    };
+    snapped_ticks * tick_size
+}
+
+fn is_numeric_order_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_aster_unknown_order(body: &str) -> bool {
+    body.contains("\"code\":-2011") || body.contains("Unknown order sent")
+}
+
+fn parse_exchange_info_price_tick_size(value: &Value, market: &str) -> Option<f64> {
+    let symbols = value.get("symbols")?.as_array()?;
+    let entry = symbols
+        .iter()
+        .find(|symbol| symbol.get("symbol").and_then(|v| v.as_str()) == Some(market))
+        .or_else(|| symbols.first())?;
+    let filters = entry.get("filters")?.as_array()?;
+    let price_filter = filters
+        .iter()
+        .find(|filter| filter.get("filterType").and_then(|v| v.as_str()) == Some("PRICE_FILTER"))?;
+    let tick_size = price_filter
+        .get("tickSize")
+        .or_else(|| price_filter.get("tick_size"))
+        .and_then(parse_f64)
+        .filter(|tick| *tick > 0.0);
+    tick_size.or_else(|| {
+        entry
+            .get("pricePrecision")
+            .and_then(|v| v.as_u64())
+            .map(|precision| 10f64.powi(-(precision as i32)))
+            .filter(|tick| *tick > 0.0)
+    })
 }
 
 fn parse_order_id(body: &str) -> Option<String> {
@@ -1246,6 +2176,58 @@ fn parse_order_id(body: &str) -> Option<String> {
         .get("clientOrderId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn parse_open_orders(value: &Value, market: &str) -> Vec<OpenOrderSnapshot> {
+    let list = value.as_array().cloned().unwrap_or_default();
+    list.into_iter()
+        .filter_map(|order| {
+            let symbol = order.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+            if !symbol_matches(symbol, market) {
+                return None;
+            }
+            let status = order.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if !(status.eq_ignore_ascii_case("NEW")
+                || status.eq_ignore_ascii_case("PARTIALLY_FILLED")
+                || status.eq_ignore_ascii_case("OPEN"))
+            {
+                return None;
+            }
+            let order_id = order.get("orderId").and_then(|v| {
+                v.as_i64()
+                    .map(|raw| raw.to_string())
+                    .or_else(|| v.as_str().map(|raw| raw.to_string()))
+            })?;
+            let client_order_id = order
+                .get("clientOrderId")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            let side = match order.get("side").and_then(|v| v.as_str())? {
+                side if side.eq_ignore_ascii_case("BUY") => Side::Buy,
+                side if side.eq_ignore_ascii_case("SELL") => Side::Sell,
+                _ => return None,
+            };
+            let price = order.get("price").and_then(parse_f64)?;
+            let orig_qty = order
+                .get("origQty")
+                .or_else(|| order.get("orig_quantity"))
+                .and_then(parse_f64)?;
+            let executed_qty = order
+                .get("executedQty")
+                .or_else(|| order.get("executed_quantity"))
+                .and_then(parse_f64)
+                .unwrap_or(0.0);
+            let size = (orig_qty - executed_qty).max(0.0);
+            (size > 0.0).then_some(OpenOrderSnapshot {
+                order_id,
+                client_order_id,
+                side,
+                price,
+                size,
+                purpose: None,
+            })
+        })
+        .collect()
 }
 
 fn parse_account_snapshot(
@@ -1341,7 +2323,31 @@ async fn fetch_public_funding(client: &Client, cfg: &AsterConfig) -> anyhow::Res
         .query(&[("symbol", cfg.market.clone())])
         .send()
         .await?;
-    let value: Value = resp.json().await?;
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        let weight_suffix = snapshot_weight_1m(&headers)
+            .map(|weight| format!(" weight_1m={weight}"))
+            .unwrap_or_default();
+        let body_snippet = body.chars().take(160).collect::<String>();
+        anyhow::bail!(
+            "HTTP status {} for {}{} body={}",
+            status.as_u16(),
+            path,
+            weight_suffix,
+            body_snippet.replace('\n', " ")
+        );
+    }
+    let value: Value = serde_json::from_str(&body).map_err(|err| {
+        anyhow::anyhow!(
+            "aster funding parse error: {err} body={}",
+            body.chars()
+                .take(160)
+                .collect::<String>()
+                .replace('\n', " ")
+        )
+    })?;
     parse_public_funding(&value, cfg)
         .ok_or_else(|| anyhow::anyhow!("invalid public funding response"))
 }
@@ -1402,6 +2408,57 @@ fn parse_public_funding(value: &Value, cfg: &AsterConfig) -> Option<FundingUpdat
         settlement_price_kind: Some(SettlementPriceKind::Mark),
         source: FundingSource::MarketDataRest,
     })
+}
+
+fn parse_mark_price_update(text: &str, cfg: &AsterConfig) -> anyhow::Result<Option<FundingUpdate>> {
+    let value: Value = serde_json::from_str(text)?;
+    let data = value.get("data").unwrap_or(&value);
+    if data.is_null() {
+        return Ok(None);
+    }
+    let event_type = data.get("e").and_then(|v| v.as_str()).unwrap_or_default();
+    if !event_type.is_empty() && event_type != "markPriceUpdate" {
+        return Ok(None);
+    }
+    let symbol = data
+        .get("s")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing symbol"))?;
+    if !symbol_matches(symbol, &cfg.market) {
+        return Ok(None);
+    }
+    let rate_native = data
+        .get("r")
+        .or_else(|| data.get("fundingRate"))
+        .or_else(|| data.get("lastFundingRate"))
+        .and_then(parse_f64);
+    let next_funding_ms = data
+        .get("T")
+        .or_else(|| data.get("nextFundingTime"))
+        .or_else(|| data.get("nextFundingTimestamp"))
+        .and_then(parse_i64_value);
+    let timestamp_ms = data
+        .get("E")
+        .or_else(|| data.get("time"))
+        .or_else(|| data.get("timestamp"))
+        .and_then(parse_i64_value)
+        .unwrap_or_else(now_ms);
+    if rate_native.is_none() && next_funding_ms.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(FundingUpdate {
+        venue_index: cfg.venue_index,
+        venue_id: cfg.venue_id.clone(),
+        seq: 0,
+        timestamp_ms,
+        received_ms: Some(now_ms()),
+        funding_rate_8h: rate_native,
+        funding_rate_native: rate_native,
+        interval_sec: rate_native.map(|_| 28_800),
+        next_funding_ms,
+        settlement_price_kind: Some(SettlementPriceKind::Mark),
+        source: FundingSource::MarketDataWs,
+    }))
 }
 
 fn map_rest_error(status: u16, body: &str) -> LiveGatewayError {
@@ -1957,7 +3014,7 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use httpmock::Method::{DELETE, POST};
+    use httpmock::Method::{DELETE, GET, POST};
     use httpmock::MockServer;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -2003,6 +3060,47 @@ mod tests {
             Some(SettlementPriceKind::Mark),
             "Aster settlement must be Mark"
         );
+    }
+
+    #[test]
+    fn parse_mark_price_update_fixture() {
+        let raw = r#"{
+            "e":"markPriceUpdate",
+            "E":1700000000123,
+            "s":"BTCUSDT",
+            "p":"43210.1",
+            "i":"43205.0",
+            "P":"43204.5",
+            "r":"0.000125",
+            "T":1700003600000
+        }"#;
+        let cfg = AsterConfig {
+            ws_url: "wss://example".to_string(),
+            rest_url: "https://example".to_string(),
+            market: "BTCUSDT".to_string(),
+            depth_limit: 100,
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            api_key: None,
+            api_secret: None,
+            recv_window: Some(5_000),
+            record_dir: None,
+        };
+        let update = parse_mark_price_update(raw, &cfg)
+            .expect("parse ok")
+            .expect("funding update");
+        assert_eq!(update.venue_index, 2);
+        assert_eq!(update.venue_id, "ASTER");
+        assert_eq!(update.timestamp_ms, 1_700_000_000_123);
+        assert_eq!(update.next_funding_ms, Some(1_700_003_600_000));
+        assert_eq!(update.funding_rate_native, Some(0.000125));
+        assert_eq!(update.funding_rate_8h, Some(0.000125));
+        assert_eq!(update.interval_sec, Some(28_800));
+        assert_eq!(
+            update.settlement_price_kind,
+            Some(SettlementPriceKind::Mark)
+        );
+        assert_eq!(update.source, FundingSource::MarketDataWs);
     }
 
     #[test]
@@ -2196,6 +3294,22 @@ mod tests {
         };
         let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
 
+        let exchange_info = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/exchangeInfo")
+                    .query_param("symbol", "BTCUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbols": [{
+                        "symbol": "BTCUSDT",
+                        "filters": [{
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.1"
+                        }]
+                    }]
+                }));
+            })
+            .await;
         let expected_signature = "4b0927aa17b493de48e207d2e891485c491aefb6c6ed0bd374259b42a21a1284";
         let mock = server
             .mock_async(|when, then| {
@@ -2232,6 +3346,42 @@ mod tests {
             .await
             .expect("place order");
 
+        exchange_info.assert_async().await;
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_public_funding_http_error_surfaces_status() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "BTCUSDT".to_string(),
+            depth_limit: 100,
+            venue_index: 0,
+            venue_id: "ASTER".to_string(),
+            api_key: None,
+            api_secret: None,
+            recv_window: Some(5_000),
+            record_dir: None,
+        };
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/premiumIndex")
+                    .query_param("symbol", "BTCUSDT");
+                then.status(429)
+                    .header("x-mbx-used-weight-1m", "2400")
+                    .body("{\"code\":-1003,\"msg\":\"Too many requests\"}");
+            })
+            .await;
+
+        let err = fetch_public_funding(&Client::new(), &cfg)
+            .await
+            .expect_err("expected rate limit failure");
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP status 429"), "msg={msg}");
+        assert!(msg.contains("weight_1m=2400"), "msg={msg}");
         mock.assert_async().await;
     }
 
@@ -2252,6 +3402,22 @@ mod tests {
         };
         let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
 
+        let exchange_info = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/exchangeInfo")
+                    .query_param("symbol", "BTCUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbols": [{
+                        "symbol": "BTCUSDT",
+                        "filters": [{
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.1"
+                        }]
+                    }]
+                }));
+            })
+            .await;
         let expected_signature = "fb231bb1595dd627ceab277d9d9b6f9ff238ad515830ba44ea5717e01ff578ad";
         let mock = server
             .mock_async(|when, then| {
@@ -2289,6 +3455,155 @@ mod tests {
             .await
             .expect("place order");
 
+        exchange_info.assert_async().await;
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rest_place_order_formats_decimal_fields_without_float_noise() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+
+        let exchange_info = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/exchangeInfo")
+                    .query_param("symbol", "ETHUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbols": [{
+                        "symbol": "ETHUSDT",
+                        "filters": [{
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.01"
+                        }]
+                    }]
+                }));
+            })
+            .await;
+        let canonical = "newClientOrderId=co_decimal&price=2073.54&quantity=0.01&recvWindow=5000&side=BUY&symbol=ETHUSDT&timeInForce=GTX&timestamp=1700000000000&type=LIMIT";
+        let expected_signature = sign_query("testsecret", canonical);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/fapi/v1/order")
+                    .header("X-MBX-APIKEY", "test-key")
+                    .query_param("symbol", "ETHUSDT")
+                    .query_param("side", "BUY")
+                    .query_param("type", "LIMIT")
+                    .query_param("timeInForce", "GTX")
+                    .query_param("price", "2073.54")
+                    .query_param("quantity", "0.01")
+                    .query_param("newClientOrderId", "co_decimal")
+                    .query_param("recvWindow", "5000")
+                    .query_param("timestamp", "1700000000000")
+                    .query_param("signature", expected_signature);
+                then.status(200).body("{\"orderId\": 13579}");
+            })
+            .await;
+
+        let _ = client
+            .place_order(LiveRestPlaceRequest {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                side: Side::Buy,
+                price: 2073.5399999999995,
+                size: 0.010000000000000002,
+                purpose: crate::types::OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "co_decimal".to_string(),
+            })
+            .await
+            .expect("place order");
+
+        exchange_info.assert_async().await;
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rest_place_order_rounds_post_only_prices_to_exchange_tick() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+
+        let exchange_info = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/exchangeInfo")
+                    .query_param("symbol", "ETHUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbols": [{
+                        "symbol": "ETHUSDT",
+                        "filters": [{
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.1"
+                        }]
+                    }]
+                }));
+            })
+            .await;
+        let canonical = "newClientOrderId=co_tick&price=2074&quantity=0.01&recvWindow=5000&side=BUY&symbol=ETHUSDT&timeInForce=GTX&timestamp=1700000000000&type=LIMIT";
+        let expected_signature = sign_query("testsecret", canonical);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/fapi/v1/order")
+                    .header("X-MBX-APIKEY", "test-key")
+                    .query_param("symbol", "ETHUSDT")
+                    .query_param("side", "BUY")
+                    .query_param("type", "LIMIT")
+                    .query_param("timeInForce", "GTX")
+                    .query_param("price", "2074")
+                    .query_param("quantity", "0.01")
+                    .query_param("newClientOrderId", "co_tick")
+                    .query_param("recvWindow", "5000")
+                    .query_param("timestamp", "1700000000000")
+                    .query_param("signature", expected_signature);
+                then.status(200).body("{\"orderId\": 24680}");
+            })
+            .await;
+
+        let _ = client
+            .place_order(LiveRestPlaceRequest {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                side: Side::Buy,
+                price: 2074.08,
+                size: 0.01,
+                purpose: crate::types::OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "co_tick".to_string(),
+            })
+            .await
+            .expect("place order");
+
+        exchange_info.assert_async().await;
         mock.assert_async().await;
     }
 
@@ -2334,6 +3649,148 @@ mod tests {
         mock.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn rest_cancel_order_uses_numeric_order_id_when_available() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+
+        let canonical = "orderId=12345&recvWindow=5000&symbol=ETHUSDT&timestamp=1700000000000";
+        let expected_signature = sign_query("testsecret", canonical);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/fapi/v1/order")
+                    .header("X-MBX-APIKEY", "test-key")
+                    .query_param("symbol", "ETHUSDT")
+                    .query_param("orderId", "12345")
+                    .query_param("recvWindow", "5000")
+                    .query_param("timestamp", "1700000000000")
+                    .query_param("signature", expected_signature);
+                then.status(200).body("{}");
+            })
+            .await;
+
+        let _ = client
+            .cancel_order(LiveRestCancelRequest {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                order_id: "12345".to_string(),
+            })
+            .await
+            .expect("cancel order");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_account_snapshot_uses_poll_time_for_freshness() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_123_456));
+
+        let canonical = "recvWindow=5000&timestamp=1700000123456";
+        let expected_signature = sign_query("testsecret", canonical);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v2/account")
+                    .header("X-MBX-APIKEY", "test-key")
+                    .query_param("recvWindow", "5000")
+                    .query_param("timestamp", "1700000123456")
+                    .query_param("signature", expected_signature);
+                then.status(200).json_body(serde_json::json!({
+                    "updateTime": 1_700_000_000_000u64,
+                    "totalWalletBalance": "100.0",
+                    "totalPositionInitialMargin": "10.0",
+                    "availableBalance": "90.0",
+                    "positions": [{
+                        "symbol": "ETHUSDT",
+                        "positionAmt": "0.14",
+                        "entryPrice": "2091.67",
+                        "updateTime": 1_700_000_000_000u64
+                    }],
+                    "assets": [{
+                        "asset": "USDT",
+                        "walletBalance": "100.0",
+                        "availableBalance": "90.0"
+                    }]
+                }));
+            })
+            .await;
+
+        let snapshot = client
+            .fetch_account_snapshot("ASTER", 2)
+            .await
+            .expect("account snapshot");
+
+        mock.assert_async().await;
+        assert_eq!(snapshot.seq, 1_700_000_000_000u64);
+        assert_eq!(snapshot.timestamp_ms, 1_700_000_123_456);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert!((snapshot.positions[0].size - 0.14).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_open_orders_keeps_remaining_size_and_client_order_id() {
+        let value = serde_json::json!([
+            {
+                "symbol": "ETHUSDT",
+                "status": "PARTIALLY_FILLED",
+                "orderId": 12345,
+                "clientOrderId": "co_aster_1",
+                "side": "BUY",
+                "price": "2090.5",
+                "origQty": "0.50",
+                "executedQty": "0.20"
+            },
+            {
+                "symbol": "BTCUSDT",
+                "status": "NEW",
+                "orderId": 999,
+                "side": "SELL",
+                "price": "60000",
+                "origQty": "1.0",
+                "executedQty": "0"
+            }
+        ]);
+
+        let open_orders = parse_open_orders(&value, "ETHUSDT");
+
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].order_id, "12345");
+        assert_eq!(
+            open_orders[0].client_order_id.as_deref(),
+            Some("co_aster_1")
+        );
+        assert_eq!(open_orders[0].side, Side::Buy);
+        assert!((open_orders[0].price - 2090.5).abs() < 1e-9);
+        assert!((open_orders[0].size - 0.30).abs() < 1e-9);
+        assert_eq!(open_orders[0].purpose, None);
+    }
+
     #[test]
     fn freshness_reset_and_anchor_behavior() {
         let freshness = Freshness::default();
@@ -2368,5 +3825,24 @@ mod tests {
         freshness.last_published_ns.store(4_000, Ordering::Relaxed);
         let anchor = freshness.anchor_with_connect_start(connect_start_ns);
         assert_eq!(anchor, 4_000);
+    }
+
+    #[test]
+    fn snapshot_failure_classification_is_rate_limit_aware() {
+        assert_eq!(classify_snapshot_failure(Some(429)), "rate_limited");
+        assert_eq!(classify_snapshot_failure(Some(418)), "ip_banned");
+        assert_eq!(classify_snapshot_failure(Some(503)), "upstream_5xx");
+        assert_eq!(classify_snapshot_failure(Some(404)), "http_4xx");
+        assert_eq!(classify_snapshot_failure(None), "transport_or_parse");
+    }
+
+    #[test]
+    fn snapshot_backoff_grows_and_caps_for_rate_limits() {
+        let first = snapshot_backoff_ms(Some(429), 1, 0);
+        let third = snapshot_backoff_ms(Some(429), 3, 0);
+        let late = snapshot_backoff_ms(Some(429), 12, 0);
+        assert!(first >= 1_000);
+        assert!(third > first);
+        assert!(late <= 15_000);
     }
 }

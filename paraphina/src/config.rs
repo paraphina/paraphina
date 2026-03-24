@@ -8,7 +8,10 @@
 // It also carries a small number of "simulation environment"
 // parameters such as the initial global inventory q0 in TAO.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -356,6 +359,12 @@ pub struct MmConfig {
     pub funding_enabled: bool,
     /// Minimum per-unit edge for local MM quotes (in USD).
     pub edge_local_min: f64,
+    /// Optional per-venue edge floor overrides keyed by venue id.
+    pub edge_local_min_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue bid edge floor overrides keyed by venue id.
+    pub edge_local_min_bid_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue ask edge floor overrides keyed by venue id.
+    pub edge_local_min_ask_by_venue: BTreeMap<String, f64>,
     /// Multiplier for volatility-based edge buffer.
     pub edge_vol_mult: f64,
     /// Risk parameter η in size objective J(Q)=eQ - 0.5 η Q^2.
@@ -372,10 +381,33 @@ pub struct MmConfig {
     // ----- Order management (Section 11) -----
     /// Minimum quote lifetime before replacement (milliseconds).
     pub min_quote_lifetime_ms: i64,
+    /// Optional per-venue quote lifetime overrides keyed by venue id.
+    pub min_quote_lifetime_ms_by_venue: BTreeMap<String, i64>,
     /// Price tolerance in ticks before triggering order replacement.
     pub price_tol_ticks: f64,
+    /// Optional per-venue price tolerance overrides keyed by venue id.
+    pub price_tol_ticks_by_venue: BTreeMap<String, f64>,
     /// Size tolerance (relative) before triggering order replacement.
     pub size_tol_rel: f64,
+    /// Optional per-venue size tolerance overrides keyed by venue id.
+    pub size_tol_rel_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue max local spread in absolute USD before skipping MM quotes.
+    pub max_quote_spread_abs_usd_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue max local spread in basis points before skipping MM quotes.
+    pub max_quote_spread_bps_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue max generated two-sided quote spread in basis points.
+    pub max_generated_quote_spread_bps_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue economic role overrides keyed by venue id.
+    pub venue_role_by_venue: BTreeMap<String, MmVenueRole>,
+    /// Optional per-venue global inventory threshold that starts tapering the
+    /// inventory-worsening side before the soft governor fully blocks it.
+    pub pre_soft_taper_global_position_tao_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue local inventory threshold that starts tapering the
+    /// inventory-worsening side before the soft governor fully blocks it.
+    pub pre_soft_taper_venue_position_tao_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue size multiplier applied to the worsening side once a
+    /// pre-soft taper threshold is breached.
+    pub pre_soft_taper_size_multiplier_by_venue: BTreeMap<String, f64>,
 
     // ----- Funding target inventory (Section 9) -----
     /// Scale for funding rate in target inventory calculation.
@@ -387,6 +419,141 @@ pub struct MmConfig {
     /// If None, uses the venue's effective stale_ms threshold.
     /// This is a fail-fast guard to prevent quoting on stale data.
     pub quote_max_age_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MmVenueRole {
+    Fill,
+    Probationary,
+    Anchor,
+    Noise,
+}
+
+impl MmVenueRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MmVenueRole::Fill => "fill",
+            MmVenueRole::Probationary => "probationary",
+            MmVenueRole::Anchor => "anchor",
+            MmVenueRole::Noise => "noise",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fill" | "fills" | "primary" => Some(MmVenueRole::Fill),
+            "probationary" | "probation" | "trial" | "candidate" => Some(MmVenueRole::Probationary),
+            "anchor" | "reference" | "ref" => Some(MmVenueRole::Anchor),
+            "noise" | "noisy" | "suppress" | "suppressed" => Some(MmVenueRole::Noise),
+            _ => None,
+        }
+    }
+}
+
+impl MmConfig {
+    #[inline]
+    pub fn edge_local_min_bid_for(&self, venue_id: &str) -> f64 {
+        self.edge_local_min_bid_by_venue
+            .get(venue_id)
+            .copied()
+            .or_else(|| self.edge_local_min_by_venue.get(venue_id).copied())
+            .unwrap_or(self.edge_local_min)
+            .max(0.0)
+    }
+
+    #[inline]
+    pub fn edge_local_min_ask_for(&self, venue_id: &str) -> f64 {
+        self.edge_local_min_ask_by_venue
+            .get(venue_id)
+            .copied()
+            .or_else(|| self.edge_local_min_by_venue.get(venue_id).copied())
+            .unwrap_or(self.edge_local_min)
+            .max(0.0)
+    }
+
+    #[inline]
+    pub fn min_quote_lifetime_ms_for(&self, venue_id: &str) -> i64 {
+        self.min_quote_lifetime_ms_by_venue
+            .get(venue_id)
+            .copied()
+            .unwrap_or(self.min_quote_lifetime_ms)
+            .max(1)
+    }
+
+    #[inline]
+    pub fn price_tol_ticks_for(&self, venue_id: &str) -> f64 {
+        self.price_tol_ticks_by_venue
+            .get(venue_id)
+            .copied()
+            .unwrap_or(self.price_tol_ticks)
+            .max(0.0)
+    }
+
+    #[inline]
+    pub fn size_tol_rel_for(&self, venue_id: &str) -> f64 {
+        self.size_tol_rel_by_venue
+            .get(venue_id)
+            .copied()
+            .unwrap_or(self.size_tol_rel)
+            .max(0.0)
+    }
+
+    #[inline]
+    pub fn max_quote_spread_abs_usd_for(&self, venue_id: &str) -> Option<f64> {
+        self.max_quote_spread_abs_usd_by_venue
+            .get(venue_id)
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
+    pub fn max_quote_spread_bps_for(&self, venue_id: &str) -> Option<f64> {
+        self.max_quote_spread_bps_by_venue
+            .get(venue_id)
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
+    pub fn max_generated_quote_spread_bps_for(&self, venue_id: &str) -> Option<f64> {
+        self.max_generated_quote_spread_bps_by_venue
+            .get(venue_id)
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
+    pub fn venue_role_for(&self, venue_id: &str) -> MmVenueRole {
+        self.venue_role_by_venue
+            .get(venue_id)
+            .copied()
+            .unwrap_or(MmVenueRole::Fill)
+    }
+
+    #[inline]
+    pub fn pre_soft_taper_global_position_tao_for(&self, venue_id: &str) -> Option<f64> {
+        self.pre_soft_taper_global_position_tao_by_venue
+            .get(venue_id)
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
+    pub fn pre_soft_taper_venue_position_tao_for(&self, venue_id: &str) -> Option<f64> {
+        self.pre_soft_taper_venue_position_tao_by_venue
+            .get(venue_id)
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
+    pub fn pre_soft_taper_size_multiplier_for(&self, venue_id: &str) -> Option<f64> {
+        self.pre_soft_taper_size_multiplier_by_venue
+            .get(venue_id)
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -640,7 +807,7 @@ impl Default for Config {
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
                 stale_ms_override: None,
-                rate_limit_rps: Some(15.0),  // Assumed Binance-compatible ~20 RPS; 75% capacity.
+                rate_limit_rps: Some(15.0), // Assumed Binance-compatible ~20 RPS; 75% capacity.
                 rate_limit_burst: Some(20),
             },
             VenueConfig {
@@ -664,7 +831,7 @@ impl Default for Config {
                 // Hyperliquid WebSocket P50 ~1195ms, P95 ~1444ms (obs_5000_ticks_report).
                 // Default 1000ms causes 63.9% Stale / 1257 flaps in 83 min.
                 stale_ms_override: Some(2_000),
-                rate_limit_rps: Some(15.0),  // 1200 wt/min; batched orders = wt 1; 75% capacity.
+                rate_limit_rps: Some(15.0), // 1200 wt/min; batched orders = wt 1; 75% capacity.
                 rate_limit_burst: Some(20),
             },
             VenueConfig {
@@ -674,8 +841,9 @@ impl Default for Config {
                 tick_size: 0.01,
                 base_order_size: 1.0,
                 max_order_size: 20.0,
-                maker_fee_bps: 2.0,
-                taker_fee_bps: 5.0,
+                // Aster Pro fee schedule: maker 0.005%, taker 0.04%.
+                maker_fee_bps: 0.5,
+                taker_fee_bps: 4.0,
                 maker_rebate_bps: 0.0,
                 gamma: 0.11,
                 k: 1.4,
@@ -686,7 +854,7 @@ impl Default for Config {
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
                 stale_ms_override: None,
-                rate_limit_rps: Some(15.0),  // 1200 wt/min Binance-style; ~75% capacity.
+                rate_limit_rps: Some(15.0), // 1200 wt/min Binance-style; ~75% capacity.
                 rate_limit_burst: Some(20),
             },
             VenueConfig {
@@ -708,7 +876,7 @@ impl Default for Config {
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
                 stale_ms_override: None,
-                rate_limit_rps: Some(30.0),  // 24k wt/min premium; sendTx wt 6; ~45% capacity.
+                rate_limit_rps: Some(30.0), // 24k wt/min premium; sendTx wt 6; ~45% capacity.
                 rate_limit_burst: Some(45),
             },
             VenueConfig {
@@ -732,7 +900,7 @@ impl Default for Config {
                 // Paradex BBO feed cadence: startup P95 ~1,546ms, steady-state P95 ~250ms.
                 // 3,000ms gives ~2x headroom over worst startup case.
                 stale_ms_override: Some(3_000),
-                rate_limit_rps: Some(50.0),  // 800 RPS documented; 50 is ~6% capacity.
+                rate_limit_rps: Some(50.0), // 800 RPS documented; 50 is ~6% capacity.
                 rate_limit_burst: Some(75),
             },
         ];
@@ -814,6 +982,9 @@ impl Default for Config {
             funding_enabled: false,
             // Local minimum edge in USD, plus a vol-dependent buffer.
             edge_local_min: 0.5,
+            edge_local_min_by_venue: BTreeMap::new(),
+            edge_local_min_bid_by_venue: BTreeMap::new(),
+            edge_local_min_ask_by_venue: BTreeMap::new(),
             edge_vol_mult: 0.2,
             // Inventory-risk parameter in J(Q) = eQ - 0.5 η Q².
             // World-model tuned η at the profile centre.
@@ -828,8 +999,18 @@ impl Default for Config {
 
             // Order management (Section 11)
             min_quote_lifetime_ms: 500,
+            min_quote_lifetime_ms_by_venue: BTreeMap::new(),
             price_tol_ticks: 1.0,
+            price_tol_ticks_by_venue: BTreeMap::new(),
             size_tol_rel: 0.10,
+            size_tol_rel_by_venue: BTreeMap::new(),
+            max_quote_spread_abs_usd_by_venue: BTreeMap::new(),
+            max_quote_spread_bps_by_venue: BTreeMap::new(),
+            max_generated_quote_spread_bps_by_venue: BTreeMap::new(),
+            venue_role_by_venue: BTreeMap::new(),
+            pre_soft_taper_global_position_tao_by_venue: BTreeMap::new(),
+            pre_soft_taper_venue_position_tao_by_venue: BTreeMap::new(),
+            pre_soft_taper_size_multiplier_by_venue: BTreeMap::new(),
 
             // Funding target inventory (Section 9)
             funding_target_rate_scale: 0.001, // 0.1% funding rate = full shift
@@ -1032,7 +1213,21 @@ impl Config {
     ///   - PARAPHINA_INIT_Q_TAO        (f64, TAO)
     ///   - PARAPHINA_HEDGE_BAND_BASE   (f64, TAO)
     ///   - PARAPHINA_HEDGE_MAX_STEP    (f64, TAO)
+    ///   - PARAPHINA_HEDGE_MIN_DEPTH_USD (f64, USD)
+    ///   - PARAPHINA_HEDGE_DISABLED_VENUES (csv venue ids)
     ///   - PARAPHINA_MM_SIZE_ETA       (f64)
+    ///   - PARAPHINA_MM_EDGE_LOCAL_MIN (f64, USD per unit)
+    ///   - PARAPHINA_MM_EDGE_LOCAL_MIN_<VENUE> (f64, USD per unit)
+    ///   - PARAPHINA_MM_EDGE_LOCAL_MIN_<VENUE>_BID (f64, USD per unit)
+    ///   - PARAPHINA_MM_EDGE_LOCAL_MIN_<VENUE>_ASK (f64, USD per unit)
+    ///   - PARAPHINA_MM_LAMBDA_INV     (f64, [0, 1])
+    ///   - PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS (i64, ms)
+    ///   - PARAPHINA_MM_PRICE_TOL_TICKS (f64, ticks)
+    ///   - PARAPHINA_MM_SIZE_TOL_REL   (f64, relative size delta)
+    ///   - PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_<VENUE> (f64, USD)
+    ///   - PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_<VENUE> (f64, bps)
+    ///   - PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_<VENUE> (f64, bps)
+    ///   - PARAPHINA_MM_VENUE_ROLE_<VENUE> (fill|probationary|anchor|noise)
     ///   - PARAPHINA_VOL_REF           (f64)
     ///   - PARAPHINA_DAILY_LOSS_LIMIT  (f64, USD; positive threshold)
     ///   - PARAPHINA_MAIN_LOOP_INTERVAL_MS  (i64, ms)
@@ -1101,6 +1296,50 @@ impl Config {
                         cfg.hedge.max_step_tao
                     );
                 }
+            }
+        }
+
+        // Hedge minimum depth requirement (USD).
+        if let Ok(raw) = env::var("PARAPHINA_HEDGE_MIN_DEPTH_USD") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.hedge.min_depth_usd = v.max(0.0);
+                    eprintln!(
+                        "[config] PARAPHINA_HEDGE_MIN_DEPTH_USD = {} (overrode default)",
+                        cfg.hedge.min_depth_usd
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_HEDGE_MIN_DEPTH_USD = {:?} as f64; using default {}",
+                        raw,
+                        cfg.hedge.min_depth_usd
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_HEDGE_DISABLED_VENUES") {
+            let disabled: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+            if disabled.is_empty() {
+                eprintln!(
+                    "[config] WARN: PARAPHINA_HEDGE_DISABLED_VENUES was set but empty; leaving hedge venue defaults unchanged"
+                );
+            } else {
+                for venue in &mut cfg.venues {
+                    if disabled.iter().any(|id| id == &venue.id) {
+                        venue.is_hedge_allowed = false;
+                    }
+                }
+                eprintln!(
+                    "[config] PARAPHINA_HEDGE_DISABLED_VENUES = {:?} (disabled hedging on matching venues)",
+                    disabled
+                );
             }
         }
 
@@ -1181,6 +1420,413 @@ impl Config {
                         raw,
                         cfg.mm.size_eta
                     );
+                }
+            }
+        }
+
+        // MM local edge floor in USD per unit.
+        if let Ok(raw) = env::var("PARAPHINA_MM_EDGE_LOCAL_MIN") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.mm.edge_local_min = v.max(0.0);
+                    eprintln!(
+                        "[config] PARAPHINA_MM_EDGE_LOCAL_MIN = {} (overrode default)",
+                        cfg.mm.edge_local_min
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_MM_EDGE_LOCAL_MIN = {:?} as f64; using default {}",
+                        raw,
+                        cfg.mm.edge_local_min
+                    );
+                }
+            }
+        }
+
+        for venue in &cfg.venues {
+            let venue_key = venue.id.to_ascii_uppercase();
+            let venue_env = format!("PARAPHINA_MM_EDGE_LOCAL_MIN_{venue_key}");
+            if let Ok(raw) = env::var(&venue_env) {
+                match raw.parse::<f64>() {
+                    Ok(v) => {
+                        cfg.mm
+                            .edge_local_min_by_venue
+                            .insert(venue.id.clone(), v.max(0.0));
+                        eprintln!(
+                            "[config] {} = {} (overrode MM edge floor for {})",
+                            venue_env,
+                            cfg.mm
+                                .edge_local_min_by_venue
+                                .get(&venue.id)
+                                .copied()
+                                .unwrap_or(cfg.mm.edge_local_min),
+                            venue.id
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as f64; leaving {} on default/parent edge floor",
+                            venue_env,
+                            raw,
+                            venue.id
+                        );
+                    }
+                }
+            }
+
+            for (side_suffix, side_name, target_map) in [
+                ("BID", "bid", &mut cfg.mm.edge_local_min_bid_by_venue),
+                ("ASK", "ask", &mut cfg.mm.edge_local_min_ask_by_venue),
+            ] {
+                let env_key = format!("PARAPHINA_MM_EDGE_LOCAL_MIN_{venue_key}_{side_suffix}");
+                if let Ok(raw) = env::var(&env_key) {
+                    match raw.parse::<f64>() {
+                        Ok(v) => {
+                            target_map.insert(venue.id.clone(), v.max(0.0));
+                            eprintln!(
+                                "[config] {} = {} (overrode MM {} edge floor for {})",
+                                env_key,
+                                target_map
+                                    .get(&venue.id)
+                                    .copied()
+                                    .unwrap_or(cfg.mm.edge_local_min),
+                                side_name,
+                                venue.id
+                            );
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[config] WARN: could not parse {} = {:?} as f64; leaving {} {} edge floor on default/parent value",
+                                env_key,
+                                raw,
+                                venue.id,
+                                side_name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // MM inventory skew balance between global and venue-local inventory.
+        if let Ok(raw) = env::var("PARAPHINA_MM_LAMBDA_INV") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.mm.lambda_inv = v.clamp(0.0, 1.0);
+                    eprintln!(
+                        "[config] PARAPHINA_MM_LAMBDA_INV = {} (overrode default)",
+                        cfg.mm.lambda_inv
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_MM_LAMBDA_INV = {:?} as f64; using default {}",
+                        raw,
+                        cfg.mm.lambda_inv
+                    );
+                }
+            }
+        }
+
+        // MM order persistence before requoting passive orders.
+        if let Ok(raw) = env::var("PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    cfg.mm.min_quote_lifetime_ms = v.max(1);
+                    eprintln!(
+                        "[config] PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS = {} (overrode default)",
+                        cfg.mm.min_quote_lifetime_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS = {:?} as i64; using default {}",
+                        raw,
+                        cfg.mm.min_quote_lifetime_ms
+                    );
+                }
+            }
+        }
+
+        // MM cancel/replace price tolerance in ticks.
+        if let Ok(raw) = env::var("PARAPHINA_MM_PRICE_TOL_TICKS") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.mm.price_tol_ticks = v.max(0.0);
+                    eprintln!(
+                        "[config] PARAPHINA_MM_PRICE_TOL_TICKS = {} (overrode default)",
+                        cfg.mm.price_tol_ticks
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_MM_PRICE_TOL_TICKS = {:?} as f64; using default {}",
+                        raw,
+                        cfg.mm.price_tol_ticks
+                    );
+                }
+            }
+        }
+
+        // MM cancel/replace size tolerance (relative).
+        if let Ok(raw) = env::var("PARAPHINA_MM_SIZE_TOL_REL") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.mm.size_tol_rel = v.max(0.0);
+                    eprintln!(
+                        "[config] PARAPHINA_MM_SIZE_TOL_REL = {} (overrode default)",
+                        cfg.mm.size_tol_rel
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_MM_SIZE_TOL_REL = {:?} as f64; using default {}",
+                        raw,
+                        cfg.mm.size_tol_rel
+                    );
+                }
+            }
+        }
+
+        for venue in &cfg.venues {
+            let venue_key = venue.id.to_ascii_uppercase();
+
+            let lifetime_key = format!("PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_{venue_key}");
+            if let Ok(raw) = env::var(&lifetime_key) {
+                match raw.parse::<i64>() {
+                    Ok(v) => {
+                        cfg.mm
+                            .min_quote_lifetime_ms_by_venue
+                            .insert(venue.id.clone(), v.max(1));
+                        eprintln!(
+                            "[config] {} = {} (overrode quote lifetime for {})",
+                            lifetime_key,
+                            cfg.mm
+                                .min_quote_lifetime_ms_by_venue
+                                .get(&venue.id)
+                                .copied()
+                                .unwrap_or(cfg.mm.min_quote_lifetime_ms),
+                            venue.id
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as i64; leaving {} quote lifetime on default/global value",
+                            lifetime_key,
+                            raw,
+                            venue.id
+                        );
+                    }
+                }
+            }
+
+            let price_tol_key = format!("PARAPHINA_MM_PRICE_TOL_TICKS_{venue_key}");
+            if let Ok(raw) = env::var(&price_tol_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) => {
+                        cfg.mm
+                            .price_tol_ticks_by_venue
+                            .insert(venue.id.clone(), v.max(0.0));
+                        eprintln!(
+                            "[config] {} = {} (overrode price tolerance for {})",
+                            price_tol_key,
+                            cfg.mm
+                                .price_tol_ticks_by_venue
+                                .get(&venue.id)
+                                .copied()
+                                .unwrap_or(cfg.mm.price_tol_ticks),
+                            venue.id
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as f64; leaving {} price tolerance on default/global value",
+                            price_tol_key,
+                            raw,
+                            venue.id
+                        );
+                    }
+                }
+            }
+
+            let size_tol_key = format!("PARAPHINA_MM_SIZE_TOL_REL_{venue_key}");
+            if let Ok(raw) = env::var(&size_tol_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) => {
+                        cfg.mm
+                            .size_tol_rel_by_venue
+                            .insert(venue.id.clone(), v.max(0.0));
+                        eprintln!(
+                            "[config] {} = {} (overrode size tolerance for {})",
+                            size_tol_key,
+                            cfg.mm
+                                .size_tol_rel_by_venue
+                                .get(&venue.id)
+                                .copied()
+                                .unwrap_or(cfg.mm.size_tol_rel),
+                            venue.id
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as f64; leaving {} size tolerance on default/global value",
+                            size_tol_key,
+                            raw,
+                            venue.id
+                        );
+                    }
+                }
+            }
+
+            let spread_abs_key = format!("PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_{venue_key}");
+            if let Ok(raw) = env::var(&spread_abs_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => {
+                        cfg.mm
+                            .max_quote_spread_abs_usd_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set quote spread USD cap for {})",
+                            spread_abs_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive f64; leaving {} spread USD cap disabled",
+                            spread_abs_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+
+            let spread_bps_key = format!("PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_{venue_key}");
+            if let Ok(raw) = env::var(&spread_bps_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => {
+                        cfg.mm
+                            .max_quote_spread_bps_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set quote spread bps cap for {})",
+                            spread_bps_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive f64; leaving {} spread bps cap disabled",
+                            spread_bps_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+
+            let generated_spread_bps_key =
+                format!("PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_{venue_key}");
+            if let Ok(raw) = env::var(&generated_spread_bps_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => {
+                        cfg.mm
+                            .max_generated_quote_spread_bps_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set generated quote spread bps cap for {})",
+                            generated_spread_bps_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive f64; leaving {} generated quote spread cap disabled",
+                            generated_spread_bps_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+
+            let venue_role_key = format!("PARAPHINA_MM_VENUE_ROLE_{venue_key}");
+            if let Ok(raw) = env::var(&venue_role_key) {
+                match MmVenueRole::parse(&raw) {
+                    Some(role) => {
+                        cfg.mm.venue_role_by_venue.insert(venue.id.clone(), role);
+                        eprintln!(
+                            "[config] {} = {} (set MM venue role for {})",
+                            venue_role_key,
+                            role.as_str(),
+                            venue.id
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as fill|probationary|anchor|noise; leaving {} on default fill role",
+                            venue_role_key,
+                            raw,
+                            venue.id
+                        );
+                    }
+                }
+            }
+
+            let taper_global_key =
+                format!("PARAPHINA_MM_PRE_SOFT_TAPER_GLOBAL_POS_TAO_{venue_key}");
+            if let Ok(raw) = env::var(&taper_global_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => {
+                        cfg.mm
+                            .pre_soft_taper_global_position_tao_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set MM pre-soft global taper threshold for {})",
+                            taper_global_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive f64; leaving {} global pre-soft taper disabled",
+                            taper_global_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+
+            let taper_venue_key = format!("PARAPHINA_MM_PRE_SOFT_TAPER_VENUE_POS_TAO_{venue_key}");
+            if let Ok(raw) = env::var(&taper_venue_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => {
+                        cfg.mm
+                            .pre_soft_taper_venue_position_tao_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set MM pre-soft venue taper threshold for {})",
+                            taper_venue_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive f64; leaving {} venue pre-soft taper disabled",
+                            taper_venue_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+
+            let taper_mult_key = format!("PARAPHINA_MM_PRE_SOFT_TAPER_SIZE_MULT_{venue_key}");
+            if let Ok(raw) = env::var(&taper_mult_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 && v < 1.0 => {
+                        cfg.mm
+                            .pre_soft_taper_size_multiplier_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set MM pre-soft taper size multiplier for {})",
+                            taper_mult_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as 0<f64<1; leaving {} pre-soft taper size multiplier disabled",
+                            taper_mult_key, raw, venue.id
+                        );
+                    }
                 }
             }
         }
@@ -1739,6 +2385,19 @@ mod tests {
         // EnvGuard restores on drop.
     }
 
+    #[test]
+    fn aster_default_fee_schedule_matches_current_fee_page() {
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        let aster = cfg
+            .venues
+            .iter()
+            .find(|v| v.id == "aster")
+            .expect("aster venue must exist");
+        assert!((aster.maker_fee_bps - 0.5).abs() < 1e-9);
+        assert!((aster.taker_fee_bps - 4.0).abs() < 1e-9);
+        assert!((aster.maker_rebate_bps - 0.0).abs() < 1e-9);
+    }
+
     /// Test that invalid values for Extended are ignored (no panic, no override).
     #[test]
     fn extended_state_stale_override_env_ignores_invalid() {
@@ -1817,5 +2476,185 @@ mod tests {
             cfg.toxicity.depth_fallback_grace_ms, 500,
             "invalid PARAPHINA_DEPTH_FALLBACK_GRACE_MS should leave default unchanged"
         );
+    }
+
+    #[test]
+    fn mm_live_tuning_envs_override_defaults() {
+        use std::env;
+
+        const EDGE_KEY: &str = "PARAPHINA_MM_EDGE_LOCAL_MIN";
+        const PARADEX_KEY: &str = "PARAPHINA_MM_EDGE_LOCAL_MIN_PARADEX";
+        const PARADEX_BID_KEY: &str = "PARAPHINA_MM_EDGE_LOCAL_MIN_PARADEX_BID";
+        const PARADEX_ASK_KEY: &str = "PARAPHINA_MM_EDGE_LOCAL_MIN_PARADEX_ASK";
+        const LAMBDA_KEY: &str = "PARAPHINA_MM_LAMBDA_INV";
+        const LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS";
+        const HL_LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_HYPERLIQUID";
+        const PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS";
+        const HL_PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS_HYPERLIQUID";
+        const SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL";
+        const HL_SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL_HYPERLIQUID";
+        const EXT_SPREAD_USD_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_EXTENDED";
+        const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
+        const ASTER_GEN_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_ASTER";
+        const HL_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID";
+        const EXT_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_EXTENDED";
+
+        let _lock = env_lock().lock().unwrap();
+        let _edge = EnvGuard::new(EDGE_KEY);
+        let _paradex = EnvGuard::new(PARADEX_KEY);
+        let _paradex_bid = EnvGuard::new(PARADEX_BID_KEY);
+        let _paradex_ask = EnvGuard::new(PARADEX_ASK_KEY);
+        let _lambda = EnvGuard::new(LAMBDA_KEY);
+        let _lifetime = EnvGuard::new(LIFETIME_KEY);
+        let _hl_lifetime = EnvGuard::new(HL_LIFETIME_KEY);
+        let _price_tol = EnvGuard::new(PRICE_TOL_KEY);
+        let _hl_price_tol = EnvGuard::new(HL_PRICE_TOL_KEY);
+        let _size_tol = EnvGuard::new(SIZE_TOL_KEY);
+        let _hl_size_tol = EnvGuard::new(HL_SIZE_TOL_KEY);
+        let _ext_spread_usd = EnvGuard::new(EXT_SPREAD_USD_KEY);
+        let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
+        let _aster_gen_spread_bps = EnvGuard::new(ASTER_GEN_SPREAD_BPS_KEY);
+        let _hl_role = EnvGuard::new(HL_ROLE_KEY);
+        let _ext_role = EnvGuard::new(EXT_ROLE_KEY);
+
+        env::set_var(EDGE_KEY, "0.15");
+        env::set_var(PARADEX_KEY, "0.09");
+        env::set_var(PARADEX_BID_KEY, "0.03");
+        env::set_var(PARADEX_ASK_KEY, "0.11");
+        env::set_var(LAMBDA_KEY, "0.8");
+        env::set_var(LIFETIME_KEY, "1500");
+        env::set_var(HL_LIFETIME_KEY, "3000");
+        env::set_var(PRICE_TOL_KEY, "2.5");
+        env::set_var(HL_PRICE_TOL_KEY, "4.0");
+        env::set_var(SIZE_TOL_KEY, "0.25");
+        env::set_var(HL_SIZE_TOL_KEY, "0.35");
+        env::set_var(EXT_SPREAD_USD_KEY, "3.0");
+        env::set_var(EXT_SPREAD_BPS_KEY, "15");
+        env::set_var(ASTER_GEN_SPREAD_BPS_KEY, "10");
+        env::set_var(HL_ROLE_KEY, "probationary");
+        env::set_var(EXT_ROLE_KEY, "noise");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert!((cfg.mm.edge_local_min - 0.15).abs() < 1e-9);
+        assert!((cfg.mm.edge_local_min_bid_for("paradex") - 0.03).abs() < 1e-9);
+        assert!((cfg.mm.edge_local_min_ask_for("paradex") - 0.11).abs() < 1e-9);
+        assert!((cfg.mm.edge_local_min_bid_for("aster") - 0.15).abs() < 1e-9);
+        assert!((cfg.mm.edge_local_min_ask_for("extended") - 0.15).abs() < 1e-9);
+        assert!((cfg.mm.lambda_inv - 0.8).abs() < 1e-9);
+        assert_eq!(cfg.mm.min_quote_lifetime_ms, 1500);
+        assert_eq!(cfg.mm.min_quote_lifetime_ms_for("hyperliquid"), 3000);
+        assert_eq!(cfg.mm.min_quote_lifetime_ms_for("lighter"), 1500);
+        assert!((cfg.mm.price_tol_ticks - 2.5).abs() < 1e-9);
+        assert!((cfg.mm.price_tol_ticks_for("hyperliquid") - 4.0).abs() < 1e-9);
+        assert!((cfg.mm.price_tol_ticks_for("aster") - 2.5).abs() < 1e-9);
+        assert!((cfg.mm.size_tol_rel - 0.25).abs() < 1e-9);
+        assert!((cfg.mm.size_tol_rel_for("hyperliquid") - 0.35).abs() < 1e-9);
+        assert!((cfg.mm.size_tol_rel_for("paradex") - 0.25).abs() < 1e-9);
+        assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("extended"), Some(3.0));
+        assert_eq!(cfg.mm.max_quote_spread_bps_for("extended"), Some(15.0));
+        assert_eq!(
+            cfg.mm.max_generated_quote_spread_bps_for("aster"),
+            Some(10.0)
+        );
+        assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("hyperliquid"), None);
+        assert_eq!(
+            cfg.mm.venue_role_for("hyperliquid"),
+            MmVenueRole::Probationary
+        );
+        assert_eq!(cfg.mm.venue_role_for("extended"), MmVenueRole::Noise);
+        assert_eq!(cfg.mm.venue_role_for("aster"), MmVenueRole::Fill);
+    }
+
+    #[test]
+    fn mm_live_tuning_envs_ignore_invalid_values() {
+        use std::env;
+
+        const LAMBDA_KEY: &str = "PARAPHINA_MM_LAMBDA_INV";
+        const LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS";
+        const HL_LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_HYPERLIQUID";
+        const PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS";
+        const HL_PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS_HYPERLIQUID";
+        const SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL";
+        const HL_SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL_HYPERLIQUID";
+        const EXT_SPREAD_USD_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_EXTENDED";
+        const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
+        const HL_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID";
+
+        let _lock = env_lock().lock().unwrap();
+        let _lambda = EnvGuard::new(LAMBDA_KEY);
+        let _lifetime = EnvGuard::new(LIFETIME_KEY);
+        let _hl_lifetime = EnvGuard::new(HL_LIFETIME_KEY);
+        let _price_tol = EnvGuard::new(PRICE_TOL_KEY);
+        let _hl_price_tol = EnvGuard::new(HL_PRICE_TOL_KEY);
+        let _size_tol = EnvGuard::new(SIZE_TOL_KEY);
+        let _hl_size_tol = EnvGuard::new(HL_SIZE_TOL_KEY);
+        let _ext_spread_usd = EnvGuard::new(EXT_SPREAD_USD_KEY);
+        let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
+        let _hl_role = EnvGuard::new(HL_ROLE_KEY);
+
+        env::set_var(LAMBDA_KEY, "not_a_number");
+        env::set_var(LIFETIME_KEY, "not_a_number");
+        env::set_var(HL_LIFETIME_KEY, "not_a_number");
+        env::set_var(PRICE_TOL_KEY, "not_a_number");
+        env::set_var(HL_PRICE_TOL_KEY, "not_a_number");
+        env::set_var(SIZE_TOL_KEY, "not_a_number");
+        env::set_var(HL_SIZE_TOL_KEY, "not_a_number");
+        env::set_var(EXT_SPREAD_USD_KEY, "not_a_number");
+        env::set_var(EXT_SPREAD_BPS_KEY, "0");
+        env::set_var(HL_ROLE_KEY, "not_a_role");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert!((cfg.mm.lambda_inv - 0.3).abs() < 1e-9);
+        assert_eq!(cfg.mm.min_quote_lifetime_ms, 500);
+        assert_eq!(cfg.mm.min_quote_lifetime_ms_for("hyperliquid"), 500);
+        assert!((cfg.mm.price_tol_ticks - 1.0).abs() < 1e-9);
+        assert!((cfg.mm.price_tol_ticks_for("hyperliquid") - 1.0).abs() < 1e-9);
+        assert!((cfg.mm.size_tol_rel - 0.10).abs() < 1e-9);
+        assert!((cfg.mm.size_tol_rel_for("hyperliquid") - 0.10).abs() < 1e-9);
+        assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("extended"), None);
+        assert_eq!(cfg.mm.max_quote_spread_bps_for("extended"), None);
+        assert_eq!(cfg.mm.venue_role_for("hyperliquid"), MmVenueRole::Fill);
+    }
+
+    #[test]
+    fn hedge_disabled_venues_env_disables_matching_venues_only() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_HEDGE_DISABLED_VENUES";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "paradex, lighter");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        let by_id = |id: &str| {
+            cfg.venues
+                .iter()
+                .find(|v| v.id == id)
+                .expect("venue must exist")
+                .is_hedge_allowed
+        };
+
+        assert!(!by_id("paradex"));
+        assert!(!by_id("lighter"));
+        assert!(by_id("extended"));
+        assert!(by_id("hyperliquid"));
+        assert!(by_id("aster"));
+    }
+
+    #[test]
+    fn hedge_min_depth_env_overrides_default() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_HEDGE_MIN_DEPTH_USD";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "125.5");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert!((cfg.hedge.min_depth_usd - 125.5).abs() < 1e-9);
     }
 }

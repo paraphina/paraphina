@@ -66,14 +66,14 @@ impl SharedVenueAges {
     }
 
     /// Milliseconds since the runner last called [`mark_write`].
-    /// Returns `i64::MAX` if the runner has never written.
+    /// Returns `None` until the runner has emitted its first heartbeat.
     #[inline]
-    pub fn runner_idle_ms(&self, now_ms: i64) -> i64 {
+    pub fn runner_idle_ms(&self, now_ms: i64) -> Option<i64> {
         let last = self.last_write_ms.load(Ordering::Relaxed);
         if last == 0 {
-            i64::MAX
+            None
         } else {
-            (now_ms - last).max(0)
+            Some((now_ms - last).max(0))
         }
     }
 
@@ -94,7 +94,7 @@ mod tests {
         assert_eq!(ages.age_ms(0), i64::MAX);
         assert_eq!(ages.age_ms(1), i64::MAX);
         assert_eq!(ages.age_ms(2), i64::MAX);
-        assert_eq!(ages.runner_idle_ms(1000), i64::MAX);
+        assert_eq!(ages.runner_idle_ms(1000), None);
     }
 
     #[test]
@@ -105,7 +105,7 @@ mod tests {
         ages.mark_write(5000);
         assert_eq!(ages.age_ms(0), 42);
         assert_eq!(ages.age_ms(1), 100);
-        assert_eq!(ages.runner_idle_ms(5050), 50);
+        assert_eq!(ages.runner_idle_ms(5050), Some(50));
     }
 
     #[test]

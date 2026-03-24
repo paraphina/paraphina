@@ -159,7 +159,14 @@ pub struct OrderRejected {
     pub venue_id: String,
     pub seq: u64,
     pub timestamp_ms: TimestampMs,
+    #[serde(default)]
     pub order_id: Option<String>,
+    #[serde(default)]
+    pub client_order_id: Option<String>,
+    #[serde(default)]
+    pub purpose: Option<OrderPurpose>,
+    #[serde(default)]
+    pub reduce_only: Option<bool>,
     pub reason: String,
 }
 
@@ -219,10 +226,11 @@ pub struct CancelAllRejected {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenOrderSnapshot {
     pub order_id: String,
+    pub client_order_id: Option<String>,
     pub side: Side,
     pub price: f64,
     pub size: f64,
-    pub purpose: OrderPurpose,
+    pub purpose: Option<OrderPurpose>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

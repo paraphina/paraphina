@@ -1,0 +1,11 @@
+{
+  "seq": 20,
+  "ts": 1700000000200,
+  "positions": [],
+  "balances": [
+    { "asset": "USD", "total": 10000.0, "available": 10000.0 }
+  ],
+  "margin": { "balance": 10000.0, "used": 0.0, "available": 10000.0 },
+  "liquidation": { "price_liq": null, "dist_liq_sigma": null },
+  "funding_8h": 0.001
+}

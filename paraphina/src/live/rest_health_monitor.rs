@@ -2,10 +2,8 @@
 //!
 //! Runs as an independent supervised task that periodically checks
 //! [`SharedVenueAges`].  When a venue is stale beyond a configurable
-//! threshold and has a REST API for L2 book data, the monitor fetches
-//! the book via REST and sends the resulting `MarketDataEvent::L2Snapshot`
-//! directly to the runner's `market_ingest_tx`, completely bypassing
-//! connector-internal code.
+//! threshold, the monitor can either fetch and inject a REST market event
+//! or run a lightweight probe-only check, depending on venue semantics.
 //!
 //! This layer survives connector bugs because it shares no state with
 //! connectors — it reads ages from the runner and fetches data
@@ -17,6 +15,11 @@ use tokio::sync::mpsc;
 
 use super::shared_venue_ages::SharedVenueAges;
 use super::types::MarketDataEvent;
+#[cfg(feature = "live_aster")]
+use crate::live::connectors::aster::{
+    aster_note_probe_rate_limit, aster_probe_budget_decision, AsterProbeBudgetDecision,
+    AsterPublicRestBudgetHandle,
+};
 
 // reqwest-dependent REST fetch functions are only available when at least one
 // connector feature pulls in the reqwest crate.  Some items may appear unused
@@ -35,16 +38,40 @@ use {
 
 // ─── per-venue REST fetcher trait ──────────────────────────────────────────
 
-/// A type-erased async function that fetches a single L2 snapshot.
+/// A type-erased async function that either returns an injectable market event
+/// or reports successful probe completion with `None`.
 pub type RestFetcher = Box<dyn Fn() -> BoxFut + Send + Sync>;
 type BoxFut =
-    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<MarketDataEvent>> + Send>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<RestFetchOutcome>> + Send>>;
+
+pub enum RestFetchOutcome {
+    Inject(MarketDataEvent),
+    ProbeOk,
+    Suppressed { reason: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestMonitorMode {
+    InjectSnapshot,
+    ProbeOnly,
+}
+
+impl RestMonitorMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InjectSnapshot => "inject_snapshot",
+            Self::ProbeOnly => "probe_only",
+        }
+    }
+}
 
 pub struct VenueRestEntry {
     /// Human-readable venue name for logging.
     pub name: String,
     /// Which venue index this fetcher covers.
     pub venue_index: usize,
+    /// Whether a successful fetch should be injected or treated as a probe.
+    pub mode: RestMonitorMode,
     /// The async fetcher closure.
     pub fetcher: RestFetcher,
 }
@@ -77,6 +104,7 @@ struct VenueRestAuditStats {
     rest_success_count: u64,
     rest_fail_count: u64,
     rest_inject_count: u64,
+    rest_suppressed_count: u64,
     last_log_ms: i64,
 }
 
@@ -97,19 +125,22 @@ fn maybe_log_rest_audit(
     if !enabled {
         return;
     }
-    let should_log = stats.rest_check_count <= 3 || now_ms.saturating_sub(stats.last_log_ms) >= 30_000;
+    let should_log =
+        stats.rest_check_count <= 3 || now_ms.saturating_sub(stats.last_log_ms) >= 30_000;
     if !should_log {
         return;
     }
     stats.last_log_ms = now_ms;
     eprintln!(
-        "WS_AUDIT subsystem=rest_monitor venue={} rest_check_count={} rest_attempt_count={} rest_success_count={} rest_fail_count={} rest_inject_count={} age_ms={} threshold_ms={}",
+        "WS_AUDIT subsystem=rest_monitor venue={} mode={} rest_check_count={} rest_attempt_count={} rest_success_count={} rest_fail_count={} rest_inject_count={} rest_suppressed_count={} age_ms={} threshold_ms={}",
         venue.name,
+        venue.mode.as_str(),
         stats.rest_check_count,
         stats.rest_attempt_count,
         stats.rest_success_count,
         stats.rest_fail_count,
         stats.rest_inject_count,
+        stats.rest_suppressed_count,
         age_ms,
         threshold_ms
     );
@@ -174,8 +205,11 @@ pub async fn run_rest_health_monitor(
 
             if !active[i] {
                 eprintln!(
-                    "WARN: REST health monitor: {} stale (age_ms={}, threshold={}), activating REST fallback",
-                    venue.name, age, cfg.rest_threshold_ms
+                    "WARN: REST health monitor: {} stale (age_ms={}, threshold={}), activating REST {}",
+                    venue.name,
+                    age,
+                    cfg.rest_threshold_ms,
+                    venue.mode.as_str()
                 );
                 active[i] = true;
             }
@@ -184,18 +218,34 @@ pub async fn run_rest_health_monitor(
             let fetch_timeout = Duration::from_secs(5);
             stats.rest_attempt_count += 1;
             match tokio::time::timeout(fetch_timeout, (venue.fetcher)()).await {
-                Ok(Ok(event)) => {
-                    stats.rest_success_count += 1;
-                    if market_tx.send(event).await.is_err() {
-                        stats.rest_fail_count += 1;
-                        eprintln!(
-                            "WARN: REST health monitor: market_tx closed for {}",
-                            venue.name
-                        );
-                    } else {
-                        stats.rest_inject_count += 1;
+                Ok(Ok(outcome)) => match outcome {
+                    RestFetchOutcome::Inject(event) => {
+                        stats.rest_success_count += 1;
+                        if market_tx.send(event).await.is_err() {
+                            stats.rest_fail_count += 1;
+                            eprintln!(
+                                "WARN: REST health monitor: market_tx closed for {}",
+                                venue.name
+                            );
+                        } else {
+                            stats.rest_inject_count += 1;
+                        }
                     }
-                }
+                    RestFetchOutcome::ProbeOk => {
+                        stats.rest_success_count += 1;
+                    }
+                    RestFetchOutcome::Suppressed { reason } => {
+                        stats.rest_suppressed_count += 1;
+                        if ws_audit_enabled {
+                            eprintln!(
+                                "WS_AUDIT subsystem=rest_monitor venue={} mode={} rest_probe_suppressed=1 suppression_reason={}",
+                                venue.name,
+                                venue.mode.as_str(),
+                                reason,
+                            );
+                        }
+                    }
+                },
                 Ok(Err(err)) => {
                     stats.rest_fail_count += 1;
                     eprintln!(
@@ -240,7 +290,7 @@ pub async fn fetch_extended_l2_snapshot(
     market: &str,
     depth_limit: usize,
     venue_index: usize,
-) -> anyhow::Result<MarketDataEvent> {
+) -> anyhow::Result<RestFetchOutcome> {
     let url = format!("{rest_url}/fapi/v1/depth?symbol={market}&limit={depth_limit}");
     let resp = client.get(&url).send().await?.error_for_status()?;
     let value: Value = resp.json().await?;
@@ -251,14 +301,16 @@ pub async fn fetch_extended_l2_snapshot(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let timestamp_ms = wall_ms();
-    Ok(MarketDataEvent::L2Snapshot(L2Snapshot {
-        venue_index,
-        venue_id: market.to_string(),
-        seq,
-        timestamp_ms,
-        bids,
-        asks,
-    }))
+    Ok(RestFetchOutcome::Inject(MarketDataEvent::L2Snapshot(
+        L2Snapshot {
+            venue_index,
+            venue_id: market.to_string(),
+            seq,
+            timestamp_ms,
+            bids,
+            asks,
+        },
+    )))
 }
 
 /// Fetch Lighter L2 book via REST.
@@ -269,7 +321,7 @@ pub async fn fetch_lighter_l2_snapshot(
     rest_url: &str,
     market: &str,
     venue_index: usize,
-) -> anyhow::Result<MarketDataEvent> {
+) -> anyhow::Result<RestFetchOutcome> {
     let base = rest_url.trim_end_matches('/');
     let endpoints = ["/api/v1/orderBooks", "/api/v1/orderbooks"];
     let mut last_error: Option<String> = None;
@@ -300,7 +352,7 @@ pub async fn fetch_lighter_l2_snapshot(
             }
         };
         match parse_lighter_snapshot_response(&value, market, venue_index) {
-            Ok(event) => return Ok(event),
+            Ok(event) => return Ok(RestFetchOutcome::Inject(event)),
             Err(err) => {
                 last_error = Some(format!("parse snapshot error url={url} err={err}"));
                 continue;
@@ -323,7 +375,7 @@ pub async fn fetch_aster_l2_snapshot(
     market: &str,
     depth_limit: usize,
     venue_index: usize,
-) -> anyhow::Result<MarketDataEvent> {
+) -> anyhow::Result<RestFetchOutcome> {
     let url = format!("{rest_url}/fapi/v1/depth?symbol={market}&limit={depth_limit}");
     let resp = client.get(&url).send().await?.error_for_status()?;
     let value: Value = resp.json().await?;
@@ -334,14 +386,130 @@ pub async fn fetch_aster_l2_snapshot(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     let timestamp_ms = wall_ms();
-    Ok(MarketDataEvent::L2Snapshot(L2Snapshot {
-        venue_index,
-        venue_id: market.to_string(),
-        seq,
-        timestamp_ms,
-        bids,
-        asks,
-    }))
+    Ok(RestFetchOutcome::Inject(MarketDataEvent::L2Snapshot(
+        L2Snapshot {
+            venue_index,
+            venue_id: market.to_string(),
+            seq,
+            timestamp_ms,
+            bids,
+            asks,
+        },
+    )))
+}
+
+/// Probe Aster market-data REST without competing for full depth snapshots.
+/// URL: `{rest_url}/fapi/v1/ticker/bookTicker?symbol={market}`
+#[cfg(feature = "live_aster")]
+pub async fn probe_aster_book_ticker(
+    client: &Client,
+    rest_url: &str,
+    market: &str,
+) -> anyhow::Result<RestFetchOutcome> {
+    let url = format!("{rest_url}/fapi/v1/ticker/bookTicker?symbol={market}");
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let value: Value = resp.json().await?;
+    let symbol = value
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing symbol"))?;
+    if symbol != market {
+        anyhow::bail!(
+            "bookTicker symbol mismatch expected={} actual={}",
+            market,
+            symbol
+        );
+    }
+    let bid = value
+        .get("bidPrice")
+        .and_then(|v| v.as_str())
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("missing bidPrice"))?;
+    let ask = value
+        .get("askPrice")
+        .and_then(|v| v.as_str())
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("missing askPrice"))?;
+    if !(bid.is_finite() && ask.is_finite() && ask >= bid) {
+        anyhow::bail!("invalid bid/ask bid={} ask={}", bid, ask);
+    }
+    Ok(RestFetchOutcome::ProbeOk)
+}
+
+/// Probe Aster market-data REST, but yield to connector-owned recovery and shared cooldown.
+#[cfg(feature = "live_aster")]
+pub async fn probe_aster_book_ticker_budgeted(
+    client: &Client,
+    rest_url: &str,
+    market: &str,
+    budget: &AsterPublicRestBudgetHandle,
+) -> anyhow::Result<RestFetchOutcome> {
+    match aster_probe_budget_decision(budget) {
+        AsterProbeBudgetDecision::Allow => {}
+        AsterProbeBudgetDecision::Suppressed { reason, .. } => {
+            return Ok(RestFetchOutcome::Suppressed { reason });
+        }
+    }
+    let url = format!("{rest_url}/fapi/v1/ticker/bookTicker?symbol={market}");
+    let resp = client.get(&url).send().await?;
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let weight_1m = headers.iter().find_map(|(name, value)| {
+        if name.as_str().eq_ignore_ascii_case("x-mbx-used-weight-1m") {
+            value.to_str().ok().and_then(|raw| raw.parse::<u64>().ok())
+        } else {
+            None
+        }
+    });
+    if !status.is_success() {
+        if matches!(status.as_u16(), 418 | 429) {
+            let budget_state = aster_note_probe_rate_limit(budget, status.as_u16(), weight_1m);
+            anyhow::bail!(
+                "HTTP status {} for url ({}) consumer=probe priority=optional shared_cooldown_ms={} shared_weight_1m={}",
+                status.as_u16(),
+                url,
+                budget_state.shared_cooldown_ms,
+                budget_state
+                    .shared_weight_1m
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "0".to_string())
+            );
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(160).collect();
+        anyhow::bail!(
+            "HTTP status {} for url ({}) consumer=probe priority=optional snippet={}",
+            status.as_u16(),
+            url,
+            snippet
+        );
+    }
+    let value: Value = resp.json().await?;
+    let symbol = value
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing symbol"))?;
+    if symbol != market {
+        anyhow::bail!(
+            "bookTicker symbol mismatch expected={} actual={}",
+            market,
+            symbol
+        );
+    }
+    let bid = value
+        .get("bidPrice")
+        .and_then(|v| v.as_str())
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("missing bidPrice"))?;
+    let ask = value
+        .get("askPrice")
+        .and_then(|v| v.as_str())
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("missing askPrice"))?;
+    if !(bid.is_finite() && ask.is_finite() && ask >= bid) {
+        anyhow::bail!("invalid bid/ask bid={} ask={}", bid, ask);
+    }
+    Ok(RestFetchOutcome::ProbeOk)
 }
 
 /// Fetch Paradex L2 book via REST.
@@ -353,7 +521,7 @@ pub async fn fetch_paradex_l2_snapshot(
     market: &str,
     depth: usize,
     venue_index: usize,
-) -> anyhow::Result<MarketDataEvent> {
+) -> anyhow::Result<RestFetchOutcome> {
     let url = format!("{rest_url}/orderbook/{market}?depth={depth}");
     let resp = client.get(&url).send().await?.error_for_status()?;
     let value: Value = resp.json().await?;
@@ -365,14 +533,16 @@ pub async fn fetch_paradex_l2_snapshot(
         .get("last_updated_at")
         .and_then(|v| v.as_i64())
         .unwrap_or_else(wall_ms);
-    Ok(MarketDataEvent::L2Snapshot(L2Snapshot {
-        venue_index,
-        venue_id: market.to_string(),
-        seq,
-        timestamp_ms,
-        bids,
-        asks,
-    }))
+    Ok(RestFetchOutcome::Inject(MarketDataEvent::L2Snapshot(
+        L2Snapshot {
+            venue_index,
+            venue_id: market.to_string(),
+            seq,
+            timestamp_ms,
+            bids,
+            asks,
+        },
+    )))
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -568,5 +738,88 @@ fn parse_str_or_number(v: Option<&Value>, label: &str, field: &str) -> anyhow::R
         Ok(n)
     } else {
         anyhow::bail!("{label} {field} is neither string nor number")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::shared_venue_ages::SharedVenueAges;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    #[cfg(feature = "live_aster")]
+    use httpmock::Method::GET;
+    #[cfg(feature = "live_aster")]
+    use httpmock::MockServer;
+
+    #[cfg(feature = "live_aster")]
+    #[tokio::test]
+    async fn probe_aster_book_ticker_accepts_valid_payload() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/ticker/bookTicker")
+                    .query_param("symbol", "ETHUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbol": "ETHUSDT",
+                    "bidPrice": "2163.10",
+                    "bidQty": "1.25",
+                    "askPrice": "2163.20",
+                    "askQty": "0.75",
+                    "time": 1774353533000u64
+                }));
+            })
+            .await;
+        let client = Client::builder().build().expect("client");
+
+        let result = probe_aster_book_ticker(&client, &server.base_url(), "ETHUSDT")
+            .await
+            .expect("probe");
+
+        mock.assert_async().await;
+        assert!(matches!(result, RestFetchOutcome::ProbeOk));
+    }
+
+    #[tokio::test]
+    async fn probe_only_mode_does_not_inject_market_events() {
+        let ages = SharedVenueAges::new(1);
+        ages.set_age(0, 60_000);
+        let (market_tx, mut market_rx) = mpsc::channel(4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let venues = vec![VenueRestEntry {
+            name: "aster".to_string(),
+            venue_index: 0,
+            mode: RestMonitorMode::ProbeOnly,
+            fetcher: Box::new(move || {
+                let calls = calls_clone.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(RestFetchOutcome::ProbeOk)
+                })
+            }),
+        }];
+        let monitor = tokio::spawn(run_rest_health_monitor(
+            ages,
+            venues,
+            market_tx,
+            RestMonitorConfig {
+                rest_threshold_ms: 1,
+                poll_interval: Duration::from_millis(10),
+            },
+        ));
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert!(
+            calls.load(Ordering::Relaxed) > 0,
+            "probe-only fetcher should still run for stale venues"
+        );
+        assert!(matches!(market_rx.try_recv(), Err(TryRecvError::Empty)));
+        monitor.abort();
     }
 }

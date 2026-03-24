@@ -1,0 +1,12 @@
+{
+  "seq": 55,
+  "time": 1700000000500,
+  "coin": "TAO",
+  "positions": [],
+  "balances": [
+    { "asset": "USD", "total": "10000", "available": "10000" }
+  ],
+  "margin": { "balance": "10000", "used": "0", "available": "10000" },
+  "liquidation": { "priceLiq": null, "distLiqSigma": null },
+  "funding8h": "0.001"
+}

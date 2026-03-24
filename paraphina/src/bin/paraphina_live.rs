@@ -3,7 +3,7 @@
 //! This binary wires the live cache, event model, and strategy loop together
 //! without any external network connectors.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +30,7 @@ use paraphina::live::venues::{canonical_venue_ids, roadmap_b_enabled};
 use paraphina::live::{resolve_effective_trade_mode, LiveTelemetry, LiveTelemetryStats, TradeMode};
 use paraphina::telemetry::{TelemetryConfig, TelemetryMode, TelemetrySink, TelemetrySinkHandle};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -342,6 +343,11 @@ struct CanaryVenueConfig {
 #[derive(Debug, Deserialize)]
 struct CanaryLimitsConfig {
     max_position_tao: Option<f64>,
+    max_gross_position_tao: Option<f64>,
+    max_abs_venue_position_tao: Option<f64>,
+    soft_max_position_tao: Option<f64>,
+    soft_max_gross_position_tao: Option<f64>,
+    soft_max_abs_venue_position_tao: Option<f64>,
     max_open_orders: Option<usize>,
 }
 
@@ -372,9 +378,14 @@ struct CanaryConfig {
     kill: Option<CanaryKillConfig>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CanarySettings {
     max_position_tao: Option<f64>,
+    max_gross_position_tao: Option<f64>,
+    max_abs_venue_position_tao: Option<f64>,
+    soft_max_position_tao: Option<f64>,
+    soft_max_gross_position_tao: Option<f64>,
+    soft_max_abs_venue_position_tao: Option<f64>,
     max_open_orders: Option<usize>,
     stale_max_ticks: Option<u64>,
     enforce_post_only: bool,
@@ -382,6 +393,188 @@ struct CanarySettings {
     rate_limit_enabled: Option<bool>,
     rate_limit_rps: Option<f64>,
     rate_limit_burst: Option<u32>,
+}
+
+const RUNTIME_CANARY_PROFILE_PATH_ENV: &str = "PARAPHINA_RUNTIME_CANARY_PROFILE_PATH";
+const RUNTIME_CANARY_PROFILE_SHA256_ENV: &str = "PARAPHINA_RUNTIME_CANARY_PROFILE_SHA256";
+const RUNTIME_CANARY_MAX_POSITION_ENV: &str = "PARAPHINA_RUNTIME_CANARY_MAX_POSITION_TAO";
+const RUNTIME_CANARY_MAX_GROSS_POSITION_ENV: &str =
+    "PARAPHINA_RUNTIME_CANARY_MAX_GROSS_POSITION_TAO";
+const RUNTIME_CANARY_MAX_ABS_VENUE_POSITION_ENV: &str =
+    "PARAPHINA_RUNTIME_CANARY_MAX_ABS_VENUE_POSITION_TAO";
+const RUNTIME_CANARY_SOFT_MAX_POSITION_ENV: &str = "PARAPHINA_RUNTIME_CANARY_SOFT_MAX_POSITION_TAO";
+const RUNTIME_CANARY_SOFT_MAX_GROSS_POSITION_ENV: &str =
+    "PARAPHINA_RUNTIME_CANARY_SOFT_MAX_GROSS_POSITION_TAO";
+const RUNTIME_CANARY_SOFT_MAX_ABS_VENUE_POSITION_ENV: &str =
+    "PARAPHINA_RUNTIME_CANARY_SOFT_MAX_ABS_VENUE_POSITION_TAO";
+const RUNTIME_CANARY_MAX_OPEN_ORDERS_ENV: &str = "PARAPHINA_RUNTIME_CANARY_MAX_OPEN_ORDERS";
+const RUNTIME_CANARY_STALE_MAX_TICKS_ENV: &str = "PARAPHINA_RUNTIME_CANARY_STALE_MAX_TICKS";
+const RUNTIME_CANARY_POST_ONLY_ENV: &str = "PARAPHINA_RUNTIME_CANARY_ENFORCE_POST_ONLY";
+const RUNTIME_CANARY_REDUCE_ONLY_ENV: &str = "PARAPHINA_RUNTIME_CANARY_ENFORCE_REDUCE_ONLY";
+const RUNTIME_CANARY_RATE_LIMIT_ENABLED_ENV: &str = "PARAPHINA_RUNTIME_CANARY_RATE_LIMIT_ENABLED";
+const RUNTIME_CANARY_RATE_LIMIT_RPS_ENV: &str = "PARAPHINA_RUNTIME_CANARY_RATE_LIMIT_RPS";
+const RUNTIME_CANARY_RATE_LIMIT_BURST_ENV: &str = "PARAPHINA_RUNTIME_CANARY_RATE_LIMIT_BURST";
+
+fn hash_file_sha256(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn clear_runtime_canary_metadata() {
+    for key in [
+        RUNTIME_CANARY_PROFILE_PATH_ENV,
+        RUNTIME_CANARY_PROFILE_SHA256_ENV,
+        RUNTIME_CANARY_MAX_POSITION_ENV,
+        RUNTIME_CANARY_MAX_GROSS_POSITION_ENV,
+        RUNTIME_CANARY_MAX_ABS_VENUE_POSITION_ENV,
+        RUNTIME_CANARY_SOFT_MAX_POSITION_ENV,
+        RUNTIME_CANARY_SOFT_MAX_GROSS_POSITION_ENV,
+        RUNTIME_CANARY_SOFT_MAX_ABS_VENUE_POSITION_ENV,
+        RUNTIME_CANARY_MAX_OPEN_ORDERS_ENV,
+        RUNTIME_CANARY_STALE_MAX_TICKS_ENV,
+        RUNTIME_CANARY_POST_ONLY_ENV,
+        RUNTIME_CANARY_REDUCE_ONLY_ENV,
+        RUNTIME_CANARY_RATE_LIMIT_ENABLED_ENV,
+        RUNTIME_CANARY_RATE_LIMIT_RPS_ENV,
+        RUNTIME_CANARY_RATE_LIMIT_BURST_ENV,
+    ] {
+        std::env::remove_var(key);
+    }
+}
+
+fn export_runtime_canary_metadata(
+    canary_profile: Option<&PathBuf>,
+    canary_settings: Option<&CanarySettings>,
+) {
+    clear_runtime_canary_metadata();
+    let resolved_settings = resolved_canary_settings_for_metadata(canary_profile, canary_settings);
+
+    if let Some(path) = canary_profile {
+        std::env::set_var(RUNTIME_CANARY_PROFILE_PATH_ENV, path.display().to_string());
+        if let Some(sha) = hash_file_sha256(path) {
+            std::env::set_var(RUNTIME_CANARY_PROFILE_SHA256_ENV, sha);
+        }
+    }
+
+    if let Some(settings) = resolved_settings.as_ref() {
+        if let Some(val) = settings.max_position_tao {
+            std::env::set_var(RUNTIME_CANARY_MAX_POSITION_ENV, val.to_string());
+        }
+        if let Some(val) = settings.max_gross_position_tao {
+            std::env::set_var(RUNTIME_CANARY_MAX_GROSS_POSITION_ENV, val.to_string());
+        }
+        if let Some(val) = settings.max_abs_venue_position_tao {
+            std::env::set_var(RUNTIME_CANARY_MAX_ABS_VENUE_POSITION_ENV, val.to_string());
+        }
+        if let Some(val) = settings.soft_max_position_tao {
+            std::env::set_var(RUNTIME_CANARY_SOFT_MAX_POSITION_ENV, val.to_string());
+        }
+        if let Some(val) = settings.soft_max_gross_position_tao {
+            std::env::set_var(RUNTIME_CANARY_SOFT_MAX_GROSS_POSITION_ENV, val.to_string());
+        }
+        if let Some(val) = settings.soft_max_abs_venue_position_tao {
+            std::env::set_var(
+                RUNTIME_CANARY_SOFT_MAX_ABS_VENUE_POSITION_ENV,
+                val.to_string(),
+            );
+        }
+        if let Some(val) = settings.max_open_orders {
+            std::env::set_var(RUNTIME_CANARY_MAX_OPEN_ORDERS_ENV, val.to_string());
+        }
+        if let Some(val) = settings.stale_max_ticks {
+            std::env::set_var(RUNTIME_CANARY_STALE_MAX_TICKS_ENV, val.to_string());
+        }
+        std::env::set_var(
+            RUNTIME_CANARY_POST_ONLY_ENV,
+            if settings.enforce_post_only { "1" } else { "0" },
+        );
+        std::env::set_var(
+            RUNTIME_CANARY_REDUCE_ONLY_ENV,
+            if settings.enforce_reduce_only {
+                "1"
+            } else {
+                "0"
+            },
+        );
+        if let Some(val) = settings.rate_limit_enabled {
+            std::env::set_var(
+                RUNTIME_CANARY_RATE_LIMIT_ENABLED_ENV,
+                if val { "1" } else { "0" },
+            );
+        }
+        if let Some(val) = settings.rate_limit_rps {
+            std::env::set_var(RUNTIME_CANARY_RATE_LIMIT_RPS_ENV, val.to_string());
+        }
+        if let Some(val) = settings.rate_limit_burst {
+            std::env::set_var(RUNTIME_CANARY_RATE_LIMIT_BURST_ENV, val.to_string());
+        }
+    }
+}
+
+fn format_runtime_canary_log(
+    canary_profile: Option<&PathBuf>,
+    canary_settings: Option<&CanarySettings>,
+) -> Option<String> {
+    let profile = canary_profile?;
+    let sha = hash_file_sha256(profile).unwrap_or_else(|| "unknown".to_string());
+    let settings = resolved_canary_settings_for_metadata(canary_profile, canary_settings)
+        .as_ref()
+        .map(|settings| {
+            format!(
+                " max_position_tao={} max_gross_position_tao={} max_abs_venue_position_tao={} soft_max_position_tao={} soft_max_gross_position_tao={} soft_max_abs_venue_position_tao={} max_open_orders={} stale_max_ticks={} post_only={} reduce_only={} rate_limit_rps={} rate_limit_burst={}",
+                settings
+                    .max_position_tao
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .max_gross_position_tao
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .max_abs_venue_position_tao
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .soft_max_position_tao
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .soft_max_gross_position_tao
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .soft_max_abs_venue_position_tao
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .max_open_orders
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .stale_max_ticks
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings.enforce_post_only,
+                settings.enforce_reduce_only,
+                settings
+                    .rate_limit_rps
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .rate_limit_burst
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "paraphina_live | canary_profile={} | canary_sha256={}{}",
+        profile.display(),
+        sha,
+        settings
+    ))
 }
 
 fn resolve_canary_profile(cli: Option<String>) -> Option<PathBuf> {
@@ -413,20 +606,15 @@ fn load_canary_config(path: &PathBuf) -> Result<CanaryConfig, String> {
     })
 }
 
-fn apply_canary_config(cfg: &mut Config, canary: &CanaryConfig) -> CanarySettings {
+fn canary_settings_from_config(canary: &CanaryConfig) -> CanarySettings {
     let mut settings = CanarySettings::default();
-    if let Some(venue) = &canary.venue {
-        for v in &mut cfg.venues {
-            if let Some(size) = venue.base_order_size {
-                v.base_order_size = size.max(0.0);
-            }
-            if let Some(size) = venue.max_order_size {
-                v.max_order_size = size.max(0.0);
-            }
-        }
-    }
     if let Some(limits) = &canary.limits {
         settings.max_position_tao = limits.max_position_tao;
+        settings.max_gross_position_tao = limits.max_gross_position_tao;
+        settings.max_abs_venue_position_tao = limits.max_abs_venue_position_tao;
+        settings.soft_max_position_tao = limits.soft_max_position_tao;
+        settings.soft_max_gross_position_tao = limits.soft_max_gross_position_tao;
+        settings.soft_max_abs_venue_position_tao = limits.soft_max_abs_venue_position_tao;
         settings.max_open_orders = limits.max_open_orders;
     }
     if let Some(rate) = &canary.rate_limit {
@@ -444,10 +632,60 @@ fn apply_canary_config(cfg: &mut Config, canary: &CanaryConfig) -> CanarySetting
     settings
 }
 
+fn apply_canary_config(cfg: &mut Config, canary: &CanaryConfig) -> CanarySettings {
+    let settings = canary_settings_from_config(canary);
+    if let Some(venue) = &canary.venue {
+        for v in &mut cfg.venues {
+            if let Some(size) = venue.base_order_size {
+                v.base_order_size = size.max(0.0);
+            }
+            if let Some(size) = venue.max_order_size {
+                v.max_order_size = size.max(0.0);
+            }
+        }
+    }
+    settings
+}
+
+fn resolved_canary_settings_for_metadata(
+    canary_profile: Option<&PathBuf>,
+    canary_settings: Option<&CanarySettings>,
+) -> Option<CanarySettings> {
+    canary_settings.cloned().or_else(|| {
+        let path = canary_profile?;
+        let canary = load_canary_config(path).ok()?;
+        Some(canary_settings_from_config(&canary))
+    })
+}
+
 fn apply_canary_env(settings: &CanarySettings) {
     std::env::set_var("PARAPHINA_CANARY_MODE", "1");
     if let Some(val) = settings.max_position_tao {
         std::env::set_var("PARAPHINA_CANARY_MAX_POSITION_TAO", val.to_string());
+    }
+    if let Some(val) = settings.max_gross_position_tao {
+        std::env::set_var("PARAPHINA_CANARY_MAX_GROSS_POSITION_TAO", val.to_string());
+    }
+    if let Some(val) = settings.max_abs_venue_position_tao {
+        std::env::set_var(
+            "PARAPHINA_CANARY_MAX_ABS_VENUE_POSITION_TAO",
+            val.to_string(),
+        );
+    }
+    if let Some(val) = settings.soft_max_position_tao {
+        std::env::set_var("PARAPHINA_CANARY_SOFT_MAX_POSITION_TAO", val.to_string());
+    }
+    if let Some(val) = settings.soft_max_gross_position_tao {
+        std::env::set_var(
+            "PARAPHINA_CANARY_SOFT_MAX_GROSS_POSITION_TAO",
+            val.to_string(),
+        );
+    }
+    if let Some(val) = settings.soft_max_abs_venue_position_tao {
+        std::env::set_var(
+            "PARAPHINA_CANARY_SOFT_MAX_ABS_VENUE_POSITION_TAO",
+            val.to_string(),
+        );
     }
     if let Some(val) = settings.max_open_orders {
         std::env::set_var("PARAPHINA_CANARY_MAX_OPEN_ORDERS", val.to_string());
@@ -508,6 +746,16 @@ fn resolve_telemetry_path(out_dir: Option<&std::path::PathBuf>) -> Option<std::p
         }
     }
     telemetry_path
+}
+
+fn should_fail_on_unexpected_live_loop_exit(mode: LiveRunMode) -> bool {
+    matches!(
+        mode,
+        LiveRunMode::Realtime {
+            max_ticks: None,
+            ..
+        }
+    )
 }
 
 const CURRENT_RUN_POINTER_PATH: &str = "/tmp/paraphina_current_run.json";
@@ -762,6 +1010,13 @@ fn parse_reconcile_interval_ms() -> Option<u64> {
         .map(|ms| ms as u64)
 }
 
+fn parse_live_order_snapshot_poll_ms() -> u64 {
+    std::env::var("PARAPHINA_LIVE_ORDER_SNAPSHOT_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2_000)
+}
+
 fn endpoint_dns_status(url: &str) -> (bool, String) {
     let parsed = match Url::parse(url) {
         Ok(parsed) => parsed,
@@ -966,6 +1221,18 @@ fn connector_support(connector: ConnectorArg) -> ConnectorSupport {
             }
         }
     }
+}
+
+fn connector_has_passive_fill_stream(connector: ConnectorArg) -> bool {
+    matches!(connector, ConnectorArg::Hyperliquid | ConnectorArg::Lighter)
+}
+
+fn connector_has_passive_fill_visibility(connector: ConnectorArg) -> bool {
+    connector_has_passive_fill_stream(connector)
+        || matches!(
+            connector,
+            ConnectorArg::Extended | ConnectorArg::Aster | ConnectorArg::Paradex
+        )
 }
 
 fn paper_market_update_from_event(
@@ -1860,6 +2127,7 @@ async fn main() {
             }
         }
     }
+    export_runtime_canary_metadata(canary_profile.as_ref(), canary_settings.as_ref());
     if paper_mode {
         if let Ok(raw) = std::env::var("PARAPHINA_PAPER_MIN_HEALTHY_FOR_KF") {
             if let Ok(val) = raw.parse::<u32>() {
@@ -1917,6 +2185,12 @@ async fn main() {
         trade_mode.trade_mode.as_str(),
         connectors_label(&connectors)
     );
+    if let Some(canary_log) =
+        format_runtime_canary_log(canary_profile.as_ref(), canary_settings.as_ref())
+    {
+        println!("{canary_log}");
+        eprintln!("{canary_log}");
+    }
 
     let audit_dir = out_dir.clone().unwrap_or_else(default_audit_dir);
     if let Err(err) = std::fs::create_dir_all(&audit_dir) {
@@ -1995,6 +2269,7 @@ async fn main() {
             }
         });
     }
+    let (priority_order_tx, mut priority_order_rx) = mpsc::channel::<LiveOrderRequest>(64);
     let (order_tx, mut order_rx) = mpsc::channel::<LiveOrderRequest>(256);
 
     let exec_enable_env = env_is_true("PARAPHINA_LIVE_EXEC_ENABLE");
@@ -2042,6 +2317,25 @@ async fn main() {
     // Layer A + B: collect slots for the health enforcer and REST monitor.
     let mut enforcer_slots: Vec<paraphina::live::venue_health_enforcer::ConnectorSlot> = Vec::new();
     let mut rest_entries: Vec<paraphina::live::rest_health_monitor::VenueRestEntry> = Vec::new();
+    if trade_mode.trade_mode != TradeMode::Shadow {
+        let degraded = connectors
+            .iter()
+            .copied()
+            .filter(|connector| {
+                matches!(
+                    connector_support(*connector),
+                    ConnectorSupport::MarketAccountExec
+                ) && !connector_has_passive_fill_visibility(*connector)
+            })
+            .map(|connector| connector.as_str())
+            .collect::<Vec<_>>();
+        if !degraded.is_empty() {
+            eprintln!(
+                "paraphina_live | passive_fill_visibility_degraded=true connectors={} reason=no_fill_stream_or_snapshot_visibility",
+                degraded.join(",")
+            );
+        }
+    }
     for connector in &connectors {
         let support = connector_support(*connector);
         if matches!(support, ConnectorSupport::MissingFeature) {
@@ -2211,6 +2505,7 @@ async fn main() {
                         rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
                             name: "hyperliquid".to_string(),
                             venue_index,
+                            mode: paraphina::live::rest_health_monitor::RestMonitorMode::InjectSnapshot,
                             fetcher: Box::new(move || {
                                 let c = hl_rest_cfg.clone();
                                 let h = hl_rest_http.clone();
@@ -2220,6 +2515,7 @@ async fn main() {
                                         &h, &c, &url,
                                     )
                                     .await
+                                    .map(paraphina::live::rest_health_monitor::RestFetchOutcome::Inject)
                                 })
                             }),
                         });
@@ -2379,6 +2675,10 @@ async fn main() {
                                 .ok()
                                 .and_then(|v| v.parse::<u64>().ok())
                                 .unwrap_or(5_000);
+                            let poll_ms =
+                                paraphina::live::connectors::lighter::lighter_account_poll_ms(
+                                    poll_ms,
+                                );
                             let lighter_poll = lighter_arc.clone();
                             spawn_supervised("lighter_account_poll", move || {
                                 let l = lighter_poll.clone();
@@ -2421,6 +2721,7 @@ async fn main() {
                             rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
                                 name: "lighter".to_string(),
                                 venue_index: vi,
+                                mode: paraphina::live::rest_health_monitor::RestMonitorMode::InjectSnapshot,
                                 fetcher: Box::new(move || {
                                     let h = ltr_http.clone();
                                     let ru = rest_url.clone();
@@ -2550,6 +2851,7 @@ async fn main() {
                             rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
                                 name: "extended".to_string(),
                                 venue_index: vi,
+                                mode: paraphina::live::rest_health_monitor::RestMonitorMode::InjectSnapshot,
                                 fetcher: Box::new(move || {
                                     let h = ext_http.clone();
                                     let ru = rest_url.clone();
@@ -2579,15 +2881,29 @@ async fn main() {
                                     .and_then(|v| v.parse::<u64>().ok())
                                     .unwrap_or(5_000);
                                 let account_tx = channels.account_tx.clone();
-                                let venue_id = venue_id.clone();
+                                let account_venue_id = venue_id.clone();
                                 let rest_client_clone = rest_client.clone();
                                 tokio::spawn(async move {
                                     rest_client_clone
                                         .run_account_polling(
                                             account_tx,
-                                            venue_id,
+                                            account_venue_id,
                                             venue_index,
                                             poll_ms,
+                                        )
+                                        .await;
+                                });
+                                let order_poll_ms = parse_live_order_snapshot_poll_ms();
+                                let exec_tx = channels.exec_tx.clone();
+                                let order_venue_id = venue_id.clone();
+                                let rest_client_clone = rest_client.clone();
+                                tokio::spawn(async move {
+                                    rest_client_clone
+                                        .run_order_polling(
+                                            exec_tx,
+                                            order_venue_id,
+                                            venue_index,
+                                            order_poll_ms,
                                         )
                                         .await;
                                 });
@@ -2668,7 +2984,6 @@ async fn main() {
                         // Capture REST monitor values before aster_cfg is moved.
                         let ast_rest_url = aster_cfg.rest_url.clone();
                         let ast_market = aster_cfg.market.clone();
-                        let ast_depth_limit = aster_cfg.depth_limit;
                         let rest_client =
                             Arc::new(paraphina::live::connectors::aster::AsterRestClient::new(
                                 aster_cfg.clone(),
@@ -2706,8 +3021,8 @@ async fn main() {
                         {
                             let rest_url = ast_rest_url;
                             let market = ast_market;
-                            let depth_limit = ast_depth_limit;
                             let vi = venue_index;
+                            let aster_budget = aster_arc.public_rest_budget();
                             let aster_http = reqwest::Client::builder()
                                 .timeout(std::time::Duration::from_secs(5))
                                 .build()
@@ -2715,13 +3030,15 @@ async fn main() {
                             rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
                                 name: "aster".to_string(),
                                 venue_index: vi,
+                                mode: paraphina::live::rest_health_monitor::RestMonitorMode::ProbeOnly,
                                 fetcher: Box::new(move || {
                                     let h = aster_http.clone();
                                     let ru = rest_url.clone();
                                     let m = market.clone();
+                                    let budget = aster_budget.clone();
                                     Box::pin(async move {
-                                        paraphina::live::rest_health_monitor::fetch_aster_l2_snapshot(
-                                            &h, &ru, &m, depth_limit, vi,
+                                        paraphina::live::rest_health_monitor::probe_aster_book_ticker_budgeted(
+                                            &h, &ru, &m, &budget,
                                         )
                                         .await
                                     })
@@ -2729,13 +3046,9 @@ async fn main() {
                             });
                         }
                         let aster_funding = aster_arc.clone();
-                        let funding_poll_ms = std::env::var("ASTER_FUNDING_POLL_MS")
-                            .ok()
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(10_000);
-                        spawn_supervised("aster_funding_poll", move || {
+                        spawn_supervised("aster_mark_price_ws", move || {
                             let a = aster_funding.clone();
-                            async move { a.run_funding_polling(funding_poll_ms).await }
+                            async move { a.run_mark_price_ws().await }
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {
@@ -2744,15 +3057,29 @@ async fn main() {
                                     .and_then(|v| v.parse::<u64>().ok())
                                     .unwrap_or(5_000);
                                 let account_tx = channels.account_tx.clone();
-                                let venue_id = venue_id.clone();
+                                let account_venue_id = venue_id.clone();
                                 let rest_client_clone = rest_client.clone();
                                 tokio::spawn(async move {
                                     rest_client_clone
                                         .run_account_polling(
                                             account_tx,
-                                            venue_id,
+                                            account_venue_id,
                                             venue_index,
                                             poll_ms,
+                                        )
+                                        .await;
+                                });
+                                let order_poll_ms = parse_live_order_snapshot_poll_ms();
+                                let exec_tx = channels.exec_tx.clone();
+                                let order_venue_id = venue_id.clone();
+                                let rest_client_clone = rest_client.clone();
+                                tokio::spawn(async move {
+                                    rest_client_clone
+                                        .run_order_polling(
+                                            exec_tx,
+                                            order_venue_id,
+                                            venue_index,
+                                            order_poll_ms,
                                         )
                                         .await;
                                 });
@@ -2881,6 +3208,7 @@ async fn main() {
                             rest_entries.push(paraphina::live::rest_health_monitor::VenueRestEntry {
                                 name: "paradex".to_string(),
                                 venue_index: vi,
+                                mode: paraphina::live::rest_health_monitor::RestMonitorMode::InjectSnapshot,
                                 fetcher: Box::new(move || {
                                     let h = pdx_http.clone();
                                     let ru = rest_url.clone();
@@ -2910,15 +3238,29 @@ async fn main() {
                                     .and_then(|v| v.parse::<u64>().ok())
                                     .unwrap_or(5_000);
                                 let account_tx = channels.account_tx.clone();
-                                let venue_id = venue_id.clone();
+                                let account_venue_id = venue_id.clone();
                                 let rest_client_clone = rest_client.clone();
                                 tokio::spawn(async move {
                                     rest_client_clone
                                         .run_account_polling(
                                             account_tx,
-                                            venue_id,
+                                            account_venue_id,
                                             venue_index,
                                             poll_ms,
+                                        )
+                                        .await;
+                                });
+                                let order_poll_ms = parse_live_order_snapshot_poll_ms();
+                                let exec_tx = channels.exec_tx.clone();
+                                let order_venue_id = venue_id.clone();
+                                let rest_client_clone = rest_client.clone();
+                                tokio::spawn(async move {
+                                    rest_client_clone
+                                        .run_order_polling(
+                                            exec_tx,
+                                            order_venue_id,
+                                            venue_index,
+                                            order_poll_ms,
                                         )
                                         .await;
                                 });
@@ -3061,8 +3403,11 @@ async fn main() {
         } else {
             None
         };
+        let mut pending_order_reqs = VecDeque::new();
+        let mut pending_priority_order_reqs = VecDeque::new();
         loop {
             tokio::select! {
+                biased;
                 Some(update) = async {
                     if let Some(rx) = paper_market_rx.as_mut() {
                         rx.recv().await
@@ -3077,7 +3422,13 @@ async fn main() {
                         }
                     }
                 }
-                Some(req) = order_rx.recv() => {
+                Some(req) = async {
+                    if let Some(req) = pending_priority_order_reqs.pop_front() {
+                        Some(req)
+                    } else {
+                        priority_order_rx.recv().await
+                    }
+                } => {
                     let LiveOrderRequest {
                         intents,
                         action_batch,
@@ -3112,17 +3463,97 @@ async fn main() {
                     } else {
                         shadow.handle_intents(intents, action_batch.tick_index, now_ms)
                     };
-                    match response {
-                        ResponseMode::Oneshot(tx) => {
-                            let _ = tx.send(events);
+                    respond_to_order_request(response, events, &exec_tx);
+                }
+                Some(req) = async {
+                    if let Some(req) = pending_order_reqs.pop_front() {
+                        Some(req)
+                    } else {
+                        order_rx.recv().await
+                    }
+                } => {
+                    let req = coalesce_fire_and_forget_request(
+                        req,
+                        &mut pending_order_reqs,
+                        &mut order_rx,
+                    );
+                    let LiveOrderRequest {
+                        intents,
+                        action_batch,
+                        now_ms,
+                        response,
+                    } = req;
+                    let events = if let Some(gateway) = live_gateway.as_mut() {
+                        if matches!(&response, ResponseMode::FireAndForget) {
+                            let batch_now_ms = action_batch.now_ms;
+                            let batch_tick = action_batch.tick_index;
+                            let batch_config_version = action_batch.config_version;
+                            let batch_seed = action_batch.run_seed;
+                            let mut remaining_intents: VecDeque<_> = intents.into();
+                            let mut events = Vec::new();
+                            while let Some(intent) = remaining_intents.pop_front() {
+                                let mut out = handle_live_gateway_intent(
+                                    gateway,
+                                    intent,
+                                    batch_tick,
+                                    now_ms,
+                                    &mut exec_seq,
+                                )
+                                .await;
+                                events.append(&mut out);
+                                if let Some(priority_req) = take_priority_request(
+                                    &mut pending_priority_order_reqs,
+                                    &mut priority_order_rx,
+                                ) {
+                                    if !remaining_intents.is_empty() {
+                                        pending_order_reqs.push_front(LiveOrderRequest {
+                                            intents: remaining_intents.into_iter().collect(),
+                                            action_batch:
+                                                paraphina::actions::ActionBatch::new(
+                                                    batch_now_ms,
+                                                    batch_tick,
+                                                    &batch_config_version,
+                                                )
+                                                .with_seed(batch_seed),
+                                            now_ms,
+                                            response: ResponseMode::FireAndForget,
+                                        });
+                                    }
+                                    pending_priority_order_reqs.push_front(priority_req);
+                                    break;
+                                }
+                            }
+                            events
+                        } else {
+                            handle_live_gateway_intents(
+                                gateway,
+                                intents,
+                                action_batch.tick_index,
+                                now_ms,
+                                &mut exec_seq,
+                            )
+                            .await
                         }
-                        ResponseMode::FireAndForget => {
-                            // Push all events to exec_tx for next-tick collection.
-                            for event in events {
-                                let _ = exec_tx.try_send(event);
+                    } else if let Some(adapter) = paper_adapter.as_mut() {
+                        let events = adapter.handle_intents(intents, action_batch.tick_index, now_ms);
+                        let mut response_events = Vec::new();
+                        for event in events {
+                            match &event {
+                                paraphina::live::types::ExecutionEvent::Filled(_) => {
+                                    let _ = exec_tx.try_send(event);
+                                }
+                                _ => response_events.push(event),
                             }
                         }
-                    }
+                        let snapshots = adapter.drain_account_snapshots(&venue_id_lookup, now_ms + 1);
+                        for snapshot in snapshots {
+                            let _ = account_tx.try_send(paraphina::live::types::AccountEvent::Snapshot(snapshot));
+                        }
+                        response_events
+                    } else {
+                        shadow.handle_intents(intents, action_batch.tick_index, now_ms)
+                    };
+                    respond_to_order_request(response, events, &exec_tx);
                 }
                 else => break,
             }
@@ -3134,6 +3565,7 @@ async fn main() {
         account_rx,
         exec_rx: Some(exec_rx),
         account_reconcile_tx: None,
+        priority_order_tx,
         order_tx,
         order_snapshot_rx: Some(order_snapshot_rx),
         shared_venue_ages: Some(shared_venue_ages.clone()),
@@ -3163,16 +3595,11 @@ async fn main() {
     let max_ticks = std::env::var("PARAPHINA_LIVE_MAX_TICKS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
-    let summary = run_live_loop(
-        &cfg,
-        channels,
-        LiveRunMode::Realtime {
-            interval_ms: cfg.main_loop_interval_ms as u64,
-            max_ticks,
-        },
-        Some(hooks),
-    )
-    .await;
+    let run_mode = LiveRunMode::Realtime {
+        interval_ms: cfg.main_loop_interval_ms as u64,
+        max_ticks,
+    };
+    let summary = run_live_loop(&cfg, channels, run_mode, Some(hooks)).await;
 
     if let Some(out_dir) = out_dir {
         write_summary(
@@ -3183,6 +3610,19 @@ async fn main() {
             &summary,
             telemetry.stats.clone(),
         );
+    }
+
+    if should_fail_on_unexpected_live_loop_exit(run_mode) {
+        eprintln!(
+            "paraphina_live | error=unexpected_live_loop_exit trade_mode={} ticks_run={} kill_switch={} ready_market_count={} stale_market_count={} fv_available={}",
+            trade_mode.trade_mode.as_str(),
+            summary.ticks_run,
+            summary.kill_switch,
+            summary.ready_market_count,
+            summary.stale_market_count,
+            summary.fv_available,
+        );
+        std::process::exit(1);
     }
 }
 
@@ -3195,55 +3635,65 @@ async fn handle_live_gateway_intents<C: LiveRestClient>(
 ) -> Vec<paraphina::live::types::ExecutionEvent> {
     let mut events = Vec::new();
     for intent in intents {
-        let mut out = match intent {
-            paraphina::types::OrderIntent::Place(place) => {
-                handle_live_gateway_place(gateway, place, tick, now_ms, seq).await
-            }
-            paraphina::types::OrderIntent::Cancel(cancel) => {
-                handle_live_gateway_cancel(gateway, cancel, tick, now_ms, seq).await
-            }
-            paraphina::types::OrderIntent::CancelAll(cancel_all) => {
-                handle_live_gateway_cancel_all(gateway, cancel_all, tick, now_ms, seq).await
-            }
-            paraphina::types::OrderIntent::Replace(replace) => {
-                let mut out = handle_live_gateway_cancel(
-                    gateway,
-                    paraphina::types::CancelOrderIntent {
-                        venue_index: replace.venue_index,
-                        venue_id: replace.venue_id.clone(),
-                        order_id: replace.order_id.clone(),
-                    },
-                    tick,
-                    now_ms,
-                    seq,
-                )
-                .await;
-                let mut out2 = handle_live_gateway_place(
-                    gateway,
-                    paraphina::types::PlaceOrderIntent {
-                        venue_index: replace.venue_index,
-                        venue_id: replace.venue_id.clone(),
-                        side: replace.side,
-                        price: replace.price,
-                        size: replace.size,
-                        purpose: replace.purpose,
-                        time_in_force: replace.time_in_force,
-                        post_only: replace.post_only,
-                        reduce_only: replace.reduce_only,
-                        client_order_id: replace.client_order_id.clone(),
-                    },
-                    tick,
-                    now_ms,
-                    seq,
-                )
-                .await;
-                out.append(&mut out2);
-                out
-            }
-        };
+        let mut out = handle_live_gateway_intent(gateway, intent, tick, now_ms, seq).await;
         events.append(&mut out);
     }
     events
+}
+
+async fn handle_live_gateway_intent<C: LiveRestClient>(
+    gateway: &mut LiveGateway<C>,
+    intent: paraphina::types::OrderIntent,
+    tick: u64,
+    now_ms: paraphina::types::TimestampMs,
+    seq: &mut u64,
+) -> Vec<paraphina::live::types::ExecutionEvent> {
+    match intent {
+        paraphina::types::OrderIntent::Place(place) => {
+            handle_live_gateway_place(gateway, place, tick, now_ms, seq).await
+        }
+        paraphina::types::OrderIntent::Cancel(cancel) => {
+            handle_live_gateway_cancel(gateway, cancel, tick, now_ms, seq).await
+        }
+        paraphina::types::OrderIntent::CancelAll(cancel_all) => {
+            handle_live_gateway_cancel_all(gateway, cancel_all, tick, now_ms, seq).await
+        }
+        paraphina::types::OrderIntent::Replace(replace) => {
+            let mut out = handle_live_gateway_cancel(
+                gateway,
+                paraphina::types::CancelOrderIntent {
+                    venue_index: replace.venue_index,
+                    venue_id: replace.venue_id.clone(),
+                    order_id: replace.order_id.clone(),
+                },
+                tick,
+                now_ms,
+                seq,
+            )
+            .await;
+            let mut out2 = handle_live_gateway_place(
+                gateway,
+                paraphina::types::PlaceOrderIntent {
+                    venue_index: replace.venue_index,
+                    venue_id: replace.venue_id.clone(),
+                    side: replace.side,
+                    price: replace.price,
+                    size: replace.size,
+                    purpose: replace.purpose,
+                    time_in_force: replace.time_in_force,
+                    post_only: replace.post_only,
+                    reduce_only: replace.reduce_only,
+                    client_order_id: replace.client_order_id.clone(),
+                },
+                tick,
+                now_ms,
+                seq,
+            )
+            .await;
+            out.append(&mut out2);
+            out
+        }
+    }
 }
 
 async fn handle_live_gateway_place<C: LiveRestClient>(
@@ -3291,6 +3741,9 @@ async fn handle_live_gateway_place<C: LiveRestClient>(
                 seq: *seq,
                 timestamp_ms: now_ms,
                 order_id: place.client_order_id.clone(),
+                client_order_id: place.client_order_id.clone(),
+                purpose: Some(place.purpose),
+                reduce_only: Some(place.reduce_only),
                 reason: err.message.clone(),
             }));
         }
@@ -3389,6 +3842,59 @@ async fn handle_live_gateway_cancel_all<C: LiveRestClient>(
     events
 }
 
+fn coalesce_fire_and_forget_request(
+    mut request: LiveOrderRequest,
+    pending: &mut VecDeque<LiveOrderRequest>,
+    order_rx: &mut mpsc::Receiver<LiveOrderRequest>,
+) -> LiveOrderRequest {
+    while let Some(next) = pending.pop_front() {
+        request = next;
+    }
+    while let Ok(next) = order_rx.try_recv() {
+        request = next;
+    }
+    request
+}
+
+fn take_priority_request(
+    pending: &mut VecDeque<LiveOrderRequest>,
+    priority_order_rx: &mut mpsc::Receiver<LiveOrderRequest>,
+) -> Option<LiveOrderRequest> {
+    if let Some(req) = pending.pop_front() {
+        return Some(req);
+    }
+    priority_order_rx.try_recv().ok()
+}
+
+fn forward_exec_events(
+    exec_tx: &mpsc::Sender<paraphina::live::types::ExecutionEvent>,
+    events: Vec<paraphina::live::types::ExecutionEvent>,
+) {
+    for event in events {
+        if exec_tx.try_send(event).is_err() {
+            eprintln!("paraphina_live | exec_tx full | dropped execution event");
+        }
+    }
+}
+
+fn respond_to_order_request(
+    response: ResponseMode,
+    events: Vec<paraphina::live::types::ExecutionEvent>,
+    exec_tx: &mpsc::Sender<paraphina::live::types::ExecutionEvent>,
+) {
+    match response {
+        ResponseMode::Oneshot(tx) => {
+            if let Err(events) = tx.send(events) {
+                eprintln!("paraphina_live | order_response_fallback=exec_tx");
+                forward_exec_events(exec_tx, events);
+            }
+        }
+        ResponseMode::FireAndForget => {
+            forward_exec_events(exec_tx, events);
+        }
+    }
+}
+
 fn send_unavailable_account_snapshot_for(
     account_tx: &mpsc::Sender<paraphina::live::types::AccountEvent>,
     cfg: &Config,
@@ -3470,8 +3976,21 @@ fn write_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::{connector_support, ConnectorArg, ConnectorSupport};
+    use super::{
+        coalesce_fire_and_forget_request, respond_to_order_request,
+        should_fail_on_unexpected_live_loop_exit, take_priority_request, LiveOrderRequest,
+        LiveRunMode, ResponseMode,
+    };
+    use super::{
+        connector_has_passive_fill_stream, connector_has_passive_fill_visibility,
+        connector_support, ConnectorArg, ConnectorSupport,
+    };
+    use paraphina::actions::ActionBatch;
+    use paraphina::live::types::{ExecutionEvent, OrderAccepted};
     use paraphina::live::venues::ROADMAP_B_VENUES;
+    use paraphina::types::{OrderPurpose, Side};
+    use std::collections::VecDeque;
+    use tokio::sync::{mpsc, oneshot};
 
     #[test]
     fn roadmap_b_registry_is_complete() {
@@ -3545,5 +4064,146 @@ mod tests {
             connector_support(ConnectorArg::Paradex),
             ConnectorSupport::MarketAccountExec
         );
+    }
+
+    #[test]
+    fn passive_fill_stream_matrix_matches_current_connectors() {
+        assert!(connector_has_passive_fill_stream(ConnectorArg::Hyperliquid));
+        assert!(connector_has_passive_fill_stream(ConnectorArg::Lighter));
+        assert!(!connector_has_passive_fill_stream(ConnectorArg::Extended));
+        assert!(!connector_has_passive_fill_stream(ConnectorArg::Aster));
+        assert!(!connector_has_passive_fill_stream(ConnectorArg::Paradex));
+    }
+
+    #[test]
+    fn passive_fill_visibility_matrix_matches_current_connectors() {
+        assert!(connector_has_passive_fill_visibility(
+            ConnectorArg::Hyperliquid
+        ));
+        assert!(connector_has_passive_fill_visibility(ConnectorArg::Lighter));
+        assert!(connector_has_passive_fill_visibility(
+            ConnectorArg::Extended
+        ));
+        assert!(connector_has_passive_fill_visibility(ConnectorArg::Aster));
+        assert!(connector_has_passive_fill_visibility(ConnectorArg::Paradex));
+    }
+
+    #[tokio::test]
+    async fn fire_and_forget_requests_coalesce_to_latest_batch() {
+        let (order_tx, mut order_rx) = mpsc::channel(8);
+        order_tx
+            .send(LiveOrderRequest {
+                intents: Vec::new(),
+                action_batch: ActionBatch::new(0, 1, "test"),
+                now_ms: 1,
+                response: ResponseMode::FireAndForget,
+            })
+            .await
+            .expect("send first fire-and-forget");
+        order_tx
+            .send(LiveOrderRequest {
+                intents: Vec::new(),
+                action_batch: ActionBatch::new(0, 2, "test"),
+                now_ms: 2,
+                response: ResponseMode::FireAndForget,
+            })
+            .await
+            .expect("send second fire-and-forget");
+
+        let first_req = order_rx.recv().await.expect("first request");
+        let mut pending = VecDeque::from([LiveOrderRequest {
+            intents: Vec::new(),
+            action_batch: ActionBatch::new(0, 3, "test"),
+            now_ms: 3,
+            response: ResponseMode::FireAndForget,
+        }]);
+        let coalesced = coalesce_fire_and_forget_request(first_req, &mut pending, &mut order_rx);
+
+        assert!(matches!(coalesced.response, ResponseMode::FireAndForget));
+        assert_eq!(coalesced.action_batch.tick_index, 2);
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn priority_requests_surface_ahead_of_fire_and_forget_batches() {
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let (response_tx, response_rx) = oneshot::channel::<Vec<ExecutionEvent>>();
+        let mut pending = VecDeque::from([LiveOrderRequest {
+            intents: Vec::new(),
+            action_batch: ActionBatch::new(0, 11, "test"),
+            now_ms: 11,
+            response: ResponseMode::Oneshot(response_tx),
+        }]);
+
+        priority_order_tx
+            .send(LiveOrderRequest {
+                intents: Vec::new(),
+                action_batch: ActionBatch::new(0, 12, "test"),
+                now_ms: 12,
+                response: ResponseMode::Oneshot(oneshot::channel::<Vec<ExecutionEvent>>().0),
+            })
+            .await
+            .expect("send priority request");
+
+        let blocking = take_priority_request(&mut pending, &mut priority_order_rx)
+            .expect("priority request should be surfaced");
+        assert!(matches!(blocking.response, ResponseMode::Oneshot(_)));
+        assert_eq!(blocking.action_batch.tick_index, 11);
+        let next = take_priority_request(&mut pending, &mut priority_order_rx)
+            .expect("queued priority request should be surfaced next");
+        assert!(matches!(next.response, ResponseMode::Oneshot(_)));
+        assert_eq!(next.action_batch.tick_index, 12);
+        assert!(pending.is_empty());
+        drop(response_rx);
+    }
+
+    #[tokio::test]
+    async fn failed_oneshot_response_falls_back_to_exec_tx() {
+        let (exec_tx, mut exec_rx) = mpsc::channel(4);
+        let (response_tx, response_rx) = oneshot::channel::<Vec<ExecutionEvent>>();
+        drop(response_rx);
+
+        respond_to_order_request(
+            ResponseMode::Oneshot(response_tx),
+            vec![ExecutionEvent::OrderAccepted(OrderAccepted {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                seq: 1,
+                timestamp_ms: 1_000,
+                order_id: "oid-1".to_string(),
+                client_order_id: Some("co_1".to_string()),
+                side: Side::Buy,
+                price: 100.0,
+                size: 1.0,
+                purpose: OrderPurpose::Mm,
+            })],
+            &exec_tx,
+        );
+
+        let event = exec_rx.recv().await.expect("fallback exec event");
+        assert!(matches!(event, ExecutionEvent::OrderAccepted(_)));
+    }
+
+    #[test]
+    fn unexpected_unbounded_realtime_loop_exit_fails_closed() {
+        assert!(should_fail_on_unexpected_live_loop_exit(
+            LiveRunMode::Realtime {
+                interval_ms: 250,
+                max_ticks: None,
+            }
+        ));
+        assert!(!should_fail_on_unexpected_live_loop_exit(
+            LiveRunMode::Realtime {
+                interval_ms: 250,
+                max_ticks: Some(10),
+            }
+        ));
+        assert!(!should_fail_on_unexpected_live_loop_exit(
+            LiveRunMode::Step {
+                start_ms: 0,
+                step_ms: 250,
+                ticks: 10,
+            }
+        ));
     }
 }

@@ -62,6 +62,11 @@ fn wall_ms() -> i64 {
         .as_millis() as i64
 }
 
+#[inline]
+fn should_report_runner_stuck(idle_ms: Option<i64>, threshold_ms: i64) -> bool {
+    idle_ms.is_some_and(|idle| idle > threshold_ms)
+}
+
 /// Run the enforcer loop.  Never returns (designed to be spawned supervised).
 pub async fn run_venue_health_enforcer(
     ages: SharedVenueAges,
@@ -80,10 +85,11 @@ pub async fn run_venue_health_enforcer(
 
         // Check runner heartbeat.
         let idle = ages.runner_idle_ms(now_ms);
-        if idle > runner_idle_threshold_ms {
+        if should_report_runner_stuck(idle, runner_idle_threshold_ms) {
             eprintln!(
-                "ERROR: VenueHealthEnforcer: runner has not updated ages for {idle}ms \
-                 (threshold={runner_idle_threshold_ms}ms) — runner may be stuck"
+                "ERROR: VenueHealthEnforcer: runner has not updated ages for {}ms \
+                 (threshold={runner_idle_threshold_ms}ms) — runner may be stuck",
+                idle.unwrap_or_default()
             );
         }
 
@@ -117,5 +123,34 @@ pub async fn run_venue_health_enforcer(
             slot.handle = (slot.respawn)();
             slot.last_abort = Some(std::time::Instant::now());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_report_runner_stuck, SharedVenueAges};
+
+    #[test]
+    fn startup_pending_runner_does_not_report_stuck() {
+        let ages = SharedVenueAges::new(2);
+        assert_eq!(ages.runner_idle_ms(1_000), None);
+        assert!(!should_report_runner_stuck(
+            ages.runner_idle_ms(1_000),
+            30_000
+        ));
+    }
+
+    #[test]
+    fn runner_reports_stuck_only_after_first_heartbeat() {
+        let ages = SharedVenueAges::new(2);
+        ages.mark_write(1_000);
+        assert!(!should_report_runner_stuck(
+            ages.runner_idle_ms(10_000),
+            30_000
+        ));
+        assert!(should_report_runner_stuck(
+            ages.runner_idle_ms(40_001),
+            30_000
+        ));
     }
 }

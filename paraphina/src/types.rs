@@ -185,6 +185,8 @@ pub struct OrderReject {
     pub order_id: Option<String>,
     pub client_order_id: Option<String>,
     pub seq: Option<u64>,
+    pub purpose: Option<OrderPurpose>,
+    pub reduce_only: Option<bool>,
     pub reason: String,
 }
 

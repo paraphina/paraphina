@@ -12,11 +12,12 @@
 
 use std::sync::Arc;
 
-use paraphina::config::{Config, RiskProfile};
+use paraphina::config::{Config, MmVenueRole, RiskProfile};
 use paraphina::engine::Engine;
 use paraphina::mm::{
-    compute_mm_quotes, compute_order_actions, compute_venue_targets, should_replace_order,
-    ActiveMmOrder, MmOrderAction, ShouldReplaceOrderCtx,
+    compute_mm_quotes, compute_order_actions, compute_venue_targets, evaluate_replace_order,
+    should_replace_order, ActiveMmOrder, CompressionEdgeNearMissReason, MmOrderAction,
+    ShouldReplaceOrderCtx, TouchRiskNearMissReason,
 };
 use paraphina::state::{FundingState, GlobalState, KillReason, RiskRegime};
 use paraphina::types::{Side, VenueStatus};
@@ -97,14 +98,26 @@ fn passivity_bid_strictly_below_best_bid() {
                 best_bid
             );
 
-            // Also verify at least one tick away.
-            assert!(
-                bid.price <= best_bid - tick,
-                "Venue {}: bid {} should be <= best_bid - tick {}",
-                i,
-                bid.price,
-                best_bid - tick
-            );
+            if h.cfg.venues[i].id == "aster"
+                && h.cfg.mm.venue_role_for(&h.cfg.venues[i].id)
+                    == paraphina::config::MmVenueRole::Fill
+            {
+                assert!(
+                    bid.price >= best_bid - tick,
+                    "Venue {}: Aster bid {} should be within one tick of touch {}",
+                    i,
+                    bid.price,
+                    best_bid - tick
+                );
+            } else {
+                assert!(
+                    bid.price <= best_bid - tick,
+                    "Venue {}: bid {} should be <= best_bid - tick {}",
+                    i,
+                    bid.price,
+                    best_bid - tick
+                );
+            }
         }
     }
 }
@@ -134,14 +147,26 @@ fn passivity_ask_strictly_above_best_ask() {
                 best_ask
             );
 
-            // Also verify at least one tick away.
-            assert!(
-                ask.price >= best_ask + tick,
-                "Venue {}: ask {} should be >= best_ask + tick {}",
-                i,
-                ask.price,
-                best_ask + tick
-            );
+            if h.cfg.venues[i].id == "aster"
+                && h.cfg.mm.venue_role_for(&h.cfg.venues[i].id)
+                    == paraphina::config::MmVenueRole::Fill
+            {
+                assert!(
+                    ask.price <= best_ask + tick,
+                    "Venue {}: Aster ask {} should be within one tick of touch {}",
+                    i,
+                    ask.price,
+                    best_ask + tick
+                );
+            } else {
+                assert!(
+                    ask.price >= best_ask + tick,
+                    "Venue {}: ask {} should be >= best_ask + tick {}",
+                    i,
+                    ask.price,
+                    best_ask + tick
+                );
+            }
         }
     }
 }
@@ -652,6 +677,7 @@ fn venue_targets_respond_to_funding() {
 fn young_passive_order_not_replaced() {
     let cfg = Config::default();
     let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
 
     let current = ActiveMmOrder {
         venue_index: 0,
@@ -665,6 +691,8 @@ fn young_passive_order_not_replaced() {
     let ctx = ShouldReplaceOrderCtx {
         cfg: &cfg,
         vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
         current: &current,
         desired_price: 299.91, // Slightly different price
         desired_size: 1.0,
@@ -684,6 +712,7 @@ fn young_passive_order_not_replaced() {
 fn old_order_with_price_change_replaced() {
     let cfg = Config::default();
     let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
 
     let current = ActiveMmOrder {
         venue_index: 0,
@@ -697,6 +726,8 @@ fn old_order_with_price_change_replaced() {
     let ctx = ShouldReplaceOrderCtx {
         cfg: &cfg,
         vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
         current: &current,
         desired_price: 299.80, // 10 cents different (10 ticks at 0.01)
         desired_size: 1.0,
@@ -716,6 +747,7 @@ fn old_order_with_price_change_replaced() {
 fn old_order_with_size_change_replaced() {
     let cfg = Config::default();
     let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
 
     let current = ActiveMmOrder {
         venue_index: 0,
@@ -725,13 +757,15 @@ fn old_order_with_size_change_replaced() {
         timestamp_ms: 0,
     };
 
-    // 1 second since order; size changed by 20%.
+    // 1 second since order; size changed by 30%.
     let ctx = ShouldReplaceOrderCtx {
         cfg: &cfg,
         vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
         current: &current,
         desired_price: 299.90,
-        desired_size: 1.2, // 20% size increase
+        desired_size: 1.30, // 30% size increase
         now_ms: 1000,
         best_bid: 300.0,
         best_ask: 300.10,
@@ -745,9 +779,1021 @@ fn old_order_with_size_change_replaced() {
 }
 
 #[test]
+fn old_order_with_price_only_move_can_be_held_by_price_cadence() {
+    let cfg = Config::default();
+    let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
+
+    let current = ActiveMmOrder {
+        venue_index: 0,
+        side: Side::Buy,
+        price: 299.90,
+        size: 1.0,
+        timestamp_ms: 0,
+    };
+
+    let ctx = ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
+        current: &current,
+        desired_price: 299.94, // 4 ticks higher, still passive
+        desired_size: 1.0,
+        now_ms: 1200, // past widened quote lifetime, still within price cadence
+        best_bid: 300.0,
+        best_ask: 300.10,
+    };
+    let should_replace = should_replace_order(ctx);
+
+    assert!(
+        !should_replace,
+        "Passive price-only move should be held by price cadence on a wide-spread venue"
+    );
+}
+
+#[test]
+fn inventory_reducing_price_move_bypasses_price_cadence() {
+    let cfg = Config::default();
+    let vcfg = &cfg.venues[0];
+    let mut state = GlobalState::new(&cfg);
+    state.q_global_tao = 5.0;
+
+    let current = ActiveMmOrder {
+        venue_index: 0,
+        side: Side::Sell,
+        price: 300.10,
+        size: 1.0,
+        timestamp_ms: 0,
+    };
+
+    let ctx = ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
+        current: &current,
+        desired_price: 300.06, // more aggressive ask to reduce long inventory
+        desired_size: 1.0,
+        now_ms: 700,
+        best_bid: 300.0,
+        best_ask: 300.10,
+    };
+    let should_replace = should_replace_order(ctx);
+
+    assert!(
+        should_replace,
+        "Inventory-reducing price move should bypass price cadence"
+    );
+}
+
+#[test]
+fn hyperliquid_sell_tighten_into_compressed_spread_can_be_held() {
+    let cfg = Config::default();
+    let venue_index = cfg
+        .venues
+        .iter()
+        .position(|venue| venue.id == "hyperliquid")
+        .expect("hyperliquid venue in config");
+    let vcfg = &cfg.venues[venue_index];
+    let mut state = GlobalState::new(&cfg);
+    state.venues[venue_index].mid = Some(100.25);
+    state.venues[venue_index].spread = Some(0.5);
+    state.venues[venue_index].prev_spread = Some(1.0);
+
+    let current = ActiveMmOrder {
+        venue_index,
+        side: Side::Sell,
+        price: 101.02,
+        size: 1.0,
+        timestamp_ms: 0,
+    };
+
+    let ctx = ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[venue_index],
+        q_global_tao: state.q_global_tao,
+        current: &current,
+        desired_price: 100.91,
+        desired_size: 1.08,
+        now_ms: 1000,
+        best_bid: 100.0,
+        best_ask: 100.5,
+    };
+    let should_replace = should_replace_order(ctx);
+
+    assert!(
+        !should_replace,
+        "Hyperliquid sell tightening into a compressed spread should be held"
+    );
+}
+
+fn evaluate_hyperliquid_sell_decision(
+    prev_spread: Option<f64>,
+    current_price: f64,
+    current_size: f64,
+    desired_price: f64,
+    desired_size: f64,
+    q_global_tao: f64,
+    position_tao: f64,
+) -> paraphina::mm::MmReplaceDecision {
+    evaluate_hyperliquid_sell_decision_with_market(
+        prev_spread,
+        Some(100.5),
+        current_price,
+        current_size,
+        desired_price,
+        desired_size,
+        q_global_tao,
+        position_tao,
+        100.0,
+        100.5,
+        2_000,
+    )
+}
+
+fn evaluate_hyperliquid_sell_decision_with_market(
+    prev_spread: Option<f64>,
+    prev_best_ask: Option<f64>,
+    current_price: f64,
+    current_size: f64,
+    desired_price: f64,
+    desired_size: f64,
+    q_global_tao: f64,
+    position_tao: f64,
+    best_bid: f64,
+    best_ask: f64,
+    now_ms: i64,
+) -> paraphina::mm::MmReplaceDecision {
+    let cfg = Config::default();
+    let venue_index = cfg
+        .venues
+        .iter()
+        .position(|venue| venue.id == "hyperliquid")
+        .expect("hyperliquid venue in config");
+    let vcfg = &cfg.venues[venue_index];
+    let mut state = GlobalState::new(&cfg);
+    state.q_global_tao = q_global_tao;
+    state.venues[venue_index].position_tao = position_tao;
+    state.venues[venue_index].mid = Some(100.25);
+    state.venues[venue_index].spread = Some(0.5);
+    state.venues[venue_index].prev_spread = prev_spread;
+    state.venues[venue_index].prev_best_ask = prev_best_ask;
+
+    let current = ActiveMmOrder {
+        venue_index,
+        side: Side::Sell,
+        price: current_price,
+        size: current_size,
+        timestamp_ms: 0,
+    };
+
+    evaluate_replace_order(ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[venue_index],
+        q_global_tao: state.q_global_tao,
+        current: &current,
+        desired_price,
+        desired_size,
+        now_ms,
+        best_bid,
+        best_ask,
+    })
+}
+
+#[test]
+fn hyperliquid_sell_compression_guard_records_no_prev_spread_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision(None, 101.02, 1.0, 100.91, 1.08, 0.0, 0.0);
+    assert_eq!(
+        decision.compression_edge_nearmiss_reason,
+        Some(CompressionEdgeNearMissReason::NoPrevSpread)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_compression_guard_records_not_compressed_nearmiss() {
+    let decision =
+        evaluate_hyperliquid_sell_decision(Some(0.5), 101.02, 1.0, 100.91, 1.08, 0.0, 0.0);
+    assert_eq!(
+        decision.compression_edge_nearmiss_reason,
+        Some(CompressionEdgeNearMissReason::NotCompressed)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_compression_guard_records_compression_too_small_nearmiss() {
+    let decision =
+        evaluate_hyperliquid_sell_decision(Some(0.59), 101.02, 1.0, 100.91, 1.08, 0.0, 0.0);
+    assert_eq!(
+        decision.compression_edge_nearmiss_reason,
+        Some(CompressionEdgeNearMissReason::CompressionTooSmall)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_compression_guard_records_clearance_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision(Some(1.0), 101.5, 1.0, 101.3, 1.08, 0.0, 0.0);
+    assert_eq!(
+        decision.compression_edge_nearmiss_reason,
+        Some(CompressionEdgeNearMissReason::ClearanceNotThinEnough)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_compression_guard_records_size_block_nearmiss() {
+    let decision =
+        evaluate_hyperliquid_sell_decision(Some(1.0), 101.02, 1.0, 100.91, 1.5, 0.0, 0.0);
+    assert_eq!(
+        decision.compression_edge_nearmiss_reason,
+        Some(CompressionEdgeNearMissReason::SizeExceedsBlock)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_compression_guard_records_not_tightening_nearmiss() {
+    let decision =
+        evaluate_hyperliquid_sell_decision(Some(1.0), 101.02, 1.0, 101.15, 1.0, 0.0, 0.0);
+    assert_eq!(
+        decision.compression_edge_nearmiss_reason,
+        Some(CompressionEdgeNearMissReason::DesiredNotTightening)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_compression_guard_records_not_passive_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision(Some(1.0), 100.5, 1.0, 100.39, 1.0, 0.0, 0.0);
+    assert_eq!(
+        decision.compression_edge_nearmiss_reason,
+        Some(CompressionEdgeNearMissReason::NotPassive)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_compression_guard_records_inventory_reducing_nearmiss() {
+    let decision =
+        evaluate_hyperliquid_sell_decision(Some(1.0), 101.02, 1.0, 100.91, 1.0, 5.0, 0.0);
+    assert_eq!(
+        decision.compression_edge_nearmiss_reason,
+        Some(CompressionEdgeNearMissReason::InventoryReducingBlock)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_tighten_into_thin_touch_uses_touch_risk_hysteresis() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.5),
+        100.70,
+        1.0,
+        100.51,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        2_000,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Keep);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::TouchRiskHysteresis
+    );
+}
+
+#[test]
+fn hyperliquid_sell_rising_touch_bypasses_young_hysteresis() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.48),
+        100.52,
+        1.0,
+        100.60,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        250,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::TouchRiskFastpath
+    );
+    assert!(!decision.touch_risk_size_band_applied);
+}
+
+#[test]
+fn hyperliquid_sell_small_size_drift_can_use_touch_risk_fastpath() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.48),
+        100.52,
+        1.0,
+        100.60,
+        1.15,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        250,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::TouchRiskFastpath
+    );
+    assert!(decision.touch_risk_size_band_applied);
+}
+
+#[test]
+fn hyperliquid_sell_three_tick_clearance_now_bypasses_young_hysteresis() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.48),
+        100.53,
+        1.0,
+        100.61,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        250,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::TouchRiskFastpath
+    );
+    assert!(!decision.touch_risk_size_band_applied);
+}
+
+#[test]
+fn hyperliquid_sell_price_move_forensics_show_marginal_old_replace() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.49),
+        100.70,
+        1.0,
+        100.72,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        2_000,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(decision.reason, paraphina::mm::MmReplaceReason::PriceMove);
+    assert!(decision
+        .hyperliquid_sell_price_excess_ticks
+        .is_some_and(|value| (value - 1.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_best_ask_motion_ticks
+        .is_some_and(|value| (value - 1.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_current_clearance_ticks
+        .is_some_and(|value| (value - 20.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_desired_clearance_ticks
+        .is_some_and(|value| (value - 22.0).abs() < 1e-9));
+    assert_eq!(
+        decision.hyperliquid_sell_price_reprice_remaining_ms,
+        Some(0)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_stationary_touch_small_old_price_move_held_by_deadband() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.50),
+        100.70,
+        1.0,
+        100.72,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        2_000,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Keep);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::StationaryPriceDeadbandHysteresis
+    );
+    assert!(decision
+        .hyperliquid_sell_price_excess_ticks
+        .is_some_and(|value| (value - 1.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_best_ask_motion_ticks
+        .is_some_and(|value| value.abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_current_clearance_ticks
+        .is_some_and(|value| (value - 20.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_desired_clearance_ticks
+        .is_some_and(|value| (value - 22.0).abs() < 1e-9));
+    assert_eq!(
+        decision.hyperliquid_sell_price_reprice_remaining_ms,
+        Some(0)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_reduced_adverse_selection_still_uses_stationary_deadband() {
+    let cfg = Config::default();
+    let venue_index = cfg
+        .venues
+        .iter()
+        .position(|venue| venue.id == "hyperliquid")
+        .expect("hyperliquid venue in config");
+    let vcfg = &cfg.venues[venue_index];
+    let mut state = GlobalState::new(&cfg);
+    state.venues[venue_index].mid = Some(100.25);
+    state.venues[venue_index].spread = Some(0.5);
+    state.venues[venue_index].prev_spread = Some(0.5);
+    state.venues[venue_index].prev_best_ask = Some(100.50);
+    state.venues[venue_index].toxicity = 0.7;
+
+    let current = ActiveMmOrder {
+        venue_index,
+        side: Side::Sell,
+        price: 100.70,
+        size: 1.0,
+        timestamp_ms: 0,
+    };
+
+    let decision = evaluate_replace_order(ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[venue_index],
+        q_global_tao: 0.0,
+        current: &current,
+        desired_price: 100.72,
+        desired_size: 1.0,
+        now_ms: 2_000,
+        best_bid: 100.0,
+        best_ask: 100.5,
+    });
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Keep);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::StationaryPriceDeadbandHysteresis
+    );
+    assert_eq!(
+        decision.utility_reason,
+        paraphina::state::VenueUtilityReason::AdverseSelection
+    );
+}
+
+#[test]
+fn hyperliquid_sell_price_move_forensics_show_young_keep_under_cadence() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.49),
+        100.70,
+        1.0,
+        100.74,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        250,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Keep);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::YoungPassiveHysteresis
+    );
+    assert!(decision
+        .hyperliquid_sell_price_excess_ticks
+        .is_some_and(|value| (value - 3.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_best_ask_motion_ticks
+        .is_some_and(|value| (value - 1.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_current_clearance_ticks
+        .is_some_and(|value| (value - 20.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_desired_clearance_ticks
+        .is_some_and(|value| (value - 24.0).abs() < 1e-9));
+    assert_eq!(
+        decision.hyperliquid_sell_price_reprice_remaining_ms,
+        Some(250)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_price_move_forensics_show_large_old_replace() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.49),
+        100.70,
+        1.0,
+        101.00,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        2_000,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(decision.reason, paraphina::mm::MmReplaceReason::PriceMove);
+    assert!(decision
+        .hyperliquid_sell_price_excess_ticks
+        .is_some_and(|value| (value - 29.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_best_ask_motion_ticks
+        .is_some_and(|value| (value - 1.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_current_clearance_ticks
+        .is_some_and(|value| (value - 20.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_desired_clearance_ticks
+        .is_some_and(|value| (value - 50.0).abs() < 1e-9));
+    assert_eq!(
+        decision.hyperliquid_sell_price_reprice_remaining_ms,
+        Some(0)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_stationary_touch_large_old_price_move_still_reprices() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.50),
+        100.70,
+        1.0,
+        101.00,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        2_000,
+    );
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(decision.reason, paraphina::mm::MmReplaceReason::PriceMove);
+    assert!(decision
+        .hyperliquid_sell_price_excess_ticks
+        .is_some_and(|value| (value - 29.0).abs() < 1e-9));
+    assert!(decision
+        .hyperliquid_sell_best_ask_motion_ticks
+        .is_some_and(|value| value.abs() < 1e-9));
+    assert_eq!(
+        decision.hyperliquid_sell_price_reprice_remaining_ms,
+        Some(0)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_reduced_low_conversion_does_not_use_stationary_deadband() {
+    let cfg = Config::default();
+    let venue_index = cfg
+        .venues
+        .iter()
+        .position(|venue| venue.id == "hyperliquid")
+        .expect("hyperliquid venue in config");
+    let vcfg = &cfg.venues[venue_index];
+    let mut state = GlobalState::new(&cfg);
+    state.venues[venue_index].mid = Some(100.25);
+    state.venues[venue_index].spread = Some(0.5);
+    state.venues[venue_index].prev_spread = Some(0.5);
+    state.venues[venue_index].prev_best_ask = Some(100.50);
+    state.venues[venue_index].utility.mm_fill_credit_ewma = 0.0;
+    state.venues[venue_index].utility.mm_fillless_ack_pressure = 25.0;
+
+    let current = ActiveMmOrder {
+        venue_index,
+        side: Side::Sell,
+        price: 100.70,
+        size: 1.0,
+        timestamp_ms: 0,
+    };
+
+    let decision = evaluate_replace_order(ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[venue_index],
+        q_global_tao: 0.0,
+        current: &current,
+        desired_price: 100.72,
+        desired_size: 1.0,
+        now_ms: 2_000,
+        best_bid: 100.0,
+        best_ask: 100.5,
+    });
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(decision.reason, paraphina::mm::MmReplaceReason::PriceMove);
+    assert_eq!(
+        decision.utility_reason,
+        paraphina::state::VenueUtilityReason::LowConversion
+    );
+}
+
+#[test]
+fn hyperliquid_sell_inventory_reducing_still_bypasses_touch_risk_controller() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.48),
+        100.52,
+        1.0,
+        100.60,
+        1.0,
+        5.0,
+        0.0,
+        100.0,
+        100.5,
+        500,
+    );
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::YoungPassiveHysteresis
+    );
+}
+
+#[test]
+fn aster_touch_local_young_one_tick_offside_sell_uses_fastpath() {
+    let mut cfg = Config::default();
+    cfg.mm
+        .venue_role_by_venue
+        .insert("aster".to_string(), MmVenueRole::Fill);
+    let venue_index = cfg
+        .venues
+        .iter()
+        .position(|venue| venue.id == "aster")
+        .expect("aster venue in config");
+    let vcfg = &cfg.venues[venue_index];
+    let tick = vcfg.tick_size.max(1e-6);
+    let best_bid = 2_131.20;
+    let best_ask = best_bid + (3.0 * tick);
+    let base_lifetime = cfg.mm.min_quote_lifetime_ms_for("aster");
+    let mut state = GlobalState::new(&cfg);
+    state.venues[venue_index].mid = Some((best_bid + best_ask) * 0.5);
+    state.venues[venue_index].spread = Some(best_ask - best_bid);
+    state.venues[venue_index].status = VenueStatus::Healthy;
+    state.venues[venue_index].toxicity = 0.0;
+    state.venues[venue_index].utility.mm_fill_credit_ewma = 0.5;
+    state.venues[venue_index].utility.mm_fillless_ack_pressure = 0.0;
+
+    let current = ActiveMmOrder {
+        venue_index,
+        side: Side::Sell,
+        price: best_ask + (0.5 * tick),
+        size: 0.01,
+        timestamp_ms: 0,
+    };
+
+    let decision = evaluate_replace_order(ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[venue_index],
+        q_global_tao: 0.0,
+        current: &current,
+        desired_price: best_ask + tick,
+        desired_size: 0.01,
+        now_ms: base_lifetime.saturating_sub(1),
+        best_bid,
+        best_ask,
+    });
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Keep);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::AsterTouchOffsideFastpath
+    );
+    assert_eq!(
+        decision.utility_tier,
+        paraphina::state::VenueUtilityTier::Full
+    );
+    assert_eq!(decision.venue_role, MmVenueRole::Fill);
+}
+
+#[test]
+fn aster_touch_local_young_one_tick_offside_buy_uses_fastpath() {
+    let mut cfg = Config::default();
+    cfg.mm
+        .venue_role_by_venue
+        .insert("aster".to_string(), MmVenueRole::Fill);
+    let venue_index = cfg
+        .venues
+        .iter()
+        .position(|venue| venue.id == "aster")
+        .expect("aster venue in config");
+    let vcfg = &cfg.venues[venue_index];
+    let tick = vcfg.tick_size.max(1e-6);
+    let best_bid = 2_131.20;
+    let best_ask = best_bid + (3.0 * tick);
+    let base_lifetime = cfg.mm.min_quote_lifetime_ms_for("aster");
+    let mut state = GlobalState::new(&cfg);
+    state.venues[venue_index].mid = Some((best_bid + best_ask) * 0.5);
+    state.venues[venue_index].spread = Some(best_ask - best_bid);
+    state.venues[venue_index].status = VenueStatus::Healthy;
+    state.venues[venue_index].toxicity = 0.0;
+    state.venues[venue_index].utility.mm_fill_credit_ewma = 0.5;
+    state.venues[venue_index].utility.mm_fillless_ack_pressure = 0.0;
+
+    let current = ActiveMmOrder {
+        venue_index,
+        side: Side::Buy,
+        price: best_bid - (0.5 * tick),
+        size: 0.01,
+        timestamp_ms: 0,
+    };
+
+    let decision = evaluate_replace_order(ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[venue_index],
+        q_global_tao: 0.0,
+        current: &current,
+        desired_price: best_bid - tick,
+        desired_size: 0.01,
+        now_ms: base_lifetime.saturating_sub(1),
+        best_bid,
+        best_ask,
+    });
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Keep);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::AsterTouchOffsideFastpath
+    );
+    assert_eq!(
+        decision.utility_tier,
+        paraphina::state::VenueUtilityTier::Full
+    );
+    assert_eq!(decision.venue_role, MmVenueRole::Fill);
+}
+
+#[test]
+fn aster_touch_local_old_quote_records_quote_too_old_nearmiss() {
+    let mut cfg = Config::default();
+    cfg.mm
+        .venue_role_by_venue
+        .insert("aster".to_string(), MmVenueRole::Fill);
+    let venue_index = cfg
+        .venues
+        .iter()
+        .position(|venue| venue.id == "aster")
+        .expect("aster venue in config");
+    let vcfg = &cfg.venues[venue_index];
+    let tick = vcfg.tick_size.max(1e-6);
+    let best_bid = 2_131.20;
+    let best_ask = best_bid + (3.0 * tick);
+    let base_lifetime = cfg.mm.min_quote_lifetime_ms_for("aster");
+    let mut state = GlobalState::new(&cfg);
+    state.venues[venue_index].mid = Some((best_bid + best_ask) * 0.5);
+    state.venues[venue_index].spread = Some(best_ask - best_bid);
+    state.venues[venue_index].status = VenueStatus::Healthy;
+    state.venues[venue_index].toxicity = 0.0;
+    state.venues[venue_index].utility.mm_fill_credit_ewma = 0.5;
+    state.venues[venue_index].utility.mm_fillless_ack_pressure = 0.0;
+
+    let current = ActiveMmOrder {
+        venue_index,
+        side: Side::Sell,
+        price: best_ask + (0.5 * tick),
+        size: 0.01,
+        timestamp_ms: 0,
+    };
+
+    let decision = evaluate_replace_order(ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[venue_index],
+        q_global_tao: 0.0,
+        current: &current,
+        desired_price: best_ask + tick,
+        desired_size: 0.01,
+        now_ms: base_lifetime + 100,
+        best_bid,
+        best_ask,
+    });
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::DangerousOffside
+    );
+    assert_eq!(
+        decision.aster_touch_offside_nearmiss_reason,
+        Some(paraphina::mm::AsterTouchOffsideNearMissReason::QuoteTooOld)
+    );
+}
+
+#[test]
+fn aster_touch_local_crossing_quote_still_replaces() {
+    let mut cfg = Config::default();
+    cfg.mm
+        .venue_role_by_venue
+        .insert("aster".to_string(), MmVenueRole::Fill);
+    let venue_index = cfg
+        .venues
+        .iter()
+        .position(|venue| venue.id == "aster")
+        .expect("aster venue in config");
+    let vcfg = &cfg.venues[venue_index];
+    let tick = vcfg.tick_size.max(1e-6);
+    let best_bid = 2_131.20;
+    let best_ask = best_bid + (3.0 * tick);
+    let base_lifetime = cfg.mm.min_quote_lifetime_ms_for("aster");
+    let mut state = GlobalState::new(&cfg);
+    state.venues[venue_index].mid = Some((best_bid + best_ask) * 0.5);
+    state.venues[venue_index].spread = Some(best_ask - best_bid);
+    state.venues[venue_index].status = VenueStatus::Healthy;
+    state.venues[venue_index].toxicity = 0.0;
+    state.venues[venue_index].utility.mm_fill_credit_ewma = 0.5;
+    state.venues[venue_index].utility.mm_fillless_ack_pressure = 0.0;
+
+    let current = ActiveMmOrder {
+        venue_index,
+        side: Side::Sell,
+        price: best_bid + tick,
+        size: 0.01,
+        timestamp_ms: 0,
+    };
+
+    let decision = evaluate_replace_order(ShouldReplaceOrderCtx {
+        cfg: &cfg,
+        vcfg,
+        vstate: &state.venues[venue_index],
+        q_global_tao: 0.0,
+        current: &current,
+        desired_price: best_ask + tick,
+        desired_size: 0.01,
+        now_ms: base_lifetime.saturating_sub(1),
+        best_bid,
+        best_ask,
+    });
+    assert_eq!(decision.outcome, paraphina::mm::MmReplaceOutcome::Replace);
+    assert_eq!(
+        decision.reason,
+        paraphina::mm::MmReplaceReason::DangerousOffside
+    );
+    assert_eq!(
+        decision.aster_touch_offside_nearmiss_reason,
+        Some(paraphina::mm::AsterTouchOffsideNearMissReason::Crossing)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_touch_risk_records_no_prev_best_ask_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        None,
+        100.52,
+        1.0,
+        100.60,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        2_000,
+    );
+    assert_eq!(
+        decision.touch_risk_nearmiss_reason,
+        Some(TouchRiskNearMissReason::NoPrevBestAsk)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_touch_risk_records_clearance_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.5),
+        100.70,
+        1.0,
+        100.60,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        2_000,
+    );
+    assert_eq!(
+        decision.touch_risk_nearmiss_reason,
+        Some(TouchRiskNearMissReason::ClearanceNotThinEnough)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_touch_risk_records_touch_not_rising_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.50),
+        100.52,
+        1.0,
+        100.60,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        250,
+    );
+    assert_eq!(
+        decision.touch_risk_nearmiss_reason,
+        Some(TouchRiskNearMissReason::TouchNotRisingEnough)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_touch_risk_records_desired_not_widening_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.48),
+        100.52,
+        1.0,
+        100.40,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        250,
+    );
+    assert_eq!(
+        decision.touch_risk_nearmiss_reason,
+        Some(TouchRiskNearMissReason::DesiredNotWidening)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_touch_risk_records_size_block_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.48),
+        100.52,
+        1.0,
+        100.60,
+        1.5,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        250,
+    );
+    assert_eq!(
+        decision.touch_risk_nearmiss_reason,
+        Some(TouchRiskNearMissReason::SizeExceedsBlock)
+    );
+    assert!(!decision.touch_risk_size_band_applied);
+}
+
+#[test]
+fn hyperliquid_sell_touch_risk_records_inventory_reducing_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.48),
+        100.52,
+        1.0,
+        100.60,
+        1.0,
+        5.0,
+        0.0,
+        100.0,
+        100.5,
+        250,
+    );
+    assert_eq!(
+        decision.touch_risk_nearmiss_reason,
+        Some(TouchRiskNearMissReason::InventoryReducingBlock)
+    );
+}
+
+#[test]
+fn hyperliquid_sell_touch_risk_records_age_window_nearmiss() {
+    let decision = evaluate_hyperliquid_sell_decision_with_market(
+        Some(0.5),
+        Some(100.48),
+        100.52,
+        1.0,
+        100.60,
+        1.0,
+        0.0,
+        0.0,
+        100.0,
+        100.5,
+        2_000,
+    );
+    assert_eq!(
+        decision.touch_risk_nearmiss_reason,
+        Some(TouchRiskNearMissReason::AgeOutsideFastpathWindow)
+    );
+}
+
+#[test]
 fn non_passive_order_replaced_even_if_young() {
     let cfg = Config::default();
     let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
 
     // Order is priced at best_bid (not passive).
     let current = ActiveMmOrder {
@@ -762,6 +1808,8 @@ fn non_passive_order_replaced_even_if_young() {
     let ctx = ShouldReplaceOrderCtx {
         cfg: &cfg,
         vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
         current: &current,
         desired_price: 299.90,
         desired_size: 1.0,
@@ -840,6 +1888,8 @@ fn compute_order_actions_place_new() {
         id: Arc::from("test"),
         mid: Some(300.0),
         spread: Some(0.10),
+        prev_spread: None,
+        prev_best_ask: None,
         depth_near_mid: 10_000.0,
         last_mid_update_ms: Some(0),
         last_mid_apply_ms: Some(0),
@@ -853,6 +1903,7 @@ fn compute_order_actions_place_new() {
         pending_markouts: std::collections::VecDeque::new(),
         pending_markouts_next_eval_ms: i64::MAX,
         markout_ewma_usd_per_tao: 0.0,
+        utility: Default::default(),
         open_orders: std::collections::BTreeMap::new(),
         recent_fills: std::collections::VecDeque::new(),
         recent_fills_cap: 0,
@@ -881,6 +1932,7 @@ fn compute_order_actions_place_new() {
             price: 300.20,
             size: 1.0,
         }),
+        generated_spread_cap_applied: false,
     };
 
     let actions = compute_order_actions(&cfg, vcfg, &vstate, &quote, None, None, 0);
@@ -924,6 +1976,8 @@ fn compute_order_actions_cancel_when_no_desired() {
         id: Arc::from("test"),
         mid: Some(300.0),
         spread: Some(0.10),
+        prev_spread: None,
+        prev_best_ask: None,
         depth_near_mid: 10_000.0,
         last_mid_update_ms: Some(0),
         last_mid_apply_ms: Some(0),
@@ -937,6 +1991,7 @@ fn compute_order_actions_cancel_when_no_desired() {
         pending_markouts: std::collections::VecDeque::new(),
         pending_markouts_next_eval_ms: i64::MAX,
         markout_ewma_usd_per_tao: 0.0,
+        utility: Default::default(),
         open_orders: std::collections::BTreeMap::new(),
         recent_fills: std::collections::VecDeque::new(),
         recent_fills_cap: 0,
@@ -960,6 +2015,7 @@ fn compute_order_actions_cancel_when_no_desired() {
         venue_id: Arc::from("test"),
         bid: None,
         ask: None,
+        generated_spread_cap_applied: false,
     };
 
     // Existing orders.

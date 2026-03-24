@@ -14,6 +14,10 @@ const PARADEX_WATCHDOG_TICK_MS: u64 = 200;
 const PARADEX_MARKET_PUB_QUEUE_CAP: usize = 256;
 const PARADEX_MARKET_PUB_DRAIN_MAX: usize = 64;
 const PARADEX_TOKEN_REFRESH_DEFAULT_SECS: u64 = 240;
+const PARADEX_RATE_LIMIT_BASE_BACKOFF_MS: u64 = 2_000;
+const PARADEX_RATE_LIMIT_MAX_BACKOFF_MS: u64 = 15_000;
+const PARADEX_SIGN_ORDER_CMD_DEFAULT: &str =
+    "/opt/paraphina/.venv_paradex/bin/python3 /opt/paraphina/tools/paradex_sign_order.py";
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 static PARADEX_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -57,6 +61,18 @@ fn paradex_audit_reconnect(reason: &'static str) {
         "WS_AUDIT venue=paradex reconnect_reason={} count={}",
         reason, *count
     );
+}
+
+fn paradex_is_rate_limit_error(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("rate limit")
+}
+
+fn paradex_next_rate_limit_backoff_ms(current_ms: u64, poll_ms: u64) -> u64 {
+    if current_ms == 0 {
+        poll_ms.max(PARADEX_RATE_LIMIT_BASE_BACKOFF_MS)
+    } else {
+        (current_ms * 2).min(PARADEX_RATE_LIMIT_MAX_BACKOFF_MS)
+    }
 }
 
 #[allow(dead_code)]
@@ -121,8 +137,9 @@ use super::super::gateway::{
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, FundingUpdate, LiquidationSnapshot,
-    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
+    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, OpenOrderSnapshot, OrderSnapshot,
+    PositionSnapshot, TopOfBook,
 };
 use crate::live::MarketPublisher;
 use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
@@ -138,6 +155,7 @@ pub struct ParadexConfig {
     pub venue_index: usize,
     pub jwt: Option<String>,
     pub jwt_cmd: Option<String>,
+    pub sign_order_cmd: Option<String>,
     pub auth_payload_json: Option<Value>,
     pub token_refresh_secs: u64,
     pub record_dir: Option<PathBuf>,
@@ -161,6 +179,18 @@ impl ParadexConfig {
             .ok()
             .map(|raw| raw.trim().to_string())
             .filter(|raw| !raw.is_empty());
+        let sign_order_cmd = std::env::var("PARADEX_SIGN_ORDER_CMD")
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+            .or_else(|| {
+                let l2_address = std::env::var("PARADEX_L2_ADDRESS").ok()?;
+                let l2_private_key = std::env::var("PARADEX_L2_PRIVATE_KEY").ok()?;
+                if l2_address.trim().is_empty() || l2_private_key.trim().is_empty() {
+                    return None;
+                }
+                Some(PARADEX_SIGN_ORDER_CMD_DEFAULT.to_string())
+            });
         let auth_payload_json = std::env::var("PARADEX_AUTH_PAYLOAD_JSON")
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
@@ -179,6 +209,7 @@ impl ParadexConfig {
             venue_index: 0,
             jwt,
             jwt_cmd,
+            sign_order_cmd,
             auth_payload_json,
             token_refresh_secs,
             record_dir: None,
@@ -347,6 +378,7 @@ impl ParadexConnector {
 
     pub async fn run_funding_polling(&self, interval_ms: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut seq: u64 = 0;
         loop {
             interval.tick().await;
@@ -671,6 +703,7 @@ pub struct ParadexRestClient {
     cfg: ParadexConfig,
     http: Client,
     token_cache: Arc<Mutex<Option<CachedParadexToken>>>,
+    poll_seq: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -706,6 +739,7 @@ impl ParadexRestClient {
                 .build()
                 .expect("paradex rest http client build"),
             token_cache: Arc::new(Mutex::new(None)),
+            poll_seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -750,7 +784,9 @@ impl ParadexRestClient {
             .arg(cmd)
             .env_remove("PARADEX_JWT")
             .output()
-            .map_err(|err| LiveGatewayError::retryable(format!("paradex jwt command error: {err}")))?;
+            .map_err(|err| {
+                LiveGatewayError::retryable(format!("paradex jwt command error: {err}"))
+            })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let detail = if stderr.is_empty() {
@@ -831,6 +867,37 @@ impl ParadexRestClient {
         Ok(response)
     }
 
+    async fn sign_order_payload(&self, payload: &Value) -> LiveResult<Value> {
+        let cmd = self
+            .cfg
+            .sign_order_cmd
+            .as_ref()
+            .ok_or_else(|| LiveGatewayError::fatal("paradex sign order command missing"))?;
+        let output = StdCommand::new("/bin/bash")
+            .arg("-lc")
+            .arg(cmd)
+            .env("PARADEX_ORDER_PAYLOAD", payload.to_string())
+            .output()
+            .map_err(|err| {
+                LiveGatewayError::retryable(format!("paradex sign order command error: {err}"))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("exit_status={}", output.status)
+            } else {
+                format!("exit_status={} stderr={stderr}", output.status)
+            };
+            return Err(LiveGatewayError::fatal(format!(
+                "paradex sign order command failed: {detail}"
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        serde_json::from_str::<Value>(stdout.trim()).map_err(|err| {
+            LiveGatewayError::fatal(format!("paradex sign order payload parse error: {err}"))
+        })
+    }
+
     async fn fetch_account_snapshot(
         &self,
         venue_id: &str,
@@ -847,8 +914,40 @@ impl ParadexRestClient {
         let value: Value = serde_json::from_str(&body).map_err(|err| {
             LiveGatewayError::fatal(format!("paradex account parse error: {err}"))
         })?;
-        parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
-            LiveGatewayError::fatal("paradex account snapshot missing required fields")
+        let mut snapshot =
+            parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
+                LiveGatewayError::fatal("paradex account snapshot missing required fields")
+            })?;
+        if snapshot.positions.is_empty() {
+            if let Ok(positions) = self.fetch_position_snapshots().await {
+                snapshot.positions = positions;
+            }
+        }
+        Ok(snapshot)
+    }
+
+    async fn fetch_open_order_snapshot(
+        &self,
+        venue_id: &str,
+        venue_index: usize,
+    ) -> LiveResult<OrderSnapshot> {
+        let resp = self
+            .send_authed_request(Method::GET, &self.cfg.order_path, None)
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("paradex open orders parse error: {err}"))
+        })?;
+        Ok(OrderSnapshot {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq: self.poll_seq.fetch_add(1, Ordering::Relaxed),
+            timestamp_ms: now_ms(),
+            open_orders: parse_open_orders(&value, &self.cfg.market),
         })
     }
 
@@ -860,14 +959,59 @@ impl ParadexRestClient {
         poll_ms: u64,
     ) {
         let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rate_limit_backoff_ms: u64 = 0;
         loop {
             interval.tick().await;
+            if rate_limit_backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(rate_limit_backoff_ms)).await;
+            }
             match self.fetch_account_snapshot(&venue_id, venue_index).await {
                 Ok(snapshot) => {
+                    rate_limit_backoff_ms = 0;
                     let _ = account_tx.send(AccountEvent::Snapshot(snapshot)).await;
                 }
                 Err(err) => {
+                    if paradex_is_rate_limit_error(&err.message) {
+                        rate_limit_backoff_ms =
+                            paradex_next_rate_limit_backoff_ms(rate_limit_backoff_ms, poll_ms);
+                    } else {
+                        rate_limit_backoff_ms = 0;
+                    }
                     eprintln!("Paradex account snapshot error: {}", err.message);
+                }
+            }
+        }
+    }
+
+    pub async fn run_order_polling(
+        self: Arc<Self>,
+        exec_tx: mpsc::Sender<ExecutionEvent>,
+        venue_id: String,
+        venue_index: usize,
+        poll_ms: u64,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rate_limit_backoff_ms: u64 = 0;
+        loop {
+            interval.tick().await;
+            if rate_limit_backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(rate_limit_backoff_ms)).await;
+            }
+            match self.fetch_open_order_snapshot(&venue_id, venue_index).await {
+                Ok(snapshot) => {
+                    rate_limit_backoff_ms = 0;
+                    let _ = exec_tx.send(ExecutionEvent::OrderSnapshot(snapshot)).await;
+                }
+                Err(err) => {
+                    if paradex_is_rate_limit_error(&err.message) {
+                        rate_limit_backoff_ms =
+                            paradex_next_rate_limit_backoff_ms(rate_limit_backoff_ms, poll_ms);
+                    } else {
+                        rate_limit_backoff_ms = 0;
+                    }
+                    eprintln!("Paradex open order snapshot error: {}", err.message);
                 }
             }
         }
@@ -880,7 +1024,12 @@ impl LiveRestClient for ParadexRestClient {
         req: LiveRestPlaceRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
-            let payload = build_order_payload(&self.cfg.market, &req)?;
+            let unsigned_payload = build_order_payload(&self.cfg.market, &req)?;
+            let payload = if self.cfg.sign_order_cmd.is_some() {
+                self.sign_order_payload(&unsigned_payload).await?
+            } else {
+                unsigned_payload
+            };
             let resp = self
                 .send_authed_request(Method::POST, &self.cfg.order_path, Some(payload))
                 .await?;
@@ -899,13 +1048,22 @@ impl LiveRestClient for ParadexRestClient {
         req: LiveRestCancelRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
-            let path = format!("{}/{}", self.cfg.order_path, req.order_id);
+            let path = if is_client_order_id(&req.order_id) {
+                format!("{}/by_client_id/{}", self.cfg.order_path, req.order_id)
+            } else {
+                format!("{}/{}", self.cfg.order_path, req.order_id)
+            };
             let resp = self
                 .send_authed_request(Method::DELETE, &path, None)
                 .await?;
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if !status.is_success() {
+                if is_paradex_cancel_not_found(&body) {
+                    return Ok(LiveRestResponse {
+                        order_id: Some(req.order_id),
+                    });
+                }
                 return Err(map_rest_error(status.as_u16(), &body));
             }
             Ok(LiveRestResponse { order_id: None })
@@ -924,11 +1082,58 @@ impl LiveRestClient for ParadexRestClient {
                 .await?;
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 404 {
+                return self.cancel_all_via_batch().await;
+            }
             if !status.is_success() {
                 return Err(map_rest_error(status.as_u16(), &body));
             }
             Ok(LiveRestResponse { order_id: None })
         })
+    }
+}
+
+impl ParadexRestClient {
+    async fn fetch_position_snapshots(&self) -> LiveResult<Vec<PositionSnapshot>> {
+        let path = format!("/positions?market={}", self.cfg.market);
+        let resp = self.send_authed_request(Method::GET, &path, None).await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("paradex positions parse error: {err}"))
+        })?;
+        Ok(parse_position_snapshots(&value, &self.cfg.market))
+    }
+
+    async fn cancel_all_via_batch(&self) -> LiveResult<LiveRestResponse> {
+        let resp = self
+            .send_authed_request(Method::GET, &self.cfg.order_path, None)
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("paradex open orders parse error: {err}"))
+        })?;
+        let order_ids = parse_open_order_ids(&value, &self.cfg.market);
+        for chunk in order_ids.chunks(50) {
+            let payload = serde_json::json!({ "order_ids": chunk });
+            let batch_path = format!("{}/batch", self.cfg.order_path);
+            let resp = self
+                .send_authed_request(Method::DELETE, &batch_path, Some(payload))
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(map_rest_error(status.as_u16(), &body));
+            }
+        }
+        Ok(LiveRestResponse { order_id: None })
     }
 }
 
@@ -1088,7 +1293,11 @@ fn parse_auth_token(body: &str) -> Option<ParadexAuthToken> {
 
 fn parse_order_id(body: &str) -> Option<String> {
     let value: Value = serde_json::from_str(body).ok()?;
-    if let Some(order_id) = value.get("order_id").or_else(|| value.get("orderId")) {
+    if let Some(order_id) = value
+        .get("id")
+        .or_else(|| value.get("order_id"))
+        .or_else(|| value.get("orderId"))
+    {
         if let Some(raw) = order_id.as_str() {
             return Some(raw.to_string());
         }
@@ -1097,10 +1306,19 @@ fn parse_order_id(body: &str) -> Option<String> {
         }
     }
     value
-        .get("client_order_id")
+        .get("client_id")
+        .or_else(|| value.get("client_order_id"))
         .or_else(|| value.get("clientOrderId"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn is_client_order_id(value: &str) -> bool {
+    value.starts_with("co_")
+}
+
+fn is_paradex_cancel_not_found(body: &str) -> bool {
+    body.contains("ORDER_ID_NOT_FOUND") || body.contains("CLIENT_ORDER_ID_NOT_FOUND")
 }
 
 fn map_time_in_force(time_in_force: TimeInForce, post_only: bool) -> &'static str {
@@ -1126,19 +1344,37 @@ fn build_order_payload(market: &str, req: &LiveRestPlaceRequest) -> LiveResult<V
             "paradex: post_only + IOC not allowed",
         ));
     }
-    let tif = map_time_in_force(req.time_in_force, req.post_only);
-    // Payload per Paradex REST docs: https://docs.paradex.trade (POST /orders).
-    Ok(serde_json::json!({
+    let instruction = map_time_in_force(req.time_in_force, req.post_only);
+    let mut payload = serde_json::json!({
         "market": market,
         "side": map_side(req.side),
         "type": "LIMIT",
-        "time_in_force": tif,
-        "price": req.price,
-        "size": req.size,
-        "post_only": req.post_only,
-        "reduce_only": req.reduce_only,
-        "client_order_id": req.client_order_id,
-    }))
+        "instruction": instruction,
+        "price": format_decimal(req.price),
+        "size": format_decimal(req.size),
+        "client_id": req.client_order_id,
+    });
+    if req.reduce_only {
+        payload["flags"] = serde_json::json!(["REDUCE_ONLY"]);
+    }
+    Ok(payload)
+}
+
+fn format_decimal(value: f64) -> String {
+    if !value.is_finite() {
+        return "0".to_string();
+    }
+    let mut formatted = format!("{value:.12}");
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    if formatted == "-0" {
+        formatted = "0".to_string();
+    }
+    formatted
 }
 
 fn parse_account_snapshot(
@@ -1212,7 +1448,177 @@ fn parse_account_snapshot(
             liquidation,
         });
     }
+    if value.get("account_value").is_some() && value.get("free_collateral").is_some() {
+        let balance_usd = value.get("account_value").and_then(parse_f64)?;
+        let available_usd = value.get("free_collateral").and_then(parse_f64)?;
+        let used_usd = value
+            .get("initial_margin_requirement")
+            .and_then(parse_f64)
+            .unwrap_or_else(|| (balance_usd - available_usd).max(0.0));
+        let total_collateral = value
+            .get("total_collateral")
+            .and_then(parse_f64)
+            .unwrap_or(balance_usd);
+        let settlement_asset = value
+            .get("settlement_asset")
+            .and_then(|v| v.as_str())
+            .unwrap_or("USDC");
+        return Some(AccountSnapshot {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq: value.get("seq_no").and_then(parse_u64_value).unwrap_or(0),
+            timestamp_ms: value
+                .get("updated_at")
+                .and_then(parse_i64_value)
+                .unwrap_or(0),
+            positions: Vec::new(),
+            balances: vec![BalanceSnapshot {
+                asset: settlement_asset.to_string(),
+                total: total_collateral,
+                available: available_usd,
+            }],
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd,
+                used_usd,
+                available_usd,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        });
+    }
     None
+}
+
+fn parse_position_snapshots(value: &Value, market: &str) -> Vec<PositionSnapshot> {
+    let list = value
+        .get("results")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    list.into_iter()
+        .filter_map(|pos| {
+            let symbol = pos
+                .get("market")
+                .or_else(|| pos.get("symbol"))
+                .and_then(|v| v.as_str())?
+                .to_string();
+            if !market.is_empty() && symbol != market {
+                return None;
+            }
+            let mut size = pos.get("size").and_then(parse_f64)?;
+            if let Some(side) = pos.get("side").and_then(|v| v.as_str()) {
+                if side.eq_ignore_ascii_case("short") && size > 0.0 {
+                    size = -size;
+                } else if side.eq_ignore_ascii_case("long") && size < 0.0 {
+                    size = size.abs();
+                }
+            }
+            if size.abs() <= f64::EPSILON {
+                return None;
+            }
+            let entry_price = pos
+                .get("average_entry_price")
+                .or_else(|| pos.get("average_entry_price_usd"))
+                .and_then(parse_f64)?;
+            Some(PositionSnapshot {
+                symbol,
+                size,
+                entry_price,
+            })
+        })
+        .collect()
+}
+
+fn parse_open_order_ids(value: &Value, market: &str) -> Vec<String> {
+    let list = value
+        .get("results")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    list.into_iter()
+        .filter_map(|order| {
+            let order_market = order.get("market").and_then(|v| v.as_str()).unwrap_or("");
+            let status = order.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if order_market != market || !status.eq_ignore_ascii_case("OPEN") {
+                return None;
+            }
+            order
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+        })
+        .collect()
+}
+
+fn parse_open_orders(value: &Value, market: &str) -> Vec<OpenOrderSnapshot> {
+    let list = value
+        .get("results")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    list.into_iter()
+        .filter_map(|order| {
+            let order_market = order
+                .get("market")
+                .or_else(|| order.get("symbol"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if order_market != market {
+                return None;
+            }
+            let status = order.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if !(status.eq_ignore_ascii_case("OPEN")
+                || status.eq_ignore_ascii_case("NEW")
+                || status.eq_ignore_ascii_case("PARTIALLY_FILLED"))
+            {
+                return None;
+            }
+            let order_id = order
+                .get("id")
+                .or_else(|| order.get("order_id"))
+                .or_else(|| order.get("orderId"))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|raw| raw.to_string())
+                        .or_else(|| v.as_i64().map(|raw| raw.to_string()))
+                })?;
+            let client_order_id = order
+                .get("client_id")
+                .or_else(|| order.get("client_order_id"))
+                .or_else(|| order.get("clientOrderId"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            let side = match order.get("side").and_then(|v| v.as_str())? {
+                side if side.eq_ignore_ascii_case("BUY") => Side::Buy,
+                side if side.eq_ignore_ascii_case("SELL") => Side::Sell,
+                _ => return None,
+            };
+            let price = order
+                .get("price")
+                .or_else(|| order.get("limit_price"))
+                .and_then(parse_f64)?;
+            let size = order
+                .get("remaining_size")
+                .or_else(|| order.get("remainingQuantity"))
+                .or_else(|| order.get("remaining_qty"))
+                .or_else(|| order.get("size"))
+                .and_then(parse_f64)?;
+            (size > 0.0).then_some(OpenOrderSnapshot {
+                order_id,
+                client_order_id,
+                side,
+                price,
+                size,
+                purpose: None,
+            })
+        })
+        .collect()
 }
 
 async fn fetch_public_funding(
@@ -2071,7 +2477,7 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use httpmock::Method::POST;
+    use httpmock::Method::{DELETE, GET, POST};
     use httpmock::MockServer;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -2210,6 +2616,7 @@ mod tests {
             venue_index: 0,
             jwt: None,
             jwt_cmd: Some("printf 'cmd.jwt\\n'".to_string()),
+            sign_order_cmd: None,
             auth_payload_json: None,
             token_refresh_secs: 240,
             record_dir: None,
@@ -2257,6 +2664,7 @@ mod tests {
             venue_index: 0,
             jwt: Some("test.jwt".to_string()),
             jwt_cmd: None,
+            sign_order_cmd: Some("python3 -c 'import json, os; payload = json.loads(os.environ[\"PARADEX_ORDER_PAYLOAD\"]); payload[\"signature\"] = \"[1,2]\"; payload[\"signature_timestamp\"] = 1700000000000; print(json.dumps(payload, separators=(\",\", \":\")))'".to_string()),
             auth_payload_json: None,
             token_refresh_secs: 240,
             record_dir: None,
@@ -2272,12 +2680,12 @@ mod tests {
                         "market": "BTC-USD-PERP",
                         "side": "BUY",
                         "type": "LIMIT",
-                        "time_in_force": "POST_ONLY",
-                        "price": 100.0,
-                        "size": 0.1,
-                        "post_only": true,
-                        "reduce_only": false,
-                        "client_order_id": "co_post_only",
+                        "instruction": "POST_ONLY",
+                        "price": "100",
+                        "size": "0.1",
+                        "client_id": "co_post_only",
+                        "signature": "[1,2]",
+                        "signature_timestamp": 1700000000000i64,
                     }));
                 then.status(200).body("{\"order_id\": \"oid_1\"}");
             })
@@ -2300,6 +2708,272 @@ mod tests {
             .expect("place order");
 
         mock.assert_async().await;
+    }
+
+    #[test]
+    fn build_order_payload_serializes_decimal_fields_as_strings() {
+        let payload = build_order_payload(
+            "ETH-USD-PERP",
+            &LiveRestPlaceRequest {
+                venue_index: 0,
+                venue_id: "paradex".to_string(),
+                side: Side::Buy,
+                price: 2073.7899999999995,
+                size: 0.010000000000000002,
+                purpose: crate::types::OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "co_decimal".to_string(),
+            },
+        )
+        .expect("payload");
+
+        assert_eq!(
+            payload.get("price").and_then(|v| v.as_str()),
+            Some("2073.79")
+        );
+        assert_eq!(payload.get("size").and_then(|v| v.as_str()), Some("0.01"));
+        assert_eq!(
+            payload.get("instruction").and_then(|v| v.as_str()),
+            Some("POST_ONLY")
+        );
+        assert_eq!(
+            payload.get("client_id").and_then(|v| v.as_str()),
+            Some("co_decimal")
+        );
+        assert!(
+            payload.get("flags").is_none(),
+            "reduce-only flags should be omitted when false"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_cancel_order_uses_client_id_endpoint_for_client_ids() {
+        let server = MockServer::start_async().await;
+        let cfg = ParadexConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            auth_url: format!("{}/auth/token", server.base_url()),
+            market: "BTC-USD-PERP".to_string(),
+            account_path: "/account".to_string(),
+            order_path: "/orders".to_string(),
+            venue_index: 0,
+            jwt: Some("test.jwt".to_string()),
+            jwt_cmd: None,
+            sign_order_cmd: None,
+            auth_payload_json: None,
+            token_refresh_secs: 240,
+            record_dir: None,
+        };
+        let client = ParadexRestClient::new(cfg);
+
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/orders/by_client_id/co_123")
+                    .header("Authorization", "Bearer test.jwt");
+                then.status(200).body("{}");
+            })
+            .await;
+
+        let _ = client
+            .cancel_order(LiveRestCancelRequest {
+                venue_index: 0,
+                venue_id: "paradex".to_string(),
+                order_id: "co_123".to_string(),
+            })
+            .await
+            .expect("cancel order");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_account_snapshot_enriches_positions_from_positions_endpoint() {
+        let server = MockServer::start_async().await;
+        let cfg = ParadexConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            auth_url: format!("{}/auth/token", server.base_url()),
+            market: "ETH-USD-PERP".to_string(),
+            account_path: "/account".to_string(),
+            order_path: "/orders".to_string(),
+            venue_index: 4,
+            jwt: Some("test.jwt".to_string()),
+            jwt_cmd: None,
+            sign_order_cmd: None,
+            auth_payload_json: None,
+            token_refresh_secs: 240,
+            record_dir: None,
+        };
+        let client = ParadexRestClient::new(cfg);
+
+        let account_mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/account")
+                    .header("Authorization", "Bearer test.jwt");
+                then.status(200).json_body(serde_json::json!({
+                    "account": "0xabc",
+                    "initial_margin_requirement": "45.2",
+                    "maintenance_margin_requirement": "22.8",
+                    "account_value": "79.79",
+                    "total_collateral": "83.31",
+                    "free_collateral": "34.59",
+                    "settlement_asset": "USDC",
+                    "updated_at": 1_700_000_000_123i64,
+                    "seq_no": 42
+                }));
+            })
+            .await;
+        let positions_mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/positions")
+                    .query_param("market", "ETH-USD-PERP")
+                    .header("Authorization", "Bearer test.jwt");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [{
+                        "market": "ETH-USD-PERP",
+                        "side": "SHORT",
+                        "size": "-1.07",
+                        "average_entry_price": "2088.21759223"
+                    }]
+                }));
+            })
+            .await;
+
+        let snapshot = client
+            .fetch_account_snapshot("PARADEX", 4)
+            .await
+            .expect("snapshot");
+
+        account_mock.assert_async().await;
+        positions_mock.assert_async().await;
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].symbol, "ETH-USD-PERP");
+        assert!((snapshot.positions[0].size + 1.07).abs() < 1e-9);
+        assert!((snapshot.positions[0].entry_price - 2088.21759223).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn rest_cancel_all_falls_back_to_batch_when_legacy_endpoint_404s() {
+        let server = MockServer::start_async().await;
+        let cfg = ParadexConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            auth_url: format!("{}/auth/token", server.base_url()),
+            market: "ETH-USD-PERP".to_string(),
+            account_path: "/account".to_string(),
+            order_path: "/orders".to_string(),
+            venue_index: 4,
+            jwt: Some("test.jwt".to_string()),
+            jwt_cmd: None,
+            sign_order_cmd: None,
+            auth_payload_json: None,
+            token_refresh_secs: 240,
+            record_dir: None,
+        };
+        let client = ParadexRestClient::new(cfg);
+
+        let legacy_mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/orders/cancel_all")
+                    .header("Authorization", "Bearer test.jwt")
+                    .json_body(serde_json::json!({"market": "ETH-USD-PERP"}));
+                then.status(404).body("{\"message\":\"Not Found\"}");
+            })
+            .await;
+        let list_mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/orders")
+                    .header("Authorization", "Bearer test.jwt");
+                then.status(200).json_body(serde_json::json!({
+                    "results": [
+                        { "id": "oid_1", "market": "ETH-USD-PERP", "status": "OPEN" },
+                        { "id": "oid_2", "market": "ETH-USD-PERP", "status": "OPEN" },
+                        { "id": "oid_3", "market": "BTC-USD-PERP", "status": "OPEN" },
+                        { "id": "oid_4", "market": "ETH-USD-PERP", "status": "FILLED" }
+                    ]
+                }));
+            })
+            .await;
+        let batch_mock = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/orders/batch")
+                    .header("Authorization", "Bearer test.jwt")
+                    .json_body(serde_json::json!({
+                        "order_ids": ["oid_1", "oid_2"]
+                    }));
+                then.status(200).json_body(serde_json::json!({
+                    "results": [
+                        {"id": "oid_1", "status": "CANCELLED"},
+                        {"id": "oid_2", "status": "CANCELLED"}
+                    ]
+                }));
+            })
+            .await;
+
+        let _ = client
+            .cancel_all(LiveRestCancelAllRequest {
+                venue_index: 4,
+                venue_id: "paradex".to_string(),
+            })
+            .await
+            .expect("cancel all");
+
+        legacy_mock.assert_async().await;
+        list_mock.assert_async().await;
+        batch_mock.assert_async().await;
+    }
+
+    #[test]
+    fn parse_order_id_prefers_exchange_id_before_client_id() {
+        let body = serde_json::json!({
+            "id": "pdx_order_123",
+            "client_id": "co_123",
+        })
+        .to_string();
+        assert_eq!(parse_order_id(&body).as_deref(), Some("pdx_order_123"));
+    }
+
+    #[test]
+    fn parse_open_orders_keeps_remaining_size_and_client_order_id() {
+        let value = serde_json::json!({
+            "results": [
+                {
+                    "id": "pdx_order_123",
+                    "client_id": "co_pdx_1",
+                    "market": "ETH-USD-PERP",
+                    "status": "OPEN",
+                    "side": "SELL",
+                    "price": "2101.25",
+                    "remaining_size": "0.07"
+                },
+                {
+                    "id": "ignore_me",
+                    "market": "BTC-USD-PERP",
+                    "status": "OPEN",
+                    "side": "BUY",
+                    "price": "60000",
+                    "remaining_size": "1.0"
+                }
+            ]
+        });
+
+        let open_orders = parse_open_orders(&value, "ETH-USD-PERP");
+
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].order_id, "pdx_order_123");
+        assert_eq!(open_orders[0].client_order_id.as_deref(), Some("co_pdx_1"));
+        assert_eq!(open_orders[0].side, Side::Sell);
+        assert!((open_orders[0].price - 2101.25).abs() < 1e-9);
+        assert!((open_orders[0].size - 0.07).abs() < 1e-9);
+        assert_eq!(open_orders[0].purpose, None);
     }
 
     #[test]
@@ -2358,6 +3032,7 @@ mod tests {
             venue_index: 4,
             jwt: None,
             jwt_cmd: None,
+            sign_order_cmd: None,
             auth_payload_json: None,
             token_refresh_secs: 240,
             record_dir: None,
@@ -2427,5 +3102,33 @@ mod tests {
         let update_none = result.expect("returns Some but with None rates");
         assert!(update_none.funding_rate_native.is_none());
         assert!(update_none.funding_rate_8h.is_none());
+    }
+
+    #[test]
+    fn account_summary_snapshot_parses() {
+        let value = serde_json::json!({
+            "account": "0xabc",
+            "initial_margin_requirement": "12.5",
+            "maintenance_margin_requirement": "6.0",
+            "account_value": "100.0",
+            "total_collateral": "100.0",
+            "free_collateral": "87.5",
+            "margin_cushion": "87.5",
+            "settlement_asset": "USDC",
+            "updated_at": 1_700_000_000_123i64,
+            "status": "ACTIVE",
+            "seq_no": 42
+        });
+        let snapshot = parse_account_snapshot(&value, "PARADEX", 4).expect("snapshot");
+        assert_eq!(snapshot.venue_index, 4);
+        assert_eq!(snapshot.venue_id, "PARADEX");
+        assert_eq!(snapshot.seq, 42);
+        assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
+        assert!(snapshot.positions.is_empty());
+        assert_eq!(snapshot.balances.len(), 1);
+        assert_eq!(snapshot.balances[0].asset, "USDC");
+        assert!((snapshot.margin.balance_usd - 100.0).abs() < 1e-9);
+        assert!((snapshot.margin.used_usd - 12.5).abs() < 1e-9);
+        assert!((snapshot.margin.available_usd - 87.5).abs() < 1e-9);
     }
 }
