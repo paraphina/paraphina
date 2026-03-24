@@ -130,6 +130,43 @@ mod tests {
     }
 
     #[test]
+    fn account_snapshot_marked_stale_by_book_window_still_hydrates_state() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        state.fair_value = Some(100.0);
+        state.fair_value_prev = 100.0;
+        state.sigma_eff = 1.0;
+        state.venues[0].mid = Some(100.0);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: 1_500,
+            market: build_market_snapshots(&cfg, 100.0),
+            account: vec![VenueAccountSnapshot {
+                venue_index: 0,
+                venue_id: cfg.venues[0].id_arc.clone(),
+                seq: 2,
+                timestamp_ms: Some(1_000),
+                position_tao: 2.0,
+                avg_entry_price: 100.0,
+                funding_8h: Some(0.001),
+                margin_balance_usd: 10_000.0,
+                margin_used_usd: 500.0,
+                margin_available_usd: 9_500.0,
+                price_liq: Some(95.0),
+                dist_liq_sigma: None,
+                // Simulate the live path where book staleness is tighter than account polling.
+                is_stale: true,
+            }],
+        };
+
+        apply_account_snapshot_to_state(&cfg, &snapshot, &mut state, 1_500);
+
+        assert_eq!(state.venues[0].position_tao, 2.0);
+        assert_eq!(state.venues[0].price_liq, Some(95.0));
+        assert!((state.venues[0].margin_balance_usd - 10_000.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn account_snapshot_staleness_tracks_unavailable() {
         let cfg = Config::default();
         let mut cache = LiveStateCache::new(&cfg);

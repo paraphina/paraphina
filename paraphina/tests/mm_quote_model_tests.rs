@@ -652,6 +652,7 @@ fn venue_targets_respond_to_funding() {
 fn young_passive_order_not_replaced() {
     let cfg = Config::default();
     let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
 
     let current = ActiveMmOrder {
         venue_index: 0,
@@ -665,6 +666,8 @@ fn young_passive_order_not_replaced() {
     let ctx = ShouldReplaceOrderCtx {
         cfg: &cfg,
         vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
         current: &current,
         desired_price: 299.91, // Slightly different price
         desired_size: 1.0,
@@ -684,6 +687,7 @@ fn young_passive_order_not_replaced() {
 fn old_order_with_price_change_replaced() {
     let cfg = Config::default();
     let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
 
     let current = ActiveMmOrder {
         venue_index: 0,
@@ -697,6 +701,8 @@ fn old_order_with_price_change_replaced() {
     let ctx = ShouldReplaceOrderCtx {
         cfg: &cfg,
         vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
         current: &current,
         desired_price: 299.80, // 10 cents different (10 ticks at 0.01)
         desired_size: 1.0,
@@ -716,6 +722,7 @@ fn old_order_with_price_change_replaced() {
 fn old_order_with_size_change_replaced() {
     let cfg = Config::default();
     let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
 
     let current = ActiveMmOrder {
         venue_index: 0,
@@ -729,6 +736,8 @@ fn old_order_with_size_change_replaced() {
     let ctx = ShouldReplaceOrderCtx {
         cfg: &cfg,
         vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
         current: &current,
         desired_price: 299.90,
         desired_size: 1.2, // 20% size increase
@@ -748,6 +757,7 @@ fn old_order_with_size_change_replaced() {
 fn non_passive_order_replaced_even_if_young() {
     let cfg = Config::default();
     let vcfg = &cfg.venues[0];
+    let state = GlobalState::new(&cfg);
 
     // Order is priced at best_bid (not passive).
     let current = ActiveMmOrder {
@@ -762,6 +772,8 @@ fn non_passive_order_replaced_even_if_young() {
     let ctx = ShouldReplaceOrderCtx {
         cfg: &cfg,
         vcfg,
+        vstate: &state.venues[0],
+        q_global_tao: state.q_global_tao,
         current: &current,
         desired_price: 299.90,
         desired_size: 1.0,
@@ -853,6 +865,7 @@ fn compute_order_actions_place_new() {
         pending_markouts: std::collections::VecDeque::new(),
         pending_markouts_next_eval_ms: i64::MAX,
         markout_ewma_usd_per_tao: 0.0,
+        utility: Default::default(),
         open_orders: std::collections::BTreeMap::new(),
         recent_fills: std::collections::VecDeque::new(),
         recent_fills_cap: 0,
@@ -937,6 +950,7 @@ fn compute_order_actions_cancel_when_no_desired() {
         pending_markouts: std::collections::VecDeque::new(),
         pending_markouts_next_eval_ms: i64::MAX,
         markout_ewma_usd_per_tao: 0.0,
+        utility: Default::default(),
         open_orders: std::collections::BTreeMap::new(),
         recent_fills: std::collections::VecDeque::new(),
         recent_fills_cap: 0,

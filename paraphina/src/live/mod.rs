@@ -35,10 +35,10 @@ pub use runner::{
     LiveTelemetryStats, ResponseMode,
 };
 pub use shadow_adapter::ShadowAckAdapter;
+pub use shared_venue_ages::SharedVenueAges;
 pub use state_cache::{
     CanonicalCacheSnapshot, ReconciliationReport, VenueAccountCache, VenueMarketCache,
 };
-pub use shared_venue_ages::SharedVenueAges;
 pub use supervision::{spawn_supervised, spawn_supervised_with_threshold};
 pub use trade_mode::{
     resolve_effective_trade_mode, EffectiveTradeMode, TradeMode, TradeModeSource,

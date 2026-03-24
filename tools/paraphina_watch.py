@@ -1258,14 +1258,7 @@ class WatchState:
                 self._append_series(self.rx_rate_history, self.rx_rate_ema)
         self._last_update_mono = now_mono
 
-        pnl_value = _pick_number(
-            [record],
-            (
-                "pnl_total_usd",
-                "pnl_usd",
-                "unrealized_pnl_usd",
-            ),
-        )
+        pnl_value = _extract_pnl_usd(record)
         pos_value = _pick_number(
             [record],
             (

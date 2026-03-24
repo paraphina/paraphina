@@ -168,6 +168,74 @@ pub struct FillRecord {
     pub realised_pnl_usd: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VenueUtilityTier {
+    Full,
+    Reduced,
+    AnchorOnly,
+    Suppressed,
+}
+
+impl VenueUtilityTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VenueUtilityTier::Full => "full",
+            VenueUtilityTier::Reduced => "reduced",
+            VenueUtilityTier::AnchorOnly => "anchor_only",
+            VenueUtilityTier::Suppressed => "suppressed",
+        }
+    }
+}
+
+impl Default for VenueUtilityTier {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VenueUtilityReason {
+    Healthy,
+    LowConversion,
+    SpreadPathology,
+    AdverseSelection,
+    RejectPressure,
+}
+
+impl VenueUtilityReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VenueUtilityReason::Healthy => "healthy",
+            VenueUtilityReason::LowConversion => "low_conversion",
+            VenueUtilityReason::SpreadPathology => "spread_pathology",
+            VenueUtilityReason::AdverseSelection => "adverse_selection",
+            VenueUtilityReason::RejectPressure => "reject_pressure",
+        }
+    }
+}
+
+impl Default for VenueUtilityReason {
+    fn default() -> Self {
+        Self::Healthy
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VenueUtilityState {
+    pub mm_ack_ewma: f64,
+    pub mm_reject_ewma: f64,
+    pub mm_fill_count_ewma: f64,
+    pub mm_fill_base_ewma: f64,
+    pub mm_fill_credit_ewma: f64,
+    pub mm_fillless_ack_pressure: f64,
+    pub spread_gate_hit_ewma: f64,
+    pub score: f64,
+    pub tier: VenueUtilityTier,
+    pub reason: VenueUtilityReason,
+}
+
 /// Per-venue state (one per perp venue / subaccount).
 #[derive(Debug, Clone)]
 pub struct VenueState {
@@ -209,6 +277,8 @@ pub struct VenueState {
     pub pending_markouts_next_eval_ms: TimestampMs,
     /// Running EWMA of markout in USD/TAO for telemetry/debugging.
     pub markout_ewma_usd_per_tao: f64,
+    /// Short-horizon rolling venue utility used to tier live quote allocation.
+    pub utility: VenueUtilityState,
 
     // ----- Order ledger (whitepaper §4.3) -----
     /// Open orders keyed by order_id (BTreeMap for deterministic iteration).
@@ -429,6 +499,8 @@ pub enum RiskRegime {
 pub enum KillReason {
     /// No kill triggered (default state).
     None,
+    /// Startup inherited position / PnL baseline is unsafe before quoting begins.
+    StartupPnlBaselineBreach,
     /// Daily PnL loss limit breached.
     PnlHardBreach,
     /// Volatility-scaled delta limit breached.
@@ -744,6 +816,7 @@ impl GlobalState {
                 pending_markouts: VecDeque::new(),
                 pending_markouts_next_eval_ms: i64::MAX,
                 markout_ewma_usd_per_tao: 0.0,
+                utility: VenueUtilityState::default(),
 
                 open_orders: BTreeMap::new(),
                 recent_fills: VecDeque::new(),

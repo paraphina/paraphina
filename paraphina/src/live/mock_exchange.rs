@@ -105,10 +105,11 @@ impl MockExchangeHandle {
             }
             orders.push(super::types::OpenOrderSnapshot {
                 order_id: order_id.clone(),
+                client_order_id: None,
                 side: order.side,
                 price: order.price,
                 size: order.size,
-                purpose: order.purpose,
+                purpose: Some(order.purpose),
             });
         }
         super::types::OrderSnapshot {
@@ -477,6 +478,9 @@ async fn handle_place_intent(
             seq: venue.exec_seq,
             timestamp_ms: now_ms,
             order_id: place.client_order_id.clone(),
+            client_order_id: place.client_order_id.clone(),
+            purpose: Some(place.purpose),
+            reduce_only: Some(place.reduce_only),
             reason: "Invalid price/size".to_string(),
         });
         record_event(&event, &execution_log).await;
@@ -498,6 +502,9 @@ async fn handle_place_intent(
             seq: venue.exec_seq,
             timestamp_ms: now_ms,
             order_id: place.client_order_id.clone(),
+            client_order_id: place.client_order_id.clone(),
+            purpose: Some(place.purpose),
+            reduce_only: Some(place.reduce_only),
             reason: "Post-only would cross".to_string(),
         });
         record_event(&event, &execution_log).await;
@@ -525,6 +532,9 @@ async fn handle_place_intent(
                 seq: venue.exec_seq,
                 timestamp_ms: now_ms,
                 order_id: place.client_order_id.clone(),
+                client_order_id: place.client_order_id.clone(),
+                purpose: Some(place.purpose),
+                reduce_only: Some(place.reduce_only),
                 reason: "Reduce-only would increase position".to_string(),
             });
             record_event(&event, &execution_log).await;

@@ -189,7 +189,10 @@ fn preflight_live_accepts_extended_bridge_auth() {
         .env("PARAPHINA_LIVE_EXEC_ENABLE", "1")
         .env("PARAPHINA_LIVE_EXECUTION_CONFIRM", "YES")
         .env("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS", "5000")
-        .env("PARAPHINA_LIVE_CANARY_PROFILE", "configs/prod_canary_eth_min.toml")
+        .env(
+            "PARAPHINA_LIVE_CANARY_PROFILE",
+            "configs/prod_canary_eth_min.toml",
+        )
         .env("EXTENDED_WS_URL", "ws://127.0.0.1:1")
         .env("EXTENDED_REST_URL", "http://127.0.0.1:1")
         .env("EXTENDED_MARKET", "ETH-USD")

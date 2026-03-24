@@ -51,7 +51,9 @@ async fn live_event_log_replay_matches_telemetry() {
             let events =
                 shadow.handle_intents(req.intents, req.action_batch.tick_index, req.now_ms);
             match req.response {
-                paraphina::live::ResponseMode::Oneshot(tx) => { let _ = tx.send(events); }
+                paraphina::live::ResponseMode::Oneshot(tx) => {
+                    let _ = tx.send(events);
+                }
                 paraphina::live::ResponseMode::FireAndForget => {}
             }
         }
@@ -90,9 +92,10 @@ async fn live_event_log_replay_matches_telemetry() {
         account_rx,
         exec_rx: Some(exec_rx),
         account_reconcile_tx: None,
+        priority_order_tx: order_tx.clone(),
         order_tx,
         order_snapshot_rx: None,
-            shared_venue_ages: None,
+        shared_venue_ages: None,
     };
 
     let summary = run_live_loop(

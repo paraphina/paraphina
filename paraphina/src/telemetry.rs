@@ -67,6 +67,7 @@
 //! opening the file and appending JSON lines.
 //!
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -78,8 +79,11 @@ use serde_json::{self, Value as JsonValue};
 use crate::config::Config;
 use crate::exit::compute_exit_edge_components;
 use crate::hedge::compute_hedge_cost_components;
-use crate::mm::{compute_mm_quotes, compute_mm_reservation_components};
-use crate::state::{GlobalState, KillEvent};
+use crate::mm::{
+    compute_mm_quotes_with_now, compute_mm_reservation_components, compute_venue_targets,
+    compute_venue_utility_decision, quote_spread_gate_reason,
+};
+use crate::state::{funding_rate_for_decision, GlobalState, KillEvent, RiskRegime};
 use crate::treasury::TreasuryGuidanceEngine;
 use crate::types::{
     ExecutionEvent, FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus,
@@ -499,6 +503,7 @@ pub struct TelemetryInputs<'a> {
     pub shadow_mode: bool,
     pub execution_mode: &'a str,
     pub reconcile_drift: &'a [ReconcileDriftRecord],
+    pub account_position_syncs: &'a [AccountPositionSyncRecord],
     pub max_orders_per_tick: usize,
 }
 
@@ -514,6 +519,21 @@ pub struct ReconcileDriftRecord {
     pub tolerance: Option<f64>,
     pub source: String,
     pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountPositionSyncRecord {
+    pub venue_index: usize,
+    pub venue_id: String,
+    pub snapshot_seq: u64,
+    pub snapshot_timestamp_ms: Option<TimestampMs>,
+    pub ingest_now_ms: TimestampMs,
+    pub pre_position_tao: f64,
+    pub post_position_tao: f64,
+    pub position_delta_tao: f64,
+    pub pre_margin_available_usd: f64,
+    pub post_margin_available_usd: f64,
+    pub source: &'static str,
 }
 
 impl TelemetryBuilder {
@@ -557,6 +577,16 @@ impl TelemetryBuilder {
         let global_stale_ms = cfg.book.stale_ms;
         let healthy_venues_used = compute_healthy_venues_used(cfg, state, now_ms, global_stale_ms);
         let healthy_venues_used_count = healthy_venues_used.len();
+        let q_gross_tao: f64 = state
+            .venues
+            .iter()
+            .map(|venue| venue.position_tao.abs())
+            .sum();
+        let q_max_abs_venue_tao: f64 = state
+            .venues
+            .iter()
+            .map(|venue| venue.position_tao.abs())
+            .fold(0.0_f64, f64::max);
         let mut record = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "t": tick,
@@ -567,6 +597,8 @@ impl TelemetryBuilder {
             "kill_switch": state.kill_switch,
             "kill_reason": kill_reason,
             "q_global_tao": state.q_global_tao,
+            "q_gross_tao": q_gross_tao,
+            "q_max_abs_venue_tao": q_max_abs_venue_tao,
             "dollar_delta_usd": state.dollar_delta_usd,
             "basis_usd": state.basis_usd,
             "basis_gross_usd": state.basis_gross_usd,
@@ -601,6 +633,48 @@ impl TelemetryBuilder {
         }
 
         if let serde_json::Value::Object(map) = &mut record {
+            let account_position_syncs = input
+                .account_position_syncs
+                .iter()
+                .map(|sync| serde_json::to_value(sync).unwrap_or_default())
+                .collect::<Vec<_>>();
+            let execution_visibility_gap =
+                !input.account_position_syncs.is_empty() && input.fills.is_empty();
+            let execution_visibility_gap_venues = input
+                .account_position_syncs
+                .iter()
+                .map(|sync| sync.venue_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect::<Vec<_>>();
+            map.insert(
+                "account_position_syncs".to_string(),
+                serde_json::Value::Array(account_position_syncs),
+            );
+            map.insert(
+                "account_position_sync_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    input.account_position_syncs.len() as u64,
+                )),
+            );
+            map.insert(
+                "execution_visibility_gap".to_string(),
+                serde_json::Value::Bool(execution_visibility_gap),
+            );
+            map.insert(
+                "execution_visibility_gap_reason".to_string(),
+                serde_json::Value::String(if execution_visibility_gap {
+                    "account_position_sync_without_fill".to_string()
+                } else {
+                    String::new()
+                }),
+            );
+            map.insert(
+                "execution_visibility_gap_venues".to_string(),
+                serde_json::Value::Array(execution_visibility_gap_venues),
+            );
+
             self.treasury.update(state, fair);
             map.insert(
                 "treasury_guidance".to_string(),
@@ -944,7 +1018,8 @@ fn build_quote_levels(
         crate::types::now_ms()
     };
     let components = compute_mm_reservation_components(cfg, state, Some(effective_now_ms));
-    let quotes = compute_mm_quotes(cfg, state);
+    let targets = compute_venue_targets(cfg, state, Some(effective_now_ms));
+    let quotes = compute_mm_quotes_with_now(cfg, state, Some(effective_now_ms));
     #[allow(clippy::type_complexity)]
     let mut quote_by_venue: Vec<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> =
         vec![(None, None, None, None); cfg.venues.len()];
@@ -975,20 +1050,34 @@ fn build_quote_levels(
         let size_eta = cfg.mm.size_eta.max(1e-9);
         let spread_mult = state.spread_mult;
         let size_mult = state.size_mult;
+        let q_target = targets
+            .get(idx)
+            .map(|target| target.q_target)
+            .unwrap_or(0.0);
 
-        let (edge_bid, q_raw_bid, size_bid, margin_cap_bid, liq_factor_bid) = quote_diagnostics(
+        let bid_diag = quote_diagnostics(
             cfg,
+            state,
+            &cfg.venues[idx],
             v,
             fair,
+            effective_now_ms,
+            Side::Buy,
+            q_target,
             maker_cost,
             bid_price.unwrap_or(0.0),
             bid_size.unwrap_or(0.0),
             size_eta,
         );
-        let (edge_ask, q_raw_ask, size_ask, margin_cap_ask, liq_factor_ask) = quote_diagnostics(
+        let ask_diag = quote_diagnostics(
             cfg,
+            state,
+            &cfg.venues[idx],
             v,
             fair,
+            effective_now_ms,
+            Side::Sell,
+            q_target,
             maker_cost,
             ask_price.unwrap_or(0.0),
             ask_size.unwrap_or(0.0),
@@ -1006,12 +1095,19 @@ fn build_quote_levels(
             "delta_final": delta_final,
             "spread_mult": spread_mult,
             "size_mult": size_mult,
-            "edge_local": edge_bid,
-            "size_raw": q_raw_bid,
-            "size_final": size_bid,
-            "size_margin_cap": margin_cap_bid,
-            "size_liq_factor": liq_factor_bid,
+            "edge_local": bid_diag.edge,
+            "size_raw": bid_diag.q_raw,
+            "size_final": bid_diag.size_final,
+            "size_margin_cap": bid_diag.margin_cap,
+            "size_liq_factor": bid_diag.liq_factor,
             "price": bid_price.unwrap_or(0.0),
+            "quote_state": bid_diag.quote_state,
+            "suppression_reason": bid_diag.suppression_reason,
+            "book_age_ms": bid_diag.book_age_ms,
+            "book_stale_threshold_ms": bid_diag.book_stale_threshold_ms,
+            "edge_threshold": bid_diag.edge_threshold,
+            "lot_size_tao": bid_diag.lot_size_tao,
+            "q_target_tao": q_target,
         }));
         out.push(serde_json::json!({
             "venue_index": idx,
@@ -1024,15 +1120,37 @@ fn build_quote_levels(
             "delta_final": delta_final,
             "spread_mult": spread_mult,
             "size_mult": size_mult,
-            "edge_local": edge_ask,
-            "size_raw": q_raw_ask,
-            "size_final": size_ask,
-            "size_margin_cap": margin_cap_ask,
-            "size_liq_factor": liq_factor_ask,
+            "edge_local": ask_diag.edge,
+            "size_raw": ask_diag.q_raw,
+            "size_final": ask_diag.size_final,
+            "size_margin_cap": ask_diag.margin_cap,
+            "size_liq_factor": ask_diag.liq_factor,
             "price": ask_price.unwrap_or(0.0),
+            "quote_state": ask_diag.quote_state,
+            "suppression_reason": ask_diag.suppression_reason,
+            "book_age_ms": ask_diag.book_age_ms,
+            "book_stale_threshold_ms": ask_diag.book_stale_threshold_ms,
+            "edge_threshold": ask_diag.edge_threshold,
+            "lot_size_tao": ask_diag.lot_size_tao,
+            "q_target_tao": q_target,
         }));
     }
     out
+}
+
+#[derive(Debug, Clone)]
+struct QuoteTelemetryDiagnostics {
+    edge: f64,
+    q_raw: f64,
+    size_final: f64,
+    margin_cap: f64,
+    liq_factor: f64,
+    quote_state: &'static str,
+    suppression_reason: Option<&'static str>,
+    book_age_ms: TimestampMs,
+    book_stale_threshold_ms: i64,
+    edge_threshold: f64,
+    lot_size_tao: f64,
 }
 
 fn mm_maker_cost(vcfg: &crate::config::VenueConfig, price: f64) -> f64 {
@@ -1043,13 +1161,35 @@ fn mm_maker_cost(vcfg: &crate::config::VenueConfig, price: f64) -> f64 {
 
 fn quote_diagnostics(
     cfg: &Config,
+    state: &GlobalState,
+    vcfg: &crate::config::VenueConfig,
     v: &crate::state::VenueState,
     fair: f64,
+    now_ms: TimestampMs,
+    side: Side,
+    q_target_v: f64,
     maker_cost: f64,
     price: f64,
     size_final: f64,
     size_eta: f64,
-) -> (f64, f64, f64, f64, f64) {
+) -> QuoteTelemetryDiagnostics {
+    let book_age_ms = compute_age_ms(now_ms, v.last_mid_update_ms);
+    let book_stale_threshold_ms = cfg
+        .mm
+        .quote_max_age_ms
+        .unwrap_or_else(|| vcfg.effective_stale_ms(cfg.book.stale_ms));
+    let lot_size_tao = vcfg.lot_size_tao.max(0.0);
+    let bid_edge_threshold = cfg.mm.edge_local_min_bid_for(&vcfg.id);
+    let ask_edge_threshold = cfg.mm.edge_local_min_ask_for(&vcfg.id);
+    let edge_threshold = match side {
+        Side::Buy => bid_edge_threshold,
+        Side::Sell => ask_edge_threshold,
+    };
+    let reference_price = if price > 0.0 {
+        price
+    } else {
+        v.mid.unwrap_or(fair).max(1e-9)
+    };
     let edge = if price > 0.0 {
         if size_final > 0.0 {
             // side-specific edge defined relative to fair value
@@ -1070,6 +1210,12 @@ fn quote_diagnostics(
     } else {
         0.0
     };
+    let margin_cap_estimate = if reference_price > 0.0 {
+        (v.margin_available_usd * cfg.risk.mm_max_leverage * cfg.risk.mm_margin_safety)
+            / reference_price
+    } else {
+        0.0
+    };
     let dist = v.dist_liq_sigma;
     let liq_factor = if dist <= cfg.risk.liq_crit_sigma {
         0.0
@@ -1080,7 +1226,164 @@ fn quote_diagnostics(
     } else {
         1.0
     };
-    (edge, q_raw, size_final, margin_cap, liq_factor)
+    let quote_state = if price > 0.0 && size_final > 0.0 {
+        "active"
+    } else {
+        "suppressed"
+    };
+    let suppression_reason = if quote_state == "active" {
+        None
+    } else {
+        quote_suppression_reason(
+            cfg,
+            state,
+            vcfg,
+            v,
+            side,
+            now_ms,
+            q_target_v,
+            bid_edge_threshold,
+            ask_edge_threshold,
+            lot_size_tao,
+            margin_cap_estimate,
+            liq_factor,
+        )
+    };
+
+    QuoteTelemetryDiagnostics {
+        edge,
+        q_raw,
+        size_final,
+        margin_cap,
+        liq_factor,
+        quote_state,
+        suppression_reason,
+        book_age_ms,
+        book_stale_threshold_ms,
+        edge_threshold,
+        lot_size_tao,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quote_suppression_reason(
+    cfg: &Config,
+    state: &GlobalState,
+    vcfg: &crate::config::VenueConfig,
+    v: &crate::state::VenueState,
+    side: Side,
+    now_ms: TimestampMs,
+    q_target_v: f64,
+    bid_edge_threshold: f64,
+    ask_edge_threshold: f64,
+    lot_size_tao: f64,
+    margin_cap_estimate: f64,
+    liq_factor: f64,
+) -> Option<&'static str> {
+    if !state.fv_available {
+        return Some("global_fv_unavailable");
+    }
+    if state.fair_value.is_none() {
+        return Some("fair_value_missing");
+    }
+    if state.kill_switch {
+        return Some("kill_switch");
+    }
+    if matches!(state.risk_regime, RiskRegime::HardLimit) {
+        return Some("risk_hard_limit");
+    }
+    if !state.sigma_eff.is_finite() || state.sigma_eff <= 0.0 || state.size_mult <= 0.0 {
+        return Some("degenerate_global_scalars");
+    }
+    if matches!(v.status, VenueStatus::Disabled) {
+        return Some("venue_disabled");
+    }
+    if v.last_mid_update_ms.is_none() {
+        return Some("book_missing");
+    }
+    let quote_max_age_ms = cfg
+        .mm
+        .quote_max_age_ms
+        .unwrap_or_else(|| vcfg.effective_stale_ms(cfg.book.stale_ms));
+    if compute_age_ms(now_ms, v.last_mid_update_ms) > quote_max_age_ms {
+        return Some("book_stale");
+    }
+    if v.mid.is_none() {
+        return Some("mid_missing");
+    }
+    if v.spread.unwrap_or(0.0) <= 0.0 || v.depth_near_mid <= 0.0 {
+        return Some("invalid_book");
+    }
+    if v.dist_liq_sigma <= cfg.risk.liq_crit_sigma {
+        return Some("liq_critical");
+    }
+    if v.toxicity >= cfg.toxicity.tox_high_threshold {
+        return Some("toxicity_high");
+    }
+    let delta_ratio = (state.dollar_delta_usd.abs() / state.delta_limit_usd.max(1.0)).max(0.0);
+    if delta_ratio >= 2.0 {
+        return Some("delta_limit_block");
+    }
+    if delta_ratio > 1.0 {
+        if state.q_global_tao > 0.0 && matches!(side, Side::Buy) {
+            return Some("delta_directional_block_long");
+        }
+        if state.q_global_tao < 0.0 && matches!(side, Side::Sell) {
+            return Some("delta_directional_block_short");
+        }
+    }
+    if margin_cap_estimate > 0.0 && margin_cap_estimate < lot_size_tao {
+        return Some("margin_cap_below_lot");
+    }
+    if liq_factor > 0.0 && (liq_factor * vcfg.max_order_size) < lot_size_tao {
+        return Some("liq_shrink_below_lot");
+    }
+    if matches!(state.risk_regime, RiskRegime::Warning)
+        && cfg.risk.q_warn_cap > 0.0
+        && cfg.risk.q_warn_cap < lot_size_tao
+    {
+        return Some("warning_cap_below_lot");
+    }
+
+    let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
+    let sigma_eff = state.sigma_eff.max(cfg.volatility.sigma_min).max(1e-8);
+    let tau = cfg.mm.quote_horizon_sec.max(1.0);
+    let funding_8h =
+        funding_rate_for_decision(&v.funding_state, now_ms, &cfg.funding, true).unwrap_or(0.0);
+    let funding_pnl_per_unit = funding_8h * (tau / (8.0 * 60.0 * 60.0)) * fair;
+    let basis_v = v.mid.unwrap_or(fair) - fair;
+    let basis_adj = cfg.mm.basis_weight * basis_v;
+    let funding_adj = cfg.mm.funding_weight * funding_pnl_per_unit;
+    let inv_deviation = state.q_global_tao - cfg.mm.lambda_inv * (v.position_tao - q_target_v);
+    let inventory_term = vcfg.gamma * sigma_eff * sigma_eff * tau * inv_deviation;
+    let reservation_price = fair + basis_adj + funding_adj - inventory_term;
+    let spread = v.spread.unwrap_or(0.0);
+    let best_bid = v.mid.unwrap_or(fair) - spread / 2.0;
+    let best_ask = v.mid.unwrap_or(fair) + spread / 2.0;
+    let tick = vcfg.tick_size.max(1e-6);
+    let maker_cost = mm_maker_cost(vcfg, fair);
+    let vol_buffer = cfg.mm.edge_vol_mult * sigma_eff * fair;
+    let min_half_spread_bid = (bid_edge_threshold + maker_cost + vol_buffer) / 2.0;
+    let min_half_spread_ask = (ask_edge_threshold + maker_cost + vol_buffer) / 2.0;
+    let bid_half_spread = min_half_spread_bid.max(0.0);
+    let ask_half_spread = min_half_spread_ask.max(0.0);
+    let raw_bid = reservation_price - bid_half_spread;
+    let raw_ask = reservation_price + ask_half_spread;
+    let passive_bid_limit = best_bid - tick;
+    let passive_ask_limit = best_ask + tick;
+    let snapped_bid = (raw_bid.min(passive_bid_limit) / tick).floor() * tick;
+    let snapped_ask = (raw_ask.max(passive_ask_limit) / tick).ceil() * tick;
+    let edge_bid = fair - snapped_bid - maker_cost;
+    let edge_ask = snapped_ask - fair - maker_cost;
+    let side_edge_ok = match side {
+        Side::Buy => edge_bid >= bid_edge_threshold,
+        Side::Sell => edge_ask >= ask_edge_threshold,
+    };
+    if !side_edge_ok {
+        return Some("edge_below_min");
+    }
+
+    Some("size_or_passivity_gated")
 }
 
 fn build_order_records(
@@ -1609,6 +1912,7 @@ fn build_venue_metrics(
 
     let mut venue_mid = Vec::new();
     let mut venue_spread = Vec::new();
+    let mut venue_quote_spread_gate_reason = Vec::new();
     let mut venue_depth = Vec::new();
     let mut venue_status = Vec::new();
     let mut venue_toxicity = Vec::new();
@@ -1633,10 +1937,29 @@ fn build_venue_metrics(
     let mut venue_taker_volume = Vec::new();
     let mut venue_fill_rate = Vec::new();
     let mut venue_markout_ewma = Vec::new();
+    let mut venue_utility_score = Vec::new();
+    let mut venue_utility_tier = Vec::new();
+    let mut venue_utility_reason = Vec::new();
+    let mut venue_utility_role = Vec::new();
+    let mut venue_utility_role_cap_applied = Vec::new();
+    let mut venue_utility_mm_ack_ewma = Vec::new();
+    let mut venue_utility_mm_fill_count_ewma = Vec::new();
+    let mut venue_utility_mm_fillless_ack_pressure = Vec::new();
+    let mut venue_utility_spread_gate_hit_ewma = Vec::new();
+    let mut venue_pre_soft_taper_active = Vec::new();
+    let mut venue_pre_soft_taper_side = Vec::new();
+    let mut venue_pre_soft_taper_reason = Vec::new();
+    let mut venue_pre_soft_taper_size_multiplier = Vec::new();
 
     for (idx, venue) in state.venues.iter().enumerate() {
         venue_mid.push(venue.mid.unwrap_or(0.0));
         venue_spread.push(venue.spread.unwrap_or(0.0));
+        venue_quote_spread_gate_reason.push(quote_spread_gate_reason(
+            &cfg.mm,
+            &cfg.venues[idx].id,
+            venue.mid,
+            venue.spread,
+        ));
         venue_depth.push(venue.depth_near_mid);
         let age_apply = compute_age_ms(effective_now, venue.last_mid_apply_ms);
         let age_event = compute_age_ms(effective_now, venue.last_mid_update_ms);
@@ -1697,6 +2020,25 @@ fn build_venue_metrics(
         };
         venue_fill_rate.push(fill_rate);
         venue_markout_ewma.push(venue.markout_ewma_usd_per_tao);
+        let utility =
+            compute_venue_utility_decision(&cfg.mm, state.q_global_tao, &cfg.venues[idx], venue);
+        venue_utility_score.push(utility.score);
+        venue_utility_tier.push(utility.tier.as_str());
+        venue_utility_reason.push(utility.reason.as_str());
+        venue_utility_role.push(utility.role.as_str());
+        venue_utility_role_cap_applied.push(utility.role_cap_applied);
+        venue_utility_mm_ack_ewma.push(venue.utility.mm_ack_ewma);
+        venue_utility_mm_fill_count_ewma.push(venue.utility.mm_fill_count_ewma);
+        venue_utility_mm_fillless_ack_pressure.push(venue.utility.mm_fillless_ack_pressure);
+        venue_utility_spread_gate_hit_ewma.push(venue.utility.spread_gate_hit_ewma);
+        venue_pre_soft_taper_active.push(utility.pre_soft_taper_active);
+        venue_pre_soft_taper_side.push(match utility.pre_soft_taper_side {
+            Some(Side::Buy) => "buy",
+            Some(Side::Sell) => "sell",
+            None => "",
+        });
+        venue_pre_soft_taper_reason.push(utility.pre_soft_taper_reason.unwrap_or(""));
+        venue_pre_soft_taper_size_multiplier.push(utility.pre_soft_taper_size_multiplier);
     }
 
     vec![
@@ -1704,6 +2046,10 @@ fn build_venue_metrics(
         (
             "venue_spread_usd".to_string(),
             serde_json::json!(venue_spread),
+        ),
+        (
+            "venue_quote_spread_gate_reason".to_string(),
+            serde_json::json!(venue_quote_spread_gate_reason),
         ),
         (
             "venue_depth_near_mid_usd".to_string(),
@@ -1794,6 +2140,58 @@ fn build_venue_metrics(
         (
             "venue_markout_ewma_usd_per_tao".to_string(),
             serde_json::json!(venue_markout_ewma),
+        ),
+        (
+            "venue_utility_score".to_string(),
+            serde_json::json!(venue_utility_score),
+        ),
+        (
+            "venue_utility_tier".to_string(),
+            serde_json::json!(venue_utility_tier),
+        ),
+        (
+            "venue_utility_reason".to_string(),
+            serde_json::json!(venue_utility_reason),
+        ),
+        (
+            "venue_utility_role".to_string(),
+            serde_json::json!(venue_utility_role),
+        ),
+        (
+            "venue_utility_role_cap_applied".to_string(),
+            serde_json::json!(venue_utility_role_cap_applied),
+        ),
+        (
+            "venue_utility_mm_ack_ewma".to_string(),
+            serde_json::json!(venue_utility_mm_ack_ewma),
+        ),
+        (
+            "venue_utility_mm_fill_count_ewma".to_string(),
+            serde_json::json!(venue_utility_mm_fill_count_ewma),
+        ),
+        (
+            "venue_utility_mm_fillless_ack_pressure".to_string(),
+            serde_json::json!(venue_utility_mm_fillless_ack_pressure),
+        ),
+        (
+            "venue_utility_spread_gate_hit_ewma".to_string(),
+            serde_json::json!(venue_utility_spread_gate_hit_ewma),
+        ),
+        (
+            "venue_pre_soft_taper_active".to_string(),
+            serde_json::json!(venue_pre_soft_taper_active),
+        ),
+        (
+            "venue_pre_soft_taper_side".to_string(),
+            serde_json::json!(venue_pre_soft_taper_side),
+        ),
+        (
+            "venue_pre_soft_taper_reason".to_string(),
+            serde_json::json!(venue_pre_soft_taper_reason),
+        ),
+        (
+            "venue_pre_soft_taper_size_multiplier".to_string(),
+            serde_json::json!(venue_pre_soft_taper_size_multiplier),
         ),
     ]
 }
@@ -1888,6 +2286,29 @@ mod tests {
     }
 
     #[test]
+    fn venue_metrics_expose_spread_gate_reason() {
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        cfg.mm
+            .max_quote_spread_abs_usd_by_venue
+            .insert("extended".to_string(), 2.0);
+        state.venues[0].mid = Some(100.0);
+        state.venues[0].spread = Some(3.0);
+        state.venues[0].depth_near_mid = 10_000.0;
+        state.venues[0].last_mid_update_ms = Some(1_000);
+        state.venues[0].last_mid_apply_ms = Some(1_000);
+
+        let metrics = build_venue_metrics(&cfg, &state, 1_050, cfg.book.stale_ms);
+        let reasons = metrics
+            .iter()
+            .find(|(k, _)| k == "venue_quote_spread_gate_reason")
+            .and_then(|(_, v)| v.as_array())
+            .expect("venue_quote_spread_gate_reason");
+
+        assert_eq!(reasons[0].as_str(), Some("spread_abs_cap"));
+    }
+
+    #[test]
     fn healthy_venues_used_matches_statuses() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -1926,6 +2347,7 @@ mod tests {
             shadow_mode: true,
             execution_mode: "shadow",
             reconcile_drift: &[],
+            account_position_syncs: &[],
             max_orders_per_tick: 0,
         });
         let used = record
@@ -2108,5 +2530,287 @@ mod tests {
             Some("Stale"),
             "Venue 2 without override should be Stale at 1500ms age"
         );
+    }
+
+    #[test]
+    fn record_includes_account_position_syncs() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+        let syncs = vec![AccountPositionSyncRecord {
+            venue_index: 2,
+            venue_id: "aster".to_string(),
+            snapshot_seq: 7,
+            snapshot_timestamp_ms: Some(now_ms - 5),
+            ingest_now_ms: now_ms,
+            pre_position_tao: 0.0,
+            post_position_tao: -0.02,
+            position_delta_tao: -0.02,
+            pre_margin_available_usd: 85.0,
+            post_margin_available_usd: 84.0,
+            source: "account_snapshot",
+        }];
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "shadow",
+            reconcile_drift: &[],
+            account_position_syncs: &syncs,
+            max_orders_per_tick: 0,
+        });
+
+        let sync_count = record
+            .get("account_position_sync_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let sync_records = record
+            .get("account_position_syncs")
+            .and_then(|value| value.as_array())
+            .expect("account_position_syncs");
+        assert_eq!(sync_count, 1);
+        assert_eq!(sync_records.len(), 1);
+        assert_eq!(sync_records[0]["venue_id"], "aster");
+        assert_eq!(sync_records[0]["position_delta_tao"], -0.02);
+    }
+
+    #[test]
+    fn record_includes_venue_utility_fillless_ack_pressure() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .venue_role_by_venue
+            .insert(cfg.venues[1].id.clone(), crate::config::MmVenueRole::Anchor);
+        cfg.mm
+            .pre_soft_taper_global_position_tao_by_venue
+            .insert(cfg.venues[2].id.clone(), 0.01);
+        cfg.mm
+            .pre_soft_taper_size_multiplier_by_venue
+            .insert(cfg.venues[2].id.clone(), 0.5);
+        let mut state = GlobalState::new(&cfg);
+        state.q_global_tao = -0.02;
+        state.venues[1].utility.mm_fillless_ack_pressure = 4.25;
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms: 10_000,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "shadow",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 0,
+        });
+
+        let values = record
+            .get("venue_utility_mm_fillless_ack_pressure")
+            .and_then(|value| value.as_array())
+            .expect("venue_utility_mm_fillless_ack_pressure");
+        assert_eq!(values.len(), cfg.venues.len());
+        assert_eq!(values[1].as_f64(), Some(4.25));
+
+        let roles = record
+            .get("venue_utility_role")
+            .and_then(|value| value.as_array())
+            .expect("venue_utility_role");
+        assert_eq!(roles[1].as_str(), Some("anchor"));
+
+        let role_caps = record
+            .get("venue_utility_role_cap_applied")
+            .and_then(|value| value.as_array())
+            .expect("venue_utility_role_cap_applied");
+        assert_eq!(role_caps[1].as_bool(), Some(true));
+
+        let taper_active = record
+            .get("venue_pre_soft_taper_active")
+            .and_then(|value| value.as_array())
+            .expect("venue_pre_soft_taper_active");
+        assert_eq!(taper_active[2].as_bool(), Some(true));
+
+        let taper_side = record
+            .get("venue_pre_soft_taper_side")
+            .and_then(|value| value.as_array())
+            .expect("venue_pre_soft_taper_side");
+        assert_eq!(taper_side[2].as_str(), Some("sell"));
+
+        let taper_reason = record
+            .get("venue_pre_soft_taper_reason")
+            .and_then(|value| value.as_array())
+            .expect("venue_pre_soft_taper_reason");
+        assert_eq!(taper_reason[2].as_str(), Some("global_inventory"));
+    }
+
+    #[test]
+    fn record_marks_execution_visibility_gap_for_sync_without_fill() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+        let syncs = vec![AccountPositionSyncRecord {
+            venue_index: 4,
+            venue_id: "paradex".to_string(),
+            snapshot_seq: 11,
+            snapshot_timestamp_ms: Some(now_ms - 3),
+            ingest_now_ms: now_ms,
+            pre_position_tao: 0.0,
+            post_position_tao: -0.09,
+            position_delta_tao: -0.09,
+            pre_margin_available_usd: 70.0,
+            post_margin_available_usd: 69.0,
+            source: "account_snapshot",
+        }];
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 7,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: false,
+            execution_mode: "live",
+            reconcile_drift: &[],
+            account_position_syncs: &syncs,
+            max_orders_per_tick: 0,
+        });
+
+        assert_eq!(
+            record
+                .get("execution_visibility_gap")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            record
+                .get("execution_visibility_gap_reason")
+                .and_then(|value| value.as_str()),
+            Some("account_position_sync_without_fill")
+        );
+        let venues = record
+            .get("execution_visibility_gap_venues")
+            .and_then(|value| value.as_array())
+            .expect("execution_visibility_gap_venues");
+        assert_eq!(venues.len(), 1);
+        assert_eq!(venues[0].as_str(), Some("paradex"));
+    }
+
+    #[test]
+    fn quote_levels_report_global_fv_suppression() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "shadow",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 0,
+        });
+
+        let quote_levels = record
+            .get("quote_levels")
+            .and_then(|value| value.as_array())
+            .expect("quote_levels");
+        let first_quote = &quote_levels[0];
+        assert_eq!(first_quote["quote_state"], "suppressed");
+        assert_eq!(first_quote["suppression_reason"], "global_fv_unavailable");
+    }
+
+    #[test]
+    fn quote_levels_report_side_specific_edge_thresholds() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .edge_local_min_bid_by_venue
+            .insert("paradex".to_string(), 0.05);
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+        state.fair_value = Some(300.0);
+        state.fair_value_prev = 300.0;
+        state.fv_available = true;
+        state.sigma_eff = 0.1;
+        state.spread_mult = 1.0;
+        state.size_mult = 1.0;
+        state.vol_ratio_clipped = 1.0;
+        state.delta_limit_usd = 100_000.0;
+        state.q_global_tao = -10.0;
+
+        for venue in &mut state.venues {
+            venue.mid = Some(300.0);
+            venue.spread = Some(1.0);
+            venue.depth_near_mid = 10_000.0;
+            venue.margin_available_usd = 10_000.0;
+            venue.dist_liq_sigma = 10.0;
+            venue.status = VenueStatus::Healthy;
+            venue.toxicity = 0.0;
+            venue.last_mid_update_ms = Some(now_ms - 10);
+            venue.last_mid_apply_ms = Some(now_ms - 10);
+        }
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: false,
+            execution_mode: "live",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 0,
+        });
+
+        let quote_levels = record
+            .get("quote_levels")
+            .and_then(|value| value.as_array())
+            .expect("quote_levels");
+        let paradex_bid = quote_levels
+            .iter()
+            .find(|entry| entry["venue_id"] == "paradex" && entry["side"] == "Bid")
+            .expect("paradex bid quote level");
+        let paradex_ask = quote_levels
+            .iter()
+            .find(|entry| entry["venue_id"] == "paradex" && entry["side"] == "Ask")
+            .expect("paradex ask quote level");
+
+        assert_eq!(paradex_bid["edge_threshold"].as_f64(), Some(0.05));
+        assert_eq!(paradex_ask["edge_threshold"].as_f64(), Some(0.5));
     }
 }

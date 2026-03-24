@@ -44,6 +44,21 @@ PREVIOUS_LINK = "previous.env"
 STATE_FILE = "deploy_state.json"
 HISTORY_FILE = "deploy_history.jsonl"
 SERVICE_NAME = "paraphina_live"
+STAGE_OVERLAY_FILE = "stage_overlay.env"
+LEGACY_ENV_FILE = "paraphina_live.env"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_ROOT = Path("/opt/paraphina")
+RUNTIME_CONFIGS_DIR = RUNTIME_ROOT / "configs"
+CANARY_SNAPSHOT_DIR = "canary_profiles"
+LIVE_EXEC_DROPIN_PATH = Path(
+    f"/etc/systemd/system/{SERVICE_NAME}.service.d/live_exec_flag.conf"
+)
+LIVE_EXEC_DROPIN_CONTENT = """[Service]
+ExecStartPre=
+ExecStartPre=/opt/paraphina/paraphina_live --enable-live-execution --validate-config
+ExecStart=
+ExecStart=/opt/paraphina/paraphina_live --enable-live-execution
+"""
 
 
 # ===========================================================================
@@ -98,6 +113,17 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def shorten_snapshot_component(raw: str, max_len: int) -> str:
+    """Bound snapshot filename components so nested promotions stay under FS limits."""
+    if len(raw) <= max_len:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    keep = max_len - len(digest) - 1
+    if keep <= 0:
+        return digest[:max_len]
+    return f"{raw[:keep]}_{digest}"
 
 
 def git_commit_short() -> Optional[str]:
@@ -176,13 +202,271 @@ def validate_env_file(path: Path) -> bool:
     return True
 
 
-def restart_service(service: str = SERVICE_NAME, dry_run: bool = False) -> bool:
-    """Restart the systemd service. Returns True on success."""
+def sync_runtime_configs(dry_run: bool = False) -> bool:
+    """Copy repo-managed config files into the runtime tree under /opt/paraphina."""
+    source_dir = PROJECT_ROOT / "configs"
+    if not source_dir.exists():
+        print(f"[error] Runtime config source missing: {source_dir}", file=sys.stderr)
+        return False
+
+    if dry_run:
+        print(f"[dry-run] Would sync runtime configs: {source_dir} -> {RUNTIME_CONFIGS_DIR}")
+        return True
+
+    file_count = 0
+    try:
+        for src in source_dir.rglob("*"):
+            rel = src.relative_to(source_dir)
+            dest = RUNTIME_CONFIGS_DIR / rel
+            if src.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            file_count += 1
+    except OSError as err:
+        print(
+            f"[error] Failed to sync runtime configs into {RUNTIME_CONFIGS_DIR}: {err}",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"[ok] Synced runtime configs: {file_count} files -> {RUNTIME_CONFIGS_DIR}")
+    return True
+
+
+def strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def load_env_values(paths: List[Path]) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[7:].strip()
+            if "=" not in stripped:
+                continue
+            key, raw_value = stripped.split("=", 1)
+            values[key.strip()] = strip_wrapping_quotes(raw_value)
+    return values
+
+
+def resolve_canary_profile_source(raw_value: str, source_env: Path) -> Path:
+    """Resolve a canary profile reference from an env file to a concrete source file."""
+    value = strip_wrapping_quotes(raw_value)
+    if value == "prod_canary":
+        value = "configs/prod_canary.toml"
+
+    profile_path = Path(value)
+    candidates: List[Path] = []
+    if profile_path.is_absolute():
+        candidates.append(profile_path)
+    else:
+        candidates.append(PROJECT_ROOT / profile_path)
+        candidates.append(source_env.resolve().parent / profile_path)
+        candidates.append(Path.cwd() / profile_path)
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    raise FileNotFoundError(
+        f"unable to resolve canary profile '{raw_value}' from {source_env}"
+    )
+
+
+def rewrite_env_var(path: Path, key: str, value: str) -> None:
+    """Replace or append a KEY=VALUE assignment in a shell env file."""
+    lines = path.read_text().splitlines()
+    new_line = f"{key}={value}"
+    replaced = False
+    rewritten: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        candidate = stripped[7:].strip() if stripped.startswith("export ") else stripped
+        if candidate.startswith(f"{key}="):
+            rewritten.append(new_line)
+            replaced = True
+        else:
+            rewritten.append(line)
+
+    if not replaced:
+        rewritten.append(new_line)
+
+    path.write_text("\n".join(rewritten) + "\n")
+
+
+def materialize_canary_profile(
+    env_path: Path,
+    config_dir: Path,
+    source_env: Path,
+    dry_run: bool = False,
+) -> Optional[Path]:
+    """Snapshot the referenced canary profile and rewrite the env to an absolute path."""
+    env_values = load_env_values([env_path])
+    raw_profile = env_values.get("PARAPHINA_LIVE_CANARY_PROFILE")
+    if not raw_profile:
+        return None
+
+    source_profile = resolve_canary_profile_source(raw_profile, source_env)
+    source_sha = sha256_file(source_profile)
+    snapshot_name = (
+        f"{shorten_snapshot_component(env_path.stem, 72)}__"
+        f"{shorten_snapshot_component(source_profile.stem, 48)}_"
+        f"{source_sha[:12]}{source_profile.suffix}"
+    )
+    snapshot_dir = config_dir / CANARY_SNAPSHOT_DIR
+    snapshot_path = snapshot_dir / snapshot_name
+
+    if dry_run:
+        print(f"[dry-run] Would snapshot canary profile: {source_profile} -> {snapshot_path}")
+        print(
+            f"[dry-run] Would rewrite {env_path.name}: "
+            f"PARAPHINA_LIVE_CANARY_PROFILE={snapshot_path}"
+        )
+        return snapshot_path
+
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_profile, snapshot_path)
+    rewrite_env_var(
+        env_path,
+        "PARAPHINA_LIVE_CANARY_PROFILE",
+        str(snapshot_path),
+    )
+    print(f"[ok] Snapshotted canary profile: {snapshot_path}")
+    print(f"     Source: {source_profile}")
+    print(f"     SHA-256: {source_sha}")
+    return snapshot_path
+
+
+def env_truthy(value: Optional[str]) -> bool:
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def live_exec_requested(config_dir: Path) -> bool:
+    env = load_env_values(
+        [
+            config_dir / CURRENT_LINK,
+            config_dir / LEGACY_ENV_FILE,
+            config_dir / STAGE_OVERLAY_FILE,
+        ]
+    )
+    trade_mode = env.get("PARAPHINA_TRADE_MODE", "").strip().lower()
+    confirm = env.get("PARAPHINA_LIVE_EXECUTION_CONFIRM", "").strip().upper()
+    return (
+        trade_mode == "live"
+        and env_truthy(env.get("PARAPHINA_LIVE_EXEC_ENABLE"))
+        and confirm == "YES"
+    )
+
+
+def sync_live_exec_dropin(config_dir: Path, dry_run: bool = False) -> bool:
+    should_enable = live_exec_requested(config_dir)
+    changed = False
+
+    if should_enable:
+        if dry_run:
+            print(f"[dry-run] Would ensure live-exec drop-in: {LIVE_EXEC_DROPIN_PATH}")
+        else:
+            LIVE_EXEC_DROPIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            current = (
+                LIVE_EXEC_DROPIN_PATH.read_text()
+                if LIVE_EXEC_DROPIN_PATH.exists()
+                else None
+            )
+            if current != LIVE_EXEC_DROPIN_CONTENT:
+                LIVE_EXEC_DROPIN_PATH.write_text(LIVE_EXEC_DROPIN_CONTENT)
+                changed = True
+    elif LIVE_EXEC_DROPIN_PATH.exists():
+        if dry_run:
+            print(f"[dry-run] Would remove stale live-exec drop-in: {LIVE_EXEC_DROPIN_PATH}")
+        else:
+            LIVE_EXEC_DROPIN_PATH.unlink()
+            changed = True
+
+    if dry_run or not changed:
+        return True
+
+    cmd = ["sudo", "systemctl", "daemon-reload"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            print(
+                f"[error] systemd daemon-reload failed: {result.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"[error] systemd daemon-reload timed out", file=sys.stderr)
+        return False
+    except FileNotFoundError:
+        print(f"[error] systemctl not found — are you on a systemd host?", file=sys.stderr)
+        return False
+    return True
+
+
+def write_stage_overlay(
+    config_dir: Path,
+    trade_mode: str,
+    canary_mode: bool = False,
+    env_overrides: Optional[Dict[str, str]] = None,
+) -> None:
+    """Write a stage overlay file for the next service restart."""
+    overlay_path = config_dir / STAGE_OVERLAY_FILE
+    lines = [f"PARAPHINA_TRADE_MODE={trade_mode}"]
+    lines.append(f"PARAPHINA_CANARY_MODE={1 if canary_mode else 0}")
+    if env_overrides:
+        for key, value in sorted(env_overrides.items()):
+            lines.append(f"{key}={value}")
+    overlay_path.write_text("\n".join(lines) + "\n")
+
+
+def restart_service(
+    service: str = SERVICE_NAME,
+    config_dir: Path = DEFAULT_CONFIG_DIR,
+    dry_run: bool = False,
+    trade_mode_override: Optional[str] = None,
+    canary_mode: bool = False,
+    env_overrides: Optional[Dict[str, str]] = None,
+) -> bool:
+    """Restart the systemd service, optionally with stage overrides."""
+    overlay_path = config_dir / STAGE_OVERLAY_FILE
     cmd = ["sudo", "systemctl", "restart", service]
     if dry_run:
+        if trade_mode_override is not None:
+            print(f"[dry-run] Would write stage overlay: {overlay_path}")
+            print(f"[dry-run]   PARAPHINA_TRADE_MODE={trade_mode_override}")
+            print(f"[dry-run]   PARAPHINA_CANARY_MODE={1 if canary_mode else 0}")
+            if env_overrides:
+                for key, value in sorted(env_overrides.items()):
+                    print(f"[dry-run]   {key}={value}")
+        elif overlay_path.exists():
+            print(f"[dry-run] Would remove stale overlay: {overlay_path}")
+        sync_live_exec_dropin(config_dir=config_dir, dry_run=True)
         print(f"[dry-run] Would execute: {' '.join(cmd)}")
         return True
     try:
+        if trade_mode_override is not None:
+            write_stage_overlay(
+                config_dir=config_dir,
+                trade_mode=trade_mode_override,
+                canary_mode=canary_mode,
+                env_overrides=env_overrides,
+            )
+        elif overlay_path.exists():
+            overlay_path.unlink()
+        if not sync_live_exec_dropin(config_dir=config_dir, dry_run=dry_run):
+            return False
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             print(f"[error] Service restart failed: {result.stderr.strip()}", file=sys.stderr)
@@ -287,6 +571,13 @@ def cmd_activate(args: argparse.Namespace) -> int:
     dest_name = f"promoted_{ts}_{promoted_env.stem}.env"
     dest = config_dir / dest_name
     shutil.copy2(promoted_env, dest)
+    if not sync_runtime_configs(dry_run=dry_run):
+        return 1
+    try:
+        materialize_canary_profile(dest, config_dir, promoted_env, dry_run=dry_run)
+    except FileNotFoundError as err:
+        print(f"[error] {err}", file=sys.stderr)
+        return 1
     new_sha = sha256_file(dest)
 
     # Rotate symlinks: previous -> old current, current -> new
@@ -335,7 +626,21 @@ def cmd_activate(args: argparse.Namespace) -> int:
 
     if getattr(args, "restart", False):
         print(f"[info] Restarting {SERVICE_NAME}...")
-        if not restart_service(dry_run=dry_run):
+        stage_trade_mode = "live" if stage in {"canary", "live"} else stage
+        stage_canary_mode = stage == "canary"
+        stage_env_overrides = None
+        if stage in {"canary", "live"}:
+            stage_env_overrides = {
+                "PARAPHINA_LIVE_EXEC_ENABLE": "1",
+                "PARAPHINA_LIVE_EXECUTION_CONFIRM": "YES",
+            }
+        if not restart_service(
+            config_dir=config_dir,
+            dry_run=dry_run,
+            trade_mode_override=stage_trade_mode,
+            canary_mode=stage_canary_mode,
+            env_overrides=stage_env_overrides,
+        ):
             return 1
 
     return 0
@@ -369,6 +674,9 @@ def cmd_rollback(args: argparse.Namespace) -> int:
         print(f"[error] Previous config file missing: {prev_file}", file=sys.stderr)
         return 1
 
+    if not sync_runtime_configs(dry_run=dry_run):
+        return 1
+
     # Verify integrity
     actual_sha = sha256_file(prev_file)
     if state.previous_config_sha256 and actual_sha != state.previous_config_sha256:
@@ -400,7 +708,8 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     state.active_config_sha256 = state.previous_config_sha256
     state.previous_config = rolled_back_from
     state.previous_config_sha256 = rolled_back_from_sha
-    state.current_stage = "live"  # rollback restores to full live (known-good)
+    rollback_stage = "live" if live_exec_requested(config_dir) else "shadow"
+    state.current_stage = rollback_stage
     state.rollback_count += 1
     state.last_rollback_timestamp = now_iso()
     state.last_rollback_reason = reason
@@ -421,10 +730,20 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     print(f"[ok] Rolled back to: {state.active_config}")
     print(f"     Rolled back from: {rolled_back_from}")
     print(f"     Reason: {reason}")
+    if rollback_stage != "live":
+        print(
+            "     Restart stage: shadow "
+            "(restored env is not live-exec-enabled)"
+        )
 
     if not getattr(args, "no_restart", False):
         print(f"[info] Restarting {SERVICE_NAME}...")
-        if not restart_service(dry_run=dry_run):
+        restart_trade_mode = None if rollback_stage == "live" else rollback_stage
+        if not restart_service(
+            config_dir=config_dir,
+            dry_run=dry_run,
+            trade_mode_override=restart_trade_mode,
+        ):
             return 1
 
     return 0

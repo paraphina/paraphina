@@ -31,6 +31,20 @@ fn env_risk_profile_is_honored_by_from_env_or_default() {
 }
 
 #[test]
+fn mm_edge_local_min_env_override_is_honored() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+
+    std::env::remove_var("PARAPHINA_MM_EDGE_LOCAL_MIN");
+    std::env::set_var("PARAPHINA_MM_EDGE_LOCAL_MIN", "0.0");
+
+    let cfg = Config::from_env_or_default();
+
+    assert_eq!(cfg.mm.edge_local_min, 0.0);
+
+    std::env::remove_var("PARAPHINA_MM_EDGE_LOCAL_MIN");
+}
+
+#[test]
 fn unknown_env_risk_profile_falls_back_to_balanced() {
     let _guard = ENV_MUTEX.lock().unwrap();
 

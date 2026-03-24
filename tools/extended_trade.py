@@ -2,7 +2,7 @@
 """SDK-backed bridge for Extended account/execution actions.
 
 The Rust connector invokes this helper via:
-  PARAPHINA_EXTENDED_BRIDGE_OP=<snapshot|place|cancel|cancel_all>
+  PARAPHINA_EXTENDED_BRIDGE_OP=<snapshot|open_orders|place|cancel|cancel_all>
   PARAPHINA_EXTENDED_BRIDGE_PAYLOAD='{"...": "..."}'
 
 It can also be run manually with CLI subcommands for debugging.
@@ -203,6 +203,42 @@ async def op_cancel_all(payload: dict[str, Any]) -> dict[str, Any]:
         await client.close()
 
 
+async def op_open_orders(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    market = str(require_payload(payload, "market")).strip()
+    client = await build_client()
+    try:
+        open_orders_resp = await client.account.get_open_orders(
+            market_names=[market] if market else None
+        )
+        open_orders = list(open_orders_resp.data or [])
+        normalized: list[dict[str, Any]] = []
+        for order in open_orders:
+            side_raw = str(getattr(order, "side", "")).upper()
+            side = "BUY" if "BUY" in side_raw else "SELL" if "SELL" in side_raw else None
+            if side is None:
+                continue
+            remaining = (
+                getattr(order, "remaining_size", None)
+                or getattr(order, "amount_of_synthetic", None)
+                or getattr(order, "size", None)
+            )
+            normalized.append(
+                {
+                    "order_id": str(getattr(order, "id")),
+                    "client_order_id": getattr(order, "external_id", None),
+                    "side": side,
+                    "price": to_float(
+                        getattr(order, "price", None)
+                        or getattr(order, "limit_price", None)
+                    ),
+                    "size": to_float(remaining),
+                }
+            )
+        return normalized
+    finally:
+        await client.close()
+
+
 def parse_payload() -> tuple[str, dict[str, Any]]:
     op = os.getenv("PARAPHINA_EXTENDED_BRIDGE_OP", "").strip()
     payload_raw = os.getenv("PARAPHINA_EXTENDED_BRIDGE_PAYLOAD", "").strip()
@@ -220,6 +256,9 @@ def parse_payload() -> tuple[str, dict[str, Any]]:
 
     snapshot = sub.add_parser("snapshot", help="fetch normalized account snapshot")
     snapshot.add_argument("--market", required=True)
+
+    open_orders = sub.add_parser("open_orders", help="fetch normalized open orders")
+    open_orders.add_argument("--market", required=True)
 
     place = sub.add_parser("place", help="place a limit order")
     place.add_argument("--market", required=True)
@@ -263,6 +302,7 @@ async def main_async() -> None:
     op, payload = parse_payload()
     handlers = {
         "snapshot": op_snapshot,
+        "open_orders": op_open_orders,
         "place": op_place,
         "cancel": op_cancel,
         "cancel_all": op_cancel_all,

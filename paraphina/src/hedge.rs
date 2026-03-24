@@ -327,6 +327,7 @@ pub struct HedgeAllocation {
     pub side: Side,
     pub size: f64,
     pub est_price: f64,
+    pub reduce_only: bool,
 }
 
 /// Global hedge decision for this tick.
@@ -575,7 +576,7 @@ pub fn compute_hedge_plan(
     }
 
     // 8) Convert to final allocations with lot-size rounding.
-    let allocations = finalize_allocations(cfg, &candidates, venue_allocations);
+    let allocations = finalize_allocations(cfg, state, &candidates, venue_allocations);
 
     if allocations.is_empty() {
         return None;
@@ -836,6 +837,7 @@ fn build_all_chunk_candidates(
 /// Convert venue allocations to final HedgeAllocations with lot-size rounding.
 fn finalize_allocations(
     cfg: &Config,
+    state: &GlobalState,
     candidates: &[HedgeCandidate],
     venue_allocations: Vec<(usize, f64, f64, Side)>,
 ) -> Vec<HedgeAllocation> {
@@ -861,6 +863,17 @@ fn finalize_allocations(
             continue;
         }
 
+        let dq = match side {
+            Side::Buy => rounded,
+            Side::Sell => -rounded,
+        };
+        let current_position = state
+            .venues
+            .get(venue_index)
+            .map(|venue| venue.position_tao)
+            .unwrap_or(0.0);
+        let reduce_only = !increases_abs_exposure(current_position, dq);
+
         // Find venue_id from candidates
         let venue_id = candidates
             .iter()
@@ -874,6 +887,7 @@ fn finalize_allocations(
             side,
             size: rounded,
             est_price: guard_price,
+            reduce_only,
         });
     }
 
@@ -907,7 +921,7 @@ pub fn hedge_plan_to_order_intents_into(plan: &HedgePlan, out: &mut Vec<OrderInt
             purpose: OrderPurpose::Hedge,
             time_in_force: TimeInForce::Ioc,
             post_only: false,
-            reduce_only: true,
+            reduce_only: alloc.reduce_only,
             client_order_id: None,
         }));
     }
@@ -957,7 +971,7 @@ pub fn compute_hedge_orders_into(
                 purpose: OrderPurpose::Hedge,
                 time_in_force: TimeInForce::Ioc,
                 post_only: false,
-                reduce_only: true,
+                reduce_only: alloc.reduce_only,
                 client_order_id: None,
             }));
         }
@@ -1000,6 +1014,61 @@ mod tests {
         // Zero position, any trade increases
         assert!(increases_abs_exposure(0.0, 5.0));
         assert!(increases_abs_exposure(0.0, -5.0));
+    }
+
+    #[test]
+    fn test_finalize_allocations_marks_reducing_hedges_reduce_only() {
+        let mut cfg = Config::default();
+        cfg.venues[0].lot_size_tao = 0.01;
+        cfg.venues[0].size_step_tao = 0.01;
+        cfg.venues[0].min_notional_usd = 0.0;
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].position_tao = 0.50;
+        let candidates = vec![HedgeCandidate {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            price: 100.0,
+            max_size: 1.0,
+            total_cost: 0.0,
+            margin_capped_size: 1.0,
+        }];
+
+        let allocations = finalize_allocations(
+            &cfg,
+            &state,
+            &candidates,
+            vec![(0, 0.20, 100.0, Side::Sell)],
+        );
+
+        assert_eq!(allocations.len(), 1);
+        assert!(allocations[0].reduce_only);
+    }
+
+    #[test]
+    fn test_finalize_allocations_allows_opening_hedges_on_flat_venue() {
+        let mut cfg = Config::default();
+        cfg.venues[0].lot_size_tao = 0.01;
+        cfg.venues[0].size_step_tao = 0.01;
+        cfg.venues[0].min_notional_usd = 0.0;
+        let state = GlobalState::new(&cfg);
+        let candidates = vec![HedgeCandidate {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            price: 100.0,
+            max_size: 1.0,
+            total_cost: 0.0,
+            margin_capped_size: 1.0,
+        }];
+
+        let allocations = finalize_allocations(
+            &cfg,
+            &state,
+            &candidates,
+            vec![(0, 0.20, 100.0, Side::Sell)],
+        );
+
+        assert_eq!(allocations.len(), 1);
+        assert!(!allocations[0].reduce_only);
     }
 
     #[test]

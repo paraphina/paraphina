@@ -111,12 +111,14 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
     let vol_tox_scale = tox_cfg.vol_tox_scale;
     let tox_high_threshold = tox_cfg.tox_high_threshold;
     let tox_med_threshold = tox_cfg.tox_med_threshold;
+    let healthy_cap_without_markouts = (tox_med_threshold - 1e-6).max(0.0);
     let sigma_min = vol_cfg.sigma_min;
 
     // Keep sigma_eff away from zero so ratios are well-defined.
     let sigma_eff: f64 = state.sigma_eff.max(sigma_min);
 
     for venue in state.venues.iter_mut() {
+        let mut forced_book_failure = false;
         // --- 1) Process pending markouts in a single pass ---
         // Opt17: Use cached next_eval_ms to skip deque access when no markouts are ready.
         if venue.pending_markouts_next_eval_ms <= now_ms {
@@ -193,12 +195,22 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
                 .map_or(i64::MAX, |pm| pm.t_eval_ms);
         }
 
-        // --- 2) Shadow-mode warmup override ---
-        if shadow_mode
-            && venue.last_mid_update_ms.is_some()
+        let has_valid_book = venue.last_mid_update_ms.is_some()
             && venue.mid.unwrap_or(0.0) > 0.0
-            && venue.depth_near_mid > 0.0
-        {
+            && venue.depth_near_mid > 0.0;
+        let has_evaluated_markouts = venue
+            .recent_fills
+            .iter()
+            .any(|fill| fill.markout_pnl_short.is_some());
+        let no_markout_history = !has_evaluated_markouts;
+
+        // --- 2) Warmup override ---
+        // Shadow/paper always clear startup toxicity once a usable book arrives.
+        // Live/testnet need the same recovery until evaluated markout history exists; otherwise
+        // the first no-book tick latches toxicity=1.0 and venues stay Disabled forever.
+        if shadow_mode && has_valid_book {
+            venue.toxicity = 0.0;
+        } else if has_valid_book && no_markout_history {
             venue.toxicity = 0.0;
         }
 
@@ -214,6 +226,7 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
             if let Some(last_ms) = venue.last_mid_update_ms {
                 if now_ms.saturating_sub(last_ms) > catastrophic_stale_ms {
                     venue.toxicity = 1.0;
+                    forced_book_failure = true;
                 }
             }
             // Note: if last_mid_update_ms is None, the existing
@@ -230,9 +243,11 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
                     now_ms.saturating_sub(last_ms) > cfg.toxicity.depth_fallback_grace_ms
                 })
                 .unwrap_or(true);
+        let tox_before_vol_floor = venue.toxicity;
         if venue.mid.is_none() || depth_zero_prolonged {
             // No valid book data -> treat as highly toxic
             venue.toxicity = 1.0;
+            forced_book_failure = true;
         } else if !shadow_mode && vol_tox_scale > 0.0 && sigma_eff > 0.0 {
             // Optionally blend in volatility-based feature for extra signal
             // (only if local vol is significantly elevated)
@@ -252,6 +267,15 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
             // Take max of current toxicity and vol-based feature
             // This provides a floor when markout data is sparse
             venue.toxicity = venue.toxicity.max(f_vol);
+        }
+
+        // Volatility is still useful as a diagnostic and soft signal, but a
+        // venue with a valid book should not become operationally unhealthy
+        // from the volatility floor alone. Preserve any pre-existing markout
+        // toxicity, but cap the incremental vol-floor contribution below the
+        // warning threshold. Broken-book paths above still force toxicity=1.
+        if has_valid_book && !forced_book_failure && venue.toxicity > tox_before_vol_floor {
+            venue.toxicity = tox_before_vol_floor.max(healthy_cap_without_markouts);
         }
 
         // --- 4) Clamp final toxicity to [0, 1] ---
@@ -277,8 +301,8 @@ fn update_toxicity_and_health_impl<const DISABLE_TOX_GATE: bool>(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::state::PendingMarkout;
-    use crate::types::Side;
+    use crate::state::{FillRecord, PendingMarkout};
+    use crate::types::{OrderPurpose, Side};
     use std::sync::Mutex;
 
     fn make_test_config() -> Config {
@@ -820,6 +844,26 @@ mod tests {
         std::env::remove_var("PARAPHINA_TRADE_MODE");
     }
 
+    #[test]
+    fn live_mode_startup_warmup_clears_toxicity_before_first_fill() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_TRADE_MODE", "live");
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(1.0);
+        venue.depth_near_mid = 500.0;
+        venue.last_mid_update_ms = Some(1_000);
+        venue.toxicity = 1.0;
+
+        update_toxicity_and_health(&mut state, &cfg, 1_000);
+
+        assert_eq!(state.venues[0].toxicity, 0.0);
+        assert!(matches!(state.venues[0].status, VenueStatus::Healthy));
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+    }
+
     // ---- P3: Catastrophic staleness tests ----
 
     #[test]
@@ -955,5 +999,122 @@ mod tests {
         );
 
         std::env::remove_var("PARAPHINA_TRADE_MODE");
+    }
+
+    #[test]
+    fn pure_vol_without_markouts_stays_below_warning_threshold() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+        state.sigma_eff = 1e-6;
+
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10_000.0;
+        venue.last_mid_update_ms = Some(1_000);
+        venue.local_vol_short = 1e-2;
+        venue.local_vol_long = 1e-2;
+
+        update_toxicity_and_health(&mut state, &cfg, 1_000);
+
+        assert!(
+            state.venues[0].toxicity < cfg.toxicity.tox_med_threshold,
+            "pure vol without markouts should stay below warning, got {}",
+            state.venues[0].toxicity
+        );
+        assert_eq!(state.venues[0].status, VenueStatus::Healthy);
+    }
+
+    #[test]
+    fn existing_markout_toxicity_is_not_capped_by_vol_guard() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+        state.sigma_eff = 1e-6;
+
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10_000.0;
+        venue.last_mid_update_ms = Some(1_000);
+        venue.local_vol_short = 1e-2;
+        venue.local_vol_long = 1e-2;
+        venue.toxicity = 0.85;
+        venue.recent_fills.push_back(FillRecord {
+            fill_seq: 1,
+            order_id: Some("oid_1".to_string()),
+            client_order_id: Some("co_1".to_string()),
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.01,
+            fill_time_ms: 500,
+            purpose: OrderPurpose::Mm,
+            fee_bps: 0.0,
+            markout_pnl_short: Some(-0.25),
+            pre_position_tao: None,
+            post_position_tao: None,
+            pre_q_global_tao: None,
+            post_q_global_tao: None,
+            realised_pnl_usd: None,
+        });
+
+        update_toxicity_and_health(&mut state, &cfg, 1_000);
+
+        assert!(
+            state.venues[0].toxicity >= cfg.toxicity.tox_high_threshold,
+            "existing markout toxicity should remain above the high threshold, got {}",
+            state.venues[0].toxicity
+        );
+        assert_eq!(state.venues[0].status, VenueStatus::Disabled);
+    }
+
+    #[test]
+    fn vol_floor_with_evaluated_markouts_stays_below_warning_without_markout_toxicity() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PARAPHINA_TRADE_MODE");
+
+        let cfg = make_test_config();
+        let mut state = GlobalState::new(&cfg);
+        state.sigma_eff = 1e-6;
+
+        let venue = &mut state.venues[0];
+        venue.mid = Some(100.0);
+        venue.spread = Some(0.1);
+        venue.depth_near_mid = 10_000.0;
+        venue.last_mid_update_ms = Some(1_000);
+        venue.local_vol_short = 1e-2;
+        venue.local_vol_long = 1e-2;
+        venue.toxicity = 0.1;
+        venue.recent_fills.push_back(FillRecord {
+            fill_seq: 1,
+            order_id: Some("oid_1".to_string()),
+            client_order_id: Some("co_1".to_string()),
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.01,
+            fill_time_ms: 500,
+            purpose: OrderPurpose::Mm,
+            fee_bps: 0.0,
+            markout_pnl_short: Some(0.05),
+            pre_position_tao: None,
+            post_position_tao: None,
+            pre_q_global_tao: None,
+            post_q_global_tao: None,
+            realised_pnl_usd: None,
+        });
+
+        update_toxicity_and_health(&mut state, &cfg, 1_000);
+
+        assert!(
+            state.venues[0].toxicity < cfg.toxicity.tox_med_threshold,
+            "vol floor should stay below warning when markout toxicity is low, got {}",
+            state.venues[0].toxicity
+        );
+        assert_eq!(state.venues[0].status, VenueStatus::Healthy);
     }
 }

@@ -97,7 +97,8 @@ fn maybe_log_rest_audit(
     if !enabled {
         return;
     }
-    let should_log = stats.rest_check_count <= 3 || now_ms.saturating_sub(stats.last_log_ms) >= 30_000;
+    let should_log =
+        stats.rest_check_count <= 3 || now_ms.saturating_sub(stats.last_log_ms) >= 30_000;
     if !should_log {
         return;
     }

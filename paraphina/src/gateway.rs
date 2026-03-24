@@ -92,6 +92,8 @@ impl ExecutionGateway for SimGateway {
                             order_id: Some(order_id),
                             client_order_id: pi.client_order_id.clone(),
                             seq: None,
+                            purpose: Some(pi.purpose),
+                            reduce_only: Some(pi.reduce_only),
                             reason: "Invalid price/size".to_string(),
                         }));
                         continue;
@@ -165,6 +167,8 @@ impl ExecutionGateway for SimGateway {
                             order_id: Some(new_order_id),
                             client_order_id: ri.client_order_id.clone(),
                             seq: None,
+                            purpose: Some(ri.purpose),
+                            reduce_only: Some(ri.reduce_only),
                             reason: "Invalid price/size".to_string(),
                         }));
                         continue;

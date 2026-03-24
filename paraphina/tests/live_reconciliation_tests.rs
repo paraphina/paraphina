@@ -110,8 +110,10 @@ mod tests {
                         venue_index: rej.venue_index,
                         venue_id: rej.venue_id.as_str().into(),
                         order_id: rej.order_id.clone(),
-                        client_order_id: None,
+                        client_order_id: rej.client_order_id.clone(),
                         seq: Some(rej.seq),
+                        purpose: rej.purpose,
+                        reduce_only: rej.reduce_only,
                         reason: rej.reason.clone(),
                     }));
                 }
@@ -149,6 +151,8 @@ mod tests {
                         order_id: rej.order_id.clone(),
                         client_order_id: None,
                         seq: Some(rej.seq),
+                        purpose: None,
+                        reduce_only: None,
                         reason: rej.reason.clone(),
                     }));
                 }

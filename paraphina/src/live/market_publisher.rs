@@ -30,12 +30,7 @@ fn now_ms() -> u64 {
 fn update_max(cell: &AtomicU64, candidate: u64) {
     let mut current = cell.load(Ordering::Relaxed);
     while candidate > current {
-        match cell.compare_exchange_weak(
-            current,
-            candidate,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match cell.compare_exchange_weak(current, candidate, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(actual) => current = actual,
         }
@@ -128,12 +123,7 @@ impl MarketPublisherAudit {
             }
             if self
                 .last_emit_ms
-                .compare_exchange_weak(
-                    last_emit_ms,
-                    now,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(last_emit_ms, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 let queued_hiwater = self

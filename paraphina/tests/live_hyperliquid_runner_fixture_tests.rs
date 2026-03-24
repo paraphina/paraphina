@@ -120,7 +120,9 @@ async fn live_runner_consumes_hyperliquid_fixtures() {
             } = req;
             let events = shadow.handle_intents(intents, action_batch.tick_index, now_ms);
             match response {
-                paraphina::live::ResponseMode::Oneshot(tx) => { let _ = tx.send(events); }
+                paraphina::live::ResponseMode::Oneshot(tx) => {
+                    let _ = tx.send(events);
+                }
                 paraphina::live::ResponseMode::FireAndForget => {}
             }
         }
@@ -138,6 +140,7 @@ async fn live_runner_consumes_hyperliquid_fixtures() {
             account_rx,
             exec_rx: Some(exec_rx),
             account_reconcile_tx: None,
+            priority_order_tx: order_tx.clone(),
             order_tx,
             order_snapshot_rx: Some(order_snapshot_rx),
             shared_venue_ages: None,

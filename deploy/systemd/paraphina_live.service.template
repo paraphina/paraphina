@@ -22,6 +22,10 @@ EnvironmentFile=-/etc/paraphina/stage_overlay.env
 
 # Pre-start validation: load config, construct Engine + GlobalState,
 # run one synthetic tick. Prevents starting with a pathological config.
+#
+# Live execution is injected only for canary/live stages via the managed
+# `live_exec_flag.conf` drop-in. That keeps shadow/paper and rollback restarts
+# from flapping when the live guardrail env vars are intentionally disabled.
 ExecStartPre=/opt/paraphina/paraphina_live --validate-config
 
 ExecStart=/opt/paraphina/paraphina_live

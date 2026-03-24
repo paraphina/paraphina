@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-telemetry_analyzer.py — Comprehensive 15-dimension telemetry analysis for paraphina shadow runs.
+telemetry_analyzer.py — Comprehensive 15-dimension telemetry analysis.
 
 Streaming single-pass architecture: reads JSONL line-by-line, accumulates statistics
-via online algorithms, and outputs a structured text report.
+via online algorithms, and outputs a structured text report. It also supports
+preserved canary artifacts whose telemetry may contain multiple concatenated JSON
+objects on a single physical line.
 
 Usage:
     python3 tools/telemetry_analyzer.py --telemetry /tmp/shadow_eth_post_fix/telemetry.jsonl
     python3 tools/telemetry_analyzer.py --telemetry /path/to/telemetry.jsonl --max-ticks 10000
     python3 tools/telemetry_analyzer.py --telemetry /path/to/telemetry.jsonl --checkpoint-json out/cp_10k.json
+    python3 tools/telemetry_analyzer.py --telemetry /path/to/telemetry.jsonl --execution-mode live
+    python3 tools/telemetry_analyzer.py --telemetry /var/lib/paraphina/out/telemetry.jsonl --execution-mode live --last-segment --tail-bytes 134217728
 
 stdlib only — no external dependencies.
 """
@@ -31,6 +35,9 @@ from typing import Any, TextIO
 VENUE_NAMES = ["extended", "hyperliquid", "aster", "lighter", "paradex"]
 NUM_VENUES = 5
 WINDOW_SIZE = 10_000  # ticks per trend window
+DEFAULT_SAFE_TAIL_BYTES = 128 * 1024 * 1024
+SAFE_PRODUCTION_SCAN_LIMIT_BYTES = 256 * 1024 * 1024
+PRODUCTION_ROLLING_TELEMETRY = Path("/var/lib/paraphina/out/telemetry.jsonl")
 
 # Staleness thresholds (from config)
 STALE_MS = {
@@ -86,6 +93,124 @@ def ts_str(ms: int | None) -> str:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%H:%M:%S")
 
 
+def ts_iso(ms: int | None) -> str:
+    if ms is None:
+        return "n/a"
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat()
+
+
+def iter_json_objects(path: Path) -> Any:
+    """Yield dict records from JSONL, tolerating concatenated objects per line."""
+    decoder = json.JSONDecoder()
+    with path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            while line:
+                try:
+                    record, idx = decoder.raw_decode(line)
+                except json.JSONDecodeError:
+                    break
+                if isinstance(record, dict):
+                    yield record
+                line = line[idx:].lstrip()
+
+
+def iter_json_objects_from_tail(path: Path, tail_bytes: int) -> Any:
+    """Yield dict records from the last tail_bytes of a JSONL file.
+
+    This mode is intentionally approximate and meant for production-safe triage on
+    very large rolling telemetry files. If the starting offset lands mid-line, the
+    first partial physical line is discarded before parsing.
+    """
+    if tail_bytes <= 0:
+        yield from iter_json_objects(path)
+        return
+
+    decoder = json.JSONDecoder()
+    with path.open("rb") as raw_fh:
+        raw_fh.seek(0, 2)
+        file_size = raw_fh.tell()
+        start = max(file_size - tail_bytes, 0)
+        raw_fh.seek(start)
+        if start > 0:
+            raw_fh.readline()
+        chunk = raw_fh.read().decode("utf-8", errors="ignore")
+
+    for raw_line in chunk.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        while line:
+            try:
+                record, idx = decoder.raw_decode(line)
+            except json.JSONDecodeError:
+                break
+            if isinstance(record, dict):
+                yield record
+            line = line[idx:].lstrip()
+
+
+def last_execution_segment(path: Path, execution_mode: str) -> list[dict[str, Any]]:
+    """Return the last contiguous segment for a given execution_mode."""
+    last: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for record in iter_json_objects(path):
+        if record.get("execution_mode") == execution_mode:
+            current.append(record)
+        elif current:
+            last = current
+            current = []
+    if current:
+        last = current
+    return last
+
+
+def last_execution_segment_from_iter(records: Any, execution_mode: str) -> list[dict[str, Any]]:
+    """Return the last contiguous execution_mode segment from an arbitrary iterator."""
+    last: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("execution_mode") == execution_mode:
+            current.append(record)
+        elif current:
+            last = current
+            current = []
+    if current:
+        last = current
+    return last
+
+
+def guard_unsafe_live_scan(path: Path, tail_bytes: int, unsafe_allow_large_live_file: bool) -> None:
+    """Refuse dangerous full scans of the rolling production telemetry file by default."""
+    try:
+        resolved = path.resolve()
+        size_bytes = path.stat().st_size
+    except OSError:
+        return
+
+    if resolved != PRODUCTION_ROLLING_TELEMETRY:
+        return
+    if unsafe_allow_large_live_file:
+        return
+    if tail_bytes > 0:
+        return
+    if size_bytes <= SAFE_PRODUCTION_SCAN_LIMIT_BYTES:
+        return
+
+    mib = size_bytes / (1024 * 1024)
+    limit_mib = SAFE_PRODUCTION_SCAN_LIMIT_BYTES / (1024 * 1024)
+    suggested_tail = DEFAULT_SAFE_TAIL_BYTES
+    raise ValueError(
+        "refusing full scan of rolling production telemetry "
+        f"({mib:.1f} MiB > safe limit {limit_mib:.0f} MiB). "
+        "Use a preserved artifact, copy the file elsewhere, or rerun with "
+        f"--tail-bytes {suggested_tail} for bounded triage. "
+        "If you truly intend the full scan, pass --unsafe-allow-large-live-file."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Online statistics accumulator
 # ---------------------------------------------------------------------------
@@ -128,13 +253,13 @@ class OnlineStats:
     def percentile(self, p: float) -> float:
         if not self._vals:
             return float("nan")
-        self._vals.sort()  # lazy sort
-        k = (len(self._vals) - 1) * p / 100.0
+        vals = sorted(self._vals)
+        k = (len(vals) - 1) * p / 100.0
         f = math.floor(k)
         c = math.ceil(k)
         if f == c:
-            return self._vals[int(k)]
-        return self._vals[f] * (c - k) + self._vals[c] * (k - f)
+            return vals[int(k)]
+        return vals[f] * (c - k) + vals[c] * (k - f)
 
     def summary(self) -> dict:
         if self.n == 0:
@@ -346,6 +471,20 @@ class TelemetryAccumulator:
         self.risk_event_counts: Counter = Counter()
         self.order_action_counts: Counter = Counter()
         self.orders_per_venue: list[int] = [0] * NUM_VENUES
+        self.mm_keep_count_stats = OnlineStats()
+        self.mm_replace_count_stats = OnlineStats()
+        self.mm_place_count_stats = OnlineStats()
+        self.mm_cancel_count_stats = OnlineStats()
+        self.mm_keep_total = 0
+        self.mm_replace_total = 0
+        self.mm_place_total = 0
+        self.mm_cancel_total = 0
+        self.mm_keep_reason_counts: Counter = Counter()
+        self.mm_replace_reason_counts: Counter = Counter()
+        self.mm_keep_utility_tier_counts: Counter = Counter()
+        self.mm_replace_utility_tier_counts: Counter = Counter()
+        self.mm_decisions_by_venue: list[Counter] = [Counter() for _ in range(NUM_VENUES)]
+        self.mm_inventory_reducing_counts: Counter = Counter()
 
         # --- Dimension 14: Anomalies ---
         self.anomalies = AnomalyCollector()
@@ -358,9 +497,21 @@ class TelemetryAccumulator:
         # --- PnL ---
         self.pnl_total_stats = OnlineStats()
         self.pnl_realised_stats = OnlineStats()
+        self.final_pnl_total: float | None = None
+        self.final_pnl_realised: float | None = None
+        self.final_pnl_unrealised: float | None = None
 
         # --- Correlated staleness detection ---
         self.multi_stale_ticks = 0  # ticks where 2+ venues are stale simultaneously
+        self.execution_mode_counts: Counter = Counter()
+        self.soft_governor_ticks = 0
+        self.soft_governor_reason_counts: Counter = Counter()
+        self.soft_governor_blocked_ticks: list[int] = [0] * NUM_VENUES
+        self.order_status_action_counts: list[Counter] = [Counter() for _ in range(NUM_VENUES)]
+        self.venue_fill_counts: list[int] = [0] * NUM_VENUES
+        self.venue_fill_size_base: list[float] = [0.0] * NUM_VENUES
+        self.drift_kind_counts: Counter = Counter()
+        self.drift_kind_by_venue: list[Counter] = [Counter() for _ in range(NUM_VENUES)]
 
     def process(self, rec: dict) -> None:
         tick = safe_int(rec.get("t"))
@@ -368,6 +519,9 @@ class TelemetryAccumulator:
             return
 
         self.tick_count += 1
+        exec_mode = rec.get("execution_mode")
+        if isinstance(exec_mode, str):
+            self.execution_mode_counts[exec_mode] += 1
         if self.first_tick is None:
             self.first_tick = tick
         self.last_tick = tick
@@ -690,8 +844,13 @@ class TelemetryAccumulator:
             for d in drift:
                 if isinstance(d, dict):
                     vi = safe_int(d.get("venue_index"))
+                    kind = d.get("kind", "unknown")
+                    if isinstance(kind, str):
+                        self.drift_kind_counts[kind] += 1
                     if vi is not None and 0 <= vi < NUM_VENUES:
                         self.drift_by_venue[vi] += 1
+                        if isinstance(kind, str):
+                            self.drift_kind_by_venue[vi][kind] += 1
 
         # === Dimension 13: Risk & Order Flow ===
         risk_regime = rec.get("risk_regime")
@@ -727,6 +886,18 @@ class TelemetryAccumulator:
         if qg is not None:
             self.q_global_stats.push(qg)
 
+        inv_soft = rec.get("inventory_soft_governor")
+        if isinstance(inv_soft, dict) and inv_soft.get("triggered"):
+            self.soft_governor_ticks += 1
+            for reason in inv_soft.get("global_reasons", []):
+                if isinstance(reason, str):
+                    self.soft_governor_reason_counts[reason] += 1
+            for blocked in inv_soft.get("blocked_venues", []):
+                if isinstance(blocked, dict):
+                    vi = safe_int(blocked.get("venue_index"))
+                    if vi is not None and 0 <= vi < NUM_VENUES:
+                        self.soft_governor_blocked_ticks[vi] += 1
+
         risk_events = rec.get("risk_events", [])
         if isinstance(risk_events, list):
             for re_item in risk_events:
@@ -743,6 +914,68 @@ class TelemetryAccumulator:
                     vi = safe_int(o.get("venue_index"))
                     if vi is not None and 0 <= vi < NUM_VENUES:
                         self.orders_per_venue[vi] += 1
+                        status = o.get("status", "unknown")
+                        if isinstance(status, str):
+                            self.order_status_action_counts[vi][f"{action}_{status}"] += 1
+
+        mm_order_management = rec.get("mm_order_management")
+        if isinstance(mm_order_management, dict):
+            for key, stats_acc in [
+                ("keep_count", self.mm_keep_count_stats),
+                ("replace_count", self.mm_replace_count_stats),
+                ("place_count", self.mm_place_count_stats),
+                ("cancel_count", self.mm_cancel_count_stats),
+            ]:
+                value = safe_int(mm_order_management.get(key))
+                if value is not None:
+                    stats_acc.push(float(value))
+
+            keep_count = safe_int(mm_order_management.get("keep_count"))
+            replace_count = safe_int(mm_order_management.get("replace_count"))
+            place_count = safe_int(mm_order_management.get("place_count"))
+            cancel_count = safe_int(mm_order_management.get("cancel_count"))
+            if keep_count is not None:
+                self.mm_keep_total += keep_count
+            if replace_count is not None:
+                self.mm_replace_total += replace_count
+            if place_count is not None:
+                self.mm_place_total += place_count
+            if cancel_count is not None:
+                self.mm_cancel_total += cancel_count
+
+            for raw_counts, target in [
+                (mm_order_management.get("keep_by_reason"), self.mm_keep_reason_counts),
+                (mm_order_management.get("replace_by_reason"), self.mm_replace_reason_counts),
+                (
+                    mm_order_management.get("keep_by_utility_tier"),
+                    self.mm_keep_utility_tier_counts,
+                ),
+                (
+                    mm_order_management.get("replace_by_utility_tier"),
+                    self.mm_replace_utility_tier_counts,
+                ),
+            ]:
+                if isinstance(raw_counts, dict):
+                    for raw_key, raw_count in raw_counts.items():
+                        count = safe_int(raw_count)
+                        if isinstance(raw_key, str) and count is not None:
+                            target[raw_key] += count
+
+            replace_decisions = mm_order_management.get("replace_decisions")
+            if isinstance(replace_decisions, list):
+                for decision in replace_decisions:
+                    if not isinstance(decision, dict):
+                        continue
+                    venue_index = safe_int(decision.get("venue_index"))
+                    outcome = decision.get("outcome")
+                    if (
+                        venue_index is not None
+                        and 0 <= venue_index < NUM_VENUES
+                        and isinstance(outcome, str)
+                    ):
+                        self.mm_decisions_by_venue[venue_index][outcome] += 1
+                        if decision.get("inventory_reducing") is True:
+                            self.mm_inventory_reducing_counts[outcome] += 1
 
         # === Dimension 14: Anomaly Detection ===
         # Age spikes
@@ -791,10 +1024,26 @@ class TelemetryAccumulator:
         # PnL
         pnl_t = safe_float(rec.get("pnl_total"))
         pnl_r = safe_float(rec.get("pnl_realised"))
+        pnl_u = safe_float(rec.get("pnl_unrealised"))
         if pnl_t is not None:
             self.pnl_total_stats.push(pnl_t)
+            self.final_pnl_total = pnl_t
         if pnl_r is not None:
             self.pnl_realised_stats.push(pnl_r)
+            self.final_pnl_realised = pnl_r
+        if pnl_u is not None:
+            self.final_pnl_unrealised = pnl_u
+
+        fills = rec.get("fills", [])
+        if isinstance(fills, list):
+            for fill in fills:
+                if isinstance(fill, dict):
+                    vi = safe_int(fill.get("venue_index"))
+                    if vi is not None and 0 <= vi < NUM_VENUES:
+                        self.venue_fill_counts[vi] += 1
+                        size = safe_float(fill.get("size"))
+                        if size is not None:
+                            self.venue_fill_size_base[vi] += size
 
 
 # ---------------------------------------------------------------------------
@@ -845,7 +1094,13 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     lines.append(f"  Ticks analyzed: {acc.tick_count} (tick {acc.first_tick} -> {acc.last_tick})")
     lines.append(f"  Time range: {ts_str(acc.first_ts_ms)} -> {ts_str(acc.last_ts_ms)} ({elapsed_s:.0f}s / {elapsed_s/3600:.2f}h)")
     lines.append(f"  Tick rate: {tick_rate:.2f} ticks/sec")
+    lines.append(f"  Segment UTC: {ts_iso(acc.first_ts_ms)} -> {ts_iso(acc.last_ts_ms)}")
     lines.append(f"  Venues: {', '.join(VENUE_NAMES)}")
+    if acc.execution_mode_counts:
+        modes = ", ".join(
+            f"{mode}={count}" for mode, count in sorted(acc.execution_mode_counts.items())
+        )
+        lines.append(f"  Execution modes: {modes}")
     lines.append(f"  Anomalies detected: {len(acc.anomalies.items)} "
                  f"(Critical={len(acc.anomalies.by_severity('Critical'))}, "
                  f"Warning={len(acc.anomalies.by_severity('Warning'))}, "
@@ -1182,7 +1437,15 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     if acc.reconcile_drift_tick_count > 0:
         lines.append("  Drift events per venue:")
         for i in range(NUM_VENUES):
-            lines.append(f"    {VENUE_NAMES[i]}: {acc.drift_by_venue[i]}")
+            top_kind = ""
+            if acc.drift_kind_by_venue[i]:
+                kind, count = acc.drift_kind_by_venue[i].most_common(1)[0]
+                top_kind = f" (top={kind}:{count})"
+            lines.append(f"    {VENUE_NAMES[i]}: {acc.drift_by_venue[i]}{top_kind}")
+        if acc.drift_kind_counts:
+            lines.append("  Drift events by kind:")
+            for kind, count in acc.drift_kind_counts.most_common():
+                lines.append(f"    {kind}: {count}")
     else:
         lines.append("  No reconcile drift events detected.")
 
@@ -1207,6 +1470,17 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     lines.append("")
     lines.append(acc.dollar_delta_stats.summary_line("dollar_delta_usd", "USD"))
     lines.append(acc.q_global_stats.summary_line("q_global_tao", "tao"))
+    lines.append(
+        f"  Soft-governor triggered ticks: {acc.soft_governor_ticks} "
+        f"({pct(acc.soft_governor_ticks, acc.tick_count)})"
+    )
+    if acc.soft_governor_reason_counts:
+        lines.append("  Soft-governor reasons:")
+        for reason, count in acc.soft_governor_reason_counts.most_common():
+            lines.append(f"    {reason}: {count}")
+        lines.append("  Soft-governor blocked venue ticks:")
+        for i in range(NUM_VENUES):
+            lines.append(f"    {VENUE_NAMES[i]}: {acc.soft_governor_blocked_ticks[i]}")
 
     lines.append("")
     lines.append("  Order Action Counts:")
@@ -1214,9 +1488,90 @@ def generate_report(acc: TelemetryAccumulator) -> str:
         lines.append(f"    {action}: {count}")
 
     lines.append("")
+    lines.append("  MM Order Management:")
+    lines.append(acc.mm_keep_count_stats.summary_line("mm keep_count"))
+    lines.append(acc.mm_replace_count_stats.summary_line("mm replace_count"))
+    lines.append(acc.mm_place_count_stats.summary_line("mm place_count"))
+    lines.append(acc.mm_cancel_count_stats.summary_line("mm cancel_count"))
+    mm_decision_total = acc.mm_keep_total + acc.mm_replace_total
+    lines.append(
+        f"  MM decision totals: keep={acc.mm_keep_total} replace={acc.mm_replace_total} "
+        f"replace_share={pct(acc.mm_replace_total, mm_decision_total)}"
+    )
+    if acc.mm_inventory_reducing_counts:
+        lines.append(
+            "  Inventory-reducing MM decisions: "
+            + ", ".join(
+                f"{outcome}={count}"
+                for outcome, count in acc.mm_inventory_reducing_counts.most_common()
+            )
+        )
+    if acc.mm_keep_reason_counts:
+        lines.append("  Top keep reasons:")
+        for reason, count in acc.mm_keep_reason_counts.most_common(5):
+            lines.append(f"    {reason}: {count}")
+    if acc.mm_replace_reason_counts:
+        lines.append("  Top replace reasons:")
+        for reason, count in acc.mm_replace_reason_counts.most_common(5):
+            lines.append(f"    {reason}: {count}")
+    if acc.mm_keep_utility_tier_counts or acc.mm_replace_utility_tier_counts:
+        lines.append("  MM utility tiers:")
+        tier_keys = sorted(
+            set(acc.mm_keep_utility_tier_counts.keys())
+            | set(acc.mm_replace_utility_tier_counts.keys())
+        )
+        for tier in tier_keys:
+            lines.append(
+                f"    {tier}: keep={acc.mm_keep_utility_tier_counts.get(tier, 0)} "
+                f"replace={acc.mm_replace_utility_tier_counts.get(tier, 0)}"
+            )
+
+    lines.append("")
     lines.append("  Orders Per Venue:")
     for i in range(NUM_VENUES):
         lines.append(f"    {VENUE_NAMES[i]}: {acc.orders_per_venue[i]}")
+
+    lines.append("")
+    lines.append("  Execution Scorecard:")
+    headers_exec = [
+        "Venue",
+        "PlaceI",
+        "ReplaceI",
+        "CancelI",
+        "PlaceAck",
+        "CancelAck",
+        "PlaceRej",
+        "Fills",
+        "FillBase",
+    ]
+    rows_exec = []
+    for i, venue in enumerate(VENUE_NAMES):
+        counts = acc.order_status_action_counts[i]
+        rows_exec.append([
+            venue,
+            str(counts.get("place_intent", 0)),
+            str(counts.get("replace_intent", 0)),
+            str(counts.get("cancel_intent", 0)),
+            str(counts.get("place_ack", 0)),
+            str(counts.get("cancel_ack", 0)),
+            str(counts.get("place_reject", 0)),
+            str(acc.venue_fill_counts[i]),
+            fmt_f(acc.venue_fill_size_base[i], 4),
+        ])
+    lines.append(format_table(headers_exec, rows_exec))
+
+    if any(acc.mm_decisions_by_venue):
+        lines.append("")
+        lines.append("  MM Keep/Replace By Venue:")
+        headers_mm = ["Venue", "KeepD", "ReplaceD"]
+        rows_mm = []
+        for i, venue in enumerate(VENUE_NAMES):
+            rows_mm.append([
+                venue,
+                str(acc.mm_decisions_by_venue[i].get("keep", 0)),
+                str(acc.mm_decisions_by_venue[i].get("replace", 0)),
+            ])
+        lines.append(format_table(headers_mm, rows_mm))
 
     lines.append("")
     lines.append("  Risk Event Types:")
@@ -1231,7 +1586,13 @@ def generate_report(acc: TelemetryAccumulator) -> str:
     lines.append(acc.pnl_total_stats.summary_line("pnl_total", "USD"))
     lines.append(acc.pnl_realised_stats.summary_line("pnl_realised", "USD"))
     if acc.pnl_total_stats.n > 0:
-        lines.append(f"  Final pnl_total: {fmt_f(acc.pnl_total_stats._vals[-1] if acc.pnl_total_stats._vals else None, 4)} USD")
+        lines.append(f"  Peak pnl_total: {fmt_f(acc.pnl_total_stats._max, 4)} USD")
+        lines.append(f"  Trough pnl_total: {fmt_f(acc.pnl_total_stats._min, 4)} USD")
+        lines.append(f"  Final pnl_total: {fmt_f(acc.final_pnl_total, 4)} USD")
+    if acc.final_pnl_realised is not None:
+        lines.append(f"  Final pnl_realised: {fmt_f(acc.final_pnl_realised, 4)} USD")
+    if acc.final_pnl_unrealised is not None:
+        lines.append(f"  Final pnl_unrealised: {fmt_f(acc.final_pnl_unrealised, 4)} USD")
 
     # Dimension 14
     subsection("Dimension 14: Anomaly Summary")
@@ -1343,29 +1704,40 @@ def generate_report(acc: TelemetryAccumulator) -> str:
 # Streaming reader
 # ---------------------------------------------------------------------------
 
-def stream_records(path: Path, max_ticks: int = 0) -> TelemetryAccumulator:
+def stream_records(
+    path: Path,
+    max_ticks: int = 0,
+    execution_mode: str = "all",
+    last_segment: bool = False,
+    tail_bytes: int = 0,
+) -> TelemetryAccumulator:
     acc = TelemetryAccumulator()
     count = 0
     t0 = time.monotonic()
 
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            acc.process(rec)
-            count += 1
-            if max_ticks > 0 and count >= max_ticks:
-                break
-            if count % 10000 == 0:
-                elapsed = time.monotonic() - t0
-                print(f"  ... processed {count} ticks ({elapsed:.1f}s)", file=sys.stderr)
+    base_records = (
+        iter_json_objects_from_tail(path, tail_bytes)
+        if tail_bytes > 0
+        else iter_json_objects(path)
+    )
+
+    if last_segment:
+        if execution_mode == "all":
+            raise ValueError("--last-segment requires --execution-mode to be set")
+        records = last_execution_segment_from_iter(base_records, execution_mode)
+    else:
+        records = base_records
+
+    for rec in records:
+        if execution_mode != "all" and rec.get("execution_mode") != execution_mode:
+            continue
+        acc.process(rec)
+        count += 1
+        if max_ticks > 0 and count >= max_ticks:
+            break
+        if count % 10000 == 0:
+            elapsed = time.monotonic() - t0
+            print(f"  ... processed {count} ticks ({elapsed:.1f}s)", file=sys.stderr)
 
     elapsed = time.monotonic() - t0
     print(f"  Processed {count} ticks in {elapsed:.1f}s ({count/elapsed:.0f} ticks/sec)", file=sys.stderr)
@@ -1496,7 +1868,35 @@ def regression_scorecard(prev_path: Path, curr_snapshot: dict) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Comprehensive 15-dimension telemetry analyzer.")
     parser.add_argument("--telemetry", required=True, help="Path to telemetry.jsonl")
+    parser.add_argument(
+        "--execution-mode",
+        choices=("all", "shadow", "paper", "live"),
+        default="all",
+        help="Filter rows by execution_mode before analysis (default: all)",
+    )
+    parser.add_argument(
+        "--last-segment",
+        action="store_true",
+        help="Only analyze the last contiguous segment for the chosen execution mode",
+    )
     parser.add_argument("--max-ticks", type=int, default=0, help="Max ticks to process (0=all)")
+    parser.add_argument(
+        "--tail-bytes",
+        type=int,
+        default=0,
+        help=(
+            "Only analyze the last N bytes of the telemetry file. "
+            "Use this for production-safe triage on large rolling files."
+        ),
+    )
+    parser.add_argument(
+        "--unsafe-allow-large-live-file",
+        action="store_true",
+        help=(
+            "Allow a full scan of the rolling production telemetry file even when it is very large. "
+            "This is intentionally unsafe on the live host."
+        ),
+    )
     parser.add_argument("--checkpoint-json", type=str, default=None, help="Path to save checkpoint JSON")
     parser.add_argument("--prev-checkpoint", type=str, default=None, help="Path to previous checkpoint JSON for regression comparison")
     parser.add_argument("--output", type=str, default=None, help="Path to write report (default: stdout)")
@@ -1511,8 +1911,28 @@ def main() -> int:
         print(f"ERROR: telemetry file not found: {telemetry_path}", file=sys.stderr)
         return 1
 
+    try:
+        guard_unsafe_live_scan(
+            telemetry_path,
+            tail_bytes=args.tail_bytes,
+            unsafe_allow_large_live_file=args.unsafe_allow_large_live_file,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     print(f"Analyzing {telemetry_path} ...", file=sys.stderr)
-    acc = stream_records(telemetry_path, max_ticks=args.max_ticks)
+    try:
+        acc = stream_records(
+            telemetry_path,
+            max_ticks=args.max_ticks,
+            execution_mode=args.execution_mode,
+            last_segment=args.last_segment,
+            tail_bytes=args.tail_bytes,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     if acc.tick_count == 0:
         print("ERROR: no ticks found in telemetry", file=sys.stderr)

@@ -127,7 +127,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
@@ -142,8 +142,9 @@ use super::super::gateway::{
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, FundingUpdate, LiquidationSnapshot,
-    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
+    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, OpenOrderSnapshot, OrderSnapshot,
+    PositionSnapshot, TopOfBook,
 };
 use crate::live::MarketPublisher;
 use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
@@ -372,6 +373,7 @@ impl ExtendedConnector {
 
     pub async fn run_funding_polling(&self, poll_ms: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut seq: u64 = 0;
         loop {
             interval.tick().await;
@@ -1093,14 +1095,16 @@ impl ExtendedConnector {
 #[derive(Clone)]
 pub struct ExtendedRestClient {
     cfg: ExtendedConfig,
-    _http: Client,
+    http: Client,
+    price_tick_size: Arc<Mutex<Option<f64>>>,
+    poll_seq: Arc<AtomicU64>,
 }
 
 impl ExtendedRestClient {
     pub fn new(cfg: ExtendedConfig) -> Self {
         Self {
             cfg,
-            _http: Client::builder()
+            http: Client::builder()
                 .user_agent("paraphina")
                 .timeout(Duration::from_secs(10))
                 .tcp_nodelay(true)
@@ -1109,6 +1113,8 @@ impl ExtendedRestClient {
                 .pool_max_idle_per_host(5)
                 .build()
                 .expect("extended rest http client build"),
+            price_tick_size: Arc::new(Mutex::new(None)),
+            poll_seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -1120,18 +1126,63 @@ impl ExtendedRestClient {
         self.cfg.has_execution_auth()
     }
 
-    async fn run_bridge_command(
-        &self,
-        op: &str,
-        payload: Value,
-    ) -> LiveResult<String> {
+    async fn resolve_price_tick_size(&self) -> LiveResult<f64> {
+        if let Some(tick_size) = std::env::var("PARAPHINA_EXTENDED_PRICE_TICK_SIZE")
+            .ok()
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .filter(|tick_size| tick_size.is_finite() && *tick_size > 0.0)
+        {
+            return Ok(tick_size);
+        }
+
+        {
+            let guard = self.price_tick_size.lock().await;
+            if let Some(tick_size) = *guard {
+                return Ok(tick_size);
+            }
+        }
+
+        let url = format!(
+            "{}/api/v1/info/markets",
+            self.cfg.rest_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("market", self.cfg.market.as_str())])
+            .send()
+            .await
+            .map_err(|err| {
+                LiveGatewayError::retryable(format!("extended market info error: {err}"))
+            })?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("extended market info parse error: {err}"))
+        })?;
+        let tick_size =
+            parse_market_info_price_tick_size(&value, &self.cfg.market).ok_or_else(|| {
+                LiveGatewayError::fatal(format!(
+                    "extended market info missing minPriceChange for {}",
+                    self.cfg.market
+                ))
+            })?;
+        let mut guard = self.price_tick_size.lock().await;
+        Ok(*guard.get_or_insert(tick_size))
+    }
+
+    async fn run_bridge_command(&self, op: &str, payload: Value) -> LiveResult<String> {
         let trader_cmd = self
             .cfg
             .trader_cmd
             .clone()
             .ok_or_else(|| LiveGatewayError::fatal("extended trader cmd missing"))?;
-        let payload_raw = serde_json::to_string(&payload)
-            .map_err(|err| LiveGatewayError::fatal(format!("extended bridge payload encode error: {err}")))?;
+        let payload_raw = serde_json::to_string(&payload).map_err(|err| {
+            LiveGatewayError::fatal(format!("extended bridge payload encode error: {err}"))
+        })?;
         let op = op.to_string();
         let op_for_child = op.clone();
         let output = tokio::task::spawn_blocking(move || {
@@ -1144,7 +1195,9 @@ impl ExtendedRestClient {
         })
         .await
         .map_err(|err| LiveGatewayError::retryable(format!("extended bridge join error: {err}")))?
-        .map_err(|err| LiveGatewayError::retryable(format!("extended bridge spawn error: {err}")))?;
+        .map_err(|err| {
+            LiveGatewayError::retryable(format!("extended bridge spawn error: {err}"))
+        })?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !output.status.success() {
@@ -1153,11 +1206,7 @@ impl ExtendedRestClient {
             } else if !stdout.is_empty() {
                 stdout
             } else {
-                format!(
-                    "extended bridge failed op={} status={}",
-                    op,
-                    output.status
-                )
+                format!("extended bridge failed op={} status={}", op, output.status)
             };
             return Err(map_rest_error(400, &message));
         }
@@ -1199,6 +1248,39 @@ impl ExtendedRestClient {
         Ok(snapshot.into_account_snapshot(venue_id, venue_index))
     }
 
+    async fn fetch_open_order_snapshot(
+        &self,
+        venue_id: &str,
+        venue_index: usize,
+    ) -> LiveResult<OrderSnapshot> {
+        let open_orders: Vec<ExtendedBridgeOpenOrder> = self
+            .run_bridge_json(
+                "open_orders",
+                json!({
+                    "market": self.cfg.market,
+                }),
+            )
+            .await?;
+        Ok(OrderSnapshot {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq: self.poll_seq.fetch_add(1, Ordering::Relaxed),
+            timestamp_ms: now_ms(),
+            open_orders: open_orders
+                .into_iter()
+                .filter(|order| order.size > 0.0)
+                .map(|order| OpenOrderSnapshot {
+                    order_id: order.order_id,
+                    client_order_id: order.client_order_id,
+                    side: order.side,
+                    price: order.price,
+                    size: order.size,
+                    purpose: None,
+                })
+                .collect(),
+        })
+    }
+
     pub async fn run_account_polling(
         self: Arc<Self>,
         account_tx: mpsc::Sender<AccountEvent>,
@@ -1207,6 +1289,7 @@ impl ExtendedRestClient {
         poll_ms: u64,
     ) {
         let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             match self.fetch_account_snapshot(&venue_id, venue_index).await {
@@ -1215,6 +1298,28 @@ impl ExtendedRestClient {
                 }
                 Err(err) => {
                     eprintln!("Extended account snapshot error: {}", err.message);
+                }
+            }
+        }
+    }
+
+    pub async fn run_order_polling(
+        self: Arc<Self>,
+        exec_tx: mpsc::Sender<ExecutionEvent>,
+        venue_id: String,
+        venue_index: usize,
+        poll_ms: u64,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match self.fetch_open_order_snapshot(&venue_id, venue_index).await {
+                Ok(snapshot) => {
+                    let _ = exec_tx.send(ExecutionEvent::OrderSnapshot(snapshot)).await;
+                }
+                Err(err) => {
+                    eprintln!("Extended open order snapshot error: {}", err.message);
                 }
             }
         }
@@ -1229,14 +1334,16 @@ impl LiveRestClient for ExtendedRestClient {
         req: LiveRestPlaceRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
+            let price_tick_size = self.resolve_price_tick_size().await?;
+            let price = snap_price_to_tick(req.price, price_tick_size, req.side, req.post_only);
             let response: ExtendedBridgePlaceResponse = self
                 .run_bridge_json(
                     "place",
                     json!({
                         "market": self.cfg.market,
                         "side": map_side(req.side),
-                        "price": req.price,
-                        "size": req.size,
+                        "price": format_f64(price),
+                        "size": format_f64(req.size),
                         "post_only": req.post_only,
                         "reduce_only": req.reduce_only,
                         "time_in_force": map_time_in_force(req.time_in_force),
@@ -1303,6 +1410,65 @@ fn map_time_in_force(time_in_force: TimeInForce) -> &'static str {
     }
 }
 
+fn format_f64(value: f64) -> String {
+    if !value.is_finite() {
+        return "0".to_string();
+    }
+    let mut formatted = format!("{value:.12}");
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    if formatted == "-0" {
+        formatted = "0".to_string();
+    }
+    formatted
+}
+
+fn snap_price_to_tick(price: f64, tick_size: f64, side: Side, post_only: bool) -> f64 {
+    if !price.is_finite() || !tick_size.is_finite() || tick_size <= 0.0 {
+        return price;
+    }
+    let ticks = price / tick_size;
+    let epsilon = 1e-9;
+    let snapped_ticks = if post_only {
+        match side {
+            Side::Buy => (ticks + epsilon).floor(),
+            Side::Sell => (ticks - epsilon).ceil(),
+        }
+    } else {
+        ticks.round()
+    };
+    snapped_ticks * tick_size
+}
+
+fn parse_market_info_price_tick_size(value: &Value, market: &str) -> Option<f64> {
+    let markets = value
+        .get("data")
+        .and_then(|raw| raw.as_array())
+        .or_else(|| value.as_array())?;
+    markets
+        .iter()
+        .find(|entry| {
+            entry
+                .get("name")
+                .and_then(|raw| raw.as_str())
+                .map(|name| symbol_matches(name, market))
+                .unwrap_or(false)
+                || entry
+                    .get("uiName")
+                    .and_then(|raw| raw.as_str())
+                    .map(|name| symbol_matches(name, market))
+                    .unwrap_or(false)
+        })
+        .and_then(|entry| entry.get("tradingConfig"))
+        .and_then(|config| config.get("minPriceChange"))
+        .and_then(parse_f64)
+        .filter(|tick_size| tick_size.is_finite() && *tick_size > 0.0)
+}
+
 #[derive(Debug, Deserialize)]
 struct ExtendedBridgePlaceResponse {
     order_id: Option<String>,
@@ -1318,6 +1484,31 @@ struct ExtendedBridgeCancelResponse {
 struct ExtendedBridgeCancelAllResponse {
     #[serde(default)]
     count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtendedBridgeOpenOrder {
+    order_id: String,
+    #[serde(default)]
+    client_order_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_extended_bridge_side")]
+    side: Side,
+    price: f64,
+    size: f64,
+}
+
+fn deserialize_extended_bridge_side<'de, D>(deserializer: D) -> Result<Side, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    match raw.trim() {
+        side if side.eq_ignore_ascii_case("BUY") => Ok(Side::Buy),
+        side if side.eq_ignore_ascii_case("SELL") => Ok(Side::Sell),
+        other => Err(serde::de::Error::custom(format!(
+            "unknown side '{other}', expected BUY or SELL"
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1348,9 +1539,7 @@ impl ExtendedBridgeSnapshot {
             .filter_map(|position| position.updated_at)
             .max();
         let timestamp_ms = self.timestamp_ms.or(position_ts).unwrap_or_else(now_ms);
-        let asset = self
-            .collateral_asset
-            .unwrap_or_else(|| "USD".to_string());
+        let asset = self.collateral_asset.unwrap_or_else(|| "USD".to_string());
         let liquidation = LiquidationSnapshot {
             price_liq: self
                 .positions
@@ -2317,7 +2506,11 @@ mod tests {
         );
     }
 
-    fn apply_market_event_to_test_state(state: &mut GlobalState, cfg: &Config, event: &MarketDataEvent) {
+    fn apply_market_event_to_test_state(
+        state: &mut GlobalState,
+        cfg: &Config,
+        event: &MarketDataEvent,
+    ) {
         let venue = state.venues.get_mut(0).expect("extended venue");
         let max_levels = cfg.book.depth_levels.max(1) as usize;
         match event {
@@ -2526,6 +2719,72 @@ printf '%s\n' '{"order_id":"12345","client_order_id":"co_post_only"}'
         assert_eq!(resp.order_id.as_deref(), Some("12345"));
     }
 
+    #[test]
+    fn parse_market_info_price_tick_size_reads_min_price_change() {
+        let payload = serde_json::json!({
+            "status": "OK",
+            "data": [{
+                "name": "ETH-USD",
+                "tradingConfig": {
+                    "minPriceChange": "0.1"
+                }
+            }]
+        });
+        assert_eq!(
+            parse_market_info_price_tick_size(&payload, "ETH-USD"),
+            Some(0.1)
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_place_order_snaps_post_only_price_to_market_tick() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard = EnvVarGuard::new("PARAPHINA_EXTENDED_PRICE_TICK_SIZE");
+        std::env::set_var("PARAPHINA_EXTENDED_PRICE_TICK_SIZE", "0.1");
+
+        let tmp = TempDir::new().expect("temp dir");
+        let trader_cmd = write_bridge_script(
+            &tmp,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PARAPHINA_EXTENDED_BRIDGE_PAYLOAD}" != *'"price":"100"'* ]]; then
+  echo "payload missing snapped price" >&2
+  echo "${PARAPHINA_EXTENDED_BRIDGE_PAYLOAD}" >&2
+  exit 4
+fi
+printf '%s\n' '{"order_id":"12345","client_order_id":"co_snap"}'
+"#,
+        );
+        let cfg = ExtendedConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "https://api.starknet.extended.exchange".to_string(),
+            market: "ETH-USD".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            api_key: Some("test-key".to_string()),
+            trader_cmd: Some(trader_cmd),
+            record_dir: None,
+        };
+        let client = ExtendedRestClient::new(cfg);
+
+        let resp = client
+            .place_order(LiveRestPlaceRequest {
+                venue_index: 0,
+                venue_id: "extended".to_string(),
+                side: Side::Buy,
+                price: 100.07,
+                size: 0.01,
+                purpose: crate::types::OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "co_snap".to_string(),
+            })
+            .await
+            .expect("place order");
+        assert_eq!(resp.order_id.as_deref(), Some("12345"));
+    }
+
     #[tokio::test]
     async fn rest_cancel_all_uses_bridge_command() {
         let tmp = TempDir::new().expect("temp dir");
@@ -2691,7 +2950,10 @@ printf '%s\n' '{"timestamp_ms":1700000000000,"collateral_asset":"USDC","balance_
                     "one-sided snapshot should still produce a side update"
                 );
                 assert!(
-                    delta.changes.iter().all(|change| change.side == BookSide::Bid),
+                    delta
+                        .changes
+                        .iter()
+                        .all(|change| change.side == BookSide::Bid),
                     "empty ask side must not clear the existing ask book"
                 );
             }
@@ -2727,6 +2989,29 @@ printf '%s\n' '{"timestamp_ms":1700000000000,"collateral_asset":"USDC","balance_
         assert_eq!(normalize_extended_market("BTCUSD"), "BTC-USD");
         assert_eq!(normalize_extended_market("BTC-USD"), "BTC-USD");
         assert_eq!(normalize_extended_market("btc-usd-perp"), "BTC-USD");
+    }
+
+    #[test]
+    fn bridge_open_order_side_accepts_uppercase_variants() {
+        let order: ExtendedBridgeOpenOrder = serde_json::from_value(serde_json::json!({
+            "order_id": "oid_1",
+            "client_order_id": "co_ext_1",
+            "side": "SELL",
+            "price": 2365.1,
+            "size": 0.02
+        }))
+        .expect("parse uppercase side");
+        assert_eq!(order.side, Side::Sell);
+
+        let order: ExtendedBridgeOpenOrder = serde_json::from_value(serde_json::json!({
+            "order_id": "oid_2",
+            "client_order_id": "co_ext_2",
+            "side": "buy",
+            "price": 2364.9,
+            "size": 0.01
+        }))
+        .expect("parse lowercase side");
+        assert_eq!(order.side, Side::Buy);
     }
 
     #[test]

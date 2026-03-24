@@ -254,6 +254,7 @@ impl<'a> Engine<'a> {
         // Prior fair reference for gating and return computation.
         let prev_fair_opt = state.fair_value;
         let prev_fair = prev_fair_opt.unwrap_or(state.fair_value_prev);
+        let prev_fv_available = state.fv_available;
 
         // Time delta (seconds) for process noise.
         let dt_ms: i64 = if state.kf_last_update_ms > 0 {
@@ -349,7 +350,7 @@ impl<'a> Engine<'a> {
         }
 
         // Compute return r_t = log(S_t / S_{t-1}) for vol updates.
-        let fair_prev_for_ret = if prev_fair.is_finite() && prev_fair > 0.0 {
+        let fair_prev_for_ret = if prev_fv_available && prev_fair.is_finite() && prev_fair > 0.0 {
             prev_fair
         } else {
             fair_new

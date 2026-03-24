@@ -3,19 +3,109 @@
 // Milestone H: Order management for MM quotes (Whitepaper §11).
 // Implements cancel/replace logic with MIN_QUOTE_LIFETIME_MS and tolerance gates.
 
+use std::collections::BTreeMap;
+
 use crate::actions::ActionIdGenerator;
 use crate::config::Config;
-use crate::mm::{MmLevel, MmQuote};
+use crate::mm::{
+    evaluate_replace_order, ActiveMmOrder, MmLevel, MmQuote, MmReplaceDecision,
+    MmReplaceOutcome, ShouldReplaceOrderCtx,
+};
 use crate::state::GlobalState;
 use crate::types::{
     CancelOrderIntent, OrderIntent, OrderPurpose, PlaceOrderIntent, ReplaceOrderIntent, Side,
     TimeInForce, TimestampMs,
 };
+use serde::Serialize;
 
 /// Output of MM order management planner.
 #[derive(Debug, Clone)]
 pub struct MmOrderManagementPlan {
     pub intents: Vec<OrderIntent>,
+    pub decision_summary: MmOrderDecisionSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MmOrderDecisionSummary {
+    pub keep_count: u64,
+    pub replace_count: u64,
+    pub place_count: u64,
+    pub cancel_count: u64,
+    pub keep_by_reason: BTreeMap<String, u64>,
+    pub replace_by_reason: BTreeMap<String, u64>,
+    pub keep_by_utility_tier: BTreeMap<String, u64>,
+    pub replace_by_utility_tier: BTreeMap<String, u64>,
+    pub replace_decisions: Vec<MmReplaceDecisionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MmReplaceDecisionRecord {
+    pub venue_index: usize,
+    pub venue_id: String,
+    pub side: String,
+    pub outcome: String,
+    pub reason: String,
+    pub utility_tier: String,
+    pub utility_reason: String,
+    pub inventory_reducing: bool,
+    pub age_ms: TimestampMs,
+    pub min_quote_lifetime_ms: TimestampMs,
+    pub price_diff_ticks: f64,
+    pub price_tol_ticks: f64,
+    pub size_diff_rel: f64,
+    pub size_tol_rel: f64,
+}
+
+impl MmOrderDecisionSummary {
+    fn record_replace_decision(
+        &mut self,
+        venue_index: usize,
+        venue_id: &str,
+        side: Side,
+        decision: MmReplaceDecision,
+    ) {
+        let tier_key = decision.utility_tier.as_str().to_string();
+        let reason_key = decision.reason.as_str().to_string();
+        match decision.outcome {
+            MmReplaceOutcome::Keep => {
+                self.keep_count += 1;
+                *self.keep_by_reason.entry(reason_key.clone()).or_insert(0) += 1;
+                *self.keep_by_utility_tier.entry(tier_key.clone()).or_insert(0) += 1;
+            }
+            MmReplaceOutcome::Replace => {
+                self.replace_count += 1;
+                *self.replace_by_reason.entry(reason_key.clone()).or_insert(0) += 1;
+                *self
+                    .replace_by_utility_tier
+                    .entry(tier_key.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+        self.replace_decisions.push(MmReplaceDecisionRecord {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            side: format!("{:?}", side),
+            outcome: decision.outcome.as_str().to_string(),
+            reason: reason_key,
+            utility_tier: tier_key,
+            utility_reason: decision.utility_reason.as_str().to_string(),
+            inventory_reducing: decision.inventory_reducing,
+            age_ms: decision.age_ms,
+            min_quote_lifetime_ms: decision.min_quote_lifetime_ms,
+            price_diff_ticks: decision.price_diff_ticks,
+            price_tol_ticks: decision.price_tol_ticks,
+            size_diff_rel: decision.size_diff_rel,
+            size_tol_rel: decision.size_tol_rel,
+        });
+    }
+
+    fn record_place(&mut self) {
+        self.place_count += 1;
+    }
+
+    fn record_cancel(&mut self) {
+        self.cancel_count += 1;
+    }
 }
 
 /// Plan MM order actions based on desired quotes and current open orders.
@@ -32,12 +122,14 @@ pub fn plan_mm_order_actions(
     gen: &mut ActionIdGenerator,
 ) -> MmOrderManagementPlan {
     let mut intents = Vec::new();
+    let mut decision_summary = MmOrderDecisionSummary::default();
 
     // Hard guard: if kill switch is active, allow only cancels (no place/replace).
     // This ensures no new risk after a hard breach while clearing existing quotes.
     if state.kill_switch {
         for (venue_index, vstate) in state.venues.iter().enumerate() {
             if let Some(cur) = &vstate.mm_open_bid {
+                decision_summary.record_cancel();
                 intents.push(OrderIntent::Cancel(CancelOrderIntent {
                     venue_index,
                     venue_id: vstate.id.clone(),
@@ -45,6 +137,7 @@ pub fn plan_mm_order_actions(
                 }));
             }
             if let Some(cur) = &vstate.mm_open_ask {
+                decision_summary.record_cancel();
                 intents.push(OrderIntent::Cancel(CancelOrderIntent {
                     venue_index,
                     venue_id: vstate.id.clone(),
@@ -52,7 +145,10 @@ pub fn plan_mm_order_actions(
                 }));
             }
         }
-        return MmOrderManagementPlan { intents };
+        return MmOrderManagementPlan {
+            intents,
+            decision_summary,
+        };
     }
 
     let venue_count = state.venues.len();
@@ -64,9 +160,6 @@ pub fn plan_mm_order_actions(
     }
 
     for (venue_index, vstate) in state.venues.iter().enumerate() {
-        let vcfg = &cfg.venues[venue_index];
-        let tick = vcfg.tick_size.max(1e-6);
-
         let (best_bid, best_ask) = match (vstate.mid, vstate.spread) {
             (Some(mid), Some(spread)) => {
                 let half = spread / 2.0;
@@ -87,30 +180,35 @@ pub fn plan_mm_order_actions(
             gen,
             venue_index,
             vstate,
+            state.q_global_tao,
             desired_bid,
             Side::Buy,
             best_bid,
             best_ask,
-            tick,
             now_ms,
             &mut intents,
+            &mut decision_summary,
         );
         plan_side(
             cfg,
             gen,
             venue_index,
             vstate,
+            state.q_global_tao,
             desired_ask,
             Side::Sell,
             best_bid,
             best_ask,
-            tick,
             now_ms,
             &mut intents,
+            &mut decision_summary,
         );
     }
 
-    MmOrderManagementPlan { intents }
+    MmOrderManagementPlan {
+        intents,
+        decision_summary,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -119,13 +217,14 @@ fn plan_side(
     gen: &mut ActionIdGenerator,
     venue_index: usize,
     vstate: &crate::state::VenueState,
+    q_global_tao: f64,
     desired: Option<&MmLevel>,
     side: Side,
     best_bid: f64,
     best_ask: f64,
-    tick: f64,
     now_ms: TimestampMs,
     intents: &mut Vec<OrderIntent>,
+    decision_summary: &mut MmOrderDecisionSummary,
 ) {
     let current = match side {
         Side::Buy => vstate.mm_open_bid.as_ref(),
@@ -135,6 +234,7 @@ fn plan_side(
     if desired.is_none() {
         if let Some(cur) = current {
             // Cancel when side should not be quoted.
+            decision_summary.record_cancel();
             intents.push(OrderIntent::Cancel(CancelOrderIntent {
                 venue_index,
                 venue_id: vstate.id.clone(),
@@ -148,6 +248,7 @@ fn plan_side(
 
     // No current order -> place new.
     let Some(cur) = current else {
+        decision_summary.record_place();
         let intent = OrderIntent::Place(PlaceOrderIntent {
             venue_index,
             venue_id: vstate.id.clone(),
@@ -164,22 +265,29 @@ fn plan_side(
         return;
     };
 
-    let age_ms = now_ms - cur.timestamp_ms;
-    let is_dangerous = dangerously_offside(side, cur.price, best_bid, best_ask, tick);
+    let current_active = ActiveMmOrder {
+        venue_index,
+        side,
+        price: cur.price,
+        size: cur.size,
+        timestamp_ms: cur.timestamp_ms,
+    };
+    let ctx = ShouldReplaceOrderCtx {
+        cfg,
+        vcfg: &cfg.venues[venue_index],
+        vstate,
+        q_global_tao,
+        current: &current_active,
+        desired_price: desired.price,
+        desired_size: desired.size,
+        now_ms,
+        best_bid,
+        best_ask,
+    };
+    let decision = evaluate_replace_order(ctx);
+    decision_summary.record_replace_decision(venue_index, &vstate.id, side, decision);
 
-    // MIN_QUOTE_LIFETIME_MS gate unless dangerously offside.
-    if age_ms < cfg.mm.min_quote_lifetime_ms && !is_dangerous {
-        return;
-    }
-
-    let price_diff_ticks = (cur.price - desired.price).abs() / tick;
-    let size_diff_rel =
-        (cur.size - desired.size).abs() / desired.size.max(cfg.venues[venue_index].lot_size_tao);
-
-    if is_dangerous
-        || price_diff_ticks > cfg.mm.price_tol_ticks
-        || size_diff_rel > cfg.mm.size_tol_rel
-    {
+    if matches!(decision.outcome, MmReplaceOutcome::Replace) {
         intents.push(OrderIntent::Replace(ReplaceOrderIntent {
             venue_index,
             venue_id: vstate.id.clone(),
@@ -193,29 +301,6 @@ fn plan_side(
             order_id: cur.order_id.clone(),
             client_order_id: Some(gen.client_order_id(venue_index, OrderPurpose::Mm)),
         }));
-    }
-}
-
-/// Dangerous offside check for MM orders (Whitepaper §11).
-///
-/// We align with current passivity rules: bids must be <= best_bid - tick,
-/// asks must be >= best_ask + tick. An order is "dangerously offside" if it
-/// is non-passive or would cross the touch.
-fn dangerously_offside(side: Side, price: f64, best_bid: f64, best_ask: f64, tick: f64) -> bool {
-    if !best_bid.is_finite() || !best_ask.is_finite() {
-        return true;
-    }
-    match side {
-        Side::Buy => {
-            let non_passive = price > best_bid - tick;
-            let crosses = price >= best_ask - tick;
-            non_passive || crosses
-        }
-        Side::Sell => {
-            let non_passive = price < best_ask + tick;
-            let crosses = price <= best_bid + tick;
-            non_passive || crosses
-        }
     }
 }
 
@@ -265,6 +350,14 @@ mod tests {
         assert!(
             plan.intents.is_empty(),
             "Should not replace under lifetime when passive"
+        );
+        assert_eq!(plan.decision_summary.keep_count, 1);
+        assert_eq!(
+            plan.decision_summary
+                .keep_by_reason
+                .get("young_passive_hysteresis")
+                .copied(),
+            Some(1)
         );
     }
 
@@ -383,6 +476,55 @@ mod tests {
     }
 
     #[test]
+    fn reduced_utility_extends_quote_hysteresis_for_non_reducing_side() {
+        let cfg = Config::default();
+        let mut state = mk_state_with_quote(&cfg);
+        let base_lifetime = cfg.mm.min_quote_lifetime_ms_for(&state.venues[0].id);
+        let now_ms = base_lifetime + 100;
+
+        state.venues[0].utility.mm_fill_credit_ewma = 0.0;
+        state.venues[0].utility.mm_fillless_ack_pressure = 25.0;
+        state.venues[0].mm_open_bid = Some(MmOpenOrder {
+            price: 299.0,
+            size: 1.0,
+            timestamp_ms: 0,
+            order_id: "co_reduced_bid".to_string(),
+        });
+
+        let quotes = vec![mk_quote(0, Some((298.985, 1.0)), None)];
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
+        assert!(
+            plan.intents.is_empty(),
+            "reduced-utility worsening-side quote should keep queue position under extended hysteresis"
+        );
+    }
+
+    #[test]
+    fn reducing_side_bypasses_extended_hysteresis() {
+        let cfg = Config::default();
+        let mut state = mk_state_with_quote(&cfg);
+        let base_lifetime = cfg.mm.min_quote_lifetime_ms_for(&state.venues[0].id);
+        let now_ms = base_lifetime + 100;
+
+        state.q_global_tao = 5.0;
+        state.venues[0].utility.mm_fill_credit_ewma = 0.0;
+        state.venues[0].utility.mm_fillless_ack_pressure = 25.0;
+        state.venues[0].mm_open_ask = Some(MmOpenOrder {
+            price: 301.0,
+            size: 1.0,
+            timestamp_ms: 0,
+            order_id: "co_reduced_ask".to_string(),
+        });
+
+        let quotes = vec![mk_quote(0, None, Some((301.015, 1.0)))];
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
+        assert_eq!(plan.intents.len(), 1, "inventory-reducing ask should still refresh");
+        assert!(matches!(plan.intents[0], OrderIntent::Replace(_)));
+    }
+
+    #[test]
     fn deterministic_ordering_cancels_before_places() {
         let cfg = Config::default();
         let mut state = mk_state_with_quote(&cfg);
@@ -399,5 +541,13 @@ mod tests {
         let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
         assert_eq!(plan.intents.len(), 1, "Replace intent expected");
         assert!(matches!(plan.intents[0], OrderIntent::Replace(_)));
+        assert_eq!(plan.decision_summary.replace_count, 1);
+        assert_eq!(
+            plan.decision_summary
+                .replace_by_reason
+                .get("price_and_size_move")
+                .copied(),
+            Some(1)
+        );
     }
 }

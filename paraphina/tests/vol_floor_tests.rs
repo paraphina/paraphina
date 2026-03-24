@@ -117,6 +117,46 @@ fn sigma_eff_uses_floor_when_raw_vol_is_low() {
 }
 
 #[test]
+fn startup_fallback_fair_does_not_spike_sigma_when_books_arrive() {
+    let mut h = make_harness(RiskProfile::Balanced);
+    let sigma_min_tick = h.engine.vol_pre.sigma_min_tick;
+
+    // Tick 0: no usable observations, so the engine falls back to its synthetic
+    // startup fair value and marks FV unavailable.
+    h.engine.main_tick(&mut h.state, 0);
+    assert!(
+        !h.state.fv_available,
+        "startup tick should not have usable FV yet"
+    );
+
+    // Tick 1: real books arrive near the live ETH price. This used to create a
+    // synthetic return from 250 -> ~2085 and blow sigma_eff up on the first live
+    // account snapshot tick.
+    set_fresh_venue_data(&mut h, 1000, 2085.0);
+    h.engine.main_tick(&mut h.state, 1000);
+
+    let fair = h
+        .state
+        .fair_value
+        .expect("fair value should initialize from books");
+    assert!(
+        fair > 2000.0,
+        "fair should initialize near live books, got {}",
+        fair
+    );
+    assert!(
+        h.state.fv_available,
+        "FV should be available once fresh books are present"
+    );
+    assert!(
+        (h.state.sigma_eff - sigma_min_tick).abs() < 1e-12,
+        "startup transition should use the sigma floor, got sigma_eff={} floor={}",
+        h.state.sigma_eff,
+        sigma_min_tick
+    );
+}
+
+#[test]
 fn sigma_eff_equals_raw_vol_when_above_floor() {
     let mut h = make_harness(RiskProfile::Balanced);
     let sigma_min_tick = h.engine.vol_pre.sigma_min_tick;

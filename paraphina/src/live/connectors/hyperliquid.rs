@@ -517,6 +517,8 @@ pub struct HyperliquidConnector {
     exec_tx: mpsc::Sender<ExecutionEvent>,
     account_tx: Option<mpsc::Sender<AccountEvent>>,
     asset_index: tokio::sync::Mutex<Option<u32>>,
+    account_role: tokio::sync::Mutex<Option<HyperliquidUserRole>>,
+    account_abstraction: tokio::sync::Mutex<Option<HyperliquidAccountAbstraction>>,
     freshness: Arc<Freshness>,
     /// Cached signing key parsed once at initialization (avoids per-call hex decode + key construction).
     signing_key: Option<SigningKey>,
@@ -560,6 +562,8 @@ impl HyperliquidConnector {
             exec_tx,
             account_tx: None,
             asset_index: tokio::sync::Mutex::new(None),
+            account_role: tokio::sync::Mutex::new(None),
+            account_abstraction: tokio::sync::Mutex::new(None),
             freshness: Arc::new(Freshness::default()),
             signing_key,
             endpoint_index: std::sync::atomic::AtomicUsize::new(0),
@@ -1372,25 +1376,46 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             "subscription": { "type": "userEvents" }
         });
         write.send(Message::Text(sub_orders.to_string())).await?;
+        let ping_interval_ms: u64 = std::env::var("PARAPHINA_HL_PING_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await;
         loop {
-            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
-                Ok(Some(msg)) => msg?,
-                Ok(None) => break,
-                Err(_) => {
-                    eprintln!(
-                        "WARN: Hyperliquid private WS read timeout ({read_timeout:?}) — reconnecting"
-                    );
-                    anyhow::bail!("Hyperliquid private WS read timeout after {read_timeout:?}");
-                }
-            };
-            if let Message::Text(text) = msg {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                    for event in translate_private_events(&value) {
-                        let _ = self.exec_tx.send(event).await;
+            tokio::select! {
+                _ = ping_timer.tick() => {
+                    if let Err(err) = write.send(Message::Text(r#"{"method":"ping"}"#.to_string())).await {
+                        eprintln!("WARN: Hyperliquid private WS ping send failed: {err} — reconnecting");
+                        anyhow::bail!("Hyperliquid private WS ping send failed: {err}");
                     }
-                    if let Some(account_tx) = self.account_tx.as_ref() {
-                        if let Some(event) = translate_account_event(&value) {
-                            let _ = account_tx.send(event).await;
+                }
+                read_result = tokio::time::timeout(read_timeout, read.next()) => {
+                    let msg = match read_result {
+                        Ok(Some(msg)) => msg?,
+                        Ok(None) => break,
+                        Err(_) => {
+                            eprintln!(
+                                "WARN: Hyperliquid private WS read timeout ({read_timeout:?}) — reconnecting"
+                            );
+                            anyhow::bail!("Hyperliquid private WS read timeout after {read_timeout:?}");
+                        }
+                    };
+                    if let Message::Text(text) = msg {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                            if channel == "subscriptionResponse" || channel == "pong" {
+                                continue;
+                            }
+                            for event in translate_private_events(&value) {
+                                let _ = self.exec_tx.send(event).await;
+                            }
+                            if let Some(account_tx) = self.account_tx.as_ref() {
+                                if let Some(event) = translate_account_event(&value) {
+                                    let _ = account_tx.send(event).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -1401,12 +1426,13 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
 
     pub async fn run_account_polling(&self, interval_ms: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             let Some(account_tx) = self.account_tx.as_ref() else {
                 continue;
             };
-            match fetch_account_snapshot(&self.http, &self.cfg, &self.current_info_url()).await {
+            match self.fetch_account_snapshot().await {
                 Ok(snapshot) => {
                     let _ = account_tx.send(snapshot).await;
                 }
@@ -1487,6 +1513,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
 
     pub async fn run_funding_polling(&self, interval_ms: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut seq: u64 = 0;
         loop {
             interval.tick().await;
@@ -1549,12 +1576,14 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
         let signature = sign_action(&action, nonce, sk)?;
-        let payload = json!({
+        let mut payload = json!({
             "action": action,
             "nonce": nonce,
             "signature": signature,
-            "vaultAddress": self.cfg.vault_address,
         });
+        if let Some(vault_address) = self.effective_vault_address().await? {
+            payload["vaultAddress"] = json!(vault_address);
+        }
         let rest_url = self.current_rest_url();
         let resp = self
             .http
@@ -1587,12 +1616,14 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
         let signature = sign_action(&action, nonce, sk)?;
-        let payload = json!({
+        let mut payload = json!({
             "action": action,
             "nonce": nonce,
             "signature": signature,
-            "vaultAddress": self.cfg.vault_address,
         });
+        if let Some(vault_address) = self.effective_vault_address().await? {
+            payload["vaultAddress"] = json!(vault_address);
+        }
         let rest_url = self.current_rest_url();
         let resp = self
             .http
@@ -1621,12 +1652,14 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
         let signature = sign_action(&action, nonce, sk)?;
-        let payload = json!({
+        let mut payload = json!({
             "action": action,
             "nonce": nonce,
             "signature": signature,
-            "vaultAddress": self.cfg.vault_address,
         });
+        if let Some(vault_address) = self.effective_vault_address().await? {
+            payload["vaultAddress"] = json!(vault_address);
+        }
         let rest_url = self.current_rest_url();
         let resp = self
             .http
@@ -1653,6 +1686,91 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
         let mut guard = self.asset_index.lock().await;
         *guard = Some(idx);
         Ok(idx)
+    }
+
+    async fn effective_vault_address(&self) -> anyhow::Result<Option<String>> {
+        let Some(address) = self.cfg.vault_address.clone() else {
+            return Ok(None);
+        };
+
+        {
+            let guard = self.account_role.lock().await;
+            if let Some(role) = *guard {
+                return Ok(role.requires_vault_address().then_some(address));
+            }
+        }
+
+        let role = fetch_user_role(&self.http, &self.current_info_url(), &address)
+            .await?
+            .unwrap_or(HyperliquidUserRole::Missing);
+        let mut guard = self.account_role.lock().await;
+        *guard = Some(role);
+        Ok(role.requires_vault_address().then_some(address))
+    }
+
+    async fn fetch_account_snapshot(&self) -> anyhow::Result<AccountEvent> {
+        let user =
+            self.cfg.vault_address.clone().ok_or_else(|| {
+                anyhow::anyhow!("HL_VAULT_ADDRESS is required for account polling")
+            })?;
+        let info_url = self.current_info_url();
+        let value = post_info_request_json(
+            &self.http,
+            &info_url,
+            &build_account_snapshot_request(&user),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("hyperliquid account snapshot error: {err}"))?;
+        let mut snapshot = parse_account_snapshot_with_meta(
+            &value,
+            Some(self.cfg.coin.as_str()),
+            self.cfg.venue_index,
+        )
+        .ok_or_else(|| anyhow::anyhow!("invalid account snapshot response"))?;
+
+        // Unified-account / portfolio-margin API users expose collateral on the spot
+        // clearinghouse endpoint; the perp clearinghouse balance fields are not meaningful for
+        // sizing.
+        if matches!(
+            self.cached_user_abstraction(&user).await?,
+            Some(HyperliquidAccountAbstraction::UnifiedAccount)
+                | Some(HyperliquidAccountAbstraction::PortfolioMargin)
+        ) {
+            let spot_value = post_info_request_json(
+                &self.http,
+                &info_url,
+                &build_spot_clearinghouse_state_request(&user),
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("hyperliquid spot collateral snapshot error: {err}"))?;
+            let spot_snapshot = parse_spot_collateral_snapshot(&spot_value).ok_or_else(|| {
+                anyhow::anyhow!("invalid hyperliquid spot collateral snapshot response")
+            })?;
+            snapshot.timestamp_ms = snapshot.timestamp_ms.max(now_ms());
+            snapshot.balances = spot_snapshot.balances;
+            snapshot.margin = spot_snapshot.margin;
+        }
+
+        Ok(AccountEvent::Snapshot(snapshot))
+    }
+
+    async fn cached_user_abstraction(
+        &self,
+        user: &str,
+    ) -> anyhow::Result<Option<HyperliquidAccountAbstraction>> {
+        {
+            let guard = self.account_abstraction.lock().await;
+            if let Some(mode) = *guard {
+                return Ok(Some(mode));
+            }
+        }
+
+        let mode = fetch_user_abstraction(&self.http, &self.current_info_url(), user).await?;
+        if let Some(mode) = mode {
+            let mut guard = self.account_abstraction.lock().await;
+            *guard = Some(mode);
+        }
+        Ok(mode)
     }
 }
 
@@ -2311,21 +2429,158 @@ async fn fetch_asset_index(
     anyhow::bail!("coin {} not found in Hyperliquid universe", cfg.coin);
 }
 
-async fn fetch_account_snapshot(
+fn build_account_snapshot_request(user: &str) -> serde_json::Value {
+    json!({ "type": "clearinghouseState", "user": user })
+}
+
+fn build_spot_clearinghouse_state_request(user: &str) -> serde_json::Value {
+    json!({ "type": "spotClearinghouseState", "user": user })
+}
+
+async fn post_info_request_json(
     client: &Client,
-    cfg: &HyperliquidConfig,
     info_url: &str,
-) -> anyhow::Result<AccountEvent> {
-    let user = cfg
-        .vault_address
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("HL_VAULT_ADDRESS is required for account polling"))?;
-    let payload = json!({ "type": "userState", "user": user });
-    let resp = client.post(info_url).json(&payload).send().await?;
-    let value: serde_json::Value = resp.json().await?;
-    let snapshot = parse_account_snapshot(&value)
-        .ok_or_else(|| anyhow::anyhow!("invalid account snapshot response"))?;
-    Ok(AccountEvent::Snapshot(snapshot))
+    payload: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let resp = client.post(info_url).json(payload).send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("http {}: {}", status, body);
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HyperliquidAccountAbstraction {
+    Standard,
+    UnifiedAccount,
+    PortfolioMargin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HyperliquidUserRole {
+    Missing,
+    User,
+    Agent,
+    Vault,
+    SubAccount,
+}
+
+impl HyperliquidUserRole {
+    fn requires_vault_address(self) -> bool {
+        matches!(self, Self::Vault | Self::SubAccount)
+    }
+}
+
+async fn fetch_user_abstraction(
+    client: &Client,
+    info_url: &str,
+    user: &str,
+) -> anyhow::Result<Option<HyperliquidAccountAbstraction>> {
+    let value = post_info_request_json(
+        client,
+        info_url,
+        &json!({
+            "type": "userAbstraction",
+            "user": user,
+        }),
+    )
+    .await?;
+    Ok(parse_user_abstraction(&value))
+}
+
+fn parse_user_abstraction(value: &serde_json::Value) -> Option<HyperliquidAccountAbstraction> {
+    match value.as_str()? {
+        "standard" => Some(HyperliquidAccountAbstraction::Standard),
+        "unifiedAccount" => Some(HyperliquidAccountAbstraction::UnifiedAccount),
+        "portfolioMargin" => Some(HyperliquidAccountAbstraction::PortfolioMargin),
+        _ => None,
+    }
+}
+
+async fn fetch_user_role(
+    client: &Client,
+    info_url: &str,
+    user: &str,
+) -> anyhow::Result<Option<HyperliquidUserRole>> {
+    let value = post_info_request_json(
+        client,
+        info_url,
+        &json!({
+            "type": "userRole",
+            "user": user,
+        }),
+    )
+    .await?;
+    Ok(parse_user_role(&value))
+}
+
+fn parse_user_role(value: &serde_json::Value) -> Option<HyperliquidUserRole> {
+    match value.get("role")?.as_str()? {
+        "missing" => Some(HyperliquidUserRole::Missing),
+        "user" => Some(HyperliquidUserRole::User),
+        "agent" => Some(HyperliquidUserRole::Agent),
+        "vault" => Some(HyperliquidUserRole::Vault),
+        "subAccount" => Some(HyperliquidUserRole::SubAccount),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SpotCollateralSnapshot {
+    balances: Vec<BalanceSnapshot>,
+    margin: MarginSnapshot,
+}
+
+fn parse_spot_collateral_snapshot(data: &serde_json::Value) -> Option<SpotCollateralSnapshot> {
+    let balances = data.get("balances")?.as_array()?;
+    let usdc = balances.iter().find(|entry| {
+        entry
+            .get("token")
+            .and_then(|v| v.as_u64())
+            .map(|token| token == 0)
+            .unwrap_or(false)
+            || entry
+                .get("coin")
+                .and_then(|v| v.as_str())
+                .map(|coin| coin.eq_ignore_ascii_case("USDC"))
+                .unwrap_or(false)
+    })?;
+
+    let total = usdc.get("total").and_then(parse_f64_value)?;
+    let hold = usdc.get("hold").and_then(parse_f64_value).unwrap_or(0.0);
+    let available = data
+        .get("tokenToAvailableAfterMaintenance")
+        .and_then(|v| v.as_array())
+        .and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                let pair = entry.as_array()?;
+                if pair.len() != 2 {
+                    return None;
+                }
+                let token = pair[0].as_u64()?;
+                if token != 0 {
+                    return None;
+                }
+                parse_f64_value(&pair[1])
+            })
+        })
+        .unwrap_or_else(|| (total - hold).max(0.0));
+    let used = (total - available).max(0.0);
+
+    Some(SpotCollateralSnapshot {
+        balances: vec![BalanceSnapshot {
+            asset: "USDC".to_string(),
+            total,
+            available,
+        }],
+        margin: MarginSnapshot {
+            balance_usd: total,
+            used_usd: used,
+            available_usd: available,
+        },
+    })
 }
 
 async fn fetch_public_funding(
@@ -2490,6 +2745,12 @@ fn build_batch_cancel_action(
     })
 }
 
+fn is_hyperliquid_cloid(value: &str) -> bool {
+    value.len() == 34
+        && value.starts_with("0x")
+        && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn build_cancel_action(
     intent: &OrderIntent,
     asset_index: u32,
@@ -2497,6 +2758,15 @@ fn build_cancel_action(
     let OrderIntent::Cancel(cancel) = intent else {
         anyhow::bail!("intent not a cancel order");
     };
+    if is_hyperliquid_cloid(&cancel.order_id) {
+        return Ok(json!({
+            "type": "cancelByCloid",
+            "cancels": [{
+                "asset": asset_index,
+                "cloid": cancel.order_id,
+            }]
+        }));
+    }
     Ok(json!({
         "type": "cancel",
         "cancels": [{
@@ -2547,7 +2817,6 @@ mod tests {
 
     #[tokio::test]
     async fn hyperliquid_cancel_all_smoke() {
-        use std::io::Read;
         use tiny_http::{Response, Server};
 
         let server = Server::http("127.0.0.1:0").expect("bind server");
@@ -2587,6 +2856,35 @@ mod tests {
         let (exec_tx, _exec_rx) = mpsc::channel(1);
         let connector = HyperliquidConnector::new(cfg, market_tx, exec_tx);
         connector.cancel_all(1_234).await.expect("cancel_all");
+    }
+
+    #[test]
+    fn cancel_action_uses_oid_for_numeric_order_ids() {
+        let intent = OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "123456".to_string(),
+        });
+        let action = build_cancel_action(&intent, 7).expect("cancel action");
+        assert_eq!(action["type"], "cancel");
+        assert_eq!(action["cancels"][0]["a"], 7);
+        assert_eq!(action["cancels"][0]["o"], "123456");
+    }
+
+    #[test]
+    fn cancel_action_uses_cloid_path_for_hex_client_ids() {
+        let intent = OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "0x1234567890abcdef1234567890abcdef".to_string(),
+        });
+        let action = build_cancel_action(&intent, 7).expect("cancel action");
+        assert_eq!(action["type"], "cancelByCloid");
+        assert_eq!(action["cancels"][0]["asset"], 7);
+        assert_eq!(
+            action["cancels"][0]["cloid"],
+            "0x1234567890abcdef1234567890abcdef"
+        );
     }
 
     #[test]
@@ -2650,6 +2948,106 @@ mod tests {
             Some(SettlementPriceKind::Mark),
             "Hyperliquid settlement must be Mark"
         );
+    }
+
+    #[test]
+    fn account_snapshot_request_and_clearinghouse_shape_parse() {
+        let request = build_account_snapshot_request("0xdeadbeef");
+        assert_eq!(request["type"], "clearinghouseState");
+        assert_eq!(request["user"], "0xdeadbeef");
+
+        let payload = serde_json::json!({
+            "marginSummary": {
+                "accountValue": "100.0",
+                "totalMarginUsed": "12.5",
+                "totalRawUsd": "100.0"
+            },
+            "withdrawable": "87.5",
+            "assetPositions": [{
+                "position": {
+                    "coin": "ETH",
+                    "szi": "0.25",
+                    "entryPx": "2500.0",
+                    "liqPx": "2100.0"
+                }
+            }],
+            "time": 1_700_000_000_123i64
+        });
+        let snapshot =
+            parse_account_snapshot_with_meta(&payload, Some("ETH"), 7).expect("snapshot");
+        assert_eq!(snapshot.venue_index, 7);
+        assert_eq!(snapshot.venue_id, "ETH");
+        assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].symbol, "ETH");
+        assert!((snapshot.margin.balance_usd - 100.0).abs() < 1e-9);
+        assert!((snapshot.margin.available_usd - 87.5).abs() < 1e-9);
+        assert_eq!(snapshot.liquidation.price_liq, Some(2100.0));
+    }
+
+    #[test]
+    fn user_abstraction_parse_recognizes_supported_modes() {
+        assert_eq!(
+            parse_user_abstraction(&serde_json::json!("standard")),
+            Some(HyperliquidAccountAbstraction::Standard)
+        );
+        assert_eq!(
+            parse_user_abstraction(&serde_json::json!("unifiedAccount")),
+            Some(HyperliquidAccountAbstraction::UnifiedAccount)
+        );
+        assert_eq!(
+            parse_user_abstraction(&serde_json::json!("portfolioMargin")),
+            Some(HyperliquidAccountAbstraction::PortfolioMargin)
+        );
+        assert_eq!(parse_user_abstraction(&serde_json::json!("other")), None);
+    }
+
+    #[test]
+    fn user_role_parse_identifies_when_vault_address_is_required() {
+        assert_eq!(
+            parse_user_role(&serde_json::json!({"role": "user"})),
+            Some(HyperliquidUserRole::User)
+        );
+        assert_eq!(
+            parse_user_role(&serde_json::json!({"role": "vault"})),
+            Some(HyperliquidUserRole::Vault)
+        );
+        assert_eq!(
+            parse_user_role(&serde_json::json!({"role": "subAccount"})),
+            Some(HyperliquidUserRole::SubAccount)
+        );
+        assert!(!HyperliquidUserRole::User.requires_vault_address());
+        assert!(HyperliquidUserRole::Vault.requires_vault_address());
+        assert!(HyperliquidUserRole::SubAccount.requires_vault_address());
+    }
+
+    #[test]
+    fn spot_collateral_snapshot_parse_uses_usdc_available_after_maintenance() {
+        let payload = serde_json::json!({
+            "balances": [
+                {
+                    "coin": "USDC",
+                    "token": 0,
+                    "total": "94.8",
+                    "hold": "0.0",
+                    "entryNtl": "0.0"
+                }
+            ],
+            "tokenToAvailableAfterMaintenance": [[0, "91.3"]]
+        });
+
+        let snapshot = parse_spot_collateral_snapshot(&payload).expect("spot collateral");
+        assert_eq!(
+            snapshot.balances,
+            vec![BalanceSnapshot {
+                asset: "USDC".to_string(),
+                total: 94.8,
+                available: 91.3,
+            }]
+        );
+        assert!((snapshot.margin.balance_usd - 94.8).abs() < 1e-9);
+        assert!((snapshot.margin.available_usd - 91.3).abs() < 1e-9);
+        assert!((snapshot.margin.used_usd - 3.5).abs() < 1e-9);
     }
 
     #[test]
@@ -3093,7 +3491,7 @@ pub fn translate_private_events(msg: &serde_json::Value) -> Vec<ExecutionEvent> 
 
 pub fn translate_account_event(msg: &serde_json::Value) -> Option<AccountEvent> {
     let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-    if channel != "userState" {
+    if channel != "userState" && channel != "clearinghouseState" {
         return None;
     }
     let data = msg.get("data")?;
@@ -3147,6 +3545,9 @@ fn parse_user_event(data: &serde_json::Value, seq: u64) -> Option<ExecutionEvent
                 seq,
                 timestamp_ms,
                 order_id: Some(order_id),
+                client_order_id: None,
+                purpose: None,
+                reduce_only: None,
                 reason,
             },
         ));
@@ -3265,10 +3666,25 @@ fn parse_purpose(value: Option<&serde_json::Value>) -> Option<OrderPurpose> {
 }
 
 pub fn parse_account_snapshot(data: &serde_json::Value) -> Option<AccountSnapshot> {
+    parse_account_snapshot_with_meta(data, None, 0)
+}
+
+fn parse_account_snapshot_with_meta(
+    data: &serde_json::Value,
+    default_venue_id: Option<&str>,
+    venue_index: usize,
+) -> Option<AccountSnapshot> {
+    if data.get("marginSummary").is_some() || data.get("assetPositions").is_some() {
+        return parse_clearinghouse_account_snapshot(data, default_venue_id, venue_index);
+    }
+
     let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-    let timestamp_ms = data.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
-    let venue_id = data.get("coin").and_then(|v| v.as_str()).unwrap_or("TAO");
-    let venue_index = 0;
+    let timestamp_ms = data.get("time").and_then(parse_i64_value).unwrap_or(0);
+    let venue_id = data
+        .get("coin")
+        .and_then(|v| v.as_str())
+        .or(default_venue_id)
+        .unwrap_or("TAO");
 
     let positions = data
         .get("positions")
@@ -3276,9 +3692,16 @@ pub fn parse_account_snapshot(data: &serde_json::Value) -> Option<AccountSnapsho
         .map(|arr| {
             arr.iter()
                 .filter_map(|pos| {
-                    let symbol = pos.get("coin").and_then(|v| v.as_str()).unwrap_or("TAO");
-                    let size = pos.get("size")?.as_str()?.parse::<f64>().ok()?;
-                    let entry_price = pos.get("entryPx")?.as_str()?.parse::<f64>().ok()?;
+                    let symbol = pos
+                        .get("coin")
+                        .or_else(|| pos.get("symbol"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(venue_id);
+                    let size = pos.get("size").and_then(parse_f64_value)?;
+                    let entry_price = pos
+                        .get("entryPx")
+                        .or_else(|| pos.get("entry_price"))
+                        .and_then(parse_f64_value)?;
                     Some(PositionSnapshot {
                         symbol: symbol.to_string(),
                         size,
@@ -3296,8 +3719,8 @@ pub fn parse_account_snapshot(data: &serde_json::Value) -> Option<AccountSnapsho
             arr.iter()
                 .filter_map(|bal| {
                     let asset = bal.get("asset")?.as_str()?.to_string();
-                    let total = bal.get("total")?.as_str()?.parse::<f64>().ok()?;
-                    let available = bal.get("available")?.as_str()?.parse::<f64>().ok()?;
+                    let total = bal.get("total").and_then(parse_f64_value)?;
+                    let available = bal.get("available").and_then(parse_f64_value)?;
                     Some(BalanceSnapshot {
                         asset,
                         total,
@@ -3309,33 +3732,19 @@ pub fn parse_account_snapshot(data: &serde_json::Value) -> Option<AccountSnapsho
         .unwrap_or_default();
 
     let margin = data.get("margin")?;
-    let margin_balance = margin.get("balance")?.as_str()?.parse::<f64>().ok()?;
-    let margin_used = margin.get("used")?.as_str()?.parse::<f64>().ok()?;
-    let margin_available = margin.get("available")?.as_str()?.parse::<f64>().ok()?;
     let margin = MarginSnapshot {
-        balance_usd: margin_balance,
-        used_usd: margin_used,
-        available_usd: margin_available,
+        balance_usd: margin.get("balance").and_then(parse_f64_value)?,
+        used_usd: margin.get("used").and_then(parse_f64_value)?,
+        available_usd: margin.get("available").and_then(parse_f64_value)?,
     };
 
     let liquidation = data.get("liquidation")?;
-    let price_liq = liquidation
-        .get("priceLiq")
-        .and_then(|v| v.as_str())
-        .and_then(|v| v.parse::<f64>().ok());
-    let dist_liq_sigma = liquidation
-        .get("distLiqSigma")
-        .and_then(|v| v.as_str())
-        .and_then(|v| v.parse::<f64>().ok());
     let liquidation = LiquidationSnapshot {
-        price_liq,
-        dist_liq_sigma,
+        price_liq: liquidation.get("priceLiq").and_then(parse_f64_value),
+        dist_liq_sigma: liquidation.get("distLiqSigma").and_then(parse_f64_value),
     };
 
-    let funding_8h = data
-        .get("funding8h")
-        .and_then(|v| v.as_str())
-        .and_then(|v| v.parse::<f64>().ok());
+    let funding_8h = data.get("funding8h").and_then(parse_f64_value);
 
     Some(AccountSnapshot {
         venue_index,
@@ -3347,5 +3756,91 @@ pub fn parse_account_snapshot(data: &serde_json::Value) -> Option<AccountSnapsho
         funding_8h,
         margin,
         liquidation,
+    })
+}
+
+fn parse_clearinghouse_account_snapshot(
+    data: &serde_json::Value,
+    default_venue_id: Option<&str>,
+    venue_index: usize,
+) -> Option<AccountSnapshot> {
+    let margin_summary = data
+        .get("marginSummary")
+        .or_else(|| data.get("crossMarginSummary"))?;
+    let balance_usd = margin_summary
+        .get("accountValue")
+        .and_then(parse_f64_value)?;
+    let used_usd = margin_summary
+        .get("totalMarginUsed")
+        .and_then(parse_f64_value)
+        .unwrap_or(0.0);
+    let available_usd = data
+        .get("withdrawable")
+        .and_then(parse_f64_value)
+        .unwrap_or_else(|| (balance_usd - used_usd).max(0.0));
+    let venue_id = data
+        .get("coin")
+        .and_then(|v| v.as_str())
+        .or(default_venue_id)
+        .unwrap_or("TAO");
+    let positions = data
+        .get("assetPositions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let pos = entry.get("position").unwrap_or(entry);
+                    let symbol = pos
+                        .get("coin")
+                        .or_else(|| pos.get("symbol"))
+                        .and_then(|v| v.as_str())?;
+                    let size = pos
+                        .get("szi")
+                        .or_else(|| pos.get("size"))
+                        .and_then(parse_f64_value)?;
+                    let entry_price = pos
+                        .get("entryPx")
+                        .or_else(|| pos.get("entry_price"))
+                        .and_then(parse_f64_value)?;
+                    Some(PositionSnapshot {
+                        symbol: symbol.to_string(),
+                        size,
+                        entry_price,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let price_liq = data
+        .get("assetPositions")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter().find_map(|entry| {
+                let pos = entry.get("position").unwrap_or(entry);
+                pos.get("liqPx").and_then(parse_f64_value)
+            })
+        });
+
+    Some(AccountSnapshot {
+        venue_index,
+        venue_id: venue_id.to_string(),
+        seq: data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+        timestamp_ms: data.get("time").and_then(parse_i64_value).unwrap_or(0),
+        positions,
+        balances: vec![BalanceSnapshot {
+            asset: "USD".to_string(),
+            total: balance_usd,
+            available: available_usd,
+        }],
+        funding_8h: None,
+        margin: MarginSnapshot {
+            balance_usd,
+            used_usd,
+            available_usd,
+        },
+        liquidation: LiquidationSnapshot {
+            price_liq,
+            dist_liq_sigma: None,
+        },
     })
 }

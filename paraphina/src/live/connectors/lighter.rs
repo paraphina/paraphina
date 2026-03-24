@@ -13,9 +13,13 @@ const LIGHTER_DECODE_WARN_INTERVAL_MS: u64 = 10_000;
 const LIGHTER_WS_CONNECT_TIMEOUT_MS_DEFAULT: u64 = 15_000;
 const LIGHTER_WS_READ_TIMEOUT_MS_DEFAULT: u64 = 30_000;
 const LIGHTER_PING_INTERVAL_MS_DEFAULT: u64 = 30_000;
+const LIGHTER_ACCOUNT_LOG_INTERVAL_MS: u64 = 30_000;
+const LIGHTER_ACCOUNT_RATE_LIMIT_BASE_BACKOFF_MS: u64 = 2_000;
+const LIGHTER_ACCOUNT_RATE_LIMIT_MAX_BACKOFF_MS: u64 = 10_000;
 /// Maximum consecutive delta decode failures before forcing a reconnect to
 /// obtain a fresh full snapshot.  Protects against book drift from missed deltas.
 const LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES: usize = 10;
+const LIGHTER_CLIENT_ORDER_INDEX_MAX: u64 = (1u64 << 48) - 1;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 static LIGHTER_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -23,6 +27,10 @@ static LIGHTER_TS_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIGHTER_PING_SENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIGHTER_PING_SEND_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIGHTER_RECONNECT_COUNTS: OnceLock<StdMutex<BTreeMap<&'static str, u64>>> = OnceLock::new();
+static LIGHTER_ACCOUNT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIGHTER_ACCOUNT_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static LIGHTER_ACCOUNT_ERROR_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIGHTER_ACCOUNT_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
@@ -59,6 +67,14 @@ fn lighter_ping_interval_ms() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(LIGHTER_PING_INTERVAL_MS_DEFAULT)
+}
+
+pub fn lighter_account_poll_ms(default_ms: u64) -> u64 {
+    std::env::var("PARAPHINA_LIGHTER_ACCOUNT_POLL_MS")
+        .ok()
+        .or_else(|| std::env::var("LIGHTER_ACCOUNT_POLL_MS").ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default_ms)
 }
 
 fn env_is_true(name: &str) -> bool {
@@ -145,11 +161,11 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::types::{
-    FundingSource, OrderIntent, OrderPurpose, SettlementPriceKind, Side, TimestampMs,
+    FundingSource, OrderIntent, OrderPurpose, SettlementPriceKind, Side, TimeInForce, TimestampMs,
 };
 
 use super::super::gateway::{
@@ -354,6 +370,7 @@ pub struct LighterConnector {
     nonce_path: Option<PathBuf>,
     signer: Option<LighterSignerClient>,
     freshness: Arc<Freshness>,
+    resolved_market: Arc<Mutex<Option<LighterResolvedMarket>>>,
 }
 
 impl LighterConnector {
@@ -400,6 +417,7 @@ impl LighterConnector {
             .as_ref()
             .map(|url| LighterSignerClient::new(url.clone()));
         let freshness = Arc::new(Freshness::default());
+        let resolved_market = Arc::new(Mutex::new(None));
         Self {
             cfg,
             http: Client::builder()
@@ -417,6 +435,7 @@ impl LighterConnector {
             nonce_path,
             signer,
             freshness,
+            resolved_market,
         }
     }
 
@@ -449,27 +468,22 @@ impl LighterConnector {
     }
 
     async fn resolve_market_decimals(&self, market_id: u64) -> anyhow::Result<(u32, u32)> {
-        let (orderbooks, source_url) = fetch_lighter_orderbooks_with_fallbacks(
-            &self.http,
-            &self.cfg.rest_url,
-            &self.cfg.ws_url,
-        )
-        .await?;
-        let Some(info) = orderbooks.iter().find(|info| info.market_id == market_id) else {
+        let info = self.resolve_market_info().await?;
+        if info.market_id != market_id {
             anyhow::bail!("Lighter market_id not found for decimals: {}", market_id);
-        };
+        }
         let price = info.price_decimals.ok_or_else(|| {
             anyhow::anyhow!(
                 "Lighter price decimals missing for market_id={} source_url={}",
                 market_id,
-                source_url
+                info.source
             )
         })?;
         let size = info.size_decimals.ok_or_else(|| {
             anyhow::anyhow!(
                 "Lighter size decimals missing for market_id={} source_url={}",
                 market_id,
-                source_url
+                info.source
             )
         })?;
         Ok((price, size))
@@ -479,13 +493,15 @@ impl LighterConnector {
         &self,
         signed: SignedTx,
     ) -> super::super::gateway::LiveResult<LiveRestResponse> {
+        let tx_info = serde_json::to_string(&signed.tx_info)
+            .map_err(|err| LiveGatewayError::retryable(format!("sendtx_serialize_error: {err}")))?;
         let resp = self
             .http
             .post(sendtx_url(&self.cfg))
-            .json(&serde_json::json!({
-                "tx_type": signed.tx_type,
-                "tx_info": signed.tx_info,
-            }))
+            .form(&[
+                ("tx_type", signed.tx_type.to_string()),
+                ("tx_info", tx_info),
+            ])
             .send()
             .await
             .map_err(|err| LiveGatewayError::retryable(format!("sendtx_error: {err}")))?;
@@ -509,10 +525,21 @@ impl LighterConnector {
     }
 
     async fn resolve_market_id_and_symbol(&self) -> anyhow::Result<(String, u64)> {
+        let info = self.resolve_market_info().await?;
+        Ok((info.symbol, info.market_id))
+    }
+
+    async fn resolve_market_info(&self) -> anyhow::Result<LighterResolvedMarket> {
+        if let Some(info) = self.resolved_market.lock().await.clone() {
+            return Ok(info);
+        }
+
         let market_id_env = std::env::var("LIGHTER_MARKET_ID")
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
-        let market_symbol_env = std::env::var("LIGHTER_MARKET").ok();
+        let market_symbol_env = std::env::var("LIGHTER_MARKET")
+            .ok()
+            .unwrap_or_else(|| self.cfg.market.clone());
         let (orderbooks, source_url) = fetch_lighter_orderbooks_with_fallbacks(
             &self.http,
             &self.cfg.rest_url,
@@ -520,14 +547,12 @@ impl LighterConnector {
         )
         .await?;
 
-        if let Some(market_id) = market_id_env {
-            let symbol = market_symbol_env.clone().or_else(|| {
-                orderbooks
-                    .iter()
-                    .find(|info| info.market_id == market_id)
-                    .map(|info| info.symbol.clone())
-            });
-            let symbol = symbol.unwrap_or_else(|| "UNKNOWN".to_string());
+        let resolved = if let Some(market_id) = market_id_env {
+            let matched = orderbooks
+                .iter()
+                .find(|info| info.market_id == market_id)
+                .cloned();
+            let symbol = market_symbol_env.clone();
             eprintln!(
                 "INFO: Lighter resolving market id symbol={} source_url=env:LIGHTER_MARKET_ID",
                 symbol
@@ -536,39 +561,61 @@ impl LighterConnector {
                 "INFO: Lighter market id resolved symbol={} market_id={} source_url=env:LIGHTER_MARKET_ID",
                 symbol, market_id
             );
-            return Ok((symbol, market_id));
-        }
-
-        let symbol = market_symbol_env.unwrap_or_else(|| "BTC-USD".to_string());
-        eprintln!(
-            "INFO: Lighter resolving market id symbol={} source_url={}",
-            symbol, source_url
-        );
-        let normalized = normalize_lighter_symbol(&symbol);
-        let found = orderbooks
-            .iter()
-            .find(|info| normalize_lighter_symbol(&info.symbol) == normalized)
-            .cloned();
-        let Some(info) = found else {
-            let available: Vec<String> = orderbooks
-                .iter()
-                .take(15)
-                .map(|info| info.symbol.clone())
-                .collect();
+            let resolved = LighterResolvedMarket {
+                symbol,
+                market_id,
+                price_decimals: matched.as_ref().and_then(|info| info.price_decimals),
+                size_decimals: matched.as_ref().and_then(|info| info.size_decimals),
+                source: "env:LIGHTER_MARKET_ID".to_string(),
+            };
+            if matched.is_some() {
+                let mut cache = self.resolved_market.lock().await;
+                *cache = Some(resolved.clone());
+            }
+            resolved
+        } else {
+            let symbol = market_symbol_env;
             eprintln!(
-                "WARN: Lighter market id not found requested={} available_symbols={:?}",
-                normalized, available
+                "INFO: Lighter resolving market id symbol={} source_url={}",
+                symbol, source_url
             );
-            anyhow::bail!(
-                "LIGHTER_MARKET not found in orderBooks response: {}",
-                symbol
+            let normalized = normalize_lighter_symbol(&symbol);
+            let found = orderbooks
+                .iter()
+                .find(|info| normalize_lighter_symbol(&info.symbol) == normalized)
+                .cloned();
+            let Some(info) = found else {
+                let available: Vec<String> = orderbooks
+                    .iter()
+                    .take(15)
+                    .map(|info| info.symbol.clone())
+                    .collect();
+                eprintln!(
+                    "WARN: Lighter market id not found requested={} available_symbols={:?}",
+                    normalized, available
+                );
+                anyhow::bail!(
+                    "LIGHTER_MARKET not found in orderBooks response: {}",
+                    symbol
+                );
+            };
+            eprintln!(
+                "INFO: Lighter market id resolved symbol={} market_id={} source_url={}",
+                info.symbol, info.market_id, source_url
             );
+            let resolved = LighterResolvedMarket {
+                symbol: info.symbol,
+                market_id: info.market_id,
+                price_decimals: info.price_decimals,
+                size_decimals: info.size_decimals,
+                source: source_url,
+            };
+            let mut cache = self.resolved_market.lock().await;
+            *cache = Some(resolved.clone());
+            resolved
         };
-        eprintln!(
-            "INFO: Lighter market id resolved symbol={} market_id={} source_url={}",
-            info.symbol, info.market_id, source_url
-        );
-        Ok((info.symbol, info.market_id))
+
+        Ok(resolved)
     }
 
     pub async fn run_public_ws(&self) {
@@ -1056,17 +1103,34 @@ impl LighterConnector {
 
     pub async fn run_account_polling(&self, interval_ms: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rate_limit_backoff_ms: u64 = 0;
         loop {
             interval.tick().await;
+            if rate_limit_backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(rate_limit_backoff_ms)).await;
+            }
             let Some(account_tx) = self.account_tx.as_ref() else {
                 continue;
             };
             match fetch_account_snapshot(&self.http, &self.cfg).await {
                 Ok(snapshot) => {
+                    rate_limit_backoff_ms = 0;
                     let _ = account_tx.send(snapshot).await;
                 }
                 Err(err) => {
-                    eprintln!("Lighter account polling error: {err}");
+                    let err_text = err.to_string();
+                    if err_text.contains("http 429") {
+                        rate_limit_backoff_ms = if rate_limit_backoff_ms == 0 {
+                            interval_ms.max(LIGHTER_ACCOUNT_RATE_LIMIT_BASE_BACKOFF_MS)
+                        } else {
+                            (rate_limit_backoff_ms * 2)
+                                .min(LIGHTER_ACCOUNT_RATE_LIMIT_MAX_BACKOFF_MS)
+                        };
+                    } else {
+                        rate_limit_backoff_ms = 0;
+                    }
+                    maybe_log_lighter_account_error(&err_text, interval_ms, rate_limit_backoff_ms);
                 }
             }
         }
@@ -1074,6 +1138,7 @@ impl LighterConnector {
 
     pub async fn run_funding_polling(&self, interval_ms: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(interval_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut seq: u64 = 0;
 
         // FIX: Retry initialization with exponential backoff instead of fatal exit
@@ -1212,7 +1277,9 @@ impl LighterConnector {
                 }
             };
             if let Message::Text(text) = msg {
-                if let Some(event) = translate_private_event(&text) {
+                if let Some(event) =
+                    translate_private_event(&text, self.cfg.venue_index, &self.cfg.venue_id)
+                {
                     let _ = self.exec_tx.send(event).await;
                 }
             }
@@ -1771,9 +1838,19 @@ struct LighterOrderBookInfo {
     size_decimals: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+struct LighterResolvedMarket {
+    symbol: String,
+    market_id: u64,
+    price_decimals: Option<u32>,
+    size_decimals: Option<u32>,
+    source: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct LighterAccountQuery {
-    account_index: u64,
+    by: &'static str,
+    value: String,
 }
 
 #[allow(dead_code)]
@@ -1982,6 +2059,25 @@ mod tests {
     }
 
     #[test]
+    fn lighter_account_poll_ms_prefers_specific_override() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_LIVE_ACCOUNT_POLL_MS",
+            "PARAPHINA_LIGHTER_ACCOUNT_POLL_MS",
+            "LIGHTER_ACCOUNT_POLL_MS",
+        ]);
+        unset_env("LIGHTER_ACCOUNT_POLL_MS");
+        set_env("PARAPHINA_LIVE_ACCOUNT_POLL_MS", "1000");
+        set_env("PARAPHINA_LIGHTER_ACCOUNT_POLL_MS", "3000");
+        assert_eq!(lighter_account_poll_ms(1_000), 3_000);
+        unset_env("PARAPHINA_LIGHTER_ACCOUNT_POLL_MS");
+        set_env("LIGHTER_ACCOUNT_POLL_MS", "2500");
+        assert_eq!(lighter_account_poll_ms(1_000), 2_500);
+        unset_env("LIGHTER_ACCOUNT_POLL_MS");
+        assert_eq!(lighter_account_poll_ms(1_000), 1_000);
+    }
+
+    #[test]
     fn order_book_channel_formats() {
         assert_eq!(build_order_book_channel(42), "order_book/42");
     }
@@ -2125,30 +2221,46 @@ mod tests {
 
     #[tokio::test]
     async fn lighter_account_snapshot_hits_api_v1_account() {
-        let server = MockServer::start_async().await;
-        let payload = serde_json::json!({
-            "seq": 1,
-            "ts": 2,
-            "positions": [],
-            "margin": { "balance": 1000.0, "used": 10.0, "available": 990.0 },
-            "liquidation": { "price_liq": 50.0, "dist_liq_sigma": 1.2 },
-            "balances": [{ "asset": "USD", "total": 1000.0, "available": 990.0 }]
-        });
-        let mock = server
-            .mock_async(|when, then| {
-                when.method(GET)
-                    .path("/api/v1/account")
-                    .query_param("account_index", "123")
-                    .header("Authorization", "Bearer t");
-                then.status(200).json_body(payload);
+        let req = Client::new()
+            .get("https://example.invalid/api/v1/account")
+            .query(&LighterAccountQuery {
+                by: "index",
+                value: "123".to_string(),
             })
-            .await;
+            .build()
+            .expect("request");
+        assert_eq!(req.url().query(), Some("by=index&value=123"));
+
+        let payload = serde_json::json!({
+            "code": 200,
+            "total": 1,
+            "accounts": [{
+                "index": 123,
+                "account_index": 123,
+                "available_balance": "990.0",
+                "collateral": "1000.0",
+                "transaction_time": 1_700_000_000_123_000i64,
+                "positions": [{
+                    "symbol": "ETH",
+                    "sign": -1,
+                    "position": "2.5",
+                    "avg_entry_price": "2500.0",
+                    "liquidation_price": "2100.0"
+                }],
+                "assets": [{
+                    "symbol": "ETH",
+                    "asset_id": 1,
+                    "balance": "0.5",
+                    "locked_balance": "0.1"
+                }]
+            }]
+        });
         let cfg = LighterConfig {
             ws_url: "wss://example.invalid".to_string(),
-            rest_url: server.base_url(),
+            rest_url: "https://example.invalid".to_string(),
             market: "BTC-USD".to_string(),
             venue_id: "LIGHTER".to_string(),
-            venue_index: 0,
+            venue_index: 3,
             paper_mode: true,
             api_key_index: Some(1),
             account_index: Some(123),
@@ -2157,13 +2269,18 @@ mod tests {
             nonce_path: None,
             signer_url: None,
         };
-        let client = Client::new();
-        let event = fetch_account_snapshot(&client, &cfg)
-            .await
+        let snapshot = parse_account_snapshot_with_meta(&payload, &cfg.venue_id, cfg.venue_index)
             .expect("snapshot");
-        let AccountEvent::Snapshot(snapshot) = event;
         assert_eq!(snapshot.venue_id, "LIGHTER");
-        mock.assert_async().await;
+        assert_eq!(snapshot.venue_index, 3);
+        assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert!((snapshot.positions[0].size + 2.5).abs() < 1e-9);
+        assert_eq!(snapshot.liquidation.price_liq, Some(2100.0));
+        assert!(snapshot
+            .balances
+            .iter()
+            .any(|bal| bal.asset == "USDC" && (bal.available - 990.0).abs() < 1e-9));
     }
 
     #[tokio::test]
@@ -2208,8 +2325,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/api/v1/sendTx")
-                    .body_contains("\"tx_type\":14")
-                    .body_contains("\"signed\":true");
+                    .body_contains("tx_type=14")
+                    .body_contains("tx_info=%7B%22signed%22%3Atrue%7D");
                 then.status(200)
                     .json_body(serde_json::json!({"order_id":"abc"}));
             })
@@ -2245,9 +2362,267 @@ mod tests {
         };
         let resp = connector.place_order(req).await.expect("place");
         assert_eq!(resp.order_id.as_deref(), Some("abc"));
-        orderbooks.assert_hits_async(2).await;
+        orderbooks.assert_hits_async(1).await;
         sign.assert_async().await;
         sendtx.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn lighter_ioc_order_uses_nil_order_expiry() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LIGHTER_MARKET_ID");
+        std::env::remove_var("LIGHTER_MARKET");
+        let api = MockServer::start_async().await;
+        let signer = MockServer::start_async().await;
+        let orderbooks = api
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "order_books": [
+                        {
+                            "symbol": "ETH",
+                            "market_id": 0,
+                            "supported_price_decimals": 2,
+                            "supported_size_decimals": 4
+                        }
+                    ]
+                }));
+            })
+            .await;
+        let sign = signer
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sign")
+                    .body_contains("\"op\":\"create_order\"")
+                    .body_contains("\"time_in_force\":\"Ioc\"")
+                    .body_contains("\"reduce_only\":1")
+                    .body_contains("\"order_expiry\":0");
+                then.status(200)
+                    .json_body(serde_json::json!({"tx_type":14,"tx_info":{"signed":true}}));
+            })
+            .await;
+        let sendtx = api
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/v1/sendTx")
+                    .body_contains("tx_type=14")
+                    .body_contains("tx_info=%7B%22signed%22%3Atrue%7D");
+                then.status(200)
+                    .json_body(serde_json::json!({"order_id":"ioc-cleanup"}));
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: api.base_url(),
+            market: "ETH-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: Some(signer.base_url()),
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let req = LiveRestPlaceRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            side: Side::Buy,
+            price: 2150.0,
+            size: 0.79,
+            purpose: OrderPurpose::Exit,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: "42".to_string(),
+        };
+        let resp = connector.place_order(req).await.expect("place");
+        assert_eq!(resp.order_id.as_deref(), Some("ioc-cleanup"));
+        orderbooks.assert_hits_async(1).await;
+        sign.assert_async().await;
+        sendtx.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_market_id_uses_cfg_market_when_env_missing() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LIGHTER_MARKET_ID");
+        std::env::remove_var("LIGHTER_MARKET");
+        let server = MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "order_books": [
+                        {
+                            "symbol": "ETH",
+                            "market_id": 0,
+                            "supported_price_decimals": 2,
+                            "supported_size_decimals": 4
+                        }
+                    ]
+                }));
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETH-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: true,
+            api_key_index: None,
+            account_index: None,
+            api_private_key_hex: None,
+            auth_token: None,
+            nonce_path: None,
+            signer_url: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let (symbol, market_id) = connector
+            .resolve_market_id_and_symbol()
+            .await
+            .expect("market resolution");
+        assert_eq!(symbol, "ETH");
+        assert_eq!(market_id, 0);
+    }
+
+    #[tokio::test]
+    async fn lighter_place_order_rejects_client_order_id_above_u48() {
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "https://example.invalid".to_string(),
+            market: "ETH-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(2),
+            account_index: Some(718392),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: Some("http://127.0.0.1:9".to_string()),
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let err = connector
+            .place_order(LiveRestPlaceRequest {
+                venue_index: 0,
+                venue_id: "LIGHTER".to_string(),
+                side: Side::Buy,
+                price: 2081.57,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: (LIGHTER_CLIENT_ORDER_INDEX_MAX + 1).to_string(),
+            })
+            .await
+            .expect_err("place should fail");
+        assert_eq!(err.kind, LiveGatewayErrorKind::Fatal);
+        assert!(err.message.contains("exceeds uint48 max"));
+    }
+
+    #[test]
+    fn lighter_err_with_context_preserves_kind_and_appends_context() {
+        let err = err_with_context(
+            LiveGatewayError::fatal("{\"code\":20001,\"message\":\"invalid param \"}"),
+            "lighter place context market_id=0 client_order_index=42 price=208157 base_amount=100 tif=Gtc post_only=true reduce_only=false",
+        );
+        assert_eq!(err.kind, LiveGatewayErrorKind::Fatal);
+        assert!(err.message.contains("\"code\":20001"));
+        assert!(err.message.contains("market_id=0"));
+        assert!(err.message.contains("client_order_index=42"));
+        assert!(err.message.contains("price=208157"));
+        assert!(err.message.contains("base_amount=100"));
+    }
+
+    #[test]
+    fn lighter_private_fill_uses_connector_venue_identity() {
+        let text = serde_json::json!({
+            "type": "fill",
+            "seq": 44,
+            "ts": 1_700_000_123_456i64,
+            "order_id": "oid-123",
+            "client_order_id": "coid-456",
+            "fill_id": "fill-789",
+            "side": "sell",
+            "price": 2081.57,
+            "size": 0.01,
+            "purpose": "Mm",
+            "fee_bps": 1.5
+        })
+        .to_string();
+        let event = translate_private_event(&text, 3, "lighter").expect("fill");
+        match event {
+            ExecutionEvent::Filled(fill) => {
+                assert_eq!(fill.venue_index, 3);
+                assert_eq!(fill.venue_id, "lighter");
+                assert_eq!(fill.seq, 44);
+                assert_eq!(fill.timestamp_ms, 1_700_000_123_456);
+                assert_eq!(fill.order_id.as_deref(), Some("oid-123"));
+                assert_eq!(fill.client_order_id.as_deref(), Some("coid-456"));
+                assert_eq!(fill.fill_id.as_deref(), Some("fill-789"));
+                assert_eq!(fill.side, Side::Sell);
+                assert!((fill.price - 2081.57).abs() < 1e-9);
+                assert!((fill.size - 0.01).abs() < 1e-9);
+                assert_eq!(fill.purpose, OrderPurpose::Mm);
+                assert!((fill.fee_bps - 1.5).abs() < 1e-9);
+            }
+            other => panic!("expected fill event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lighter_private_events_accept_uppercase_side_variants() {
+        let ack = serde_json::json!({
+            "type": "order_ack",
+            "seq": 45,
+            "ts": 1_700_000_123_457i64,
+            "order_id": "oid-ack",
+            "client_order_id": "coid-ack",
+            "side": "BUY",
+            "price": 2080.0,
+            "size": 0.01,
+            "purpose": "Mm"
+        })
+        .to_string();
+        let event = translate_private_event(&ack, 3, "lighter").expect("order ack");
+        match event {
+            ExecutionEvent::OrderAccepted(ack) => {
+                assert_eq!(ack.side, Side::Buy);
+            }
+            other => panic!("expected order ack event, got {other:?}"),
+        }
+
+        let fill = serde_json::json!({
+            "type": "fill",
+            "seq": 46,
+            "ts": 1_700_000_123_458i64,
+            "order_id": "oid-fill",
+            "client_order_id": "coid-fill",
+            "fill_id": "fill-790",
+            "side": "SELL",
+            "price": 2082.0,
+            "size": 0.01,
+            "purpose": "Mm"
+        })
+        .to_string();
+        let event = translate_private_event(&fill, 3, "lighter").expect("fill");
+        match event {
+            ExecutionEvent::Filled(fill) => {
+                assert_eq!(fill.side, Side::Sell);
+            }
+            other => panic!("expected fill event, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2277,7 +2652,7 @@ mod tests {
                     .body_contains("\"account_index\":123")
                     .body_contains("\"api_key_index\":1")
                     .body_contains("\"market_index\":7")
-                    .body_contains("\"order_index\":55");
+                    .body_contains("\"client_order_index\":55");
                 then.status(200)
                     .json_body(serde_json::json!({"tx_type":15,"tx_info":{"signed":true}}));
             })
@@ -2286,8 +2661,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/api/v1/sendTx")
-                    .body_contains("\"tx_type\":15")
-                    .body_contains("\"signed\":true");
+                    .body_contains("tx_type=15")
+                    .body_contains("tx_info=%7B%22signed%22%3Atrue%7D");
                 then.status(200).json_body(serde_json::json!({}));
             })
             .await;
@@ -2321,6 +2696,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lighter_cancel_order_uses_exchange_order_index_for_large_ids() {
+        let api = MockServer::start_async().await;
+        let signer = MockServer::start_async().await;
+        let orderbooks = api
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "order_books": [
+                        {
+                            "symbol": "BTC",
+                            "market_id": 7,
+                            "supported_price_decimals": 2,
+                            "supported_size_decimals": 3
+                        }
+                    ]
+                }));
+            })
+            .await;
+        let large_order_index = LIGHTER_CLIENT_ORDER_INDEX_MAX + 1;
+        let sign = signer
+            .mock_async(move |when, then| {
+                when.method(POST)
+                    .path("/sign")
+                    .body_contains("\"op\":\"cancel_order\"")
+                    .body_contains("\"account_index\":123")
+                    .body_contains("\"api_key_index\":1")
+                    .body_contains("\"market_index\":7")
+                    .body_contains(&format!("\"order_index\":{}", large_order_index));
+                then.status(200)
+                    .json_body(serde_json::json!({"tx_type":15,"tx_info":{"signed":true}}));
+            })
+            .await;
+        let sendtx = api
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/v1/sendTx")
+                    .body_contains("tx_type=15")
+                    .body_contains("tx_info=%7B%22signed%22%3Atrue%7D");
+                then.status(200).json_body(serde_json::json!({}));
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: api.base_url(),
+            market: "BTC-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: Some(signer.base_url()),
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let req = LiveRestCancelRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            order_id: large_order_index.to_string(),
+        };
+        let resp = connector.cancel_order(req).await.expect("cancel");
+        assert!(resp.order_id.is_none());
+        orderbooks.assert_hits_async(1).await;
+        sign.assert_async().await;
+        sendtx.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn lighter_cancel_all_calls_signer_then_sendtx() {
         let api = MockServer::start_async().await;
         let signer = MockServer::start_async().await;
@@ -2330,7 +2776,8 @@ mod tests {
                     .path("/sign")
                     .body_contains("\"op\":\"cancel_all\"")
                     .body_contains("\"account_index\":123")
-                    .body_contains("\"api_key_index\":1");
+                    .body_contains("\"api_key_index\":1")
+                    .body_contains("\"cancel_all_time\":0");
                 then.status(200)
                     .json_body(serde_json::json!({"tx_type":16,"tx_info":{"signed":true}}));
             })
@@ -2339,8 +2786,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/api/v1/sendTx")
-                    .body_contains("\"tx_type\":16")
-                    .body_contains("\"signed\":true");
+                    .body_contains("tx_type=16")
+                    .body_contains("tx_info=%7B%22signed%22%3Atrue%7D");
                 then.status(200).json_body(serde_json::json!({}));
             })
             .await;
@@ -2412,6 +2859,66 @@ mod tests {
             .expect("resolve");
         assert_eq!(symbol, "BTC");
         assert_eq!(market_id, 1);
+        std::env::remove_var("LIGHTER_MARKET");
+    }
+
+    #[tokio::test]
+    async fn resolve_market_id_is_cached_after_first_lookup() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LIGHTER_MARKET_ID");
+        std::env::set_var("LIGHTER_MARKET", "BTC-USD");
+        let server = MockServer::start_async().await;
+        let orderbooks = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "code": 200,
+                    "order_books": [
+                        {
+                            "symbol": "BTC-USD",
+                            "market_id": 7,
+                            "price_decimals": 2,
+                            "size_decimals": 3
+                        }
+                    ]
+                }));
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "BTC-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: true,
+            api_key_index: None,
+            account_index: None,
+            api_private_key_hex: None,
+            auth_token: None,
+            nonce_path: None,
+            signer_url: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+
+        let first = connector
+            .resolve_market_id_and_symbol()
+            .await
+            .expect("first resolve");
+        let second = connector
+            .resolve_market_id_and_symbol()
+            .await
+            .expect("second resolve");
+        let decimals = connector
+            .resolve_market_decimals(first.1)
+            .await
+            .expect("decimals");
+
+        assert_eq!(first, ("BTC-USD".to_string(), 7));
+        assert_eq!(second, first);
+        assert_eq!(decimals, (2, 3));
+        orderbooks.assert_hits_async(1).await;
         std::env::remove_var("LIGHTER_MARKET");
     }
 
@@ -3089,13 +3596,16 @@ mod tests {
     }
 }
 
-pub fn translate_private_event(text: &str) -> Option<ExecutionEvent> {
+pub fn translate_private_event(
+    text: &str,
+    venue_index: usize,
+    venue_id: &str,
+) -> Option<ExecutionEvent> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let msg_type = value.get("type")?.as_str()?;
     let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
     let timestamp_ms = value.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
-    let venue_id = "LIGHTER".to_string();
-    let venue_index = 0;
+    let venue_id = venue_id.to_string();
     match msg_type {
         "order_ack" => Some(ExecutionEvent::OrderAccepted(
             super::super::types::OrderAccepted {
@@ -3152,10 +3662,12 @@ pub fn translate_private_event(text: &str) -> Option<ExecutionEvent> {
 
 fn parse_side(value: &serde_json::Value) -> Option<Side> {
     let raw = value.as_str()?;
-    match raw {
-        "buy" | "Buy" | "B" => Some(Side::Buy),
-        "sell" | "Sell" | "S" => Some(Side::Sell),
-        _ => None,
+    if raw.eq_ignore_ascii_case("buy") || raw == "B" {
+        Some(Side::Buy)
+    } else if raw.eq_ignore_ascii_case("sell") || raw == "S" {
+        Some(Side::Sell)
+    } else {
+        None
     }
 }
 
@@ -3181,21 +3693,136 @@ async fn fetch_account_snapshot(
     let account_index = cfg
         .account_index
         .ok_or_else(|| anyhow::anyhow!("lighter: missing auth account_index"))?;
-    let query = LighterAccountQuery { account_index };
+    let query = LighterAccountQuery {
+        by: "index",
+        value: account_index.to_string(),
+    };
     let mut req = client.get(account_url(cfg)).query(&query);
     if let Some(token) = cfg.auth_token.as_ref() {
         req = req.bearer_auth(token);
     }
     let resp = req.send().await?;
-    let value: serde_json::Value = resp.json().await?;
-    let snapshot = parse_account_snapshot(&value, &cfg.venue_id)
-        .ok_or_else(|| anyhow::anyhow!("invalid account snapshot"))?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("lighter account snapshot http {}: {}", status, body);
+    }
+    let value: serde_json::Value = serde_json::from_str(&body)?;
+    let snapshot = parse_account_snapshot_with_meta(&value, &cfg.venue_id, cfg.venue_index)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid account snapshot: {}",
+                summarize_account_payload(&value)
+            )
+        })?;
+    maybe_log_lighter_account_snapshot(&snapshot, &value);
     Ok(AccountEvent::Snapshot(snapshot))
 }
 
 /// Rate-limit log state for funding fetch errors.
 static LIGHTER_FUNDING_ERROR_LOG_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+fn should_log_account_event(last_log_ms: &AtomicU64, log_count: &AtomicU64, now_ms: u64) -> bool {
+    let count = log_count.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 3 {
+        last_log_ms.store(now_ms, Ordering::Relaxed);
+        return true;
+    }
+    let last = last_log_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= LIGHTER_ACCOUNT_LOG_INTERVAL_MS {
+        last_log_ms.store(now_ms, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+fn summarize_account_payload(value: &serde_json::Value) -> String {
+    let top_keys = value
+        .as_object()
+        .map(|obj| {
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            keys.join(",")
+        })
+        .unwrap_or_else(|| "non_object".to_string());
+    let account = value
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .unwrap_or(value);
+    let account_keys = account
+        .as_object()
+        .map(|obj| {
+            let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            keys.join(",")
+        })
+        .unwrap_or_else(|| "non_object".to_string());
+    format!("top_keys=[{top_keys}] account_keys=[{account_keys}]")
+}
+
+fn maybe_log_lighter_account_snapshot(snapshot: &AccountSnapshot, value: &serde_json::Value) {
+    let positions = snapshot
+        .positions
+        .iter()
+        .filter(|pos| pos.size.abs() > 1e-9)
+        .map(|pos| format!("{}:{:.4}", pos.symbol, pos.size))
+        .collect::<Vec<_>>();
+    let account = value
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .unwrap_or(value);
+    let total_order_count = account
+        .get("total_order_count")
+        .and_then(parse_i64_value)
+        .unwrap_or(0);
+    let pending_order_count = account
+        .get("pending_order_count")
+        .and_then(parse_i64_value)
+        .unwrap_or(0);
+    let should_log = !positions.is_empty()
+        || total_order_count > 0
+        || pending_order_count > 0
+        || should_log_account_event(
+            &LIGHTER_ACCOUNT_LAST_LOG_MS,
+            &LIGHTER_ACCOUNT_LOG_COUNT,
+            now_ms(),
+        );
+    if !should_log {
+        return;
+    }
+    let positions_summary = if positions.is_empty() {
+        "flat".to_string()
+    } else {
+        positions.join("|")
+    };
+    eprintln!(
+        "INFO: Lighter account snapshot seq={} ts={} positions={} collateral_usd={:.6} available_usd={:.6} total_order_count={} pending_order_count={}",
+        snapshot.seq,
+        snapshot.timestamp_ms,
+        positions_summary,
+        snapshot.margin.balance_usd,
+        snapshot.margin.available_usd,
+        total_order_count,
+        pending_order_count
+    );
+}
+
+fn maybe_log_lighter_account_error(err: &str, interval_ms: u64, backoff_ms: u64) {
+    if !should_log_account_event(
+        &LIGHTER_ACCOUNT_ERROR_LAST_LOG_MS,
+        &LIGHTER_ACCOUNT_ERROR_LOG_COUNT,
+        now_ms(),
+    ) {
+        return;
+    }
+    eprintln!(
+        "Lighter account polling error: {} (interval_ms={} backoff_ms={})",
+        err, interval_ms, backoff_ms
+    );
+}
 
 async fn fetch_public_funding(
     client: &Client,
@@ -3389,18 +4016,61 @@ fn parse_i64_value(value: &serde_json::Value) -> Option<i64> {
 }
 
 pub fn parse_account_snapshot(data: &serde_json::Value, venue_id: &str) -> Option<AccountSnapshot> {
-    let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-    let timestamp_ms = data.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
-    let venue_index = 0;
-    let positions = data
+    parse_account_snapshot_with_meta(data, venue_id, 0)
+}
+
+fn parse_account_snapshot_with_meta(
+    data: &serde_json::Value,
+    venue_id: &str,
+    venue_index: usize,
+) -> Option<AccountSnapshot> {
+    let account = data
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .unwrap_or(data);
+    let seq = account
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            account
+                .get("transaction_time")
+                .and_then(parse_i64_value)
+                .map(|v| v.max(0) as u64)
+        })
+        .or_else(|| {
+            account
+                .get("created_at")
+                .and_then(parse_i64_value)
+                .map(|v| v.max(0) as u64)
+        })
+        .unwrap_or(0);
+    let timestamp_ms = normalize_lighter_timestamp_ms(
+        account
+            .get("ts")
+            .or_else(|| account.get("transaction_time"))
+            .or_else(|| account.get("created_at"))
+            .and_then(parse_i64_value)
+            .unwrap_or(0),
+    );
+    let positions = account
         .get("positions")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|pos| {
                     let symbol = pos.get("symbol")?.as_str()?;
-                    let size = pos.get("size")?.as_f64()?;
-                    let entry_price = pos.get("entry_px")?.as_f64()?;
+                    let size = if let Some(size) = pos.get("size").and_then(parse_f64_value) {
+                        size
+                    } else {
+                        let base = pos.get("position").and_then(parse_f64_value)?;
+                        let sign = pos.get("sign").and_then(parse_f64_value).unwrap_or(1.0);
+                        base * sign.signum()
+                    };
+                    let entry_price = pos
+                        .get("entry_px")
+                        .or_else(|| pos.get("avg_entry_price"))
+                        .and_then(parse_f64_value)?;
                     Some(PositionSnapshot {
                         symbol: symbol.to_string(),
                         size,
@@ -3410,36 +4080,98 @@ pub fn parse_account_snapshot(data: &serde_json::Value, venue_id: &str) -> Optio
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let margin = data.get("margin")?;
-    let margin = MarginSnapshot {
-        balance_usd: margin.get("balance")?.as_f64()?,
-        used_usd: margin.get("used")?.as_f64()?,
-        available_usd: margin.get("available")?.as_f64()?,
-    };
-    let liquidation = data.get("liquidation")?;
-    let liquidation = LiquidationSnapshot {
-        price_liq: liquidation.get("price_liq").and_then(|v| v.as_f64()),
-        dist_liq_sigma: liquidation.get("dist_liq_sigma").and_then(|v| v.as_f64()),
-    };
-    let funding_8h = data.get("funding_8h").and_then(|v| v.as_f64());
-    let balances = data
-        .get("balances")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|bal| {
-                    let asset = bal.get("asset")?.as_str()?;
-                    let total = bal.get("total")?.as_f64()?;
-                    let available = bal.get("available")?.as_f64()?;
-                    Some(BalanceSnapshot {
-                        asset: asset.to_string(),
-                        total,
-                        available,
-                    })
+
+    let balances = if let Some(arr) = account.get("balances").and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|bal| {
+                let asset = bal.get("asset")?.as_str()?;
+                let total = bal.get("total").and_then(parse_f64_value)?;
+                let available = bal.get("available").and_then(parse_f64_value)?;
+                Some(BalanceSnapshot {
+                    asset: asset.to_string(),
+                    total,
+                    available,
                 })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let mut parsed = account
+            .get("assets")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|asset| {
+                        let symbol = asset.get("symbol")?.as_str()?;
+                        let total = asset.get("balance").and_then(parse_f64_value)?;
+                        let locked = asset
+                            .get("locked_balance")
+                            .and_then(parse_f64_value)
+                            .unwrap_or(0.0);
+                        Some(BalanceSnapshot {
+                            asset: symbol.to_string(),
+                            total,
+                            available: (total - locked).max(0.0),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let (Some(total), Some(available)) = (
+            account.get("collateral").and_then(parse_f64_value),
+            account.get("available_balance").and_then(parse_f64_value),
+        ) {
+            if !parsed
+                .iter()
+                .any(|balance| balance.asset.eq_ignore_ascii_case("USDC"))
+            {
+                parsed.push(BalanceSnapshot {
+                    asset: "USDC".to_string(),
+                    total,
+                    available,
+                });
+            }
+        }
+        parsed
+    };
+
+    let (margin, liquidation, funding_8h) = if let Some(margin) = account.get("margin") {
+        let liquidation = account.get("liquidation")?;
+        (
+            MarginSnapshot {
+                balance_usd: margin.get("balance").and_then(parse_f64_value)?,
+                used_usd: margin.get("used").and_then(parse_f64_value)?,
+                available_usd: margin.get("available").and_then(parse_f64_value)?,
+            },
+            LiquidationSnapshot {
+                price_liq: liquidation.get("price_liq").and_then(parse_f64_value),
+                dist_liq_sigma: liquidation.get("dist_liq_sigma").and_then(parse_f64_value),
+            },
+            account.get("funding_8h").and_then(parse_f64_value),
+        )
+    } else {
+        let balance_usd = account.get("collateral").and_then(parse_f64_value)?;
+        let available_usd = account.get("available_balance").and_then(parse_f64_value)?;
+        let price_liq = account
+            .get("positions")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find_map(|pos| pos.get("liquidation_price").and_then(parse_f64_value))
+            });
+        (
+            MarginSnapshot {
+                balance_usd,
+                used_usd: (balance_usd - available_usd).max(0.0),
+                available_usd,
+            },
+            LiquidationSnapshot {
+                price_liq,
+                dist_liq_sigma: None,
+            },
+            None,
+        )
+    };
+
     Some(AccountSnapshot {
         venue_index,
         venue_id: venue_id.to_string(),
@@ -3451,6 +4183,14 @@ pub fn parse_account_snapshot(data: &serde_json::Value, venue_id: &str) -> Optio
         margin,
         liquidation,
     })
+}
+
+fn normalize_lighter_timestamp_ms(raw: i64) -> i64 {
+    if raw > 10_000_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    }
 }
 
 impl LiveRestClient for LighterConnector {
@@ -3489,6 +4229,12 @@ impl LiveRestClient for LighterConnector {
                     "lighter: client_order_id must be numeric for signer bridge",
                 )
             })?;
+            if client_order_index > LIGHTER_CLIENT_ORDER_INDEX_MAX {
+                return Err(LiveGatewayError::fatal(format!(
+                    "lighter: client_order_id exceeds uint48 max client_order_id={} max={}",
+                    req.client_order_id, LIGHTER_CLIENT_ORDER_INDEX_MAX
+                )));
+            }
             let (_, market_id) = self.resolve_market_id_and_symbol().await.map_err(|err| {
                 LiveGatewayError::fatal(format!("lighter market_id error: {err}"))
             })?;
@@ -3501,6 +4247,10 @@ impl LiveRestClient for LighterConnector {
             let base_amount = scale_to_i64(req.size, size_decimals, "size")
                 .map_err(|err| LiveGatewayError::fatal(format!("{err}")))?;
             let expired_at = now_ms().saturating_add(60_000);
+            let order_expiry = match req.time_in_force {
+                TimeInForce::Ioc => Some(0),
+                _ => None,
+            };
             let _intent = OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: req.venue_index,
                 venue_id: req.venue_id.as_str().into(),
@@ -3528,14 +4278,27 @@ impl LiveRestClient for LighterConnector {
                 post_only: if req.post_only { 1 } else { 0 },
                 reduce_only: if req.reduce_only { 1 } else { 0 },
                 trigger_price: None,
-                order_expiry: None,
+                order_expiry,
                 expired_at,
             };
             let signed = signer
                 .sign_create_order(sign_req)
                 .await
                 .map_err(|err| LiveGatewayError::retryable(format!("signer_error: {err}")))?;
-            let resp = self.submit_sendtx(signed).await?;
+            let context = format!(
+                "lighter place context market_id={} client_order_index={} price={} base_amount={} tif={:?} post_only={} reduce_only={}",
+                market_id,
+                client_order_index,
+                price,
+                base_amount,
+                req.time_in_force,
+                req.post_only,
+                req.reduce_only
+            );
+            let resp = self
+                .submit_sendtx(signed)
+                .await
+                .map_err(|err| err_with_context(err, &context))?;
             Ok(resp)
         })
     }
@@ -3570,9 +4333,15 @@ impl LiveRestClient for LighterConnector {
                 .cfg
                 .api_key_index
                 .ok_or_else(|| LiveGatewayError::fatal("lighter: missing auth api_key_index"))?;
-            let order_index = req.order_id.parse::<u64>().map_err(|_| {
+            let raw_order_id = req.order_id.parse::<u64>().map_err(|_| {
                 LiveGatewayError::fatal("lighter: order_id must be numeric for signer bridge")
             })?;
+            let (order_index, client_order_index) =
+                if raw_order_id <= LIGHTER_CLIENT_ORDER_INDEX_MAX {
+                    (None, Some(raw_order_id))
+                } else {
+                    (Some(raw_order_id), None)
+                };
             let (_, market_id) = self.resolve_market_id_and_symbol().await.map_err(|err| {
                 LiveGatewayError::fatal(format!("lighter market_id error: {err}"))
             })?;
@@ -3583,8 +4352,8 @@ impl LiveRestClient for LighterConnector {
                 api_key_index,
                 nonce: self.next_nonce(),
                 market_index: market_id,
-                order_index: Some(order_index),
-                client_order_index: None,
+                order_index,
+                client_order_index,
                 expired_at,
             };
             let signed = signer
@@ -3626,15 +4395,15 @@ impl LiveRestClient for LighterConnector {
                 .cfg
                 .api_key_index
                 .ok_or_else(|| LiveGatewayError::fatal("lighter: missing auth api_key_index"))?;
-            let now_ms = now_ms();
             let sign_req = SignCancelAllRequest {
                 op: "cancel_all".to_string(),
                 account_index,
                 api_key_index,
                 nonce: self.next_nonce(),
                 cancel_all_time_in_force: 0,
-                cancel_all_time: now_ms,
-                expired_at: now_ms.saturating_add(60_000),
+                // Lighter expects a nil cancel_all_time sentinel, not wall-clock time.
+                cancel_all_time: 0,
+                expired_at: 0,
             };
             let signed = signer
                 .sign_cancel_all(sign_req)
@@ -3663,5 +4432,12 @@ fn map_rest_error(body: &str) -> LiveGatewayError {
     LiveGatewayError {
         kind: LiveGatewayErrorKind::Fatal,
         message: body.to_string(),
+    }
+}
+
+fn err_with_context(err: LiveGatewayError, context: &str) -> LiveGatewayError {
+    LiveGatewayError {
+        kind: err.kind,
+        message: format!("{} [{}]", err.message, context),
     }
 }

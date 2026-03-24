@@ -1,0 +1,30 @@
+# Paraphina ETH recovery canary profile.
+# Same micro-canary sizing as prod_canary_eth_min, but allow brief single-venue
+# feed gaps before tripping the canary stale-market kill.
+
+[venue]
+base_order_size = 0.01
+max_order_size = 0.01
+
+[limits]
+# Base units for this deployment are ETH. Keep the live canary materially below
+# the funded notional so inventory drift is caught before it becomes expensive.
+max_position_tao = 0.12
+max_gross_position_tao = 0.20
+max_abs_venue_position_tao = 0.08
+soft_max_gross_position_tao = 0.02
+soft_max_abs_venue_position_tao = 0.01
+soft_max_position_tao = 0.015
+max_open_orders = 10
+
+[rate_limit]
+enabled = true
+rps = 4.0
+burst = 6
+
+[enforcement]
+post_only = true
+reduce_only = false
+
+[kill]
+stale_max_ticks = 20

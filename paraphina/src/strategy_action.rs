@@ -238,6 +238,8 @@ where
                             order_id: Some(place.client_order_id.clone()),
                             client_order_id: Some(place.client_order_id.clone()),
                             seq: None,
+                            purpose: Some(place.purpose),
+                            reduce_only: Some(place.reduce_only),
                             reason: reason.clone(),
                         }));
                     }
@@ -264,6 +266,8 @@ where
                             order_id: Some(cancel.order_id.clone()),
                             client_order_id: None,
                             seq: None,
+                            purpose: None,
+                            reduce_only: None,
                             reason: reason.clone(),
                         }));
                     }
@@ -336,6 +340,8 @@ where
                             order_id: Some(place.client_order_id.clone()),
                             client_order_id: Some(place.client_order_id.clone()),
                             seq: None,
+                            purpose: Some(place.purpose),
+                            reduce_only: Some(place.reduce_only),
                             reason: reason.clone(),
                         }));
                     }
@@ -362,6 +368,8 @@ where
                             order_id: Some(cancel.order_id.clone()),
                             client_order_id: None,
                             seq: None,
+                            purpose: None,
+                            reduce_only: None,
                             reason: reason.clone(),
                         }));
                     }
@@ -634,6 +642,7 @@ where
                 shadow_mode: false,
                 execution_mode: "strategy",
                 reconcile_drift: &[],
+                account_position_syncs: &[],
                 max_orders_per_tick: 200,
             });
 

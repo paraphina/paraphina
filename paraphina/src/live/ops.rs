@@ -23,6 +23,64 @@ pub trait SecretProvider: Send + Sync {
     fn get(&self, key: &str) -> Option<String>;
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeCanaryMetadata {
+    profile_path: Option<String>,
+    profile_sha256: Option<String>,
+    max_position_tao: Option<f64>,
+    max_gross_position_tao: Option<f64>,
+    max_abs_venue_position_tao: Option<f64>,
+    soft_max_position_tao: Option<f64>,
+    soft_max_gross_position_tao: Option<f64>,
+    soft_max_abs_venue_position_tao: Option<f64>,
+    max_open_orders: Option<usize>,
+    stale_max_ticks: Option<u64>,
+    enforce_post_only: Option<bool>,
+    enforce_reduce_only: Option<bool>,
+    rate_limit_enabled: Option<bool>,
+    rate_limit_rps: Option<f64>,
+    rate_limit_burst: Option<u32>,
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
+    std::env::var(key).ok()?.parse::<T>().ok()
+}
+
+fn env_parse_bool(key: &str) -> Option<bool> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn runtime_canary_metadata_from_env() -> RuntimeCanaryMetadata {
+    RuntimeCanaryMetadata {
+        profile_path: std::env::var("PARAPHINA_RUNTIME_CANARY_PROFILE_PATH").ok(),
+        profile_sha256: std::env::var("PARAPHINA_RUNTIME_CANARY_PROFILE_SHA256").ok(),
+        max_position_tao: env_parse("PARAPHINA_RUNTIME_CANARY_MAX_POSITION_TAO"),
+        max_gross_position_tao: env_parse("PARAPHINA_RUNTIME_CANARY_MAX_GROSS_POSITION_TAO"),
+        max_abs_venue_position_tao: env_parse(
+            "PARAPHINA_RUNTIME_CANARY_MAX_ABS_VENUE_POSITION_TAO",
+        ),
+        soft_max_position_tao: env_parse("PARAPHINA_RUNTIME_CANARY_SOFT_MAX_POSITION_TAO"),
+        soft_max_gross_position_tao: env_parse(
+            "PARAPHINA_RUNTIME_CANARY_SOFT_MAX_GROSS_POSITION_TAO",
+        ),
+        soft_max_abs_venue_position_tao: env_parse(
+            "PARAPHINA_RUNTIME_CANARY_SOFT_MAX_ABS_VENUE_POSITION_TAO",
+        ),
+        max_open_orders: env_parse("PARAPHINA_RUNTIME_CANARY_MAX_OPEN_ORDERS"),
+        stale_max_ticks: env_parse("PARAPHINA_RUNTIME_CANARY_STALE_MAX_TICKS"),
+        enforce_post_only: env_parse_bool("PARAPHINA_RUNTIME_CANARY_ENFORCE_POST_ONLY"),
+        enforce_reduce_only: env_parse_bool("PARAPHINA_RUNTIME_CANARY_ENFORCE_REDUCE_ONLY"),
+        rate_limit_enabled: env_parse_bool("PARAPHINA_RUNTIME_CANARY_RATE_LIMIT_ENABLED"),
+        rate_limit_rps: env_parse("PARAPHINA_RUNTIME_CANARY_RATE_LIMIT_RPS"),
+        rate_limit_burst: env_parse("PARAPHINA_RUNTIME_CANARY_RATE_LIMIT_BURST"),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct EnvSecretProvider;
 
@@ -61,6 +119,24 @@ impl HealthState {
     pub fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
     }
+}
+
+fn system_time_to_unix_ms(time: std::time::SystemTime) -> Option<i64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+fn kill_events_active(audit_dir: &Path, start_time_ms: i64) -> bool {
+    let path = audit_dir.join("kill_events.jsonl");
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) if metadata.len() > 0 => metadata,
+        _ => return false,
+    };
+    let Some(modified_ms) = metadata.modified().ok().and_then(system_time_to_unix_ms) else {
+        return false;
+    };
+    modified_ms >= start_time_ms
 }
 
 #[derive(Clone)]
@@ -315,6 +391,7 @@ pub fn start_metrics_server(
         .as_millis() as i64;
     let trade_mode_str = std::env::var("PARAPHINA_TRADE_MODE").unwrap_or_default();
     let config_id = std::env::var("PARAPHINA_CONFIG_ID").unwrap_or_default();
+    let canary_metadata = runtime_canary_metadata_from_env();
     let addr = addr.to_string();
     std::thread::spawn(move || {
         let Ok(server) = Server::http(addr.as_str()) else {
@@ -361,13 +438,14 @@ pub fn start_metrics_server(
                         .as_millis() as i64;
                     let uptime_sec = (now_ms - start_time_ms) / 1000;
                     let last_tick = metrics.get_last_tick_ms();
-                    let tick_age_ms = if last_tick > 0 { now_ms - last_tick } else { -1 };
+                    let tick_age_ms = if last_tick > 0 {
+                        now_ms - last_tick
+                    } else {
+                        -1
+                    };
 
                     // Check for kill events in the audit dir.
-                    let kill_active = audit_dir.join("kill_events.jsonl").exists()
-                        && fs::metadata(audit_dir.join("kill_events.jsonl"))
-                            .map(|m| m.len() > 0)
-                            .unwrap_or(false);
+                    let kill_active = kill_events_active(&audit_dir, start_time_ms);
 
                     let detail = HealthDetail {
                         healthy: health.is_healthy(),
@@ -381,17 +459,32 @@ pub fn start_metrics_server(
                         kill_events_present: kill_active,
                         trade_mode: trade_mode_str.clone(),
                         config_id: config_id.clone(),
+                        canary_profile_path: canary_metadata.profile_path.clone(),
+                        canary_profile_sha256: canary_metadata.profile_sha256.clone(),
+                        canary_max_position_tao: canary_metadata.max_position_tao,
+                        canary_max_gross_position_tao: canary_metadata.max_gross_position_tao,
+                        canary_max_abs_venue_position_tao: canary_metadata
+                            .max_abs_venue_position_tao,
+                        canary_soft_max_position_tao: canary_metadata.soft_max_position_tao,
+                        canary_soft_max_gross_position_tao: canary_metadata
+                            .soft_max_gross_position_tao,
+                        canary_soft_max_abs_venue_position_tao: canary_metadata
+                            .soft_max_abs_venue_position_tao,
+                        canary_max_open_orders: canary_metadata.max_open_orders,
+                        canary_stale_max_ticks: canary_metadata.stale_max_ticks,
+                        canary_enforce_post_only: canary_metadata.enforce_post_only,
+                        canary_enforce_reduce_only: canary_metadata.enforce_reduce_only,
+                        canary_rate_limit_enabled: canary_metadata.rate_limit_enabled,
+                        canary_rate_limit_rps: canary_metadata.rate_limit_rps,
+                        canary_rate_limit_burst: canary_metadata.rate_limit_burst,
                     };
                     let payload = serde_json::to_string(&detail).unwrap_or_default();
                     let status = if health.is_healthy() { 200 } else { 503 };
                     Response::from_string(payload)
                         .with_status_code(status)
                         .with_header(
-                            Header::from_bytes(
-                                &b"Content-Type"[..],
-                                &b"application/json"[..],
-                            )
-                            .unwrap(),
+                            Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                                .unwrap(),
                         )
                 }
                 "/ready" => {
@@ -423,6 +516,21 @@ struct HealthDetail {
     kill_events_present: bool,
     trade_mode: String,
     config_id: String,
+    canary_profile_path: Option<String>,
+    canary_profile_sha256: Option<String>,
+    canary_max_position_tao: Option<f64>,
+    canary_max_gross_position_tao: Option<f64>,
+    canary_max_abs_venue_position_tao: Option<f64>,
+    canary_soft_max_position_tao: Option<f64>,
+    canary_soft_max_gross_position_tao: Option<f64>,
+    canary_soft_max_abs_venue_position_tao: Option<f64>,
+    canary_max_open_orders: Option<usize>,
+    canary_stale_max_ticks: Option<u64>,
+    canary_enforce_post_only: Option<bool>,
+    canary_enforce_reduce_only: Option<bool>,
+    canary_rate_limit_enabled: Option<bool>,
+    canary_rate_limit_rps: Option<f64>,
+    canary_rate_limit_burst: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -468,6 +576,7 @@ struct LiveConfigResolved<'a> {
     config_version: &'a str,
     config_hash: String,
     config_debug: String,
+    canary_runtime: RuntimeCanaryMetadata,
 }
 
 pub fn config_hash(cfg: &Config) -> u64 {
@@ -565,6 +674,7 @@ pub fn write_audit_files(dir: &Path, cfg: &Config, build_info: &BuildInfo) -> st
         config_version: cfg.version,
         config_hash: format!("0x{:016x}", config_hash(cfg)),
         config_debug: format!("{cfg:?}"),
+        canary_runtime: runtime_canary_metadata_from_env(),
     };
     let config_json = serde_json::to_string_pretty(&resolved)?;
     fs::write(config_path, config_json)?;
@@ -597,4 +707,32 @@ pub fn default_audit_dir() -> PathBuf {
         }
     }
     PathBuf::from("./live_audit")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kill_events_active, system_time_to_unix_ms};
+    use std::fs;
+    use std::time::SystemTime;
+    use tempfile::TempDir;
+
+    #[test]
+    fn kill_events_active_ignores_stale_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let path = tmp.path().join("kill_events.jsonl");
+        fs::write(&path, "{\"kill_reason\":\"StaleMarket\"}\n").expect("write kill event");
+
+        let now_ms = system_time_to_unix_ms(SystemTime::now()).expect("current time");
+        assert!(!kill_events_active(tmp.path(), now_ms + 1));
+    }
+
+    #[test]
+    fn kill_events_active_accepts_current_run_files() {
+        let tmp = TempDir::new().expect("temp dir");
+        let path = tmp.path().join("kill_events.jsonl");
+        fs::write(&path, "{\"kill_reason\":\"StaleMarket\"}\n").expect("write kill event");
+
+        let now_ms = system_time_to_unix_ms(SystemTime::now()).expect("current time");
+        assert!(kill_events_active(tmp.path(), now_ms - 1));
+    }
 }

@@ -27,8 +27,9 @@ use super::super::gateway::{
 };
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
-    AccountEvent, AccountSnapshot, BalanceSnapshot, FundingUpdate, LiquidationSnapshot,
-    MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+    AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
+    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, OpenOrderSnapshot, OrderSnapshot,
+    PositionSnapshot, TopOfBook,
 };
 use crate::live::MarketPublisher;
 use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
@@ -345,6 +346,7 @@ impl AsterConnector {
 
     pub async fn run_funding_polling(&self, poll_ms: u64) {
         let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut seq: u64 = 0;
         loop {
             interval.tick().await;
@@ -987,6 +989,8 @@ pub struct AsterRestClient {
     cfg: AsterConfig,
     http: Client,
     timestamp_fn: Arc<dyn Fn() -> TimestampMs + Send + Sync>,
+    price_tick_size: Arc<Mutex<Option<f64>>>,
+    poll_seq: Arc<AtomicU64>,
 }
 
 impl AsterRestClient {
@@ -1002,6 +1006,8 @@ impl AsterRestClient {
                 .build()
                 .expect("aster rest http client build"),
             timestamp_fn: Arc::new(now_ms),
+            price_tick_size: Arc::new(Mutex::new(None)),
+            poll_seq: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -1015,6 +1021,46 @@ impl AsterRestClient {
 
     pub fn has_auth(&self) -> bool {
         self.cfg.has_auth()
+    }
+
+    async fn resolve_price_tick_size(&self) -> LiveResult<f64> {
+        {
+            let guard = self.price_tick_size.lock().await;
+            if let Some(tick_size) = *guard {
+                return Ok(tick_size);
+            }
+        }
+
+        let url = format!(
+            "{}/fapi/v1/exchangeInfo",
+            self.cfg.rest_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("symbol", self.cfg.market.as_str())])
+            .send()
+            .await
+            .map_err(|err| {
+                LiveGatewayError::retryable(format!("aster exchangeInfo error: {err}"))
+            })?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("aster exchangeInfo parse error: {err}"))
+        })?;
+        let tick_size =
+            parse_exchange_info_price_tick_size(&value, &self.cfg.market).ok_or_else(|| {
+                LiveGatewayError::fatal(format!(
+                    "aster exchangeInfo missing price tick size for {}",
+                    self.cfg.market
+                ))
+            })?;
+        let mut guard = self.price_tick_size.lock().await;
+        Ok(*guard.get_or_insert(tick_size))
     }
 
     fn signed_query(&self, mut params: Vec<(String, String)>) -> Result<String, LiveGatewayError> {
@@ -1073,8 +1119,40 @@ impl AsterRestClient {
         }
         let value: Value = serde_json::from_str(&body)
             .map_err(|err| LiveGatewayError::fatal(format!("aster account parse error: {err}")))?;
-        parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
-            LiveGatewayError::fatal("aster account snapshot missing required fields")
+        let mut snapshot =
+            parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
+                LiveGatewayError::fatal("aster account snapshot missing required fields")
+            })?;
+        // Treat freshness as the time we successfully polled the venue. Aster's
+        // `updateTime` reflects the last account mutation and can remain unchanged
+        // for long periods, which would make a fresh poll look stale downstream.
+        snapshot.timestamp_ms = (self.timestamp_fn)();
+        Ok(snapshot)
+    }
+
+    async fn fetch_open_order_snapshot(
+        &self,
+        venue_id: &str,
+        venue_index: usize,
+    ) -> LiveResult<OrderSnapshot> {
+        let params = vec![("symbol".to_string(), self.cfg.market.clone())];
+        let resp = self
+            .send_signed_request(Method::GET, "/fapi/v1/openOrders", params)
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("aster open orders parse error: {err}"))
+        })?;
+        Ok(OrderSnapshot {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq: self.poll_seq.fetch_add(1, Ordering::Relaxed),
+            timestamp_ms: (self.timestamp_fn)(),
+            open_orders: parse_open_orders(&value, &self.cfg.market),
         })
     }
 
@@ -1086,6 +1164,7 @@ impl AsterRestClient {
         poll_ms: u64,
     ) {
         let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(250)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             match self.fetch_account_snapshot(&venue_id, venue_index).await {
@@ -1094,6 +1173,28 @@ impl AsterRestClient {
                 }
                 Err(err) => {
                     eprintln!("Aster account snapshot error: {}", err.message);
+                }
+            }
+        }
+    }
+
+    pub async fn run_order_polling(
+        self: Arc<Self>,
+        exec_tx: mpsc::Sender<ExecutionEvent>,
+        venue_id: String,
+        venue_index: usize,
+        poll_ms: u64,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_millis(poll_ms.max(500)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match self.fetch_open_order_snapshot(&venue_id, venue_index).await {
+                Ok(snapshot) => {
+                    let _ = exec_tx.send(ExecutionEvent::OrderSnapshot(snapshot)).await;
+                }
+                Err(err) => {
+                    eprintln!("Aster open order snapshot error: {}", err.message);
                 }
             }
         }
@@ -1108,6 +1209,8 @@ impl LiveRestClient for AsterRestClient {
         req: LiveRestPlaceRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
+            let price_tick_size = self.resolve_price_tick_size().await?;
+            let price = snap_price_to_tick(req.price, price_tick_size, req.side, req.post_only);
             let mut params = vec![
                 ("symbol".to_string(), self.cfg.market.clone()),
                 ("side".to_string(), map_side(req.side).to_string()),
@@ -1116,7 +1219,7 @@ impl LiveRestClient for AsterRestClient {
                     "timeInForce".to_string(),
                     map_time_in_force(req.time_in_force, req.post_only).to_string(),
                 ),
-                ("price".to_string(), format_f64(req.price)),
+                ("price".to_string(), format_f64(price)),
                 ("quantity".to_string(), format_f64(req.size)),
                 ("newClientOrderId".to_string(), req.client_order_id.clone()),
             ];
@@ -1141,16 +1244,23 @@ impl LiveRestClient for AsterRestClient {
         req: LiveRestCancelRequest,
     ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
         Box::pin(async move {
-            let params = vec![
-                ("symbol".to_string(), self.cfg.market.clone()),
-                ("origClientOrderId".to_string(), req.order_id),
-            ];
+            let mut params = vec![("symbol".to_string(), self.cfg.market.clone())];
+            if is_numeric_order_id(&req.order_id) {
+                params.push(("orderId".to_string(), req.order_id.clone()));
+            } else {
+                params.push(("origClientOrderId".to_string(), req.order_id.clone()));
+            }
             let resp = self
                 .send_signed_request(Method::DELETE, "/fapi/v1/order", params)
                 .await?;
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             if !status.is_success() {
+                if is_aster_unknown_order(&body) {
+                    return Ok(LiveRestResponse {
+                        order_id: Some(req.order_id),
+                    });
+                }
                 return Err(map_rest_error(status.as_u16(), &body));
             }
             Ok(LiveRestResponse { order_id: None })
@@ -1225,11 +1335,69 @@ fn map_time_in_force(time_in_force: TimeInForce, post_only: bool) -> &'static st
 }
 
 fn format_f64(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value}")
-    } else {
-        "0".to_string()
+    if !value.is_finite() {
+        return "0".to_string();
     }
+    let mut formatted = format!("{value:.12}");
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    if formatted == "-0" {
+        formatted = "0".to_string();
+    }
+    formatted
+}
+
+fn snap_price_to_tick(price: f64, tick_size: f64, side: Side, post_only: bool) -> f64 {
+    if !price.is_finite() || !tick_size.is_finite() || tick_size <= 0.0 {
+        return price;
+    }
+    let ticks = price / tick_size;
+    let epsilon = 1e-9;
+    let snapped_ticks = if post_only {
+        match side {
+            Side::Buy => (ticks + epsilon).floor(),
+            Side::Sell => (ticks - epsilon).ceil(),
+        }
+    } else {
+        ticks.round()
+    };
+    snapped_ticks * tick_size
+}
+
+fn is_numeric_order_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_aster_unknown_order(body: &str) -> bool {
+    body.contains("\"code\":-2011") || body.contains("Unknown order sent")
+}
+
+fn parse_exchange_info_price_tick_size(value: &Value, market: &str) -> Option<f64> {
+    let symbols = value.get("symbols")?.as_array()?;
+    let entry = symbols
+        .iter()
+        .find(|symbol| symbol.get("symbol").and_then(|v| v.as_str()) == Some(market))
+        .or_else(|| symbols.first())?;
+    let filters = entry.get("filters")?.as_array()?;
+    let price_filter = filters
+        .iter()
+        .find(|filter| filter.get("filterType").and_then(|v| v.as_str()) == Some("PRICE_FILTER"))?;
+    let tick_size = price_filter
+        .get("tickSize")
+        .or_else(|| price_filter.get("tick_size"))
+        .and_then(parse_f64)
+        .filter(|tick| *tick > 0.0);
+    tick_size.or_else(|| {
+        entry
+            .get("pricePrecision")
+            .and_then(|v| v.as_u64())
+            .map(|precision| 10f64.powi(-(precision as i32)))
+            .filter(|tick| *tick > 0.0)
+    })
 }
 
 fn parse_order_id(body: &str) -> Option<String> {
@@ -1246,6 +1414,58 @@ fn parse_order_id(body: &str) -> Option<String> {
         .get("clientOrderId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+fn parse_open_orders(value: &Value, market: &str) -> Vec<OpenOrderSnapshot> {
+    let list = value.as_array().cloned().unwrap_or_default();
+    list.into_iter()
+        .filter_map(|order| {
+            let symbol = order.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+            if !symbol_matches(symbol, market) {
+                return None;
+            }
+            let status = order.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if !(status.eq_ignore_ascii_case("NEW")
+                || status.eq_ignore_ascii_case("PARTIALLY_FILLED")
+                || status.eq_ignore_ascii_case("OPEN"))
+            {
+                return None;
+            }
+            let order_id = order.get("orderId").and_then(|v| {
+                v.as_i64()
+                    .map(|raw| raw.to_string())
+                    .or_else(|| v.as_str().map(|raw| raw.to_string()))
+            })?;
+            let client_order_id = order
+                .get("clientOrderId")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            let side = match order.get("side").and_then(|v| v.as_str())? {
+                side if side.eq_ignore_ascii_case("BUY") => Side::Buy,
+                side if side.eq_ignore_ascii_case("SELL") => Side::Sell,
+                _ => return None,
+            };
+            let price = order.get("price").and_then(parse_f64)?;
+            let orig_qty = order
+                .get("origQty")
+                .or_else(|| order.get("orig_quantity"))
+                .and_then(parse_f64)?;
+            let executed_qty = order
+                .get("executedQty")
+                .or_else(|| order.get("executed_quantity"))
+                .and_then(parse_f64)
+                .unwrap_or(0.0);
+            let size = (orig_qty - executed_qty).max(0.0);
+            (size > 0.0).then_some(OpenOrderSnapshot {
+                order_id,
+                client_order_id,
+                side,
+                price,
+                size,
+                purpose: None,
+            })
+        })
+        .collect()
 }
 
 fn parse_account_snapshot(
@@ -1957,7 +2177,7 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use httpmock::Method::{DELETE, POST};
+    use httpmock::Method::{DELETE, GET, POST};
     use httpmock::MockServer;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -2196,6 +2416,22 @@ mod tests {
         };
         let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
 
+        let exchange_info = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/exchangeInfo")
+                    .query_param("symbol", "BTCUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbols": [{
+                        "symbol": "BTCUSDT",
+                        "filters": [{
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.1"
+                        }]
+                    }]
+                }));
+            })
+            .await;
         let expected_signature = "4b0927aa17b493de48e207d2e891485c491aefb6c6ed0bd374259b42a21a1284";
         let mock = server
             .mock_async(|when, then| {
@@ -2232,6 +2468,7 @@ mod tests {
             .await
             .expect("place order");
 
+        exchange_info.assert_async().await;
         mock.assert_async().await;
     }
 
@@ -2252,6 +2489,22 @@ mod tests {
         };
         let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
 
+        let exchange_info = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/exchangeInfo")
+                    .query_param("symbol", "BTCUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbols": [{
+                        "symbol": "BTCUSDT",
+                        "filters": [{
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.1"
+                        }]
+                    }]
+                }));
+            })
+            .await;
         let expected_signature = "fb231bb1595dd627ceab277d9d9b6f9ff238ad515830ba44ea5717e01ff578ad";
         let mock = server
             .mock_async(|when, then| {
@@ -2289,6 +2542,155 @@ mod tests {
             .await
             .expect("place order");
 
+        exchange_info.assert_async().await;
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rest_place_order_formats_decimal_fields_without_float_noise() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+
+        let exchange_info = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/exchangeInfo")
+                    .query_param("symbol", "ETHUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbols": [{
+                        "symbol": "ETHUSDT",
+                        "filters": [{
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.01"
+                        }]
+                    }]
+                }));
+            })
+            .await;
+        let canonical = "newClientOrderId=co_decimal&price=2073.54&quantity=0.01&recvWindow=5000&side=BUY&symbol=ETHUSDT&timeInForce=GTX&timestamp=1700000000000&type=LIMIT";
+        let expected_signature = sign_query("testsecret", canonical);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/fapi/v1/order")
+                    .header("X-MBX-APIKEY", "test-key")
+                    .query_param("symbol", "ETHUSDT")
+                    .query_param("side", "BUY")
+                    .query_param("type", "LIMIT")
+                    .query_param("timeInForce", "GTX")
+                    .query_param("price", "2073.54")
+                    .query_param("quantity", "0.01")
+                    .query_param("newClientOrderId", "co_decimal")
+                    .query_param("recvWindow", "5000")
+                    .query_param("timestamp", "1700000000000")
+                    .query_param("signature", expected_signature);
+                then.status(200).body("{\"orderId\": 13579}");
+            })
+            .await;
+
+        let _ = client
+            .place_order(LiveRestPlaceRequest {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                side: Side::Buy,
+                price: 2073.5399999999995,
+                size: 0.010000000000000002,
+                purpose: crate::types::OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "co_decimal".to_string(),
+            })
+            .await
+            .expect("place order");
+
+        exchange_info.assert_async().await;
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rest_place_order_rounds_post_only_prices_to_exchange_tick() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+
+        let exchange_info = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v1/exchangeInfo")
+                    .query_param("symbol", "ETHUSDT");
+                then.status(200).json_body(serde_json::json!({
+                    "symbols": [{
+                        "symbol": "ETHUSDT",
+                        "filters": [{
+                            "filterType": "PRICE_FILTER",
+                            "tickSize": "0.1"
+                        }]
+                    }]
+                }));
+            })
+            .await;
+        let canonical = "newClientOrderId=co_tick&price=2074&quantity=0.01&recvWindow=5000&side=BUY&symbol=ETHUSDT&timeInForce=GTX&timestamp=1700000000000&type=LIMIT";
+        let expected_signature = sign_query("testsecret", canonical);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/fapi/v1/order")
+                    .header("X-MBX-APIKEY", "test-key")
+                    .query_param("symbol", "ETHUSDT")
+                    .query_param("side", "BUY")
+                    .query_param("type", "LIMIT")
+                    .query_param("timeInForce", "GTX")
+                    .query_param("price", "2074")
+                    .query_param("quantity", "0.01")
+                    .query_param("newClientOrderId", "co_tick")
+                    .query_param("recvWindow", "5000")
+                    .query_param("timestamp", "1700000000000")
+                    .query_param("signature", expected_signature);
+                then.status(200).body("{\"orderId\": 24680}");
+            })
+            .await;
+
+        let _ = client
+            .place_order(LiveRestPlaceRequest {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                side: Side::Buy,
+                price: 2074.08,
+                size: 0.01,
+                purpose: crate::types::OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "co_tick".to_string(),
+            })
+            .await
+            .expect("place order");
+
+        exchange_info.assert_async().await;
         mock.assert_async().await;
     }
 
@@ -2332,6 +2734,148 @@ mod tests {
             .expect("cancel_all");
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rest_cancel_order_uses_numeric_order_id_when_available() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 0,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_000_000));
+
+        let canonical = "orderId=12345&recvWindow=5000&symbol=ETHUSDT&timestamp=1700000000000";
+        let expected_signature = sign_query("testsecret", canonical);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/fapi/v1/order")
+                    .header("X-MBX-APIKEY", "test-key")
+                    .query_param("symbol", "ETHUSDT")
+                    .query_param("orderId", "12345")
+                    .query_param("recvWindow", "5000")
+                    .query_param("timestamp", "1700000000000")
+                    .query_param("signature", expected_signature);
+                then.status(200).body("{}");
+            })
+            .await;
+
+        let _ = client
+            .cancel_order(LiveRestCancelRequest {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                order_id: "12345".to_string(),
+            })
+            .await
+            .expect("cancel order");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_account_snapshot_uses_poll_time_for_freshness() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg).with_timestamp_fn(Arc::new(|| 1_700_000_123_456));
+
+        let canonical = "recvWindow=5000&timestamp=1700000123456";
+        let expected_signature = sign_query("testsecret", canonical);
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/fapi/v2/account")
+                    .header("X-MBX-APIKEY", "test-key")
+                    .query_param("recvWindow", "5000")
+                    .query_param("timestamp", "1700000123456")
+                    .query_param("signature", expected_signature);
+                then.status(200).json_body(serde_json::json!({
+                    "updateTime": 1_700_000_000_000u64,
+                    "totalWalletBalance": "100.0",
+                    "totalPositionInitialMargin": "10.0",
+                    "availableBalance": "90.0",
+                    "positions": [{
+                        "symbol": "ETHUSDT",
+                        "positionAmt": "0.14",
+                        "entryPrice": "2091.67",
+                        "updateTime": 1_700_000_000_000u64
+                    }],
+                    "assets": [{
+                        "asset": "USDT",
+                        "walletBalance": "100.0",
+                        "availableBalance": "90.0"
+                    }]
+                }));
+            })
+            .await;
+
+        let snapshot = client
+            .fetch_account_snapshot("ASTER", 2)
+            .await
+            .expect("account snapshot");
+
+        mock.assert_async().await;
+        assert_eq!(snapshot.seq, 1_700_000_000_000u64);
+        assert_eq!(snapshot.timestamp_ms, 1_700_000_123_456);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert!((snapshot.positions[0].size - 0.14).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_open_orders_keeps_remaining_size_and_client_order_id() {
+        let value = serde_json::json!([
+            {
+                "symbol": "ETHUSDT",
+                "status": "PARTIALLY_FILLED",
+                "orderId": 12345,
+                "clientOrderId": "co_aster_1",
+                "side": "BUY",
+                "price": "2090.5",
+                "origQty": "0.50",
+                "executedQty": "0.20"
+            },
+            {
+                "symbol": "BTCUSDT",
+                "status": "NEW",
+                "orderId": 999,
+                "side": "SELL",
+                "price": "60000",
+                "origQty": "1.0",
+                "executedQty": "0"
+            }
+        ]);
+
+        let open_orders = parse_open_orders(&value, "ETHUSDT");
+
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].order_id, "12345");
+        assert_eq!(
+            open_orders[0].client_order_id.as_deref(),
+            Some("co_aster_1")
+        );
+        assert_eq!(open_orders[0].side, Side::Buy);
+        assert!((open_orders[0].price - 2090.5).abs() < 1e-9);
+        assert!((open_orders[0].size - 0.30).abs() < 1e-9);
+        assert_eq!(open_orders[0].purpose, None);
     }
 
     #[test]

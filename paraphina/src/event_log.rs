@@ -73,6 +73,10 @@ pub enum SerializableExecutionEvent {
         client_order_id: Option<String>,
         #[serde(default)]
         seq: Option<u64>,
+        #[serde(default)]
+        purpose: Option<OrderPurpose>,
+        #[serde(default)]
+        reduce_only: Option<bool>,
         reason: String,
     },
     BalanceUpdate {
@@ -157,6 +161,8 @@ impl SerializableExecutionEvent {
                 order_id,
                 client_order_id,
                 seq,
+                purpose,
+                reduce_only,
                 reason,
             } => ExecutionEvent::OrderReject(OrderReject {
                 venue_index: *venue_index,
@@ -164,6 +170,8 @@ impl SerializableExecutionEvent {
                 order_id: order_id.clone(),
                 client_order_id: client_order_id.clone(),
                 seq: *seq,
+                purpose: *purpose,
+                reduce_only: *reduce_only,
                 reason: reason.clone(),
             }),
             SerializableExecutionEvent::BalanceUpdate {
@@ -232,6 +240,8 @@ impl From<&ExecutionEvent> for SerializableExecutionEvent {
                 order_id: r.order_id.clone(),
                 client_order_id: r.client_order_id.clone(),
                 seq: r.seq,
+                purpose: r.purpose,
+                reduce_only: r.reduce_only,
                 reason: r.reason.clone(),
             },
             ExecutionEvent::BalanceUpdate(b) => SerializableExecutionEvent::BalanceUpdate {

@@ -69,7 +69,7 @@ class LighterSignerBridge:
     def __init__(self) -> None:
         _patch_lighter_sdk_platform_detection()
         try:
-            from lighter import SignerClient
+            from lighter import SignerClient, nonce_manager
         except ImportError as exc:  # pragma: no cover - runtime only
             raise SystemExit(
                 "lighter-sdk is not installed. Install it with: pip install lighter-sdk"
@@ -83,6 +83,7 @@ class LighterSignerBridge:
         self.client = asyncio.run(
             self._build_signer_client(
                 SignerClient,
+                nonce_manager,
                 self.base_url,
                 self.account_index,
                 {self.api_key_index: _normalize_hex(_require("LIGHTER_API_PRIVATE_KEY_HEX"))},
@@ -96,11 +97,19 @@ class LighterSignerBridge:
     @staticmethod
     async def _build_signer_client(
         signer_client_cls: Any,
+        nonce_manager_mod: Any,
         base_url: str,
         account_index: int,
         api_private_keys: dict[int, str],
     ) -> Any:
-        return signer_client_cls(base_url, account_index, api_private_keys)
+        # Let the SDK fetch nextNonce from the exchange for each signed tx.
+        # Caller-managed local nonces drift across restarts and led to live rejects.
+        return signer_client_cls(
+            base_url,
+            account_index,
+            api_private_keys,
+            nonce_management_type=nonce_manager_mod.NonceManagerType.API,
+        )
 
     def health(self) -> dict[str, Any]:
         return {
@@ -177,10 +186,18 @@ class LighterSignerBridge:
             return self.client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
         raise ValueError(f"unsupported Lighter time_in_force: {raw!r}")
 
+    def _next_api_key_nonce(self) -> tuple[int, int]:
+        api_key_index, nonce = self.client.get_api_key_nonce(
+            self.client.DEFAULT_API_KEY_INDEX,
+            self.client.DEFAULT_NONCE,
+        )
+        return int(api_key_index), int(nonce)
+
     def _sign_create_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         post_only = bool(int(payload.get("post_only", 0)))
         trigger_price = payload.get("trigger_price")
         order_expiry = payload.get("order_expiry")
+        api_key_index, nonce = self._next_api_key_nonce()
         result = self.client.sign_create_order(
             market_index=int(payload.get("market_index", self.market_index())),
             client_order_index=int(payload["client_order_index"]),
@@ -203,8 +220,8 @@ class LighterSignerBridge:
                 if order_expiry is not None
                 else self.client.DEFAULT_28_DAY_ORDER_EXPIRY
             ),
-            nonce=int(payload["nonce"]),
-            api_key_index=self.api_key_index,
+            nonce=nonce,
+            api_key_index=api_key_index,
         )
         return self._decode_signed(result)
 
@@ -214,20 +231,22 @@ class LighterSignerBridge:
             order_index = payload.get("client_order_index")
         if order_index is None:
             raise ValueError("cancel_order requires order_index or client_order_index")
+        api_key_index, nonce = self._next_api_key_nonce()
         result = self.client.sign_cancel_order(
             market_index=int(payload.get("market_index", self.market_index())),
             order_index=int(order_index),
-            nonce=int(payload["nonce"]),
-            api_key_index=self.api_key_index,
+            nonce=nonce,
+            api_key_index=api_key_index,
         )
         return self._decode_signed(result)
 
     def _sign_cancel_all(self, payload: dict[str, Any]) -> dict[str, Any]:
+        api_key_index, nonce = self._next_api_key_nonce()
         result = self.client.sign_cancel_all_orders(
             time_in_force=int(payload["cancel_all_time_in_force"]),
             timestamp_ms=int(payload["cancel_all_time"]),
-            nonce=int(payload["nonce"]),
-            api_key_index=self.api_key_index,
+            nonce=nonce,
+            api_key_index=api_key_index,
         )
         return self._decode_signed(result)
 

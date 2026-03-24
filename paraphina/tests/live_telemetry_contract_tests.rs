@@ -69,7 +69,9 @@ async fn live_telemetry_contract_passes_fixture_run() {
             } = req;
             let events = shadow.handle_intents(intents, action_batch.tick_index, now_ms);
             match response {
-                paraphina::live::ResponseMode::Oneshot(tx) => { let _ = tx.send(events); }
+                paraphina::live::ResponseMode::Oneshot(tx) => {
+                    let _ = tx.send(events);
+                }
                 paraphina::live::ResponseMode::FireAndForget => {}
             }
         }
@@ -88,6 +90,7 @@ async fn live_telemetry_contract_passes_fixture_run() {
             account_rx,
             exec_rx: Some(exec_rx),
             account_reconcile_tx: None,
+            priority_order_tx: order_tx.clone(),
             order_tx,
             order_snapshot_rx: Some(order_snapshot_rx),
             shared_venue_ages: None,
@@ -111,6 +114,21 @@ async fn live_telemetry_contract_passes_fixture_run() {
     assert!(
         text.contains("\"market_rx_stats\""),
         "expected market_rx_stats in telemetry"
+    );
+    let has_mm_order_management = text.lines().any(|line| {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        value
+            .get("mm_order_management")
+            .and_then(|v| v.as_object())
+            .is_some_and(|summary| {
+                summary.contains_key("keep_count") && summary.contains_key("replace_count")
+            })
+    });
+    assert!(
+        has_mm_order_management,
+        "expected mm_order_management summary in telemetry"
     );
 
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
