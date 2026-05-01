@@ -11,6 +11,7 @@ Supports multiple schemas:
 """
 
 import contextlib
+import hashlib
 import io
 import json
 import subprocess
@@ -167,6 +168,17 @@ class TestCheckType(unittest.TestCase):
         self.assertIsNotNone(check_type([1, "two", 3], "array_of_integer", "test"))
         # Contains boolean
         self.assertIsNotNone(check_type([1, True, 3], "array_of_integer", "test"))
+
+    def test_array_of_string_valid(self):
+        """Valid string arrays should pass."""
+        self.assertIsNone(check_type([], "array_of_string", "test"))
+        self.assertIsNone(check_type(["a", "b"], "array_of_string", "test"))
+
+    def test_array_of_string_invalid(self):
+        """Invalid string arrays should fail."""
+        self.assertIsNotNone(check_type("not array", "array_of_string", "test"))
+        self.assertIsNotNone(check_type(["a", 2], "array_of_string", "test"))
+        self.assertIsNotNone(check_type(["a", None], "array_of_string", "test"))
 
 
 class TestLoadSchema(unittest.TestCase):
@@ -565,6 +577,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the validator script."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "check_telemetry_contract.py"
+
+    def _get_phase51_shadow_path(self) -> Path:
+        """Get path to the Phase 5.1 shadow harness."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51_ev_shadow.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -691,6 +708,135 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 1, f"stdout: {result.stdout}\nstderr: {result.stderr}")
             self.assertIn("Unsupported schema_version", result.stderr)
+
+    def test_phase51_shadow_harness_emits_valid_hold_artifact(self):
+        """Phase 5.1 shadow harness should emit source-linked HOLD-only v2 artifacts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_path = tmp_path / "phase5_sample.telemetry.jsonl"
+            output_root = tmp_path / "phase51_runs"
+            run_id = "phase51_contract_test"
+            source_record = self._make_valid_telemetry_record(
+                tick=42,
+                fair_value=100.25,
+                config_version_id="test-config",
+                quote_levels=[
+                    {
+                        "venue_id": "lighter",
+                        "side": "Bid",
+                        "price": 100.0,
+                        "size_final": 0.01,
+                        "edge_local": 0.12,
+                        "candidate_edge_pre_utility": 0.15,
+                        "edge_threshold": 0.1,
+                        "book_age_ms": 7,
+                        "book_stale_threshold_ms": 12000,
+                        "distance_to_touch_bps": 2.5,
+                        "size_raw": 1.2,
+                        "size_margin_cap": 4.0,
+                        "quote_state": "active",
+                        "suppression_reason": None,
+                        "utility_tier": "full",
+                        "utility_role": "fill",
+                        "utility_reason": "healthy",
+                    },
+                    {
+                        "venue_id": "paradex",
+                        "side": "Ask",
+                        "price": 100.5,
+                        "size_final": 0.01,
+                        "edge_local": 0.1,
+                    },
+                ],
+            )
+            input_path.write_text(json.dumps(source_record) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51_shadow_path()),
+                    "--input-telemetry",
+                    str(input_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    run_id,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+
+            run_dir = output_root / run_id
+            telemetry_path = run_dir / "telemetry.jsonl"
+            self.assertTrue(telemetry_path.exists())
+            validator = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(telemetry_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(validator.returncode, 0, f"stdout: {validator.stdout}\nstderr: {validator.stderr}")
+
+            records = [
+                json.loads(line)
+                for line in telemetry_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            ev_records = [r for r in records if r["event_type"] == "V2_EV_EVALUATED"]
+            replay_labels = [r for r in records if r["event_type"] == "V2_REPLAY_LABEL"]
+            self.assertEqual(len(ev_records), 1)
+            self.assertEqual(len(replay_labels), 1)
+            self.assertTrue(all(r["no_live_flag"] is True for r in records))
+            self.assertTrue(all(r.get("decision") == "HOLD" for r in records if "decision" in r))
+            self.assertTrue(all(
+                r.get("admissible_for_financial_claim") is False
+                for r in records
+                if "admissible_for_financial_claim" in r
+            ))
+
+            ev = ev_records[0]
+            self.assertEqual(ev["source_t"], 42)
+            self.assertEqual(ev["source_line"], 1)
+            self.assertEqual(ev["instrument_id"], "ETH-PERP")
+            self.assertEqual(ev["passive_price"], 100.0)
+            self.assertEqual(ev["candidate_size_Q"], 0.01)
+            self.assertEqual(ev["quote_state"], "active")
+            self.assertEqual(ev["binding_constraints"], ["missing_phase51_calibration", "nonlive_hold"])
+            self.assertEqual(ev["decision_reason_primary"], "missing_phase51_calibration")
+            self.assertIn("no_pfill_calibration", ev["decision_reason_secondary_list"])
+
+            label = replay_labels[0]
+            self.assertEqual(label["candidate_id"], ev["candidate_id"])
+            self.assertEqual(label["label_type"], "COUNTERFACTUAL_DECISION")
+            self.assertEqual(label["source_t"], 42)
+            self.assertEqual(label["source_line"], 1)
+            self.assertEqual(label["label_confidence"], 1.0)
+
+            summary = json.loads((run_dir / "ev_shadow_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["candidates_evaluated"], 1)
+            self.assertEqual(summary["replay_labels_emitted"], 1)
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertTrue((run_dir / "manifest.json").exists())
+
+            telemetry_hash = hashlib.sha256(telemetry_path.read_bytes()).hexdigest()
+            manifest_hash = hashlib.sha256((run_dir / "manifest.json").read_bytes()).hexdigest()
+            repeat = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51_shadow_path()),
+                    "--input-telemetry",
+                    str(input_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    run_id,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(repeat.returncode, 0, f"stdout: {repeat.stdout}\nstderr: {repeat.stderr}")
+            self.assertEqual(hashlib.sha256(telemetry_path.read_bytes()).hexdigest(), telemetry_hash)
+            self.assertEqual(hashlib.sha256((run_dir / "manifest.json").read_bytes()).hexdigest(), manifest_hash)
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

@@ -44,9 +44,26 @@ revision addenda:
 - `V2_REPLAY_LABEL`
 - `V2_GUARDRAIL_EVENT`
 
-This initial schema validates the common envelope and common EV evaluation
-fields. Event-family-specific required fields can be tightened once emitters
-are producing stable artifacts.
+The Phase 5.1 shadow harness currently emits source-linked
+`V2_EV_EVALUATED` and `V2_REPLAY_LABEL` records. These records include
+`source_t`, `source_line`, `source_record_sha256`, `model_features_hash`,
+`calibration_bucket_id`, and `binding_constraints` so candidates can be traced
+back to the v1 telemetry line that produced them.
+
+All Phase 5.1 shadow candidates remain `HOLD` until calibration evidence exists.
+`V2_REPLAY_LABEL` records are counterfactual decision labels, not realized fills
+or economic proof.
+
+Event-family-specific required fields can be tightened further once emitters are
+producing stable artifacts for order lifecycle, fill, hedge, inventory, and
+balance events.
+
+## Determinism
+
+Phase 5.1 non-live runs should provide a stable `run_id` and input telemetry
+snapshot. The shadow harness derives replay timestamps from the run id and input
+hash unless `--replay-timestamp-ns` is provided, and writes a root
+`manifest.json` covering the run artifacts.
 
 ## Validation
 

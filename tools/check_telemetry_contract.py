@@ -162,6 +162,14 @@ def check_type(value: Any, expected_type: str | list[str], field_name: str) -> s
                     continue
                 return f"field '{field_name}[{i}]' expected integer, got {type(elem).__name__}"
         return None
+
+    elif expected_type == "array_of_string":
+        if not isinstance(value, list):
+            return f"field '{field_name}' expected array, got {type(value).__name__}"
+        for i, elem in enumerate(value):
+            if not isinstance(elem, str):
+                return f"field '{field_name}[{i}]' expected string, got {type(elem).__name__}"
+        return None
     
     else:
         # Unknown type in schema - treat as internal error
