@@ -116,6 +116,7 @@ async fn live_runner_consumes_hyperliquid_fixtures() {
                 intents,
                 action_batch,
                 now_ms,
+                transport_hint: _,
                 response,
             } = req;
             let events = shadow.handle_intents(intents, action_batch.tick_index, now_ms);
@@ -140,6 +141,7 @@ async fn live_runner_consumes_hyperliquid_fixtures() {
             account_rx,
             exec_rx: Some(exec_rx),
             account_reconcile_tx: None,
+            priority_order_tx: order_tx.clone(),
             order_tx,
             order_snapshot_rx: Some(order_snapshot_rx),
             shared_venue_ages: None,

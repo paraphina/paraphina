@@ -35,6 +35,7 @@ mod tests {
             intents: vec![intent],
             action_batch: ActionBatch::new(now_ms, 0, &cfg.version),
             now_ms,
+            transport_hint: paraphina::live::gateway::TransportHint::Default,
             response: paraphina::live::ResponseMode::Oneshot(response_tx),
         };
         handle.order_tx.send(request).await.expect("send order");
@@ -112,6 +113,8 @@ mod tests {
                         order_id: rej.order_id.clone(),
                         client_order_id: None,
                         seq: Some(rej.seq),
+                        purpose: rej.purpose,
+                        reduce_only: rej.reduce_only,
                         reason: rej.reason.clone(),
                     }));
                 }
@@ -149,6 +152,8 @@ mod tests {
                         order_id: rej.order_id.clone(),
                         client_order_id: None,
                         seq: Some(rej.seq),
+                        purpose: None,
+                        reduce_only: None,
                         reason: rej.reason.clone(),
                     }));
                 }

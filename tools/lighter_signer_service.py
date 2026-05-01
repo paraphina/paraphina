@@ -142,6 +142,8 @@ class LighterSignerBridge:
             return self._sign_create_order(payload)
         if op == "cancel_order":
             return self._sign_cancel_order(payload)
+        if op == "modify_order":
+            return self._sign_modify_order(payload)
         if op == "cancel_all":
             return self._sign_cancel_all(payload)
         raise ValueError(f"unsupported op: {op!r}")
@@ -217,6 +219,28 @@ class LighterSignerBridge:
         result = self.client.sign_cancel_order(
             market_index=int(payload.get("market_index", self.market_index())),
             order_index=int(order_index),
+            nonce=int(payload["nonce"]),
+            api_key_index=self.api_key_index,
+        )
+        return self._decode_signed(result)
+
+    def _sign_modify_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        order_index = payload.get("order_index")
+        if order_index is None:
+            order_index = payload.get("client_order_index")
+        if order_index is None:
+            raise ValueError("modify_order requires order_index or client_order_index")
+        trigger_price = payload.get("trigger_price")
+        result = self.client.sign_modify_order(
+            market_index=int(payload.get("market_index", self.market_index())),
+            order_index=int(order_index),
+            base_amount=int(payload["base_amount"]),
+            price=int(payload["price"]),
+            trigger_price=(
+                int(trigger_price)
+                if trigger_price is not None
+                else self.client.NIL_TRIGGER_PRICE
+            ),
             nonce=int(payload["nonce"]),
             api_key_index=self.api_key_index,
         )

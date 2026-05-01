@@ -476,6 +476,15 @@ impl<'a> Engine<'a> {
             if venue_idx == EXTENDED_VENUE_INDEX && extended_stale_gate.unwrap_or(false) {
                 continue;
             }
+            if self
+                .cfg
+                .venues
+                .get(venue_idx)
+                .map(|v| !v.contributes_to_fv)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let v = &state.venues[venue_idx];
 
             // --- Disabled venue gating ---
@@ -509,6 +518,13 @@ impl<'a> Engine<'a> {
             }
             if !depth.is_finite() || depth <= 0.0 {
                 continue;
+            }
+
+            if let Some(max_spread_bps) = self.cfg.venues[venue_idx].fv_max_spread_bps {
+                let spread_bps = (spread / mid) * 10_000.0;
+                if !spread_bps.is_finite() || spread_bps > max_spread_bps {
+                    continue;
+                }
             }
 
             // --- Outlier gating (Milestone D) ---

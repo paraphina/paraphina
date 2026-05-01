@@ -1,0 +1,281 @@
+schema_version: 1
+prepared_utc: '2026-05-01T01:41:27Z'
+tranche:
+  id: phase5_reopened_wallet_econ_full_cost_opportunity_adjusted_gate_requal
+  track: serialized_mainline
+  status: in_progress
+  branch_class: qualification
+  manual_gate_required: true
+  hypothesis_blocker_family: microstructure_underconversion
+  support_gate: shadow_smoke_10m
+  support_gate_require_mechanism: false
+  progress_credit: major
+  objective: Requalify the reopened full-cost wallet-economics surface by replacing
+    the raw all-venue market-making fill gate with an opportunity-adjusted participation
+    gate and authoritative five-account balance-delta PnL.
+  hypothesis: If a clean 7200s full-cost live rung shows positive combined account-balance
+    delta, complete hedge attribution, controlled modeled hedge cost, real MM fill
+    evidence on venues that had fillable cost-positive opportunity, and no cost-positive
+    opportunity or insufficient active quote samples on the other venues, then Phase
+    5 should promote the exact surface without forcing orders onto venues that the
+    strategy/maths correctly suppressed.
+  control:
+    description: The dynamic-size 7200s rung completed cleanly with service restored
+      to shadow, no kill events, no reconcile mismatches, clean first pre-restore
+      and post-rollback direct venue audits, final_q_global_tao=0.0, authoritative
+      five-account balance-delta PnL=+0.00742413 USD, and economics_attribution.net_after_hedge_exec_model_usd=-0.074448
+      inside the -0.50 USD budget. The old promotion gate held only because Hyperliquid,
+      Extended, and Aster had zero MM fills, even though regenerated live metrics
+      show opportunity_adjusted_scorecard passed all five venues.
+    artifacts:
+      parent_summary: /home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/live_segment_summary.json
+      parent_metrics: /home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/live_metrics.json
+      parent_autoscore_old_gate: /home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/autoscore_bundle.json
+      parent_balance_snapshot: /home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/balance_snapshot_comparison.json
+      parent_guard: /home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/guard.log
+      parent_telemetry_report: /home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/telemetry_report_live_segment.md
+  candidate:
+    change_scope:
+      files:
+      - /home/ubuntu/paraphina_mm_pnl_harness/phase5/queue.yaml
+      - /home/ubuntu/paraphina_mm_pnl_harness/tools/telemetry_analyzer.py
+      - /home/ubuntu/paraphina_mm_pnl_harness/tools/phase5_tranche.py
+      - /home/ubuntu/paraphina_mm_pnl_harness/tools/paraphina_watch.py
+      - /home/ubuntu/paraphina_mm_pnl_harness/tests/test_telemetry_analyzer.py
+      - /home/ubuntu/paraphina_mm_pnl_harness/tests/test_phase5_tranche_system.py
+      - /home/ubuntu/paraphina_mm_pnl_harness/tests/test_paraphina_watch.py
+    runtime_binary: /home/ubuntu/paraphina_mm_pnl_harness/target/release/paraphina_live
+  execution:
+    stage_overlay_source: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env
+    live_guard_args:
+    - --pre-audit-cleanup-on-exit
+    - --stop-service-before-pre-restore-cleanup-on-exit
+    - --terminal-exit-signal-file
+    - /var/lib/paraphina/out/phase5_terminal_exit_quiesce.signal
+    - --terminal-exit-before-sec
+    - '60'
+  env_diff:
+    stage_overlay_source: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env
+    inherited_overlay: phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal
+    strategy_math_changes: none; gate-only requalification of existing full-cost dynamic-size
+      7200s evidence
+    preserved_controls:
+    - PARAPHINA_MM_HEDGE_COST_EDGE_MULT=1.0
+    - PARAPHINA_CANARY_MAX_OPEN_ORDERS=12
+    - PARAPHINA_CANARY_MAX_POSITION_TAO=0.08
+    - PARAPHINA_CANARY_MAX_GROSS_POSITION_TAO=0.08
+    - PARAPHINA_CANARY_MAX_ABS_VENUE_POSITION_TAO=0.03
+    - PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_HYPERLIQUID=0.02
+    - PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_LIGHTER=0.02
+    - PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_EXTENDED=0.02
+    - PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_ASTER=0.02
+    - PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_PARADEX=0.02
+    - PARAPHINA_TERMINAL_EXIT_QUIESCE_ENABLED=1
+    - PARAPHINA_TERMINAL_EXIT_SIGNAL_FILE=/var/lib/paraphina/out/phase5_terminal_exit_quiesce.signal
+  gate_contract:
+    required_artifacts:
+    - closeout
+    - metrics
+    - autoscore
+    - direct_venue_audit
+    - cashflow
+    - state_sync
+    - balance_snapshot
+  capital_budget:
+    max_unexplained_equity_drift_usd: 0.5
+    source: rollback_criteria
+    applies_to: final promotion and final closeout
+  automation:
+    rung_plan:
+    - duration_sec: 7200
+      continue_on: promotion
+    autoscore:
+      mechanism:
+      - source: metrics
+        path: economics_attribution.hedge_fill_unattributed_count
+        op: ==
+        value: 0
+        severity: fail
+      - source: metrics
+        path: economics_attribution.hedge_exec_cost_model_unattributed_usd
+        op: <=
+        value: 0.01
+        severity: fail
+      promotion:
+      - source: closeout
+        path: final_q_global_tao
+        op: '>='
+        value: -0.0025
+        severity: fail
+      - source: closeout
+        path: final_q_global_tao
+        op: <=
+        value: 0.0025
+        severity: fail
+      - source: balance_snapshot
+        path: exists
+        op: ==
+        value: true
+        severity: fail
+      - source: balance_snapshot
+        path: venue_count
+        op: ==
+        value: 5
+        severity: fail
+      - source: balance_snapshot
+        path: total.abs_delta_usd_float
+        op: <=
+        value: 0.5
+        severity: fail
+      - source: balance_snapshot
+        path: total.delta_usd
+        op: '>='
+        value: 0.0
+        severity: fail
+      - source: metrics
+        path: economics_attribution.net_after_hedge_exec_model_usd
+        op: '>='
+        value: -0.5
+        severity: fail
+      - source: metrics
+        path: economics_attribution.hedge_fill_unattributed_count
+        op: ==
+        value: 0
+        severity: fail
+      - source: metrics
+        path: economics_attribution.hedge_exec_cost_model_unattributed_usd
+        op: <=
+        value: 0.01
+        severity: fail
+      - source: metrics
+        path: opportunity_adjusted_scorecard.hyperliquid.passed
+        op: ==
+        value: true
+        severity: fail
+      - source: metrics
+        path: opportunity_adjusted_scorecard.lighter.passed
+        op: ==
+        value: true
+        severity: fail
+      - source: metrics
+        path: opportunity_adjusted_scorecard.extended.passed
+        op: ==
+        value: true
+        severity: fail
+      - source: metrics
+        path: opportunity_adjusted_scorecard.aster.passed
+        op: ==
+        value: true
+        severity: fail
+      - source: metrics
+        path: opportunity_adjusted_scorecard.paradex.passed
+        op: ==
+        value: true
+        severity: fail
+      - source: metrics
+        path: opportunity_adjusted_scorecard.lighter.reason
+        op: ==
+        value: mm_fill_evidence
+        severity: fail
+      - source: metrics
+        path: opportunity_adjusted_scorecard.paradex.reason
+        op: ==
+        value: mm_fill_evidence
+        severity: fail
+  mechanism_gate:
+    required:
+    - no runtime, venue, sizing, connector, vault, API-wallet, or live-order execution
+      change is introduced by this tranche
+    - PnL for promotion is total five-exchange account balance after the live run
+      minus total five-exchange account balance before the live run
+    - every venue passes opportunity_adjusted_scorecard, meaning it either produced
+      MM fill evidence or lacked enough active cost-positive quote samples to require
+      a fill
+    - at least Lighter and Paradex retain real MM fill evidence on the exact evidence
+      rung
+    - full hedge-cost gating remains enabled with PARAPHINA_MM_HEDGE_COST_EDGE_MULT=1.0
+  promotion_gate:
+    next_gate: phase5_reopened_final_closeout
+    required:
+    - the scored 7200s evidence is from the exact full-cost dynamic-size live surface
+    - default clean closeout rules pass, including clean first pre-restore and post-rollback
+      direct venue audits
+    - final_q_global_tao remains inside +/-0.0025 ETH
+    - authoritative combined account-balance delta is non-negative and absolute drift
+      is <= 0.50 USD across all five venues
+    - opportunity_adjusted_scorecard passes all five venues
+    - hedge attribution is complete with hedge_fill_unattributed_count=0 and hedge_exec_cost_model_unattributed_usd
+      <= 0.01
+    - cost-inclusive net_after_hedge_exec_model_usd is >= -0.50 USD
+  rollback_criteria:
+  - any runtime, stage overlay, connector, vault, API-wallet, sizing, venue-role,
+    quote-generation, or live-order execution change is mixed into this gate-only
+    tranche
+  - balance_snapshot comparison is missing, has fewer than five venues, is negative,
+    or shows absolute combined account-balance drift above 0.50 USD
+  - any default clean closeout rule fails
+  - any opportunity_adjusted_scorecard venue fails
+  - hedge attribution is incomplete or cost-inclusive economics breach budget
+  next_if_pass: phase5_reopened_final_closeout
+  history:
+  - decision: prepare
+    timestamp_utc: '2026-05-01T01:41:27Z'
+    notes: Prepared tranche card
+surface_id: 19ac6e21020d39d8
+control_pack_baseline: phase5_promoted_4v_fvdisabled_lighter
+topology: &id001
+  overlay_path: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env
+  connectors:
+  - aster
+  - extended
+  - hyperliquid
+  - lighter
+  - paradex
+  fv_disabled_venues: []
+  excluded_venues: []
+  roles:
+    hyperliquid: fill
+    aster: fill
+    paradex: fill
+    lighter: fill
+    extended: fill
+effective_topology: *id001
+baseline_topology:
+  connectors:
+  - hyperliquid
+  - lighter
+  - aster
+  - paradex
+  fv_disabled_venues:
+  - lighter
+  excluded_venues:
+  - extended
+  roles:
+    hyperliquid: primary_fill
+    aster: anchor_fv
+    paradex: anchor_fv
+    lighter: connected_non_fv
+    extended: excluded_pending_rescue
+execution_defaults:
+  runtime_binary: /home/ubuntu/paraphina_mm_pnl_harness/target/release/paraphina_live
+  cleanup_binary: /opt/paraphina/tools/live_cleanup
+  env_file: /etc/paraphina/current.env
+  stage_overlay_target: /etc/paraphina/stage_overlay.env
+  stage_overlay_source: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env
+  live_guard_args:
+  - --pre-restore-cleanup-on-exit
+  - --pre-audit-cleanup-on-exit
+  - --stop-service-before-pre-restore-cleanup-on-exit
+  - --terminal-exit-signal-file
+  - /var/lib/paraphina/out/phase5_terminal_exit_quiesce.signal
+  - --terminal-exit-before-sec
+  - '60'
+  live_exec_dropin_target: /etc/systemd/system/paraphina_live.service.d/live_exec_flag.conf
+  live_exec_dropin_source: /home/ubuntu/promotion_runs/phase5_hl_syncnoop_scopefix_live4v_5m_canary_20260328T202349Z/live_canary/live_exec_flag.conf
+  service: paraphina_live
+  guard_script: /home/ubuntu/paraphina/tools/unattended_live_guard.py
+  analyzer_script: /home/ubuntu/paraphina_mm_pnl_harness/tools/telemetry_analyzer.py
+  telemetry_path: /var/lib/paraphina/out/telemetry.jsonl
+  stderr_path: /var/log/paraphina/paraphina_live.err
+  promotion_runs_root: /home/ubuntu/promotion_runs
+run_dir: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_opportunity_adjusted_gate_requal

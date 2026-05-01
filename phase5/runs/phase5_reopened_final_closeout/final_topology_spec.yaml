@@ -1,0 +1,179 @@
+phase: 5
+status: accepted_closeout
+frozen_utc: '2026-05-01T01:44:22Z'
+surface_id: 19ac6e21020d39d8
+baseline_id: phase5_promoted_4v_fvdisabled_lighter
+runtime_binary: /home/ubuntu/paraphina_mm_pnl_harness/target/release/paraphina_live
+runtime_binary_sha256: 7ccdf082ab9629290aad0aec0d1ee177552bff8f7cedd1a4c74fb976560a2c1d
+stage_overlay_source: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env
+live_connectors:
+- aster
+- extended
+- hyperliquid
+- lighter
+- paradex
+fv_disabled_venues: []
+excluded_venues: []
+roles:
+  hyperliquid: fill
+  aster: fill
+  paradex: fill
+  lighter: fill
+  extended: fill
+role_rationale:
+  hyperliquid: Promoted as fill because it remained execution-eligible with live order
+    activity on the accepted surface and no narrower venue-local disproof reopened.
+  aster: Promoted as fill because it remained execution-eligible with live order activity
+    on the accepted surface and no narrower venue-local disproof reopened.
+  paradex: 'Promoted as fill after current final 2h reopened soak participation: 2
+    fills / 0.03 ETH.'
+  lighter: 'Promoted as fill after current final 2h reopened soak participation: 3
+    fills / 0.04 ETH.'
+  extended: Promoted as fill on the accepted exact surface.
+completion_standard:
+  no_connector_excluded_for_unresolved_defect: true
+  all_five_execution_eligible: true
+  all_five_fv_eligible: true
+  all_five_fill_roles_frozen: true
+  non_hyperliquid_fill_venues_in_final_soak: 2
+  opportunity_adjusted_participation_passed: true
+  opportunity_adjusted_passed_by_venue:
+    hyperliquid: true
+    aster: true
+    paradex: true
+    lighter: true
+    extended: true
+  opportunity_adjusted_reason_by_venue:
+    hyperliquid: insufficient_active_quote_sample
+    aster: insufficient_active_quote_sample
+    paradex: mm_fill_evidence
+    lighter: mm_fill_evidence
+    extended: no_cost_positive_quote_opportunity
+  mm_fill_evidence_venues:
+  - paradex
+  - lighter
+  mm_fill_evidence_venue_count: 2
+  balance_snapshot_exists: true
+  balance_snapshot_venue_count: 5
+  balance_delta_usd: 0.00742413
+  balance_abs_delta_usd: 0.00742413
+  balance_delta_nonnegative: true
+  balance_abs_delta_within_budget: true
+  final_long_soak_operationally_clean: true
+  final_direct_venue_audit_clean: true
+  passed: true
+evidence:
+  reopened_multi_venue_long_soak:
+    tranche_id: phase5_reopened_wallet_econ_full_cost_opportunity_adjusted_gate_requal
+    run_root: /home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary
+    segment_start_utc: '2026-04-30T22:04:41.427000Z'
+    segment_end_utc: '2026-05-01T00:04:47.813000Z'
+    tick_count: 29114
+    guard_window_completed: true
+    guard_exit_code: 0
+    guard_intervened: false
+    kill_events_present_post: false
+    reconcile_mismatch_count_post: 0
+    systemd_nrestarts_post: 0
+    trade_mode_post: shadow
+    final_pnl_total_usd: 0.0
+    final_q_global_eth: null
+    fill_count_total: 5
+    fill_base_total_eth: 0.07
+    fills_by_venue:
+      hyperliquid:
+        fill_count: 0
+        fill_base_eth: 0.0
+      aster:
+        fill_count: 0
+        fill_base_eth: 0.0
+      paradex:
+        fill_count: 2
+        fill_base_eth: 0.03
+      lighter:
+        fill_count: 3
+        fill_base_eth: 0.04
+      extended:
+        fill_count: 0
+        fill_base_eth: 0.0
+    order_activity_by_venue:
+      hyperliquid:
+        place_intents: 25
+        place_acks: 25
+        cancel_intents: 27
+        cancel_acks: 25
+      aster:
+        place_intents: 26
+        place_acks: 25
+        cancel_intents: 39
+        cancel_acks: 25
+      paradex:
+        place_intents: 39
+        place_acks: 38
+        cancel_intents: 43
+        cancel_acks: 40
+      lighter:
+        place_intents: 4
+        place_acks: 3
+        cancel_intents: 3
+        cancel_acks: 32
+      extended:
+        place_intents: 0
+        place_acks: 0
+        cancel_intents: 0
+        cancel_acks: 0
+    opportunity_adjusted_scorecard:
+      extended:
+        passed: true
+        reason: no_cost_positive_quote_opportunity
+        mm_fills: 0
+        active_quote_samples: 0
+        total_quote_samples: 58228
+        active_quote_pct: 0.0
+        fill_required_active_samples: 200
+      hyperliquid:
+        passed: true
+        reason: insufficient_active_quote_sample
+        mm_fills: 0
+        active_quote_samples: 78
+        total_quote_samples: 58228
+        active_quote_pct: 0.133956
+        fill_required_active_samples: 200
+      aster:
+        passed: true
+        reason: insufficient_active_quote_sample
+        mm_fills: 0
+        active_quote_samples: 105
+        total_quote_samples: 58228
+        active_quote_pct: 0.180326
+        fill_required_active_samples: 200
+      lighter:
+        passed: true
+        reason: mm_fill_evidence
+        mm_fills: 1
+        active_quote_samples: 2
+        total_quote_samples: 58228
+        active_quote_pct: 0.003435
+        fill_required_active_samples: 200
+      paradex:
+        passed: true
+        reason: mm_fill_evidence
+        mm_fills: 1
+        active_quote_samples: 230
+        total_quote_samples: 58228
+        active_quote_pct: 0.394999
+        fill_required_active_samples: 200
+    balance_snapshot:
+      path: /home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/balance_snapshot_comparison.json
+      venue_count: 5
+      total:
+        abs_delta_usd: '0.00742413'
+        abs_delta_usd_float: 0.00742413
+        delta_usd: '0.00742413'
+        post_usd: '317.24152188'
+        pre_usd: '317.23409775'
+closeout_disposition:
+  verdict: accepted
+  reason: The reopened Phase 5 surface is frozen as a five-connector, five-FV-eligible,
+    five-fill-role topology with clean long-soak operation, non-negative balance-delta
+    PnL, and opportunity-adjusted venue participation.

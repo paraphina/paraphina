@@ -1,0 +1,127 @@
+schema_version: 1
+prepared_utc: '2026-05-01T01:44:17Z'
+tranche:
+  id: phase5_reopened_final_closeout
+  track: serialized_mainline
+  status: ready
+  objective: Close the reopened Phase 5 only after multi-venue fill qualification
+    meets the all-5-primary-fill world-class standard.
+  hypothesis: 'Phase 5 should close only when the surface is both operationally clean
+    and strategically credible as a genuine multi-venue execution system aiming for
+    all five venues as rightful primary fill venues.
+
+    '
+  control:
+    description: Latest successful reopened long-soak evidence pack on promoted all5
+      surface 19ac6e21020d39d8.
+  candidate:
+    change_scope:
+      files: []
+    runtime_binary: /home/ubuntu/paraphina_mm_pnl_harness/target/release/paraphina_live
+  env_diff:
+    stage_overlay_source: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env
+  mechanism_gate:
+    required:
+    - reopened multi-venue long soak passes
+  promotion_gate:
+    next_gate: phase5_complete
+    required:
+    - final topology frozen
+    - final role matrix frozen
+    - reopened completion standard satisfied
+  rollback_criteria:
+  - reopened completion standard not met
+  history:
+  - decision: prepare
+    timestamp_utc: '2026-04-28T23:00:53Z'
+    notes: Reopened final closeout as a blocked pending child for current exact surface
+      8faedf4a9701d5e0. It must not promote until the current exact-surface reopened
+      long-soak tranche completes and auto-refreshes the closeout evidence pack.
+  - decision: prepare
+    timestamp_utc: '2026-04-16T17:36:09Z'
+    notes: Prepared tranche card
+  - decision: promote
+    timestamp_utc: '2026-04-16T17:39:47Z'
+    precondition_failed: false
+    branch_class: null
+    hypothesis_blocker_family: null
+    surface_id: b55fa3a4681b76d6
+    summary_path: /home/ubuntu/promotion_runs/phase5_reopened_multi_venue_long_soak_7200s_20260416T152916Z/live_canary/live_segment_summary.json
+    guard_path: /home/ubuntu/promotion_runs/phase5_reopened_multi_venue_long_soak_7200s_20260416T152916Z/live_canary/guard.log
+    notes: 'Accepted reopened Phase 5 final closeout on exact all5 surface b55fa3a4681b76d6.
+      Frozen spec and report written under phase5/runs/phase5_reopened_final_closeout.
+      Final topology has all five connectors enabled, no FV-disabled venues, no excluded
+      venues, and all venue roles frozen as fill. Promotion is based on clean final
+      2h long soak plus exact-surface lineage evidence: final 2h guard completed with
+      exit_code=0/no intervention/no restart/no kill/no reconcile mismatch/direct
+      audit flat; final 2h had 13 fills / 0.13 ETH across four non-Hyperliquid venues
+      with order activity on all five; prior exact-surface 60m requal had 137 fills
+      / 1.5463 ETH across all five including Hyperliquid 55/0.7645.'
+    credit_earned: major
+    child_activation_allowed: true
+    activated_child: null
+  - decision: promote
+    timestamp_utc: '2026-04-23T15:31:41Z'
+    precondition_failed: false
+    branch_class: null
+    hypothesis_blocker_family: null
+    surface_id: 00b280143fc3cee5
+    summary_path: /home/ubuntu/promotion_runs/phase5_reopened_multi_venue_long_soak_7200s_20260423T104210Z/live_canary/live_segment_summary.json
+    guard_path: /home/ubuntu/promotion_runs/phase5_reopened_multi_venue_long_soak_7200s_20260423T104210Z/live_canary/guard.log
+    notes: Auto-refreshed reopened final closeout from phase5_reopened_multi_venue_long_soak
+      using /home/ubuntu/promotion_runs/phase5_reopened_multi_venue_long_soak_7200s_20260423T104210Z/live_canary.
+    credit_earned: major
+    child_activation_allowed: true
+    activated_child: null
+surface_id: 19ac6e21020d39d8
+control_pack_baseline: phase5_promoted_4v_fvdisabled_lighter
+topology: &id001
+  overlay_path: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env
+  connectors:
+  - aster
+  - extended
+  - hyperliquid
+  - lighter
+  - paradex
+  fv_disabled_venues: []
+  excluded_venues: []
+  roles:
+    hyperliquid: fill
+    aster: fill
+    paradex: fill
+    lighter: fill
+    extended: fill
+effective_topology: *id001
+baseline_topology:
+  connectors:
+  - hyperliquid
+  - lighter
+  - aster
+  - paradex
+  fv_disabled_venues:
+  - lighter
+  excluded_venues:
+  - extended
+  roles:
+    hyperliquid: primary_fill
+    aster: anchor_fv
+    paradex: anchor_fv
+    lighter: connected_non_fv
+    extended: excluded_pending_rescue
+execution_defaults:
+  runtime_binary: /home/ubuntu/paraphina_mm_pnl_harness/target/release/paraphina_live
+  cleanup_binary: /opt/paraphina/tools/live_cleanup
+  env_file: /etc/paraphina/current.env
+  stage_overlay_target: /etc/paraphina/stage_overlay.env
+  stage_overlay_source: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env
+  live_guard_args:
+  - --pre-restore-cleanup-on-exit
+  live_exec_dropin_target: /etc/systemd/system/paraphina_live.service.d/live_exec_flag.conf
+  live_exec_dropin_source: /home/ubuntu/promotion_runs/phase5_hl_syncnoop_scopefix_live4v_5m_canary_20260328T202349Z/live_canary/live_exec_flag.conf
+  service: paraphina_live
+  guard_script: /home/ubuntu/paraphina/tools/unattended_live_guard.py
+  analyzer_script: /home/ubuntu/paraphina_mm_pnl_harness/tools/telemetry_analyzer.py
+  telemetry_path: /var/lib/paraphina/out/telemetry.jsonl
+  stderr_path: /var/log/paraphina/paraphina_live.err
+  promotion_runs_root: /home/ubuntu/promotion_runs
+run_dir: /home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_final_closeout

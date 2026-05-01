@@ -33,6 +33,7 @@ mod tests {
                 intents: vec![intent],
                 action_batch: ActionBatch::new(1_000, 0, &cfg.version),
                 now_ms: 1_000,
+                transport_hint: paraphina::live::gateway::TransportHint::Default,
                 response: paraphina::live::ResponseMode::Oneshot(response_tx),
             })
             .await
@@ -101,6 +102,7 @@ mod tests {
                 intents: vec![intent],
                 action_batch: ActionBatch::new(2_000, 0, &cfg.version),
                 now_ms: 2_000,
+                transport_hint: paraphina::live::gateway::TransportHint::Default,
                 response: paraphina::live::ResponseMode::Oneshot(response_tx),
             })
             .await
@@ -183,6 +185,7 @@ mod tests {
                 intents: vec![intent],
                 action_batch: ActionBatch::new(3_000, 0, &cfg.version),
                 now_ms: 3_000,
+                transport_hint: paraphina::live::gateway::TransportHint::Default,
                 response: paraphina::live::ResponseMode::Oneshot(response_tx),
             })
             .await

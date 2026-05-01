@@ -6,13 +6,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
 use paraphina::config::{resolve_effective_profile, Config};
 use paraphina::io::GatewayPolicy;
-use paraphina::live::gateway::{GatewayMux, LiveGateway, LiveRestClient};
+use paraphina::live::gateway::{GatewayMux, LiveGateway, LiveRestClient, TransportHint};
 use paraphina::live::instrument::{validate_specs, InstrumentSpec};
 use paraphina::live::ops::{
     default_audit_dir, format_startup_log, start_metrics_server, write_audit_files,
@@ -21,7 +21,8 @@ use paraphina::live::ops::{
 use paraphina::live::orderbook_l2::BookLevel;
 use paraphina::live::paper_adapter::{PaperExecutionAdapter, PaperFillMode, PaperMarketUpdate};
 use paraphina::live::runner::{
-    run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRuntimeHooks, ResponseMode,
+    run_live_loop, LiveAccountRequest, LiveChannels, LiveOrderRequest, LiveRunMode,
+    LiveRuntimeHooks, ResponseMode,
 };
 use paraphina::live::shadow_adapter::ShadowAckAdapter;
 use paraphina::live::supervision::spawn_supervised;
@@ -35,6 +36,22 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 use tokio::sync::mpsc;
+
+type AccountRefreshFetch = Arc<
+    dyn Fn() -> paraphina::live::gateway::BoxFuture<
+            'static,
+            paraphina::live::gateway::LiveResult<paraphina::live::types::AccountSnapshot>,
+        > + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+struct AccountRefreshHandler {
+    connector: &'static str,
+    venue_id: String,
+    venue_index: usize,
+    fetch: AccountRefreshFetch,
+}
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum TradeModeArg {
@@ -878,6 +895,30 @@ fn env_is_true(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn market_frontier_audit_enabled() -> bool {
+    env_is_true("PARAPHINA_WS_AUDIT")
+}
+
+fn market_ingest_channel_cap() -> usize {
+    env_usize("PARAPHINA_MARKET_INGEST_CHANNEL_CAP", 1024)
+}
+
+fn market_channel_cap() -> usize {
+    env_usize("PARAPHINA_MARKET_CHANNEL_CAP", 1024)
+}
+
+fn connector_market_channel_cap() -> usize {
+    env_usize("PARAPHINA_CONNECTOR_MARKET_CHANNEL_CAP", 1024)
+}
+
 fn env_is_yes(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v.trim().eq_ignore_ascii_case("yes"))
@@ -1015,6 +1056,29 @@ fn parse_live_order_snapshot_poll_ms() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2_000)
+}
+
+fn parse_aster_backstop_account_poll_ms() -> u64 {
+    std::env::var("PARAPHINA_ASTER_BACKSTOP_ACCOUNT_POLL_MS")
+        .ok()
+        .or_else(|| std::env::var("PARAPHINA_ASTER_ACCOUNT_POLL_MS").ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(15_000)
+}
+
+fn paradex_private_order_truth_enabled() -> bool {
+    std::env::var("PARAPHINA_PARADEX_PRIVATE_ORDER_TRUTH_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn parse_paradex_backstop_order_poll_ms() -> u64 {
+    std::env::var("PARAPHINA_PARADEX_ORDER_BACKSTOP_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(15_000)
 }
 
 fn endpoint_dns_status(url: &str) -> (bool, String) {
@@ -2225,9 +2289,14 @@ async fn main() {
         // Secret provider is wired for future use.
     }
 
+    let market_ingest_channel_cap = market_ingest_channel_cap();
+    let market_channel_cap = market_channel_cap();
+    let connector_market_channel_cap = connector_market_channel_cap();
     let (market_ingest_tx, mut market_ingest_rx) =
-        mpsc::channel::<paraphina::live::types::MarketDataEvent>(1024);
-    let (market_tx, market_rx) = mpsc::channel::<paraphina::live::types::MarketDataEvent>(1024);
+        mpsc::channel::<paraphina::live::types::MarketDataEvent>(market_ingest_channel_cap);
+    let market_ingest_audit_tx = market_ingest_tx.clone();
+    let (market_tx, market_rx) =
+        mpsc::channel::<paraphina::live::types::MarketDataEvent>(market_channel_cap);
     let (paper_market_tx, paper_market_rx) = mpsc::channel::<PaperMarketUpdate>(1024);
     let paper_market_tx = if paper_mode {
         Some(paper_market_tx)
@@ -2235,7 +2304,17 @@ async fn main() {
         None
     };
     let override_market_ts = paper_mode && env_is_true("PARAPHINA_PAPER_USE_WALLCLOCK_TS");
+    let market_frontier_audit_enabled = market_frontier_audit_enabled();
     tokio::spawn(async move {
+        let mut last_emit = Instant::now();
+        let mut ingest_queued_hiwater: usize = 0;
+        let mut out_queued_hiwater: usize = 0;
+        let mut forward_send_count: u64 = 0;
+        let mut forward_send_err_count: u64 = 0;
+        let mut send_block_max_ms: u64 = 0;
+        let mut send_block_gt_5ms: u64 = 0;
+        let mut send_block_gt_50ms: u64 = 0;
+        let mut send_block_gt_250ms: u64 = 0;
         while let Some(event) = market_ingest_rx.recv().await {
             let event = if override_market_ts {
                 override_market_timestamp(event, now_ms())
@@ -2248,7 +2327,62 @@ async fn main() {
                     let _ = tx.try_send(update);
                 }
             }
-            if market_tx.send(event).await.is_err() {
+            let send_started = Instant::now();
+            let send_result = market_tx.send(event).await;
+            let send_block_ms = send_started.elapsed().as_millis() as u64;
+            forward_send_count = forward_send_count.saturating_add(1);
+            send_block_max_ms = send_block_max_ms.max(send_block_ms);
+            if send_block_ms > 5 {
+                send_block_gt_5ms = send_block_gt_5ms.saturating_add(1);
+            }
+            if send_block_ms > 50 {
+                send_block_gt_50ms = send_block_gt_50ms.saturating_add(1);
+            }
+            if send_block_ms > 250 {
+                send_block_gt_250ms = send_block_gt_250ms.saturating_add(1);
+            }
+            if send_result.is_err() {
+                forward_send_err_count = forward_send_err_count.saturating_add(1);
+            }
+            if market_frontier_audit_enabled {
+                let ingest_queued_len =
+                    market_ingest_channel_cap.saturating_sub(market_ingest_audit_tx.capacity());
+                let out_queued_len = market_channel_cap.saturating_sub(market_tx.capacity());
+                ingest_queued_hiwater = ingest_queued_hiwater.max(ingest_queued_len);
+                out_queued_hiwater = out_queued_hiwater.max(out_queued_len);
+                let emit_since_ms = last_emit.elapsed().as_millis() as u64;
+                if emit_since_ms >= 1_000 {
+                    eprintln!(
+                        "WS_AUDIT component=market_frontier reason=periodic interval_ms=1000 \
+ingest_cap={} ingest_queued_len={} ingest_queued_hiwater={} out_cap={} out_queued_len={} \
+out_queued_hiwater={} forward_send_count={} forward_send_err_count={} send_block_max_ms={} \
+send_block_gt_5ms={} send_block_gt_50ms={} send_block_gt_250ms={} emit_since_ms={}",
+                        market_ingest_channel_cap,
+                        ingest_queued_len,
+                        ingest_queued_hiwater,
+                        market_channel_cap,
+                        out_queued_len,
+                        out_queued_hiwater,
+                        forward_send_count,
+                        forward_send_err_count,
+                        send_block_max_ms,
+                        send_block_gt_5ms,
+                        send_block_gt_50ms,
+                        send_block_gt_250ms,
+                        emit_since_ms,
+                    );
+                    last_emit = Instant::now();
+                    ingest_queued_hiwater = ingest_queued_len;
+                    out_queued_hiwater = out_queued_len;
+                    forward_send_count = 0;
+                    forward_send_err_count = 0;
+                    send_block_max_ms = 0;
+                    send_block_gt_5ms = 0;
+                    send_block_gt_50ms = 0;
+                    send_block_gt_250ms = 0;
+                }
+            }
+            if send_result.is_err() {
                 break;
             }
         }
@@ -2257,6 +2391,8 @@ async fn main() {
     let (exec_tx, exec_rx) = mpsc::channel::<paraphina::live::types::ExecutionEvent>(512);
     let (_order_snapshot_tx, order_snapshot_rx) =
         mpsc::channel::<paraphina::live::types::OrderSnapshot>(128);
+    let (account_reconcile_tx, account_reconcile_rx) = mpsc::channel::<LiveAccountRequest>(32);
+    let mut account_refresh_handlers: HashMap<usize, AccountRefreshHandler> = HashMap::new();
 
     if let Some(ms) = parse_reconcile_interval_ms() {
         tokio::spawn(async move {
@@ -2269,7 +2405,9 @@ async fn main() {
             }
         });
     }
-    let (priority_order_tx, mut priority_order_rx) = mpsc::channel::<LiveOrderRequest>(64);
+    // Keep the emergency single-flight lane as deep as the main order queue so
+    // cleanup and inventory-brake requests do not drop behind closeout bursts.
+    let (priority_order_tx, mut priority_order_rx) = mpsc::channel::<LiveOrderRequest>(256);
     let (order_tx, mut order_rx) = mpsc::channel::<LiveOrderRequest>(256);
 
     let exec_enable_env = env_is_true("PARAPHINA_LIVE_EXEC_ENABLE");
@@ -2286,7 +2424,7 @@ async fn main() {
                 return;
             }
         };
-        let (market_tx, market_rx) = mpsc::channel(1024);
+        let (market_tx, market_rx) = mpsc::channel(connector_market_channel_cap);
         let (account_tx, account_rx) = mpsc::channel(256);
         let (exec_tx_local, exec_rx_local) = mpsc::channel(512);
         spawn_connector_forwarders(
@@ -2439,6 +2577,33 @@ async fn main() {
                         }
                     }
                     let hl_arc = Arc::new(hl);
+                    if trade_mode.trade_mode != TradeMode::Shadow && hl_cfg.vault_address.is_some()
+                    {
+                        let refresh_client = hl_arc.clone();
+                        register_account_refresh_handler(
+                            &mut account_refresh_handlers,
+                            "hyperliquid",
+                            venue_id.clone(),
+                            venue_index,
+                            Arc::new(move || {
+                                let client = refresh_client.clone();
+                                Box::pin(async move {
+                                    match client.fetch_account_snapshot().await {
+                                        Ok(paraphina::live::types::AccountEvent::Snapshot(
+                                            snapshot,
+                                        )) => Ok(snapshot),
+                                        Err(err) => Err(
+                                            paraphina::live::gateway::LiveGatewayError::retryable(
+                                                format!(
+                                                    "hyperliquid account snapshot error: {err}"
+                                                ),
+                                            ),
+                                        ),
+                                    }
+                                })
+                            }),
+                        );
+                    }
                     if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
                         if hl_cfg.paper_mode {
                             eprintln!(
@@ -2470,6 +2635,20 @@ async fn main() {
                         } else {
                             eprintln!("paraphina_live | private_ws_disabled=true reason=missing_hl_private_key connector=hyperliquid");
                         }
+                    }
+                    if trade_mode.trade_mode != TradeMode::Shadow
+                        && hl_cfg.private_key_hex.is_some()
+                        && hl_arc.uses_ws_post_actions()
+                    {
+                        eprintln!(
+                            "paraphina_live | connector=hyperliquid | action_transport={}",
+                            hl_arc.action_transport_label()
+                        );
+                        let hl_post = hl_arc.clone();
+                        spawn_supervised("hyperliquid_post_ws", move || {
+                            let hl = hl_post.clone();
+                            async move { hl.run_post_ws().await }
+                        });
                     }
                     let hl_public = hl_arc.clone();
                     let hl_handle = spawn_supervised("hyperliquid_public_ws", move || {
@@ -2875,41 +3054,84 @@ async fn main() {
                             async move { e.run_funding_polling(funding_poll_ms).await }
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
-                            if rest_client.has_account_auth() {
-                                let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+                            if rest_client.has_private_read_auth() {
+                                let account_tx = channels.account_tx.clone();
+                                let exec_tx = channels.exec_tx.clone();
+                                let private_venue_id = venue_id.clone();
+                                let rest_client_clone = rest_client.clone();
+                                tokio::spawn(async move {
+                                    rest_client_clone
+                                        .run_private_ws(
+                                            account_tx,
+                                            exec_tx,
+                                            private_venue_id,
+                                            venue_index,
+                                        )
+                                        .await;
+                                });
+                                if rest_client.has_execution_auth() {
+                                    let refresh_client = rest_client.clone();
+                                    let refresh_venue_id = venue_id.clone();
+                                    register_account_refresh_handler(
+                                        &mut account_refresh_handlers,
+                                        "extended",
+                                        venue_id.clone(),
+                                        venue_index,
+                                        Arc::new(move || {
+                                            let client = refresh_client.clone();
+                                            let venue_id = refresh_venue_id.clone();
+                                            Box::pin(async move {
+                                                client
+                                                    .fetch_account_snapshot(&venue_id, venue_index)
+                                                    .await
+                                            })
+                                        }),
+                                    );
+                                    let poll_ms = std::env::var(
+                                        "PARAPHINA_EXTENDED_ACCOUNT_BACKSTOP_POLL_MS",
+                                    )
                                     .ok()
                                     .and_then(|v| v.parse::<u64>().ok())
-                                    .unwrap_or(5_000);
-                                let account_tx = channels.account_tx.clone();
-                                let account_venue_id = venue_id.clone();
-                                let rest_client_clone = rest_client.clone();
-                                tokio::spawn(async move {
-                                    rest_client_clone
-                                        .run_account_polling(
-                                            account_tx,
-                                            account_venue_id,
-                                            venue_index,
-                                            poll_ms,
-                                        )
-                                        .await;
-                                });
-                                let order_poll_ms = parse_live_order_snapshot_poll_ms();
-                                let exec_tx = channels.exec_tx.clone();
-                                let order_venue_id = venue_id.clone();
-                                let rest_client_clone = rest_client.clone();
-                                tokio::spawn(async move {
-                                    rest_client_clone
-                                        .run_order_polling(
-                                            exec_tx,
-                                            order_venue_id,
-                                            venue_index,
-                                            order_poll_ms,
-                                        )
-                                        .await;
-                                });
+                                    .unwrap_or(15_000);
+                                    let account_tx = channels.account_tx.clone();
+                                    let account_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    tokio::spawn(async move {
+                                        rest_client_clone
+                                            .run_account_polling(
+                                                account_tx,
+                                                account_venue_id,
+                                                venue_index,
+                                                poll_ms,
+                                            )
+                                            .await;
+                                    });
+                                    let order_poll_ms =
+                                        std::env::var("PARAPHINA_EXTENDED_ORDER_BACKSTOP_POLL_MS")
+                                            .ok()
+                                            .and_then(|v| v.parse::<u64>().ok())
+                                            .unwrap_or(15_000);
+                                    let exec_tx = channels.exec_tx.clone();
+                                    let order_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    tokio::spawn(async move {
+                                        rest_client_clone
+                                            .run_order_polling(
+                                                exec_tx,
+                                                order_venue_id,
+                                                venue_index,
+                                                order_poll_ms,
+                                            )
+                                            .await;
+                                    });
+                                } else {
+                                    eprintln!(
+                                        "paraphina_live | account_backstop_disabled=true reason=missing_extended_bridge_auth connector=extended"
+                                    );
+                                }
                             } else {
                                 eprintln!(
-                                    "paraphina_live | account_snapshots_disabled=true reason=missing_extended_bridge_auth connector=extended"
+                                    "paraphina_live | account_snapshots_disabled=true reason=missing_extended_api_key connector=extended"
                                 );
                                 if let Some(index) = resolve_venue_index(&cfg, &venue_id) {
                                     send_unavailable_account_snapshot_for(
@@ -3052,37 +3274,97 @@ async fn main() {
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {
-                                let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
-                                    .ok()
-                                    .and_then(|v| v.parse::<u64>().ok())
-                                    .unwrap_or(5_000);
-                                let account_tx = channels.account_tx.clone();
-                                let account_venue_id = venue_id.clone();
-                                let rest_client_clone = rest_client.clone();
-                                tokio::spawn(async move {
-                                    rest_client_clone
-                                        .run_account_polling(
-                                            account_tx,
-                                            account_venue_id,
-                                            venue_index,
-                                            poll_ms,
-                                        )
-                                        .await;
-                                });
-                                let order_poll_ms = parse_live_order_snapshot_poll_ms();
-                                let exec_tx = channels.exec_tx.clone();
-                                let order_venue_id = venue_id.clone();
-                                let rest_client_clone = rest_client.clone();
-                                tokio::spawn(async move {
-                                    rest_client_clone
-                                        .run_order_polling(
-                                            exec_tx,
-                                            order_venue_id,
-                                            venue_index,
-                                            order_poll_ms,
-                                        )
-                                        .await;
-                                });
+                                let refresh_client = rest_client.clone();
+                                let refresh_venue_id = venue_id.clone();
+                                register_account_refresh_handler(
+                                    &mut account_refresh_handlers,
+                                    "aster",
+                                    venue_id.clone(),
+                                    venue_index,
+                                    Arc::new(move || {
+                                        let client = refresh_client.clone();
+                                        let venue_id = refresh_venue_id.clone();
+                                        Box::pin(async move {
+                                            client
+                                                .fetch_account_snapshot(&venue_id, venue_index)
+                                                .await
+                                        })
+                                    }),
+                                );
+                                let use_user_stream = std::env::var("PARAPHINA_ASTER_USER_STREAM")
+                                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                                    .unwrap_or(false);
+                                if use_user_stream {
+                                    let account_tx = channels.account_tx.clone();
+                                    let exec_tx = channels.exec_tx.clone();
+                                    let account_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    spawn_supervised("aster_private_ws", move || {
+                                        let rest = rest_client_clone.clone();
+                                        let account_tx = account_tx.clone();
+                                        let exec_tx = exec_tx.clone();
+                                        let venue_id = account_venue_id.clone();
+                                        async move {
+                                            rest.run_private_ws(
+                                                account_tx,
+                                                exec_tx,
+                                                venue_id,
+                                                venue_index,
+                                            )
+                                            .await
+                                        }
+                                    });
+                                    let poll_ms = parse_aster_backstop_account_poll_ms();
+                                    eprintln!(
+                                        "paraphina_live | aster_account_backstop_poll_ms={} mode=user_stream",
+                                        poll_ms
+                                    );
+                                    let account_tx = channels.account_tx.clone();
+                                    let account_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    tokio::spawn(async move {
+                                        rest_client_clone
+                                            .run_account_polling(
+                                                account_tx,
+                                                account_venue_id,
+                                                venue_index,
+                                                poll_ms,
+                                            )
+                                            .await;
+                                    });
+                                } else {
+                                    let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+                                        .ok()
+                                        .and_then(|v| v.parse::<u64>().ok())
+                                        .unwrap_or(5_000);
+                                    let account_tx = channels.account_tx.clone();
+                                    let account_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    tokio::spawn(async move {
+                                        rest_client_clone
+                                            .run_account_polling(
+                                                account_tx,
+                                                account_venue_id,
+                                                venue_index,
+                                                poll_ms,
+                                            )
+                                            .await;
+                                    });
+                                    let order_poll_ms = parse_live_order_snapshot_poll_ms();
+                                    let exec_tx = channels.exec_tx.clone();
+                                    let order_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    tokio::spawn(async move {
+                                        rest_client_clone
+                                            .run_order_polling(
+                                                exec_tx,
+                                                order_venue_id,
+                                                venue_index,
+                                                order_poll_ms,
+                                            )
+                                            .await;
+                                    });
+                                }
                             } else {
                                 eprintln!(
                                     "paraphina_live | account_snapshots_disabled=true reason=missing_aster_api_keys connector=aster"
@@ -3233,6 +3515,23 @@ async fn main() {
                         });
                         if trade_mode.trade_mode != TradeMode::Shadow {
                             if rest_client.has_auth() {
+                                let refresh_client = rest_client.clone();
+                                let refresh_venue_id = venue_id.clone();
+                                register_account_refresh_handler(
+                                    &mut account_refresh_handlers,
+                                    "paradex",
+                                    venue_id.clone(),
+                                    venue_index,
+                                    Arc::new(move || {
+                                        let client = refresh_client.clone();
+                                        let venue_id = refresh_venue_id.clone();
+                                        Box::pin(async move {
+                                            client
+                                                .fetch_account_snapshot(&venue_id, venue_index)
+                                                .await
+                                        })
+                                    }),
+                                );
                                 let poll_ms = std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
                                     .ok()
                                     .and_then(|v| v.parse::<u64>().ok())
@@ -3250,20 +3549,57 @@ async fn main() {
                                         )
                                         .await;
                                 });
-                                let order_poll_ms = parse_live_order_snapshot_poll_ms();
-                                let exec_tx = channels.exec_tx.clone();
-                                let order_venue_id = venue_id.clone();
-                                let rest_client_clone = rest_client.clone();
-                                tokio::spawn(async move {
-                                    rest_client_clone
-                                        .run_order_polling(
-                                            exec_tx,
-                                            order_venue_id,
-                                            venue_index,
-                                            order_poll_ms,
-                                        )
-                                        .await;
-                                });
+                                if paradex_private_order_truth_enabled() {
+                                    let exec_tx = channels.exec_tx.clone();
+                                    let private_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    spawn_supervised("paradex_private_order_ws", move || {
+                                        let rest = rest_client_clone.clone();
+                                        let exec_tx = exec_tx.clone();
+                                        let venue_id = private_venue_id.clone();
+                                        async move {
+                                            rest.run_private_order_ws(
+                                                exec_tx,
+                                                venue_id,
+                                                venue_index,
+                                            )
+                                            .await
+                                        }
+                                    });
+                                    let order_poll_ms = parse_paradex_backstop_order_poll_ms();
+                                    eprintln!(
+                                        "paraphina_live | paradex_order_backstop_poll_ms={} mode=private_order_truth",
+                                        order_poll_ms
+                                    );
+                                    let exec_tx = channels.exec_tx.clone();
+                                    let order_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    tokio::spawn(async move {
+                                        rest_client_clone
+                                            .run_order_polling(
+                                                exec_tx,
+                                                order_venue_id,
+                                                venue_index,
+                                                order_poll_ms,
+                                            )
+                                            .await;
+                                    });
+                                } else {
+                                    let order_poll_ms = parse_live_order_snapshot_poll_ms();
+                                    let exec_tx = channels.exec_tx.clone();
+                                    let order_venue_id = venue_id.clone();
+                                    let rest_client_clone = rest_client.clone();
+                                    tokio::spawn(async move {
+                                        rest_client_clone
+                                            .run_order_polling(
+                                                exec_tx,
+                                                order_venue_id,
+                                                venue_index,
+                                                order_poll_ms,
+                                            )
+                                            .await;
+                                    });
+                                }
                             } else {
                                 eprintln!(
                                     "paraphina_live | account_snapshots_disabled=true reason=missing_paradex_auth connector=paradex"
@@ -3296,6 +3632,13 @@ async fn main() {
             }
         }
     }
+
+    let account_reconcile_tx_for_runner = if account_refresh_handlers.is_empty() {
+        None
+    } else {
+        spawn_account_refresh_router(account_reconcile_rx, account_refresh_handlers);
+        Some(account_reconcile_tx.clone())
+    };
 
     // ── Layer A: spawn the venue health enforcer ──────────────────────────
     // Spawned as a plain tokio task because ConnectorSlot contains non-Clone
@@ -3423,16 +3766,18 @@ async fn main() {
                     }
                 }
                 Some(req) = async {
-                    if let Some(req) = pending_priority_order_reqs.pop_front() {
-                        Some(req)
-                    } else {
-                        priority_order_rx.recv().await
+                    if pending_priority_order_reqs.is_empty() {
+                        if let Some(req) = priority_order_rx.recv().await {
+                            pending_priority_order_reqs.push_back(req);
+                        }
                     }
+                    take_priority_request(&mut pending_priority_order_reqs, &mut priority_order_rx)
                 } => {
                     let LiveOrderRequest {
                         intents,
                         action_batch,
                         now_ms,
+                        transport_hint,
                         response,
                     } = req;
                     let events = if let Some(gateway) = live_gateway.as_mut() {
@@ -3442,6 +3787,8 @@ async fn main() {
                             action_batch.tick_index,
                             now_ms,
                             &mut exec_seq,
+                            false,
+                            transport_hint,
                         )
                         .await
                     } else if let Some(adapter) = paper_adapter.as_mut() {
@@ -3472,68 +3819,43 @@ async fn main() {
                         order_rx.recv().await
                     }
                 } => {
-                    let req = coalesce_fire_and_forget_request(
-                        req,
-                        &mut pending_order_reqs,
-                        &mut order_rx,
-                    );
+                    let normalize_hyperliquid_batch_window =
+                        request_contains_hyperliquid_batchable_intents(&req);
+                    let req = if normalize_hyperliquid_batch_window {
+                        coalesce_hyperliquid_fire_and_forget_request(
+                            req,
+                            &mut pending_order_reqs,
+                            &mut order_rx,
+                            &mut pending_priority_order_reqs,
+                            &mut priority_order_rx,
+                            Duration::from_millis(HYPERLIQUID_BATCH_WINDOW_MS),
+                        )
+                        .await
+                    } else {
+                        coalesce_fire_and_forget_request(
+                            req,
+                            &mut pending_order_reqs,
+                            &mut order_rx,
+                        )
+                    };
                     let LiveOrderRequest {
                         intents,
                         action_batch,
                         now_ms,
+                        transport_hint,
                         response,
                     } = req;
                     let events = if let Some(gateway) = live_gateway.as_mut() {
-                        if matches!(&response, ResponseMode::FireAndForget) {
-                            let batch_now_ms = action_batch.now_ms;
-                            let batch_tick = action_batch.tick_index;
-                            let batch_config_version = action_batch.config_version;
-                            let batch_seed = action_batch.run_seed;
-                            let mut remaining_intents: VecDeque<_> = intents.into();
-                            let mut events = Vec::new();
-                            while let Some(intent) = remaining_intents.pop_front() {
-                                let mut out = handle_live_gateway_intent(
-                                    gateway,
-                                    intent,
-                                    batch_tick,
-                                    now_ms,
-                                    &mut exec_seq,
-                                )
-                                .await;
-                                events.append(&mut out);
-                                if let Some(priority_req) = take_priority_request(
-                                    &mut pending_priority_order_reqs,
-                                    &mut priority_order_rx,
-                                ) {
-                                    if !remaining_intents.is_empty() {
-                                        pending_order_reqs.push_front(LiveOrderRequest {
-                                            intents: remaining_intents.into_iter().collect(),
-                                            action_batch:
-                                                paraphina::actions::ActionBatch::new(
-                                                    batch_now_ms,
-                                                    batch_tick,
-                                                    &batch_config_version,
-                                                )
-                                                .with_seed(batch_seed),
-                                            now_ms,
-                                            response: ResponseMode::FireAndForget,
-                                        });
-                                    }
-                                    pending_priority_order_reqs.push_front(priority_req);
-                                    break;
-                                }
-                            }
-                            events
-                        } else {
-                            handle_live_gateway_intents(
-                                gateway,
-                                intents,
-                                action_batch.tick_index,
-                                now_ms,
-                                &mut exec_seq,
-                            )
-                            .await
-                        }
+                        handle_live_gateway_intents(
+                            gateway,
+                            intents,
+                            action_batch.tick_index,
+                            now_ms,
+                            &mut exec_seq,
+                            normalize_hyperliquid_batch_window,
+                            transport_hint,
+                        )
+                        .await
                     } else if let Some(adapter) = paper_adapter.as_mut() {
                         let events = adapter.handle_intents(intents, action_batch.tick_index, now_ms);
                         let mut response_events = Vec::new();
@@ -3564,7 +3886,7 @@ async fn main() {
         market_rx,
         account_rx,
         exec_rx: Some(exec_rx),
-        account_reconcile_tx: None,
+        account_reconcile_tx: account_reconcile_tx_for_runner,
         priority_order_tx,
         order_tx,
         order_snapshot_rx: Some(order_snapshot_rx),
@@ -3632,13 +3954,442 @@ async fn handle_live_gateway_intents<C: LiveRestClient>(
     tick: u64,
     now_ms: paraphina::types::TimestampMs,
     seq: &mut u64,
+    normalize_hyperliquid_batch_window: bool,
+    transport_hint: TransportHint,
 ) -> Vec<paraphina::live::types::ExecutionEvent> {
+    let expanded = expand_live_gateway_intents(intents);
+    let expanded = if normalize_hyperliquid_batch_window {
+        normalize_hyperliquid_batch_window_expanded_intents(expanded)
+    } else {
+        expanded
+    };
+    if expanded.is_empty() {
+        return Vec::new();
+    }
+    let mut results = gateway
+        .submit_batch(&expanded, tick, now_ms, transport_hint)
+        .await;
+    if results.len() != expanded.len() {
+        let err =
+            paraphina::live::gateway::LiveGatewayError::fatal("live_gateway_batch_len_mismatch");
+        results = vec![Err(err); expanded.len()];
+    }
     let mut events = Vec::new();
-    for intent in intents {
-        let mut out = handle_live_gateway_intent(gateway, intent, tick, now_ms, seq).await;
+    for (intent, result) in expanded.into_iter().zip(results.into_iter()) {
+        let mut out = execution_events_from_gateway_result(intent, result, now_ms, seq);
         events.append(&mut out);
     }
     events
+}
+
+fn expand_live_gateway_intents(
+    intents: Vec<paraphina::types::OrderIntent>,
+) -> Vec<paraphina::types::OrderIntent> {
+    let mut expanded = Vec::with_capacity(intents.len() * 2);
+    for intent in intents {
+        match intent {
+            paraphina::types::OrderIntent::Replace(replace)
+                if preserve_native_replace_intent(&replace) =>
+            {
+                expanded.push(paraphina::types::OrderIntent::Replace(replace));
+            }
+            paraphina::types::OrderIntent::Replace(replace) => {
+                expanded.push(paraphina::types::OrderIntent::Cancel(
+                    paraphina::types::CancelOrderIntent {
+                        venue_index: replace.venue_index,
+                        venue_id: replace.venue_id.clone(),
+                        order_id: replace.order_id.clone(),
+                    },
+                ));
+                expanded.push(paraphina::types::OrderIntent::Place(
+                    paraphina::types::PlaceOrderIntent {
+                        venue_index: replace.venue_index,
+                        venue_id: replace.venue_id,
+                        side: replace.side,
+                        price: replace.price,
+                        size: replace.size,
+                        purpose: replace.purpose,
+                        time_in_force: replace.time_in_force,
+                        post_only: replace.post_only,
+                        reduce_only: replace.reduce_only,
+                        client_order_id: replace.client_order_id,
+                    },
+                ));
+            }
+            other => expanded.push(other),
+        }
+    }
+    expanded
+}
+
+fn preserve_native_replace_intent(replace: &paraphina::types::ReplaceOrderIntent) -> bool {
+    if replace.reduce_only
+        || !replace.post_only
+        || replace.purpose != paraphina::types::OrderPurpose::Mm
+    {
+        return false;
+    }
+    if replace
+        .venue_id
+        .as_ref()
+        .eq_ignore_ascii_case("hyperliquid")
+    {
+        return is_hyperliquid_replace_identity(&replace.order_id);
+    }
+    if replace.venue_id.as_ref().eq_ignore_ascii_case("paradex") {
+        return !replace.order_id.starts_with("co_");
+    }
+    if replace.venue_id.as_ref().eq_ignore_ascii_case("lighter") {
+        return is_lighter_replace_identity(&replace.order_id);
+    }
+    if replace.venue_id.as_ref().eq_ignore_ascii_case("extended") {
+        return env_is_true("PARAPHINA_EXTENDED_NATIVE_REPLACE_ENABLED")
+            && is_extended_replace_identity(&replace.order_id);
+    }
+    false
+}
+
+const HYPERLIQUID_BATCH_WINDOW_MS: u64 = 100;
+
+fn is_hyperliquid_cloid(order_id: &str) -> bool {
+    order_id.len() == 34
+        && order_id.starts_with("0x")
+        && order_id[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_hyperliquid_replace_identity(order_id: &str) -> bool {
+    is_hyperliquid_cloid(order_id) || order_id.parse::<u64>().is_ok()
+}
+
+fn is_lighter_replace_identity(order_id: &str) -> bool {
+    order_id.parse::<u64>().is_ok()
+}
+
+fn is_extended_replace_identity(order_id: &str) -> bool {
+    let order_id = order_id.trim();
+    !order_id.is_empty() && !order_id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_hyperliquid_batchable_intent(intent: &paraphina::types::OrderIntent) -> bool {
+    match intent {
+        paraphina::types::OrderIntent::Cancel(cancel) => {
+            cancel.venue_id.eq_ignore_ascii_case("hyperliquid")
+        }
+        paraphina::types::OrderIntent::Place(place) => {
+            place.venue_id.eq_ignore_ascii_case("hyperliquid") && place.post_only
+        }
+        paraphina::types::OrderIntent::Replace(replace) => {
+            replace.venue_id.eq_ignore_ascii_case("hyperliquid") && replace.post_only
+        }
+        paraphina::types::OrderIntent::CancelAll(_) => false,
+    }
+}
+
+fn request_contains_hyperliquid_batchable_intents(request: &LiveOrderRequest) -> bool {
+    matches!(request.response, ResponseMode::FireAndForget)
+        && request.intents.iter().any(is_hyperliquid_batchable_intent)
+}
+
+fn merge_fire_and_forget_request(request: &mut LiveOrderRequest, next: LiveOrderRequest) -> usize {
+    let next_len = next.intents.len();
+    request.intents.extend(next.intents);
+    request.action_batch = next.action_batch;
+    request.now_ms = next.now_ms;
+    next_len
+}
+
+fn hyperliquid_mm_batch_same_side_dedup_enabled() -> bool {
+    env_is_true("PARAPHINA_HL_MM_BATCH_SAME_SIDE_DEDUP")
+}
+
+fn hyperliquid_mm_same_side_place_key(
+    intent: &paraphina::types::OrderIntent,
+) -> Option<(usize, paraphina::types::Side)> {
+    match intent {
+        paraphina::types::OrderIntent::Place(place)
+            if place.venue_id.eq_ignore_ascii_case("hyperliquid")
+                && place.post_only
+                && !place.reduce_only
+                && place.purpose == paraphina::types::OrderPurpose::Mm =>
+        {
+            Some((place.venue_index, place.side))
+        }
+        _ => None,
+    }
+}
+
+fn dedup_hyperliquid_mm_same_side_places(
+    intents: Vec<paraphina::types::OrderIntent>,
+) -> Vec<paraphina::types::OrderIntent> {
+    let mut seen: Vec<(usize, paraphina::types::Side)> = Vec::new();
+    let mut retained = Vec::with_capacity(intents.len());
+    for intent in intents.into_iter().rev() {
+        if let Some(key) = hyperliquid_mm_same_side_place_key(&intent) {
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+        }
+        retained.push(intent);
+    }
+    retained.reverse();
+    retained
+}
+
+async fn coalesce_hyperliquid_fire_and_forget_request(
+    mut request: LiveOrderRequest,
+    pending: &mut VecDeque<LiveOrderRequest>,
+    order_rx: &mut mpsc::Receiver<LiveOrderRequest>,
+    pending_priority: &mut VecDeque<LiveOrderRequest>,
+    priority_order_rx: &mut mpsc::Receiver<LiveOrderRequest>,
+    window: Duration,
+) -> LiveOrderRequest {
+    let mut merged_requests = 1usize;
+    let mut merged_intents = request.intents.len();
+
+    while pending
+        .front()
+        .is_some_and(request_contains_hyperliquid_batchable_intents)
+    {
+        let next = pending
+            .pop_front()
+            .expect("pending front exists when merging hyperliquid batch window");
+        merged_intents += merge_fire_and_forget_request(&mut request, next);
+        merged_requests += 1;
+    }
+
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(sleep);
+        tokio::select! {
+            biased;
+            Some(priority_req) = priority_order_rx.recv() => {
+                pending_priority.push_back(priority_req);
+                break;
+            }
+            _ = &mut sleep => break,
+            maybe_req = order_rx.recv() => {
+                let Some(next) = maybe_req else {
+                    break;
+                };
+                if request_contains_hyperliquid_batchable_intents(&next) {
+                    merged_intents += merge_fire_and_forget_request(&mut request, next);
+                    merged_requests += 1;
+                    continue;
+                }
+                pending.push_back(next);
+                break;
+            }
+        }
+    }
+
+    if merged_requests > 1 {
+        eprintln!(
+            "BATCH_WINDOW_FLUSH venue=hyperliquid window_ms={} merged_requests={} merged_intents={} tick={}",
+            window.as_millis(),
+            merged_requests,
+            merged_intents,
+            request.action_batch.tick_index,
+        );
+    }
+
+    if hyperliquid_mm_batch_same_side_dedup_enabled() {
+        let pre_dedup_intents = request.intents.len();
+        request.intents = dedup_hyperliquid_mm_same_side_places(request.intents);
+        let dropped_intents = pre_dedup_intents.saturating_sub(request.intents.len());
+        if dropped_intents > 0 {
+            eprintln!(
+                "BATCH_WINDOW_DEDUP venue=hyperliquid rule=mm_same_side_places dropped_intents={} tick={}",
+                dropped_intents,
+                request.action_batch.tick_index,
+            );
+        }
+    }
+
+    request
+}
+
+fn normalize_hyperliquid_batch_window_expanded_intents(
+    intents: Vec<paraphina::types::OrderIntent>,
+) -> Vec<paraphina::types::OrderIntent> {
+    let mut passthrough = Vec::with_capacity(intents.len());
+    let mut cancel_by_cloid = Vec::new();
+    let mut cancel_oid = Vec::new();
+    let mut replace_alo = Vec::new();
+    let mut place_alo = Vec::new();
+
+    for intent in intents {
+        match intent {
+            paraphina::types::OrderIntent::Cancel(cancel)
+                if cancel.venue_id.eq_ignore_ascii_case("hyperliquid") =>
+            {
+                if is_hyperliquid_cloid(&cancel.order_id) {
+                    cancel_by_cloid.push(paraphina::types::OrderIntent::Cancel(cancel));
+                } else {
+                    cancel_oid.push(paraphina::types::OrderIntent::Cancel(cancel));
+                }
+            }
+            paraphina::types::OrderIntent::Place(place)
+                if place.venue_id.eq_ignore_ascii_case("hyperliquid") && place.post_only =>
+            {
+                place_alo.push(paraphina::types::OrderIntent::Place(place));
+            }
+            paraphina::types::OrderIntent::Replace(replace)
+                if replace.venue_id.eq_ignore_ascii_case("hyperliquid")
+                    && replace.post_only
+                    && !replace.reduce_only =>
+            {
+                replace_alo.push(paraphina::types::OrderIntent::Replace(replace));
+            }
+            other => passthrough.push(other),
+        }
+    }
+
+    passthrough.extend(cancel_by_cloid);
+    passthrough.extend(cancel_oid);
+    passthrough.extend(replace_alo);
+    passthrough.extend(place_alo);
+    passthrough
+}
+
+fn execution_events_from_gateway_result(
+    intent: paraphina::types::OrderIntent,
+    result: paraphina::live::gateway::LiveResult<paraphina::live::gateway::LiveRestResponse>,
+    now_ms: paraphina::types::TimestampMs,
+    seq: &mut u64,
+) -> Vec<paraphina::live::types::ExecutionEvent> {
+    use paraphina::live::types::{
+        CancelAccepted, CancelAllAccepted, CancelAllRejected, CancelRejected, ExecutionEvent,
+        OrderAccepted, OrderRejected,
+    };
+
+    match intent {
+        paraphina::types::OrderIntent::Place(place) => {
+            *seq = seq.wrapping_add(1);
+            match result {
+                Ok(resp) => vec![ExecutionEvent::OrderAccepted(OrderAccepted {
+                    venue_index: place.venue_index,
+                    venue_id: place.venue_id.to_string(),
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    order_id: resp.order_id.clone().unwrap_or_else(|| {
+                        place
+                            .client_order_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string())
+                    }),
+                    client_order_id: resp.client_order_id.or(place.client_order_id.clone()),
+                    side: place.side,
+                    price: place.price,
+                    size: place.size,
+                    purpose: place.purpose,
+                })],
+                Err(err) => vec![ExecutionEvent::OrderRejected(OrderRejected {
+                    venue_index: place.venue_index,
+                    venue_id: place.venue_id.to_string(),
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    order_id: place.client_order_id.clone(),
+                    client_order_id: place.client_order_id.clone(),
+                    purpose: Some(place.purpose),
+                    reduce_only: Some(place.reduce_only),
+                    reason: err.message.clone(),
+                })],
+            }
+        }
+        paraphina::types::OrderIntent::Cancel(cancel) => {
+            *seq = seq.wrapping_add(1);
+            match result {
+                Ok(_resp) => vec![ExecutionEvent::CancelAccepted(CancelAccepted {
+                    venue_index: cancel.venue_index,
+                    venue_id: cancel.venue_id.to_string(),
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    order_id: cancel.order_id,
+                })],
+                Err(err) => vec![ExecutionEvent::CancelRejected(CancelRejected {
+                    venue_index: cancel.venue_index,
+                    venue_id: cancel.venue_id.to_string(),
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    order_id: Some(cancel.order_id),
+                    reason: err.message.clone(),
+                })],
+            }
+        }
+        paraphina::types::OrderIntent::CancelAll(cancel_all) => {
+            *seq = seq.wrapping_add(1);
+            let venue_index = cancel_all.venue_index.unwrap_or(0);
+            let venue_id = cancel_all
+                .venue_id
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "all".to_string());
+            match result {
+                Ok(_resp) => vec![ExecutionEvent::CancelAllAccepted(CancelAllAccepted {
+                    venue_index,
+                    venue_id,
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    count: 0,
+                })],
+                Err(err) => vec![ExecutionEvent::CancelAllRejected(CancelAllRejected {
+                    venue_index,
+                    venue_id,
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    reason: err.message.clone(),
+                })],
+            }
+        }
+        paraphina::types::OrderIntent::Replace(replace) => match result {
+            Ok(resp) => {
+                let client_order_id = resp
+                    .client_order_id
+                    .clone()
+                    .or(replace.client_order_id.clone());
+                let order_id = resp.order_id.clone().or_else(|| client_order_id.clone());
+                let mut events = Vec::with_capacity(2);
+                *seq = seq.wrapping_add(1);
+                events.push(ExecutionEvent::CancelAccepted(CancelAccepted {
+                    venue_index: replace.venue_index,
+                    venue_id: replace.venue_id.to_string(),
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    order_id: replace.order_id,
+                }));
+                *seq = seq.wrapping_add(1);
+                events.push(ExecutionEvent::OrderAccepted(OrderAccepted {
+                    venue_index: replace.venue_index,
+                    venue_id: replace.venue_id.to_string(),
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    order_id: order_id.unwrap_or_else(|| "unknown".to_string()),
+                    client_order_id,
+                    side: replace.side,
+                    price: replace.price,
+                    size: replace.size,
+                    purpose: replace.purpose,
+                }));
+                events
+            }
+            Err(err) => {
+                *seq = seq.wrapping_add(1);
+                vec![ExecutionEvent::OrderRejected(OrderRejected {
+                    venue_index: replace.venue_index,
+                    venue_id: replace.venue_id.to_string(),
+                    seq: *seq,
+                    timestamp_ms: now_ms,
+                    order_id: Some(replace.order_id),
+                    client_order_id: replace.client_order_id.clone(),
+                    purpose: Some(replace.purpose),
+                    reduce_only: Some(replace.reduce_only),
+                    reason: err.message.clone(),
+                })]
+            }
+        },
+    }
 }
 
 async fn handle_live_gateway_intent<C: LiveRestClient>(
@@ -3659,39 +4410,20 @@ async fn handle_live_gateway_intent<C: LiveRestClient>(
             handle_live_gateway_cancel_all(gateway, cancel_all, tick, now_ms, seq).await
         }
         paraphina::types::OrderIntent::Replace(replace) => {
-            let mut out = handle_live_gateway_cancel(
-                gateway,
-                paraphina::types::CancelOrderIntent {
-                    venue_index: replace.venue_index,
-                    venue_id: replace.venue_id.clone(),
-                    order_id: replace.order_id.clone(),
-                },
-                tick,
+            let result = gateway
+                .submit_intent(
+                    &paraphina::types::OrderIntent::Replace(replace.clone()),
+                    tick,
+                    now_ms,
+                    TransportHint::Default,
+                )
+                .await;
+            execution_events_from_gateway_result(
+                paraphina::types::OrderIntent::Replace(replace),
+                result,
                 now_ms,
                 seq,
             )
-            .await;
-            let mut out2 = handle_live_gateway_place(
-                gateway,
-                paraphina::types::PlaceOrderIntent {
-                    venue_index: replace.venue_index,
-                    venue_id: replace.venue_id.clone(),
-                    side: replace.side,
-                    price: replace.price,
-                    size: replace.size,
-                    purpose: replace.purpose,
-                    time_in_force: replace.time_in_force,
-                    post_only: replace.post_only,
-                    reduce_only: replace.reduce_only,
-                    client_order_id: replace.client_order_id.clone(),
-                },
-                tick,
-                now_ms,
-                seq,
-            )
-            .await;
-            out.append(&mut out2);
-            out
         }
     }
 }
@@ -3710,6 +4442,7 @@ async fn handle_live_gateway_place<C: LiveRestClient>(
             &paraphina::types::OrderIntent::Place(place.clone()),
             tick,
             now_ms,
+            TransportHint::Default,
         )
         .await;
     match res {
@@ -3765,6 +4498,7 @@ async fn handle_live_gateway_cancel<C: LiveRestClient>(
             &paraphina::types::OrderIntent::Cancel(cancel.clone()),
             tick,
             now_ms,
+            TransportHint::Default,
         )
         .await;
     match res {
@@ -3807,6 +4541,7 @@ async fn handle_live_gateway_cancel_all<C: LiveRestClient>(
             &paraphina::types::OrderIntent::CancelAll(cancel_all.clone()),
             tick,
             now_ms,
+            TransportHint::Default,
         )
         .await;
     match res {
@@ -3860,10 +4595,29 @@ fn take_priority_request(
     pending: &mut VecDeque<LiveOrderRequest>,
     priority_order_rx: &mut mpsc::Receiver<LiveOrderRequest>,
 ) -> Option<LiveOrderRequest> {
-    if let Some(req) = pending.pop_front() {
-        return Some(req);
+    while let Ok(req) = priority_order_rx.try_recv() {
+        pending.push_back(req);
     }
-    priority_order_rx.try_recv().ok()
+    if let Some(index) = pending
+        .iter()
+        .position(request_contains_critical_exit_flatten)
+    {
+        return pending.remove(index);
+    }
+    pending.pop_front()
+}
+
+fn request_contains_critical_exit_flatten(request: &LiveOrderRequest) -> bool {
+    request.intents.iter().any(|intent| {
+        matches!(
+            intent,
+            paraphina::types::OrderIntent::Place(place)
+                if place.purpose == paraphina::types::OrderPurpose::Exit
+                    && place.reduce_only
+                    && !place.post_only
+                    && place.time_in_force == paraphina::types::TimeInForce::Ioc
+        )
+    })
 }
 
 fn forward_exec_events(
@@ -3924,6 +4678,65 @@ fn send_unavailable_account_snapshot_for(
     let _ = account_tx.try_send(paraphina::live::types::AccountEvent::Snapshot(snapshot));
 }
 
+fn register_account_refresh_handler(
+    handlers: &mut HashMap<usize, AccountRefreshHandler>,
+    connector: &'static str,
+    venue_id: String,
+    venue_index: usize,
+    fetch: AccountRefreshFetch,
+) {
+    if let Some(previous) = handlers.insert(
+        venue_index,
+        AccountRefreshHandler {
+            connector,
+            venue_id: venue_id.clone(),
+            venue_index,
+            fetch,
+        },
+    ) {
+        eprintln!(
+            "paraphina_live | account_refresh_handler_replaced venue_index={} previous_connector={} previous_venue={} connector={} venue={}",
+            venue_index, previous.connector, previous.venue_id, connector, venue_id
+        );
+    }
+}
+
+fn spawn_account_refresh_router(
+    mut request_rx: mpsc::Receiver<LiveAccountRequest>,
+    handlers: HashMap<usize, AccountRefreshHandler>,
+) {
+    tokio::spawn(async move {
+        while let Some(request) = request_rx.recv().await {
+            let requested_venue_index = request.venue_index.unwrap_or(usize::MAX);
+            let Some(handler) = handlers.get(&requested_venue_index).cloned() else {
+                eprintln!(
+                    "paraphina_live | account_refresh_unsupported requested_venue_index={}",
+                    requested_venue_index
+                );
+                continue;
+            };
+            let request_age_ms = now_ms().saturating_sub(request.now_ms);
+            match (handler.fetch)().await {
+                Ok(snapshot) => {
+                    let timestamp_ms = snapshot.timestamp_ms;
+                    if request.response.send(snapshot).is_err() {
+                        eprintln!(
+                            "paraphina_live | account_refresh_response_dropped connector={} venue={} venue_index={} snapshot_ts_ms={}",
+                            handler.connector, handler.venue_id, handler.venue_index, timestamp_ms
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "paraphina_live | account_refresh_failed connector={} venue={} venue_index={} request_age_ms={} err={}",
+                        handler.connector, handler.venue_id, handler.venue_index, request_age_ms, err.message
+                    );
+                }
+            }
+        }
+    });
+}
+
 fn write_summary(
     out_dir: &std::path::Path,
     cfg: &Config,
@@ -3976,27 +4789,432 @@ fn write_summary(
 
 #[cfg(test)]
 mod tests {
+    use super::register_account_refresh_handler;
     use super::{
-        coalesce_fire_and_forget_request, respond_to_order_request,
-        should_fail_on_unexpected_live_loop_exit, take_priority_request, LiveOrderRequest,
-        LiveRunMode, ResponseMode,
+        coalesce_fire_and_forget_request, coalesce_hyperliquid_fire_and_forget_request,
+        connector_market_channel_cap, dedup_hyperliquid_mm_same_side_places, market_channel_cap,
+        market_ingest_channel_cap, normalize_hyperliquid_batch_window_expanded_intents,
+        paradex_private_order_truth_enabled, parse_aster_backstop_account_poll_ms,
+        parse_paradex_backstop_order_poll_ms, respond_to_order_request,
+        should_fail_on_unexpected_live_loop_exit, spawn_account_refresh_router,
+        take_priority_request, LiveAccountRequest, LiveOrderRequest, LiveRunMode, ResponseMode,
     };
     use super::{
         connector_has_passive_fill_stream, connector_has_passive_fill_visibility,
         connector_support, ConnectorArg, ConnectorSupport,
     };
     use paraphina::actions::ActionBatch;
-    use paraphina::live::types::{ExecutionEvent, OrderAccepted};
+    use paraphina::live::gateway::TransportHint;
+    use paraphina::live::types::{
+        AccountSnapshot, BalanceSnapshot, ExecutionEvent, LiquidationSnapshot, MarginSnapshot,
+        OrderAccepted, PositionSnapshot,
+    };
     use paraphina::live::venues::ROADMAP_B_VENUES;
-    use paraphina::types::{OrderPurpose, Side};
-    use std::collections::VecDeque;
+    use paraphina::types::{
+        CancelAllOrderIntent, CancelOrderIntent, OrderIntent, OrderPurpose, PlaceOrderIntent,
+        ReplaceOrderIntent, Side, TimeInForce,
+    };
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn new(key: &'static str) -> Self {
+            Self {
+                key,
+                prior: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.prior {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn test_account_snapshot(venue_index: usize, venue_id: &str, size: f64) -> AccountSnapshot {
+        AccountSnapshot {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq: 7,
+            timestamp_ms: 1_234,
+            positions: vec![PositionSnapshot {
+                symbol: "ETH-USD".to_string(),
+                size,
+                entry_price: 2_000.0,
+            }],
+            balances: vec![BalanceSnapshot {
+                asset: "USD".to_string(),
+                total: 100.0,
+                available: 90.0,
+            }],
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: 100.0,
+                used_usd: 10.0,
+                available_usd: 90.0,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn account_refresh_router_routes_by_venue_index() {
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let mut handlers = HashMap::new();
+        register_account_refresh_handler(
+            &mut handlers,
+            "extended",
+            "extended".to_string(),
+            2,
+            Arc::new(|| Box::pin(async { Ok(test_account_snapshot(2, "extended", 0.01)) })),
+        );
+        spawn_account_refresh_router(request_rx, handlers);
+
+        let (response_tx, response_rx) = oneshot::channel();
+        request_tx
+            .send(LiveAccountRequest {
+                venue_index: Some(2),
+                now_ms: 1,
+                response: response_tx,
+            })
+            .await
+            .expect("send account refresh request");
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), response_rx)
+            .await
+            .expect("account refresh response timed out")
+            .expect("account refresh response dropped");
+        assert_eq!(snapshot.venue_index, 2);
+        assert_eq!(snapshot.venue_id, "extended");
+        assert_eq!(snapshot.positions[0].size, 0.01);
+    }
 
     #[test]
     fn roadmap_b_registry_is_complete() {
         assert_eq!(ROADMAP_B_VENUES.len(), 5);
         let selectable = ConnectorArg::roadmap_b_selectable_venues();
         assert_eq!(selectable, ROADMAP_B_VENUES.to_vec());
+    }
+
+    #[test]
+    fn aster_backstop_account_poll_ms_prefers_specific_override() {
+        const KEY: &str = "PARAPHINA_ASTER_BACKSTOP_ACCOUNT_POLL_MS";
+        let prior = std::env::var(KEY).ok();
+        std::env::remove_var(KEY);
+        assert_eq!(parse_aster_backstop_account_poll_ms(), 15_000);
+        std::env::set_var(KEY, "21000");
+        assert_eq!(parse_aster_backstop_account_poll_ms(), 21_000);
+        if let Some(value) = prior {
+            std::env::set_var(KEY, value);
+        } else {
+            std::env::remove_var(KEY);
+        }
+    }
+
+    #[test]
+    fn paradex_private_order_truth_enabled_reads_boolean_env() {
+        const KEY: &str = "PARAPHINA_PARADEX_PRIVATE_ORDER_TRUTH_ENABLED";
+        let prior = std::env::var(KEY).ok();
+        std::env::remove_var(KEY);
+        assert!(!paradex_private_order_truth_enabled());
+        std::env::set_var(KEY, "1");
+        assert!(paradex_private_order_truth_enabled());
+        std::env::set_var(KEY, "true");
+        assert!(paradex_private_order_truth_enabled());
+        if let Some(value) = prior {
+            std::env::set_var(KEY, value);
+        } else {
+            std::env::remove_var(KEY);
+        }
+    }
+
+    #[test]
+    fn market_frontier_channel_caps_read_env_overrides() {
+        let _guard = env_lock().lock().expect("env mutex");
+        std::env::set_var("PARAPHINA_MARKET_INGEST_CHANNEL_CAP", "4096");
+        std::env::set_var("PARAPHINA_MARKET_CHANNEL_CAP", "4096");
+        std::env::set_var("PARAPHINA_CONNECTOR_MARKET_CHANNEL_CAP", "2048");
+        assert_eq!(market_ingest_channel_cap(), 4096);
+        assert_eq!(market_channel_cap(), 4096);
+        assert_eq!(connector_market_channel_cap(), 2048);
+        std::env::remove_var("PARAPHINA_MARKET_INGEST_CHANNEL_CAP");
+        std::env::remove_var("PARAPHINA_MARKET_CHANNEL_CAP");
+        std::env::remove_var("PARAPHINA_CONNECTOR_MARKET_CHANNEL_CAP");
+    }
+
+    #[test]
+    fn paradex_backstop_order_poll_ms_prefers_specific_override() {
+        const KEY: &str = "PARAPHINA_PARADEX_ORDER_BACKSTOP_POLL_MS";
+        let prior = std::env::var(KEY).ok();
+        std::env::remove_var(KEY);
+        assert_eq!(parse_paradex_backstop_order_poll_ms(), 15_000);
+        std::env::set_var(KEY, "21000");
+        assert_eq!(parse_paradex_backstop_order_poll_ms(), 21_000);
+        if let Some(value) = prior {
+            std::env::set_var(KEY, value);
+        } else {
+            std::env::remove_var(KEY);
+        }
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_keeps_native_hyperliquid_replace() {
+        let intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 2,
+            venue_id: "hyperliquid".into(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.05,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "0x1234567890abcdef1234567890abcdef".to_string(),
+            client_order_id: Some("new-coid".to_string()),
+        })];
+        let expanded = super::expand_live_gateway_intents(intents);
+        assert_eq!(expanded.len(), 1);
+        match &expanded[0] {
+            OrderIntent::Replace(replace) => {
+                assert_eq!(replace.venue_id.as_ref(), "hyperliquid");
+                assert_eq!(replace.client_order_id.as_deref(), Some("new-coid"));
+                assert!(replace.post_only);
+            }
+            other => panic!("expected replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_keeps_native_hyperliquid_replace_for_numeric_oid() {
+        let intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 2,
+            venue_id: "hyperliquid".into(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.05,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "123456789".to_string(),
+            client_order_id: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        })];
+        let expanded = super::expand_live_gateway_intents(intents);
+        assert_eq!(expanded.len(), 1);
+        assert!(matches!(expanded[0], OrderIntent::Replace(_)));
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_still_splits_non_native_replace() {
+        let intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 1,
+            venue_id: "lighter".into(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.05,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "old-order-id".to_string(),
+            client_order_id: Some("co_lighter".to_string()),
+        })];
+        let expanded = super::expand_live_gateway_intents(intents);
+        assert_eq!(expanded.len(), 2);
+        assert!(matches!(expanded[0], OrderIntent::Cancel(_)));
+        assert!(matches!(expanded[1], OrderIntent::Place(_)));
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_keeps_native_lighter_replace_for_numeric_id() {
+        let intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 1,
+            venue_id: "lighter".into(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.05,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "55".to_string(),
+            client_order_id: Some("77".to_string()),
+        })];
+        let expanded = super::expand_live_gateway_intents(intents);
+        assert_eq!(expanded.len(), 1);
+        match &expanded[0] {
+            OrderIntent::Replace(replace) => {
+                assert_eq!(replace.venue_id.as_ref(), "lighter");
+                assert_eq!(replace.order_id, "55");
+                assert_eq!(replace.client_order_id.as_deref(), Some("77"));
+            }
+            other => panic!("expected replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_keeps_gated_extended_replace_for_external_id() {
+        const KEY: &str = "PARAPHINA_EXTENDED_NATIVE_REPLACE_ENABLED";
+        let _guard = env_lock().lock().expect("env mutex");
+        let _env_guard = EnvVarGuard::new(KEY);
+        std::env::set_var(KEY, "1");
+
+        let intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 4,
+            venue_id: "extended".into(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.05,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "d0_mm_v4_buy".to_string(),
+            client_order_id: Some("d1_mm_v4_buy".to_string()),
+        })];
+        let expanded = super::expand_live_gateway_intents(intents);
+        assert_eq!(expanded.len(), 1);
+        match &expanded[0] {
+            OrderIntent::Replace(replace) => {
+                assert_eq!(replace.venue_id.as_ref(), "extended");
+                assert_eq!(replace.order_id, "d0_mm_v4_buy");
+                assert_eq!(replace.client_order_id.as_deref(), Some("d1_mm_v4_buy"));
+            }
+            other => panic!("expected replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_splits_extended_replace_when_disabled_or_numeric() {
+        const KEY: &str = "PARAPHINA_EXTENDED_NATIVE_REPLACE_ENABLED";
+        let _guard = env_lock().lock().expect("env mutex");
+        let _env_guard = EnvVarGuard::new(KEY);
+        std::env::remove_var(KEY);
+
+        let disabled = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 4,
+            venue_id: "extended".into(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.05,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "d0_mm_v4_buy".to_string(),
+            client_order_id: Some("d1_mm_v4_buy".to_string()),
+        })];
+        let expanded_disabled = super::expand_live_gateway_intents(disabled);
+        assert_eq!(expanded_disabled.len(), 2);
+        assert!(matches!(expanded_disabled[0], OrderIntent::Cancel(_)));
+        assert!(matches!(expanded_disabled[1], OrderIntent::Place(_)));
+
+        std::env::set_var(KEY, "1");
+        let numeric = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 4,
+            venue_id: "extended".into(),
+            side: Side::Sell,
+            price: 2_101.0,
+            size: 0.05,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "1784963886257016832".to_string(),
+            client_order_id: Some("d1_mm_v4_sell".to_string()),
+        })];
+        let expanded_numeric = super::expand_live_gateway_intents(numeric);
+        assert_eq!(expanded_numeric.len(), 2);
+        assert!(matches!(expanded_numeric[0], OrderIntent::Cancel(_)));
+        assert!(matches!(expanded_numeric[1], OrderIntent::Place(_)));
+    }
+
+    #[test]
+    fn replace_gateway_result_emits_cancel_then_order_accept() {
+        let intent = OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 4,
+            venue_id: "paradex".into(),
+            side: Side::Sell,
+            price: 101.0,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "pdx_old".to_string(),
+            client_order_id: Some("co_pdx_new".to_string()),
+        });
+        let mut seq = 10_u64;
+        let events = super::execution_events_from_gateway_result(
+            intent,
+            Ok(paraphina::live::gateway::LiveRestResponse {
+                order_id: Some("pdx_new".to_string()),
+                client_order_id: Some("co_pdx_new".to_string()),
+            }),
+            1_000,
+            &mut seq,
+        );
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ExecutionEvent::CancelAccepted(cancel) => assert_eq!(cancel.order_id, "pdx_old"),
+            other => panic!("expected cancel accepted, got {other:?}"),
+        }
+        match &events[1] {
+            ExecutionEvent::OrderAccepted(ack) => {
+                assert_eq!(ack.order_id, "pdx_new");
+                assert_eq!(ack.client_order_id.as_deref(), Some("co_pdx_new"));
+            }
+            other => panic!("expected order accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_batch_error_maps_to_cancel_reject_not_place_reject() {
+        let intent = OrderIntent::Cancel(paraphina::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "0x1234567890abcdef1234567890abcdef".to_string(),
+        });
+        let mut seq = 0_u64;
+        let events = super::execution_events_from_gateway_result(
+            intent,
+            Err(paraphina::live::gateway::LiveGatewayError::fatal(
+                "Hyperliquid cancel_batch failed: 422 Unprocessable Entity",
+            )),
+            1_000,
+            &mut seq,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ExecutionEvent::CancelRejected(reject) => {
+                assert_eq!(reject.venue_id, "hyperliquid");
+                assert_eq!(
+                    reject.reason,
+                    "Hyperliquid cancel_batch failed: 422 Unprocessable Entity"
+                );
+            }
+            other => panic!("expected CancelRejected, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4096,6 +5314,7 @@ mod tests {
                 intents: Vec::new(),
                 action_batch: ActionBatch::new(0, 1, "test"),
                 now_ms: 1,
+                transport_hint: TransportHint::Default,
                 response: ResponseMode::FireAndForget,
             })
             .await
@@ -4105,6 +5324,7 @@ mod tests {
                 intents: Vec::new(),
                 action_batch: ActionBatch::new(0, 2, "test"),
                 now_ms: 2,
+                transport_hint: TransportHint::Default,
                 response: ResponseMode::FireAndForget,
             })
             .await
@@ -4115,6 +5335,7 @@ mod tests {
             intents: Vec::new(),
             action_batch: ActionBatch::new(0, 3, "test"),
             now_ms: 3,
+            transport_hint: TransportHint::Default,
             response: ResponseMode::FireAndForget,
         }]);
         let coalesced = coalesce_fire_and_forget_request(first_req, &mut pending, &mut order_rx);
@@ -4125,6 +5346,250 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hyperliquid_fire_and_forget_requests_coalesce_within_batch_window() {
+        let (order_tx, mut order_rx) = mpsc::channel(8);
+        let (_priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut pending_priority = VecDeque::new();
+        let venue_id = Arc::<str>::from("hyperliquid");
+
+        order_tx
+            .send(LiveOrderRequest {
+                intents: vec![OrderIntent::Place(PlaceOrderIntent {
+                    venue_index: 0,
+                    venue_id: venue_id.clone(),
+                    side: Side::Buy,
+                    price: 2_100.0,
+                    size: 0.02,
+                    purpose: OrderPurpose::Mm,
+                    time_in_force: TimeInForce::Gtc,
+                    post_only: true,
+                    reduce_only: false,
+                    client_order_id: Some("co_queued".to_string()),
+                })],
+                action_batch: ActionBatch::new(0, 3, "test"),
+                now_ms: 3,
+                transport_hint: TransportHint::Default,
+                response: ResponseMode::FireAndForget,
+            })
+            .await
+            .expect("send queued hyperliquid place");
+
+        let first_req = LiveOrderRequest {
+            intents: vec![OrderIntent::Cancel(CancelOrderIntent {
+                venue_index: 0,
+                venue_id: venue_id.clone(),
+                order_id: "0x1234567890abcdef1234567890abcdef".to_string(),
+            })],
+            action_batch: ActionBatch::new(0, 1, "test"),
+            now_ms: 1,
+            transport_hint: TransportHint::Default,
+            response: ResponseMode::FireAndForget,
+        };
+        let mut pending = VecDeque::from([LiveOrderRequest {
+            intents: vec![OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 0,
+                venue_id,
+                side: Side::Sell,
+                price: 2_101.0,
+                size: 0.02,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("co_pending".to_string()),
+            })],
+            action_batch: ActionBatch::new(0, 2, "test"),
+            now_ms: 2,
+            transport_hint: TransportHint::Default,
+            response: ResponseMode::FireAndForget,
+        }]);
+
+        let coalesced = coalesce_hyperliquid_fire_and_forget_request(
+            first_req,
+            &mut pending,
+            &mut order_rx,
+            &mut pending_priority,
+            &mut priority_order_rx,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(coalesced.intents.len(), 3);
+        assert_eq!(coalesced.action_batch.tick_index, 3);
+        assert!(matches!(coalesced.response, ResponseMode::FireAndForget));
+        assert!(pending.is_empty());
+        assert!(pending_priority.is_empty());
+    }
+
+    #[test]
+    fn hyperliquid_same_side_mm_place_dedup_keeps_latest_per_side() {
+        let hyperliquid_id = Arc::<str>::from("hyperliquid");
+        let lighter_id = Arc::<str>::from("lighter");
+        let deduped = dedup_hyperliquid_mm_same_side_places(vec![
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 0,
+                venue_id: hyperliquid_id.clone(),
+                side: Side::Buy,
+                price: 2_100.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("hl-buy-old".to_string()),
+            }),
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 0,
+                venue_id: hyperliquid_id.clone(),
+                side: Side::Sell,
+                price: 2_101.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("hl-sell".to_string()),
+            }),
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 0,
+                venue_id: hyperliquid_id.clone(),
+                side: Side::Buy,
+                price: 2_102.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("hl-buy-latest".to_string()),
+            }),
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 0,
+                venue_id: hyperliquid_id,
+                side: Side::Buy,
+                price: 2_099.0,
+                size: 0.02,
+                purpose: OrderPurpose::Exit,
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: Some("hl-exit".to_string()),
+            }),
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 1,
+                venue_id: lighter_id,
+                side: Side::Buy,
+                price: 2_100.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("lighter-buy".to_string()),
+            }),
+        ]);
+
+        let client_ids: Vec<Option<&str>> = deduped
+            .iter()
+            .map(|intent| match intent {
+                OrderIntent::Place(place) => place.client_order_id.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            client_ids,
+            vec![
+                Some("hl-sell"),
+                Some("hl-buy-latest"),
+                Some("hl-exit"),
+                Some("lighter-buy")
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_hyperliquid_expanded_intents_groups_cancels_before_alo_places() {
+        let normalized = normalize_hyperliquid_batch_window_expanded_intents(vec![
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 1,
+                venue_id: Arc::<str>::from("lighter"),
+                side: Side::Buy,
+                price: 100.0,
+                size: 1.0,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("lighter-1".to_string()),
+            }),
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 0,
+                venue_id: Arc::<str>::from("hyperliquid"),
+                side: Side::Buy,
+                price: 2_100.0,
+                size: 0.02,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("hl-place".to_string()),
+            }),
+            OrderIntent::Cancel(CancelOrderIntent {
+                venue_index: 0,
+                venue_id: Arc::<str>::from("hyperliquid"),
+                order_id: "0x1234567890abcdef1234567890abcdef".to_string(),
+            }),
+            OrderIntent::Cancel(CancelOrderIntent {
+                venue_index: 0,
+                venue_id: Arc::<str>::from("hyperliquid"),
+                order_id: "12345".to_string(),
+            }),
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 2,
+                venue_id: Arc::<str>::from("paradex"),
+                side: Side::Sell,
+                price: 100.5,
+                size: 1.0,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("paradex-1".to_string()),
+            }),
+        ]);
+
+        assert_eq!(normalized.len(), 5);
+        match &normalized[0] {
+            OrderIntent::Place(place) => assert_eq!(place.venue_id.as_ref(), "lighter"),
+            other => panic!("expected lighter passthrough first, got {other:?}"),
+        }
+        match &normalized[1] {
+            OrderIntent::Place(place) => assert_eq!(place.venue_id.as_ref(), "paradex"),
+            other => panic!("expected paradex passthrough second, got {other:?}"),
+        }
+        match &normalized[2] {
+            OrderIntent::Cancel(cancel) => {
+                assert_eq!(cancel.venue_id.as_ref(), "hyperliquid");
+                assert!(cancel.order_id.starts_with("0x"));
+            }
+            other => panic!("expected hyperliquid cloid cancel third, got {other:?}"),
+        }
+        match &normalized[3] {
+            OrderIntent::Cancel(cancel) => {
+                assert_eq!(cancel.venue_id.as_ref(), "hyperliquid");
+                assert_eq!(cancel.order_id, "12345");
+            }
+            other => panic!("expected hyperliquid oid cancel fourth, got {other:?}"),
+        }
+        match &normalized[4] {
+            OrderIntent::Place(place) => {
+                assert_eq!(place.venue_id.as_ref(), "hyperliquid");
+                assert_eq!(place.client_order_id.as_deref(), Some("hl-place"));
+            }
+            other => panic!("expected hyperliquid place last, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn priority_requests_surface_ahead_of_fire_and_forget_batches() {
         let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
         let (response_tx, response_rx) = oneshot::channel::<Vec<ExecutionEvent>>();
@@ -4132,6 +5597,7 @@ mod tests {
             intents: Vec::new(),
             action_batch: ActionBatch::new(0, 11, "test"),
             now_ms: 11,
+            transport_hint: TransportHint::Default,
             response: ResponseMode::Oneshot(response_tx),
         }]);
 
@@ -4140,6 +5606,7 @@ mod tests {
                 intents: Vec::new(),
                 action_batch: ActionBatch::new(0, 12, "test"),
                 now_ms: 12,
+                transport_hint: TransportHint::Default,
                 response: ResponseMode::Oneshot(oneshot::channel::<Vec<ExecutionEvent>>().0),
             })
             .await
@@ -4155,6 +5622,98 @@ mod tests {
         assert_eq!(next.action_batch.tick_index, 12);
         assert!(pending.is_empty());
         drop(response_rx);
+    }
+
+    #[tokio::test]
+    async fn take_priority_request_promotes_critical_exit_flatten_over_backlog() {
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut pending = VecDeque::from([
+            LiveOrderRequest {
+                intents: vec![OrderIntent::CancelAll(CancelAllOrderIntent {
+                    venue_index: Some(1),
+                    venue_id: Some(Arc::<str>::from("lighter")),
+                })],
+                action_batch: ActionBatch::new(0, 31, "test"),
+                now_ms: 31,
+                transport_hint: TransportHint::Default,
+                response: ResponseMode::FireAndForget,
+            },
+            LiveOrderRequest {
+                intents: vec![OrderIntent::Place(PlaceOrderIntent {
+                    venue_index: 1,
+                    venue_id: Arc::<str>::from("lighter"),
+                    side: Side::Buy,
+                    price: 2_100.0,
+                    size: 0.01,
+                    purpose: OrderPurpose::Hedge,
+                    time_in_force: TimeInForce::Ioc,
+                    post_only: false,
+                    reduce_only: true,
+                    client_order_id: Some("hedge-flatten".to_string()),
+                })],
+                action_batch: ActionBatch::new(0, 32, "test"),
+                now_ms: 32,
+                transport_hint: TransportHint::Default,
+                response: ResponseMode::FireAndForget,
+            },
+        ]);
+
+        priority_order_tx
+            .send(LiveOrderRequest {
+                intents: vec![OrderIntent::Place(PlaceOrderIntent {
+                    venue_index: 1,
+                    venue_id: Arc::<str>::from("lighter"),
+                    side: Side::Buy,
+                    price: 2_100.0,
+                    size: 0.04,
+                    purpose: OrderPurpose::Exit,
+                    time_in_force: TimeInForce::Ioc,
+                    post_only: false,
+                    reduce_only: true,
+                    client_order_id: Some("critical-exit-flatten".to_string()),
+                })],
+                action_batch: ActionBatch::new(0, 33, "test"),
+                now_ms: 33,
+                transport_hint: TransportHint::Default,
+                response: ResponseMode::FireAndForget,
+            })
+            .await
+            .expect("send critical exit flatten");
+
+        let critical = take_priority_request(&mut pending, &mut priority_order_rx)
+            .expect("critical exit flatten should be promoted");
+        assert_eq!(critical.action_batch.tick_index, 33);
+        match &critical.intents[0] {
+            OrderIntent::Place(place) => {
+                assert_eq!(place.purpose, OrderPurpose::Exit);
+                assert!(place.reduce_only);
+                assert_eq!(place.time_in_force, TimeInForce::Ioc);
+            }
+            other => panic!("expected critical exit place, got {other:?}"),
+        }
+
+        let oldest = take_priority_request(&mut pending, &mut priority_order_rx)
+            .expect("older non-critical request remains queued");
+        assert_eq!(oldest.action_batch.tick_index, 31);
+    }
+
+    #[tokio::test]
+    async fn take_priority_request_preserves_request_transport_hint() {
+        let (_priority_order_tx, mut priority_order_rx) = mpsc::channel(1);
+        let mut pending = VecDeque::from([LiveOrderRequest {
+            intents: Vec::new(),
+            action_batch: ActionBatch::new(0, 21, "test"),
+            now_ms: 21,
+            transport_hint: TransportHint::HyperliquidSyncControl,
+            response: ResponseMode::FireAndForget,
+        }]);
+
+        let req =
+            take_priority_request(&mut pending, &mut priority_order_rx).expect("priority request");
+
+        assert_eq!(req.action_batch.tick_index, 21);
+        assert_eq!(req.transport_hint, TransportHint::HyperliquidSyncControl);
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]

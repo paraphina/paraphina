@@ -13,6 +13,126 @@ def _load_watch_module():
     return module
 
 
+def test_pnl_formatters_show_sub_dollar_precision():
+    watch = _load_watch_module()
+
+    assert watch._format_signed_dollars(0.001) == "+0.0010"
+    assert watch._format_pnl_short(0.001) == "+0.0010"
+
+
+def test_watch_state_ingests_canonical_pnl_total():
+    watch = _load_watch_module()
+    state = watch.WatchState()
+
+    state.update({"t": 1, "pnl_total": 0.001, "venue_status": []})
+
+    assert list(state.pnl_history) == [0.001]
+
+
+def test_balance_pnl_state_loads_completed_run_comparison(tmp_path):
+    watch = _load_watch_module()
+    comparison_path = tmp_path / "balance_snapshot_comparison.json"
+    comparison_path.write_text(
+        (
+            "{"
+            "\"generated_at_utc\":\"2026-05-01T00:00:00Z\","
+            "\"venue_count\":5,"
+            "\"total\":{"
+            "\"pre_usd\":\"317.24306565\","
+            "\"post_usd\":\"317.25048978\","
+            "\"delta_usd\":\"0.00742413\""
+            "}"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    state = watch.WatchState()
+
+    watch.refresh_balance_pnl_from_run_dir(state, tmp_path, force=True)
+
+    assert state.balance_pnl.status == "available"
+    assert state.balance_pnl.delta_usd == 0.00742413
+    assert state.balance_pnl.pre_usd == 317.24306565
+    assert state.balance_pnl.post_usd == 317.25048978
+    assert state.balance_pnl.venue_count == 5
+    assert state.balance_pnl.source_path == str(comparison_path)
+
+
+def test_balance_pnl_state_marks_active_run_pending_post(tmp_path):
+    watch = _load_watch_module()
+    pre_path = tmp_path / "balance_pre_snapshot.json"
+    pre_path.write_text(
+        "{\"captured_at_utc\":\"2026-05-01T00:00:00Z\",\"venue_count\":5,\"total_balance_usd\":\"317.24306565\"}\n",
+        encoding="utf-8",
+    )
+    state = watch.WatchState()
+
+    watch.refresh_balance_pnl_from_run_dir(state, tmp_path, force=True)
+
+    assert state.balance_pnl.status == "pending_post"
+    assert state.balance_pnl.pre_usd == 317.24306565
+    assert state.balance_pnl.venue_count == 5
+    assert state.balance_pnl.source_path == str(pre_path)
+
+
+def test_simple_frame_prefers_balance_pnl_over_telemetry_pnl():
+    watch = _load_watch_module()
+    if not watch._RICH_AVAILABLE:
+        return
+
+    state = watch.WatchState()
+    state.update(
+        {
+            "t": 1,
+            "trade_mode": "live",
+            "pnl_total": 999.0,
+            "venue_status": [],
+        }
+    )
+    state.balance_pnl = watch.BalancePnlState(status="available", delta_usd=0.00742413)
+
+    from rich.console import Console
+
+    console = Console(record=True, width=140, no_color=True)
+    console.print(
+        watch.render_frame_simple(
+            state,
+            50,
+            term_width=140,
+            term_height=20,
+        )
+    )
+    text = console.export_text()
+
+    assert "bPNL +0.0074" in text
+    assert "tPNL +999" not in text
+
+
+def test_net_pos_base_prefers_q_global_over_usd_delta():
+    watch = _load_watch_module()
+
+    record = {
+        "q_global_tao": 0.0125,
+        "net_position_tao": 0.02,
+        "dollar_delta_usd": 28.125,
+    }
+
+    assert watch._extract_net_pos_base(record) == 0.0125
+    assert watch._extract_net_pos_usd(record) == 28.125
+
+
+def test_frame_key_changes_on_sub_dollar_pnl_only_update():
+    watch = _load_watch_module()
+    state = watch.WatchState()
+    state.update({"t": 1, "pnl_total": 0.001, "venue_status": []})
+    key1 = watch._build_frame_key(state, 10.0)
+
+    state.update({"t": 1, "pnl_total": 0.002, "venue_status": []})
+    key2 = watch._build_frame_key(state, 10.0)
+
+    assert key1 != key2
+
+
 def test_auto_target_candidates_include_systemd_and_globs(tmp_path, monkeypatch):
     watch = _load_watch_module()
     systemd_telemetry = tmp_path / "var" / "lib" / "paraphina" / "out" / "telemetry.jsonl"

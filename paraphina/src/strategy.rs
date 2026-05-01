@@ -12,6 +12,7 @@
 
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::execution_events::apply_execution_events;
 use crate::exit;
 use crate::gateway::ExecutionGateway;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
@@ -109,6 +110,7 @@ where
                     mid,
                     horizon_ms,
                     max_pending,
+                    fill_seq: fill.seq.unwrap_or(0),
                 });
         }
     }
@@ -136,12 +138,12 @@ where
 
             let mut all_fills = Vec::new();
 
-            let mm_fills = self
+            let mm_events = self
                 .gateway
-                .process_intents(self.cfg, &mut self.state, &all_intents);
+                .process_intents(self.cfg, &all_intents, now_ms);
 
-            // Record pending markouts for MM fills (before extending all_fills)
-            self.record_markouts_for_fills(&mm_fills, now_ms);
+            let mm_fills = apply_execution_events(&mut self.state, &mm_events, now_ms);
+            self.apply_fills(&mm_fills, now_ms);
             all_fills.extend(mm_fills);
 
             // Recompute after MM fills
@@ -157,12 +159,10 @@ where
                 // include in overall intents log
                 all_intents.extend(exit_intents.iter().cloned());
 
-                let exit_fills =
-                    self.gateway
-                        .process_intents(self.cfg, &mut self.state, &exit_intents);
+                let exit_events = self.gateway.process_intents(self.cfg, &exit_intents, now_ms);
 
-                // Record pending markouts for exit fills
-                self.record_markouts_for_fills(&exit_fills, now_ms);
+                let exit_fills = apply_execution_events(&mut self.state, &exit_events, now_ms);
+                self.apply_fills(&exit_fills, now_ms);
                 all_fills.extend(exit_fills);
 
                 self.state.recompute_after_fills(self.cfg);
@@ -177,12 +177,12 @@ where
             if !hedge_intents.is_empty() {
                 all_intents.extend(hedge_intents.iter().cloned());
 
-                let hedge_fills =
-                    self.gateway
-                        .process_intents(self.cfg, &mut self.state, &hedge_intents);
+                let hedge_events = self
+                    .gateway
+                    .process_intents(self.cfg, &hedge_intents, now_ms);
 
-                // Record pending markouts for hedge fills
-                self.record_markouts_for_fills(&hedge_fills, now_ms);
+                let hedge_fills = apply_execution_events(&mut self.state, &hedge_events, now_ms);
+                self.apply_fills(&hedge_fills, now_ms);
                 all_fills.extend(hedge_fills);
 
                 self.state.recompute_after_fills(self.cfg);
@@ -247,6 +247,12 @@ where
         self.print_daily_summary();
 
         self.telemetry.flush();
+    }
+
+    fn apply_fills(&mut self, fills: &[FillEvent], now_ms: TimestampMs) {
+        for fill in fills {
+            self.state.apply_fill_event(fill, now_ms, self.cfg);
+        }
     }
 
     /// Print end-of-run summary in the format expected by batch_runs/metrics.py.

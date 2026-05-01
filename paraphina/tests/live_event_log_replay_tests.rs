@@ -92,6 +92,7 @@ async fn live_event_log_replay_matches_telemetry() {
         account_rx,
         exec_rx: Some(exec_rx),
         account_reconcile_tx: None,
+        priority_order_tx: order_tx.clone(),
         order_tx,
         order_snapshot_rx: None,
         shared_venue_ages: None,

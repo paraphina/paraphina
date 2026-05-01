@@ -48,6 +48,7 @@ mod tests {
             account_rx,
             exec_rx: None,
             account_reconcile_tx: None,
+            priority_order_tx: handle.order_tx.clone(),
             order_tx: handle.order_tx.clone(),
             order_snapshot_rx: None,
             shared_venue_ages: None,
@@ -129,6 +130,7 @@ mod tests {
                 &cfg.version,
             ),
             now_ms: start_ms + step_ms * ticks as i64,
+            transport_hint: paraphina::live::gateway::TransportHint::Default,
             response: paraphina::live::ResponseMode::Oneshot(response_tx),
         };
         let _ = handle.order_tx.send(request).await;

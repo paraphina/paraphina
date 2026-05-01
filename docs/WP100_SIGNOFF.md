@@ -1,5 +1,12 @@
 # WP100 Signoff
 
+Scope: historical WP100 implementation-parity signoff.
+
+This signoff proves the dated WP100 audit scope recorded below. It does not
+prove final all-5 live topology, unattended market-making production readiness,
+or Phase 5 promotion. Use `ROADMAP.md` and read-only Phase 5 status/queue files
+for current operational context.
+
 git HEAD: `a712e9035bb1b79143de3f34125dde7326b70ef9`
 
 Audit JSON summary (verbatim):

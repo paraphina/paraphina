@@ -1,5 +1,12 @@
 # WHITEPAPER PARITY MATRIX (Audit-Grade)
 
+Scope: generated historical code-visible parity audit.
+
+This matrix records the dated whitepaper parity scope below. It is not the
+current roadmap, not the current Phase 5 topology, and not an unattended
+production-readiness certificate. Regenerate it before using it as current
+evidence.
+
 Date: 2026-01-17  
 Scope: `docs/WHITEPAPER.md` Part II canonical spec (§4, §11, §14.5, §15, §17)  
 Feature flags: `event_log`, `live`, `live_hyperliquid`, `live_lighter` (`paraphina/Cargo.toml:L59-L65`)  

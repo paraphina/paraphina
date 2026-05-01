@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "updated_utc": "2026-05-01T01:44:33Z",
+  "tranche_id": "phase5_reopened_final_closeout",
+  "session_id": null,
+  "max_parallel_support_lanes": 3,
+  "support_lane_priority": [
+    "forensics",
+    "blocker_shadow",
+    "topology_audit",
+    "tooling"
+  ],
+  "support_lane_capacity_gate": true,
+  "total_runs": 0,
+  "lanes": [],
+  "state_sync": {
+    "requested_tranche_id": "phase5_reopened_final_closeout",
+    "status": "pass",
+    "critical_count": 0,
+    "warning_count": 0,
+    "surface_id": "19ac6e21020d39d8",
+    "report_path": "/home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/state_sync_report.json",
+    "blocks_promotion": false
+  }
+}

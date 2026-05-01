@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use serde_json::Value;
 use tempfile::TempDir;
 
 #[test]
@@ -114,4 +115,122 @@ fn multi_connector_fixture_run_is_deterministic_and_healthy() {
 
     assert!(saw_ready, "expected readiness once both venues are healthy");
     assert!(saw_fv_true, "expected fv_available to become true");
+}
+
+#[test]
+fn telemetry_analyzer_reports_only_active_reduced_topology_venues() {
+    let tmp = TempDir::new().expect("temp dir");
+    let out_dir = tmp.path().join("multi_run_report");
+    let telemetry_path = out_dir.join("telemetry.jsonl");
+    let checkpoint_path = out_dir.join("checkpoint.json");
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let hl_fixture_dir = workspace_root
+        .join("tests")
+        .join("fixtures")
+        .join("hyperliquid");
+    let lighter_fixture_dir = workspace_root
+        .join("tests")
+        .join("fixtures")
+        .join("lighter");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_paraphina_live"))
+        .env_clear()
+        .env_remove("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS")
+        .env_remove("PARAPHINA_LIVE_RECONCILE_MS")
+        .env_remove("PARAPHINA_LIVE_KILL_FLATTEN")
+        .env_remove("PARAPHINA_LIVE_KILL_SWITCH")
+        .env_remove("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
+        .env_remove("ROADMAP_B_FIXTURE_DIR")
+        .env_remove("HL_FIXTURE_DIR")
+        .env_remove("LIGHTER_FIXTURE_DIR")
+        .env_remove("EXTENDED_FIXTURE_DIR")
+        .env_remove("ASTER_FIXTURE_DIR")
+        .env_remove("PARADEX_FIXTURE_DIR")
+        .env_remove("EXTENDED_FIXTURE_MODE")
+        .env_remove("ASTER_FIXTURE_MODE")
+        .env_remove("PARADEX_FIXTURE_MODE")
+        .env_remove("EXTENDED_RECORD_FIXTURES")
+        .env_remove("ASTER_RECORD_FIXTURES")
+        .env_remove("PARADEX_RECORD_FIXTURES")
+        .env("PARAPHINA_TRADE_MODE", "paper")
+        .env("PARAPHINA_LIVE_CONNECTORS", "hyperliquid_fixture,lighter")
+        .env("HL_FIXTURE_DIR", &hl_fixture_dir)
+        .env("LIGHTER_FIXTURE_DIR", &lighter_fixture_dir)
+        .env("PARAPHINA_LIVE_OUT_DIR", &out_dir)
+        .env("PARAPHINA_LIVE_MAX_TICKS", "20")
+        .env("PARAPHINA_LIVE_METRICS_ADDR", "127.0.0.1:0")
+        .env("PARAPHINA_TELEMETRY_MODE", "jsonl")
+        .env("PARAPHINA_PAPER_FILL_MODE", "mid")
+        .env("PARAPHINA_PAPER_SLIPPAGE_BPS", "5")
+        .env("PARAPHINA_PAPER_MIN_HEALTHY_FOR_KF", "2")
+        .env("PARAPHINA_PAPER_USE_WALLCLOCK_TS", "1")
+        .output()
+        .expect("run paraphina_live");
+
+    assert!(
+        output.status.success(),
+        "multi-connector run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let analyzer = Command::new("python3")
+        .arg("tools/telemetry_analyzer.py")
+        .arg("--telemetry")
+        .arg(&telemetry_path)
+        .arg("--checkpoint-json")
+        .arg(&checkpoint_path)
+        .current_dir(&workspace_root)
+        .output()
+        .expect("run analyzer");
+
+    assert!(
+        analyzer.status.success(),
+        "telemetry analyzer failed: {}",
+        String::from_utf8_lossy(&analyzer.stderr)
+    );
+
+    let report = String::from_utf8_lossy(&analyzer.stdout);
+    assert!(
+        report.contains("Venues:"),
+        "expected venue header in analyzer report"
+    );
+    assert!(
+        !report.contains("extended"),
+        "reduced-topology report should not mention extended"
+    );
+    assert!(
+        !report.contains("aster"),
+        "reduced-topology report should not mention aster"
+    );
+    assert!(
+        !report.contains("paradex"),
+        "reduced-topology report should not mention paradex"
+    );
+
+    let checkpoint: Value = serde_json::from_str(
+        &std::fs::read_to_string(&checkpoint_path).expect("read analyzer checkpoint"),
+    )
+    .expect("parse analyzer checkpoint");
+    let venue_names = checkpoint
+        .get("venue_names")
+        .and_then(|v| v.as_array())
+        .expect("checkpoint venue_names");
+    assert_eq!(
+        venue_names.len(),
+        2,
+        "expected exactly two venue names in reduced-topology checkpoint"
+    );
+    let names: Vec<&str> = venue_names.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        names.iter().any(|name| *name == "lighter"),
+        "expected lighter in reduced-topology checkpoint: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name.contains("hyperliquid")),
+        "expected hyperliquid-like venue in reduced-topology checkpoint: {names:?}"
+    );
 }

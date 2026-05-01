@@ -1,0 +1,46 @@
+{
+  "generated_at_utc": "2026-05-01T00:04:58Z",
+  "per_venue": {
+    "aster": {
+      "delta_usd": "0.00000000",
+      "post_balance_usd": "50.02988464",
+      "pre_balance_usd": "50.02988464"
+    },
+    "extended": {
+      "delta_usd": "0.000000",
+      "post_balance_usd": "69.412133",
+      "pre_balance_usd": "69.412133"
+    },
+    "hyperliquid": {
+      "delta_usd": "0.000000",
+      "post_balance_usd": "63.666288",
+      "pre_balance_usd": "63.666288"
+    },
+    "lighter": {
+      "delta_usd": "0.014546",
+      "post_balance_usd": "82.150044",
+      "pre_balance_usd": "82.135498"
+    },
+    "paradex": {
+      "delta_usd": "-0.00712187",
+      "post_balance_usd": "51.98317224",
+      "pre_balance_usd": "51.99029411"
+    }
+  },
+  "schema_version": 1,
+  "total": {
+    "abs_delta_usd": "0.00742413",
+    "abs_delta_usd_float": 0.00742413,
+    "delta_usd": "0.00742413",
+    "post_usd": "317.24152188",
+    "pre_usd": "317.23409775"
+  },
+  "venue_count": 5,
+  "venues": [
+    "hyperliquid",
+    "extended",
+    "lighter",
+    "aster",
+    "paradex"
+  ]
+}

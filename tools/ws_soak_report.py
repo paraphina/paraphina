@@ -43,6 +43,18 @@ PUBLISHER_GATE_COUNTERS = (
     "mp_try_send_full_count",
     "mp_pending_latest_replaced_count",
 )
+EXTENDED_DEFECT_CLASSES = (
+    "no_data_transport_gap",
+    "data_seen_no_publish",
+    "runner_freeze_apply_gap",
+    "future_timestamp_deferral",
+    "unclassified",
+)
+EXTENDED_BOOTSTRAP_CLASSES = (
+    "bootstrap_no_first_frame",
+    "bootstrap_frame_no_book",
+    "bootstrap_book_no_publish",
+)
 
 
 @dataclass
@@ -210,6 +222,233 @@ def parse_expected_connectors(raw: str) -> list[str]:
         seen.add(name)
         connectors.append(name)
     return connectors
+
+
+def classify_extended_stale_episode(
+    ws_msg_pairs: dict[str, Any], runner_truth_pairs: dict[str, Any] | None
+) -> str:
+    stale_ms = safe_float(ws_msg_pairs.get("stale_ms")) or 0.0
+    half_stale_ms = stale_ms / 2.0 if stale_ms > 0 else 0.0
+    age_ws_rx_ms = safe_float(ws_msg_pairs.get("age_ws_rx_ms"))
+    age_data_rx_ms = safe_float(ws_msg_pairs.get("age_data_rx_ms"))
+    age_book_event_ms = safe_float(ws_msg_pairs.get("age_book_event_ms"))
+    age_published_ms = safe_float(ws_msg_pairs.get("age_published_ms"))
+
+    if (
+        age_ws_rx_ms is not None
+        and age_data_rx_ms is not None
+        and age_book_event_ms is not None
+        and age_published_ms is not None
+        and age_ws_rx_ms < half_stale_ms
+        and age_data_rx_ms >= stale_ms
+        and age_book_event_ms >= stale_ms
+        and age_published_ms >= stale_ms
+    ):
+        return "no_data_transport_gap"
+
+    if (
+        age_data_rx_ms is not None
+        and age_book_event_ms is not None
+        and age_published_ms is not None
+        and age_data_rx_ms < half_stale_ms
+        and (age_book_event_ms >= stale_ms or age_published_ms >= stale_ms)
+    ):
+        return "data_seen_no_publish"
+
+    if runner_truth_pairs:
+        age_apply_ms = safe_float(runner_truth_pairs.get("age_apply_ms"))
+        age_event_ms = safe_float(runner_truth_pairs.get("age_event_ms"))
+        venue_state_stale_ms = safe_float(runner_truth_pairs.get("venue_state_stale_ms"))
+        ext_apply_frozen_total = safe_int(runner_truth_pairs.get("ext_apply_frozen_total")) or 0
+        ext_future_total = safe_int(runner_truth_pairs.get("ext_future_total")) or 0
+        freeze_warning_count = safe_int(runner_truth_pairs.get("_freeze_warning_count")) or 0
+
+        if (
+            age_published_ms is not None
+            and age_apply_ms is not None
+            and venue_state_stale_ms is not None
+            and age_published_ms < half_stale_ms
+            and age_apply_ms >= venue_state_stale_ms
+            and (ext_apply_frozen_total > 0 or freeze_warning_count > 0)
+        ):
+            return "runner_freeze_apply_gap"
+
+        if (
+            age_event_ms is not None
+            and age_apply_ms is not None
+            and venue_state_stale_ms is not None
+            and ext_future_total > 0
+            and age_event_ms < half_stale_ms
+            and age_apply_ms >= venue_state_stale_ms
+        ):
+            return "future_timestamp_deferral"
+
+    return "unclassified"
+
+
+def summarize_extended_defects(episodes: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {name: 0 for name in EXTENDED_DEFECT_CLASSES}
+    for episode in episodes:
+        defect_class = str(episode.get("defect_class") or "unclassified")
+        counts.setdefault(defect_class, 0)
+        counts[defect_class] += 1
+
+    total = sum(counts.values())
+    dominant_class = "unclassified"
+    dominant_count = 0
+    if total > 0:
+        dominant_class, dominant_count = max(counts.items(), key=lambda item: item[1])
+    confidence_pct = (dominant_count / total * 100.0) if total > 0 else 0.0
+    return {
+        "counts": counts,
+        "total": total,
+        "dominant_class": dominant_class,
+        "dominant_count": dominant_count,
+        "confidence_pct": confidence_pct,
+    }
+
+
+def summarize_extended_bootstrap(episodes: list[dict[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {name: 0 for name in EXTENDED_BOOTSTRAP_CLASSES}
+    for episode in episodes:
+        reason = str(episode.get("reason") or "bootstrap_no_first_frame")
+        counts.setdefault(reason, 0)
+        counts[reason] += 1
+
+    total = sum(counts.values())
+    dominant_reason = "bootstrap_no_first_frame"
+    dominant_count = 0
+    if total > 0:
+        dominant_reason, dominant_count = max(counts.items(), key=lambda item: item[1])
+    confidence_pct = (dominant_count / total * 100.0) if total > 0 else 0.0
+    return {
+        "counts": counts,
+        "total": total,
+        "dominant_reason": dominant_reason,
+        "dominant_count": dominant_count,
+        "confidence_pct": confidence_pct,
+    }
+
+
+def summarize_extended_bootstrap_stages(
+    timeout_stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    counts = {"first_frame": 0, "post_first_frame": 0}
+    for reason, stats in timeout_stats.items():
+        samples = safe_int(stats.get("samples")) or 0
+        stage = str(
+            stats.get("last_bootstrap_timeout_stage")
+            or ("first_frame" if reason == "bootstrap_no_first_frame" else "post_first_frame")
+        )
+        counts.setdefault(stage, 0)
+        counts[stage] += samples
+
+    total = sum(counts.values())
+    dominant_stage = "first_frame"
+    dominant_count = 0
+    if total > 0:
+        dominant_stage, dominant_count = max(counts.items(), key=lambda item: item[1])
+    confidence_pct = (dominant_count / total * 100.0) if total > 0 else 0.0
+    return {
+        "counts": counts,
+        "total": total,
+        "dominant_stage": dominant_stage,
+        "dominant_count": dominant_count,
+        "confidence_pct": confidence_pct,
+    }
+
+
+def summarize_extended_first_frame_timeout(
+    timeout_stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    stats = dict(timeout_stats.get("bootstrap_no_first_frame", {}))
+    return {
+        "samples": safe_int(stats.get("samples")) or 0,
+        "last_connect_first_frame_timeout_ms": safe_int(
+            stats.get("last_connect_first_frame_timeout_ms")
+        ),
+        "max_connect_first_frame_timeout_ms": safe_int(
+            stats.get("max_connect_first_frame_timeout_ms")
+        ),
+        "last_stale_watchdog_deferred_until_first_publish": safe_int(
+            stats.get("last_stale_watchdog_deferred_until_first_publish")
+        ),
+        "last_stale_watchdog_armed": safe_int(stats.get("last_stale_watchdog_armed")),
+        "max_time_to_first_message_ms": safe_int(
+            stats.get("max_time_to_first_message_ms")
+        ),
+    }
+
+
+def summarize_extended_first_data_timeout(
+    timeout_stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    stats = dict(timeout_stats.get("bootstrap_no_first_frame", {}))
+    return {
+        "samples": safe_int(stats.get("samples")) or 0,
+        "last_connect_first_frame_timeout_ms": safe_int(
+            stats.get("last_connect_first_frame_timeout_ms")
+        ),
+        "max_connect_first_frame_timeout_ms": safe_int(
+            stats.get("max_connect_first_frame_timeout_ms")
+        ),
+        "last_first_control_frame_seen": safe_int(
+            stats.get("last_first_control_frame_seen")
+        ),
+        "last_first_control_frame_kind": stats.get("last_first_control_frame_kind"),
+        "last_first_data_frame_seen": safe_int(stats.get("last_first_data_frame_seen")),
+        "last_rest_seed_bridge_active": safe_int(
+            stats.get("last_rest_seed_bridge_active")
+        ),
+        "last_stale_watchdog_deferred_until_first_publish": safe_int(
+            stats.get("last_stale_watchdog_deferred_until_first_publish")
+        ),
+        "max_time_to_first_control_frame_ms": safe_int(
+            stats.get("max_time_to_first_control_frame_ms")
+        ),
+        "max_time_to_first_message_ms": safe_int(
+            stats.get("max_time_to_first_message_ms")
+        ),
+    }
+
+
+def summarize_extended_watchdog_bootstrap_transition(
+    transport_gap_stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    stats = dict(transport_gap_stats.get("extended", {}))
+    return {
+        "samples": safe_int(stats.get("watchdog_bootstrap_transition_samples")) or 0,
+        "last_first_publish_observed": safe_int(stats.get("last_first_publish_observed")),
+        "last_watchdog_armed_now": safe_int(stats.get("last_watchdog_armed_now")),
+        "last_stale_watchdog_deferred_until_first_publish": safe_int(
+            stats.get("last_stale_watchdog_deferred_until_first_publish")
+        ),
+        "last_time_to_first_publish_ms": safe_int(
+            stats.get("last_time_to_first_publish_ms")
+        ),
+        "max_time_to_first_publish_ms": safe_int(
+            stats.get("max_time_to_first_publish_ms")
+        ),
+    }
+
+
+def summarize_extended_rest_seed(stats: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    summary = dict(stats.get("extended", {}))
+    failures_by_status: dict[str, int] = {}
+    failures_by_http_status: dict[str, int] = {}
+    for key, value in list(summary.items()):
+        if key.startswith("status_") and key.endswith("_count"):
+            status = key[len("status_") : -len("_count")]
+            if status != "ok":
+                failures_by_status[status] = safe_int(value) or 0
+        if key.startswith("http_status_") and key.endswith("_count"):
+            status = key[len("http_status_") : -len("_count")]
+            failures_by_http_status[status] = safe_int(value) or 0
+    return {
+        "extended": summary,
+        "failures_by_status": failures_by_status,
+        "failures_by_http_status": failures_by_http_status,
+    }
 
 
 def update_plateau(
@@ -423,6 +662,14 @@ def infer_venue_from_line(lower_line: str) -> str | None:
 
 
 def infer_reason_from_line(lower_line: str) -> str | None:
+    if "bootstrap no first frame" in lower_line:
+        return "bootstrap_no_first_frame"
+    if "bootstrap frame/no-book" in lower_line:
+        return "bootstrap_frame_no_book"
+    if "bootstrap book/no-publish" in lower_line:
+        return "bootstrap_book_no_publish"
+    if "post publish transport gap" in lower_line:
+        return "post_publish_transport_gap"
     if "watchdog" in lower_line and "reconnect" in lower_line:
         return "stale_watchdog"
     if "ping send failed" in lower_line and "reconnect" in lower_line:
@@ -467,19 +714,52 @@ def parse_run_log(
     dict[str, dict[str, Any]],
     dict[str, dict[str, Any]],
     dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
 ]:
     audit_reconnect_counts: dict[tuple[str, str], int] = defaultdict(int)
     signature_reconnect_counts: dict[tuple[str, str], int] = defaultdict(int)
     market_publisher_counters: dict[str, int] = defaultdict(int)
     runner_apply_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    runner_apply_truth_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     rest_monitor_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     arb_gate_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     hl_pubq_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     extended_ws_msg_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     extended_cfg_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_reconnect_policy_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_transport_gap_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_rest_seed_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_seed_bridge_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_control_frame_grace_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_session_hedge_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_backend_attach_fallback_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_post_publish_fallback_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_bootstrap_timeout_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_bootstrap_churn_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_socket_establishment_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_socket_role_progress_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    extended_stream_kind_progress_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     ping_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     lighter_ts_fallback_stats: dict[str, dict[str, Any]] = defaultdict(dict)
     aster_book_recovery_stats: dict[str, dict[str, Any]] = defaultdict(dict)
+    latest_extended_runner_truth: dict[str, Any] | None = None
+    extended_defect_episodes: list[dict[str, Any]] = []
+    extended_bootstrap_episodes: list[dict[str, Any]] = []
 
     with run_log_path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -502,7 +782,52 @@ def parse_run_log(
                         if count > market_publisher_counters[name]:
                             market_publisher_counters[name] = count
 
-                if "component=runner_apply" in line:
+                if "component=runner_apply_truth" in line:
+                    venue = str(pairs.get("venue", "unknown")).lower()
+                    stats = runner_apply_truth_stats[venue]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+                    for field in (
+                        "age_apply_ms",
+                        "age_event_ms",
+                        "last_candidate_mid",
+                        "last_candidate_spread",
+                        "last_prev_mid",
+                        "last_prev_spread",
+                        "venue_state_stale_ms",
+                    ):
+                        value = safe_float(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                    if venue == "extended":
+                        latest_extended_runner_truth = dict(pairs)
+                        freeze_warning_count = (
+                            safe_int(stats.get("freeze_warning_count")) or 0
+                        )
+                        if freeze_warning_count > 0:
+                            latest_extended_runner_truth["_freeze_warning_count"] = str(
+                                freeze_warning_count
+                            )
+
+                if "WARN: Extended core book update frozen" in line:
+                    stats = runner_apply_truth_stats["extended"]
+                    freeze_warning_count = (
+                        safe_int(stats.get("freeze_warning_count")) or 0
+                    ) + 1
+                    stats["freeze_warning_count"] = freeze_warning_count
+                    update_max_stat(
+                        stats,
+                        "max_freeze_warning_count",
+                        freeze_warning_count,
+                    )
+                    if latest_extended_runner_truth is None:
+                        latest_extended_runner_truth = {}
+                    latest_extended_runner_truth["_freeze_warning_count"] = str(
+                        freeze_warning_count
+                    )
+
+                if pairs.get("component") == "runner_apply":
                     venue = str(pairs.get("venue", "unknown")).lower()
                     stats = runner_apply_stats[venue]
                     stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
@@ -588,8 +913,33 @@ def parse_run_log(
                     reason = pairs.get("reason")
                     if reason:
                         stats["last_reason"] = reason
+                    for field in ("last_frame_kind", "last_data_kind"):
+                        value = pairs.get(field)
+                        if value:
+                            stats[f"last_{field}"] = value
                     for key, raw in pairs.items():
                         update_max_numeric_token(stats, key, raw)
+                    if reason in {
+                        "stale_watchdog",
+                        "read_timeout",
+                        "post_publish_transport_gap",
+                    }:
+                        extended_defect_episodes.append(
+                            {
+                                "reason": reason,
+                                "defect_class": classify_extended_stale_episode(
+                                    pairs, latest_extended_runner_truth
+                                ),
+                                "age_ws_rx_ms": safe_float(pairs.get("age_ws_rx_ms")),
+                                "age_data_rx_ms": safe_float(pairs.get("age_data_rx_ms")),
+                                "age_book_event_ms": safe_float(
+                                    pairs.get("age_book_event_ms")
+                                ),
+                                "age_published_ms": safe_float(
+                                    pairs.get("age_published_ms")
+                                ),
+                            }
+                        )
 
                 if "extended_read_timeout_ms=" in line and "venue=extended" in line:
                     stats = extended_cfg_stats["extended"]
@@ -597,8 +947,461 @@ def parse_run_log(
                     timeout_ms = safe_int(pairs.get("extended_read_timeout_ms"))
                     if timeout_ms is not None:
                         stats["last_extended_read_timeout_ms"] = timeout_ms
+                    connect_first_frame_timeout_ms = safe_int(
+                        pairs.get("extended_connect_first_frame_timeout_ms")
+                    )
+                    if connect_first_frame_timeout_ms is not None:
+                        stats[
+                            "last_extended_connect_first_frame_timeout_ms"
+                        ] = connect_first_frame_timeout_ms
+                    connect_book_timeout_ms = safe_int(
+                        pairs.get("extended_connect_book_timeout_ms")
+                    )
+                    if connect_book_timeout_ms is not None:
+                        stats[
+                            "last_extended_connect_book_timeout_ms"
+                        ] = connect_book_timeout_ms
                     for key, raw in pairs.items():
                         update_max_numeric_token(stats, key, raw)
+
+                if "component=reconnect_policy" in line and "venue=extended" in line:
+                    reason = str(pairs.get("reason", "unknown")).lower()
+                    stats = extended_reconnect_policy_stats[reason]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    stats["reason"] = reason
+                    sleep_ms = safe_int(pairs.get("sleep_ms"))
+                    if sleep_ms is not None:
+                        stats["last_sleep_ms"] = sleep_ms
+                        update_max_stat(stats, "max_sleep_ms", sleep_ms)
+                    suppressed = safe_int(pairs.get("failure_escalation_suppressed"))
+                    if suppressed is not None:
+                        stats["last_failure_escalation_suppressed"] = suppressed
+                        update_max_stat(
+                            stats,
+                            "max_failure_escalation_suppressed",
+                            suppressed,
+                        )
+                    consecutive_failures = safe_int(pairs.get("consecutive_failures"))
+                    if consecutive_failures is not None:
+                        stats["last_consecutive_failures"] = consecutive_failures
+                        update_max_stat(
+                            stats, "max_consecutive_failures", consecutive_failures
+                        )
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "component=rest_snapshot_seed" in line and "venue=extended" in line:
+                    stats = extended_rest_seed_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    status = str(pairs.get("status", "unknown")).lower()
+                    stats["last_status"] = status
+                    stats[f"status_{status}_count"] = (
+                        safe_int(stats.get(f"status_{status}_count")) or 0
+                    ) + 1
+                    http_status = safe_int(pairs.get("http_status"))
+                    if http_status is not None:
+                        stats["last_http_status"] = http_status
+                        stats[f"http_status_{http_status}_count"] = (
+                            safe_int(stats.get(f"http_status_{http_status}_count")) or 0
+                        ) + 1
+                    endpoint_kind = pairs.get("endpoint_kind")
+                    if endpoint_kind:
+                        stats["last_endpoint_kind"] = endpoint_kind
+                    market = pairs.get("market")
+                    if market:
+                        stats["last_market"] = market
+                    for field in ("latency_ms", "seeded", "bid_levels", "ask_levels"):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "component=socket_establishment" in line and "venue=extended" in line:
+                    stats = extended_socket_establishment_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    action = str(pairs.get("action", "unknown")).lower()
+                    socket_role = str(pairs.get("socket_role", "unknown")).lower()
+                    stream_kind = str(pairs.get("stream_kind", "unknown")).lower()
+                    stats["last_action"] = action
+                    stats["last_socket_role"] = socket_role
+                    stats["last_stream_kind"] = stream_kind
+                    stats[f"action_{action}_count"] = (
+                        safe_int(stats.get(f"action_{action}_count")) or 0
+                    ) + 1
+                    stats[f"{socket_role}_{action}_count"] = (
+                        safe_int(stats.get(f"{socket_role}_{action}_count")) or 0
+                    ) + 1
+                    stats[f"{stream_kind}_{action}_count"] = (
+                        safe_int(stats.get(f"{stream_kind}_{action}_count")) or 0
+                    ) + 1
+                    for field in ("host", "path", "failure_stage", "failure_class"):
+                        value = pairs.get(field)
+                        if value:
+                            stats[f"last_{field}"] = value
+                    for field in (
+                        "disable_nagle",
+                        "elapsed_ms",
+                        "tcp_connect_ms",
+                        "ws_upgrade_ms",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "component=bootstrap_seed_bridge" in line and "venue=extended" in line:
+                    stats = extended_seed_bridge_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    action = str(pairs.get("action", "unknown")).lower()
+                    stats["last_action"] = action
+                    stats[f"action_{action}_count"] = (
+                        safe_int(stats.get(f"action_{action}_count")) or 0
+                    ) + 1
+                    clear_reason = pairs.get("clear_reason")
+                    if clear_reason:
+                        stats["last_clear_reason"] = clear_reason
+                    for field in (
+                        "rest_snapshot_seeded",
+                        "rest_seed_bridge_active",
+                        "seed_age_ms",
+                        "venue_state_stale_ms",
+                        "connect_first_frame_timeout_ms",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if (
+                    "component=bootstrap_control_frame_grace" in line
+                    and "venue=extended" in line
+                ):
+                    stats = extended_control_frame_grace_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    action = str(pairs.get("action", "unknown")).lower()
+                    stats["last_action"] = action
+                    stats[f"action_{action}_count"] = (
+                        safe_int(stats.get(f"action_{action}_count")) or 0
+                    ) + 1
+                    reason_family = pairs.get("reason_family")
+                    if reason_family:
+                        stats["last_reason_family"] = reason_family
+                    first_control_frame_kind = pairs.get("first_control_frame_kind")
+                    if first_control_frame_kind:
+                        stats["last_first_control_frame_kind"] = first_control_frame_kind
+                    for field in (
+                        "control_frame_only_timeout_ms",
+                        "connect_first_frame_timeout_ms",
+                        "seed_age_ms",
+                        "venue_state_stale_ms",
+                        "first_control_frame_seen",
+                        "first_data_frame_seen",
+                        "rest_seed_bridge_active",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "component=bootstrap_session_hedge" in line and "venue=extended" in line:
+                    stats = extended_session_hedge_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    action = str(pairs.get("action", "unknown")).lower()
+                    stats["last_action"] = action
+                    stats[f"action_{action}_count"] = (
+                        safe_int(stats.get(f"action_{action}_count")) or 0
+                    ) + 1
+                    winner = pairs.get("winner")
+                    if winner:
+                        stats["last_winner"] = winner
+                        stats[f"winner_{winner}_count"] = (
+                            safe_int(stats.get(f"winner_{winner}_count")) or 0
+                        ) + 1
+                    loser = pairs.get("loser")
+                    if loser:
+                        stats["last_loser"] = loser
+                    first_control_frame_kind = pairs.get("first_control_frame_kind")
+                    if first_control_frame_kind:
+                        stats["last_first_control_frame_kind"] = first_control_frame_kind
+                    for field in (
+                        "hedge_started_at_ms",
+                        "connect_first_frame_timeout_ms",
+                        "control_frame_only_timeout_ms",
+                        "seed_age_ms",
+                        "venue_state_stale_ms",
+                        "rest_seed_bridge_active",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "component=backend_attach_fallback" in line and "venue=extended" in line:
+                    stats = extended_backend_attach_fallback_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    action = str(pairs.get("action", "unknown")).lower()
+                    stats["last_action"] = action
+                    stats[f"action_{action}_count"] = (
+                        safe_int(stats.get(f"action_{action}_count")) or 0
+                    ) + 1
+                    for field in (
+                        "winner_socket_role",
+                        "winner_stream_kind",
+                        "primary_stream_kind",
+                        "fallback_stream_kind",
+                    ):
+                        value = pairs.get(field)
+                        if value:
+                            stats[f"last_{field}"] = value
+                    for field in (
+                        "hedge_started_at_ms",
+                        "connect_first_frame_timeout_ms",
+                        "control_frame_only_timeout_ms",
+                        "seed_age_ms",
+                        "rest_seed_bridge_active",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if (
+                    "component=post_publish_stream_fallback" in line
+                    and "venue=extended" in line
+                ):
+                    stats = extended_post_publish_fallback_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    action = str(pairs.get("action", "unknown")).lower()
+                    stats["last_action"] = action
+                    stats[f"action_{action}_count"] = (
+                        safe_int(stats.get(f"action_{action}_count")) or 0
+                    ) + 1
+                    for field in (
+                        "active_stream_kind",
+                        "fallback_stream_kind",
+                        "winner_stream_kind",
+                        "last_frame_kind",
+                        "last_data_kind",
+                        "stream_preference",
+                    ):
+                        value = pairs.get(field)
+                        if value:
+                            stats[f"last_{field}"] = value
+                    for field in (
+                        "started_at_ms",
+                        "post_publish_fallback_after_ms",
+                        "post_publish_fallback_deadline_ms",
+                        "age_ws_rx_ms",
+                        "age_data_rx_ms",
+                        "age_book_event_ms",
+                        "age_published_ms",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "component=bootstrap_timeout" in line and "venue=extended" in line:
+                    reason = str(pairs.get("reason", "unknown")).lower()
+                    stats = extended_bootstrap_timeout_stats[reason]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    stats["reason"] = reason
+                    for field in (
+                        "connect_first_frame_timeout_ms",
+                        "connect_book_timeout_ms",
+                        "rest_snapshot_seeded",
+                        "rest_seed_bridge_active",
+                        "first_control_frame_seen",
+                        "first_data_frame_seen",
+                        "first_message_seen",
+                        "first_book_seen",
+                        "first_publish_seen",
+                        "stale_watchdog_armed",
+                        "stale_watchdog_deferred_until_first_publish",
+                        "rest_snapshot_seq",
+                        "rest_snapshot_latency_ms",
+                        "rest_snapshot_bid_levels",
+                        "rest_snapshot_ask_levels",
+                        "control_frame_only_timeout_ms",
+                        "seed_age_ms",
+                        "time_to_first_control_frame_ms",
+                        "time_to_first_message_ms",
+                        "time_to_first_book_ms",
+                        "time_to_first_publish_ms",
+                        "last_seq",
+                        "last_snapshot_seq",
+                        "last_book_seq",
+                        "last_publish_seq",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for field in (
+                        "last_frame_kind",
+                        "last_data_kind",
+                        "reason_family",
+                        "first_control_frame_kind",
+                    ):
+                        value = pairs.get(field)
+                        if value:
+                            stats[f"last_{field}"] = value
+                    timeout_stage = pairs.get("bootstrap_timeout_stage")
+                    if timeout_stage:
+                        stats["last_bootstrap_timeout_stage"] = timeout_stage
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+                    extended_bootstrap_episodes.append(
+                        {
+                            "reason": reason,
+                            "first_control_frame_seen": safe_int(
+                                pairs.get("first_control_frame_seen")
+                            )
+                            or 0,
+                            "first_data_frame_seen": safe_int(
+                                pairs.get("first_data_frame_seen")
+                            )
+                            or 0,
+                        }
+                    )
+
+                if "component=bootstrap_churn" in line and "venue=extended" in line:
+                    stats = extended_bootstrap_churn_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    action = str(pairs.get("action", "unknown")).lower()
+                    stats["last_action"] = action
+                    bootstrap_reason = pairs.get("bootstrap_reason")
+                    if bootstrap_reason:
+                        stats["last_bootstrap_reason"] = bootstrap_reason
+                    for field in (
+                        "bootstrap_count_window",
+                        "bootstrap_window_ms",
+                        "bootstrap_limit",
+                        "bootstrap_fast_reconnect_allowed",
+                        "bootstrap_churn_escalated",
+                        "healthy_session_ms_before_reset",
+                        "session_duration_ms",
+                        "previous_bootstrap_count_window",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "component=stale_watchdog_churn" in line and "venue=extended" in line:
+                    stats = extended_transport_gap_stats["extended"]
+                    stats["samples"] = (safe_int(stats.get("samples")) or 0) + 1
+                    action = str(pairs.get("action", "unknown")).lower()
+                    stats["last_action"] = action
+                    for field in (
+                        "stale_watchdog_count_window",
+                        "stale_watchdog_window_ms",
+                        "stale_watchdog_limit",
+                        "stale_watchdog_fast_reconnect_allowed",
+                        "stale_watchdog_churn_escalated",
+                        "healthy_session_ms_before_reset",
+                        "session_duration_ms",
+                        "previous_stale_watchdog_count_window",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+
+                if "component=session_progress" in line and "venue=extended" in line:
+                    stats = extended_transport_gap_stats["extended"]
+                    stats["session_progress_samples"] = (
+                        safe_int(stats.get("session_progress_samples")) or 0
+                    ) + 1
+                    stage = str(pairs.get("stage", "unknown")).lower()
+                    stats["last_stage"] = stage
+                    socket_role = str(pairs.get("socket_role", "unknown")).lower()
+                    role_stats = extended_socket_role_progress_stats[socket_role]
+                    role_stats["samples"] = (
+                        safe_int(role_stats.get("samples")) or 0
+                    ) + 1
+                    role_stats["last_stage"] = stage
+                    role_stats[f"stage_{stage}_count"] = (
+                        safe_int(role_stats.get(f"stage_{stage}_count")) or 0
+                    ) + 1
+                    stream_kind = str(pairs.get("stream_kind", "unknown")).lower()
+                    stream_stats = extended_stream_kind_progress_stats[stream_kind]
+                    stream_stats["samples"] = (
+                        safe_int(stream_stats.get("samples")) or 0
+                    ) + 1
+                    stream_stats["last_stage"] = stage
+                    stream_stats[f"stage_{stage}_count"] = (
+                        safe_int(stream_stats.get(f"stage_{stage}_count")) or 0
+                    ) + 1
+                    ws_upgrade_completed = safe_int(pairs.get("ws_upgrade_completed"))
+                    if ws_upgrade_completed is not None:
+                        role_stats["last_ws_upgrade_completed"] = ws_upgrade_completed
+                        update_max_stat(
+                            role_stats,
+                            "max_ws_upgrade_completed",
+                            ws_upgrade_completed,
+                        )
+                        stream_stats["last_ws_upgrade_completed"] = ws_upgrade_completed
+                        update_max_stat(
+                            stream_stats,
+                            "max_ws_upgrade_completed",
+                            ws_upgrade_completed,
+                        )
+                    for field in (
+                        "time_to_first_control_frame_ms",
+                        "time_to_first_message_ms",
+                        "time_to_first_book_ms",
+                        "time_to_first_publish_ms",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
+                            role_stats[f"last_{field}"] = value
+                            update_max_stat(role_stats, f"max_{field}", value)
+                            stream_stats[f"last_{field}"] = value
+                            update_max_stat(stream_stats, f"max_{field}", value)
+                    for key, raw in pairs.items():
+                        update_max_numeric_token(stats, key, raw)
+                        update_max_numeric_token(role_stats, key, raw)
+                        update_max_numeric_token(stream_stats, key, raw)
+
+                if (
+                    "component=watchdog_bootstrap_transition" in line
+                    and "venue=extended" in line
+                ):
+                    stats = extended_transport_gap_stats["extended"]
+                    stats["watchdog_bootstrap_transition_samples"] = (
+                        safe_int(stats.get("watchdog_bootstrap_transition_samples")) or 0
+                    ) + 1
+                    for field in (
+                        "first_publish_observed",
+                        "watchdog_armed_now",
+                        "stale_watchdog_deferred_until_first_publish",
+                        "time_to_first_publish_ms",
+                    ):
+                        value = safe_int(pairs.get(field))
+                        if value is not None:
+                            stats[f"last_{field}"] = value
+                            update_max_stat(stats, f"max_{field}", value)
 
                 if "venue=lighter" in line and "lighter_ts_fallback_count=" in line:
                     stats = lighter_ts_fallback_stats["lighter"]
@@ -667,14 +1470,39 @@ def parse_run_log(
         signature_reconnect_counts,
         market_publisher_counters,
         runner_apply_stats,
+        runner_apply_truth_stats,
         rest_monitor_stats,
         arb_gate_stats,
         hl_pubq_stats,
         extended_ws_msg_stats,
         extended_cfg_stats,
+        extended_reconnect_policy_stats,
+        extended_transport_gap_stats,
+        summarize_extended_rest_seed(extended_rest_seed_stats),
+        summarize_extended_seed_bridge(extended_seed_bridge_stats),
+        summarize_extended_control_frame_grace(extended_control_frame_grace_stats),
+        extended_session_hedge_stats,
+        summarize_extended_backend_attach_fallback(
+            extended_backend_attach_fallback_stats
+        ),
+        extended_bootstrap_timeout_stats,
+        extended_bootstrap_churn_stats,
+        summarize_extended_bootstrap(extended_bootstrap_episodes),
         ping_stats,
         lighter_ts_fallback_stats,
         aster_book_recovery_stats,
+        summarize_extended_defects(extended_defect_episodes),
+        summarize_extended_control_frame_before_data(extended_bootstrap_episodes),
+        summarize_extended_socket_establishment(extended_socket_establishment_stats),
+        summarize_extended_socket_role_progress(extended_socket_role_progress_stats),
+        summarize_extended_stream_kind_progress(extended_stream_kind_progress_stats),
+        summarize_extended_post_publish_fallback(extended_post_publish_fallback_stats),
+        summarize_extended_post_publish_gap_stage(
+            summarize_extended_post_publish_fallback(extended_post_publish_fallback_stats)
+        ),
+        summarize_extended_stream_preference(
+            summarize_extended_post_publish_fallback(extended_post_publish_fallback_stats)
+        ),
     )
 
 
@@ -722,6 +1550,396 @@ def parse_market_rx_stats(path: Path) -> CapHitsSummary:
             prev_tick = tick
             summary.last_cap_hits = cap_hits
 
+    return summary
+
+
+def summarize_extended_seed_bridge(stats: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    summary = dict(stats.get("extended", {}))
+    return {
+        "samples": safe_int(summary.get("samples")) or 0,
+        "activated_count": safe_int(summary.get("action_activated_count")) or 0,
+        "cleared_count": safe_int(summary.get("action_cleared_count")) or 0,
+        "last_action": summary.get("last_action"),
+        "last_clear_reason": summary.get("last_clear_reason"),
+        "last_rest_snapshot_seeded": safe_int(summary.get("last_rest_snapshot_seeded")),
+        "last_rest_seed_bridge_active": safe_int(
+            summary.get("last_rest_seed_bridge_active")
+        ),
+        "last_seed_age_ms": safe_int(summary.get("last_seed_age_ms")),
+        "max_seed_age_ms": safe_int(summary.get("max_seed_age_ms")),
+        "last_venue_state_stale_ms": safe_int(
+            summary.get("last_venue_state_stale_ms")
+        ),
+        "last_connect_first_frame_timeout_ms": safe_int(
+            summary.get("last_connect_first_frame_timeout_ms")
+        ),
+    }
+
+
+def summarize_extended_control_frame_grace(
+    stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    summary = dict(stats.get("extended", {}))
+    return {
+        "samples": safe_int(summary.get("samples")) or 0,
+        "armed_count": safe_int(summary.get("action_armed_count")) or 0,
+        "cleared_count": safe_int(summary.get("action_cleared_count")) or 0,
+        "expired_count": safe_int(summary.get("action_expired_count")) or 0,
+        "last_action": summary.get("last_action"),
+        "last_reason_family": summary.get("last_reason_family"),
+        "last_first_control_frame_kind": summary.get("last_first_control_frame_kind"),
+        "last_first_control_frame_seen": safe_int(
+            summary.get("last_first_control_frame_seen")
+        ),
+        "last_first_data_frame_seen": safe_int(
+            summary.get("last_first_data_frame_seen")
+        ),
+        "last_rest_seed_bridge_active": safe_int(
+            summary.get("last_rest_seed_bridge_active")
+        ),
+        "last_seed_age_ms": safe_int(summary.get("last_seed_age_ms")),
+        "max_seed_age_ms": safe_int(summary.get("max_seed_age_ms")),
+        "last_venue_state_stale_ms": safe_int(
+            summary.get("last_venue_state_stale_ms")
+        ),
+        "last_connect_first_frame_timeout_ms": safe_int(
+            summary.get("last_connect_first_frame_timeout_ms")
+        ),
+        "last_control_frame_only_timeout_ms": safe_int(
+            summary.get("last_control_frame_only_timeout_ms")
+        ),
+    }
+
+
+def summarize_extended_session_hedge(
+    stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    summary = dict(stats.get("extended", {}))
+    return {
+        "samples": safe_int(summary.get("samples")) or 0,
+        "started_count": safe_int(summary.get("action_started_count")) or 0,
+        "primary_won_count": safe_int(summary.get("action_primary_won_count")) or 0,
+        "hedge_won_count": safe_int(summary.get("action_hedge_won_count")) or 0,
+        "cancelled_count": safe_int(summary.get("action_cancelled_count")) or 0,
+        "expired_count": safe_int(summary.get("action_expired_count")) or 0,
+        "last_action": summary.get("last_action"),
+        "last_winner": summary.get("last_winner"),
+        "last_loser": summary.get("last_loser"),
+        "last_first_control_frame_kind": summary.get("last_first_control_frame_kind"),
+        "last_hedge_started_at_ms": safe_int(summary.get("last_hedge_started_at_ms")),
+        "max_hedge_started_at_ms": safe_int(summary.get("max_hedge_started_at_ms")),
+        "last_connect_first_frame_timeout_ms": safe_int(
+            summary.get("last_connect_first_frame_timeout_ms")
+        ),
+        "last_control_frame_only_timeout_ms": safe_int(
+            summary.get("last_control_frame_only_timeout_ms")
+        ),
+        "last_seed_age_ms": safe_int(summary.get("last_seed_age_ms")),
+        "max_seed_age_ms": safe_int(summary.get("max_seed_age_ms")),
+        "last_venue_state_stale_ms": safe_int(
+            summary.get("last_venue_state_stale_ms")
+        ),
+        "last_rest_seed_bridge_active": safe_int(
+            summary.get("last_rest_seed_bridge_active")
+        ),
+    }
+
+
+def summarize_extended_backend_attach_fallback(
+    stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    summary = dict(stats.get("extended", {}))
+    return {
+        "samples": safe_int(summary.get("samples")) or 0,
+        "started_count": safe_int(summary.get("action_started_count")) or 0,
+        "primary_won_count": safe_int(summary.get("action_primary_won_count")) or 0,
+        "fallback_won_count": safe_int(summary.get("action_fallback_won_count")) or 0,
+        "cancelled_count": safe_int(summary.get("action_cancelled_count")) or 0,
+        "expired_count": safe_int(summary.get("action_expired_count")) or 0,
+        "last_action": summary.get("last_action"),
+        "last_winner_socket_role": summary.get("last_winner_socket_role"),
+        "last_winner_stream_kind": summary.get("last_winner_stream_kind"),
+        "last_primary_stream_kind": summary.get("last_primary_stream_kind"),
+        "last_fallback_stream_kind": summary.get("last_fallback_stream_kind"),
+        "last_hedge_started_at_ms": safe_int(summary.get("last_hedge_started_at_ms")),
+        "max_hedge_started_at_ms": safe_int(summary.get("max_hedge_started_at_ms")),
+        "last_connect_first_frame_timeout_ms": safe_int(
+            summary.get("last_connect_first_frame_timeout_ms")
+        ),
+        "last_control_frame_only_timeout_ms": safe_int(
+            summary.get("last_control_frame_only_timeout_ms")
+        ),
+        "last_seed_age_ms": safe_int(summary.get("last_seed_age_ms")),
+        "max_seed_age_ms": safe_int(summary.get("max_seed_age_ms")),
+        "last_rest_seed_bridge_active": safe_int(
+            summary.get("last_rest_seed_bridge_active")
+        ),
+    }
+
+
+def summarize_extended_post_publish_fallback(
+    stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    summary = dict(stats.get("extended", {}))
+    return {
+        "samples": safe_int(summary.get("samples")) or 0,
+        "armed_count": safe_int(summary.get("action_armed_count")) or 0,
+        "started_count": safe_int(summary.get("action_started_count")) or 0,
+        "primary_recovered_count": safe_int(
+            summary.get("action_primary_recovered_count")
+        )
+        or 0,
+        "fallback_won_count": safe_int(summary.get("action_fallback_won_count")) or 0,
+        "expired_count": safe_int(summary.get("action_expired_count")) or 0,
+        "cancelled_count": safe_int(summary.get("action_cancelled_count")) or 0,
+        "preference_set_count": safe_int(summary.get("action_preference_set_count"))
+        or 0,
+        "preference_reset_count": safe_int(
+            summary.get("action_preference_reset_count")
+        )
+        or 0,
+        "last_action": summary.get("last_action"),
+        "last_active_stream_kind": summary.get("last_active_stream_kind"),
+        "last_fallback_stream_kind": summary.get("last_fallback_stream_kind"),
+        "last_winner_stream_kind": summary.get("last_winner_stream_kind"),
+        "last_last_frame_kind": summary.get("last_last_frame_kind"),
+        "last_last_data_kind": summary.get("last_last_data_kind"),
+        "last_stream_preference": summary.get("last_stream_preference"),
+        "last_started_at_ms": safe_int(summary.get("last_started_at_ms")),
+        "max_started_at_ms": safe_int(summary.get("max_started_at_ms")),
+        "last_post_publish_fallback_after_ms": safe_int(
+            summary.get("last_post_publish_fallback_after_ms")
+        ),
+        "last_post_publish_fallback_deadline_ms": safe_int(
+            summary.get("last_post_publish_fallback_deadline_ms")
+        ),
+        "last_age_ws_rx_ms": safe_int(summary.get("last_age_ws_rx_ms")),
+        "last_age_data_rx_ms": safe_int(summary.get("last_age_data_rx_ms")),
+        "last_age_book_event_ms": safe_int(summary.get("last_age_book_event_ms")),
+        "last_age_published_ms": safe_int(summary.get("last_age_published_ms")),
+        "max_age_ws_rx_ms": safe_int(summary.get("max_age_ws_rx_ms")),
+        "max_age_data_rx_ms": safe_int(summary.get("max_age_data_rx_ms")),
+        "max_age_book_event_ms": safe_int(summary.get("max_age_book_event_ms")),
+        "max_age_published_ms": safe_int(summary.get("max_age_published_ms")),
+    }
+
+
+def summarize_extended_post_publish_gap_stage(
+    summary: dict[str, Any]
+) -> dict[str, Any]:
+    counts = {
+        "armed": safe_int(summary.get("armed_count")) or 0,
+        "started": safe_int(summary.get("started_count")) or 0,
+        "primary_recovered": safe_int(summary.get("primary_recovered_count")) or 0,
+        "fallback_won": safe_int(summary.get("fallback_won_count")) or 0,
+        "expired": safe_int(summary.get("expired_count")) or 0,
+        "cancelled": safe_int(summary.get("cancelled_count")) or 0,
+    }
+    terminal_counts = {
+        "primary_recovered": counts["primary_recovered"],
+        "fallback_won": counts["fallback_won"],
+        "expired": counts["expired"],
+        "cancelled": counts["cancelled"],
+    }
+    attempts = counts["started"]
+    dominant_stage = "none"
+    dominant_count = 0
+    if attempts > 0:
+        dominant_stage, dominant_count = max(
+            terminal_counts.items(), key=lambda item: item[1]
+        )
+    confidence_pct = (dominant_count / attempts * 100.0) if attempts > 0 else 0.0
+    return {
+        "counts": counts,
+        "attempts": attempts,
+        "dominant_stage": dominant_stage,
+        "dominant_count": dominant_count,
+        "confidence_pct": confidence_pct,
+        "successful_recoveries": counts["primary_recovered"] + counts["fallback_won"],
+    }
+
+
+def summarize_extended_stream_preference(summary: dict[str, Any]) -> dict[str, Any]:
+    last_preference = str(summary.get("last_stream_preference") or "depth1")
+    return {
+        "last_stream_preference": last_preference,
+        "preference_set_count": safe_int(summary.get("preference_set_count")) or 0,
+        "preference_reset_count": safe_int(summary.get("preference_reset_count")) or 0,
+        "degraded_active": 1 if last_preference == "full_orderbook_degraded" else 0,
+    }
+
+
+def summarize_extended_control_frame_before_data(
+    episodes: list[dict[str, Any]]
+) -> dict[str, Any]:
+    counts = {
+        "no_frame": 0,
+        "control_frame_only": 0,
+        "data_frame_seen": 0,
+    }
+    for episode in episodes:
+        first_data = safe_int(episode.get("first_data_frame_seen")) or 0
+        first_control = safe_int(episode.get("first_control_frame_seen")) or 0
+        if first_data:
+            counts["data_frame_seen"] += 1
+        elif first_control:
+            counts["control_frame_only"] += 1
+        else:
+            counts["no_frame"] += 1
+    total = sum(counts.values())
+    dominant_shape = "no_frame"
+    dominant_count = 0
+    if total > 0:
+        dominant_shape, dominant_count = max(counts.items(), key=lambda item: item[1])
+    confidence_pct = (dominant_count / total * 100.0) if total > 0 else 0.0
+    return {
+        "counts": counts,
+        "total": total,
+        "dominant_shape": dominant_shape,
+        "dominant_count": dominant_count,
+        "confidence_pct": confidence_pct,
+    }
+
+
+def summarize_extended_socket_establishment(
+    stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    summary = dict(stats.get("extended", {}))
+    return {
+        "samples": safe_int(summary.get("samples")) or 0,
+        "tcp_connected_count": safe_int(summary.get("action_tcp_connected_count")) or 0,
+        "ws_upgraded_count": safe_int(summary.get("action_ws_upgraded_count")) or 0,
+        "failed_count": safe_int(summary.get("action_failed_count")) or 0,
+        "primary_ws_upgraded_count": safe_int(summary.get("primary_ws_upgraded_count")) or 0,
+        "hedge_ws_upgraded_count": safe_int(summary.get("hedge_ws_upgraded_count")) or 0,
+        "primary_failed_count": safe_int(summary.get("primary_failed_count")) or 0,
+        "hedge_failed_count": safe_int(summary.get("hedge_failed_count")) or 0,
+        "last_action": summary.get("last_action"),
+        "last_socket_role": summary.get("last_socket_role"),
+        "last_stream_kind": summary.get("last_stream_kind"),
+        "last_host": summary.get("last_host"),
+        "last_path": summary.get("last_path"),
+        "last_failure_stage": summary.get("last_failure_stage"),
+        "last_failure_class": summary.get("last_failure_class"),
+        "last_disable_nagle": safe_int(summary.get("last_disable_nagle")),
+        "last_elapsed_ms": safe_int(summary.get("last_elapsed_ms")),
+        "max_elapsed_ms": safe_int(summary.get("max_elapsed_ms")),
+        "last_tcp_connect_ms": safe_int(summary.get("last_tcp_connect_ms")),
+        "max_tcp_connect_ms": safe_int(summary.get("max_tcp_connect_ms")),
+        "last_ws_upgrade_ms": safe_int(summary.get("last_ws_upgrade_ms")),
+        "max_ws_upgrade_ms": safe_int(summary.get("max_ws_upgrade_ms")),
+        "depth1_ws_upgraded_count": safe_int(summary.get("depth1_ws_upgraded_count")) or 0,
+        "full_orderbook_ws_upgraded_count": safe_int(
+            summary.get("full_orderbook_ws_upgraded_count")
+        )
+        or 0,
+    }
+
+
+def summarize_extended_socket_role_progress(
+    stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for socket_role in ("primary", "hedge"):
+        role = dict(stats.get(socket_role, {}))
+        summary[socket_role] = {
+            "samples": safe_int(role.get("samples")) or 0,
+            "last_stage": role.get("last_stage"),
+            "stage_first_control_frame_count": safe_int(
+                role.get("stage_first_control_frame_count")
+            )
+            or 0,
+            "stage_first_message_count": safe_int(
+                role.get("stage_first_message_count")
+            )
+            or 0,
+            "stage_first_book_count": safe_int(role.get("stage_first_book_count")) or 0,
+            "stage_first_publish_count": safe_int(
+                role.get("stage_first_publish_count")
+            )
+            or 0,
+            "last_ws_upgrade_completed": safe_int(
+                role.get("last_ws_upgrade_completed")
+            ),
+            "last_time_to_first_control_frame_ms": safe_int(
+                role.get("last_time_to_first_control_frame_ms")
+            ),
+            "max_time_to_first_control_frame_ms": safe_int(
+                role.get("max_time_to_first_control_frame_ms")
+            ),
+            "last_time_to_first_message_ms": safe_int(
+                role.get("last_time_to_first_message_ms")
+            ),
+            "max_time_to_first_message_ms": safe_int(
+                role.get("max_time_to_first_message_ms")
+            ),
+            "last_time_to_first_book_ms": safe_int(
+                role.get("last_time_to_first_book_ms")
+            ),
+            "max_time_to_first_book_ms": safe_int(
+                role.get("max_time_to_first_book_ms")
+            ),
+            "last_time_to_first_publish_ms": safe_int(
+                role.get("last_time_to_first_publish_ms")
+            ),
+            "max_time_to_first_publish_ms": safe_int(
+                role.get("max_time_to_first_publish_ms")
+            ),
+        }
+    return summary
+
+
+def summarize_extended_stream_kind_progress(
+    stats: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for stream_kind in ("depth1", "full_orderbook"):
+        stream = dict(stats.get(stream_kind, {}))
+        summary[stream_kind] = {
+            "samples": safe_int(stream.get("samples")) or 0,
+            "last_stage": stream.get("last_stage"),
+            "stage_first_control_frame_count": safe_int(
+                stream.get("stage_first_control_frame_count")
+            )
+            or 0,
+            "stage_first_message_count": safe_int(
+                stream.get("stage_first_message_count")
+            )
+            or 0,
+            "stage_first_book_count": safe_int(stream.get("stage_first_book_count"))
+            or 0,
+            "stage_first_publish_count": safe_int(
+                stream.get("stage_first_publish_count")
+            )
+            or 0,
+            "last_ws_upgrade_completed": safe_int(
+                stream.get("last_ws_upgrade_completed")
+            ),
+            "last_time_to_first_control_frame_ms": safe_int(
+                stream.get("last_time_to_first_control_frame_ms")
+            ),
+            "max_time_to_first_control_frame_ms": safe_int(
+                stream.get("max_time_to_first_control_frame_ms")
+            ),
+            "last_time_to_first_message_ms": safe_int(
+                stream.get("last_time_to_first_message_ms")
+            ),
+            "max_time_to_first_message_ms": safe_int(
+                stream.get("max_time_to_first_message_ms")
+            ),
+            "last_time_to_first_book_ms": safe_int(
+                stream.get("last_time_to_first_book_ms")
+            ),
+            "max_time_to_first_book_ms": safe_int(
+                stream.get("max_time_to_first_book_ms")
+            ),
+            "last_time_to_first_publish_ms": safe_int(
+                stream.get("last_time_to_first_publish_ms")
+            ),
+            "max_time_to_first_publish_ms": safe_int(
+                stream.get("max_time_to_first_publish_ms")
+            ),
+        }
     return summary
 
 
@@ -835,14 +2053,33 @@ def build_report(
     signature_reconnect: dict[tuple[str, str], int],
     market_publisher_counters: dict[str, int],
     runner_apply_stats: dict[str, dict[str, Any]],
+    runner_apply_truth_stats: dict[str, dict[str, Any]],
     rest_monitor_stats: dict[str, dict[str, Any]],
     arb_gate_stats: dict[str, dict[str, Any]],
     hl_pubq_stats: dict[str, dict[str, Any]],
     extended_ws_msg_stats: dict[str, dict[str, Any]],
     extended_cfg_stats: dict[str, dict[str, Any]],
+    extended_reconnect_policy_stats: dict[str, dict[str, Any]],
+    extended_transport_gap_stats: dict[str, dict[str, Any]],
+    extended_rest_seed_summary: dict[str, Any],
+    extended_seed_bridge_summary: dict[str, Any],
+    extended_control_frame_grace_summary: dict[str, Any],
+    extended_session_hedge_summary: dict[str, Any],
+    extended_backend_attach_fallback_summary: dict[str, Any],
+    extended_post_publish_fallback_summary: dict[str, Any],
+    extended_post_publish_gap_stage_summary: dict[str, Any],
+    extended_stream_preference_summary: dict[str, Any],
+    extended_bootstrap_timeout_stats: dict[str, dict[str, Any]],
+    extended_bootstrap_churn_stats: dict[str, dict[str, Any]],
+    extended_bootstrap_summary: dict[str, Any],
+    extended_control_frame_before_data_summary: dict[str, Any],
+    extended_socket_establishment_summary: dict[str, Any],
+    extended_socket_role_progress_summary: dict[str, Any],
+    extended_stream_kind_progress_summary: dict[str, Any],
     ping_stats: dict[str, dict[str, Any]],
     lighter_ts_fallback_stats: dict[str, dict[str, Any]],
     aster_book_recovery_stats: dict[str, dict[str, Any]],
+    extended_defect_summary: dict[str, Any],
     cap_hits_summary: CapHitsSummary | None,
 ) -> str:
     lines: list[str] = []
@@ -930,6 +2167,484 @@ def build_report(
         lines.append("_No reconnect evidence found in run.log._")
     lines.append("")
 
+    lines.append("## Extended REST Snapshot Seed")
+    rest_seed_stats = dict(extended_rest_seed_summary.get("extended", {}))
+    if rest_seed_stats:
+        lines.append(
+            md_table(
+                [
+                    "samples",
+                    "status_ok_count",
+                    "status_http_error_count",
+                    "status_parse_error_count",
+                    "status_empty_count",
+                    "last_http_status",
+                    "last_latency_ms",
+                    "max_latency_ms",
+                    "last_seeded",
+                    "last_bid_levels",
+                    "last_ask_levels",
+                ],
+                [[
+                    fmt_int(safe_int(rest_seed_stats.get("samples"))),
+                    fmt_int(safe_int(rest_seed_stats.get("status_ok_count"))),
+                    fmt_int(safe_int(rest_seed_stats.get("status_http_error_count"))),
+                    fmt_int(safe_int(rest_seed_stats.get("status_parse_error_count"))),
+                    fmt_int(safe_int(rest_seed_stats.get("status_empty_count"))),
+                    fmt_int(safe_int(rest_seed_stats.get("last_http_status"))),
+                    fmt_int(safe_int(rest_seed_stats.get("last_latency_ms"))),
+                    fmt_int(safe_int(rest_seed_stats.get("max_latency_ms"))),
+                    fmt_int(safe_int(rest_seed_stats.get("last_seeded"))),
+                    fmt_int(safe_int(rest_seed_stats.get("last_bid_levels"))),
+                    fmt_int(safe_int(rest_seed_stats.get("last_ask_levels"))),
+                ]],
+            )
+        )
+        failures_by_status = extended_rest_seed_summary.get("failures_by_status") or {}
+        failures_by_http_status = extended_rest_seed_summary.get("failures_by_http_status") or {}
+        if failures_by_status:
+            lines.append(
+                f"- failure counts by status: `{json.dumps(failures_by_status, sort_keys=True)}`"
+            )
+        if failures_by_http_status:
+            lines.append(
+                f"- failure counts by HTTP status: `{json.dumps(failures_by_http_status, sort_keys=True)}`"
+            )
+    else:
+        lines.append("_No `component=rest_snapshot_seed` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Seed Bridge")
+    if safe_int(extended_seed_bridge_summary.get("samples")):
+        lines.append(
+            md_table(
+                [
+                    "samples",
+                    "activated_count",
+                    "cleared_count",
+                    "last_action",
+                    "last_clear_reason",
+                    "last_seed_age_ms",
+                    "max_seed_age_ms",
+                    "last_rest_seed_bridge_active",
+                    "last_venue_state_stale_ms",
+                    "last_connect_first_frame_timeout_ms",
+                ],
+                [[
+                    fmt_int(safe_int(extended_seed_bridge_summary.get("samples"))),
+                    fmt_int(safe_int(extended_seed_bridge_summary.get("activated_count"))),
+                    fmt_int(safe_int(extended_seed_bridge_summary.get("cleared_count"))),
+                    str(extended_seed_bridge_summary.get("last_action") or "n/a"),
+                    str(extended_seed_bridge_summary.get("last_clear_reason") or "n/a"),
+                    fmt_int(safe_int(extended_seed_bridge_summary.get("last_seed_age_ms"))),
+                    fmt_int(safe_int(extended_seed_bridge_summary.get("max_seed_age_ms"))),
+                    fmt_int(safe_int(extended_seed_bridge_summary.get("last_rest_seed_bridge_active"))),
+                    fmt_int(safe_int(extended_seed_bridge_summary.get("last_venue_state_stale_ms"))),
+                    fmt_int(safe_int(extended_seed_bridge_summary.get("last_connect_first_frame_timeout_ms"))),
+                ]],
+            )
+        )
+    else:
+        lines.append("_No `component=bootstrap_seed_bridge` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Control-Frame Grace")
+    if safe_int(extended_control_frame_grace_summary.get("samples")):
+        lines.append(
+            "- armed / cleared / expired: "
+            f"`{fmt_int(safe_int(extended_control_frame_grace_summary.get('armed_count')))} / "
+            f"{fmt_int(safe_int(extended_control_frame_grace_summary.get('cleared_count')))} / "
+            f"{fmt_int(safe_int(extended_control_frame_grace_summary.get('expired_count')))}`"
+        )
+        lines.append(
+            "- last action / reason_family: "
+            f"`{extended_control_frame_grace_summary.get('last_action', 'n/a')} / "
+            f"{extended_control_frame_grace_summary.get('last_reason_family', 'n/a')}`"
+        )
+        lines.append(
+            "- last first-control kind / first-data-seen / bridge-active: "
+            f"`{extended_control_frame_grace_summary.get('last_first_control_frame_kind', 'n/a')} / "
+            f"{fmt_int(safe_int(extended_control_frame_grace_summary.get('last_first_data_frame_seen')))} / "
+            f"{fmt_int(safe_int(extended_control_frame_grace_summary.get('last_rest_seed_bridge_active')))} `"
+        )
+        lines.append(
+            "- last control-frame-only timeout / seed-age / state-stale: "
+            f"`{fmt_int(safe_int(extended_control_frame_grace_summary.get('last_control_frame_only_timeout_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_control_frame_grace_summary.get('last_seed_age_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_control_frame_grace_summary.get('last_venue_state_stale_ms')))}ms`"
+        )
+    else:
+        lines.append("_No `component=bootstrap_control_frame_grace` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Session Hedge")
+    if safe_int(extended_session_hedge_summary.get("samples")):
+        lines.append(
+            "- started / primary_won / hedge_won / cancelled / expired: "
+            f"`{fmt_int(safe_int(extended_session_hedge_summary.get('started_count')))} / "
+            f"{fmt_int(safe_int(extended_session_hedge_summary.get('primary_won_count')))} / "
+            f"{fmt_int(safe_int(extended_session_hedge_summary.get('hedge_won_count')))} / "
+            f"{fmt_int(safe_int(extended_session_hedge_summary.get('cancelled_count')))} / "
+            f"{fmt_int(safe_int(extended_session_hedge_summary.get('expired_count')))}`"
+        )
+        lines.append(
+            "- last action / winner / loser: "
+            f"`{extended_session_hedge_summary.get('last_action', 'n/a')} / "
+            f"{extended_session_hedge_summary.get('last_winner', 'n/a')} / "
+            f"{extended_session_hedge_summary.get('last_loser', 'n/a')}`"
+        )
+        lines.append(
+            "- last hedge-start / first-control kind / bridge-active: "
+            f"`{fmt_int(safe_int(extended_session_hedge_summary.get('last_hedge_started_at_ms')))}ms / "
+            f"{extended_session_hedge_summary.get('last_first_control_frame_kind', 'n/a')} / "
+            f"{fmt_int(safe_int(extended_session_hedge_summary.get('last_rest_seed_bridge_active')))}`"
+        )
+        lines.append(
+            "- last control-frame-only timeout / seed-age / state-stale: "
+            f"`{fmt_int(safe_int(extended_session_hedge_summary.get('last_control_frame_only_timeout_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_session_hedge_summary.get('last_seed_age_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_session_hedge_summary.get('last_venue_state_stale_ms')))}ms`"
+        )
+    else:
+        lines.append("_No `component=bootstrap_session_hedge` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Backend-Attach Fallback")
+    if safe_int(extended_backend_attach_fallback_summary.get("samples")):
+        lines.append(
+            "- started / primary_won / fallback_won / cancelled / expired: "
+            f"`{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('started_count')))} / "
+            f"{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('primary_won_count')))} / "
+            f"{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('fallback_won_count')))} / "
+            f"{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('cancelled_count')))} / "
+            f"{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('expired_count')))}`"
+        )
+        lines.append(
+            "- last action / winner role / winner stream: "
+            f"`{extended_backend_attach_fallback_summary.get('last_action', 'n/a')} / "
+            f"{extended_backend_attach_fallback_summary.get('last_winner_socket_role', 'n/a')} / "
+            f"{extended_backend_attach_fallback_summary.get('last_winner_stream_kind', 'n/a')}`"
+        )
+        lines.append(
+            "- last primary stream / fallback stream / bridge-active: "
+            f"`{extended_backend_attach_fallback_summary.get('last_primary_stream_kind', 'n/a')} / "
+            f"{extended_backend_attach_fallback_summary.get('last_fallback_stream_kind', 'n/a')} / "
+            f"{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('last_rest_seed_bridge_active')))}`"
+        )
+        lines.append(
+            "- last start / timeout / seed-age: "
+            f"`{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('last_hedge_started_at_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('last_control_frame_only_timeout_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_backend_attach_fallback_summary.get('last_seed_age_ms')))}ms`"
+        )
+    else:
+        lines.append("_No `component=backend_attach_fallback` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Post-Publish Stream Fallback")
+    if safe_int(extended_post_publish_fallback_summary.get("samples")):
+        lines.append(
+            "- armed / started / primary_recovered / fallback_won / expired / cancelled: "
+            f"`{fmt_int(safe_int(extended_post_publish_fallback_summary.get('armed_count')))} / "
+            f"{fmt_int(safe_int(extended_post_publish_fallback_summary.get('started_count')))} / "
+            f"{fmt_int(safe_int(extended_post_publish_fallback_summary.get('primary_recovered_count')))} / "
+            f"{fmt_int(safe_int(extended_post_publish_fallback_summary.get('fallback_won_count')))} / "
+            f"{fmt_int(safe_int(extended_post_publish_fallback_summary.get('expired_count')))} / "
+            f"{fmt_int(safe_int(extended_post_publish_fallback_summary.get('cancelled_count')))}`"
+        )
+        lines.append(
+            "- dominant post-publish stage / confidence: "
+            f"`{extended_post_publish_gap_stage_summary.get('dominant_stage', 'none')} / "
+            f"{safe_float(extended_post_publish_gap_stage_summary.get('confidence_pct')) or 0.0:.1f}%`"
+        )
+        lines.append(
+            "- last action / active stream / winner stream / preference: "
+            f"`{extended_post_publish_fallback_summary.get('last_action', 'n/a')} / "
+            f"{extended_post_publish_fallback_summary.get('last_active_stream_kind', 'n/a')} / "
+            f"{extended_post_publish_fallback_summary.get('last_winner_stream_kind', 'n/a')} / "
+            f"{extended_stream_preference_summary.get('last_stream_preference', 'depth1')}`"
+        )
+        lines.append(
+            "- last after / deadline / data age / published age: "
+            f"`{fmt_int(safe_int(extended_post_publish_fallback_summary.get('last_post_publish_fallback_after_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_post_publish_fallback_summary.get('last_post_publish_fallback_deadline_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_post_publish_fallback_summary.get('last_age_data_rx_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_post_publish_fallback_summary.get('last_age_published_ms')))}ms`"
+        )
+    else:
+        lines.append("_No `component=post_publish_stream_fallback` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Socket Establishment")
+    if safe_int(extended_socket_establishment_summary.get("samples")):
+        lines.append(
+            "- tcp_connected / ws_upgraded / failed: "
+            f"`{fmt_int(safe_int(extended_socket_establishment_summary.get('tcp_connected_count')))} / "
+            f"{fmt_int(safe_int(extended_socket_establishment_summary.get('ws_upgraded_count')))} / "
+            f"{fmt_int(safe_int(extended_socket_establishment_summary.get('failed_count')))}`"
+        )
+        lines.append(
+            "- primary ws_upgraded / hedge ws_upgraded: "
+            f"`{fmt_int(safe_int(extended_socket_establishment_summary.get('primary_ws_upgraded_count')))} / "
+            f"{fmt_int(safe_int(extended_socket_establishment_summary.get('hedge_ws_upgraded_count')))}`"
+        )
+        lines.append(
+            "- depth1 ws_upgraded / full_orderbook ws_upgraded: "
+            f"`{fmt_int(safe_int(extended_socket_establishment_summary.get('depth1_ws_upgraded_count')))} / "
+            f"{fmt_int(safe_int(extended_socket_establishment_summary.get('full_orderbook_ws_upgraded_count')))}`"
+        )
+        lines.append(
+            "- last action / role / stream / failure stage / failure class: "
+            f"`{extended_socket_establishment_summary.get('last_action', 'n/a')} / "
+            f"{extended_socket_establishment_summary.get('last_socket_role', 'n/a')} / "
+            f"{extended_socket_establishment_summary.get('last_stream_kind', 'n/a')} / "
+            f"{extended_socket_establishment_summary.get('last_failure_stage', 'n/a')} / "
+            f"{extended_socket_establishment_summary.get('last_failure_class', 'n/a')}`"
+        )
+        lines.append(
+            "- last tcp_connect / ws_upgrade / elapsed: "
+            f"`{fmt_int(safe_int(extended_socket_establishment_summary.get('last_tcp_connect_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_socket_establishment_summary.get('last_ws_upgrade_ms')))}ms / "
+            f"{fmt_int(safe_int(extended_socket_establishment_summary.get('last_elapsed_ms')))}ms`"
+        )
+        primary_role = extended_socket_role_progress_summary.get("primary", {})
+        hedge_role = extended_socket_role_progress_summary.get("hedge", {})
+        lines.append(
+            "- primary last stage / max first-message / max first-publish: "
+            f"`{primary_role.get('last_stage', 'n/a')} / "
+            f"{fmt_int(safe_int(primary_role.get('max_time_to_first_message_ms')))}ms / "
+            f"{fmt_int(safe_int(primary_role.get('max_time_to_first_publish_ms')))}ms`"
+        )
+        lines.append(
+            "- hedge last stage / max first-message / max first-publish: "
+            f"`{hedge_role.get('last_stage', 'n/a')} / "
+            f"{fmt_int(safe_int(hedge_role.get('max_time_to_first_message_ms')))}ms / "
+            f"{fmt_int(safe_int(hedge_role.get('max_time_to_first_publish_ms')))}ms`"
+        )
+        depth1_stream = extended_stream_kind_progress_summary.get("depth1", {})
+        full_stream = extended_stream_kind_progress_summary.get("full_orderbook", {})
+        lines.append(
+            "- depth1 last stage / max first-message / max first-publish: "
+            f"`{depth1_stream.get('last_stage', 'n/a')} / "
+            f"{fmt_int(safe_int(depth1_stream.get('max_time_to_first_message_ms')))}ms / "
+            f"{fmt_int(safe_int(depth1_stream.get('max_time_to_first_publish_ms')))}ms`"
+        )
+        lines.append(
+            "- full_orderbook last stage / max first-message / max first-publish: "
+            f"`{full_stream.get('last_stage', 'n/a')} / "
+            f"{fmt_int(safe_int(full_stream.get('max_time_to_first_message_ms')))}ms / "
+            f"{fmt_int(safe_int(full_stream.get('max_time_to_first_publish_ms')))}ms`"
+        )
+    else:
+        lines.append("_No `component=socket_establishment` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Bootstrap Truth")
+    lines.append(
+        f"- dominant bootstrap subtype: `{extended_bootstrap_summary.get('dominant_reason', 'bootstrap_no_first_frame')}`"
+    )
+    lines.append(
+        f"- dominant count / total: `{fmt_int(safe_int(extended_bootstrap_summary.get('dominant_count')))} / {fmt_int(safe_int(extended_bootstrap_summary.get('total')))} ({safe_float(extended_bootstrap_summary.get('confidence_pct')) or 0.0:.2f}%)`"
+    )
+    bootstrap_stage_summary = summarize_extended_bootstrap_stages(
+        extended_bootstrap_timeout_stats
+    )
+    lines.append(
+        f"- dominant bootstrap timeout stage: `{bootstrap_stage_summary.get('dominant_stage', 'first_frame')}`"
+    )
+    lines.append(
+        f"- dominant pre-first-data shape: `{extended_control_frame_before_data_summary.get('dominant_shape', 'no_frame')}`"
+    )
+    lines.append("")
+
+    if extended_bootstrap_timeout_stats:
+        rows = []
+        for reason, stats in sorted(extended_bootstrap_timeout_stats.items()):
+            rows.append(
+                [
+                    reason,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    str(stats.get("last_bootstrap_timeout_stage") or "n/a"),
+                    fmt_int(safe_int(stats.get("last_connect_first_frame_timeout_ms"))),
+                    fmt_int(safe_int(stats.get("last_connect_book_timeout_ms"))),
+                    fmt_int(safe_int(stats.get("last_rest_snapshot_seeded"))),
+                    fmt_int(safe_int(stats.get("last_rest_seed_bridge_active"))),
+                    fmt_int(safe_int(stats.get("last_first_control_frame_seen"))),
+                    str(stats.get("last_first_control_frame_kind") or "n/a"),
+                    fmt_int(safe_int(stats.get("last_first_data_frame_seen"))),
+                    fmt_int(safe_int(stats.get("last_first_message_seen"))),
+                    fmt_int(safe_int(stats.get("last_first_book_seen"))),
+                    fmt_int(safe_int(stats.get("last_first_publish_seen"))),
+                    fmt_int(
+                        safe_int(
+                            stats.get(
+                                "last_stale_watchdog_deferred_until_first_publish"
+                            )
+                        )
+                    ),
+                    fmt_int(safe_int(stats.get("max_time_to_first_control_frame_ms"))),
+                    fmt_int(safe_int(stats.get("max_time_to_first_message_ms"))),
+                    fmt_int(safe_int(stats.get("max_time_to_first_book_ms"))),
+                    fmt_int(safe_int(stats.get("max_time_to_first_publish_ms"))),
+                    str(stats.get("last_last_frame_kind") or "n/a"),
+                    str(stats.get("last_last_data_kind") or "n/a"),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "reason",
+                    "samples",
+                    "last_bootstrap_timeout_stage",
+                    "last_connect_first_frame_timeout_ms",
+                    "last_connect_book_timeout_ms",
+                    "last_rest_snapshot_seeded",
+                    "last_rest_seed_bridge_active",
+                    "last_first_control_frame_seen",
+                    "last_first_control_frame_kind",
+                    "last_first_data_frame_seen",
+                    "last_first_message_seen",
+                    "last_first_book_seen",
+                    "last_first_publish_seen",
+                    "last_watchdog_deferred",
+                    "max_time_to_first_control_frame_ms",
+                    "max_time_to_first_message_ms",
+                    "max_time_to_first_book_ms",
+                    "max_time_to_first_publish_ms",
+                    "last_frame_kind",
+                    "last_data_kind",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=bootstrap_timeout` entries found in run.log._")
+    lines.append("")
+
+    if extended_bootstrap_churn_stats:
+        rows = []
+        for venue, stats in sorted(extended_bootstrap_churn_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    str(stats.get("last_action") or "n/a"),
+                    str(stats.get("last_bootstrap_reason") or "n/a"),
+                    fmt_int(safe_int(stats.get("max_bootstrap_count_window"))),
+                    fmt_int(safe_int(stats.get("last_bootstrap_limit"))),
+                    fmt_int(safe_int(stats.get("last_bootstrap_window_ms"))),
+                    fmt_int(safe_int(stats.get("last_bootstrap_fast_reconnect_allowed"))),
+                    fmt_int(safe_int(stats.get("last_bootstrap_churn_escalated"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "venue",
+                    "samples",
+                    "last_action",
+                    "last_bootstrap_reason",
+                    "max_bootstrap_count_window",
+                    "last_bootstrap_limit",
+                    "last_bootstrap_window_ms",
+                    "last_fast_reconnect_allowed",
+                    "last_bootstrap_churn_escalated",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=bootstrap_churn` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Reconnect Policy Audit (WS_AUDIT)")
+    if extended_reconnect_policy_stats:
+        rows = []
+        for reason, stats in sorted(extended_reconnect_policy_stats.items()):
+            rows.append(
+                [
+                    reason,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("last_sleep_ms"))),
+                    fmt_int(safe_int(stats.get("max_sleep_ms"))),
+                    fmt_int(
+                        safe_int(stats.get("last_failure_escalation_suppressed"))
+                    ),
+                    fmt_int(safe_int(stats.get("last_consecutive_failures"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "reason",
+                    "samples",
+                    "last_sleep_ms",
+                    "max_sleep_ms",
+                    "last_failure_escalation_suppressed",
+                    "last_consecutive_failures",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=reconnect_policy` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Transport-Gap Audit (WS_AUDIT)")
+    if extended_transport_gap_stats:
+        rows = []
+        for venue, stats in sorted(extended_transport_gap_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(
+                        safe_int(stats.get("watchdog_bootstrap_transition_samples"))
+                    ),
+                    fmt_int(safe_int(stats.get("max_stale_watchdog_count_window"))),
+                    fmt_int(safe_int(stats.get("last_stale_watchdog_limit"))),
+                    fmt_int(safe_int(stats.get("last_stale_watchdog_window_ms"))),
+                    fmt_int(
+                        safe_int(stats.get("last_stale_watchdog_fast_reconnect_allowed"))
+                    ),
+                    fmt_int(safe_int(stats.get("last_stale_watchdog_churn_escalated"))),
+                    fmt_int(safe_int(stats.get("last_watchdog_armed_now"))),
+                    fmt_int(
+                        safe_int(
+                            stats.get("last_stale_watchdog_deferred_until_first_publish")
+                        )
+                    ),
+                    fmt_int(safe_int(stats.get("max_time_to_first_message_ms"))),
+                    fmt_int(safe_int(stats.get("max_time_to_first_book_ms"))),
+                    fmt_int(safe_int(stats.get("max_time_to_first_publish_ms"))),
+                    fmt_int(safe_int(stats.get("max_healthy_session_ms_before_reset"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "venue",
+                    "churn_samples",
+                    "watchdog_transition_samples",
+                    "max_stale_watchdog_count_window",
+                    "last_stale_watchdog_limit",
+                    "last_stale_watchdog_window_ms",
+                    "last_fast_reconnect_allowed",
+                    "last_churn_escalated",
+                    "last_watchdog_armed_now",
+                    "last_watchdog_deferred",
+                    "max_time_to_first_message_ms",
+                    "max_time_to_first_book_ms",
+                    "max_time_to_first_publish_ms",
+                    "max_healthy_session_ms_before_reset",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=stale_watchdog_churn` or `component=session_progress` entries found in run.log._")
+    lines.append("")
+
     lines.append("## MarketPublisher Pressure Counters (WS_AUDIT)")
     if market_publisher_counters:
         rows = [[name, str(value)] for name, value in sorted(market_publisher_counters.items())]
@@ -960,6 +2675,73 @@ def build_report(
         )
     else:
         lines.append("_No `component=runner_apply` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Runner Apply Truth Audit (WS_AUDIT)")
+    if runner_apply_truth_stats:
+        rows: list[list[str]] = []
+        for venue, stats in sorted(runner_apply_truth_stats.items()):
+            rows.append(
+                [
+                    venue,
+                    fmt_int(safe_int(stats.get("samples"))),
+                    fmt_int(safe_int(stats.get("max_ext_apply_eligible_total"))),
+                    fmt_int(safe_int(stats.get("max_ext_apply_same_tick_repeat_total"))),
+                    fmt_int(safe_int(stats.get("max_ext_apply_frozen_total"))),
+                    fmt_int(safe_int(stats.get("max_ext_apply_missing_metrics_total"))),
+                    fmt_int(safe_int(stats.get("max_ext_freeze_nonpositive_spread"))),
+                    fmt_int(safe_int(stats.get("max_ext_freeze_rel_spread"))),
+                    fmt_int(safe_int(stats.get("max_ext_freeze_mid_jump"))),
+                    fmt_ms(safe_float(stats.get("last_age_apply_ms"))),
+                    fmt_ms(safe_float(stats.get("last_age_event_ms"))),
+                    fmt_ms(safe_float(stats.get("last_venue_state_stale_ms"))),
+                ]
+            )
+        lines.append(
+            md_table(
+                [
+                    "venue",
+                    "samples",
+                    "max_ext_apply_eligible_total",
+                    "max_ext_apply_same_tick_repeat_total",
+                    "max_ext_apply_frozen_total",
+                    "max_ext_apply_missing_metrics_total",
+                    "max_ext_freeze_nonpositive_spread",
+                    "max_ext_freeze_rel_spread",
+                    "max_ext_freeze_mid_jump",
+                    "last_age_apply_ms",
+                    "last_age_event_ms",
+                    "last_venue_state_stale_ms",
+                ],
+                rows,
+            )
+        )
+    else:
+        lines.append("_No `component=runner_apply_truth` entries found in run.log._")
+    lines.append("")
+
+    lines.append("## Extended Stale Defect Classification")
+    total_episodes = safe_int(extended_defect_summary.get("total")) or 0
+    if total_episodes > 0:
+        lines.append(
+            "- dominant defect: "
+            f"`{extended_defect_summary.get('dominant_class', 'unclassified')}` "
+            f"at `{safe_float(extended_defect_summary.get('confidence_pct')) or 0.0:.1f}%` confidence "
+            f"across `{total_episodes}` stale episodes"
+        )
+        rows = []
+        counts = extended_defect_summary.get("counts", {})
+        if isinstance(counts, dict):
+            for defect_class in EXTENDED_DEFECT_CLASSES:
+                rows.append(
+                    [
+                        defect_class,
+                        fmt_int(safe_int(counts.get(defect_class))),
+                    ]
+                )
+        lines.append(md_table(["defect_class", "episode_count"], rows))
+    else:
+        lines.append("_No Extended stale episodes were classified in run.log._")
     lines.append("")
 
     lines.append("## REST Monitor Audit (WS_AUDIT)")
@@ -1106,6 +2888,9 @@ def build_report(
                     venue,
                     fmt_int(safe_int(stats.get("samples"))),
                     str(stats.get("last_reason", "n/a")),
+                    str(stats.get("last_last_frame_kind", "n/a")),
+                    str(stats.get("last_last_data_kind", "n/a")),
+                    fmt_int(safe_int(stats.get("max_stale_ms"))),
                     fmt_int(safe_int(stats.get("max_parse_err"))),
                     fmt_int(safe_int(stats.get("max_publish_err"))),
                     fmt_int(safe_int(stats.get("max_max_gap_ms"))),
@@ -1118,6 +2903,9 @@ def build_report(
                     "venue",
                     "samples",
                     "last_reason",
+                    "last_frame_kind",
+                    "last_data_kind",
+                    "max_stale_ms",
                     "max_parse_err",
                     "max_publish_err",
                     "max_max_gap_ms",
@@ -1140,11 +2928,20 @@ def build_report(
                     fmt_int(safe_int(stats.get("samples"))),
                     fmt_int(safe_int(stats.get("last_extended_read_timeout_ms"))),
                     fmt_int(safe_int(stats.get("max_extended_read_timeout_ms"))),
+                    fmt_int(safe_int(stats.get("last_extended_connect_book_timeout_ms"))),
+                    fmt_int(safe_int(stats.get("max_extended_connect_book_timeout_ms"))),
                 ]
             )
         lines.append(
             md_table(
-                ["venue", "samples", "last_extended_read_timeout_ms", "max_extended_read_timeout_ms"],
+                [
+                    "venue",
+                    "samples",
+                    "last_extended_read_timeout_ms",
+                    "max_extended_read_timeout_ms",
+                    "last_extended_connect_book_timeout_ms",
+                    "max_extended_connect_book_timeout_ms",
+                ],
                 rows,
             )
         )
@@ -1318,6 +3115,81 @@ def build_report(
     return "\n".join(lines).strip() + "\n"
 
 
+def build_metrics_payload(
+    telemetry_summary: TelemetrySummary,
+    extended_cfg_stats: dict[str, dict[str, Any]],
+    extended_reconnect_policy_stats: dict[str, dict[str, Any]],
+    extended_transport_gap_stats: dict[str, dict[str, Any]],
+    extended_rest_seed_summary: dict[str, Any],
+    extended_seed_bridge_summary: dict[str, Any],
+    extended_control_frame_grace_summary: dict[str, Any],
+    extended_session_hedge_summary: dict[str, Any],
+    extended_backend_attach_fallback_summary: dict[str, Any],
+    extended_post_publish_fallback_summary: dict[str, Any],
+    extended_post_publish_gap_stage_summary: dict[str, Any],
+    extended_stream_preference_summary: dict[str, Any],
+    extended_bootstrap_timeout_stats: dict[str, dict[str, Any]],
+    extended_bootstrap_churn_stats: dict[str, dict[str, Any]],
+    extended_bootstrap_summary: dict[str, Any],
+    extended_control_frame_before_data_summary: dict[str, Any],
+    extended_socket_establishment_summary: dict[str, Any],
+    extended_socket_role_progress_summary: dict[str, Any],
+    extended_stream_kind_progress_summary: dict[str, Any],
+    extended_defect_summary: dict[str, Any],
+) -> dict[str, Any]:
+    extended_bootstrap_stage_summary = summarize_extended_bootstrap_stages(
+        extended_bootstrap_timeout_stats
+    )
+    extended_first_frame_timeout_summary = summarize_extended_first_frame_timeout(
+        extended_bootstrap_timeout_stats
+    )
+    extended_first_data_timeout_summary = summarize_extended_first_data_timeout(
+        extended_bootstrap_timeout_stats
+    )
+    extended_watchdog_bootstrap_transition_summary = (
+        summarize_extended_watchdog_bootstrap_transition(extended_transport_gap_stats)
+    )
+    return {
+        "schema_version": 1,
+        "telemetry_summary": {
+            "rows": telemetry_summary.rows,
+            "first_tick": telemetry_summary.first_tick,
+            "last_tick": telemetry_summary.last_tick,
+            "first_ts_ms": telemetry_summary.first_ts_ms,
+            "last_ts_ms": telemetry_summary.last_ts_ms,
+        },
+        "extended_cfg_stats": extended_cfg_stats,
+        "extended_reconnect_policy_stats": extended_reconnect_policy_stats,
+        "extended_transport_gap_stats": extended_transport_gap_stats,
+        "extended_rest_seed_summary": extended_rest_seed_summary,
+        "extended_rest_seed_failures": {
+            "by_status": extended_rest_seed_summary.get("failures_by_status", {}),
+            "by_http_status": extended_rest_seed_summary.get("failures_by_http_status", {}),
+        },
+        "extended_seed_bridge_summary": extended_seed_bridge_summary,
+        "extended_control_frame_grace_summary": extended_control_frame_grace_summary,
+        "extended_session_hedge_summary": extended_session_hedge_summary,
+        "extended_backend_attach_fallback_summary": extended_backend_attach_fallback_summary,
+        "extended_post_publish_fallback_summary": extended_post_publish_fallback_summary,
+        "extended_post_publish_gap_stage_summary": extended_post_publish_gap_stage_summary,
+        "extended_stream_preference_summary": extended_stream_preference_summary,
+        "extended_bootstrap_timeout_stats": extended_bootstrap_timeout_stats,
+        "extended_bootstrap_churn_stats": extended_bootstrap_churn_stats,
+        "extended_bootstrap_summary": extended_bootstrap_summary,
+        "extended_bootstrap_reason_summary": extended_bootstrap_summary,
+        "extended_bootstrap_stage_summary": extended_bootstrap_stage_summary,
+        "extended_first_frame_timeout_summary": extended_first_frame_timeout_summary,
+        "extended_first_data_timeout_summary": extended_first_data_timeout_summary,
+        "extended_control_frame_before_data_summary": extended_control_frame_before_data_summary,
+        "extended_pre_first_data_shape_summary": extended_control_frame_before_data_summary,
+        "extended_socket_establishment_summary": extended_socket_establishment_summary,
+        "extended_socket_role_progress_summary": extended_socket_role_progress_summary,
+        "extended_stream_kind_progress_summary": extended_stream_kind_progress_summary,
+        "extended_watchdog_bootstrap_transition_summary": extended_watchdog_bootstrap_transition_summary,
+        "extended_defect_summary": extended_defect_summary,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate a markdown WS soak report from run artifacts.")
     parser.add_argument("--out-dir", required=True, help="Run output directory containing telemetry.jsonl and run.log")
@@ -1354,20 +3226,42 @@ def main() -> int:
             signature_reconnect,
             market_publisher,
             runner_apply_stats,
+            runner_apply_truth_stats,
             rest_monitor_stats,
             arb_gate_stats,
             hl_pubq_stats,
             extended_ws_msg_stats,
             extended_cfg_stats,
+            extended_reconnect_policy_stats,
+            extended_transport_gap_stats,
+            extended_rest_seed_summary,
+            extended_seed_bridge_summary,
+            extended_control_frame_grace_summary,
+            extended_session_hedge_stats,
+            extended_backend_attach_fallback_summary,
+            extended_bootstrap_timeout_stats,
+            extended_bootstrap_churn_stats,
+            extended_bootstrap_summary,
             ping_stats,
             lighter_ts_fallback_stats,
             aster_book_recovery_stats,
+            extended_defect_summary,
+            extended_control_frame_before_data_summary,
+            extended_socket_establishment_summary,
+            extended_socket_role_progress_summary,
+            extended_stream_kind_progress_summary,
+            extended_post_publish_fallback_summary,
+            extended_post_publish_gap_stage_summary,
+            extended_stream_preference_summary,
         ) = parse_run_log(run_log_path)
         cap_hits = parse_market_rx_stats(market_rx_path) if market_rx_path.exists() else None
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    extended_session_hedge_summary = summarize_extended_session_hedge(
+        extended_session_hedge_stats
+    )
     report = build_report(
         out_dir=out_dir,
         telemetry_summary=telemetry_summary,
@@ -1378,21 +3272,72 @@ def main() -> int:
         signature_reconnect=signature_reconnect,
         market_publisher_counters=market_publisher,
         runner_apply_stats=runner_apply_stats,
+        runner_apply_truth_stats=runner_apply_truth_stats,
         rest_monitor_stats=rest_monitor_stats,
         arb_gate_stats=arb_gate_stats,
         hl_pubq_stats=hl_pubq_stats,
         extended_ws_msg_stats=extended_ws_msg_stats,
         extended_cfg_stats=extended_cfg_stats,
+        extended_reconnect_policy_stats=extended_reconnect_policy_stats,
+        extended_transport_gap_stats=extended_transport_gap_stats,
+        extended_rest_seed_summary=extended_rest_seed_summary,
+        extended_seed_bridge_summary=extended_seed_bridge_summary,
+        extended_control_frame_grace_summary=extended_control_frame_grace_summary,
+        extended_session_hedge_summary=extended_session_hedge_summary,
+        extended_backend_attach_fallback_summary=extended_backend_attach_fallback_summary,
+        extended_post_publish_fallback_summary=extended_post_publish_fallback_summary,
+        extended_post_publish_gap_stage_summary=extended_post_publish_gap_stage_summary,
+        extended_stream_preference_summary=extended_stream_preference_summary,
+        extended_bootstrap_timeout_stats=extended_bootstrap_timeout_stats,
+        extended_bootstrap_churn_stats=extended_bootstrap_churn_stats,
+        extended_bootstrap_summary=extended_bootstrap_summary,
+        extended_control_frame_before_data_summary=extended_control_frame_before_data_summary,
+        extended_socket_establishment_summary=extended_socket_establishment_summary,
+        extended_socket_role_progress_summary=extended_socket_role_progress_summary,
+        extended_stream_kind_progress_summary=extended_stream_kind_progress_summary,
         ping_stats=ping_stats,
         lighter_ts_fallback_stats=lighter_ts_fallback_stats,
         aster_book_recovery_stats=aster_book_recovery_stats,
+        extended_defect_summary=extended_defect_summary,
         cap_hits_summary=cap_hits,
     )
 
     report_path = out_dir / "ws_soak_report.md"
     report_path.write_text(report, encoding="utf-8")
+    metrics_path = out_dir / "ws_soak_metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            build_metrics_payload(
+                telemetry_summary=telemetry_summary,
+                extended_cfg_stats=extended_cfg_stats,
+                extended_reconnect_policy_stats=extended_reconnect_policy_stats,
+                extended_transport_gap_stats=extended_transport_gap_stats,
+                extended_rest_seed_summary=extended_rest_seed_summary,
+                extended_seed_bridge_summary=extended_seed_bridge_summary,
+                extended_control_frame_grace_summary=extended_control_frame_grace_summary,
+                extended_session_hedge_summary=extended_session_hedge_summary,
+                extended_backend_attach_fallback_summary=extended_backend_attach_fallback_summary,
+                extended_post_publish_fallback_summary=extended_post_publish_fallback_summary,
+                extended_post_publish_gap_stage_summary=extended_post_publish_gap_stage_summary,
+                extended_stream_preference_summary=extended_stream_preference_summary,
+                extended_bootstrap_timeout_stats=extended_bootstrap_timeout_stats,
+                extended_bootstrap_churn_stats=extended_bootstrap_churn_stats,
+                extended_bootstrap_summary=extended_bootstrap_summary,
+                extended_control_frame_before_data_summary=extended_control_frame_before_data_summary,
+                extended_socket_establishment_summary=extended_socket_establishment_summary,
+                extended_socket_role_progress_summary=extended_socket_role_progress_summary,
+                extended_stream_kind_progress_summary=extended_stream_kind_progress_summary,
+                extended_defect_summary=extended_defect_summary,
+            ),
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     print(report, end="")
     print(f"\n_report saved to `{report_path}`_")
+    print(f"_metrics saved to `{metrics_path}`_")
 
     if args.gate:
         expected_connectors = parse_expected_connectors(args.expected_connectors)

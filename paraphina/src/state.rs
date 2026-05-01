@@ -262,6 +262,11 @@ pub struct VenueState {
     pub last_mid_apply_ms: Option<TimestampMs>,
     /// Last time (ms) we applied a book snapshot or delta.
     pub last_book_update_ms: Option<TimestampMs>,
+    /// Local runner quarantine flag used when a venue is receiving market data but
+    /// its quoted top-of-book is intentionally being suppressed.
+    pub quote_quarantined: bool,
+    /// Timestamp when the local quote quarantine was last activated.
+    pub quote_quarantined_at_ms: Option<TimestampMs>,
     /// Core L2 order book (bounded).
     pub orderbook_l2: OrderBookL2,
     /// Short-horizon EWMA local vol of log mid.
@@ -430,12 +435,31 @@ impl VenueState {
 }
 
 /// Minimal MM order tracking for order management (one per side per venue).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MmOpenTrackingSource {
+    #[default]
+    OpenSnapshot,
+    GapGrace,
+}
+
+impl MmOpenTrackingSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenSnapshot => "open_snapshot",
+            Self::GapGrace => "gap_grace",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MmOpenOrder {
     pub price: f64,
     pub size: f64,
     pub timestamp_ms: TimestampMs,
     pub order_id: String,
+    pub client_order_id: Option<String>,
+    pub tracking_source: MmOpenTrackingSource,
 }
 
 impl VenueState {
@@ -444,19 +468,30 @@ impl VenueState {
     }
 
     pub(crate) fn remove_open_order(&mut self, order_id: &str) {
-        self.open_orders.remove(order_id);
-        if self
-            .mm_open_bid
-            .as_ref()
-            .is_some_and(|o| o.order_id == order_id)
-        {
+        let canonical_order_id = self
+            .open_orders
+            .get(order_id)
+            .map(|record| record.order_id.clone())
+            .or_else(|| {
+                self.open_orders.iter().find_map(|(key, record)| {
+                    record
+                        .client_order_id
+                        .as_deref()
+                        .filter(|client_order_id| *client_order_id == order_id)
+                        .map(|_| key.clone())
+                })
+            });
+        if let Some(canonical_order_id) = canonical_order_id.as_deref() {
+            self.open_orders.remove(canonical_order_id);
+        }
+        if self.mm_open_bid.as_ref().is_some_and(|o| {
+            o.order_id == order_id || o.client_order_id.as_deref() == Some(order_id)
+        }) {
             self.mm_open_bid = None;
         }
-        if self
-            .mm_open_ask
-            .as_ref()
-            .is_some_and(|o| o.order_id == order_id)
-        {
+        if self.mm_open_ask.as_ref().is_some_and(|o| {
+            o.order_id == order_id || o.client_order_id.as_deref() == Some(order_id)
+        }) {
             self.mm_open_ask = None;
         }
     }
@@ -820,6 +855,8 @@ impl GlobalState {
                 last_mid_update_ms: None,
                 last_mid_apply_ms: None,
                 last_book_update_ms: None,
+                quote_quarantined: false,
+                quote_quarantined_at_ms: None,
                 orderbook_l2: OrderBookL2::new(),
                 local_vol_short: 0.0,
                 local_vol_long: 0.0,

@@ -4,6 +4,7 @@
 //! and event model for live trading without introducing any network I/O.
 
 pub mod connectors;
+pub mod connector_registry;
 pub mod gateway;
 pub mod instrument;
 mod market_publisher;
@@ -25,7 +26,9 @@ pub mod venue_health_enforcer;
 pub mod venues;
 
 pub use gateway::{LiveGateway, LiveGatewayError, LiveGatewayErrorKind, LiveRestClient};
-pub(crate) use market_publisher::MarketPublisher;
+pub(crate) use market_publisher::{
+    live_market_pub_drain_max, live_market_pub_queue_cap, MarketPublisher,
+};
 pub use orderbook_l2::{
     BookLevel, BookLevelDelta, BookSide, DepthConfig, DerivedBookMetrics, OrderBookError,
     OrderBookL2,

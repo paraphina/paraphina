@@ -31,6 +31,7 @@ mod tests {
             intents: vec![intent],
             action_batch: paraphina::actions::ActionBatch::new(0, 0, "test"),
             now_ms: 1_000,
+            transport_hint: paraphina::live::gateway::TransportHint::Default,
             response: paraphina::live::ResponseMode::Oneshot(response_tx),
         };
         handle.order_tx.send(request).await.expect("send order");
@@ -49,6 +50,7 @@ mod tests {
             account_rx,
             exec_rx: None,
             account_reconcile_tx: None,
+            priority_order_tx: handle.order_tx.clone(),
             order_tx: handle.order_tx.clone(),
             order_snapshot_rx: None,
             shared_venue_ages: None,

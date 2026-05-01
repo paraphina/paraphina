@@ -157,6 +157,8 @@ where
                                 size: place.size,
                                 timestamp_ms: now_ms,
                                 order_id: order_id.clone(),
+                                client_order_id: Some(place.client_order_id.clone()),
+                                tracking_source: crate::state::MmOpenTrackingSource::OpenSnapshot,
                             };
                             if place.purpose == crate::types::OrderPurpose::Mm {
                                 match place.side {

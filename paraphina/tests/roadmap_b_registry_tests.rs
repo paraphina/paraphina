@@ -1,14 +1,14 @@
 #![cfg(feature = "roadmap_b")]
 
-use paraphina::connector_registry::{
+use paraphina::live::connector_registry::{
     roadmap_b_selectable_venues, validate_roadmap_b_connector_coverage,
 };
-use paraphina::venues::{VenueId, ROADMAP_B_VENUE_IDS};
+use paraphina::live::venues::ROADMAP_B_VENUES;
 
 #[test]
 fn roadmap_b_registry_has_five_venues() {
     let expected = ["extended", "hyperliquid", "aster", "lighter", "paradex"];
-    assert_eq!(ROADMAP_B_VENUE_IDS, expected);
+    assert_eq!(ROADMAP_B_VENUES, expected);
 }
 
 #[test]
@@ -16,23 +16,29 @@ fn roadmap_b_connector_selection_covers_all_venues() {
     validate_roadmap_b_connector_coverage().expect("roadmap-b coverage should be complete");
     let selectable = roadmap_b_selectable_venues()
         .into_iter()
-        .map(|v| v.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(selectable, ROADMAP_B_VENUE_IDS);
+    assert_eq!(selectable, ROADMAP_B_VENUES);
 }
 
 #[test]
-fn roadmap_b_venue_id_names_are_stable() {
+fn roadmap_b_connector_venue_ids_are_stable() {
+    use paraphina::live::connector_registry::ConnectorArg;
+
     let ids = [
-        VenueId::Extended,
-        VenueId::Hyperliquid,
-        VenueId::Aster,
-        VenueId::Lighter,
-        VenueId::Paradex,
+        ConnectorArg::Extended.venue_id(),
+        ConnectorArg::Hyperliquid.venue_id(),
+        ConnectorArg::Aster.venue_id(),
+        ConnectorArg::Lighter.venue_id(),
+        ConnectorArg::Paradex.venue_id(),
     ];
-    let names = ids.iter().map(|v| v.name()).collect::<Vec<_>>();
     assert_eq!(
-        names,
-        ["Extended", "Hyperliquid", "Aster", "Lighter", "Paradex"]
+        ids,
+        [
+            Some("extended"),
+            Some("hyperliquid"),
+            Some("aster"),
+            Some("lighter"),
+            Some("paradex")
+        ]
     );
 }

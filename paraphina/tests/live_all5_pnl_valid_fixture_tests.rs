@@ -101,6 +101,14 @@ fn run_all5_paper_fixture(
         .env("PARAPHINA_PAPER_FILL_MODE", fill_mode)
         .env("PARAPHINA_PAPER_SLIPPAGE_BPS", "5")
         .env("PARAPHINA_PAPER_MIN_HEALTHY_FOR_KF", "5")
+        // The coherent all-5 fixture uses wall-clock timestamps. Keep stale
+        // thresholds above CI/test-host scheduling jitter so fixture health is
+        // driven by data coherence, not local load.
+        .env("PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE", "60000")
+        .env("PARAPHINA_HL_STATE_STALE_MS_OVERRIDE", "60000")
+        .env("PARAPHINA_ASTER_STATE_STALE_MS_OVERRIDE", "60000")
+        .env("PARAPHINA_LIGHTER_STATE_STALE_MS_OVERRIDE", "60000")
+        .env("PARAPHINA_PARADEX_STATE_STALE_MS_OVERRIDE", "60000")
         .env("PARAPHINA_PAPER_USE_WALLCLOCK_TS", "1");
     for (key, value) in extra_env {
         command.env(key, value);

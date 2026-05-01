@@ -72,6 +72,8 @@ pub fn apply_execution_events(
                                 size,
                                 timestamp_ms: now_ms,
                                 order_id: ack.order_id.clone(),
+                                client_order_id: ack.client_order_id.clone(),
+                                tracking_source: crate::state::MmOpenTrackingSource::OpenSnapshot,
                             };
                             match side {
                                 Side::Buy => v.mm_open_bid = Some(order),
@@ -105,4 +107,65 @@ pub fn apply_execution_events(
     }
 
     fills
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::types::OrderAck;
+
+    #[test]
+    fn client_id_cancel_ack_removes_exchange_keyed_mm_open_order() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue");
+        let venue_id = cfg.venues[venue_index].id_arc.clone();
+        let exchange_order_id = "1775978755410201709235320000".to_string();
+        let client_order_id = "co_9d808de6f1_649bec6932dd".to_string();
+
+        apply_execution_events(
+            &mut state,
+            &[ExecutionEvent::OrderAck(OrderAck {
+                venue_index,
+                venue_id: venue_id.clone(),
+                order_id: exchange_order_id.clone(),
+                client_order_id: Some(client_order_id.clone()),
+                seq: Some(1),
+                side: Some(Side::Buy),
+                price: Some(2213.5),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            })],
+            1_000,
+        );
+
+        assert!(state.venues[venue_index]
+            .open_orders
+            .contains_key(&exchange_order_id));
+        assert!(state.venues[venue_index].mm_open_bid.is_some());
+
+        apply_execution_events(
+            &mut state,
+            &[ExecutionEvent::OrderAck(OrderAck {
+                venue_index,
+                venue_id,
+                order_id: client_order_id.clone(),
+                client_order_id: None,
+                seq: Some(2),
+                side: None,
+                price: None,
+                size: None,
+                purpose: None,
+            })],
+            1_500,
+        );
+
+        assert!(state.venues[venue_index].open_orders.is_empty());
+        assert!(state.venues[venue_index].mm_open_bid.is_none());
+    }
 }

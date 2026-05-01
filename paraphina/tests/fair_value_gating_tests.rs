@@ -288,6 +288,87 @@ fn min_healthy_threshold_enforced() {
 }
 
 #[test]
+fn fv_disabled_venue_is_excluded_from_kf_and_healthy_list() {
+    let mut cfg_box = Box::new(Config::for_profile(RiskProfile::Balanced));
+    let lighter_idx = cfg_box
+        .venues
+        .iter()
+        .position(|v| v.id == "lighter")
+        .expect("lighter venue must exist");
+    cfg_box.venues[lighter_idx].contributes_to_fv = false;
+    let cfg: &'static Config = Box::leak(cfg_box);
+    let engine = Engine::new(cfg);
+    let state = GlobalState::new(cfg);
+    let mut h = Harness { cfg, engine, state };
+    let now_ms = 1_000_i64;
+    set_fresh_venue_data(&mut h, now_ms, 250.0);
+
+    run_tick(&mut h, now_ms);
+
+    assert!(
+        !h.state.healthy_venues_used.contains(&lighter_idx),
+        "lighter should be excluded from fair-value contributors"
+    );
+    assert!(
+        h.state
+            .healthy_venues_used
+            .iter()
+            .all(|idx| h.cfg.venues[*idx].id != "lighter"),
+        "healthy venues used should not include lighter"
+    );
+}
+
+#[test]
+fn fv_spread_gate_excludes_wide_venue_from_kf() {
+    let mut cfg_box = Box::new(Config::for_profile(RiskProfile::Balanced));
+    let lighter_idx = cfg_box
+        .venues
+        .iter()
+        .position(|v| v.id == "lighter")
+        .expect("lighter venue must exist");
+    cfg_box.venues[lighter_idx].fv_max_spread_bps = Some(0.5);
+    let cfg: &'static Config = Box::leak(cfg_box);
+    let engine = Engine::new(cfg);
+    let state = GlobalState::new(cfg);
+    let mut h = Harness { cfg, engine, state };
+    let now_ms = 1_000_i64;
+    set_fresh_venue_data(&mut h, now_ms, 250.0);
+
+    h.state.venues[lighter_idx].spread = Some(0.2);
+    run_tick(&mut h, now_ms);
+
+    assert!(
+        !h.state.healthy_venues_used.contains(&lighter_idx),
+        "lighter should be excluded from fair value when its spread exceeds the gate"
+    );
+}
+
+#[test]
+fn fv_spread_gate_keeps_tight_venue_in_kf() {
+    let mut cfg_box = Box::new(Config::for_profile(RiskProfile::Balanced));
+    let lighter_idx = cfg_box
+        .venues
+        .iter()
+        .position(|v| v.id == "lighter")
+        .expect("lighter venue must exist");
+    cfg_box.venues[lighter_idx].fv_max_spread_bps = Some(0.5);
+    let cfg: &'static Config = Box::leak(cfg_box);
+    let engine = Engine::new(cfg);
+    let state = GlobalState::new(cfg);
+    let mut h = Harness { cfg, engine, state };
+    let now_ms = 1_000_i64;
+    set_fresh_venue_data(&mut h, now_ms, 250.0);
+
+    h.state.venues[lighter_idx].spread = Some(0.01);
+    run_tick(&mut h, now_ms);
+
+    assert!(
+        h.state.healthy_venues_used.contains(&lighter_idx),
+        "lighter should remain eligible for fair value when its spread is inside the gate"
+    );
+}
+
+#[test]
 fn fv_updates_when_exactly_at_min_healthy() {
     let mut h = make_harness(RiskProfile::Balanced);
 

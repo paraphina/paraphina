@@ -1,5 +1,11 @@
 # WHITEPAPER COMPLETION AUDIT v2 (Decisive, Zero-Unknowns)
 
+Scope: historical WP100 implementation-parity audit.
+
+This audit is useful provenance for the recorded git revision and test scope. It
+is not the current roadmap, current Phase 5 topology, or an unattended
+production-readiness certificate.
+
 Source of truth: `docs/WHITEPAPER.md`
 
 ## Environment + Reproducibility Header

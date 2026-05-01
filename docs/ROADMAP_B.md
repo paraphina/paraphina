@@ -1,6 +1,13 @@
 # Roadmap B (Live Venues)
 
-## Canonical venues (single source of truth)
+Scope: supporting live-venue rollout note.
+
+This file is not the master roadmap. `ROADMAP.md` is the strategic source of
+truth. Use this file for canonical venue assumptions and additive live safety
+gates, then reconcile current Phase 5 state from read-only `phase5/status.md`
+and `phase5/queue.yaml`.
+
+## Canonical venues (code-owned source)
 
 Roadmap-B targets exactly five venues, in stable order:
 

@@ -228,6 +228,13 @@ pub struct VenueConfig {
     pub w_fund: f64,
     /// Whether this venue is allowed to be used for hedging.
     pub is_hedge_allowed: bool,
+    /// Whether this venue is allowed to contribute observations to the global
+    /// fair-value filter / healthy-venues-used set.
+    pub contributes_to_fv: bool,
+    /// Optional per-venue gate on spread quality before the venue may
+    /// contribute to fair value. When set, the venue is excluded from the
+    /// global KF on ticks where `spread / mid * 10_000` exceeds this threshold.
+    pub fv_max_spread_bps: Option<f64>,
     /// Minimum lot size in TAO (orders smaller than this are rejected).
     pub lot_size_tao: f64,
     /// Size step/increment in TAO (orders must be multiples of this).
@@ -367,6 +374,9 @@ pub struct MmConfig {
     pub edge_local_min_ask_by_venue: BTreeMap<String, f64>,
     /// Multiplier for volatility-based edge buffer.
     pub edge_vol_mult: f64,
+    /// Optional multiplier that adds estimated hedge/forced-unwind cost to MM
+    /// local edge floors. Default is zero to preserve legacy behavior.
+    pub hedge_cost_edge_mult: f64,
     /// Risk parameter η in size objective J(Q)=eQ - 0.5 η Q^2.
     pub size_eta: f64,
     /// λ_inv ∈ [0,1] controlling anchoring to per-venue targets.
@@ -383,6 +393,43 @@ pub struct MmConfig {
     pub min_quote_lifetime_ms: i64,
     /// Optional per-venue quote lifetime overrides keyed by venue id.
     pub min_quote_lifetime_ms_by_venue: BTreeMap<String, i64>,
+    /// Optional Paradex-only extension for keeping a safe same-side order when the
+    /// control layer temporarily suppresses the desired side.
+    pub paradex_post_control_suppression_grace_ms: Option<i64>,
+    /// Optional Paradex-only grace for keeping a safe same-side order when the
+    /// current order remains near the local edge floor but the desired quote is
+    /// temporarily absent because edge dipped below minimum.
+    pub paradex_edge_under_min_grace_ms: Option<i64>,
+    /// Optional Paradex-only allowance for how far below the local edge floor a
+    /// safe same-side current order may drift while we preserve queue position.
+    pub paradex_edge_under_min_band_usd: Option<f64>,
+    /// Optional Hyperliquid-only grace for keeping a safe same-side order when
+    /// the current order remains near the local edge floor but the desired quote
+    /// is temporarily absent because edge dipped below minimum.
+    pub hyperliquid_edge_under_min_grace_ms: Option<i64>,
+    /// Optional Hyperliquid-only allowance for how far below the local edge floor
+    /// a safe same-side current order may drift while we preserve queue
+    /// position.
+    pub hyperliquid_edge_under_min_band_usd: Option<f64>,
+    /// Optional Extended-only grace for keeping a safe same-side order when the
+    /// current order remains near the local edge floor but the desired quote is
+    /// temporarily absent because edge dipped below minimum.
+    pub extended_edge_under_min_grace_ms: Option<i64>,
+    /// Optional Extended-only allowance for how far below the local edge floor a
+    /// safe same-side current order may drift while we preserve queue position.
+    pub extended_edge_under_min_band_usd: Option<f64>,
+    /// Optional Paradex-only extension for preserving supported-replace same-side
+    /// visibility across open-order snapshot gaps.
+    pub paradex_supported_replace_snapshot_gap_grace_ms: Option<i64>,
+    /// Optional per-venue extension for preserving supported-replace same-side
+    /// visibility across open-order snapshot gaps.
+    pub supported_replace_snapshot_gap_grace_ms_by_venue: BTreeMap<String, i64>,
+    /// Optional Paradex-only guard for preserving just-placed MM orders while
+    /// awaiting the first accepted/open-order truth from the venue.
+    pub paradex_pending_place_grace_ms: Option<i64>,
+    /// Optional per-venue guard for preserving just-placed MM orders while
+    /// awaiting the first accepted/open-order truth from the venue.
+    pub pending_place_grace_ms_by_venue: BTreeMap<String, i64>,
     /// Price tolerance in ticks before triggering order replacement.
     pub price_tol_ticks: f64,
     /// Optional per-venue price tolerance overrides keyed by venue id.
@@ -397,6 +444,8 @@ pub struct MmConfig {
     pub max_quote_spread_bps_by_venue: BTreeMap<String, f64>,
     /// Optional per-venue max generated two-sided quote spread in basis points.
     pub max_generated_quote_spread_bps_by_venue: BTreeMap<String, f64>,
+    /// Optional per-venue hard cap on MM quote size in TAO.
+    pub max_quote_size_tao_by_venue: BTreeMap<String, f64>,
     /// Optional per-venue economic role overrides keyed by venue id.
     pub venue_role_by_venue: BTreeMap<String, MmVenueRole>,
     /// Optional per-venue global inventory threshold that starts tapering the
@@ -482,6 +531,18 @@ impl MmConfig {
     }
 
     #[inline]
+    pub fn post_control_suppression_grace_ms_for(&self, venue_id: &str) -> i64 {
+        let base = self.min_quote_lifetime_ms_for(venue_id);
+        if venue_id.eq_ignore_ascii_case("paradex") {
+            self.paradex_post_control_suppression_grace_ms
+                .unwrap_or(base)
+                .max(base)
+        } else {
+            base
+        }
+    }
+
+    #[inline]
     pub fn price_tol_ticks_for(&self, venue_id: &str) -> f64 {
         self.price_tol_ticks_by_venue
             .get(venue_id)
@@ -524,6 +585,14 @@ impl MmConfig {
     }
 
     #[inline]
+    pub fn max_quote_size_tao_for(&self, venue_id: &str) -> Option<f64> {
+        self.max_quote_size_tao_by_venue
+            .get(venue_id)
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
     pub fn venue_role_for(&self, venue_id: &str) -> MmVenueRole {
         self.venue_role_by_venue
             .get(venue_id)
@@ -553,6 +622,78 @@ impl MmConfig {
             .get(venue_id)
             .copied()
             .filter(|v| v.is_finite() && *v > 0.0 && *v < 1.0)
+    }
+
+    #[inline]
+    pub fn edge_under_min_grace_ms_for(&self, venue_id: &str) -> i64 {
+        if venue_id.eq_ignore_ascii_case("paradex") {
+            return self
+                .paradex_edge_under_min_grace_ms
+                .unwrap_or(self.min_quote_lifetime_ms_for(venue_id))
+                .max(1);
+        }
+        if venue_id.eq_ignore_ascii_case("hyperliquid") {
+            return self
+                .hyperliquid_edge_under_min_grace_ms
+                .unwrap_or(self.min_quote_lifetime_ms_for(venue_id))
+                .max(1);
+        }
+        if venue_id.eq_ignore_ascii_case("extended") {
+            return self
+                .extended_edge_under_min_grace_ms
+                .unwrap_or(self.min_quote_lifetime_ms_for(venue_id))
+                .max(1);
+        }
+        self.min_quote_lifetime_ms_for(venue_id)
+    }
+
+    #[inline]
+    pub fn edge_under_min_band_usd_for(&self, venue_id: &str) -> Option<f64> {
+        if venue_id.eq_ignore_ascii_case("paradex") {
+            return self
+                .paradex_edge_under_min_band_usd
+                .filter(|v| v.is_finite() && *v >= 0.0);
+        }
+        if venue_id.eq_ignore_ascii_case("hyperliquid") {
+            return self
+                .hyperliquid_edge_under_min_band_usd
+                .filter(|v| v.is_finite() && *v >= 0.0);
+        }
+        if venue_id.eq_ignore_ascii_case("extended") {
+            return self
+                .extended_edge_under_min_band_usd
+                .filter(|v| v.is_finite() && *v >= 0.0);
+        }
+        None
+    }
+
+    #[inline]
+    pub fn supported_replace_snapshot_gap_grace_ms_for(&self, venue_id: &str) -> i64 {
+        const DEFAULT_SUPPORTED_REPLACE_SNAPSHOT_GAP_GRACE_MS: i64 = 2_000;
+        if let Some(value) = self
+            .supported_replace_snapshot_gap_grace_ms_by_venue
+            .get(venue_id)
+        {
+            return (*value).max(1);
+        }
+        if venue_id.eq_ignore_ascii_case("paradex") {
+            return self
+                .paradex_supported_replace_snapshot_gap_grace_ms
+                .unwrap_or(DEFAULT_SUPPORTED_REPLACE_SNAPSHOT_GAP_GRACE_MS)
+                .max(1);
+        }
+        DEFAULT_SUPPORTED_REPLACE_SNAPSHOT_GAP_GRACE_MS
+    }
+
+    #[inline]
+    pub fn pending_place_grace_ms_for(&self, venue_id: &str) -> i64 {
+        if let Some(value) = self.pending_place_grace_ms_by_venue.get(venue_id) {
+            return (*value).max(0);
+        }
+        if venue_id.eq_ignore_ascii_case("paradex") {
+            return self.paradex_pending_place_grace_ms.unwrap_or(0).max(0);
+        }
+        0
     }
 }
 
@@ -803,6 +944,8 @@ impl Default for Config {
                 w_liq: 0.25,
                 w_fund: 0.25,
                 is_hedge_allowed: true,
+                contributes_to_fv: true,
+                fv_max_spread_bps: None,
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
@@ -825,6 +968,8 @@ impl Default for Config {
                 w_liq: 0.25,
                 w_fund: 0.25,
                 is_hedge_allowed: true,
+                contributes_to_fv: true,
+                fv_max_spread_bps: None,
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
@@ -850,6 +995,8 @@ impl Default for Config {
                 w_liq: 0.20,
                 w_fund: 0.20,
                 is_hedge_allowed: true,
+                contributes_to_fv: true,
+                fv_max_spread_bps: None,
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
@@ -872,6 +1019,8 @@ impl Default for Config {
                 w_liq: 0.15,
                 w_fund: 0.15,
                 is_hedge_allowed: true,
+                contributes_to_fv: true,
+                fv_max_spread_bps: None,
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
@@ -894,6 +1043,8 @@ impl Default for Config {
                 w_liq: 0.15,
                 w_fund: 0.15,
                 is_hedge_allowed: true,
+                contributes_to_fv: true,
+                fv_max_spread_bps: None,
                 lot_size_tao: 0.01,
                 size_step_tao: 0.01,
                 min_notional_usd: 10.0,
@@ -986,6 +1137,7 @@ impl Default for Config {
             edge_local_min_bid_by_venue: BTreeMap::new(),
             edge_local_min_ask_by_venue: BTreeMap::new(),
             edge_vol_mult: 0.2,
+            hedge_cost_edge_mult: 0.0,
             // Inventory-risk parameter in J(Q) = eQ - 0.5 η Q².
             // World-model tuned η at the profile centre.
             size_eta: MM_SIZE_ETA,
@@ -1000,6 +1152,17 @@ impl Default for Config {
             // Order management (Section 11)
             min_quote_lifetime_ms: 500,
             min_quote_lifetime_ms_by_venue: BTreeMap::new(),
+            paradex_post_control_suppression_grace_ms: None,
+            paradex_edge_under_min_grace_ms: None,
+            paradex_edge_under_min_band_usd: None,
+            hyperliquid_edge_under_min_grace_ms: None,
+            hyperliquid_edge_under_min_band_usd: None,
+            extended_edge_under_min_grace_ms: None,
+            extended_edge_under_min_band_usd: None,
+            paradex_supported_replace_snapshot_gap_grace_ms: None,
+            supported_replace_snapshot_gap_grace_ms_by_venue: BTreeMap::new(),
+            paradex_pending_place_grace_ms: None,
+            pending_place_grace_ms_by_venue: BTreeMap::new(),
             price_tol_ticks: 1.0,
             price_tol_ticks_by_venue: BTreeMap::new(),
             size_tol_rel: 0.10,
@@ -1007,6 +1170,7 @@ impl Default for Config {
             max_quote_spread_abs_usd_by_venue: BTreeMap::new(),
             max_quote_spread_bps_by_venue: BTreeMap::new(),
             max_generated_quote_spread_bps_by_venue: BTreeMap::new(),
+            max_quote_size_tao_by_venue: BTreeMap::new(),
             venue_role_by_venue: BTreeMap::new(),
             pre_soft_taper_global_position_tao_by_venue: BTreeMap::new(),
             pre_soft_taper_venue_position_tao_by_venue: BTreeMap::new(),
@@ -1215,11 +1379,13 @@ impl Config {
     ///   - PARAPHINA_HEDGE_MAX_STEP    (f64, TAO)
     ///   - PARAPHINA_HEDGE_MIN_DEPTH_USD (f64, USD)
     ///   - PARAPHINA_HEDGE_DISABLED_VENUES (csv venue ids)
+    ///   - PARAPHINA_FV_DISABLED_VENUES (csv venue ids)
     ///   - PARAPHINA_MM_SIZE_ETA       (f64)
     ///   - PARAPHINA_MM_EDGE_LOCAL_MIN (f64, USD per unit)
     ///   - PARAPHINA_MM_EDGE_LOCAL_MIN_<VENUE> (f64, USD per unit)
     ///   - PARAPHINA_MM_EDGE_LOCAL_MIN_<VENUE>_BID (f64, USD per unit)
     ///   - PARAPHINA_MM_EDGE_LOCAL_MIN_<VENUE>_ASK (f64, USD per unit)
+    ///   - PARAPHINA_MM_HEDGE_COST_EDGE_MULT (f64, multiplier)
     ///   - PARAPHINA_MM_LAMBDA_INV     (f64, [0, 1])
     ///   - PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS (i64, ms)
     ///   - PARAPHINA_MM_PRICE_TOL_TICKS (f64, ticks)
@@ -1343,6 +1509,30 @@ impl Config {
             }
         }
 
+        if let Ok(raw) = env::var("PARAPHINA_FV_DISABLED_VENUES") {
+            let disabled: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+            if disabled.is_empty() {
+                eprintln!(
+                    "[config] WARN: PARAPHINA_FV_DISABLED_VENUES was set but empty; leaving fair-value venue defaults unchanged"
+                );
+            } else {
+                for venue in &mut cfg.venues {
+                    if disabled.iter().any(|id| id == &venue.id) {
+                        venue.contributes_to_fv = false;
+                    }
+                }
+                eprintln!(
+                    "[config] PARAPHINA_FV_DISABLED_VENUES = {:?} (disabled fair-value contribution on matching venues)",
+                    disabled
+                );
+            }
+        }
+
         // Hedge k_hedge (LQ controller gain).
         if let Ok(raw) = env::var("PARAPHINA_HEDGE_K_HEDGE") {
             match raw.parse::<f64>() {
@@ -1439,6 +1629,26 @@ impl Config {
                         "[config] WARN: could not parse PARAPHINA_MM_EDGE_LOCAL_MIN = {:?} as f64; using default {}",
                         raw,
                         cfg.mm.edge_local_min
+                    );
+                }
+            }
+        }
+
+        // Optional hedge/forced-unwind cost pass-through into MM edge floors.
+        if let Ok(raw) = env::var("PARAPHINA_MM_HEDGE_COST_EDGE_MULT") {
+            match raw.parse::<f64>() {
+                Ok(v) => {
+                    cfg.mm.hedge_cost_edge_mult = v.max(0.0);
+                    eprintln!(
+                        "[config] PARAPHINA_MM_HEDGE_COST_EDGE_MULT = {} (added hedge-cost edge floor multiplier)",
+                        cfg.mm.hedge_cost_edge_mult
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_MM_HEDGE_COST_EDGE_MULT = {:?} as f64; using default {}",
+                        raw,
+                        cfg.mm.hedge_cost_edge_mult
                     );
                 }
             }
@@ -1743,6 +1953,27 @@ impl Config {
                 }
             }
 
+            let max_quote_size_key = format!("PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_{venue_key}");
+            if let Ok(raw) = env::var(&max_quote_size_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => {
+                        cfg.mm
+                            .max_quote_size_tao_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set MM max quote size tao for {})",
+                            max_quote_size_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive f64; leaving {} max quote size cap disabled",
+                            max_quote_size_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+
             let venue_role_key = format!("PARAPHINA_MM_VENUE_ROLE_{venue_key}");
             if let Ok(raw) = env::var(&venue_role_key) {
                 match MmVenueRole::parse(&raw) {
@@ -1825,6 +2056,242 @@ impl Config {
                         eprintln!(
                             "[config] WARN: could not parse {} = {:?} as 0<f64<1; leaving {} pre-soft taper size multiplier disabled",
                             taper_mult_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_PARADEX_POST_CONTROL_SUPPRESSION_GRACE_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let base = cfg.mm.min_quote_lifetime_ms_for("paradex");
+                    let grace_ms = v.max(base);
+                    cfg.mm.paradex_post_control_suppression_grace_ms = Some(grace_ms);
+                    eprintln!(
+                        "[config] PARAPHINA_PARADEX_POST_CONTROL_SUPPRESSION_GRACE_MS = {} (set Paradex post-control suppression grace)",
+                        grace_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PARADEX_POST_CONTROL_SUPPRESSION_GRACE_MS = {:?} as i64; leaving Paradex post-control suppression grace unset",
+                        raw
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_PARADEX_EDGE_UNDER_MIN_GRACE_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let base = cfg.mm.min_quote_lifetime_ms_for("paradex");
+                    let grace_ms = v.max(base);
+                    cfg.mm.paradex_edge_under_min_grace_ms = Some(grace_ms);
+                    eprintln!(
+                        "[config] PARAPHINA_PARADEX_EDGE_UNDER_MIN_GRACE_MS = {} (set Paradex edge-under-min queue-hold grace)",
+                        grace_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PARADEX_EDGE_UNDER_MIN_GRACE_MS = {:?} as i64; leaving Paradex edge-under-min queue-hold grace unset",
+                        raw
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_PARADEX_EDGE_UNDER_MIN_BAND_USD") {
+            match raw.parse::<f64>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => {
+                    cfg.mm.paradex_edge_under_min_band_usd = Some(v);
+                    eprintln!(
+                        "[config] PARAPHINA_PARADEX_EDGE_UNDER_MIN_BAND_USD = {} (set Paradex edge-under-min queue-hold band)",
+                        v
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PARADEX_EDGE_UNDER_MIN_BAND_USD = {:?} as non-negative f64; leaving Paradex edge-under-min queue-hold band unset",
+                        raw
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_HYPERLIQUID_EDGE_UNDER_MIN_GRACE_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let base = cfg.mm.min_quote_lifetime_ms_for("hyperliquid");
+                    let grace_ms = v.max(base);
+                    cfg.mm.hyperliquid_edge_under_min_grace_ms = Some(grace_ms);
+                    eprintln!(
+                        "[config] PARAPHINA_HYPERLIQUID_EDGE_UNDER_MIN_GRACE_MS = {} (set Hyperliquid edge-under-min queue-hold grace)",
+                        grace_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_HYPERLIQUID_EDGE_UNDER_MIN_GRACE_MS = {:?} as i64; leaving Hyperliquid edge-under-min queue-hold grace unset",
+                        raw
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_HYPERLIQUID_EDGE_UNDER_MIN_BAND_USD") {
+            match raw.parse::<f64>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => {
+                    cfg.mm.hyperliquid_edge_under_min_band_usd = Some(v);
+                    eprintln!(
+                        "[config] PARAPHINA_HYPERLIQUID_EDGE_UNDER_MIN_BAND_USD = {} (set Hyperliquid edge-under-min queue-hold band)",
+                        v
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_HYPERLIQUID_EDGE_UNDER_MIN_BAND_USD = {:?} as non-negative f64; leaving Hyperliquid edge-under-min queue-hold band unset",
+                        raw
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_EXTENDED_EDGE_UNDER_MIN_GRACE_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let base = cfg.mm.min_quote_lifetime_ms_for("extended");
+                    let grace_ms = v.max(base);
+                    cfg.mm.extended_edge_under_min_grace_ms = Some(grace_ms);
+                    eprintln!(
+                        "[config] PARAPHINA_EXTENDED_EDGE_UNDER_MIN_GRACE_MS = {} (set Extended edge-under-min queue-hold grace)",
+                        grace_ms
+                    );
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_EXTENDED_EDGE_UNDER_MIN_GRACE_MS = {:?} as i64; leaving Extended edge-under-min queue-hold grace unset",
+                        raw
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_EXTENDED_EDGE_UNDER_MIN_BAND_USD") {
+            match raw.parse::<f64>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => {
+                    cfg.mm.extended_edge_under_min_band_usd = Some(v);
+                    eprintln!(
+                        "[config] PARAPHINA_EXTENDED_EDGE_UNDER_MIN_BAND_USD = {} (set Extended edge-under-min queue-hold band)",
+                        v
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_EXTENDED_EDGE_UNDER_MIN_BAND_USD = {:?} as non-negative f64; leaving Extended edge-under-min queue-hold band unset",
+                        raw
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_PARADEX_SUPPORTED_REPLACE_GAP_GRACE_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) if v > 0 => {
+                    cfg.mm.paradex_supported_replace_snapshot_gap_grace_ms = Some(v);
+                    eprintln!(
+                        "[config] PARAPHINA_PARADEX_SUPPORTED_REPLACE_GAP_GRACE_MS = {} (set Paradex supported-replace snapshot-gap grace)",
+                        v
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PARADEX_SUPPORTED_REPLACE_GAP_GRACE_MS = {:?} as positive i64; leaving Paradex supported-replace snapshot-gap grace at default",
+                        raw
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_PARADEX_PENDING_PLACE_GRACE_MS") {
+            match raw.parse::<i64>() {
+                Ok(v) if v > 0 => {
+                    cfg.mm.paradex_pending_place_grace_ms = Some(v);
+                    eprintln!(
+                        "[config] PARAPHINA_PARADEX_PENDING_PLACE_GRACE_MS = {} (set Paradex pending-place self-cancel guard)",
+                        v
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PARADEX_PENDING_PLACE_GRACE_MS = {:?} as positive i64; leaving Paradex pending-place self-cancel guard disabled",
+                        raw
+                    );
+                }
+            }
+        }
+
+        for venue in &mut cfg.venues {
+            let venue_key = venue.id.to_ascii_uppercase();
+            let supported_replace_gap_grace_key =
+                format!("PARAPHINA_MM_SUPPORTED_REPLACE_GAP_GRACE_MS_{venue_key}");
+            if let Ok(raw) = env::var(&supported_replace_gap_grace_key) {
+                match raw.parse::<i64>() {
+                    Ok(v) if v > 0 => {
+                        cfg.mm
+                            .supported_replace_snapshot_gap_grace_ms_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set supported-replace snapshot-gap grace for {})",
+                            supported_replace_gap_grace_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive i64; leaving {} supported-replace snapshot-gap grace at default",
+                            supported_replace_gap_grace_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+
+            let pending_place_grace_key =
+                format!("PARAPHINA_MM_PENDING_PLACE_GRACE_MS_{venue_key}");
+            if let Ok(raw) = env::var(&pending_place_grace_key) {
+                match raw.parse::<i64>() {
+                    Ok(v) if v > 0 => {
+                        cfg.mm
+                            .pending_place_grace_ms_by_venue
+                            .insert(venue.id.clone(), v);
+                        eprintln!(
+                            "[config] {} = {} (set pending-place guard for {})",
+                            pending_place_grace_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive i64; leaving {} pending-place guard disabled",
+                            pending_place_grace_key, raw, venue.id
+                        );
+                    }
+                }
+            }
+
+            let fv_max_spread_bps_key = format!("PARAPHINA_FV_MAX_SPREAD_BPS_{venue_key}");
+            if let Ok(raw) = env::var(&fv_max_spread_bps_key) {
+                match raw.parse::<f64>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => {
+                        venue.fv_max_spread_bps = Some(v);
+                        eprintln!(
+                            "[config] {} = {} (set fair-value max spread gate for {})",
+                            fv_max_spread_bps_key, v, venue.id
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "[config] WARN: could not parse {} = {:?} as positive f64; leaving {} fair-value spread gate disabled",
+                            fv_max_spread_bps_key, raw, venue.id
                         );
                     }
                 }
@@ -2027,6 +2494,54 @@ impl Config {
                 Err(_) => {
                     eprintln!(
                         "[config] WARN: could not parse PARAPHINA_EXTENDED_STATE_STALE_MS_OVERRIDE = {:?} as i64; ignoring",
+                        raw
+                    );
+                }
+            }
+        }
+
+        // Aster state-level staleness override.
+        // Same pattern as Hyperliquid/Extended: affects venue health gating and quote staleness guards.
+        // NOT the connector watchdog (that's PARAPHINA_ASTER_STALE_MS / PARAPHINA_ASTER_BRIDGE_WAIT_STALE_MS).
+        if let Ok(raw) = env::var("PARAPHINA_ASTER_STATE_STALE_MS_OVERRIDE") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let ms = v.max(0);
+                    if let Some(venue) = cfg.venues.iter_mut().find(|v| v.id == "aster") {
+                        venue.stale_ms_override = Some(ms);
+                        eprintln!(
+                            "[config] PARAPHINA_ASTER_STATE_STALE_MS_OVERRIDE = {} (set aster stale_ms_override)",
+                            ms
+                        );
+                    }
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_ASTER_STATE_STALE_MS_OVERRIDE = {:?} as i64; ignoring",
+                        raw
+                    );
+                }
+            }
+        }
+
+        // Lighter state-level staleness override.
+        // Same pattern as Hyperliquid/Extended/Aster: affects venue health gating and quote staleness guards.
+        // NOT the connector watchdog (that's PARAPHINA_LIGHTER_STALE_MS).
+        if let Ok(raw) = env::var("PARAPHINA_LIGHTER_STATE_STALE_MS_OVERRIDE") {
+            match raw.parse::<i64>() {
+                Ok(v) => {
+                    let ms = v.max(0);
+                    if let Some(venue) = cfg.venues.iter_mut().find(|v| v.id == "lighter") {
+                        venue.stale_ms_override = Some(ms);
+                        eprintln!(
+                            "[config] PARAPHINA_LIGHTER_STATE_STALE_MS_OVERRIDE = {} (set lighter stale_ms_override)",
+                            ms
+                        );
+                    }
+                }
+                Err(_) => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_LIGHTER_STATE_STALE_MS_OVERRIDE = {:?} as i64; ignoring",
                         raw
                     );
                 }
@@ -2398,6 +2913,64 @@ mod tests {
         assert!((aster.maker_rebate_bps - 0.0).abs() < 1e-9);
     }
 
+    /// Test that PARAPHINA_ASTER_STATE_STALE_MS_OVERRIDE sets aster's
+    /// stale_ms_override without affecting other venues.
+    #[test]
+    fn aster_state_stale_override_env_sets_aster_only() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_ASTER_STATE_STALE_MS_OVERRIDE";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::remove_var(ENV_KEY);
+
+        let cfg_baseline = Config::from_env_or_profile(RiskProfile::Balanced);
+        let aster_baseline = cfg_baseline.venues.iter().find(|v| v.id == "aster");
+        assert!(
+            aster_baseline.is_some(),
+            "aster venue must exist in default config"
+        );
+        assert_eq!(
+            aster_baseline.unwrap().stale_ms_override,
+            None,
+            "baseline aster stale_ms_override should be None"
+        );
+
+        env::set_var(ENV_KEY, "12000");
+        let cfg_with_override = Config::from_env_or_profile(RiskProfile::Balanced);
+
+        let aster = cfg_with_override
+            .venues
+            .iter()
+            .find(|v| v.id == "aster")
+            .expect("aster venue must exist");
+        assert_eq!(
+            aster.stale_ms_override,
+            Some(12_000),
+            "aster stale_ms_override should be 12000"
+        );
+
+        for venue in &cfg_with_override.venues {
+            if venue.id == "aster" {
+                continue;
+            }
+            let expected = if venue.id == "hyperliquid" {
+                Some(2_000)
+            } else if venue.id == "paradex" {
+                Some(3_000)
+            } else {
+                None
+            };
+            assert_eq!(
+                venue.stale_ms_override, expected,
+                "venue {} stale_ms_override mismatch",
+                venue.id
+            );
+        }
+    }
+
     /// Test that invalid values for Extended are ignored (no panic, no override).
     #[test]
     fn extended_state_stale_override_env_ignores_invalid() {
@@ -2422,6 +2995,110 @@ mod tests {
             "invalid env value should be ignored"
         );
         // EnvGuard restores on drop.
+    }
+
+    #[test]
+    fn aster_state_stale_override_env_ignores_invalid() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_ASTER_STATE_STALE_MS_OVERRIDE";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "not_a_number");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        let aster = cfg
+            .venues
+            .iter()
+            .find(|v| v.id == "aster")
+            .expect("aster venue must exist");
+        assert_eq!(
+            aster.stale_ms_override, None,
+            "invalid env value should be ignored"
+        );
+    }
+
+    /// Test that PARAPHINA_LIGHTER_STATE_STALE_MS_OVERRIDE sets lighter's
+    /// stale_ms_override without affecting other venues.
+    #[test]
+    fn lighter_state_stale_override_env_sets_lighter_only() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_LIGHTER_STATE_STALE_MS_OVERRIDE";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::remove_var(ENV_KEY);
+
+        let cfg_baseline = Config::from_env_or_profile(RiskProfile::Balanced);
+        let lighter_baseline = cfg_baseline.venues.iter().find(|v| v.id == "lighter");
+        assert!(
+            lighter_baseline.is_some(),
+            "lighter venue must exist in default config"
+        );
+        assert_eq!(
+            lighter_baseline.unwrap().stale_ms_override,
+            None,
+            "baseline lighter stale_ms_override should be None"
+        );
+
+        env::set_var(ENV_KEY, "12000");
+        let cfg_with_override = Config::from_env_or_profile(RiskProfile::Balanced);
+
+        let lighter = cfg_with_override
+            .venues
+            .iter()
+            .find(|v| v.id == "lighter")
+            .expect("lighter venue must exist");
+        assert_eq!(
+            lighter.stale_ms_override,
+            Some(12_000),
+            "lighter stale_ms_override should be 12000"
+        );
+
+        for venue in &cfg_with_override.venues {
+            if venue.id == "lighter" {
+                continue;
+            }
+            let expected = if venue.id == "hyperliquid" {
+                Some(2_000)
+            } else if venue.id == "paradex" {
+                Some(3_000)
+            } else {
+                None
+            };
+            assert_eq!(
+                venue.stale_ms_override, expected,
+                "venue {} stale_ms_override mismatch",
+                venue.id
+            );
+        }
+    }
+
+    #[test]
+    fn lighter_state_stale_override_env_ignores_invalid() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_LIGHTER_STATE_STALE_MS_OVERRIDE";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "not_a_number");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        let lighter = cfg
+            .venues
+            .iter()
+            .find(|v| v.id == "lighter")
+            .expect("lighter venue must exist");
+        assert_eq!(
+            lighter.stale_ms_override, None,
+            "invalid env value should be ignored"
+        );
     }
 
     #[test]
@@ -2486,9 +3163,17 @@ mod tests {
         const PARADEX_KEY: &str = "PARAPHINA_MM_EDGE_LOCAL_MIN_PARADEX";
         const PARADEX_BID_KEY: &str = "PARAPHINA_MM_EDGE_LOCAL_MIN_PARADEX_BID";
         const PARADEX_ASK_KEY: &str = "PARAPHINA_MM_EDGE_LOCAL_MIN_PARADEX_ASK";
+        const HEDGE_COST_EDGE_MULT_KEY: &str = "PARAPHINA_MM_HEDGE_COST_EDGE_MULT";
         const LAMBDA_KEY: &str = "PARAPHINA_MM_LAMBDA_INV";
         const LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS";
         const HL_LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_HYPERLIQUID";
+        const PARADEX_SUPPRESSION_GRACE_KEY: &str =
+            "PARAPHINA_PARADEX_POST_CONTROL_SUPPRESSION_GRACE_MS";
+        const PARADEX_GAP_GRACE_KEY: &str = "PARAPHINA_PARADEX_SUPPORTED_REPLACE_GAP_GRACE_MS";
+        const EXT_SUPPORTED_REPLACE_GAP_GRACE_KEY: &str =
+            "PARAPHINA_MM_SUPPORTED_REPLACE_GAP_GRACE_MS_EXTENDED";
+        const PARADEX_PENDING_PLACE_GRACE_KEY: &str = "PARAPHINA_PARADEX_PENDING_PLACE_GRACE_MS";
+        const LIGHTER_PENDING_PLACE_GRACE_KEY: &str = "PARAPHINA_MM_PENDING_PLACE_GRACE_MS_LIGHTER";
         const PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS";
         const HL_PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS_HYPERLIQUID";
         const SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL";
@@ -2496,6 +3181,7 @@ mod tests {
         const EXT_SPREAD_USD_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_EXTENDED";
         const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
         const ASTER_GEN_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_ASTER";
+        const ASTER_MAX_QUOTE_SIZE_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_ASTER";
         const HL_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID";
         const EXT_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_EXTENDED";
 
@@ -2504,9 +3190,16 @@ mod tests {
         let _paradex = EnvGuard::new(PARADEX_KEY);
         let _paradex_bid = EnvGuard::new(PARADEX_BID_KEY);
         let _paradex_ask = EnvGuard::new(PARADEX_ASK_KEY);
+        let _hedge_cost_edge_mult = EnvGuard::new(HEDGE_COST_EDGE_MULT_KEY);
         let _lambda = EnvGuard::new(LAMBDA_KEY);
         let _lifetime = EnvGuard::new(LIFETIME_KEY);
         let _hl_lifetime = EnvGuard::new(HL_LIFETIME_KEY);
+        let _hedge_cost_edge_mult = EnvGuard::new(HEDGE_COST_EDGE_MULT_KEY);
+        let _paradex_suppression_grace = EnvGuard::new(PARADEX_SUPPRESSION_GRACE_KEY);
+        let _paradex_gap_grace = EnvGuard::new(PARADEX_GAP_GRACE_KEY);
+        let _ext_supported_replace_gap_grace = EnvGuard::new(EXT_SUPPORTED_REPLACE_GAP_GRACE_KEY);
+        let _paradex_pending_place_grace = EnvGuard::new(PARADEX_PENDING_PLACE_GRACE_KEY);
+        let _lighter_pending_place_grace = EnvGuard::new(LIGHTER_PENDING_PLACE_GRACE_KEY);
         let _price_tol = EnvGuard::new(PRICE_TOL_KEY);
         let _hl_price_tol = EnvGuard::new(HL_PRICE_TOL_KEY);
         let _size_tol = EnvGuard::new(SIZE_TOL_KEY);
@@ -2514,6 +3207,7 @@ mod tests {
         let _ext_spread_usd = EnvGuard::new(EXT_SPREAD_USD_KEY);
         let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
         let _aster_gen_spread_bps = EnvGuard::new(ASTER_GEN_SPREAD_BPS_KEY);
+        let _aster_max_quote_size = EnvGuard::new(ASTER_MAX_QUOTE_SIZE_KEY);
         let _hl_role = EnvGuard::new(HL_ROLE_KEY);
         let _ext_role = EnvGuard::new(EXT_ROLE_KEY);
 
@@ -2521,9 +3215,15 @@ mod tests {
         env::set_var(PARADEX_KEY, "0.09");
         env::set_var(PARADEX_BID_KEY, "0.03");
         env::set_var(PARADEX_ASK_KEY, "0.11");
+        env::set_var(HEDGE_COST_EDGE_MULT_KEY, "0.6");
         env::set_var(LAMBDA_KEY, "0.8");
         env::set_var(LIFETIME_KEY, "1500");
         env::set_var(HL_LIFETIME_KEY, "3000");
+        env::set_var(PARADEX_SUPPRESSION_GRACE_KEY, "900");
+        env::set_var(PARADEX_GAP_GRACE_KEY, "4000");
+        env::set_var(EXT_SUPPORTED_REPLACE_GAP_GRACE_KEY, "45000");
+        env::set_var(PARADEX_PENDING_PLACE_GRACE_KEY, "8000");
+        env::set_var(LIGHTER_PENDING_PLACE_GRACE_KEY, "7000");
         env::set_var(PRICE_TOL_KEY, "2.5");
         env::set_var(HL_PRICE_TOL_KEY, "4.0");
         env::set_var(SIZE_TOL_KEY, "0.25");
@@ -2531,6 +3231,7 @@ mod tests {
         env::set_var(EXT_SPREAD_USD_KEY, "3.0");
         env::set_var(EXT_SPREAD_BPS_KEY, "15");
         env::set_var(ASTER_GEN_SPREAD_BPS_KEY, "10");
+        env::set_var(ASTER_MAX_QUOTE_SIZE_KEY, "0.01");
         env::set_var(HL_ROLE_KEY, "probationary");
         env::set_var(EXT_ROLE_KEY, "noise");
 
@@ -2540,10 +3241,33 @@ mod tests {
         assert!((cfg.mm.edge_local_min_ask_for("paradex") - 0.11).abs() < 1e-9);
         assert!((cfg.mm.edge_local_min_bid_for("aster") - 0.15).abs() < 1e-9);
         assert!((cfg.mm.edge_local_min_ask_for("extended") - 0.15).abs() < 1e-9);
+        assert!((cfg.mm.hedge_cost_edge_mult - 0.6).abs() < 1e-9);
         assert!((cfg.mm.lambda_inv - 0.8).abs() < 1e-9);
         assert_eq!(cfg.mm.min_quote_lifetime_ms, 1500);
         assert_eq!(cfg.mm.min_quote_lifetime_ms_for("hyperliquid"), 3000);
         assert_eq!(cfg.mm.min_quote_lifetime_ms_for("lighter"), 1500);
+        assert_eq!(
+            cfg.mm.post_control_suppression_grace_ms_for("paradex"),
+            1500
+        );
+        assert_eq!(cfg.mm.post_control_suppression_grace_ms_for("aster"), 1500);
+        assert_eq!(
+            cfg.mm
+                .supported_replace_snapshot_gap_grace_ms_for("paradex"),
+            4000
+        );
+        assert_eq!(
+            cfg.mm
+                .supported_replace_snapshot_gap_grace_ms_for("extended"),
+            45000
+        );
+        assert_eq!(
+            cfg.mm.supported_replace_snapshot_gap_grace_ms_for("aster"),
+            2000
+        );
+        assert_eq!(cfg.mm.pending_place_grace_ms_for("paradex"), 8000);
+        assert_eq!(cfg.mm.pending_place_grace_ms_for("lighter"), 7000);
+        assert_eq!(cfg.mm.pending_place_grace_ms_for("aster"), 0);
         assert!((cfg.mm.price_tol_ticks - 2.5).abs() < 1e-9);
         assert!((cfg.mm.price_tol_ticks_for("hyperliquid") - 4.0).abs() < 1e-9);
         assert!((cfg.mm.price_tol_ticks_for("aster") - 2.5).abs() < 1e-9);
@@ -2556,6 +3280,7 @@ mod tests {
             cfg.mm.max_generated_quote_spread_bps_for("aster"),
             Some(10.0)
         );
+        assert_eq!(cfg.mm.max_quote_size_tao_for("aster"), Some(0.01));
         assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("hyperliquid"), None);
         assert_eq!(
             cfg.mm.venue_role_for("hyperliquid"),
@@ -2572,48 +3297,181 @@ mod tests {
         const LAMBDA_KEY: &str = "PARAPHINA_MM_LAMBDA_INV";
         const LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS";
         const HL_LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_HYPERLIQUID";
+        const HEDGE_COST_EDGE_MULT_KEY: &str = "PARAPHINA_MM_HEDGE_COST_EDGE_MULT";
+        const PARADEX_SUPPRESSION_GRACE_KEY: &str =
+            "PARAPHINA_PARADEX_POST_CONTROL_SUPPRESSION_GRACE_MS";
+        const PARADEX_GAP_GRACE_KEY: &str = "PARAPHINA_PARADEX_SUPPORTED_REPLACE_GAP_GRACE_MS";
+        const EXT_SUPPORTED_REPLACE_GAP_GRACE_KEY: &str =
+            "PARAPHINA_MM_SUPPORTED_REPLACE_GAP_GRACE_MS_EXTENDED";
+        const PARADEX_PENDING_PLACE_GRACE_KEY: &str = "PARAPHINA_PARADEX_PENDING_PLACE_GRACE_MS";
+        const LIGHTER_PENDING_PLACE_GRACE_KEY: &str = "PARAPHINA_MM_PENDING_PLACE_GRACE_MS_LIGHTER";
         const PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS";
         const HL_PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS_HYPERLIQUID";
         const SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL";
         const HL_SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL_HYPERLIQUID";
         const EXT_SPREAD_USD_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_EXTENDED";
         const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
+        const ASTER_MAX_QUOTE_SIZE_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_ASTER";
         const HL_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID";
 
         let _lock = env_lock().lock().unwrap();
         let _lambda = EnvGuard::new(LAMBDA_KEY);
         let _lifetime = EnvGuard::new(LIFETIME_KEY);
         let _hl_lifetime = EnvGuard::new(HL_LIFETIME_KEY);
+        let _paradex_suppression_grace = EnvGuard::new(PARADEX_SUPPRESSION_GRACE_KEY);
+        let _paradex_gap_grace = EnvGuard::new(PARADEX_GAP_GRACE_KEY);
+        let _ext_supported_replace_gap_grace = EnvGuard::new(EXT_SUPPORTED_REPLACE_GAP_GRACE_KEY);
+        let _paradex_pending_place_grace = EnvGuard::new(PARADEX_PENDING_PLACE_GRACE_KEY);
+        let _lighter_pending_place_grace = EnvGuard::new(LIGHTER_PENDING_PLACE_GRACE_KEY);
         let _price_tol = EnvGuard::new(PRICE_TOL_KEY);
         let _hl_price_tol = EnvGuard::new(HL_PRICE_TOL_KEY);
         let _size_tol = EnvGuard::new(SIZE_TOL_KEY);
         let _hl_size_tol = EnvGuard::new(HL_SIZE_TOL_KEY);
         let _ext_spread_usd = EnvGuard::new(EXT_SPREAD_USD_KEY);
         let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
+        let _aster_max_quote_size = EnvGuard::new(ASTER_MAX_QUOTE_SIZE_KEY);
         let _hl_role = EnvGuard::new(HL_ROLE_KEY);
 
         env::set_var(LAMBDA_KEY, "not_a_number");
         env::set_var(LIFETIME_KEY, "not_a_number");
         env::set_var(HL_LIFETIME_KEY, "not_a_number");
+        env::set_var(HEDGE_COST_EDGE_MULT_KEY, "not_a_number");
+        env::set_var(PARADEX_SUPPRESSION_GRACE_KEY, "not_a_number");
+        env::set_var(PARADEX_GAP_GRACE_KEY, "not_a_number");
+        env::set_var(EXT_SUPPORTED_REPLACE_GAP_GRACE_KEY, "not_a_number");
+        env::set_var(PARADEX_PENDING_PLACE_GRACE_KEY, "not_a_number");
+        env::set_var(LIGHTER_PENDING_PLACE_GRACE_KEY, "not_a_number");
         env::set_var(PRICE_TOL_KEY, "not_a_number");
         env::set_var(HL_PRICE_TOL_KEY, "not_a_number");
         env::set_var(SIZE_TOL_KEY, "not_a_number");
         env::set_var(HL_SIZE_TOL_KEY, "not_a_number");
         env::set_var(EXT_SPREAD_USD_KEY, "not_a_number");
         env::set_var(EXT_SPREAD_BPS_KEY, "0");
+        env::set_var(ASTER_MAX_QUOTE_SIZE_KEY, "0");
         env::set_var(HL_ROLE_KEY, "not_a_role");
 
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
         assert!((cfg.mm.lambda_inv - 0.3).abs() < 1e-9);
+        assert!((cfg.mm.hedge_cost_edge_mult - 0.0).abs() < 1e-9);
         assert_eq!(cfg.mm.min_quote_lifetime_ms, 500);
         assert_eq!(cfg.mm.min_quote_lifetime_ms_for("hyperliquid"), 500);
+        assert_eq!(cfg.mm.post_control_suppression_grace_ms_for("paradex"), 500);
+        assert_eq!(
+            cfg.mm
+                .supported_replace_snapshot_gap_grace_ms_for("paradex"),
+            2000
+        );
+        assert_eq!(
+            cfg.mm
+                .supported_replace_snapshot_gap_grace_ms_for("extended"),
+            2000
+        );
+        assert_eq!(cfg.mm.pending_place_grace_ms_for("paradex"), 0);
+        assert_eq!(cfg.mm.pending_place_grace_ms_for("lighter"), 0);
         assert!((cfg.mm.price_tol_ticks - 1.0).abs() < 1e-9);
         assert!((cfg.mm.price_tol_ticks_for("hyperliquid") - 1.0).abs() < 1e-9);
         assert!((cfg.mm.size_tol_rel - 0.10).abs() < 1e-9);
         assert!((cfg.mm.size_tol_rel_for("hyperliquid") - 0.10).abs() < 1e-9);
         assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("extended"), None);
         assert_eq!(cfg.mm.max_quote_spread_bps_for("extended"), None);
+        assert_eq!(cfg.mm.max_quote_size_tao_for("aster"), None);
         assert_eq!(cfg.mm.venue_role_for("hyperliquid"), MmVenueRole::Fill);
+    }
+
+    #[test]
+    fn paradex_post_control_suppression_grace_env_extends_beyond_base_lifetime() {
+        use std::env;
+
+        const PARADEX_LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_PARADEX";
+        const PARADEX_SUPPRESSION_GRACE_KEY: &str =
+            "PARAPHINA_PARADEX_POST_CONTROL_SUPPRESSION_GRACE_MS";
+
+        let _lock = env_lock().lock().unwrap();
+        let _paradex_lifetime = EnvGuard::new(PARADEX_LIFETIME_KEY);
+        let _paradex_suppression_grace = EnvGuard::new(PARADEX_SUPPRESSION_GRACE_KEY);
+
+        env::set_var(PARADEX_LIFETIME_KEY, "300");
+        env::set_var(PARADEX_SUPPRESSION_GRACE_KEY, "900");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(cfg.mm.min_quote_lifetime_ms_for("paradex"), 300);
+        assert_eq!(cfg.mm.post_control_suppression_grace_ms_for("paradex"), 900);
+        assert_eq!(cfg.mm.post_control_suppression_grace_ms_for("aster"), 500);
+    }
+
+    #[test]
+    fn paradex_edge_under_min_env_sets_grace_and_band() {
+        use std::env;
+
+        const PARADEX_LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_PARADEX";
+        const PARADEX_EDGE_GRACE_KEY: &str = "PARAPHINA_PARADEX_EDGE_UNDER_MIN_GRACE_MS";
+        const PARADEX_EDGE_BAND_KEY: &str = "PARAPHINA_PARADEX_EDGE_UNDER_MIN_BAND_USD";
+
+        let _lock = env_lock().lock().unwrap();
+        let _paradex_lifetime = EnvGuard::new(PARADEX_LIFETIME_KEY);
+        let _paradex_edge_grace = EnvGuard::new(PARADEX_EDGE_GRACE_KEY);
+        let _paradex_edge_band = EnvGuard::new(PARADEX_EDGE_BAND_KEY);
+
+        env::set_var(PARADEX_LIFETIME_KEY, "300");
+        env::set_var(PARADEX_EDGE_GRACE_KEY, "900");
+        env::set_var(PARADEX_EDGE_BAND_KEY, "0.02");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(cfg.mm.edge_under_min_grace_ms_for("paradex"), 900);
+        assert_eq!(cfg.mm.edge_under_min_grace_ms_for("aster"), 500);
+        assert_eq!(cfg.mm.edge_under_min_band_usd_for("paradex"), Some(0.02));
+        assert_eq!(cfg.mm.edge_under_min_band_usd_for("aster"), None);
+    }
+
+    #[test]
+    fn hyperliquid_edge_under_min_env_sets_grace_and_band() {
+        use std::env;
+
+        const HYPERLIQUID_LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_HYPERLIQUID";
+        const HYPERLIQUID_EDGE_GRACE_KEY: &str = "PARAPHINA_HYPERLIQUID_EDGE_UNDER_MIN_GRACE_MS";
+        const HYPERLIQUID_EDGE_BAND_KEY: &str = "PARAPHINA_HYPERLIQUID_EDGE_UNDER_MIN_BAND_USD";
+
+        let _lock = env_lock().lock().unwrap();
+        let _hyperliquid_lifetime = EnvGuard::new(HYPERLIQUID_LIFETIME_KEY);
+        let _hyperliquid_edge_grace = EnvGuard::new(HYPERLIQUID_EDGE_GRACE_KEY);
+        let _hyperliquid_edge_band = EnvGuard::new(HYPERLIQUID_EDGE_BAND_KEY);
+
+        env::set_var(HYPERLIQUID_LIFETIME_KEY, "1500");
+        env::set_var(HYPERLIQUID_EDGE_GRACE_KEY, "3000");
+        env::set_var(HYPERLIQUID_EDGE_BAND_KEY, "0.04");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(cfg.mm.edge_under_min_grace_ms_for("hyperliquid"), 3000);
+        assert_eq!(cfg.mm.edge_under_min_grace_ms_for("aster"), 500);
+        assert_eq!(
+            cfg.mm.edge_under_min_band_usd_for("hyperliquid"),
+            Some(0.04)
+        );
+        assert_eq!(cfg.mm.edge_under_min_band_usd_for("aster"), None);
+    }
+
+    #[test]
+    fn extended_edge_under_min_env_sets_grace_and_band() {
+        use std::env;
+
+        const EXTENDED_LIFETIME_KEY: &str = "PARAPHINA_MM_MIN_QUOTE_LIFETIME_MS_EXTENDED";
+        const EXTENDED_EDGE_GRACE_KEY: &str = "PARAPHINA_EXTENDED_EDGE_UNDER_MIN_GRACE_MS";
+        const EXTENDED_EDGE_BAND_KEY: &str = "PARAPHINA_EXTENDED_EDGE_UNDER_MIN_BAND_USD";
+
+        let _lock = env_lock().lock().unwrap();
+        let _extended_lifetime = EnvGuard::new(EXTENDED_LIFETIME_KEY);
+        let _extended_edge_grace = EnvGuard::new(EXTENDED_EDGE_GRACE_KEY);
+        let _extended_edge_band = EnvGuard::new(EXTENDED_EDGE_BAND_KEY);
+
+        env::set_var(EXTENDED_LIFETIME_KEY, "500");
+        env::set_var(EXTENDED_EDGE_GRACE_KEY, "3000");
+        env::set_var(EXTENDED_EDGE_BAND_KEY, "0.04");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(cfg.mm.edge_under_min_grace_ms_for("extended"), 3000);
+        assert_eq!(cfg.mm.edge_under_min_grace_ms_for("aster"), 500);
+        assert_eq!(cfg.mm.edge_under_min_band_usd_for("extended"), Some(0.04));
+        assert_eq!(cfg.mm.edge_under_min_band_usd_for("aster"), None);
     }
 
     #[test]
@@ -2641,6 +3499,60 @@ mod tests {
         assert!(by_id("extended"));
         assert!(by_id("hyperliquid"));
         assert!(by_id("aster"));
+    }
+
+    #[test]
+    fn fv_disabled_venues_env_disables_matching_venues_only() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_FV_DISABLED_VENUES";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "paradex, lighter");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        let by_id = |id: &str| {
+            cfg.venues
+                .iter()
+                .find(|v| v.id == id)
+                .expect("venue must exist")
+                .contributes_to_fv
+        };
+
+        assert!(!by_id("paradex"));
+        assert!(!by_id("lighter"));
+        assert!(by_id("extended"));
+        assert!(by_id("hyperliquid"));
+        assert!(by_id("aster"));
+    }
+
+    #[test]
+    fn fv_max_spread_bps_env_sets_only_matching_venue() {
+        use std::env;
+
+        const ENV_KEY: &str = "PARAPHINA_FV_MAX_SPREAD_BPS_LIGHTER";
+
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvGuard::new(ENV_KEY);
+
+        env::set_var(ENV_KEY, "0.5");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        let by_id = |id: &str| {
+            cfg.venues
+                .iter()
+                .find(|v| v.id == id)
+                .expect("venue must exist")
+                .fv_max_spread_bps
+        };
+
+        assert_eq!(by_id("lighter"), Some(0.5));
+        assert_eq!(by_id("hyperliquid"), None);
+        assert_eq!(by_id("aster"), None);
+        assert_eq!(by_id("paradex"), None);
+        assert_eq!(by_id("extended"), None);
     }
 
     #[test]

@@ -77,3 +77,25 @@ live_audit/
 
 # Shadow / live run output artifacts
 out/
+
+# Phase 5 repo hygiene
+# Keep curated queue/status/control and final closeout evidence in Git, but do
+# not track orchestration sessions, lane worktrees, duplicated overlays, or raw
+# run output copied from promotion runs.
+phase5/orchestration.yaml
+phase5/runs/**
+!phase5/runs/
+!phase5/runs/README.md
+!phase5/runs/phase5_reopened_final_closeout/
+!phase5/runs/phase5_reopened_final_closeout/**
+!phase5/runs/phase5_reopened_wallet_econ_full_cost_opportunity_adjusted_gate_requal/
+!phase5/runs/phase5_reopened_wallet_econ_full_cost_opportunity_adjusted_gate_requal/**
+phase5/runs/**/lanes/
+phase5/runs/**/overlay/
+phase5/runs/**/queue_preview.yaml
+phase5/runs/**/tranche_card_preview.yaml
+
+# Historical/local Phase 5 investigation notes are kept out of the production
+# cloneable closeout baseline unless explicitly promoted into docs.
+docs/INVESTIGATIONS/phase5_*_202604*.md
+docs/INVESTIGATIONS/phase5_balance_baseline_*.yaml

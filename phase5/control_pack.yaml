@@ -1,0 +1,83 @@
+schema_version: 1
+phase: 5
+baseline_id: phase5_promoted_4v_fvdisabled_lighter
+program_status: reopened
+completion_standard:
+  target:
+    - all five venues are fairly rehabilitated toward primary_fill candidacy
+    - the default intended end state is all five venues rightfully promoted as primary_fill
+    - final topology is judged on true multi-venue fill behavior, not only operational cleanliness
+  hard_requirements:
+    - no venue remains excluded solely because of unresolved known connector or platform defects
+    - each venue must either reach primary_fill candidacy or be explicitly disproven with venue-local evidence
+    - at least two non-Hyperliquid venues must demonstrate non-zero fill participation in reopened qualification before any new closeout is considered
+    - Extended must either reach primary_fill candidacy or be explicitly disproven after a dedicated rescue program
+    - all five venues must be execution-eligible on one integrated surface before the reopened long soak can begin
+    - all five venues must be FV-eligible on the integrated surface before final closeout can be considered
+    - final long soak must be operationally clean and strategically credible as a multi-venue execution surface
+topology:
+  connectors:
+    - hyperliquid
+    - lighter
+    - aster
+    - paradex
+  fv_disabled_venues:
+    - lighter
+  excluded_venues:
+    - extended
+  roles:
+    hyperliquid: primary_fill
+    aster: anchor_fv
+    paradex: anchor_fv
+    lighter: connected_non_fv
+    extended: excluded_pending_rescue
+execution_defaults:
+  runtime_binary: /opt/paraphina/paraphina_live
+  cleanup_binary: /opt/paraphina/tools/live_cleanup
+  env_file: /etc/paraphina/current.env
+  stage_overlay_target: /etc/paraphina/stage_overlay.env
+  stage_overlay_source: /home/ubuntu/promotion_runs/phase5_hl_syncnoop_scopefix_live4v_5m_canary_20260328T202349Z/live_canary/stage_overlay_live.env
+  live_guard_args:
+    - --pre-restore-cleanup-on-exit
+  live_exec_dropin_target: /etc/systemd/system/paraphina_live.service.d/live_exec_flag.conf
+  live_exec_dropin_source: /home/ubuntu/promotion_runs/phase5_hl_syncnoop_scopefix_live4v_5m_canary_20260328T202349Z/live_canary/live_exec_flag.conf
+  service: paraphina_live
+  guard_script: /home/ubuntu/paraphina/tools/unattended_live_guard.py
+  analyzer_script: /home/ubuntu/paraphina_mm_pnl_harness/tools/telemetry_analyzer.py
+  telemetry_path: /var/lib/paraphina/out/telemetry.jsonl
+  stderr_path: /var/log/paraphina/paraphina_live.err
+  promotion_runs_root: /home/ubuntu/promotion_runs
+automation_defaults:
+  autonomy_mode: full_auto
+  subagent_model: deterministic_handoff
+  worktree_lifecycle: ephemeral
+  artifact_packaging: full
+  worktree_root: /home/ubuntu/.codex/phase5_worktrees/paraphina_mm_pnl_harness
+  lane_bundle_root: phase5/runs/{tranche_id}/lanes
+  cleanup_policy: ephemeral_on_verdict
+  repo_headroom_bytes: 2147483648
+  promotion_runs_headroom_bytes: 4294967296
+  autorun_support_default: manual
+  max_parallel_support_lanes: 3
+  support_lane_priority:
+  - forensics
+  - blocker_shadow
+  - topology_audit
+  - tooling
+  support_lane_capacity_gate: true
+  stage_verdict_contract:
+  - stage_verdict.json
+  - venue_capability_matrix.json
+  - support_summary.json
+control_artifacts:
+  phase4_exit_soak_summary: /home/ubuntu/promotion_runs/anchor_truth_live4v_60m_exitsoak_20260328T135547Z/live_canary/live_segment_summary.json
+  latest_clean_5m_summary: /home/ubuntu/promotion_runs/phase5_canary_breach_multiflatten_live4v_5m_canary_20260328T232227Z/live_canary/live_segment_summary.json
+  latest_clean_20m_summary: /home/ubuntu/promotion_runs/phase5_canary_breach_multiflatten_live4v_20m_soak_20260328T232851Z/live_canary/live_segment_summary.json
+  latest_clean_20m_guard: /home/ubuntu/promotion_runs/phase5_canary_breach_multiflatten_live4v_20m_soak_20260328T232851Z/live_canary/guard.log
+current_runtime:
+  trade_mode: shadow
+  healthy: true
+  ready: true
+  kill_events_present: false
+  reconcile_mismatch_count: 0
+  nrestarts: 0

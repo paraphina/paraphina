@@ -106,6 +106,7 @@ impl MockExchangeHandle {
             orders.push(super::types::OpenOrderSnapshot {
                 order_id: order_id.clone(),
                 client_order_id: None,
+                exchange_order_id: None,
                 side: order.side,
                 price: order.price,
                 size: order.size,

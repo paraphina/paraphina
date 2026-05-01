@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "updated_utc": "2026-05-01T01:44:33Z",
+  "tranche_id": "phase5_reopened_final_closeout",
+  "surface_id": "19ac6e21020d39d8",
+  "verdict": "PROMOTE",
+  "decision": "promote",
+  "continue_to_next_rung": false,
+  "selected_child": null,
+  "selected_child_support_gate": null,
+  "observed_blocker_family": null,
+  "run_root": "/home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary",
+  "closeout_bundle_path": "/home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/live_closeout_bundle.json",
+  "autoscore_bundle_path": "/home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/autoscore_bundle.json",
+  "support_summary_path": "/home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_final_closeout/support_summary.json",
+  "venue_capability_matrix_path": "/home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_final_closeout/venue_capability_matrix.json",
+  "session_id": null,
+  "support_runs_count": 0,
+  "autoscore": {
+    "clean_passed": true,
+    "mechanism_passed": true,
+    "promotion_passed": true,
+    "suggested_action": "promote"
+  },
+  "state_sync": {
+    "requested_tranche_id": "phase5_reopened_final_closeout",
+    "status": "pass",
+    "critical_count": 0,
+    "warning_count": 0,
+    "surface_id": "19ac6e21020d39d8",
+    "report_path": "/home/ubuntu/promotion_runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal_7200s_20260430T220436Z/live_canary/state_sync_report.json",
+    "blocks_promotion": false
+  }
+}

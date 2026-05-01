@@ -89,7 +89,7 @@ fn main() {
     );
 
     // Legacy gateway + sink (SimGateway, pre-action-batch path)
-    let gateway = Box::new(SimGateway::new());
+    let gateway = SimGateway::new();
     let sink = NoopSink;
 
     let mut runner = LegacyStrategyRunner::new(&cfg, gateway, sink);

@@ -2,7 +2,7 @@
 
 This document has two parts:
 
-1) **Code-derived whitepaper (implementation truth)** — describes what the current repository implements today (Rust sim + research toolchain), including invariants and known drift.
+1) **Code-derived whitepaper (implementation truth)** — describes what the current repository implements today (Rust sim, research toolchain, and guarded live-runtime surfaces), including invariants and known drift.
 2) **Appendix: Canonical v1 target specification (VERBATIM)** — included exactly as provided, unedited, but annotated with implementation status markers.
 
 ---
@@ -23,11 +23,29 @@ For audit-grade provenance and integrity of simulation outputs, see `docs/EVIDEN
 
 ### Scope and sources of truth
 
-1) The Rust code under `src/` is the executable truth.
+1) The Rust code under `paraphina/src/` is the executable truth.
 2) Research tooling under `tools/` and `batch_runs/` defines the data contracts used to evaluate/align behavior.
 3) Tests in `tests/` (and any in-module tests) are the strongest statements of safety invariants.
 
 Where the canonical spec differs from current code, that difference must be treated as **roadmap**, not assumed behavior.
+
+### Current scope note (2026-04-24)
+
+This whitepaper is an algorithmic and implementation-parity document. It is not
+the final authority for live topology, Phase 5 promotion state, or unattended
+market-making production readiness.
+
+Use `ROADMAP.md` for strategic direction, `docs/ARCHITECTURE.md` for the current
+implementation/source map, and read-only `phase5/status.md` plus
+`phase5/queue.yaml` for current Phase 5 context. WP100 completion means the
+audited whitepaper requirements were code-visible under the audit definition; it
+does not prove final all-5 live topology or unattended MM production readiness.
+
+Part II is a preserved canonical target-spec appendix guarded by the docs
+integrity hash. Some historical status annotations in that appendix may lag
+current live-runtime code. Correct current-state claims in Part I or roadmap
+docs unless the explicit task is to revise the canonical appendix and update its
+integrity artifacts.
 
 ---
 
@@ -475,7 +493,7 @@ These are the highest-impact mismatches currently observed in the repo wiring an
 | Evidence Pack v1 | Implemented (Step 6) | Audit-grade provenance for sim_eval outputs; see `docs/EVIDENCE_PACK.md` |
 | Evidence Pack Verifier + CI Gate | Implemented (Step 7) | Strict verifier CLI + CI gate verifies extracted bundles |
 | Scenario Library v1 | Implemented (Partial) | 10 scenarios, 5 categories; manifest-verified; CI smoke suite; v2 planned for latency/fill modelling |
-| Production I/O | Planned | Current focus is deterministic sim + telemetry |
+| Live runner / guarded execution | Implemented but operationally gated | Feature-gated live binary and connector surfaces exist; Phase 5 evidence, not whitepaper completion, decides live readiness |
 
 ### Milestone E: Cross-venue Exit Allocator (Section 12)
 

@@ -35,6 +35,10 @@ impl LighterSignerClient {
         self.send_sign_request(&req).await
     }
 
+    pub async fn sign_modify_order(&self, req: SignModifyOrderRequest) -> anyhow::Result<SignedTx> {
+        self.send_sign_request(&req).await
+    }
+
     async fn send_sign_request<T: Serialize + ?Sized>(&self, req: &T) -> anyhow::Result<SignedTx> {
         let url = format!("{}/sign", self.base_url);
         let resp = self.http.post(url).json(req).send().await?;
@@ -106,6 +110,24 @@ pub struct SignCancelAllRequest {
     pub expired_at: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignModifyOrderRequest {
+    pub op: String,
+    pub account_index: u64,
+    pub api_key_index: u64,
+    pub nonce: u64,
+    pub market_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_order_index: Option<u64>,
+    pub base_amount: i64,
+    pub price: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_price: Option<i64>,
+    pub expired_at: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct SignerResponse {
     tx_type: u32,
@@ -125,7 +147,7 @@ fn normalize_signer_base_url(base_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_signer_base_url;
+    use super::{normalize_signer_base_url, SignModifyOrderRequest};
 
     #[test]
     fn normalize_signer_base_url_accepts_base_or_sign_path() {
@@ -145,5 +167,32 @@ mod tests {
             normalize_signer_base_url("http://127.0.0.1:9001/sign/"),
             "http://127.0.0.1:9001"
         );
+    }
+
+    #[test]
+    fn modify_request_serializes_order_identity() {
+        let payload = serde_json::to_value(SignModifyOrderRequest {
+            op: "modify_order".to_string(),
+            account_index: 123,
+            api_key_index: 1,
+            nonce: 456,
+            market_index: 7,
+            order_index: None,
+            client_order_index: Some(42),
+            base_amount: 1234,
+            price: 220055,
+            trigger_price: None,
+            expired_at: 999_999,
+        })
+        .expect("serialize modify request");
+        assert_eq!(
+            payload.get("op").and_then(|v| v.as_str()),
+            Some("modify_order")
+        );
+        assert_eq!(
+            payload.get("client_order_index").and_then(|v| v.as_u64()),
+            Some(42)
+        );
+        assert!(payload.get("order_index").is_none());
     }
 }

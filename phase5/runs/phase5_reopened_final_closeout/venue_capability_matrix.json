@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "updated_utc": "2026-05-01T01:44:33Z",
+  "tranche_id": "phase5_reopened_final_closeout",
+  "surface_id": "19ac6e21020d39d8",
+  "topology_snapshot": {
+    "overlay_path": "/home/ubuntu/paraphina_mm_pnl_harness/phase5/runs/phase5_reopened_wallet_econ_full_cost_dynamic_size_02_requal/stage_overlay_live.env",
+    "connectors": [
+      "aster",
+      "extended",
+      "hyperliquid",
+      "lighter",
+      "paradex"
+    ],
+    "fv_disabled_venues": [],
+    "excluded_venues": [],
+    "roles": {
+      "hyperliquid": "fill",
+      "aster": "fill",
+      "paradex": "fill",
+      "lighter": "fill",
+      "extended": "fill"
+    }
+  },
+  "autoscore_clean_passed": true,
+  "autoscore_mechanism_passed": true,
+  "final_decision": "promote",
+  "venues": {
+    "aster": {
+      "role": "fill",
+      "connected": true,
+      "execution_eligible": true,
+      "fill_role_enabled": true,
+      "fill_participation_observed": false,
+      "primary_fill_candidate": false,
+      "fv_eligible": true,
+      "restore_clean": true,
+      "long_soak_ready": false
+    },
+    "extended": {
+      "role": "fill",
+      "connected": true,
+      "execution_eligible": true,
+      "fill_role_enabled": true,
+      "fill_participation_observed": false,
+      "primary_fill_candidate": false,
+      "fv_eligible": true,
+      "restore_clean": true,
+      "long_soak_ready": false
+    },
+    "hyperliquid": {
+      "role": "fill",
+      "connected": true,
+      "execution_eligible": true,
+      "fill_role_enabled": true,
+      "fill_participation_observed": false,
+      "primary_fill_candidate": false,
+      "fv_eligible": true,
+      "restore_clean": true,
+      "long_soak_ready": false
+    },
+    "lighter": {
+      "role": "fill",
+      "connected": true,
+      "execution_eligible": true,
+      "fill_role_enabled": true,
+      "fill_participation_observed": true,
+      "primary_fill_candidate": true,
+      "fv_eligible": true,
+      "restore_clean": true,
+      "long_soak_ready": true
+    },
+    "paradex": {
+      "role": "fill",
+      "connected": true,
+      "execution_eligible": true,
+      "fill_role_enabled": true,
+      "fill_participation_observed": true,
+      "primary_fill_candidate": true,
+      "fv_eligible": true,
+      "restore_clean": true,
+      "long_soak_ready": true
+    }
+  }
+}

@@ -458,6 +458,8 @@ fn exit_deterministic_ordering_with_identical_edges() {
     cfg.exit.basis_risk_penalty_weight = 0.0;
 
     for v in &mut cfg.venues {
+        v.taker_fee_bps = 0.0;
+        v.tick_size = 0.01;
         v.lot_size_tao = 0.01;
         v.size_step_tao = 0.01;
         v.min_notional_usd = 1.0;
@@ -490,7 +492,6 @@ fn exit_deterministic_ordering_with_identical_edges() {
 
     assert_eq!(intents1.len(), intents2.len(), "Must be deterministic");
     assert_eq!(intents1.len(), intents3.len(), "Must be deterministic");
-
     for i in 0..intents1.len() {
         assert_eq!(
             intent_venue_index(&intents1[i]),

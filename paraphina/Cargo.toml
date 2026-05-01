@@ -88,3 +88,9 @@ required-features = ["legacy_runner"]
 name = "paraphina_live"
 path = "src/bin/paraphina_live.rs"
 required-features = ["live"]
+
+[[bin]]
+# One-shot Hyperliquid request-weight reservation tool (dry-run by default).
+name = "hl_reserve_request_weight"
+path = "src/bin/hl_reserve_request_weight.rs"
+required-features = ["live_hyperliquid"]

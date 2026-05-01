@@ -2,7 +2,7 @@
 """SDK-backed bridge for Extended account/execution actions.
 
 The Rust connector invokes this helper via:
-  PARAPHINA_EXTENDED_BRIDGE_OP=<snapshot|place|cancel|cancel_all>
+  PARAPHINA_EXTENDED_BRIDGE_OP=<snapshot|open_orders|place|replace|cancel|cancel_all>
   PARAPHINA_EXTENDED_BRIDGE_PAYLOAD='{"...": "..."}'
 
 It can also be run manually with CLI subcommands for debugging.
@@ -74,6 +74,81 @@ def to_float(value: Any) -> float:
     if isinstance(value, Decimal):
         return float(value)
     return float(value)
+
+
+def to_decimal(value: Any) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def first_present_attr(value: Any, names: tuple[str, ...]) -> Any:
+    for name in names:
+        attr = getattr(value, name, None)
+        if attr is not None:
+            return attr
+    return None
+
+
+def open_order_remaining_size(order: Any) -> float:
+    remaining = first_present_attr(
+        order,
+        (
+            "remaining_size",
+            "remaining_qty",
+            "remainingQty",
+            "leaves_qty",
+            "leavesQty",
+            "open_qty",
+            "openQty",
+        ),
+    )
+    if remaining is not None:
+        return to_float(remaining)
+
+    qty = first_present_attr(
+        order,
+        (
+            "qty",
+            "quantity",
+            "amount_of_synthetic",
+            "amountOfSynthetic",
+            "size",
+        ),
+    )
+    if qty is None:
+        return 0.0
+    filled = first_present_attr(
+        order,
+        (
+            "filled_qty",
+            "filledQty",
+            "cum_qty",
+            "cumQty",
+            "executed_qty",
+            "executedQty",
+        ),
+    )
+    remaining_qty = to_decimal(qty) - to_decimal(filled)
+    return float(max(remaining_qty, Decimal("0")))
+
+
+def normalize_open_order(order: Any) -> dict[str, Any] | None:
+    side_raw = str(getattr(order, "side", "")).upper()
+    side = "BUY" if "BUY" in side_raw else "SELL" if "SELL" in side_raw else None
+    if side is None:
+        return None
+    return {
+        "order_id": str(getattr(order, "id")),
+        "client_order_id": getattr(order, "external_id", None),
+        "side": side,
+        "price": to_float(
+            first_present_attr(order, ("price", "limit_price", "limitPrice"))
+        ),
+        "size": open_order_remaining_size(order),
+    }
 
 
 def bool_value(payload: dict[str, Any], key: str, default: bool = False) -> bool:
@@ -174,6 +249,38 @@ async def op_place(payload: dict[str, Any]) -> dict[str, Any]:
         await client.close()
 
 
+async def op_replace(payload: dict[str, Any]) -> dict[str, Any]:
+    _, _, _, OrderSide, TimeInForce, _ = load_sdk()
+    market = str(require_payload(payload, "market")).strip()
+    side = OrderSide(str(require_payload(payload, "side")).upper())
+    previous_order_id = str(require_payload(payload, "order_id")).strip()
+    if not previous_order_id or previous_order_id.isdigit():
+        fatal("extended replace requires previous external order id in order_id")
+    client_order_id = str(require_payload(payload, "client_order_id")).strip()
+    time_in_force = TimeInForce(str(payload.get("time_in_force", "GTT")).upper())
+    client = await build_client()
+    try:
+        response = await client.place_order(
+            market_name=market,
+            amount_of_synthetic=Decimal(str(require_payload(payload, "size"))),
+            price=Decimal(str(require_payload(payload, "price"))),
+            side=side,
+            post_only=bool_value(payload, "post_only"),
+            reduce_only=bool_value(payload, "reduce_only"),
+            time_in_force=time_in_force,
+            external_id=client_order_id,
+            previous_order_id=previous_order_id,
+        )
+        if response.data is None:
+            fatal("extended replace place_order returned no data")
+        return {
+            "order_id": str(response.data.id),
+            "client_order_id": response.data.external_id,
+        }
+    finally:
+        await client.close()
+
+
 async def op_cancel(payload: dict[str, Any]) -> dict[str, Any]:
     raw_order_id = str(require_payload(payload, "order_id")).strip()
     client = await build_client()
@@ -203,6 +310,24 @@ async def op_cancel_all(payload: dict[str, Any]) -> dict[str, Any]:
         await client.close()
 
 
+async def op_open_orders(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    market = str(require_payload(payload, "market")).strip()
+    client = await build_client()
+    try:
+        open_orders_resp = await client.account.get_open_orders(
+            market_names=[market] if market else None
+        )
+        open_orders = list(open_orders_resp.data or [])
+        normalized: list[dict[str, Any]] = []
+        for order in open_orders:
+            normalized_order = normalize_open_order(order)
+            if normalized_order is not None:
+                normalized.append(normalized_order)
+        return normalized
+    finally:
+        await client.close()
+
+
 def parse_payload() -> tuple[str, dict[str, Any]]:
     op = os.getenv("PARAPHINA_EXTENDED_BRIDGE_OP", "").strip()
     payload_raw = os.getenv("PARAPHINA_EXTENDED_BRIDGE_PAYLOAD", "").strip()
@@ -221,6 +346,9 @@ def parse_payload() -> tuple[str, dict[str, Any]]:
     snapshot = sub.add_parser("snapshot", help="fetch normalized account snapshot")
     snapshot.add_argument("--market", required=True)
 
+    open_orders = sub.add_parser("open_orders", help="fetch normalized open orders")
+    open_orders.add_argument("--market", required=True)
+
     place = sub.add_parser("place", help="place a limit order")
     place.add_argument("--market", required=True)
     place.add_argument("--side", required=True, choices=["BUY", "SELL"])
@@ -230,6 +358,17 @@ def parse_payload() -> tuple[str, dict[str, Any]]:
     place.add_argument("--time-in-force", default="GTT")
     place.add_argument("--post-only", action="store_true")
     place.add_argument("--reduce-only", action="store_true")
+
+    replace = sub.add_parser("replace", help="edit an order by previous external id")
+    replace.add_argument("--market", required=True)
+    replace.add_argument("--side", required=True, choices=["BUY", "SELL"])
+    replace.add_argument("--price", required=True)
+    replace.add_argument("--size", required=True)
+    replace.add_argument("--order-id", required=True)
+    replace.add_argument("--client-order-id", required=True)
+    replace.add_argument("--time-in-force", default="GTT")
+    replace.add_argument("--post-only", action="store_true")
+    replace.add_argument("--reduce-only", action="store_true")
 
     cancel = sub.add_parser("cancel", help="cancel an order")
     cancel.add_argument("--order-id", required=True)
@@ -263,7 +402,9 @@ async def main_async() -> None:
     op, payload = parse_payload()
     handlers = {
         "snapshot": op_snapshot,
+        "open_orders": op_open_orders,
         "place": op_place,
+        "replace": op_replace,
         "cancel": op_cancel,
         "cancel_all": op_cancel_all,
     }

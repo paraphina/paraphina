@@ -1894,6 +1894,8 @@ fn compute_order_actions_place_new() {
         last_mid_update_ms: Some(0),
         last_mid_apply_ms: Some(0),
         last_book_update_ms: Some(0),
+        quote_quarantined: false,
+        quote_quarantined_at_ms: None,
         orderbook_l2: paraphina::orderbook_l2::OrderBookL2::new(),
         local_vol_short: 0.0,
         local_vol_long: 0.0,
@@ -1933,6 +1935,11 @@ fn compute_order_actions_place_new() {
             size: 1.0,
         }),
         generated_spread_cap_applied: false,
+        generated_spread_cap_bid_suppressed: false,
+        generated_spread_cap_ask_suppressed: false,
+        touch_mode_kind: None,
+        bid_terminal_reason: "active",
+        ask_terminal_reason: "active",
     };
 
     let actions = compute_order_actions(&cfg, vcfg, &vstate, &quote, None, None, 0);
@@ -1982,6 +1989,8 @@ fn compute_order_actions_cancel_when_no_desired() {
         last_mid_update_ms: Some(0),
         last_mid_apply_ms: Some(0),
         last_book_update_ms: Some(0),
+        quote_quarantined: false,
+        quote_quarantined_at_ms: None,
         orderbook_l2: paraphina::orderbook_l2::OrderBookL2::new(),
         local_vol_short: 0.0,
         local_vol_long: 0.0,
@@ -2016,6 +2025,11 @@ fn compute_order_actions_cancel_when_no_desired() {
         bid: None,
         ask: None,
         generated_spread_cap_applied: false,
+        generated_spread_cap_bid_suppressed: false,
+        generated_spread_cap_ask_suppressed: false,
+        touch_mode_kind: None,
+        bid_terminal_reason: "not_quoted",
+        ask_terminal_reason: "not_quoted",
     };
 
     // Existing orders.

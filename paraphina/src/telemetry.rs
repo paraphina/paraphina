@@ -67,7 +67,7 @@
 //! opening the file and appending JSON lines.
 //!
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -76,21 +76,26 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::{self, Value as JsonValue};
 
-use crate::config::{Config, MmVenueRole};
+use crate::config::Config;
 use crate::exit::compute_exit_edge_components;
 use crate::hedge::compute_hedge_cost_components;
 use crate::mm::venue_utility_conversion_penalties_enabled;
 use crate::mm::{
     compute_mm_quotes_with_now, compute_mm_reservation_components, compute_venue_targets,
-    compute_venue_utility_decision, quote_spread_gate_reason,
+    compute_venue_utility_decision, quote_spread_gate_reason, VenueUtilityDecision,
+    HYPERLIQUID_TOUCH_CLIP_MAX_TICKS,
 };
-use crate::state::{funding_rate_for_decision, GlobalState, KillEvent, RiskRegime};
+use crate::state::{
+    funding_rate_for_decision, GlobalState, KillEvent, RiskRegime, VenueUtilityTier,
+};
 use crate::treasury::TreasuryGuidanceEngine;
 use crate::types::{
     ExecutionEvent, FillEvent, OrderIntent, OrderPurpose, Side, TimestampMs, VenueStatus,
 };
 /// Current telemetry schema version.
 pub const SCHEMA_VERSION: i64 = 1;
+const HEDGE_SOURCE_FILL_CACHE_MAX_AGE_MS: TimestampMs = 8 * 60 * 60 * 1_000;
+const HEDGE_SOURCE_FILL_CACHE_CAP: usize = 256;
 
 /// Ensure a JSON record has `schema_version: 1`.
 ///
@@ -488,6 +493,20 @@ pub struct TelemetryBuilder {
     prev_venue_status: Vec<String>,
     prev_liq_warn: Vec<bool>,
     treasury: TreasuryGuidanceEngine,
+    source_fill_cache: VecDeque<SourceFillAttribution>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceFillAttribution {
+    source_decision_id: String,
+    venue_index: usize,
+    venue_id: String,
+    order_id: Option<String>,
+    client_order_id: Option<String>,
+    side: Side,
+    price: f64,
+    size: f64,
+    fill_time_ms: TimestampMs,
 }
 
 pub struct TelemetryInputs<'a> {
@@ -567,6 +586,62 @@ impl TelemetryBuilder {
             prev_venue_status: vec!["Unknown".to_string(); cfg.venues.len()],
             prev_liq_warn: vec![false; cfg.venues.len()],
             treasury: TreasuryGuidanceEngine::new(cfg.venues.len()),
+            source_fill_cache: VecDeque::new(),
+        }
+    }
+
+    fn prune_source_fill_cache(&mut self, now_ms: TimestampMs) {
+        while self.source_fill_cache.front().is_some_and(|fill| {
+            (now_ms - fill.fill_time_ms).max(0) > HEDGE_SOURCE_FILL_CACHE_MAX_AGE_MS
+        }) {
+            self.source_fill_cache.pop_front();
+        }
+    }
+
+    fn observe_source_fills(
+        &mut self,
+        state: &GlobalState,
+        fills: &[FillEvent],
+        now_ms: TimestampMs,
+    ) {
+        self.prune_source_fill_cache(now_ms);
+        for fill in fills {
+            if !matches!(fill.purpose, OrderPurpose::Mm) {
+                continue;
+            }
+            let Some(source_decision_id) = lookup_order_decision_id(
+                state,
+                fill.order_id.as_deref(),
+                fill.client_order_id.as_deref(),
+            ) else {
+                continue;
+            };
+            let duplicate = self.source_fill_cache.iter().any(|cached| {
+                cached.venue_index == fill.venue_index
+                    && cached.order_id == fill.order_id
+                    && cached.client_order_id == fill.client_order_id
+                    && cached.side == fill.side
+                    && (cached.price - fill.price).abs() < 1e-12
+                    && (cached.size - fill.size).abs() < 1e-12
+                    && cached.fill_time_ms == now_ms
+            });
+            if duplicate {
+                continue;
+            }
+            self.source_fill_cache.push_back(SourceFillAttribution {
+                source_decision_id,
+                venue_index: fill.venue_index,
+                venue_id: fill.venue_id.to_string(),
+                order_id: fill.order_id.clone(),
+                client_order_id: fill.client_order_id.clone(),
+                side: fill.side,
+                price: fill.price,
+                size: fill.size,
+                fill_time_ms: now_ms,
+            });
+            while self.source_fill_cache.len() > HEDGE_SOURCE_FILL_CACHE_CAP {
+                self.source_fill_cache.pop_front();
+            }
         }
     }
 
@@ -575,6 +650,7 @@ impl TelemetryBuilder {
         let state = input.state;
         let tick = input.tick;
         let now_ms = input.now_ms;
+        self.observe_source_fills(state, input.fills, now_ms);
 
         let kill_reason = {
             let reason = format!("{:?}", state.kill_reason);
@@ -719,7 +795,7 @@ impl TelemetryBuilder {
                 serde_json::Value::Bool(would_send_truncated),
             );
 
-            let fills = build_fill_records(state, input.fills, now_ms);
+            let fills = build_fill_records(state, input.fills, now_ms, &self.source_fill_cache);
             map.insert("fills".to_string(), serde_json::Value::Array(fills));
 
             let exits = build_exit_records(
@@ -739,6 +815,7 @@ impl TelemetryBuilder {
                 input.fills,
                 input.last_hedge_intent,
                 now_ms,
+                &self.source_fill_cache,
             );
             map.insert("hedges".to_string(), serde_json::Value::Array(hedges));
             map.insert(
@@ -999,6 +1076,14 @@ fn compute_healthy_venues_used(
     let effective_now = effective_now_for_staleness(state, now_ms);
     let mut out = Vec::new();
     for (idx, venue) in state.venues.iter().enumerate() {
+        if cfg
+            .venues
+            .get(idx)
+            .map(|v| !v.contributes_to_fv)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if !matches!(venue.status, VenueStatus::Healthy) {
             continue;
         }
@@ -1039,8 +1124,32 @@ fn build_quote_levels(
     let targets = compute_venue_targets(cfg, state, Some(effective_now_ms));
     let quotes = compute_mm_quotes_with_now(cfg, state, Some(effective_now_ms));
     #[allow(clippy::type_complexity)]
-    let mut quote_by_venue: Vec<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, bool)> =
-        vec![(None, None, None, None, false); cfg.venues.len()];
+    let mut quote_by_venue: Vec<(
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        bool,
+        bool,
+        bool,
+        Option<&'static str>,
+        &'static str,
+        &'static str,
+    )> = vec![
+        (
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            "not_quoted",
+            "not_quoted"
+        );
+        cfg.venues.len()
+    ];
     for quote in quotes {
         let bid_price = quote.bid.as_ref().map(|b| b.price);
         let bid_size = quote.bid.as_ref().map(|b| b.size);
@@ -1052,13 +1161,29 @@ fn build_quote_levels(
             ask_price,
             ask_size,
             quote.generated_spread_cap_applied,
+            quote.generated_spread_cap_bid_suppressed,
+            quote.generated_spread_cap_ask_suppressed,
+            quote.touch_mode_kind,
+            quote.bid_terminal_reason,
+            quote.ask_terminal_reason,
         );
     }
 
     let mut out = Vec::new();
+    let conversion_penalties_enabled = venue_utility_conversion_penalties_enabled();
     for (idx, v) in state.venues.iter().enumerate() {
-        let (bid_price, bid_size, ask_price, ask_size, generated_spread_cap_applied) =
-            quote_by_venue[idx];
+        let (
+            bid_price,
+            bid_size,
+            ask_price,
+            ask_size,
+            generated_spread_cap_applied,
+            generated_spread_cap_bid_suppressed,
+            generated_spread_cap_ask_suppressed,
+            touch_mode_kind,
+            bid_terminal_reason,
+            ask_terminal_reason,
+        ) = quote_by_venue[idx];
         let basis_adj = components.basis_adj_usd.get(idx).copied().unwrap_or(0.0);
         let funding_adj = components.funding_adj_usd.get(idx).copied().unwrap_or(0.0);
         let inv_term = components
@@ -1079,6 +1204,13 @@ fn build_quote_levels(
             .get(idx)
             .map(|target| target.q_target)
             .unwrap_or(0.0);
+        let utility = compute_venue_utility_decision(
+            &cfg.mm,
+            state.q_global_tao,
+            &cfg.venues[idx],
+            v,
+            conversion_penalties_enabled,
+        );
 
         let bid_diag = quote_diagnostics(
             cfg,
@@ -1089,10 +1221,14 @@ fn build_quote_levels(
             effective_now_ms,
             Side::Buy,
             q_target,
+            utility,
             maker_cost,
             bid_price.unwrap_or(0.0),
             bid_size.unwrap_or(0.0),
             size_eta,
+            generated_spread_cap_applied,
+            generated_spread_cap_bid_suppressed,
+            generated_spread_cap_ask_suppressed,
         );
         let ask_diag = quote_diagnostics(
             cfg,
@@ -1103,10 +1239,14 @@ fn build_quote_levels(
             effective_now_ms,
             Side::Sell,
             q_target,
+            utility,
             maker_cost,
             ask_price.unwrap_or(0.0),
             ask_size.unwrap_or(0.0),
             size_eta,
+            generated_spread_cap_applied,
+            generated_spread_cap_bid_suppressed,
+            generated_spread_cap_ask_suppressed,
         );
         let best_bid = v.mid.zip(v.spread).map(|(mid, spread)| mid - spread / 2.0);
         let best_ask = v.mid.zip(v.spread).map(|(mid, spread)| mid + spread / 2.0);
@@ -1131,71 +1271,267 @@ fn build_quote_levels(
             (Some(price), Some(best_ask)) => ((price - best_ask).max(0.0) / tick).round(),
             _ => 0.0,
         };
-        let touch_mode_applied = cfg.venues[idx].id == "aster"
-            && cfg.mm.venue_role_for(&cfg.venues[idx].id) == MmVenueRole::Fill
-            && (bid_touch_offset_ticks <= 1.0 || ask_touch_offset_ticks <= 1.0)
-            && (bid_price.is_some() || ask_price.is_some());
+        let touch_mode_applied = touch_mode_kind.is_some();
 
-        out.push(serde_json::json!({
-            "venue_index": idx,
-            "venue_id": v.id.as_ref(),
-            "side": "Bid",
-            "s_tilde": s_tilde,
-            "basis_adj_usd": basis_adj,
-            "funding_adj_usd": funding_adj,
-            "inventory_term_usd": inv_term,
-            "delta_final": delta_final,
-            "spread_mult": spread_mult,
-            "size_mult": size_mult,
-            "edge_local": bid_diag.edge,
-            "size_raw": bid_diag.q_raw,
-            "size_final": bid_diag.size_final,
-            "size_margin_cap": bid_diag.margin_cap,
-            "size_liq_factor": bid_diag.liq_factor,
-            "price": bid_price.unwrap_or(0.0),
-            "quote_state": bid_diag.quote_state,
-            "generated_spread_cap_applied": generated_spread_cap_applied,
-            "distance_to_touch_bps": bid_distance_to_touch_bps,
-            "touch_offset_ticks": bid_touch_offset_ticks,
-            "touch_mode_applied": touch_mode_applied,
-            "suppression_reason": bid_diag.suppression_reason,
-            "book_age_ms": bid_diag.book_age_ms,
-            "book_stale_threshold_ms": bid_diag.book_stale_threshold_ms,
-            "edge_threshold": bid_diag.edge_threshold,
-            "lot_size_tao": bid_diag.lot_size_tao,
-            "q_target_tao": q_target,
-        }));
-        out.push(serde_json::json!({
-            "venue_index": idx,
-            "venue_id": v.id.as_ref(),
-            "side": "Ask",
-            "s_tilde": s_tilde,
-            "basis_adj_usd": basis_adj,
-            "funding_adj_usd": funding_adj,
-            "inventory_term_usd": inv_term,
-            "delta_final": delta_final,
-            "spread_mult": spread_mult,
-            "size_mult": size_mult,
-            "edge_local": ask_diag.edge,
-            "size_raw": ask_diag.q_raw,
-            "size_final": ask_diag.size_final,
-            "size_margin_cap": ask_diag.margin_cap,
-            "size_liq_factor": ask_diag.liq_factor,
-            "price": ask_price.unwrap_or(0.0),
-            "quote_state": ask_diag.quote_state,
-            "generated_spread_cap_applied": generated_spread_cap_applied,
-            "distance_to_touch_bps": ask_distance_to_touch_bps,
-            "touch_offset_ticks": ask_touch_offset_ticks,
-            "touch_mode_applied": touch_mode_applied,
-            "suppression_reason": ask_diag.suppression_reason,
-            "book_age_ms": ask_diag.book_age_ms,
-            "book_stale_threshold_ms": ask_diag.book_stale_threshold_ms,
-            "edge_threshold": ask_diag.edge_threshold,
-            "lot_size_tao": ask_diag.lot_size_tao,
-            "q_target_tao": q_target,
-        }));
+        out.push(build_quote_level_record(
+            idx,
+            v.id.as_ref(),
+            "Bid",
+            s_tilde,
+            basis_adj,
+            funding_adj,
+            inv_term,
+            delta_final,
+            spread_mult,
+            size_mult,
+            bid_price.unwrap_or(0.0),
+            bid_distance_to_touch_bps,
+            bid_touch_offset_ticks,
+            touch_mode_applied,
+            touch_mode_kind,
+            generated_spread_cap_applied,
+            generated_spread_cap_bid_suppressed,
+            generated_spread_cap_ask_suppressed,
+            bid_terminal_reason,
+            q_target,
+            &bid_diag,
+        ));
+        out.push(build_quote_level_record(
+            idx,
+            v.id.as_ref(),
+            "Ask",
+            s_tilde,
+            basis_adj,
+            funding_adj,
+            inv_term,
+            delta_final,
+            spread_mult,
+            size_mult,
+            ask_price.unwrap_or(0.0),
+            ask_distance_to_touch_bps,
+            ask_touch_offset_ticks,
+            touch_mode_applied,
+            touch_mode_kind,
+            generated_spread_cap_applied,
+            generated_spread_cap_bid_suppressed,
+            generated_spread_cap_ask_suppressed,
+            ask_terminal_reason,
+            q_target,
+            &ask_diag,
+        ));
     }
     out
+}
+
+#[inline]
+fn generated_spread_cap_mode(
+    generated_spread_cap_applied: bool,
+    generated_spread_cap_bid_suppressed: bool,
+    generated_spread_cap_ask_suppressed: bool,
+) -> &'static str {
+    if !generated_spread_cap_applied {
+        "none"
+    } else if generated_spread_cap_bid_suppressed && generated_spread_cap_ask_suppressed {
+        "suppress_both"
+    } else if generated_spread_cap_bid_suppressed {
+        "suppress_bid"
+    } else if generated_spread_cap_ask_suppressed {
+        "suppress_ask"
+    } else {
+        "compressed_only"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_quote_level_record(
+    venue_index: usize,
+    venue_id: &str,
+    side: &'static str,
+    s_tilde: f64,
+    basis_adj: f64,
+    funding_adj: f64,
+    inv_term: f64,
+    delta_final: f64,
+    spread_mult: f64,
+    size_mult: f64,
+    price: f64,
+    distance_to_touch_bps: f64,
+    touch_offset_ticks: f64,
+    touch_mode_applied: bool,
+    touch_mode_kind: Option<&'static str>,
+    generated_spread_cap_applied: bool,
+    generated_spread_cap_bid_suppressed: bool,
+    generated_spread_cap_ask_suppressed: bool,
+    engine_terminal_reason: &'static str,
+    q_target: f64,
+    diag: &QuoteTelemetryDiagnostics,
+) -> JsonValue {
+    let mut record = serde_json::Map::new();
+    record.insert(
+        "venue_index".to_string(),
+        JsonValue::from(venue_index as u64),
+    );
+    record.insert(
+        "venue_id".to_string(),
+        JsonValue::from(venue_id.to_string()),
+    );
+    record.insert("side".to_string(), JsonValue::from(side));
+    record.insert("s_tilde".to_string(), JsonValue::from(s_tilde));
+    record.insert("basis_adj_usd".to_string(), JsonValue::from(basis_adj));
+    record.insert("funding_adj_usd".to_string(), JsonValue::from(funding_adj));
+    record.insert("inventory_term_usd".to_string(), JsonValue::from(inv_term));
+    record.insert("delta_final".to_string(), JsonValue::from(delta_final));
+    record.insert("spread_mult".to_string(), JsonValue::from(spread_mult));
+    record.insert("size_mult".to_string(), JsonValue::from(size_mult));
+    record.insert("edge_local".to_string(), JsonValue::from(diag.edge));
+    record.insert("size_raw".to_string(), JsonValue::from(diag.q_raw));
+    record.insert("size_final".to_string(), JsonValue::from(diag.size_final));
+    record.insert(
+        "size_margin_cap".to_string(),
+        JsonValue::from(diag.margin_cap),
+    );
+    record.insert(
+        "size_liq_factor".to_string(),
+        JsonValue::from(diag.liq_factor),
+    );
+    record.insert("price".to_string(), JsonValue::from(price));
+    record.insert("quote_state".to_string(), JsonValue::from(diag.quote_state));
+    record.insert(
+        "engine_terminal_reason".to_string(),
+        JsonValue::from(engine_terminal_reason),
+    );
+    record.insert(
+        "generated_spread_cap_applied".to_string(),
+        JsonValue::from(generated_spread_cap_applied),
+    );
+    record.insert(
+        "generated_spread_cap_bid_suppressed".to_string(),
+        JsonValue::from(generated_spread_cap_bid_suppressed),
+    );
+    record.insert(
+        "generated_spread_cap_ask_suppressed".to_string(),
+        JsonValue::from(generated_spread_cap_ask_suppressed),
+    );
+    record.insert(
+        "generated_spread_cap_mode".to_string(),
+        JsonValue::from(generated_spread_cap_mode(
+            generated_spread_cap_applied,
+            generated_spread_cap_bid_suppressed,
+            generated_spread_cap_ask_suppressed,
+        )),
+    );
+    record.insert(
+        "distance_to_touch_bps".to_string(),
+        JsonValue::from(distance_to_touch_bps),
+    );
+    record.insert(
+        "touch_offset_ticks".to_string(),
+        JsonValue::from(touch_offset_ticks),
+    );
+    record.insert(
+        "touch_mode_applied".to_string(),
+        JsonValue::from(touch_mode_applied),
+    );
+    record.insert(
+        "touch_mode_kind".to_string(),
+        touch_mode_kind
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+    );
+    record.insert(
+        "touch_clip_applied".to_string(),
+        JsonValue::from(matches!(touch_mode_kind, Some("hyperliquid_clip"))),
+    );
+    record.insert(
+        "touch_clip_max_ticks".to_string(),
+        if matches!(touch_mode_kind, Some("hyperliquid_clip")) {
+            JsonValue::from(HYPERLIQUID_TOUCH_CLIP_MAX_TICKS)
+        } else {
+            JsonValue::Null
+        },
+    );
+    record.insert(
+        "suppression_reason".to_string(),
+        diag.suppression_reason
+            .map(JsonValue::from)
+            .unwrap_or(JsonValue::Null),
+    );
+    record.insert("book_age_ms".to_string(), JsonValue::from(diag.book_age_ms));
+    record.insert(
+        "book_stale_threshold_ms".to_string(),
+        JsonValue::from(diag.book_stale_threshold_ms),
+    );
+    record.insert(
+        "edge_threshold".to_string(),
+        JsonValue::from(diag.edge_threshold),
+    );
+    record.insert(
+        "edge_threshold_base".to_string(),
+        JsonValue::from(diag.base_edge_threshold),
+    );
+    record.insert(
+        "hedge_cost_edge_floor".to_string(),
+        JsonValue::from(diag.hedge_cost_edge_floor),
+    );
+    record.insert(
+        "utility_extra_edge_usd".to_string(),
+        JsonValue::from(diag.utility_extra_edge_usd),
+    );
+    record.insert(
+        "utility_tier".to_string(),
+        JsonValue::from(diag.utility_tier),
+    );
+    record.insert(
+        "utility_reason".to_string(),
+        JsonValue::from(diag.utility_reason),
+    );
+    record.insert(
+        "utility_role".to_string(),
+        JsonValue::from(diag.utility_role),
+    );
+    record.insert(
+        "utility_size_multiplier".to_string(),
+        JsonValue::from(diag.utility_size_multiplier),
+    );
+    record.insert("prune_stage".to_string(), JsonValue::from(diag.prune_stage));
+    record.insert(
+        "candidate_price_pre_utility".to_string(),
+        JsonValue::from(diag.candidate_price_pre_utility),
+    );
+    record.insert(
+        "candidate_edge_pre_utility".to_string(),
+        JsonValue::from(diag.candidate_edge_pre_utility),
+    );
+    record.insert(
+        "candidate_size_pre_margin".to_string(),
+        JsonValue::from(diag.candidate_size_pre_margin),
+    );
+    record.insert(
+        "candidate_size_post_margin".to_string(),
+        JsonValue::from(diag.candidate_size_post_margin),
+    );
+    record.insert(
+        "candidate_size_pre_utility".to_string(),
+        JsonValue::from(diag.candidate_size_pre_utility),
+    );
+    record.insert(
+        "candidate_size_post_utility".to_string(),
+        JsonValue::from(diag.candidate_size_post_utility),
+    );
+    record.insert(
+        "candidate_size_post_taper".to_string(),
+        JsonValue::from(diag.candidate_size_post_taper),
+    );
+    record.insert(
+        "candidate_notional_post_utility".to_string(),
+        JsonValue::from(diag.candidate_notional_post_utility),
+    );
+    record.insert(
+        "lot_size_tao".to_string(),
+        JsonValue::from(diag.lot_size_tao),
+    );
+    record.insert("q_target_tao".to_string(), JsonValue::from(q_target));
+    JsonValue::Object(record)
 }
 
 #[derive(Debug, Clone)]
@@ -1207,16 +1543,82 @@ struct QuoteTelemetryDiagnostics {
     liq_factor: f64,
     quote_state: &'static str,
     suppression_reason: Option<&'static str>,
+    prune_stage: &'static str,
     book_age_ms: TimestampMs,
     book_stale_threshold_ms: i64,
     edge_threshold: f64,
+    base_edge_threshold: f64,
+    hedge_cost_edge_floor: f64,
+    utility_extra_edge_usd: f64,
+    utility_tier: &'static str,
+    utility_reason: &'static str,
+    utility_role: &'static str,
+    utility_size_multiplier: f64,
+    candidate_price_pre_utility: f64,
+    candidate_edge_pre_utility: f64,
+    candidate_size_pre_margin: f64,
+    candidate_size_post_margin: f64,
+    candidate_size_pre_utility: f64,
+    candidate_size_post_utility: f64,
+    candidate_size_post_taper: f64,
+    candidate_notional_post_utility: f64,
     lot_size_tao: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuotePruneDetails {
+    suppression_reason: Option<&'static str>,
+    prune_stage: &'static str,
+    candidate_price_pre_utility: f64,
+    candidate_edge_pre_utility: f64,
+    candidate_size_pre_margin: f64,
+    candidate_size_post_margin: f64,
+    candidate_size_pre_utility: f64,
+    candidate_size_post_utility: f64,
+    candidate_size_post_taper: f64,
+    candidate_notional_post_utility: f64,
 }
 
 fn mm_maker_cost(vcfg: &crate::config::VenueConfig, price: f64) -> f64 {
     let maker_fee = vcfg.maker_fee_bps / 10_000.0;
     let maker_rebate = vcfg.maker_rebate_bps / 10_000.0;
     (maker_fee - maker_rebate).max(0.0) * price
+}
+
+fn mm_hedge_cost_edge_floor(cfg: &Config, state: &GlobalState, fallback_price: f64) -> f64 {
+    let mult = cfg.mm.hedge_cost_edge_mult.max(0.0);
+    if mult <= 0.0 {
+        return 0.0;
+    }
+
+    let mut best_cost = f64::INFINITY;
+    for (i, vcfg) in cfg.venues.iter().enumerate() {
+        if !vcfg.is_hedge_allowed {
+            continue;
+        }
+        let Some(vstate) = state.venues.get(i) else {
+            continue;
+        };
+        if !matches!(vstate.status, VenueStatus::Healthy) {
+            continue;
+        }
+        let mid = vstate.mid.unwrap_or(fallback_price);
+        if !mid.is_finite() || mid <= 0.0 {
+            continue;
+        }
+        let spread = vstate.spread.unwrap_or(0.0).max(0.0);
+        let taker_fee = (vcfg.taker_fee_bps / 10_000.0).abs() * mid;
+        let cost = 0.5 * spread + taker_fee + cfg.hedge.slippage_buffer.max(0.0);
+        if cost.is_finite() && cost >= 0.0 {
+            best_cost = best_cost.min(cost);
+        }
+    }
+
+    if best_cost.is_finite() {
+        mult * best_cost
+    } else {
+        0.0
+    }
 }
 
 fn quote_diagnostics(
@@ -1228,10 +1630,14 @@ fn quote_diagnostics(
     now_ms: TimestampMs,
     side: Side,
     q_target_v: f64,
+    utility: VenueUtilityDecision,
     maker_cost: f64,
     price: f64,
     size_final: f64,
     size_eta: f64,
+    generated_spread_cap_applied: bool,
+    generated_spread_cap_bid_suppressed: bool,
+    generated_spread_cap_ask_suppressed: bool,
 ) -> QuoteTelemetryDiagnostics {
     let book_age_ms = compute_age_ms(now_ms, v.last_mid_update_ms);
     let book_stale_threshold_ms = cfg
@@ -1241,10 +1647,12 @@ fn quote_diagnostics(
     let lot_size_tao = vcfg.lot_size_tao.max(0.0);
     let bid_edge_threshold = cfg.mm.edge_local_min_bid_for(&vcfg.id);
     let ask_edge_threshold = cfg.mm.edge_local_min_ask_for(&vcfg.id);
-    let edge_threshold = match side {
+    let base_edge_threshold = match side {
         Side::Buy => bid_edge_threshold,
         Side::Sell => ask_edge_threshold,
     };
+    let hedge_cost_edge_floor = mm_hedge_cost_edge_floor(cfg, state, fair);
+    let edge_threshold = base_edge_threshold + hedge_cost_edge_floor + utility.extra_edge_usd;
     let reference_price = if price > 0.0 {
         price
     } else {
@@ -1291,24 +1699,24 @@ fn quote_diagnostics(
     } else {
         "suppressed"
     };
-    let suppression_reason = if quote_state == "active" {
-        None
-    } else {
-        quote_suppression_reason(
-            cfg,
-            state,
-            vcfg,
-            v,
-            side,
-            now_ms,
-            q_target_v,
-            bid_edge_threshold,
-            ask_edge_threshold,
-            lot_size_tao,
-            margin_cap_estimate,
-            liq_factor,
-        )
-    };
+    let prune = quote_prune_details(
+        cfg,
+        state,
+        vcfg,
+        v,
+        side,
+        now_ms,
+        q_target_v,
+        utility,
+        bid_edge_threshold,
+        ask_edge_threshold,
+        lot_size_tao,
+        margin_cap_estimate,
+        liq_factor,
+        generated_spread_cap_applied,
+        generated_spread_cap_bid_suppressed,
+        generated_spread_cap_ask_suppressed,
+    );
 
     QuoteTelemetryDiagnostics {
         edge,
@@ -1317,16 +1725,70 @@ fn quote_diagnostics(
         margin_cap,
         liq_factor,
         quote_state,
-        suppression_reason,
+        suppression_reason: prune.suppression_reason,
+        prune_stage: if quote_state == "active" {
+            "active"
+        } else {
+            prune.prune_stage
+        },
         book_age_ms,
         book_stale_threshold_ms,
         edge_threshold,
+        base_edge_threshold,
+        hedge_cost_edge_floor,
+        utility_extra_edge_usd: utility.extra_edge_usd,
+        utility_tier: utility.tier.as_str(),
+        utility_reason: utility.reason.as_str(),
+        utility_role: utility.role.as_str(),
+        utility_size_multiplier: utility.size_multiplier,
+        candidate_price_pre_utility: prune.candidate_price_pre_utility,
+        candidate_edge_pre_utility: prune.candidate_edge_pre_utility,
+        candidate_size_pre_margin: prune.candidate_size_pre_margin,
+        candidate_size_post_margin: prune.candidate_size_post_margin,
+        candidate_size_pre_utility: prune.candidate_size_pre_utility,
+        candidate_size_post_utility: prune.candidate_size_post_utility,
+        candidate_size_post_taper: prune.candidate_size_post_taper,
+        candidate_notional_post_utility: prune.candidate_notional_post_utility,
         lot_size_tao,
     }
 }
 
+#[inline]
+fn telemetry_scale_size(
+    size: f64,
+    factor: f64,
+    price: f64,
+    vcfg: &crate::config::VenueConfig,
+) -> Option<f64> {
+    if factor >= 1.0 {
+        return Some(size);
+    }
+    let scaled = (size * factor).min(vcfg.max_order_size).max(0.0);
+    if scaled < vcfg.lot_size_tao || scaled * price < vcfg.min_notional_usd {
+        None
+    } else {
+        Some(scaled)
+    }
+}
+
+#[inline]
+fn telemetry_inventory_reducing_side(q_global_tao: f64, venue_position_tao: f64) -> Option<Side> {
+    let signed_inventory = if q_global_tao.abs() > 1e-9 {
+        q_global_tao
+    } else {
+        venue_position_tao
+    };
+    if signed_inventory > 0.0 {
+        Some(Side::Sell)
+    } else if signed_inventory < 0.0 {
+        Some(Side::Buy)
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn quote_suppression_reason(
+fn quote_prune_details(
     cfg: &Config,
     state: &GlobalState,
     vcfg: &crate::config::VenueConfig,
@@ -1334,75 +1796,170 @@ fn quote_suppression_reason(
     side: Side,
     now_ms: TimestampMs,
     q_target_v: f64,
+    utility: VenueUtilityDecision,
     bid_edge_threshold: f64,
     ask_edge_threshold: f64,
     lot_size_tao: f64,
     margin_cap_estimate: f64,
     liq_factor: f64,
-) -> Option<&'static str> {
+    _generated_spread_cap_applied: bool,
+    generated_spread_cap_bid_suppressed: bool,
+    generated_spread_cap_ask_suppressed: bool,
+) -> QuotePruneDetails {
+    let blank = QuotePruneDetails {
+        suppression_reason: None,
+        prune_stage: "active",
+        candidate_price_pre_utility: 0.0,
+        candidate_edge_pre_utility: 0.0,
+        candidate_size_pre_margin: 0.0,
+        candidate_size_post_margin: 0.0,
+        candidate_size_pre_utility: 0.0,
+        candidate_size_post_utility: 0.0,
+        candidate_size_post_taper: 0.0,
+        candidate_notional_post_utility: 0.0,
+    };
     if !state.fv_available {
-        return Some("global_fv_unavailable");
+        return QuotePruneDetails {
+            suppression_reason: Some("global_fv_unavailable"),
+            prune_stage: "global_fv_unavailable",
+            ..blank
+        };
     }
     if state.fair_value.is_none() {
-        return Some("fair_value_missing");
+        return QuotePruneDetails {
+            suppression_reason: Some("fair_value_missing"),
+            prune_stage: "fair_value_missing",
+            ..blank
+        };
     }
     if state.kill_switch {
-        return Some("kill_switch");
+        return QuotePruneDetails {
+            suppression_reason: Some("kill_switch"),
+            prune_stage: "kill_switch",
+            ..blank
+        };
     }
     if matches!(state.risk_regime, RiskRegime::HardLimit) {
-        return Some("risk_hard_limit");
+        return QuotePruneDetails {
+            suppression_reason: Some("risk_hard_limit"),
+            prune_stage: "risk_hard_limit",
+            ..blank
+        };
     }
     if !state.sigma_eff.is_finite() || state.sigma_eff <= 0.0 || state.size_mult <= 0.0 {
-        return Some("degenerate_global_scalars");
+        return QuotePruneDetails {
+            suppression_reason: Some("degenerate_global_scalars"),
+            prune_stage: "degenerate_global_scalars",
+            ..blank
+        };
     }
     if matches!(v.status, VenueStatus::Disabled) {
-        return Some("venue_disabled");
+        return QuotePruneDetails {
+            suppression_reason: Some("venue_disabled"),
+            prune_stage: "venue_disabled",
+            ..blank
+        };
     }
     if v.last_mid_update_ms.is_none() {
-        return Some("book_missing");
+        return QuotePruneDetails {
+            suppression_reason: Some("book_missing"),
+            prune_stage: "book_missing",
+            ..blank
+        };
     }
     let quote_max_age_ms = cfg
         .mm
         .quote_max_age_ms
         .unwrap_or_else(|| vcfg.effective_stale_ms(cfg.book.stale_ms));
     if compute_age_ms(now_ms, v.last_mid_update_ms) > quote_max_age_ms {
-        return Some("book_stale");
+        return QuotePruneDetails {
+            suppression_reason: Some("book_stale"),
+            prune_stage: "book_stale",
+            ..blank
+        };
     }
     if v.mid.is_none() {
-        return Some("mid_missing");
+        return QuotePruneDetails {
+            suppression_reason: Some("mid_missing"),
+            prune_stage: "mid_missing",
+            ..blank
+        };
     }
     if v.spread.unwrap_or(0.0) <= 0.0 || v.depth_near_mid <= 0.0 {
-        return Some("invalid_book");
+        return QuotePruneDetails {
+            suppression_reason: Some("invalid_book"),
+            prune_stage: "invalid_book",
+            ..blank
+        };
     }
     if v.dist_liq_sigma <= cfg.risk.liq_crit_sigma {
-        return Some("liq_critical");
+        return QuotePruneDetails {
+            suppression_reason: Some("liq_critical"),
+            prune_stage: "liq_critical",
+            ..blank
+        };
     }
     if v.toxicity >= cfg.toxicity.tox_high_threshold {
-        return Some("toxicity_high");
+        return QuotePruneDetails {
+            suppression_reason: Some("toxicity_high"),
+            prune_stage: "toxicity_high",
+            ..blank
+        };
     }
     let delta_ratio = (state.dollar_delta_usd.abs() / state.delta_limit_usd.max(1.0)).max(0.0);
     if delta_ratio >= 2.0 {
-        return Some("delta_limit_block");
+        return QuotePruneDetails {
+            suppression_reason: Some("delta_limit_block"),
+            prune_stage: "delta_limit_block",
+            ..blank
+        };
     }
     if delta_ratio > 1.0 {
         if state.q_global_tao > 0.0 && matches!(side, Side::Buy) {
-            return Some("delta_directional_block_long");
+            return QuotePruneDetails {
+                suppression_reason: Some("delta_directional_block_long"),
+                prune_stage: "delta_directional_block_long",
+                ..blank
+            };
         }
         if state.q_global_tao < 0.0 && matches!(side, Side::Sell) {
-            return Some("delta_directional_block_short");
+            return QuotePruneDetails {
+                suppression_reason: Some("delta_directional_block_short"),
+                prune_stage: "delta_directional_block_short",
+                ..blank
+            };
         }
     }
     if margin_cap_estimate > 0.0 && margin_cap_estimate < lot_size_tao {
-        return Some("margin_cap_below_lot");
+        return QuotePruneDetails {
+            suppression_reason: Some("margin_cap_below_lot"),
+            prune_stage: "margin_cap_below_lot",
+            ..blank
+        };
     }
     if liq_factor > 0.0 && (liq_factor * vcfg.max_order_size) < lot_size_tao {
-        return Some("liq_shrink_below_lot");
+        return QuotePruneDetails {
+            suppression_reason: Some("liq_shrink_below_lot"),
+            prune_stage: "liq_shrink_below_lot",
+            ..blank
+        };
     }
     if matches!(state.risk_regime, RiskRegime::Warning)
         && cfg.risk.q_warn_cap > 0.0
         && cfg.risk.q_warn_cap < lot_size_tao
     {
-        return Some("warning_cap_below_lot");
+        return QuotePruneDetails {
+            suppression_reason: Some("warning_cap_below_lot"),
+            prune_stage: "warning_cap_below_lot",
+            ..blank
+        };
+    }
+    if matches!(utility.tier, VenueUtilityTier::Suppressed) {
+        return QuotePruneDetails {
+            suppression_reason: Some("utility_suppressed"),
+            prune_stage: "utility_suppressed",
+            ..blank
+        };
     }
 
     let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
@@ -1423,27 +1980,349 @@ fn quote_suppression_reason(
     let tick = vcfg.tick_size.max(1e-6);
     let maker_cost = mm_maker_cost(vcfg, fair);
     let vol_buffer = cfg.mm.edge_vol_mult * sigma_eff * fair;
-    let min_half_spread_bid = (bid_edge_threshold + maker_cost + vol_buffer) / 2.0;
-    let min_half_spread_ask = (ask_edge_threshold + maker_cost + vol_buffer) / 2.0;
-    let bid_half_spread = min_half_spread_bid.max(0.0);
-    let ask_half_spread = min_half_spread_ask.max(0.0);
+    let hedge_cost_edge_floor = mm_hedge_cost_edge_floor(cfg, state, fair);
+    let effective_bid_edge_threshold =
+        bid_edge_threshold + hedge_cost_edge_floor + utility.extra_edge_usd;
+    let effective_ask_edge_threshold =
+        ask_edge_threshold + hedge_cost_edge_floor + utility.extra_edge_usd;
+    let gamma = vcfg.gamma.max(1e-8);
+    let k = vcfg.k.max(1e-8);
+    let delta_as = (1.0 / gamma) * (1.0 + (gamma / k)).ln();
+    let delta_vol = delta_as * state.spread_mult.max(1e-6);
+    let mut bid_half_spread = delta_vol
+        .max((effective_bid_edge_threshold + maker_cost + vol_buffer) / 2.0)
+        .max(0.0);
+    let mut ask_half_spread = delta_vol
+        .max((effective_ask_edge_threshold + maker_cost + vol_buffer) / 2.0)
+        .max(0.0);
+    if matches!(state.risk_regime, RiskRegime::Warning) {
+        let warn_mult = cfg.risk.spread_warn_mult.max(1.0);
+        bid_half_spread *= warn_mult;
+        ask_half_spread *= warn_mult;
+    }
+    if v.dist_liq_sigma > 0.0 && v.dist_liq_sigma < cfg.risk.liq_warn_sigma {
+        let t = ((cfg.risk.liq_warn_sigma - v.dist_liq_sigma) / cfg.risk.liq_warn_sigma)
+            .clamp(0.0, 1.0);
+        let liq_mult = 1.0 + 2.0 * t;
+        bid_half_spread *= liq_mult;
+        ask_half_spread *= liq_mult;
+    }
     let raw_bid = reservation_price - bid_half_spread;
     let raw_ask = reservation_price + ask_half_spread;
     let passive_bid_limit = best_bid - tick;
     let passive_ask_limit = best_ask + tick;
-    let snapped_bid = (raw_bid.min(passive_bid_limit) / tick).floor() * tick;
-    let snapped_ask = (raw_ask.max(passive_ask_limit) / tick).ceil() * tick;
+    let snapped_bid = {
+        let mut px = (raw_bid.min(passive_bid_limit) / tick).floor() * tick;
+        if px > passive_bid_limit {
+            px = (passive_bid_limit / tick).floor() * tick;
+        }
+        px
+    };
+    let snapped_ask = {
+        let mut px = (raw_ask.max(passive_ask_limit) / tick).ceil() * tick;
+        if px < passive_ask_limit {
+            px = (passive_ask_limit / tick).ceil() * tick;
+        }
+        px
+    };
+    let candidate_price = match side {
+        Side::Buy => snapped_bid,
+        Side::Sell => snapped_ask,
+    };
     let edge_bid = fair - snapped_bid - maker_cost;
     let edge_ask = snapped_ask - fair - maker_cost;
+    let candidate_edge = match side {
+        Side::Buy => edge_bid,
+        Side::Sell => edge_ask,
+    };
     let side_edge_ok = match side {
-        Side::Buy => edge_bid >= bid_edge_threshold,
-        Side::Sell => edge_ask >= ask_edge_threshold,
+        Side::Buy => edge_bid >= effective_bid_edge_threshold,
+        Side::Sell => edge_ask >= effective_ask_edge_threshold,
     };
     if !side_edge_ok {
-        return Some("edge_below_min");
+        return QuotePruneDetails {
+            suppression_reason: Some("edge_below_min"),
+            prune_stage: "edge_fail_pre_utility",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            ..blank
+        };
     }
 
-    Some("size_or_passivity_gated")
+    let q_raw_bid = if edge_bid > 0.0 {
+        edge_bid / cfg.mm.size_eta.max(1e-9)
+    } else {
+        0.0
+    };
+    let q_raw_ask = if edge_ask > 0.0 {
+        edge_ask / cfg.mm.size_eta.max(1e-9)
+    } else {
+        0.0
+    };
+    let mut size_bid = q_raw_bid * state.size_mult.max(0.0);
+    let mut size_ask = q_raw_ask * state.size_mult.max(0.0);
+    size_bid = size_bid.max(vcfg.lot_size_tao);
+    size_ask = size_ask.max(vcfg.lot_size_tao);
+    let candidate_size_pre_margin = match side {
+        Side::Buy => size_bid,
+        Side::Sell => size_ask,
+    };
+
+    let mm_margin_factor = cfg.risk.mm_max_leverage * cfg.risk.mm_margin_safety;
+    let margin_cap_bid = if snapped_bid > 0.0 {
+        (v.margin_available_usd * mm_margin_factor) / snapped_bid
+    } else {
+        0.0
+    };
+    let margin_cap_ask = if snapped_ask > 0.0 {
+        (v.margin_available_usd * mm_margin_factor) / snapped_ask
+    } else {
+        0.0
+    };
+    size_bid = size_bid.min(margin_cap_bid);
+    size_ask = size_ask.min(margin_cap_ask);
+    let candidate_size_post_margin = match side {
+        Side::Buy => size_bid,
+        Side::Sell => size_ask,
+    };
+
+    if candidate_size_post_margin < lot_size_tao {
+        return QuotePruneDetails {
+            suppression_reason: Some("margin_cap_below_lot"),
+            prune_stage: "margin_cap_below_lot",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            candidate_size_pre_margin,
+            candidate_size_post_margin,
+            ..blank
+        };
+    }
+    if candidate_size_post_margin * candidate_price < vcfg.min_notional_usd {
+        return QuotePruneDetails {
+            suppression_reason: Some("margin_cap_below_min_notional"),
+            prune_stage: "margin_cap_below_min_notional",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            candidate_size_pre_margin,
+            candidate_size_post_margin,
+            ..blank
+        };
+    }
+
+    if matches!(v.status, VenueStatus::Warning) {
+        size_bid *= 0.5;
+        size_ask *= 0.5;
+    }
+    if v.toxicity >= cfg.toxicity.tox_med_threshold && v.toxicity < cfg.toxicity.tox_high_threshold
+    {
+        let tox_factor = 1.0 - (v.toxicity - cfg.toxicity.tox_med_threshold) / (0.3_f64).max(1e-6);
+        size_bid *= tox_factor.clamp(0.1, 1.0);
+        size_ask *= tox_factor.clamp(0.1, 1.0);
+    }
+    if v.dist_liq_sigma < cfg.risk.liq_warn_sigma {
+        let k_liq = ((v.dist_liq_sigma - cfg.risk.liq_crit_sigma)
+            / (cfg.risk.liq_warn_sigma - cfg.risk.liq_crit_sigma + 1e-9))
+            .clamp(0.0, 1.0);
+        size_bid *= k_liq;
+        size_ask *= k_liq;
+    }
+    if delta_ratio > 1.0 {
+        let factor = (2.0 - delta_ratio).clamp(0.0, 1.0);
+        if state.q_global_tao > 0.0 {
+            size_bid = 0.0;
+            size_ask *= factor;
+        } else if state.q_global_tao < 0.0 {
+            size_ask = 0.0;
+            size_bid *= factor;
+        } else {
+            size_bid *= factor;
+            size_ask *= factor;
+        }
+    }
+    if matches!(state.risk_regime, RiskRegime::Warning) {
+        size_bid = size_bid.min(cfg.risk.q_warn_cap.max(0.0));
+        size_ask = size_ask.min(cfg.risk.q_warn_cap.max(0.0));
+    }
+    size_bid = size_bid.min(vcfg.max_order_size);
+    size_ask = size_ask.min(vcfg.max_order_size);
+    let lot = vcfg.lot_size_tao.max(1e-9);
+    size_bid = (size_bid / lot).floor() * lot;
+    size_ask = (size_ask / lot).floor() * lot;
+    let generated_spread_cap_side_suppressed = match side {
+        Side::Buy => generated_spread_cap_bid_suppressed,
+        Side::Sell => generated_spread_cap_ask_suppressed,
+    };
+    if generated_spread_cap_side_suppressed {
+        match side {
+            Side::Buy => size_bid = 0.0,
+            Side::Sell => size_ask = 0.0,
+        }
+    }
+    let candidate_size_pre_utility = match side {
+        Side::Buy => size_bid,
+        Side::Sell => size_ask,
+    };
+    if generated_spread_cap_side_suppressed && candidate_size_pre_utility <= 0.0 {
+        return QuotePruneDetails {
+            suppression_reason: Some("generated_spread_cap"),
+            prune_stage: "generated_spread_cap",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            candidate_size_pre_margin,
+            candidate_size_post_margin,
+            candidate_size_pre_utility,
+            ..blank
+        };
+    }
+    if candidate_size_pre_utility < lot_size_tao
+        || candidate_size_pre_utility * candidate_price < vcfg.min_notional_usd
+    {
+        return QuotePruneDetails {
+            suppression_reason: Some("size_or_passivity_gated"),
+            prune_stage: "size_or_passivity_gated",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            candidate_size_pre_margin,
+            candidate_size_post_margin,
+            candidate_size_pre_utility,
+            ..blank
+        };
+    }
+
+    let inventory_reducing_side =
+        telemetry_inventory_reducing_side(state.q_global_tao, v.position_tao);
+    let mut candidate_size_post_utility = candidate_size_pre_utility;
+    match utility.tier {
+        VenueUtilityTier::Full => {}
+        VenueUtilityTier::Reduced => {
+            candidate_size_post_utility = telemetry_scale_size(
+                candidate_size_post_utility,
+                utility.size_multiplier,
+                candidate_price,
+                vcfg,
+            )
+            .unwrap_or(0.0);
+        }
+        VenueUtilityTier::AnchorOnly => {
+            candidate_size_post_utility = telemetry_scale_size(
+                candidate_size_post_utility,
+                utility.size_multiplier,
+                candidate_price,
+                vcfg,
+            )
+            .unwrap_or(0.0);
+            let allowed = match inventory_reducing_side {
+                Some(Side::Buy) => matches!(side, Side::Buy),
+                Some(Side::Sell) => matches!(side, Side::Sell),
+                None => false,
+            };
+            if !allowed {
+                return QuotePruneDetails {
+                    suppression_reason: Some("size_or_passivity_gated"),
+                    prune_stage: "anchor_inventory_gate",
+                    candidate_price_pre_utility: candidate_price,
+                    candidate_edge_pre_utility: candidate_edge,
+                    candidate_size_pre_margin,
+                    candidate_size_post_margin,
+                    candidate_size_pre_utility,
+                    candidate_size_post_utility: 0.0,
+                    candidate_size_post_taper: 0.0,
+                    candidate_notional_post_utility: 0.0,
+                    ..blank
+                };
+            }
+        }
+        VenueUtilityTier::Suppressed => {}
+    }
+    if candidate_size_post_utility < lot_size_tao {
+        return QuotePruneDetails {
+            suppression_reason: Some("size_or_passivity_gated"),
+            prune_stage: "utility_scale_below_lot",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            candidate_size_pre_margin,
+            candidate_size_post_margin,
+            candidate_size_pre_utility,
+            candidate_size_post_utility,
+            ..blank
+        };
+    }
+    if candidate_size_post_utility * candidate_price < vcfg.min_notional_usd {
+        return QuotePruneDetails {
+            suppression_reason: Some("size_or_passivity_gated"),
+            prune_stage: "utility_scale_below_min_notional",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            candidate_size_pre_margin,
+            candidate_size_post_margin,
+            candidate_size_pre_utility,
+            candidate_size_post_utility,
+            candidate_notional_post_utility: candidate_size_post_utility * candidate_price,
+            ..blank
+        };
+    }
+
+    let candidate_size_post_taper = if utility.pre_soft_taper_active {
+        let taper_matches_side = matches!(
+            (utility.pre_soft_taper_side, side),
+            (Some(Side::Buy), Side::Buy) | (Some(Side::Sell), Side::Sell)
+        );
+        if taper_matches_side {
+            telemetry_scale_size(
+                candidate_size_post_utility,
+                utility.pre_soft_taper_size_multiplier,
+                candidate_price,
+                vcfg,
+            )
+            .unwrap_or(0.0)
+        } else {
+            candidate_size_post_utility
+        }
+    } else {
+        candidate_size_post_utility
+    };
+    if candidate_size_post_taper < lot_size_tao {
+        return QuotePruneDetails {
+            suppression_reason: Some("size_or_passivity_gated"),
+            prune_stage: "pre_soft_taper_below_lot",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            candidate_size_pre_margin,
+            candidate_size_post_margin,
+            candidate_size_pre_utility,
+            candidate_size_post_utility,
+            candidate_size_post_taper,
+            ..blank
+        };
+    }
+    if candidate_size_post_taper * candidate_price < vcfg.min_notional_usd {
+        return QuotePruneDetails {
+            suppression_reason: Some("size_or_passivity_gated"),
+            prune_stage: "pre_soft_taper_below_min_notional",
+            candidate_price_pre_utility: candidate_price,
+            candidate_edge_pre_utility: candidate_edge,
+            candidate_size_pre_margin,
+            candidate_size_post_margin,
+            candidate_size_pre_utility,
+            candidate_size_post_utility,
+            candidate_size_post_taper,
+            candidate_notional_post_utility: candidate_size_post_taper * candidate_price,
+            ..blank
+        };
+    }
+
+    QuotePruneDetails {
+        suppression_reason: None,
+        prune_stage: "active",
+        candidate_price_pre_utility: candidate_price,
+        candidate_edge_pre_utility: candidate_edge,
+        candidate_size_pre_margin,
+        candidate_size_post_margin,
+        candidate_size_pre_utility,
+        candidate_size_post_utility,
+        candidate_size_post_taper,
+        candidate_notional_post_utility: candidate_size_post_taper * candidate_price,
+    }
 }
 
 fn build_order_records(
@@ -1721,6 +2600,7 @@ fn build_fill_records(
     state: &GlobalState,
     fills: &[FillEvent],
     now_ms: TimestampMs,
+    source_fill_cache: &VecDeque<SourceFillAttribution>,
 ) -> Vec<JsonValue> {
     let mut out = Vec::new();
     for fill in fills {
@@ -1730,8 +2610,15 @@ fn build_fill_records(
             fill.order_id.as_deref(),
             fill.client_order_id.as_deref(),
         );
-        let hedge_source = matches!(fill.purpose, OrderPurpose::Hedge)
-            .then(|| attribute_hedge_source_decision(state, fill.side, now_ms));
+        let hedge_source = matches!(fill.purpose, OrderPurpose::Hedge).then(|| {
+            let source =
+                attribute_hedge_source_decision(state, fill.side, now_ms, source_fill_cache);
+            if source.source_decision_id.is_some() {
+                source
+            } else {
+                residual_hedge_fill_source_attribution(fill)
+            }
+        });
         out.push(serde_json::json!({
             "fill_seq": record.as_ref().map(|r| r.fill_seq),
             "venue_index": fill.venue_index as i64,
@@ -1764,6 +2651,9 @@ fn build_fill_records(
             "source_fill_age_ms": hedge_source
                 .as_ref()
                 .and_then(|source| source.source_fill_age_ms),
+            "source_kind": hedge_source
+                .as_ref()
+                .and_then(|source| source.source_kind),
         }));
     }
     out.sort_by_key(fill_sort_key);
@@ -1797,18 +2687,44 @@ struct HedgeSourceAttribution {
     source_fill_venue_index: Option<usize>,
     source_fill_venue_id: Option<String>,
     source_fill_age_ms: Option<TimestampMs>,
+    source_kind: Option<&'static str>,
 }
 
 fn attribute_hedge_source_decision(
     state: &GlobalState,
     hedge_side: Side,
     now_ms: TimestampMs,
+    source_fill_cache: &VecDeque<SourceFillAttribution>,
 ) -> HedgeSourceAttribution {
     let mm_fill_side = match hedge_side {
         Side::Buy => Side::Sell,
         Side::Sell => Side::Buy,
     };
     let mut best: Option<(TimestampMs, f64, HedgeSourceAttribution)> = None;
+
+    for fill in source_fill_cache.iter().rev() {
+        if fill.side != mm_fill_side {
+            continue;
+        }
+        let source_fill_age_ms = Some((now_ms - fill.fill_time_ms).max(0));
+        let candidate = HedgeSourceAttribution {
+            source_decision_id: Some(fill.source_decision_id.clone()),
+            source_fill_venue_index: Some(fill.venue_index),
+            source_fill_venue_id: Some(fill.venue_id.clone()),
+            source_fill_age_ms,
+            source_kind: Some("mm_fill_cache"),
+        };
+        let replace_best = match &best {
+            None => true,
+            Some((best_fill_time_ms, best_size, _)) => {
+                fill.fill_time_ms > *best_fill_time_ms
+                    || (fill.fill_time_ms == *best_fill_time_ms && fill.size > *best_size)
+            }
+        };
+        if replace_best {
+            best = Some((fill.fill_time_ms, fill.size, candidate));
+        }
+    }
 
     for (venue_index, venue) in state.venues.iter().enumerate() {
         for fill in venue.recent_fills.iter().rev() {
@@ -1828,6 +2744,7 @@ fn attribute_hedge_source_decision(
                 source_fill_venue_index: Some(venue_index),
                 source_fill_venue_id: Some(state.venues[venue_index].id.to_string()),
                 source_fill_age_ms,
+                source_kind: Some("mm_recent_fill"),
             };
             let replace_best = match &best {
                 None => true,
@@ -1843,7 +2760,61 @@ fn attribute_hedge_source_decision(
     }
 
     best.map(|(_, _, attribution)| attribution)
-        .unwrap_or_default()
+        .unwrap_or_else(|| residual_hedge_source_attribution(state, hedge_side))
+}
+
+fn residual_hedge_source_attribution(
+    state: &GlobalState,
+    hedge_side: Side,
+) -> HedgeSourceAttribution {
+    const EPS: f64 = 1e-9;
+    let residual_direction = match hedge_side {
+        Side::Buy => "short",
+        Side::Sell => "long",
+    };
+    let matching_position = |position_tao: f64| match hedge_side {
+        Side::Buy => position_tao < -EPS,
+        Side::Sell => position_tao > EPS,
+    };
+    let best = state
+        .venues
+        .iter()
+        .enumerate()
+        .filter(|(_, venue)| matching_position(venue.position_tao))
+        .max_by(|(_, lhs), (_, rhs)| {
+            lhs.position_tao
+                .abs()
+                .partial_cmp(&rhs.position_tao.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    let Some((venue_index, venue)) = best else {
+        return HedgeSourceAttribution::default();
+    };
+    HedgeSourceAttribution {
+        source_decision_id: Some(format!("residual:{}:{}", venue.id, residual_direction)),
+        source_fill_venue_index: Some(venue_index),
+        source_fill_venue_id: Some(venue.id.to_string()),
+        source_fill_age_ms: None,
+        source_kind: Some("residual_position"),
+    }
+}
+
+fn residual_hedge_fill_source_attribution(fill: &FillEvent) -> HedgeSourceAttribution {
+    let residual_direction = match fill.side {
+        Side::Buy => "short",
+        Side::Sell => "long",
+    };
+    HedgeSourceAttribution {
+        source_decision_id: Some(format!(
+            "residual:{}:{}",
+            fill.venue_id.as_ref(),
+            residual_direction
+        )),
+        source_fill_venue_index: Some(fill.venue_index),
+        source_fill_venue_id: Some(fill.venue_id.to_string()),
+        source_fill_age_ms: None,
+        source_kind: Some("residual_fill"),
+    }
 }
 
 fn fill_sort_key(value: &JsonValue) -> (i64, i64, i64, String) {
@@ -1996,6 +2967,7 @@ fn build_hedge_records(
     fills: &[FillEvent],
     last_hedge_intent: Option<&OrderIntent>,
     _now_ms: TimestampMs,
+    source_fill_cache: &VecDeque<SourceFillAttribution>,
 ) -> (Vec<JsonValue>, f64) {
     let mut out = Vec::new();
     let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
@@ -2026,7 +2998,8 @@ fn build_hedge_records(
                 .copied()
                 .unwrap_or(0.0);
             let venue = state.venues.get(pi.venue_index);
-            let source = attribute_hedge_source_decision(state, pi.side, _now_ms);
+            let source =
+                attribute_hedge_source_decision(state, pi.side, _now_ms, source_fill_cache);
             out.push(serde_json::json!({
                 "venue_index": pi.venue_index as i64,
                 "venue_id": pi.venue_id.as_ref(),
@@ -2046,6 +3019,7 @@ fn build_hedge_records(
                 "source_fill_venue_index": source.source_fill_venue_index.map(|venue_index| venue_index as i64),
                 "source_fill_venue_id": source.source_fill_venue_id,
                 "source_fill_age_ms": source.source_fill_age_ms,
+                "source_kind": source.source_kind,
             }));
         }
     }
@@ -2089,13 +3063,22 @@ fn build_venue_metrics(
     let effective_now = effective_now_for_staleness(state, now_ms);
     let generated_quotes = compute_mm_quotes_with_now(cfg, state, Some(now_ms));
     #[allow(clippy::type_complexity)]
-    let mut generated_quote_by_venue: Vec<(Option<f64>, Option<f64>, bool)> =
-        vec![(None, None, false); cfg.venues.len()];
+    let mut generated_quote_by_venue: Vec<(
+        Option<f64>,
+        Option<f64>,
+        bool,
+        bool,
+        bool,
+        Option<&'static str>,
+    )> = vec![(None, None, false, false, false, None); cfg.venues.len()];
     for quote in generated_quotes {
         generated_quote_by_venue[quote.venue_index] = (
             quote.bid.as_ref().map(|level| level.price),
             quote.ask.as_ref().map(|level| level.price),
             quote.generated_spread_cap_applied,
+            quote.generated_spread_cap_bid_suppressed,
+            quote.generated_spread_cap_ask_suppressed,
+            quote.touch_mode_kind,
         );
     }
 
@@ -2104,9 +3087,14 @@ fn build_venue_metrics(
     let mut venue_quote_spread_gate_reason = Vec::new();
     let mut venue_generated_quote_spread_bps = Vec::new();
     let mut venue_generated_quote_spread_cap_applied = Vec::new();
+    let mut venue_generated_quote_spread_cap_bid_suppressed = Vec::new();
+    let mut venue_generated_quote_spread_cap_ask_suppressed = Vec::new();
+    let mut venue_generated_quote_spread_cap_mode = Vec::new();
     let mut venue_bid_distance_to_touch_bps = Vec::new();
     let mut venue_ask_distance_to_touch_bps = Vec::new();
     let mut venue_touch_mode_applied = Vec::new();
+    let mut venue_touch_mode_kind = Vec::new();
+    let mut venue_touch_clip_applied = Vec::new();
     let mut venue_touch_offset_ticks = Vec::new();
     let mut venue_depth = Vec::new();
     let mut venue_status = Vec::new();
@@ -2166,7 +3154,14 @@ fn build_venue_metrics(
             venue.mid,
             venue.spread,
         ));
-        let (generated_bid, generated_ask, generated_cap_applied) = generated_quote_by_venue[idx];
+        let (
+            generated_bid,
+            generated_ask,
+            generated_cap_applied,
+            generated_cap_bid_suppressed,
+            generated_cap_ask_suppressed,
+            touch_mode_kind,
+        ) = generated_quote_by_venue[idx];
         let generated_spread_bps = match (generated_bid, generated_ask, venue.mid) {
             (Some(bid), Some(ask), Some(mid))
                 if bid.is_finite() && ask.is_finite() && mid > 0.0 =>
@@ -2177,6 +3172,13 @@ fn build_venue_metrics(
         };
         venue_generated_quote_spread_bps.push(generated_spread_bps);
         venue_generated_quote_spread_cap_applied.push(generated_cap_applied);
+        venue_generated_quote_spread_cap_bid_suppressed.push(generated_cap_bid_suppressed);
+        venue_generated_quote_spread_cap_ask_suppressed.push(generated_cap_ask_suppressed);
+        venue_generated_quote_spread_cap_mode.push(generated_spread_cap_mode(
+            generated_cap_applied,
+            generated_cap_bid_suppressed,
+            generated_cap_ask_suppressed,
+        ));
         let best_bid = venue
             .mid
             .zip(venue.spread)
@@ -2208,12 +3210,9 @@ fn build_venue_metrics(
         };
         venue_bid_distance_to_touch_bps.push(bid_distance_to_touch_bps);
         venue_ask_distance_to_touch_bps.push(ask_distance_to_touch_bps);
-        venue_touch_mode_applied.push(
-            cfg.venues[idx].id == "aster"
-                && cfg.mm.venue_role_for(&cfg.venues[idx].id) == MmVenueRole::Fill
-                && (bid_touch_offset_ticks <= 1.0 || ask_touch_offset_ticks <= 1.0)
-                && (generated_bid.is_some() || generated_ask.is_some()),
-        );
+        venue_touch_mode_applied.push(touch_mode_kind.is_some());
+        venue_touch_mode_kind.push(touch_mode_kind);
+        venue_touch_clip_applied.push(matches!(touch_mode_kind, Some("hyperliquid_clip")));
         venue_touch_offset_ticks.push(bid_touch_offset_ticks.max(ask_touch_offset_ticks));
         venue_depth.push(venue.depth_near_mid);
         let age_apply = compute_age_ms(effective_now, venue.last_mid_apply_ms);
@@ -2329,6 +3328,18 @@ fn build_venue_metrics(
             serde_json::json!(venue_generated_quote_spread_cap_applied),
         ),
         (
+            "venue_generated_quote_spread_cap_bid_suppressed".to_string(),
+            serde_json::json!(venue_generated_quote_spread_cap_bid_suppressed),
+        ),
+        (
+            "venue_generated_quote_spread_cap_ask_suppressed".to_string(),
+            serde_json::json!(venue_generated_quote_spread_cap_ask_suppressed),
+        ),
+        (
+            "venue_generated_quote_spread_cap_mode".to_string(),
+            serde_json::json!(venue_generated_quote_spread_cap_mode),
+        ),
+        (
             "venue_bid_distance_to_touch_bps".to_string(),
             serde_json::json!(venue_bid_distance_to_touch_bps),
         ),
@@ -2339,6 +3350,14 @@ fn build_venue_metrics(
         (
             "venue_touch_mode_applied".to_string(),
             serde_json::json!(venue_touch_mode_applied),
+        ),
+        (
+            "venue_touch_mode_kind".to_string(),
+            serde_json::json!(venue_touch_mode_kind),
+        ),
+        (
+            "venue_touch_clip_applied".to_string(),
+            serde_json::json!(venue_touch_clip_applied),
         ),
         (
             "venue_touch_offset_ticks".to_string(),
@@ -2526,9 +3545,9 @@ impl Drop for TelemetrySink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, MmVenueRole};
     use crate::state::GlobalState;
-    use crate::types::{FillEvent, OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce};
+    use crate::types::{PlaceOrderIntent, TimeInForce};
     use serde_json::json;
 
     #[test]
@@ -2628,6 +3647,77 @@ mod tests {
             .expect("venue_quote_spread_gate_reason");
 
         assert_eq!(reasons[0].as_str(), Some("spread_abs_cap"));
+    }
+
+    #[test]
+    fn generated_spread_cap_mode_distinguishes_compression_from_side_suppression() {
+        assert_eq!(generated_spread_cap_mode(false, false, false), "none");
+        assert_eq!(
+            generated_spread_cap_mode(true, false, false),
+            "compressed_only"
+        );
+        assert_eq!(generated_spread_cap_mode(true, true, false), "suppress_bid");
+        assert_eq!(generated_spread_cap_mode(true, false, true), "suppress_ask");
+        assert_eq!(generated_spread_cap_mode(true, true, true), "suppress_both");
+    }
+
+    #[test]
+    fn quote_diagnostics_does_not_false_flag_compressed_only_quotes_as_cap_suppressed() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        state.fv_available = true;
+        state.fair_value = Some(100.0);
+        state.fair_value_prev = 100.0;
+        state.sigma_eff = 0.01;
+        state.spread_mult = 1.0;
+        state.size_mult = 1.0;
+
+        let vcfg = &cfg.venues[1];
+        {
+            let venue = &mut state.venues[1];
+            venue.mid = Some(100.0);
+            venue.spread = Some(0.2);
+            venue.depth_near_mid = 10_000.0;
+            venue.last_mid_update_ms = Some(1_000);
+            venue.last_mid_apply_ms = Some(1_000);
+            venue.status = VenueStatus::Healthy;
+            venue.toxicity = 0.0;
+            venue.dist_liq_sigma = 10.0;
+            venue.margin_available_usd = 10_000.0;
+        }
+        let venue = &state.venues[1];
+
+        let utility = compute_venue_utility_decision(
+            &cfg.mm,
+            state.q_global_tao,
+            vcfg,
+            venue,
+            venue_utility_conversion_penalties_enabled(),
+        );
+        let maker_cost = mm_maker_cost(vcfg, 100.0);
+
+        let diag = quote_diagnostics(
+            &cfg,
+            &state,
+            vcfg,
+            venue,
+            100.0,
+            1_050,
+            Side::Sell,
+            0.0,
+            utility,
+            maker_cost,
+            100.20,
+            0.5,
+            cfg.mm.size_eta.max(1e-9),
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(diag.quote_state, "active");
+        assert_eq!(diag.suppression_reason, None);
+        assert_eq!(diag.prune_stage, "active");
     }
 
     #[test]
@@ -3140,6 +4230,161 @@ mod tests {
 
         assert_eq!(paradex_bid["edge_threshold"].as_f64(), Some(0.05));
         assert_eq!(paradex_ask["edge_threshold"].as_f64(), Some(0.5));
+        assert_eq!(paradex_bid["hedge_cost_edge_floor"].as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn quote_levels_include_hedge_cost_edge_floor_when_enabled() {
+        let mut cfg = Config::default();
+        cfg.mm.hedge_cost_edge_mult = 0.5;
+        cfg.mm.edge_local_min = 0.10;
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+        state.fair_value = Some(300.0);
+        state.fair_value_prev = 300.0;
+        state.fv_available = true;
+        state.sigma_eff = 0.1;
+        state.spread_mult = 1.0;
+        state.size_mult = 1.0;
+        state.vol_ratio_clipped = 1.0;
+        state.delta_limit_usd = 100_000.0;
+
+        for venue in &mut state.venues {
+            venue.mid = Some(300.0);
+            venue.spread = Some(1.0);
+            venue.depth_near_mid = 10_000.0;
+            venue.margin_available_usd = 10_000.0;
+            venue.dist_liq_sigma = 10.0;
+            venue.status = VenueStatus::Healthy;
+            venue.toxicity = 0.0;
+            venue.last_mid_update_ms = Some(now_ms - 10);
+            venue.last_mid_apply_ms = Some(now_ms - 10);
+        }
+
+        let expected_floor = 0.5 * (0.5 * 1.0 + 0.0004 * 300.0 + cfg.hedge.slippage_buffer);
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: false,
+            execution_mode: "live",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 0,
+            venue_health_diagnostics: &[],
+        });
+
+        let quote_levels = record
+            .get("quote_levels")
+            .and_then(|value| value.as_array())
+            .expect("quote_levels");
+        let aster_bid = quote_levels
+            .iter()
+            .find(|entry| entry["venue_id"] == "aster" && entry["side"] == "Bid")
+            .expect("aster bid quote level");
+        let hedge_floor = aster_bid["hedge_cost_edge_floor"]
+            .as_f64()
+            .expect("hedge_cost_edge_floor");
+        let edge_threshold = aster_bid["edge_threshold"]
+            .as_f64()
+            .expect("edge_threshold");
+
+        assert!((hedge_floor - expected_floor).abs() < 1e-9);
+        assert!((edge_threshold - (cfg.mm.edge_local_min + expected_floor)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quote_levels_report_utility_prune_stage_for_probationary_margin_limited_quote() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .edge_local_min_bid_by_venue
+            .insert("hyperliquid".to_string(), 0.01);
+        cfg.mm
+            .edge_local_min_ask_by_venue
+            .insert("hyperliquid".to_string(), 0.01);
+        cfg.mm
+            .venue_role_by_venue
+            .insert("hyperliquid".to_string(), MmVenueRole::Probationary);
+
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+        state.fair_value = Some(1_000.0);
+        state.fair_value_prev = 1_000.0;
+        state.fv_available = true;
+        state.sigma_eff = 0.1;
+        state.spread_mult = 1.0;
+        state.size_mult = 1.0;
+        state.vol_ratio_clipped = 1.0;
+        state.delta_limit_usd = 100_000.0;
+        state.q_global_tao = 0.0;
+
+        for venue in &mut state.venues {
+            venue.mid = Some(1_000.0);
+            venue.spread = Some(2.0);
+            venue.depth_near_mid = 10_000.0;
+            venue.margin_available_usd = 10_000.0;
+            venue.dist_liq_sigma = 10.0;
+            venue.status = VenueStatus::Healthy;
+            venue.toxicity = 0.0;
+            venue.last_mid_update_ms = Some(now_ms - 10);
+            venue.last_mid_apply_ms = Some(now_ms - 10);
+        }
+        state.venues[1].margin_available_usd = 4.0;
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: false,
+            execution_mode: "live",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 0,
+            venue_health_diagnostics: &[],
+        });
+
+        let quote_levels = record
+            .get("quote_levels")
+            .and_then(|value| value.as_array())
+            .expect("quote_levels");
+        let hyperliquid_ask = quote_levels
+            .iter()
+            .find(|entry| entry["venue_id"] == "hyperliquid" && entry["side"] == "Ask")
+            .expect("hyperliquid ask quote level");
+
+        assert_eq!(hyperliquid_ask["utility_role"], "probationary");
+        assert_eq!(hyperliquid_ask["utility_tier"], "reduced");
+        assert_eq!(
+            hyperliquid_ask["suppression_reason"],
+            "size_or_passivity_gated"
+        );
+        assert_eq!(hyperliquid_ask["prune_stage"], "utility_scale_below_lot");
+        assert!(
+            hyperliquid_ask["candidate_size_pre_utility"]
+                .as_f64()
+                .expect("candidate_size_pre_utility")
+                >= 0.01
+        );
+        assert_eq!(
+            hyperliquid_ask["candidate_size_post_utility"].as_f64(),
+            Some(0.0)
+        );
     }
 
     #[cfg(feature = "live")]
@@ -3247,5 +4492,343 @@ mod tests {
             .find(|fill| fill["purpose"] == "Hedge")
             .expect("hedge fill record");
         assert_eq!(hedge_fill_record["source_decision_id"], "mm_decision_1");
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn hedge_records_include_source_decision_id_from_cached_inferred_mm_fill() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let mm_fill_time_ms = 10_000;
+        let hedge_time_ms = mm_fill_time_ms + 120_000;
+
+        state.fair_value = Some(100.0);
+        state.fair_value_prev = 100.0;
+        state.venues[0].mid = Some(100.0);
+        state.venues[1].mid = Some(100.0);
+
+        state.live_order_state.register_mm_decision_lineage(
+            0,
+            "mm_coid_cached",
+            Side::Sell,
+            100.5,
+            0.25,
+            OrderPurpose::Mm,
+            "mm_decision_cached",
+            mm_fill_time_ms - 1,
+        );
+
+        let mm_fill = FillEvent {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            order_id: None,
+            client_order_id: Some("mm_coid_cached".to_string()),
+            seq: Some(1),
+            side: Side::Sell,
+            price: 100.5,
+            size: 0.25,
+            purpose: OrderPurpose::Mm,
+            fee_bps: 0.0,
+        };
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let _ = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms: mm_fill_time_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[mm_fill],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "paper",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        assert!(
+            state.venues[0].recent_fills.is_empty(),
+            "test must prove the telemetry cache, not state.recent_fills"
+        );
+
+        let hedge_intent = OrderIntent::Place(PlaceOrderIntent {
+            venue_index: 1,
+            venue_id: cfg.venues[1].id_arc.clone(),
+            side: Side::Buy,
+            price: 100.4,
+            size: 0.25,
+            purpose: OrderPurpose::Hedge,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: None,
+        });
+        let hedge_fill = FillEvent {
+            venue_index: 1,
+            venue_id: cfg.venues[1].id_arc.clone(),
+            order_id: None,
+            client_order_id: None,
+            seq: Some(2),
+            side: Side::Buy,
+            price: 100.4,
+            size: 0.25,
+            purpose: OrderPurpose::Hedge,
+            fee_bps: 0.0,
+        };
+
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 2,
+            now_ms: hedge_time_ms,
+            intents: &[hedge_intent],
+            exec_events: &[],
+            fills: &[hedge_fill],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "paper",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let hedges = record
+            .get("hedges")
+            .and_then(|value| value.as_array())
+            .expect("hedges");
+        assert_eq!(hedges.len(), 1);
+        assert_eq!(hedges[0]["source_decision_id"], "mm_decision_cached");
+        assert_eq!(
+            hedges[0]["source_fill_age_ms"].as_i64(),
+            Some(hedge_time_ms - mm_fill_time_ms)
+        );
+
+        let fills = record
+            .get("fills")
+            .and_then(|value| value.as_array())
+            .expect("fills");
+        let hedge_fill_record = fills
+            .iter()
+            .find(|fill| fill["purpose"] == "Hedge")
+            .expect("hedge fill record");
+        assert_eq!(
+            hedge_fill_record["source_decision_id"],
+            "mm_decision_cached"
+        );
+        assert_eq!(hedge_fill_record["source_kind"], "mm_fill_cache");
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn hedge_records_retain_source_decision_id_across_long_soak() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let mm_fill_time_ms = 10_000;
+        let hedge_time_ms = mm_fill_time_ms + 7_200_000;
+
+        state.fair_value = Some(100.0);
+        state.fair_value_prev = 100.0;
+        state.venues[0].mid = Some(100.0);
+        state.venues[1].mid = Some(100.0);
+
+        state.live_order_state.register_mm_decision_lineage(
+            0,
+            "mm_coid_long_soak",
+            Side::Sell,
+            100.5,
+            0.25,
+            OrderPurpose::Mm,
+            "mm_decision_long_soak",
+            mm_fill_time_ms - 1,
+        );
+
+        let mm_fill = FillEvent {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            order_id: None,
+            client_order_id: Some("mm_coid_long_soak".to_string()),
+            seq: Some(1),
+            side: Side::Sell,
+            price: 100.5,
+            size: 0.25,
+            purpose: OrderPurpose::Mm,
+            fee_bps: 0.0,
+        };
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let _ = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms: mm_fill_time_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[mm_fill],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "paper",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let hedge_intent = OrderIntent::Place(PlaceOrderIntent {
+            venue_index: 1,
+            venue_id: cfg.venues[1].id_arc.clone(),
+            side: Side::Buy,
+            price: 100.4,
+            size: 0.25,
+            purpose: OrderPurpose::Hedge,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: None,
+        });
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 2,
+            now_ms: hedge_time_ms,
+            intents: &[hedge_intent],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "paper",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let hedges = record
+            .get("hedges")
+            .and_then(|value| value.as_array())
+            .expect("hedges");
+        assert_eq!(hedges.len(), 1);
+        assert_eq!(hedges[0]["source_decision_id"], "mm_decision_long_soak");
+        assert_eq!(hedges[0]["source_kind"], "mm_fill_cache");
+        assert_eq!(
+            hedges[0]["source_fill_age_ms"].as_i64(),
+            Some(hedge_time_ms - mm_fill_time_ms)
+        );
+    }
+
+    #[test]
+    fn hedge_records_fallback_to_residual_source_when_no_mm_fill_lineage_exists() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+
+        state.fair_value = Some(100.0);
+        state.fair_value_prev = 100.0;
+        state.venues[1].mid = Some(100.0);
+        state.venues[1].position_tao = -0.01;
+
+        let hedge_intent = OrderIntent::Place(PlaceOrderIntent {
+            venue_index: 1,
+            venue_id: cfg.venues[1].id_arc.clone(),
+            side: Side::Buy,
+            price: 100.4,
+            size: 0.01,
+            purpose: OrderPurpose::Hedge,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: None,
+        });
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 7,
+            now_ms,
+            intents: &[hedge_intent],
+            exec_events: &[],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "paper",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let hedges = record
+            .get("hedges")
+            .and_then(|value| value.as_array())
+            .expect("hedges");
+        assert_eq!(hedges.len(), 1);
+        let expected_source = format!("residual:{}:short", cfg.venues[1].id);
+        assert_eq!(hedges[0]["source_decision_id"], expected_source.as_str());
+        assert_eq!(hedges[0]["source_fill_venue_id"], cfg.venues[1].id.as_str());
+        assert_eq!(hedges[0]["source_kind"], "residual_position");
+    }
+
+    #[test]
+    fn hedge_fill_records_fallback_to_residual_source_after_position_flattened() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+
+        let hedge_fill = FillEvent {
+            venue_index: 1,
+            venue_id: cfg.venues[1].id_arc.clone(),
+            order_id: None,
+            client_order_id: None,
+            seq: Some(2),
+            side: Side::Buy,
+            price: 100.4,
+            size: 0.01,
+            purpose: OrderPurpose::Hedge,
+            fee_bps: 0.0,
+        };
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 7,
+            now_ms,
+            intents: &[],
+            exec_events: &[],
+            fills: &[hedge_fill],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: true,
+            execution_mode: "paper",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let fills = record
+            .get("fills")
+            .and_then(|value| value.as_array())
+            .expect("fills");
+        assert_eq!(fills.len(), 1);
+        let expected_source = format!("residual:{}:short", cfg.venues[1].id);
+        assert_eq!(fills[0]["source_decision_id"], expected_source.as_str());
+        assert_eq!(fills[0]["source_fill_venue_id"], cfg.venues[1].id.as_str());
+        assert_eq!(fills[0]["source_kind"], "residual_fill");
     }
 }

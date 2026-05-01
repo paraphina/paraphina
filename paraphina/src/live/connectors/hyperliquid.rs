@@ -25,6 +25,9 @@ const HL_WS_CONNECT_TIMEOUT_MS_DEFAULT: u64 = 15_000;
 /// Maximum time to wait for a single WS frame before treating connection as dead.
 /// Prevents idle ESTABLISHED sockets from blocking the reconnect loop.
 const HL_WS_READ_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+const HL_WS_POST_RESPONSE_TIMEOUT_MS_DEFAULT: u64 = 15_000;
+const HL_WS_POST_CHANNEL_CAPACITY: usize = 256;
+const HL_WS_POST_MAX_INFLIGHT_DEFAULT: usize = 32;
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 static HL_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -40,6 +43,14 @@ fn hl_stale_ms() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(HL_STALE_MS_DEFAULT)
+}
+
+fn hl_internal_pub_q() -> usize {
+    std::env::var("PARAPHINA_HL_INTERNAL_PUB_Q")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(HL_INTERNAL_PUB_Q)
 }
 
 fn hl_ws_connect_timeout() -> Duration {
@@ -60,14 +71,72 @@ fn hl_ws_read_timeout() -> Duration {
     )
 }
 
+fn hl_ws_post_response_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("PARAPHINA_HL_WS_POST_RESPONSE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(HL_WS_POST_RESPONSE_TIMEOUT_MS_DEFAULT),
+    )
+}
+
+fn hl_ws_post_max_inflight() -> usize {
+    std::env::var("PARAPHINA_HL_WS_POST_MAX_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(HL_WS_POST_MAX_INFLIGHT_DEFAULT)
+}
+
 fn env_bool(var: &str) -> bool {
     std::env::var(var)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
+fn env_bool_default(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
+}
+
+fn hl_sync_control_http_fallback_enabled() -> bool {
+    env_bool_default("PARAPHINA_HL_SYNC_CONTROL_HTTP_FALLBACK_ENABLED", true)
+}
+
+fn hl_cancel_all_http_fallback_enabled() -> bool {
+    env_bool_default("PARAPHINA_HL_CANCEL_ALL_HTTP_FALLBACK_ENABLED", true)
+}
+
 fn hl_ws_audit_enabled() -> bool {
     *HL_WS_AUDIT_ENABLED.get_or_init(|| env_bool("PARAPHINA_WS_AUDIT"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HyperliquidActionTransport {
+    Http,
+    WsPost,
+}
+
+impl HyperliquidActionTransport {
+    fn from_env() -> Self {
+        match std::env::var("PARAPHINA_HL_ACTION_TRANSPORT")
+            .unwrap_or_else(|_| "http".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "ws_post" | "ws-post" | "ws" => Self::WsPost,
+            _ => Self::Http,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::WsPost => "ws_post",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -359,6 +428,25 @@ impl Freshness {
     }
 }
 
+#[derive(Debug)]
+struct HyperliquidPostRequest {
+    id: u64,
+    action_label: &'static str,
+    batch_kind: &'static str,
+    batch_size: usize,
+    payload: serde_json::Value,
+    response_tx: oneshot::Sender<anyhow::Result<()>>,
+}
+
+#[derive(Debug)]
+struct HyperliquidPostPending {
+    action_label: &'static str,
+    batch_kind: &'static str,
+    batch_size: usize,
+    sent_at: Instant,
+    response_tx: oneshot::Sender<anyhow::Result<()>>,
+}
+
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -368,12 +456,12 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use k256::ecdsa::SigningKey;
+use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha3::{Digest, Keccak256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::types::{
@@ -387,7 +475,7 @@ use super::super::types::{
 };
 use crate::live::gateway::{
     BoxFuture, LiveGatewayError, LiveRestCancelAllRequest, LiveRestCancelRequest, LiveRestClient,
-    LiveRestPlaceRequest, LiveRestResponse, LiveResult,
+    LiveRestPlaceRequest, LiveRestReplaceRequest, LiveRestResponse, LiveResult, TransportHint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,7 +604,7 @@ pub struct HyperliquidConnector {
     market_tx: mpsc::Sender<MarketDataEvent>,
     exec_tx: mpsc::Sender<ExecutionEvent>,
     account_tx: Option<mpsc::Sender<AccountEvent>>,
-    asset_index: tokio::sync::Mutex<Option<u32>>,
+    asset_meta: tokio::sync::Mutex<Option<HyperliquidAssetMeta>>,
     account_role: tokio::sync::Mutex<Option<HyperliquidUserRole>>,
     account_abstraction: tokio::sync::Mutex<Option<HyperliquidAccountAbstraction>>,
     freshness: Arc<Freshness>,
@@ -524,6 +612,12 @@ pub struct HyperliquidConnector {
     signing_key: Option<SigningKey>,
     /// Current endpoint index for round-robin rotation across ws_urls/rest_urls/info_urls.
     endpoint_index: std::sync::atomic::AtomicUsize,
+    action_transport: HyperliquidActionTransport,
+    action_nonce: AtomicU64,
+    post_request_seq: AtomicU64,
+    post_inflight: AtomicU64,
+    post_request_tx: mpsc::Sender<HyperliquidPostRequest>,
+    post_request_rx: tokio::sync::Mutex<mpsc::Receiver<HyperliquidPostRequest>>,
 }
 
 impl HyperliquidConnector {
@@ -532,6 +626,8 @@ impl HyperliquidConnector {
         market_tx: mpsc::Sender<MarketDataEvent>,
         exec_tx: mpsc::Sender<ExecutionEvent>,
     ) -> Self {
+        let action_transport = HyperliquidActionTransport::from_env();
+        let (post_request_tx, post_request_rx) = mpsc::channel(HL_WS_POST_CHANNEL_CAPACITY);
         let signing_key = cfg.private_key_hex.as_ref().and_then(|key_hex| {
             let trimmed = key_hex.trim_start_matches("0x");
             match hex::decode(trimmed) {
@@ -561,18 +657,32 @@ impl HyperliquidConnector {
             market_tx,
             exec_tx,
             account_tx: None,
-            asset_index: tokio::sync::Mutex::new(None),
+            asset_meta: tokio::sync::Mutex::new(None),
             account_role: tokio::sync::Mutex::new(None),
             account_abstraction: tokio::sync::Mutex::new(None),
             freshness: Arc::new(Freshness::default()),
             signing_key,
             endpoint_index: std::sync::atomic::AtomicUsize::new(0),
+            action_transport,
+            action_nonce: AtomicU64::new(0),
+            post_request_seq: AtomicU64::new(0),
+            post_inflight: AtomicU64::new(0),
+            post_request_tx,
+            post_request_rx: tokio::sync::Mutex::new(post_request_rx),
         }
     }
 
     pub fn with_account_tx(mut self, account_tx: mpsc::Sender<AccountEvent>) -> Self {
         self.account_tx = Some(account_tx);
         self
+    }
+
+    pub fn uses_ws_post_actions(&self) -> bool {
+        self.action_transport == HyperliquidActionTransport::WsPost
+    }
+
+    pub fn action_transport_label(&self) -> &'static str {
+        self.action_transport.label()
     }
 
     /// Return the current endpoint URLs without rotating.
@@ -828,7 +938,8 @@ impl HyperliquidConnector {
                 }
             });
         }
-        let (tx_int, mut rx_int) = tokio::sync::mpsc::channel::<MarketDataEvent>(HL_INTERNAL_PUB_Q);
+        let hl_internal_pub_q = hl_internal_pub_q();
+        let (tx_int, mut rx_int) = tokio::sync::mpsc::channel::<MarketDataEvent>(hl_internal_pub_q);
         let pending_latest = Arc::new(tokio::sync::Mutex::new(None::<MarketDataEvent>));
         let forward_market_tx = self.market_tx.clone();
         let forward_freshness = self.freshness.clone();
@@ -864,6 +975,7 @@ impl HyperliquidConnector {
         });
         fn maybe_emit_hl_pubq_audit(
             enabled: bool,
+            queue_cap: usize,
             ts_policy_enabled: bool,
             freshness: &Freshness,
             forward_audit: &HlForwardAudit,
@@ -881,7 +993,7 @@ impl HyperliquidConnector {
             if !enabled {
                 return;
             }
-            let queued_len = HL_INTERNAL_PUB_Q.saturating_sub(tx_int.capacity());
+            let queued_len = queue_cap.saturating_sub(tx_int.capacity());
             *queued_hiwater = (*queued_hiwater).max(queued_len);
             if let Ok(guard) = pending_latest.try_lock() {
                 *pending_latest_present = u8::from(guard.is_some());
@@ -906,7 +1018,7 @@ send_block_gt_250ms={} forward_send_count={} forward_send_err_count={} coalesced
 ts_missing_or_zero_count={} ts_clamped_past_skew_count={} ts_clamped_future_skew_count={} \
 ts_policy_enabled={} ts_policy_applied_count={} ts_kept_exchange_count={} ts_past_skew_max_ms={} ts_future_skew_max_ms={} \
 try_send_ok={} try_send_full={} emit_since_ms={}",
-                HL_INTERNAL_PUB_Q,
+                queue_cap,
                 queued_len,
                 (*queued_hiwater).max(queued_len),
                 *pending_latest_present,
@@ -970,6 +1082,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                         hl_pubq_try_send_ok = hl_pubq_try_send_ok.saturating_add(1);
                         maybe_emit_hl_pubq_audit(
                             hl_pubq_audit_enabled,
+                            hl_internal_pub_q,
                             hl_ts_policy.enabled,
                             freshness.as_ref(),
                             forward_audit.as_ref(),
@@ -1008,6 +1121,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                     if hl_pubq_audit_enabled {
                         maybe_emit_hl_pubq_audit(
                             hl_pubq_audit_enabled,
+                            hl_internal_pub_q,
                             hl_ts_policy.enabled,
                             freshness.as_ref(),
                             forward_audit.as_ref(),
@@ -1366,16 +1480,14 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
         .await?
         .map_err(|e| anyhow::anyhow!("Hyperliquid private WS connect error: {e}"))?;
         let (mut write, mut read) = ws_stream.split();
-        let sub_fills = json!({
-            "method": "subscribe",
-            "subscription": { "type": "userFills" }
-        });
-        write.send(Message::Text(sub_fills.to_string())).await?;
-        let sub_orders = json!({
-            "method": "subscribe",
-            "subscription": { "type": "userEvents" }
-        });
-        write.send(Message::Text(sub_orders.to_string())).await?;
+        let account_user = if self.account_tx.is_some() {
+            self.cfg.vault_address.as_deref()
+        } else {
+            None
+        };
+        for subscription in build_private_subscriptions(account_user) {
+            write.send(Message::Text(subscription.to_string())).await?;
+        }
         let ping_interval_ms: u64 = std::env::var("PARAPHINA_HL_PING_INTERVAL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1412,7 +1524,11 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                                 let _ = self.exec_tx.send(event).await;
                             }
                             if let Some(account_tx) = self.account_tx.as_ref() {
-                                if let Some(event) = translate_account_event(&value) {
+                                if let Some(event) = translate_account_event(
+                                    &value,
+                                    Some(self.cfg.coin.as_str()),
+                                    self.cfg.venue_index,
+                                ) {
                                     let _ = account_tx.send(event).await;
                                 }
                             }
@@ -1421,6 +1537,179 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                 }
             }
         }
+        Ok(())
+    }
+
+    pub async fn run_post_ws(&self) {
+        use rand::Rng;
+
+        if !self.uses_ws_post_actions() {
+            eprintln!("INFO: Hyperliquid post WS not enabled; transport=http");
+            return;
+        }
+
+        let mut backoff = Duration::from_secs(1);
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
+        loop {
+            let session_start = Instant::now();
+            if let Err(err) = self.post_ws_once().await {
+                eprintln!("Hyperliquid post WS error: {err}");
+            }
+
+            if session_start.elapsed() >= healthy_threshold {
+                backoff = Duration::from_secs(1);
+            }
+
+            let jitter = Duration::from_millis(
+                rand::thread_rng().gen_range(0..=backoff.as_millis().max(1) as u64 / 4),
+            );
+            tokio::time::sleep(backoff + jitter).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    async fn post_ws_once(&self) -> anyhow::Result<()> {
+        let connect_timeout = hl_ws_connect_timeout();
+        let read_timeout = hl_ws_read_timeout();
+        let ws_url = self.current_ws_url();
+
+        let (ws_stream, _) = with_timeout(
+            connect_timeout,
+            "post WS connect",
+            connect_async(ws_url.as_str()),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("Hyperliquid post WS connect error: {e}"))?;
+        let (mut write, mut read) = ws_stream.split();
+        let ping_interval_ms: u64 = std::env::var("PARAPHINA_HL_PING_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await;
+
+        let max_inflight = hl_ws_post_max_inflight();
+        let mut receiver = self.post_request_rx.lock().await;
+        let mut pending: BTreeMap<u64, HyperliquidPostPending> = BTreeMap::new();
+
+        loop {
+            tokio::select! {
+                _ = ping_timer.tick() => {
+                    if let Err(err) = write.send(Message::Text(r#"{"method":"ping"}"#.to_string())).await {
+                        self.fail_pending_post_requests(&mut pending, format!("Hyperliquid post WS ping send failed: {err}"));
+                        anyhow::bail!("Hyperliquid post WS ping send failed: {err}");
+                    }
+                }
+                maybe_req = receiver.recv() => {
+                    let Some(req) = maybe_req else {
+                        self.fail_pending_post_requests(&mut pending, "Hyperliquid post WS request channel closed".to_string());
+                        break;
+                    };
+                    if pending.len() >= max_inflight {
+                        let _ = req.response_tx.send(Err(anyhow::anyhow!(
+                            "Hyperliquid post WS inflight limit exceeded: {} >= {}",
+                            pending.len(),
+                            max_inflight
+                        )));
+                        continue;
+                    }
+                    let envelope = json!({
+                        "method": "post",
+                        "id": req.id,
+                        "request": {
+                            "type": "action",
+                            "payload": req.payload,
+                        }
+                    });
+                    if let Err(err) = write.send(Message::Text(envelope.to_string())).await {
+                        let _ = req.response_tx.send(Err(anyhow::anyhow!(
+                            "Hyperliquid post WS send failed: {err}"
+                        )));
+                        self.fail_pending_post_requests(&mut pending, format!("Hyperliquid post WS send failed: {err}"));
+                        anyhow::bail!("Hyperliquid post WS send failed: {err}");
+                    }
+                    let inflight = self.post_inflight.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!(
+                        "HL_POST_SUBMIT submit_path=ws_post post_id={} action_label={} batch_kind={} batch_size={} post_inflight={}",
+                        req.id,
+                        req.action_label,
+                        req.batch_kind,
+                        req.batch_size,
+                        inflight
+                    );
+                    pending.insert(req.id, HyperliquidPostPending {
+                        action_label: req.action_label,
+                        batch_kind: req.batch_kind,
+                        batch_size: req.batch_size,
+                        sent_at: Instant::now(),
+                        response_tx: req.response_tx,
+                    });
+                }
+                read_result = tokio::time::timeout(read_timeout, read.next()) => {
+                    let msg = match read_result {
+                        Ok(Some(msg)) => msg?,
+                        Ok(None) => {
+                            self.fail_pending_post_requests(&mut pending, "Hyperliquid post WS closed".to_string());
+                            break;
+                        }
+                        Err(_) => {
+                            self.fail_pending_post_requests(&mut pending, format!("Hyperliquid post WS read timeout after {read_timeout:?}"));
+                            anyhow::bail!("Hyperliquid post WS read timeout after {read_timeout:?}");
+                        }
+                    };
+                    let Message::Text(text) = msg else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                    if channel == "pong" || channel == "subscriptionResponse" {
+                        continue;
+                    }
+                    if channel != "post" {
+                        continue;
+                    }
+                    let Some((id, response_type, response_result)) = parse_ws_post_response(&value) else {
+                        continue;
+                    };
+                    let Some(pending_req) = pending.remove(&id) else {
+                        continue;
+                    };
+                    let inflight = self.post_inflight.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                    let latency_ms = pending_req.sent_at.elapsed().as_millis();
+                    eprintln!(
+                        "HL_POST_RESPONSE submit_path=ws_post post_id={} action_label={} batch_kind={} batch_size={} response_type={} post_latency_ms={} post_inflight={}",
+                        id,
+                        pending_req.action_label,
+                        pending_req.batch_kind,
+                        pending_req.batch_size,
+                        response_type,
+                        latency_ms,
+                        inflight
+                    );
+                    if let Err(err) = &response_result {
+                        eprintln!(
+                            "HL_POST_ACTION_ERR submit_path=ws_post post_id={} action_label={} batch_kind={} batch_size={} detail={}",
+                            id,
+                            pending_req.action_label,
+                            pending_req.batch_kind,
+                            pending_req.batch_size,
+                            err
+                        );
+                    }
+                    let _ = pending_req.response_tx.send(response_result);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1568,35 +1857,10 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             eprintln!("Hyperliquid paper mode: {:?}", intent);
             return Ok(());
         }
-        let asset_index = self.get_asset_index().await?;
-        let action = build_action(intent, asset_index)?;
-        let nonce = now_ms;
-        let sk = self
-            .signing_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
-        let signature = sign_action(&action, nonce, sk)?;
-        let mut payload = json!({
-            "action": action,
-            "nonce": nonce,
-            "signature": signature,
-        });
-        if let Some(vault_address) = self.effective_vault_address().await? {
-            payload["vaultAddress"] = json!(vault_address);
-        }
-        let rest_url = self.current_rest_url();
-        let resp = self
-            .http
-            .post(rest_url.as_str())
-            .json(&payload)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Hyperliquid order failed: {status} {body}");
-        }
-        Ok(())
+        let asset_meta = self.get_asset_meta().await?;
+        let action = build_action(intent, asset_meta)?;
+        self.submit_signed_action(action, now_ms, "order", "place_single", 1)
+            .await
     }
 
     pub async fn cancel_order(
@@ -1608,35 +1872,10 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             eprintln!("Hyperliquid paper mode cancel: {:?}", intent);
             return Ok(());
         }
-        let asset_index = self.get_asset_index().await?;
+        let asset_index = self.get_asset_meta().await?.index;
         let action = build_cancel_action(intent, asset_index)?;
-        let nonce = now_ms;
-        let sk = self
-            .signing_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
-        let signature = sign_action(&action, nonce, sk)?;
-        let mut payload = json!({
-            "action": action,
-            "nonce": nonce,
-            "signature": signature,
-        });
-        if let Some(vault_address) = self.effective_vault_address().await? {
-            payload["vaultAddress"] = json!(vault_address);
-        }
-        let rest_url = self.current_rest_url();
-        let resp = self
-            .http
-            .post(rest_url.as_str())
-            .json(&payload)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Hyperliquid cancel failed: {status} {body}");
-        }
-        Ok(())
+        self.submit_signed_action(action, now_ms, "cancel", "cancel_single", 1)
+            .await
     }
 
     pub async fn cancel_all(&self, now_ms: TimestampMs) -> anyhow::Result<()> {
@@ -1644,22 +1883,167 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             eprintln!("Hyperliquid paper mode cancel_all");
             return Ok(());
         }
-        let asset_index = self.get_asset_index().await?;
+        let asset_index = self.get_asset_meta().await?.index;
         let action = build_cancel_all_action(asset_index);
-        let nonce = now_ms;
+        self.submit_signed_action(action, now_ms, "cancel_all", "cancel_all", 1)
+            .await
+    }
+
+    async fn submit_signed_action_with_hint(
+        &self,
+        action: serde_json::Value,
+        now_ms: TimestampMs,
+        action_label: &'static str,
+        batch_kind: &'static str,
+        batch_size: usize,
+        hint: TransportHint,
+    ) -> anyhow::Result<()> {
+        let nonce = self.next_action_nonce(now_ms);
+        let payload = self.build_signed_payload(action, nonce).await?;
+        match self.action_transport_for(action_label, hint) {
+            HyperliquidActionTransport::Http => {
+                if self.action_transport == HyperliquidActionTransport::WsPost {
+                    eprintln!(
+                        "HL_ACTION_FALLBACK submit_path=http_control_fallback request_class={} action_label={} batch_kind={} batch_size={}",
+                        self.transport_hint_label(hint),
+                        action_label,
+                        batch_kind,
+                        batch_size,
+                    );
+                }
+                self.submit_signed_action_http(payload, action_label).await
+            }
+            HyperliquidActionTransport::WsPost => {
+                self.submit_signed_action_ws_post(payload, action_label, batch_kind, batch_size)
+                    .await
+            }
+        }
+    }
+
+    async fn submit_signed_action(
+        &self,
+        action: serde_json::Value,
+        now_ms: TimestampMs,
+        action_label: &'static str,
+        batch_kind: &'static str,
+        batch_size: usize,
+    ) -> anyhow::Result<()> {
+        self.submit_signed_action_with_hint(
+            action,
+            now_ms,
+            action_label,
+            batch_kind,
+            batch_size,
+            TransportHint::Default,
+        )
+        .await
+    }
+
+    fn action_transport_for(
+        &self,
+        action_label: &'static str,
+        hint: TransportHint,
+    ) -> HyperliquidActionTransport {
+        if self.action_transport != HyperliquidActionTransport::WsPost {
+            return self.action_transport;
+        }
+        if action_label == "cancel_all" && hl_cancel_all_http_fallback_enabled() {
+            return HyperliquidActionTransport::Http;
+        }
+        if hint.is_hyperliquid_sync_control() && hl_sync_control_http_fallback_enabled() {
+            return HyperliquidActionTransport::Http;
+        }
+        self.action_transport
+    }
+
+    fn transport_hint_label(&self, hint: TransportHint) -> &'static str {
+        match hint {
+            TransportHint::Default => "default",
+            TransportHint::HyperliquidSyncControl => "sync_control",
+        }
+    }
+
+    fn next_action_nonce(&self, requested_ms: TimestampMs) -> u64 {
+        let requested = if requested_ms > 0 {
+            requested_ms as u64
+        } else {
+            now_ms() as u64
+        };
+        let mut observed = self.action_nonce.load(Ordering::Relaxed);
+        loop {
+            let nonce = observed.max(requested);
+            match self.action_nonce.compare_exchange_weak(
+                observed,
+                nonce.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return nonce,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    async fn build_signed_payload(
+        &self,
+        action: serde_json::Value,
+        nonce: u64,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.build_signed_payload_with_vault_override(action, nonce, None)
+            .await
+    }
+
+    async fn build_signed_payload_with_vault_override(
+        &self,
+        action: serde_json::Value,
+        nonce: u64,
+        vault_address_override: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
         let sk = self
             .signing_key
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("HL_PRIVATE_KEY is required for live orders"))?;
-        let signature = sign_action(&action, nonce, sk)?;
+        let vault_address = if let Some(value) = vault_address_override {
+            Some(normalize_hl_address(value)?)
+        } else {
+            self.effective_vault_address()
+                .await?
+                .map(|value| normalize_hl_address(&value))
+                .transpose()?
+        };
+        let signature = sign_action(
+            &action,
+            vault_address.as_deref(),
+            nonce as TimestampMs,
+            matches!(self.cfg.network, HyperliquidNetwork::Mainnet),
+            sk,
+        )?;
         let mut payload = json!({
             "action": action,
             "nonce": nonce,
             "signature": signature,
         });
-        if let Some(vault_address) = self.effective_vault_address().await? {
+        if let Some(vault_address) = vault_address {
             payload["vaultAddress"] = json!(vault_address);
         }
+        Ok(payload)
+    }
+
+    async fn submit_signed_action_http(
+        &self,
+        payload: serde_json::Value,
+        action_label: &'static str,
+    ) -> anyhow::Result<()> {
+        self.submit_signed_action_http_json(payload, action_label)
+            .await
+            .map(|_| ())
+    }
+
+    async fn submit_signed_action_http_json(
+        &self,
+        payload: serde_json::Value,
+        action_label: &'static str,
+    ) -> anyhow::Result<serde_json::Value> {
         let rest_url = self.current_rest_url();
         let resp = self
             .http
@@ -1670,22 +2054,97 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Hyperliquid cancel_all failed: {status} {body}");
+            anyhow::bail!("Hyperliquid {action_label} failed: {status} {body}");
         }
-        Ok(())
+        let body = resp.text().await.unwrap_or_default();
+        let value = serde_json::from_str(&body).unwrap_or_else(|_| json!({ "raw": body }));
+        if let Some(error) = hyperliquid_exchange_response_error(&value) {
+            anyhow::bail!("Hyperliquid {action_label} rejected: {error}");
+        }
+        Ok(value)
     }
 
-    async fn get_asset_index(&self) -> anyhow::Result<u32> {
+    pub async fn reserve_request_weight(&self, weight: u64) -> anyhow::Result<serde_json::Value> {
+        let action = build_reserve_request_weight_action(weight)?;
+        let nonce = self.next_action_nonce(0);
+        let payload = self.build_signed_payload(action, nonce).await?;
+        self.submit_signed_action_http_json(payload, "reserve_request_weight")
+            .await
+    }
+
+    pub async fn reserve_request_weight_for_vault_address(
+        &self,
+        weight: u64,
+        vault_address: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let action = build_reserve_request_weight_action(weight)?;
+        let nonce = self.next_action_nonce(0);
+        let payload = self
+            .build_signed_payload_with_vault_override(action, nonce, Some(vault_address))
+            .await?;
+        self.submit_signed_action_http_json(payload, "reserve_request_weight")
+            .await
+    }
+
+    async fn submit_signed_action_ws_post(
+        &self,
+        payload: serde_json::Value,
+        action_label: &'static str,
+        batch_kind: &'static str,
+        batch_size: usize,
+    ) -> anyhow::Result<()> {
+        let post_id = self.post_request_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.post_request_tx
+            .send(HyperliquidPostRequest {
+                id: post_id,
+                action_label,
+                batch_kind,
+                batch_size,
+                payload,
+                response_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Hyperliquid post WS request channel closed"))?;
+        match tokio::time::timeout(hl_ws_post_response_timeout(), response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "Hyperliquid post WS response channel closed for action_label={action_label}"
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "Hyperliquid post WS response timeout after {:?} action_label={action_label}",
+                hl_ws_post_response_timeout()
+            )),
+        }
+    }
+
+    fn fail_pending_post_requests(
+        &self,
+        pending: &mut BTreeMap<u64, HyperliquidPostPending>,
+        message: String,
+    ) {
+        let count = pending.len() as u64;
+        if count > 0 {
+            self.post_inflight.fetch_sub(count, Ordering::Relaxed);
+        }
+        for (_id, pending_req) in std::mem::take(pending) {
+            let _ = pending_req
+                .response_tx
+                .send(Err(anyhow::anyhow!(message.clone())));
+        }
+    }
+
+    async fn get_asset_meta(&self) -> anyhow::Result<HyperliquidAssetMeta> {
         {
-            let guard = self.asset_index.lock().await;
-            if let Some(idx) = *guard {
-                return Ok(idx);
+            let guard = self.asset_meta.lock().await;
+            if let Some(meta) = *guard {
+                return Ok(meta);
             }
         }
-        let idx = fetch_asset_index(&self.http, &self.cfg, &self.current_info_url()).await?;
-        let mut guard = self.asset_index.lock().await;
-        *guard = Some(idx);
-        Ok(idx)
+        let meta = fetch_asset_meta(&self.http, &self.cfg, &self.current_info_url()).await?;
+        let mut guard = self.asset_meta.lock().await;
+        *guard = Some(meta);
+        Ok(meta)
     }
 
     async fn effective_vault_address(&self) -> anyhow::Result<Option<String>> {
@@ -1708,7 +2167,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
         Ok(role.requires_vault_address().then_some(address))
     }
 
-    async fn fetch_account_snapshot(&self) -> anyhow::Result<AccountEvent> {
+    pub async fn fetch_account_snapshot(&self) -> anyhow::Result<AccountEvent> {
         let user =
             self.cfg.vault_address.clone().ok_or_else(|| {
                 anyhow::anyhow!("HL_VAULT_ADDRESS is required for account polling")
@@ -1794,7 +2253,46 @@ impl LiveRestClient for HyperliquidConnector {
             });
             HyperliquidConnector::place_order(self, &intent, 0)
                 .await
-                .map(|_| LiveRestResponse { order_id: None })
+                .map(|_| LiveRestResponse {
+                    order_id: None,
+                    client_order_id: Some(req.client_order_id),
+                })
+                .map_err(map_rest_error)
+        })
+    }
+
+    fn place_order_with_hint(
+        &self,
+        req: LiveRestPlaceRequest,
+        hint: TransportHint,
+    ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
+        Box::pin(async move {
+            let intent = OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: req.venue_index,
+                venue_id: req.venue_id.as_str().into(),
+                side: req.side,
+                price: req.price,
+                size: req.size,
+                purpose: req.purpose,
+                time_in_force: req.time_in_force,
+                post_only: req.post_only,
+                reduce_only: req.reduce_only,
+                client_order_id: Some(req.client_order_id.clone()),
+            });
+            if self.cfg.paper_mode {
+                return Ok(LiveRestResponse {
+                    order_id: Some(req.client_order_id.clone()),
+                    client_order_id: Some(req.client_order_id),
+                });
+            }
+            let asset_meta = self.get_asset_meta().await.map_err(map_rest_error)?;
+            let action = build_action(&intent, asset_meta).map_err(map_rest_error)?;
+            self.submit_signed_action_with_hint(action, 0, "order", "place_single", 1, hint)
+                .await
+                .map(|_| LiveRestResponse {
+                    order_id: Some(req.client_order_id.clone()),
+                    client_order_id: Some(req.client_order_id),
+                })
                 .map_err(map_rest_error)
         })
     }
@@ -1811,7 +2309,39 @@ impl LiveRestClient for HyperliquidConnector {
             });
             HyperliquidConnector::cancel_order(self, &intent, 0)
                 .await
-                .map(|_| LiveRestResponse { order_id: None })
+                .map(|_| LiveRestResponse {
+                    order_id: Some(req.order_id),
+                    client_order_id: None,
+                })
+                .map_err(map_rest_error)
+        })
+    }
+
+    fn cancel_order_with_hint(
+        &self,
+        req: LiveRestCancelRequest,
+        hint: TransportHint,
+    ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
+        Box::pin(async move {
+            let intent = OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: req.venue_index,
+                venue_id: req.venue_id.as_str().into(),
+                order_id: req.order_id.clone(),
+            });
+            if self.cfg.paper_mode {
+                return Ok(LiveRestResponse {
+                    order_id: Some(req.order_id),
+                    client_order_id: None,
+                });
+            }
+            let asset_index = self.get_asset_meta().await.map_err(map_rest_error)?.index;
+            let action = build_cancel_action(&intent, asset_index).map_err(map_rest_error)?;
+            self.submit_signed_action_with_hint(action, 0, "cancel", "cancel_single", 1, hint)
+                .await
+                .map(|_| LiveRestResponse {
+                    order_id: Some(req.order_id),
+                    client_order_id: None,
+                })
                 .map_err(map_rest_error)
         })
     }
@@ -1823,8 +2353,419 @@ impl LiveRestClient for HyperliquidConnector {
         Box::pin(async move {
             HyperliquidConnector::cancel_all(self, 0)
                 .await
-                .map(|_| LiveRestResponse { order_id: None })
+                .map(|_| LiveRestResponse {
+                    order_id: None,
+                    client_order_id: None,
+                })
                 .map_err(map_rest_error)
+        })
+    }
+
+    fn cancel_all_with_hint(
+        &self,
+        _req: LiveRestCancelAllRequest,
+        hint: TransportHint,
+    ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
+        Box::pin(async move {
+            if self.cfg.paper_mode {
+                return Ok(LiveRestResponse {
+                    order_id: None,
+                    client_order_id: None,
+                });
+            }
+            let asset_index = self.get_asset_meta().await.map_err(map_rest_error)?.index;
+            let action = build_cancel_all_action(asset_index);
+            self.submit_signed_action_with_hint(action, 0, "cancel_all", "cancel_all", 1, hint)
+                .await
+                .map(|_| LiveRestResponse {
+                    order_id: None,
+                    client_order_id: None,
+                })
+                .map_err(map_rest_error)
+        })
+    }
+
+    fn replace_order(
+        &self,
+        req: LiveRestReplaceRequest,
+    ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
+        self.replace_order_with_hint(req, TransportHint::Default)
+    }
+
+    fn replace_order_with_hint(
+        &self,
+        req: LiveRestReplaceRequest,
+        hint: TransportHint,
+    ) -> BoxFuture<'_, LiveResult<LiveRestResponse>> {
+        Box::pin(async move {
+            if !req.post_only
+                || req.reduce_only
+                || req.purpose != OrderPurpose::Mm
+                || !is_hyperliquid_cloid(&req.order_id)
+            {
+                return Err(LiveGatewayError::fatal(
+                    "hyperliquid native replace unsupported for request",
+                ));
+            }
+            if self.cfg.paper_mode {
+                return Ok(LiveRestResponse {
+                    order_id: Some(req.client_order_id.clone()),
+                    client_order_id: Some(req.client_order_id),
+                });
+            }
+            let asset_meta = self.get_asset_meta().await.map_err(map_rest_error)?;
+            let action = build_modify_action(&req, asset_meta).map_err(map_rest_error)?;
+            self.submit_signed_action_with_hint(action, 0, "modify", "modify_alo", 1, hint)
+                .await
+                .map(|_| LiveRestResponse {
+                    order_id: Some(req.client_order_id.clone()),
+                    client_order_id: Some(req.client_order_id),
+                })
+                .map_err(map_rest_error)
+        })
+    }
+
+    fn place_batch(
+        &self,
+        reqs: Vec<LiveRestPlaceRequest>,
+    ) -> BoxFuture<'_, Vec<LiveResult<LiveRestResponse>>> {
+        Box::pin(async move {
+            if reqs.is_empty() {
+                return Vec::new();
+            }
+            if self.cfg.paper_mode {
+                return reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.client_order_id),
+                            client_order_id: None,
+                        })
+                    })
+                    .collect();
+            }
+
+            let asset_meta = match self.get_asset_meta().await {
+                Ok(asset_meta) => asset_meta,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            let intents: Vec<crate::types::PlaceOrderIntent> = reqs
+                .iter()
+                .map(|req| crate::types::PlaceOrderIntent {
+                    venue_index: req.venue_index,
+                    venue_id: req.venue_id.as_str().into(),
+                    side: req.side,
+                    price: req.price,
+                    size: req.size,
+                    purpose: req.purpose,
+                    time_in_force: req.time_in_force,
+                    post_only: req.post_only,
+                    reduce_only: req.reduce_only,
+                    client_order_id: Some(req.client_order_id.clone()),
+                })
+                .collect();
+            let intent_refs: Vec<&crate::types::PlaceOrderIntent> = intents.iter().collect();
+            let action = match build_batch_action(&intent_refs, asset_meta) {
+                Ok(action) => action,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            match self
+                .submit_signed_action(action, 0, "order_batch", "place_alo", reqs.len())
+                .await
+            {
+                Ok(()) => reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.client_order_id),
+                            client_order_id: None,
+                        })
+                    })
+                    .collect(),
+                Err(err) => {
+                    let mapped = map_rest_error(err);
+                    vec![Err(mapped); reqs.len()]
+                }
+            }
+        })
+    }
+
+    fn place_batch_with_hint(
+        &self,
+        reqs: Vec<LiveRestPlaceRequest>,
+        hint: TransportHint,
+    ) -> BoxFuture<'_, Vec<LiveResult<LiveRestResponse>>> {
+        Box::pin(async move {
+            if reqs.is_empty() {
+                return Vec::new();
+            }
+            if self.cfg.paper_mode {
+                return reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.client_order_id),
+                            client_order_id: None,
+                        })
+                    })
+                    .collect();
+            }
+
+            let asset_meta = match self.get_asset_meta().await {
+                Ok(asset_meta) => asset_meta,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            let intents: Vec<crate::types::PlaceOrderIntent> = reqs
+                .iter()
+                .map(|req| crate::types::PlaceOrderIntent {
+                    venue_index: req.venue_index,
+                    venue_id: req.venue_id.as_str().into(),
+                    side: req.side,
+                    price: req.price,
+                    size: req.size,
+                    purpose: req.purpose,
+                    time_in_force: req.time_in_force,
+                    post_only: req.post_only,
+                    reduce_only: req.reduce_only,
+                    client_order_id: Some(req.client_order_id.clone()),
+                })
+                .collect();
+            let intent_refs: Vec<&crate::types::PlaceOrderIntent> = intents.iter().collect();
+            let action = match build_batch_action(&intent_refs, asset_meta) {
+                Ok(action) => action,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            match self
+                .submit_signed_action_with_hint(
+                    action,
+                    0,
+                    "order_batch",
+                    "place_alo",
+                    reqs.len(),
+                    hint,
+                )
+                .await
+            {
+                Ok(()) => reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.client_order_id),
+                            client_order_id: None,
+                        })
+                    })
+                    .collect(),
+                Err(err) => {
+                    let mapped = map_rest_error(err);
+                    vec![Err(mapped); reqs.len()]
+                }
+            }
+        })
+    }
+
+    fn cancel_batch(
+        &self,
+        reqs: Vec<LiveRestCancelRequest>,
+    ) -> BoxFuture<'_, Vec<LiveResult<LiveRestResponse>>> {
+        Box::pin(async move {
+            if reqs.is_empty() {
+                return Vec::new();
+            }
+            if self.cfg.paper_mode {
+                return reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.order_id),
+                            client_order_id: None,
+                        })
+                    })
+                    .collect();
+            }
+
+            let asset_index = match self.get_asset_meta().await {
+                Ok(asset_meta) => asset_meta.index,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            let intents: Vec<crate::types::CancelOrderIntent> = reqs
+                .iter()
+                .map(|req| crate::types::CancelOrderIntent {
+                    venue_index: req.venue_index,
+                    venue_id: req.venue_id.as_str().into(),
+                    order_id: req.order_id.clone(),
+                })
+                .collect();
+            let intent_refs: Vec<&crate::types::CancelOrderIntent> = intents.iter().collect();
+            let (action, kind) = match build_batch_cancel_action(&intent_refs, asset_index) {
+                Ok(result) => result,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            let batch_kind = match kind {
+                HyperliquidCancelBatchKind::Oid => "cancel_oid",
+                HyperliquidCancelBatchKind::Cloid => "cancel_by_cloid",
+            };
+            match self
+                .submit_signed_action(action, 0, "cancel_batch", batch_kind, reqs.len())
+                .await
+            {
+                Ok(()) => reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.order_id),
+                            client_order_id: None,
+                        })
+                    })
+                    .collect(),
+                Err(err) => {
+                    let mapped = map_rest_error(err);
+                    vec![Err(mapped); reqs.len()]
+                }
+            }
+        })
+    }
+
+    fn cancel_batch_with_hint(
+        &self,
+        reqs: Vec<LiveRestCancelRequest>,
+        hint: TransportHint,
+    ) -> BoxFuture<'_, Vec<LiveResult<LiveRestResponse>>> {
+        Box::pin(async move {
+            if reqs.is_empty() {
+                return Vec::new();
+            }
+            if self.cfg.paper_mode {
+                return reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.order_id),
+                            client_order_id: None,
+                        })
+                    })
+                    .collect();
+            }
+
+            let asset_index = match self.get_asset_meta().await {
+                Ok(asset_meta) => asset_meta.index,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            let intents: Vec<crate::types::CancelOrderIntent> = reqs
+                .iter()
+                .map(|req| crate::types::CancelOrderIntent {
+                    venue_index: req.venue_index,
+                    venue_id: req.venue_id.as_str().into(),
+                    order_id: req.order_id.clone(),
+                })
+                .collect();
+            let intent_refs: Vec<&crate::types::CancelOrderIntent> = intents.iter().collect();
+            let (action, kind) = match build_batch_cancel_action(&intent_refs, asset_index) {
+                Ok(result) => result,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            let batch_kind = match kind {
+                HyperliquidCancelBatchKind::Oid => "cancel_oid",
+                HyperliquidCancelBatchKind::Cloid => "cancel_by_cloid",
+            };
+            match self
+                .submit_signed_action_with_hint(
+                    action,
+                    0,
+                    "cancel_batch",
+                    batch_kind,
+                    reqs.len(),
+                    hint,
+                )
+                .await
+            {
+                Ok(()) => reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.order_id),
+                            client_order_id: None,
+                        })
+                    })
+                    .collect(),
+                Err(err) => {
+                    let mapped = map_rest_error(err);
+                    vec![Err(mapped); reqs.len()]
+                }
+            }
+        })
+    }
+
+    fn replace_batch(
+        &self,
+        reqs: Vec<LiveRestReplaceRequest>,
+    ) -> BoxFuture<'_, Vec<LiveResult<LiveRestResponse>>> {
+        self.replace_batch_with_hint(reqs, TransportHint::Default)
+    }
+
+    fn replace_batch_with_hint(
+        &self,
+        reqs: Vec<LiveRestReplaceRequest>,
+        hint: TransportHint,
+    ) -> BoxFuture<'_, Vec<LiveResult<LiveRestResponse>>> {
+        Box::pin(async move {
+            if reqs.is_empty() {
+                return Vec::new();
+            }
+            if reqs.iter().any(|req| {
+                !req.post_only
+                    || req.reduce_only
+                    || req.purpose != OrderPurpose::Mm
+                    || !is_hyperliquid_cloid(&req.order_id)
+            }) {
+                let err = LiveGatewayError::fatal(
+                    "hyperliquid native replace batch unsupported for request",
+                );
+                return vec![Err(err); reqs.len()];
+            }
+            if self.cfg.paper_mode {
+                return reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.client_order_id.clone()),
+                            client_order_id: Some(req.client_order_id),
+                        })
+                    })
+                    .collect();
+            }
+            let asset_meta = match self.get_asset_meta().await {
+                Ok(asset_meta) => asset_meta,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            let action = match build_batch_modify_action(&reqs, asset_meta) {
+                Ok(action) => action,
+                Err(err) => return vec![Err(map_rest_error(err)); reqs.len()],
+            };
+            match self
+                .submit_signed_action_with_hint(
+                    action,
+                    0,
+                    "modify_batch",
+                    "modify_alo",
+                    reqs.len(),
+                    hint,
+                )
+                .await
+            {
+                Ok(()) => reqs
+                    .into_iter()
+                    .map(|req| {
+                        Ok(LiveRestResponse {
+                            order_id: Some(req.client_order_id.clone()),
+                            client_order_id: Some(req.client_order_id),
+                        })
+                    })
+                    .collect(),
+                Err(err) => {
+                    let mapped = map_rest_error(err);
+                    vec![Err(mapped); reqs.len()]
+                }
+            }
         })
     }
 }
@@ -2404,11 +3345,11 @@ pub async fn fetch_l2_snapshot(
     Ok(MarketDataEvent::L2Snapshot(snapshot))
 }
 
-async fn fetch_asset_index(
+async fn fetch_asset_meta(
     client: &Client,
     cfg: &HyperliquidConfig,
     info_url: &str,
-) -> anyhow::Result<u32> {
+) -> anyhow::Result<HyperliquidAssetMeta> {
     let payload = json!({ "type": "meta" });
     let resp = client.post(info_url).json(&payload).send().await?;
     let value: serde_json::Value = resp.json().await?;
@@ -2423,7 +3364,15 @@ async fn fetch_asset_index(
             .map(|name| name.eq_ignore_ascii_case(&cfg.coin))
             .unwrap_or(false)
         {
-            return Ok(idx as u32);
+            let sz_decimals = entry
+                .get("szDecimals")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("missing szDecimals for coin {}", cfg.coin))?
+                as u32;
+            return Ok(HyperliquidAssetMeta {
+                index: idx as u32,
+                sz_decimals,
+            });
         }
     }
     anyhow::bail!("coin {} not found in Hyperliquid universe", cfg.coin);
@@ -2433,8 +3382,109 @@ fn build_account_snapshot_request(user: &str) -> serde_json::Value {
     json!({ "type": "clearinghouseState", "user": user })
 }
 
+fn build_private_subscriptions(account_user: Option<&str>) -> Vec<serde_json::Value> {
+    let mut subscriptions = vec![
+        json!({
+            "method": "subscribe",
+            "subscription": { "type": "userFills" }
+        }),
+        json!({
+            "method": "subscribe",
+            "subscription": { "type": "userEvents" }
+        }),
+    ];
+    if let Some(user) = account_user {
+        subscriptions.push(json!({
+            "method": "subscribe",
+            "subscription": { "type": "clearinghouseState", "user": user }
+        }));
+    }
+    subscriptions
+}
+
 fn build_spot_clearinghouse_state_request(user: &str) -> serde_json::Value {
     json!({ "type": "spotClearinghouseState", "user": user })
+}
+
+pub async fn fetch_user_rate_limit(
+    client: &Client,
+    info_url: &str,
+    user: &str,
+) -> anyhow::Result<serde_json::Value> {
+    post_info_request_json(
+        client,
+        info_url,
+        &json!({
+            "type": "userRateLimit",
+            "user": user,
+        }),
+    )
+    .await
+}
+
+pub async fn fetch_clearinghouse_state(
+    client: &Client,
+    info_url: &str,
+    user: &str,
+) -> anyhow::Result<serde_json::Value> {
+    post_info_request_json(client, info_url, &build_account_snapshot_request(user)).await
+}
+
+pub async fn fetch_user_abstraction_raw(
+    client: &Client,
+    info_url: &str,
+    user: &str,
+) -> anyhow::Result<serde_json::Value> {
+    post_info_request_json(
+        client,
+        info_url,
+        &json!({
+            "type": "userAbstraction",
+            "user": user,
+        }),
+    )
+    .await
+}
+
+pub async fn fetch_spot_clearinghouse_state(
+    client: &Client,
+    info_url: &str,
+    user: &str,
+) -> anyhow::Result<serde_json::Value> {
+    post_info_request_json(
+        client,
+        info_url,
+        &build_spot_clearinghouse_state_request(user),
+    )
+    .await
+}
+
+pub fn summarize_clearinghouse_state(value: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "marginSummary": value.get("marginSummary").cloned().unwrap_or(serde_json::Value::Null),
+        "crossMarginSummary": value.get("crossMarginSummary").cloned().unwrap_or(serde_json::Value::Null),
+        "withdrawable": value.get("withdrawable").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
+pub fn summarize_spot_clearinghouse_state(value: &serde_json::Value) -> serde_json::Value {
+    let usdc = value
+        .get("balances")
+        .and_then(|balances| balances.as_array())
+        .and_then(|balances| {
+            balances
+                .iter()
+                .find(|balance| balance.get("coin").and_then(|coin| coin.as_str()) == Some("USDC"))
+        })
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    json!({
+        "usdc": usdc,
+        "tokenToAvailableAfterMaintenance": value
+            .get("tokenToAvailableAfterMaintenance")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
 }
 
 async fn post_info_request_json(
@@ -2667,10 +3717,125 @@ fn parse_public_funding(
     })
 }
 
-fn build_action(intent: &OrderIntent, asset_index: u32) -> anyhow::Result<serde_json::Value> {
-    let OrderIntent::Place(place) = intent else {
-        anyhow::bail!("intent not a place order");
-    };
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlLimitOrderType {
+    tif: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HyperliquidAssetMeta {
+    index: u32,
+    sz_decimals: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HlTriggerOrderType {
+    is_market: bool,
+    trigger_px: String,
+    tpsl: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum HlOrderType {
+    Limit { limit: HlLimitOrderType },
+    Trigger { trigger: HlTriggerOrderType },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlOrderWire {
+    a: u32,
+    b: bool,
+    p: String,
+    s: String,
+    r: bool,
+    t: HlOrderType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    c: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlOrderAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    orders: Vec<HlOrderWire>,
+    grouping: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    builder: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlCancelOidWire {
+    a: u32,
+    o: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlCancelOidAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    cancels: Vec<HlCancelOidWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlCancelCloidWire {
+    asset: u32,
+    cloid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlCancelCloidAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    cancels: Vec<HlCancelCloidWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlCancelAllAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    asset: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlNoopAction {
+    #[serde(rename = "type")]
+    action_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlReserveRequestWeightAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    weight: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlModifyAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    oid: serde_json::Value,
+    order: HlOrderWire,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlBatchModifyWire {
+    oid: serde_json::Value,
+    order: HlOrderWire,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HlBatchModifyAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    modifies: Vec<HlBatchModifyWire>,
+}
+
+fn build_hl_order_wire(
+    place: &crate::types::PlaceOrderIntent,
+    asset_meta: HyperliquidAssetMeta,
+) -> HlOrderWire {
     let tif = if place.post_only {
         "Alo"
     } else {
@@ -2679,70 +3844,231 @@ fn build_action(intent: &OrderIntent, asset_index: u32) -> anyhow::Result<serde_
             TimeInForce::Ioc => "Ioc",
         }
     };
-    let order = json!({
-        "a": asset_index,
-        "b": place.side == Side::Buy,
-        "p": format!("{:.8}", place.price),
-        "s": format!("{:.8}", place.size),
-        "r": place.reduce_only,
-        "t": { "limit": { "tif": tif } },
-        "c": place.client_order_id,
-    });
-    Ok(json!({
-        "type": "order",
-        "orders": [order],
-        "grouping": "na",
-    }))
+    let price = quantize_hl_price(place.price, place.side, asset_meta);
+    HlOrderWire {
+        a: asset_meta.index,
+        b: place.side == Side::Buy,
+        // Match Hyperliquid SDK wire formatting after snapping to the venue's
+        // valid price grid (5 significant figures and max venue decimals).
+        p: hl_float_to_wire(price),
+        s: hl_float_to_wire(place.size),
+        r: place.reduce_only,
+        t: HlOrderType::Limit {
+            limit: HlLimitOrderType {
+                tif: tif.to_string(),
+            },
+        },
+        c: place.client_order_id.clone(),
+    }
+}
+
+fn hl_float_to_wire(value: f64) -> String {
+    let mut wire = format!("{:.8}", value);
+    while wire.ends_with('0') {
+        wire.pop();
+    }
+    if wire.ends_with('.') {
+        wire.pop();
+    }
+    if wire == "-0" {
+        "0".to_string()
+    } else {
+        wire
+    }
+}
+
+fn max_hl_price_decimals(sz_decimals: u32, asset_index: u32) -> u32 {
+    let max_decimals: u32 = if asset_index < 10_000 { 6 } else { 8 };
+    max_decimals.saturating_sub(sz_decimals)
+}
+
+fn quantize_hl_price(value: f64, side: Side, asset_meta: HyperliquidAssetMeta) -> f64 {
+    if !value.is_finite() || value == 0.0 {
+        return value;
+    }
+
+    let price_decimals = max_hl_price_decimals(asset_meta.sz_decimals, asset_meta.index);
+    let decimal_step = 10f64.powi(-(price_decimals as i32));
+    let magnitude = value.abs().log10().floor() as i32;
+    let sig_step = 10f64.powi(magnitude - 5 + 1);
+    let step = decimal_step.max(sig_step);
+    let scaled = value / step;
+    let snapped = match side {
+        Side::Buy => scaled.floor() * step,
+        Side::Sell => scaled.ceil() * step,
+    };
+
+    if snapped == -0.0 {
+        0.0
+    } else {
+        snapped
+    }
+}
+
+fn build_action(
+    intent: &OrderIntent,
+    asset_meta: HyperliquidAssetMeta,
+) -> anyhow::Result<serde_json::Value> {
+    let OrderIntent::Place(place) = intent else {
+        anyhow::bail!("intent not a place order");
+    };
+    let action = HlOrderAction {
+        action_type: "order".to_string(),
+        orders: vec![build_hl_order_wire(place, asset_meta)],
+        grouping: "na".to_string(),
+        builder: None,
+    };
+    Ok(serde_json::to_value(action)?)
 }
 
 /// Build a batch order action with N orders in a single API call.
 /// Weight cost: 1 + floor(N/40). For N<=39, cost is weight 1 (same as a single order).
 fn build_batch_action(
     places: &[&crate::types::PlaceOrderIntent],
-    asset_index: u32,
+    asset_meta: HyperliquidAssetMeta,
 ) -> anyhow::Result<serde_json::Value> {
-    let orders: Vec<serde_json::Value> = places
+    let action = HlOrderAction {
+        action_type: "order".to_string(),
+        orders: places
+            .iter()
+            .map(|place| build_hl_order_wire(place, asset_meta))
+            .collect(),
+        grouping: "na".to_string(),
+        builder: None,
+    };
+    Ok(serde_json::to_value(action)?)
+}
+
+fn build_modify_oid_value(order_id: &str) -> anyhow::Result<serde_json::Value> {
+    if is_hyperliquid_cloid(order_id) {
+        return Ok(serde_json::Value::String(order_id.to_string()));
+    }
+    Ok(serde_json::Value::Number(parse_hl_oid(order_id)?.into()))
+}
+
+fn build_modify_action(
+    req: &LiveRestReplaceRequest,
+    asset_meta: HyperliquidAssetMeta,
+) -> anyhow::Result<serde_json::Value> {
+    let place = crate::types::PlaceOrderIntent {
+        venue_index: req.venue_index,
+        venue_id: req.venue_id.as_str().into(),
+        side: req.side,
+        price: req.price,
+        size: req.size,
+        purpose: req.purpose,
+        time_in_force: req.time_in_force,
+        post_only: req.post_only,
+        reduce_only: req.reduce_only,
+        client_order_id: Some(req.client_order_id.clone()),
+    };
+    let action = HlModifyAction {
+        action_type: "modify".to_string(),
+        oid: build_modify_oid_value(&req.order_id)?,
+        order: build_hl_order_wire(&place, asset_meta),
+    };
+    Ok(serde_json::to_value(action)?)
+}
+
+fn build_batch_modify_action(
+    reqs: &[LiveRestReplaceRequest],
+    asset_meta: HyperliquidAssetMeta,
+) -> anyhow::Result<serde_json::Value> {
+    let modifies = reqs
         .iter()
-        .map(|place| {
-            let tif = if place.post_only {
-                "Alo"
-            } else {
-                match place.time_in_force {
-                    TimeInForce::Gtc => "Gtc",
-                    TimeInForce::Ioc => "Ioc",
-                }
+        .map(|req| {
+            let place = crate::types::PlaceOrderIntent {
+                venue_index: req.venue_index,
+                venue_id: req.venue_id.as_str().into(),
+                side: req.side,
+                price: req.price,
+                size: req.size,
+                purpose: req.purpose,
+                time_in_force: req.time_in_force,
+                post_only: req.post_only,
+                reduce_only: req.reduce_only,
+                client_order_id: Some(req.client_order_id.clone()),
             };
-            json!({
-                "a": asset_index,
-                "b": place.side == Side::Buy,
-                "p": format!("{:.8}", place.price),
-                "s": format!("{:.8}", place.size),
-                "r": place.reduce_only,
-                "t": { "limit": { "tif": tif } },
-                "c": place.client_order_id,
+            Ok(HlBatchModifyWire {
+                oid: build_modify_oid_value(&req.order_id)?,
+                order: build_hl_order_wire(&place, asset_meta),
             })
         })
-        .collect();
-    Ok(json!({
-        "type": "order",
-        "orders": orders,
-        "grouping": "na",
-    }))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(serde_json::to_value(HlBatchModifyAction {
+        action_type: "batchModify".to_string(),
+        modifies,
+    })?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HyperliquidCancelBatchKind {
+    Oid,
+    Cloid,
+}
+
+fn parse_hl_oid(order_id: &str) -> anyhow::Result<u64> {
+    order_id
+        .parse::<u64>()
+        .map_err(|err| anyhow::anyhow!("invalid Hyperliquid numeric order id '{order_id}': {err}"))
 }
 
 /// Build a batch cancel action with N cancels in a single API call.
 fn build_batch_cancel_action(
     cancels: &[&crate::types::CancelOrderIntent],
     asset_index: u32,
-) -> serde_json::Value {
-    let cancel_items: Vec<serde_json::Value> = cancels
-        .iter()
-        .map(|c| json!({ "a": asset_index, "o": c.order_id }))
-        .collect();
-    json!({
-        "type": "cancel",
-        "cancels": cancel_items,
-    })
+) -> anyhow::Result<(serde_json::Value, HyperliquidCancelBatchKind)> {
+    let Some(first) = cancels.first() else {
+        anyhow::bail!("empty cancel batch");
+    };
+    let kind = if is_hyperliquid_cloid(&first.order_id) {
+        HyperliquidCancelBatchKind::Cloid
+    } else {
+        HyperliquidCancelBatchKind::Oid
+    };
+    let mixed_kinds = cancels.iter().any(|cancel| {
+        let item_kind = if is_hyperliquid_cloid(&cancel.order_id) {
+            HyperliquidCancelBatchKind::Cloid
+        } else {
+            HyperliquidCancelBatchKind::Oid
+        };
+        item_kind != kind
+    });
+    if mixed_kinds {
+        anyhow::bail!("mixed hyperliquid cancel batch id kinds");
+    }
+
+    let action = match kind {
+        HyperliquidCancelBatchKind::Oid => {
+            let cancel_items: anyhow::Result<Vec<HlCancelOidWire>> = cancels
+                .iter()
+                .map(|c| {
+                    Ok(HlCancelOidWire {
+                        a: asset_index,
+                        o: parse_hl_oid(&c.order_id)?,
+                    })
+                })
+                .collect();
+            serde_json::to_value(HlCancelOidAction {
+                action_type: "cancel".to_string(),
+                cancels: cancel_items?,
+            })?
+        }
+        HyperliquidCancelBatchKind::Cloid => {
+            let cancel_items: Vec<HlCancelCloidWire> = cancels
+                .iter()
+                .map(|c| HlCancelCloidWire {
+                    asset: asset_index,
+                    cloid: c.order_id.clone(),
+                })
+                .collect();
+            serde_json::to_value(HlCancelCloidAction {
+                action_type: "cancelByCloid".to_string(),
+                cancels: cancel_items,
+            })?
+        }
+    };
+    Ok((action, kind))
 }
 
 fn is_hyperliquid_cloid(value: &str) -> bool {
@@ -2759,35 +4085,107 @@ fn build_cancel_action(
         anyhow::bail!("intent not a cancel order");
     };
     if is_hyperliquid_cloid(&cancel.order_id) {
-        return Ok(json!({
-            "type": "cancelByCloid",
-            "cancels": [{
-                "asset": asset_index,
-                "cloid": cancel.order_id,
-            }]
-        }));
+        return Ok(serde_json::to_value(HlCancelCloidAction {
+            action_type: "cancelByCloid".to_string(),
+            cancels: vec![HlCancelCloidWire {
+                asset: asset_index,
+                cloid: cancel.order_id.clone(),
+            }],
+        })?);
     }
-    Ok(json!({
-        "type": "cancel",
-        "cancels": [{
-            "a": asset_index,
-            "o": cancel.order_id,
-        }]
-    }))
+    Ok(serde_json::to_value(HlCancelOidAction {
+        action_type: "cancel".to_string(),
+        cancels: vec![HlCancelOidWire {
+            a: asset_index,
+            o: parse_hl_oid(&cancel.order_id)?,
+        }],
+    })?)
 }
 
 fn build_cancel_all_action(asset_index: u32) -> serde_json::Value {
-    json!({
-        "type": "cancelAll",
-        "asset": asset_index,
+    serde_json::to_value(HlCancelAllAction {
+        action_type: "cancelAll".to_string(),
+        asset: asset_index,
     })
+    .expect("serialize hyperliquid cancelAll action")
+}
+
+fn build_noop_action() -> serde_json::Value {
+    serde_json::to_value(HlNoopAction {
+        action_type: "noop".to_string(),
+    })
+    .expect("serialize hyperliquid noop action")
+}
+
+pub fn reserve_request_weight_cost_micros(weight: u64) -> u64 {
+    weight.saturating_mul(500)
+}
+
+pub fn format_usdc_micros(micros: u64) -> String {
+    let whole = micros / 1_000_000;
+    let frac = micros % 1_000_000;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let mut frac_str = format!("{frac:06}");
+    while frac_str.ends_with('0') {
+        frac_str.pop();
+    }
+    format!("{whole}.{frac_str}")
+}
+
+pub fn build_reserve_request_weight_action(weight: u64) -> anyhow::Result<serde_json::Value> {
+    if weight == 0 {
+        anyhow::bail!("reserveRequestWeight weight must be positive");
+    }
+    Ok(serde_json::to_value(HlReserveRequestWeightAction {
+        action_type: "reserveRequestWeight".to_string(),
+        weight,
+    })?)
+}
+
+pub fn hyperliquid_exchange_response_error(value: &serde_json::Value) -> Option<String> {
+    let status = value.get("status").and_then(|field| field.as_str());
+    if matches!(status, Some("err" | "error")) {
+        return Some(
+            exchange_response_detail(value.get("response")).unwrap_or_else(|| value.to_string()),
+        );
+    }
+
+    let response = value.get("response")?;
+    let response_status = response.get("status").and_then(|field| field.as_str());
+    if matches!(response_status, Some("err" | "error")) {
+        return Some(
+            exchange_response_detail(Some(response)).unwrap_or_else(|| response.to_string()),
+        );
+    }
+    let response_type = response.get("type").and_then(|field| field.as_str());
+    if matches!(response_type, Some("err" | "error")) {
+        return Some(
+            exchange_response_detail(Some(response)).unwrap_or_else(|| response.to_string()),
+        );
+    }
+    None
+}
+
+fn exchange_response_detail(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    for key in ["message", "error", "payload", "response"] {
+        if let Some(text) = value.get(key).and_then(|field| field.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+    Some(value.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -2815,6 +4213,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hl_internal_pub_q_reads_env_override() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        let _restore = EnvVarGuard::new("PARAPHINA_HL_INTERNAL_PUB_Q");
+        std::env::set_var("PARAPHINA_HL_INTERNAL_PUB_Q", "1024");
+        assert_eq!(hl_internal_pub_q(), 1024);
+    }
+
     #[tokio::test]
     async fn hyperliquid_cancel_all_smoke() {
         use tiny_http::{Response, Server};
@@ -2824,11 +4230,15 @@ mod tests {
         let rest_url = format!("http://{}", addr);
         let info_url = rest_url.clone();
         std::thread::spawn(move || {
-            for mut request in server.incoming_requests().take(2) {
+            for mut request in server.incoming_requests().take(3) {
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
                 if body.contains(r#""type":"meta""#) {
-                    let resp = Response::from_string(r#"{"universe":[{"name":"TAO"}]}"#);
+                    let resp =
+                        Response::from_string(r#"{"universe":[{"name":"TAO","szDecimals":4}]}"#);
+                    let _ = request.respond(resp);
+                } else if body.contains(r#""type":"userRole""#) {
+                    let resp = Response::from_string(r#"{"role":"missing"}"#);
                     let _ = request.respond(resp);
                 } else {
                     let resp = Response::from_string(r#"{"status":"ok"}"#);
@@ -2859,6 +4269,856 @@ mod tests {
     }
 
     #[test]
+    fn next_action_nonce_is_monotonic_and_fast_forwards() {
+        let cfg = HyperliquidConfig {
+            network: HyperliquidNetwork::Testnet,
+            ws_urls: vec!["wss://example".to_string()],
+            rest_urls: vec!["https://example".to_string()],
+            info_urls: vec!["https://example".to_string()],
+            coin: "TAO".to_string(),
+            n_sig_figs: 5,
+            n_levels: 5,
+            venue_index: 0,
+            paper_mode: true,
+            private_key_hex: None,
+            vault_address: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = HyperliquidConnector::new(cfg, market_tx, exec_tx);
+
+        let first = connector.next_action_nonce(10_000);
+        let second = connector.next_action_nonce(10_000);
+        let jumped = connector.next_action_nonce((second + 25) as TimestampMs);
+
+        assert_eq!(second, first + 1);
+        assert_eq!(jumped, second + 25);
+    }
+
+    fn test_signing_key() -> SigningKey {
+        let key_bytes =
+            hex::decode("e908f86dbb4d55ac876378565aafeabc187f6690f046459397b17d9b9a19688e")
+                .expect("decode signing key");
+        SigningKey::from_slice(&key_bytes).expect("signing key")
+    }
+
+    fn verifying_key_to_eth_address(verifying_key: &k256::ecdsa::VerifyingKey) -> String {
+        let encoded = verifying_key.to_encoded_point(false);
+        let digest = keccak_bytes(&encoded.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&digest[12..]))
+    }
+
+    fn signature_to_hex(signature: &serde_json::Value) -> String {
+        let r = signature["r"].as_str().expect("r").trim_start_matches("0x");
+        let s = signature["s"].as_str().expect("s").trim_start_matches("0x");
+        let v = signature["v"].as_u64().expect("v");
+        format!("0x{r}{s}{v:02x}")
+    }
+
+    #[test]
+    fn hl_float_to_wire_matches_official_sdk_examples() {
+        assert_eq!(hl_float_to_wire(0.0), "0");
+        assert_eq!(hl_float_to_wire(-0.0), "0");
+        assert_eq!(hl_float_to_wire(0.00076), "0.00076");
+        assert_eq!(hl_float_to_wire(0.00000001), "0.00000001");
+        assert_eq!(hl_float_to_wire(87654321.1234), "87654321.1234");
+        assert_eq!(hl_float_to_wire(987654321.0), "987654321");
+        assert_eq!(hl_float_to_wire(2062.62), "2062.62");
+        assert_eq!(hl_float_to_wire(0.01), "0.01");
+    }
+
+    #[test]
+    fn build_hl_order_wire_canonicalizes_live_like_price_and_size() {
+        let place = crate::types::PlaceOrderIntent {
+            venue_index: 0,
+            venue_id: std::sync::Arc::<str>::from("hyperliquid"),
+            side: Side::Buy,
+            price: 2062.62,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            client_order_id: Some("0xc8f74824e72973753f7a01a83e322717".to_string()),
+        };
+
+        let wire = build_hl_order_wire(
+            &place,
+            HyperliquidAssetMeta {
+                index: 1,
+                sz_decimals: 4,
+            },
+        );
+        assert_eq!(wire.p, "2062.6");
+        assert_eq!(wire.s, "0.01");
+        match wire.t {
+            HlOrderType::Limit { limit } => assert_eq!(limit.tif, "Alo"),
+            other => panic!("unexpected order type: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_modify_action_serializes_cloid_and_new_cloid_wire() {
+        let req = LiveRestReplaceRequest {
+            venue_index: 0,
+            venue_id: "hyperliquid".to_string(),
+            order_id: "0xc8f74824e72973753f7a01a83e322717".to_string(),
+            side: Side::Buy,
+            price: 2062.62,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            client_order_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        };
+        let action = build_modify_action(
+            &req,
+            HyperliquidAssetMeta {
+                index: 1,
+                sz_decimals: 4,
+            },
+        )
+        .expect("modify action");
+        assert_eq!(action["type"], "modify");
+        assert_eq!(action["oid"], req.order_id);
+        assert_eq!(action["order"]["c"], req.client_order_id);
+        assert_eq!(action["order"]["t"]["limit"]["tif"], "Alo");
+    }
+
+    #[test]
+    fn build_batch_modify_action_serializes_multiple_modifies() {
+        let reqs = vec![
+            LiveRestReplaceRequest {
+                venue_index: 0,
+                venue_id: "hyperliquid".to_string(),
+                order_id: "0x11111111111111111111111111111111".to_string(),
+                side: Side::Buy,
+                price: 100.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            },
+            LiveRestReplaceRequest {
+                venue_index: 0,
+                venue_id: "hyperliquid".to_string(),
+                order_id: "0x22222222222222222222222222222222".to_string(),
+                side: Side::Sell,
+                price: 101.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            },
+        ];
+        let action = build_batch_modify_action(
+            &reqs,
+            HyperliquidAssetMeta {
+                index: 1,
+                sz_decimals: 4,
+            },
+        )
+        .expect("batch modify action");
+        assert_eq!(action["type"], "batchModify");
+        assert_eq!(action["modifies"].as_array().map(|v| v.len()), Some(2));
+        assert_eq!(action["modifies"][0]["oid"], reqs[0].order_id);
+        assert_eq!(action["modifies"][1]["order"]["c"], reqs[1].client_order_id);
+    }
+
+    #[test]
+    fn quantize_hl_price_snaps_eth_perp_buy_down_to_valid_tick() {
+        let asset_meta = HyperliquidAssetMeta {
+            index: 1,
+            sz_decimals: 4,
+        };
+        assert_eq!(
+            hl_float_to_wire(quantize_hl_price(2068.22, Side::Buy, asset_meta)),
+            "2068.2"
+        );
+        assert_eq!(
+            hl_float_to_wire(quantize_hl_price(2067.92, Side::Buy, asset_meta)),
+            "2067.9"
+        );
+    }
+
+    #[test]
+    fn quantize_hl_price_snaps_eth_perp_sell_up_to_valid_tick() {
+        let asset_meta = HyperliquidAssetMeta {
+            index: 1,
+            sz_decimals: 4,
+        };
+        assert_eq!(
+            hl_float_to_wire(quantize_hl_price(2069.36, Side::Sell, asset_meta)),
+            "2069.4"
+        );
+        assert_eq!(
+            hl_float_to_wire(quantize_hl_price(2069.62, Side::Sell, asset_meta)),
+            "2069.7"
+        );
+    }
+
+    #[test]
+    fn sign_action_matches_official_limit_order_vector() {
+        let wallet = test_signing_key();
+        let action = json!({
+            "type": "order",
+            "orders": [{
+                "a": 1,
+                "b": true,
+                "p": "2000.0",
+                "s": "3.5",
+                "r": false,
+                "t": { "limit": { "tif": "Ioc" } }
+            }],
+            "grouping": "na"
+        });
+
+        let signature = sign_action(&action, None, 1_583_838, true, &wallet).expect("signature");
+        assert_eq!(
+            signature_to_hex(&signature),
+            "0x77957e58e70f43b6b68581f2dc42011fc384538a2e5b7bf42d5b936f19fbb67360721a8598727230f67080efee48c812a6a4442013fd3b0eed509171bef9f23f1c"
+        );
+    }
+
+    #[test]
+    fn sign_action_matches_official_limit_order_cloid_vector() {
+        let wallet = test_signing_key();
+        let action = json!({
+            "type": "order",
+            "orders": [{
+                "a": 1,
+                "b": true,
+                "p": "2000.0",
+                "s": "3.5",
+                "r": false,
+                "t": { "limit": { "tif": "Ioc" } },
+                "c": "0x1e60610f0b3d420597c88c1fed2ad5ee"
+            }],
+            "grouping": "na"
+        });
+
+        let signature = sign_action(&action, None, 1_583_838, true, &wallet).expect("signature");
+        assert_eq!(
+            signature_to_hex(&signature),
+            "0xd3e894092eb27098077145714630a77bbe3836120ee29df7d935d8510b03a08f456de5ec1be82aa65fc6ecda9ef928b0445e212517a98858cfaa251c4cd7552b1c"
+        );
+    }
+
+    #[test]
+    fn sign_action_matches_official_cancel_vector() {
+        let wallet = test_signing_key();
+        let action = json!({
+            "type": "cancel",
+            "cancels": [{
+                "a": 1,
+                "o": 82382
+            }]
+        });
+
+        let signature = sign_action(&action, None, 1_583_838, true, &wallet).expect("signature");
+        assert_eq!(
+            signature_to_hex(&signature),
+            "0x02f76cc5b16e0810152fa0e14e7b219f49c361e3325f771544c6f54e157bf9fa17ed0afc11a98596be85d5cd9f86600aad515337318f7ab346e5ccc1b03425d51b"
+        );
+    }
+
+    #[test]
+    fn sign_action_recovery_matches_signing_key_address() {
+        let wallet = test_signing_key();
+        let verifying_key = wallet.verifying_key();
+        let expected_address = verifying_key_to_eth_address(verifying_key);
+        let action = json!({
+            "type": "order",
+            "orders": [{
+                "a": 1,
+                "b": true,
+                "p": "2000.0",
+                "s": "3.5",
+                "r": false,
+                "t": { "limit": { "tif": "Ioc" } }
+            }],
+            "grouping": "na"
+        });
+
+        let signature = sign_action(&action, None, 1_583_838, true, &wallet).expect("signature");
+        let recovered = recover_action_signer_address(&action, None, 1_583_838, true, &signature)
+            .expect("recover signer");
+        assert_eq!(recovered, expected_address);
+    }
+
+    #[test]
+    fn reserve_request_weight_action_serializes_and_costs_exactly() {
+        let action = build_reserve_request_weight_action(4_149).expect("reserve action");
+        assert_eq!(action["type"], "reserveRequestWeight");
+        assert_eq!(action["weight"], 4_149);
+        assert!(serialize_action_for_hl_signing(&action).is_ok());
+        assert_eq!(reserve_request_weight_cost_micros(4_149), 2_074_500);
+        assert_eq!(format_usdc_micros(2_074_500), "2.0745");
+        assert_eq!(format_usdc_micros(500), "0.0005");
+    }
+
+    #[test]
+    fn reserve_request_weight_action_rejects_zero_weight() {
+        let err = build_reserve_request_weight_action(0).expect_err("zero weight must fail");
+        assert!(err
+            .to_string()
+            .contains("reserveRequestWeight weight must be positive"));
+    }
+
+    #[test]
+    fn reserve_request_weight_signature_recovers_signer() {
+        let wallet = test_signing_key();
+        let verifying_key = wallet.verifying_key();
+        let expected_address = verifying_key_to_eth_address(verifying_key);
+        let action = build_reserve_request_weight_action(4_149).expect("reserve action");
+
+        let signature = sign_action(&action, None, 1_583_838, true, &wallet).expect("signature");
+        let recovered = recover_action_signer_address(&action, None, 1_583_838, true, &signature)
+            .expect("recover signer");
+        assert_eq!(recovered, expected_address);
+    }
+
+    #[test]
+    fn reserve_request_weight_signature_with_vault_recovers_signer() {
+        let wallet = test_signing_key();
+        let verifying_key = wallet.verifying_key();
+        let expected_address = verifying_key_to_eth_address(verifying_key);
+        let vault_address = "0x000000000000000000000000000000000000dEaD";
+        let action = build_reserve_request_weight_action(4_149).expect("reserve action");
+
+        let without_vault =
+            sign_action(&action, None, 1_583_838, true, &wallet).expect("signature");
+        let with_vault =
+            sign_action(&action, Some(vault_address), 1_583_838, true, &wallet).expect("signature");
+        assert_ne!(with_vault, without_vault);
+        let recovered = recover_action_signer_address(
+            &action,
+            Some(vault_address),
+            1_583_838,
+            true,
+            &with_vault,
+        )
+        .expect("recover signer");
+        assert_eq!(recovered, expected_address);
+    }
+
+    #[test]
+    fn exchange_response_error_detects_status_err() {
+        let value = json!({
+            "status": "err",
+            "response": "Must deposit before performing actions. User: 0xabc"
+        });
+
+        assert_eq!(
+            hyperliquid_exchange_response_error(&value).as_deref(),
+            Some("Must deposit before performing actions. User: 0xabc")
+        );
+    }
+
+    #[test]
+    fn exchange_response_error_detects_nested_error_payload() {
+        let value = json!({
+            "status": "ok",
+            "response": {
+                "type": "error",
+                "payload": "429 Too Many Requests"
+            }
+        });
+
+        assert_eq!(
+            hyperliquid_exchange_response_error(&value).as_deref(),
+            Some("429 Too Many Requests")
+        );
+    }
+
+    #[test]
+    fn exchange_response_error_allows_status_ok() {
+        let value = json!({
+            "status": "ok",
+            "response": {
+                "type": "default"
+            }
+        });
+
+        assert!(hyperliquid_exchange_response_error(&value).is_none());
+    }
+
+    #[test]
+    fn parse_ws_post_response_maps_error_payloads() {
+        let value = json!({
+            "channel": "post",
+            "data": {
+                "id": 42,
+                "response": {
+                    "type": "error",
+                    "payload": "429 Too Many Requests"
+                }
+            }
+        });
+        let (id, response_type, result) =
+            parse_ws_post_response(&value).expect("parse ws post response");
+        assert_eq!(id, 42);
+        assert_eq!(response_type, "error");
+        let err = result.expect_err("error response");
+        assert!(err.to_string().contains("429 Too Many Requests"));
+    }
+
+    #[test]
+    fn parse_ws_post_response_maps_top_level_err_payloads() {
+        let value = json!({
+            "channel": "post",
+            "data": {
+                "id": 7,
+                "response": {
+                    "type": "action",
+                    "payload": {
+                        "status": "err",
+                        "response": "User or API Wallet does not exist"
+                    }
+                }
+            }
+        });
+        let (id, response_type, result) =
+            parse_ws_post_response(&value).expect("parse ws post response");
+        assert_eq!(id, 7);
+        assert_eq!(response_type, "action");
+        let err = result.expect_err("top level err response");
+        assert!(err
+            .to_string()
+            .contains("User or API Wallet does not exist"));
+    }
+
+    #[test]
+    fn parse_ws_post_response_accepts_resting_order_status() {
+        let value = json!({
+            "channel": "post",
+            "data": {
+                "id": 8,
+                "response": {
+                    "type": "action",
+                    "payload": {
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {
+                                "statuses": [
+                                    { "resting": { "oid": 12345 } }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (id, response_type, result) =
+            parse_ws_post_response(&value).expect("parse ws post response");
+        assert_eq!(id, 8);
+        assert_eq!(response_type, "action");
+        result.expect("resting status should succeed");
+    }
+
+    #[test]
+    fn parse_ws_post_response_maps_nested_exchange_errors() {
+        let value = json!({
+            "channel": "post",
+            "data": {
+                "id": 9,
+                "response": {
+                    "type": "action",
+                    "payload": {
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {
+                                "statuses": [
+                                    { "error": "BadAloPx" }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (id, response_type, result) =
+            parse_ws_post_response(&value).expect("parse ws post response");
+        assert_eq!(id, 9);
+        assert_eq!(response_type, "action");
+        let err = result.expect_err("nested exchange error");
+        assert!(err.to_string().contains("BadAloPx"));
+        assert!(err.to_string().contains("\"statuses\""));
+    }
+
+    #[tokio::test]
+    async fn submit_signed_action_uses_ws_post_for_orders_when_enabled() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard_transport = EnvVarGuard::new("PARAPHINA_HL_ACTION_TRANSPORT");
+        let _guard_timeout = EnvVarGuard::new("PARAPHINA_HL_WS_POST_RESPONSE_TIMEOUT_MS");
+        std::env::set_var("PARAPHINA_HL_ACTION_TRANSPORT", "ws_post");
+        std::env::set_var("PARAPHINA_HL_WS_POST_RESPONSE_TIMEOUT_MS", "1000");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let observed = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let observed_server = observed.clone();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept ws client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept websocket");
+            while let Some(message) = ws.next().await {
+                let message = message.expect("ws frame");
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&text).expect("ws post payload");
+                    if value.get("method").and_then(|v| v.as_str()) != Some("post") {
+                        continue;
+                    }
+                    *observed_server.lock().expect("observed lock") = Some(value.clone());
+                    let id = value["id"].as_u64().expect("post id");
+                    let response = json!({
+                        "channel": "post",
+                        "data": {
+                            "id": id,
+                            "response": {
+                                "type": "action",
+                                "payload": {
+                                    "status": "ok",
+                                    "response": {
+                                        "type": "order",
+                                        "data": {
+                                            "statuses": [
+                                                { "resting": { "oid": 777 } }
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ws.send(Message::Text(response.to_string()))
+                        .await
+                        .expect("send post response");
+                    break;
+                }
+            }
+        });
+
+        let cfg = HyperliquidConfig {
+            network: HyperliquidNetwork::Testnet,
+            ws_urls: vec![format!("ws://{}", addr)],
+            rest_urls: vec!["http://127.0.0.1:1/exchange".to_string()],
+            info_urls: vec!["http://127.0.0.1:1/info".to_string()],
+            coin: "TAO".to_string(),
+            n_sig_figs: 5,
+            n_levels: 5,
+            venue_index: 0,
+            paper_mode: false,
+            private_key_hex: Some(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vault_address: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = Arc::new(HyperliquidConnector::new(cfg, market_tx, exec_tx));
+        assert!(connector.uses_ws_post_actions());
+        let worker = {
+            let connector = connector.clone();
+            tokio::spawn(async move { connector.run_post_ws().await })
+        };
+
+        connector
+            .submit_signed_action(
+                json!({
+                    "type": "order",
+                    "orders": [{
+                        "a": 7,
+                        "b": true,
+                        "p": "1",
+                        "s": "1",
+                        "r": false,
+                        "t": { "limit": { "tif": "Alo" } }
+                    }],
+                    "grouping": "na"
+                }),
+                12_345,
+                "order_batch",
+                "place_alo",
+                1,
+            )
+            .await
+            .expect("ws post action");
+
+        server.await.expect("ws server task");
+        let observed = observed
+            .lock()
+            .expect("observed lock")
+            .clone()
+            .expect("captured ws post payload");
+        assert_eq!(observed["method"], "post");
+        assert_eq!(observed["request"]["type"], "action");
+        assert_eq!(observed["request"]["payload"]["action"]["type"], "order");
+        assert!(observed["request"]["payload"]["nonce"].as_u64().is_some());
+        assert!(observed["request"]["payload"]["signature"]["r"]
+            .as_str()
+            .is_some());
+        assert!(observed["id"].as_u64().is_some());
+
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn submit_signed_action_routes_cancel_all_to_http_when_ws_post_enabled() {
+        use std::sync::{Arc, Mutex};
+        use tiny_http::{Response, Server};
+
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard_transport = EnvVarGuard::new("PARAPHINA_HL_ACTION_TRANSPORT");
+        std::env::set_var("PARAPHINA_HL_ACTION_TRANSPORT", "ws_post");
+
+        let server = Server::http("127.0.0.1:0").expect("bind server");
+        let addr = server.server_addr();
+        let rest_url = format!("http://{}", addr);
+        let observed = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let observed_server = observed.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests().take(2) {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let value: serde_json::Value =
+                    serde_json::from_str(&body).expect("http payload json");
+                if value.get("type").and_then(|value| value.as_str()) == Some("meta") {
+                    let _ = request.respond(Response::from_string(
+                        r#"{"universe":[{"name":"TAO","szDecimals":4}]}"#,
+                    ));
+                } else {
+                    *observed_server.lock().expect("observed lock") = Some(value);
+                    let _ = request.respond(Response::from_string(r#"{"status":"ok"}"#));
+                }
+            }
+        });
+
+        let cfg = HyperliquidConfig {
+            network: HyperliquidNetwork::Testnet,
+            ws_urls: vec!["ws://127.0.0.1:1".to_string()],
+            rest_urls: vec![rest_url.clone()],
+            info_urls: vec![rest_url],
+            coin: "TAO".to_string(),
+            n_sig_figs: 5,
+            n_levels: 5,
+            venue_index: 0,
+            paper_mode: false,
+            private_key_hex: Some(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vault_address: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = HyperliquidConnector::new(cfg, market_tx, exec_tx);
+
+        connector
+            .submit_signed_action(
+                json!({ "type": "cancelAll", "asset": 7 }),
+                12_345,
+                "cancel_all",
+                "cancel_all",
+                1,
+            )
+            .await
+            .expect("http control fallback");
+
+        let observed = observed
+            .lock()
+            .expect("observed lock")
+            .clone()
+            .expect("captured http payload");
+        assert_eq!(observed["action"]["type"], "cancelAll");
+        assert!(observed["nonce"].as_u64().is_some());
+        assert!(observed["signature"]["r"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_signed_action_routes_sync_control_orders_to_http_when_ws_post_enabled() {
+        use std::sync::{Arc, Mutex};
+        use tiny_http::{Response, Server};
+
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard_transport = EnvVarGuard::new("PARAPHINA_HL_ACTION_TRANSPORT");
+        let _guard_sync_fallback =
+            EnvVarGuard::new("PARAPHINA_HL_SYNC_CONTROL_HTTP_FALLBACK_ENABLED");
+        std::env::set_var("PARAPHINA_HL_ACTION_TRANSPORT", "ws_post");
+        std::env::set_var("PARAPHINA_HL_SYNC_CONTROL_HTTP_FALLBACK_ENABLED", "1");
+
+        let server = Server::http("127.0.0.1:0").expect("bind server");
+        let addr = server.server_addr();
+        let rest_url = format!("http://{}", addr);
+        let observed = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let observed_server = observed.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests().take(2) {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let value: serde_json::Value =
+                    serde_json::from_str(&body).expect("http payload json");
+                if value.get("type").and_then(|value| value.as_str()) == Some("meta") {
+                    let _ = request.respond(Response::from_string(
+                        r#"{"universe":[{"name":"TAO","szDecimals":4}]}"#,
+                    ));
+                } else {
+                    *observed_server.lock().expect("observed lock") = Some(value);
+                    let _ = request.respond(Response::from_string(r#"{"status":"ok"}"#));
+                }
+            }
+        });
+
+        let cfg = HyperliquidConfig {
+            network: HyperliquidNetwork::Testnet,
+            ws_urls: vec!["ws://127.0.0.1:1".to_string()],
+            rest_urls: vec![rest_url.clone()],
+            info_urls: vec![rest_url],
+            coin: "TAO".to_string(),
+            n_sig_figs: 5,
+            n_levels: 5,
+            venue_index: 0,
+            paper_mode: false,
+            private_key_hex: Some(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vault_address: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = HyperliquidConnector::new(cfg, market_tx, exec_tx);
+
+        connector
+            .submit_signed_action_with_hint(
+                json!({
+                    "type": "order",
+                    "orders": [{
+                        "a": 7,
+                        "b": true,
+                        "p": "1",
+                        "s": "1",
+                        "r": false,
+                        "t": { "limit": { "tif": "Alo" } }
+                    }],
+                    "grouping": "na"
+                }),
+                12_345,
+                "order_batch",
+                "place_alo",
+                1,
+                TransportHint::HyperliquidSyncControl,
+            )
+            .await
+            .expect("http sync-control fallback");
+
+        let observed = observed
+            .lock()
+            .expect("observed lock")
+            .clone()
+            .expect("captured http payload");
+        assert_eq!(observed["action"]["type"], "order");
+        assert!(observed["nonce"].as_u64().is_some());
+        assert!(observed["signature"]["r"].as_str().is_some());
+    }
+
+    #[test]
+    fn action_transport_routes_sync_control_to_http_when_ws_post_enabled() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard_transport = EnvVarGuard::new("PARAPHINA_HL_ACTION_TRANSPORT");
+        let _guard_sync_fallback =
+            EnvVarGuard::new("PARAPHINA_HL_SYNC_CONTROL_HTTP_FALLBACK_ENABLED");
+        let _guard_cancel_all_fallback =
+            EnvVarGuard::new("PARAPHINA_HL_CANCEL_ALL_HTTP_FALLBACK_ENABLED");
+        std::env::set_var("PARAPHINA_HL_ACTION_TRANSPORT", "ws_post");
+        std::env::set_var("PARAPHINA_HL_SYNC_CONTROL_HTTP_FALLBACK_ENABLED", "1");
+        std::env::set_var("PARAPHINA_HL_CANCEL_ALL_HTTP_FALLBACK_ENABLED", "1");
+
+        let cfg = HyperliquidConfig {
+            network: HyperliquidNetwork::Testnet,
+            ws_urls: vec!["ws://127.0.0.1:1".to_string()],
+            rest_urls: vec!["http://127.0.0.1:1/exchange".to_string()],
+            info_urls: vec!["http://127.0.0.1:1/info".to_string()],
+            coin: "TAO".to_string(),
+            n_sig_figs: 5,
+            n_levels: 5,
+            venue_index: 0,
+            paper_mode: false,
+            private_key_hex: Some(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vault_address: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = HyperliquidConnector::new(cfg, market_tx, exec_tx);
+
+        assert_eq!(
+            connector.action_transport_for("order_batch", TransportHint::Default),
+            HyperliquidActionTransport::WsPost
+        );
+        assert_eq!(
+            connector.action_transport_for("order_batch", TransportHint::HyperliquidSyncControl),
+            HyperliquidActionTransport::Http
+        );
+        assert_eq!(
+            connector.action_transport_for("cancel_all", TransportHint::Default),
+            HyperliquidActionTransport::Http
+        );
+    }
+
+    #[test]
+    fn action_transport_uses_ws_post_for_sync_control_when_http_fallback_disabled() {
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard_transport = EnvVarGuard::new("PARAPHINA_HL_ACTION_TRANSPORT");
+        let _guard_sync_fallback =
+            EnvVarGuard::new("PARAPHINA_HL_SYNC_CONTROL_HTTP_FALLBACK_ENABLED");
+        let _guard_cancel_all_fallback =
+            EnvVarGuard::new("PARAPHINA_HL_CANCEL_ALL_HTTP_FALLBACK_ENABLED");
+        std::env::set_var("PARAPHINA_HL_ACTION_TRANSPORT", "ws_post");
+        std::env::set_var("PARAPHINA_HL_SYNC_CONTROL_HTTP_FALLBACK_ENABLED", "0");
+        std::env::set_var("PARAPHINA_HL_CANCEL_ALL_HTTP_FALLBACK_ENABLED", "1");
+
+        let cfg = HyperliquidConfig {
+            network: HyperliquidNetwork::Testnet,
+            ws_urls: vec!["ws://127.0.0.1:1".to_string()],
+            rest_urls: vec!["http://127.0.0.1:1/exchange".to_string()],
+            info_urls: vec!["http://127.0.0.1:1/info".to_string()],
+            coin: "TAO".to_string(),
+            n_sig_figs: 5,
+            n_levels: 5,
+            venue_index: 0,
+            paper_mode: false,
+            private_key_hex: Some(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vault_address: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = HyperliquidConnector::new(cfg, market_tx, exec_tx);
+
+        assert_eq!(
+            connector.action_transport_for("order_batch", TransportHint::HyperliquidSyncControl),
+            HyperliquidActionTransport::WsPost
+        );
+        assert_eq!(
+            connector.action_transport_for("cancel_all", TransportHint::Default),
+            HyperliquidActionTransport::Http
+        );
+    }
+
+    #[test]
     fn cancel_action_uses_oid_for_numeric_order_ids() {
         let intent = OrderIntent::Cancel(crate::types::CancelOrderIntent {
             venue_index: 0,
@@ -2868,7 +5128,7 @@ mod tests {
         let action = build_cancel_action(&intent, 7).expect("cancel action");
         assert_eq!(action["type"], "cancel");
         assert_eq!(action["cancels"][0]["a"], 7);
-        assert_eq!(action["cancels"][0]["o"], "123456");
+        assert_eq!(action["cancels"][0]["o"], 123456);
     }
 
     #[test]
@@ -2885,6 +5145,165 @@ mod tests {
             action["cancels"][0]["cloid"],
             "0x1234567890abcdef1234567890abcdef"
         );
+    }
+
+    #[test]
+    fn batch_cancel_action_uses_oid_shape_for_numeric_order_ids() {
+        let cancel_a = crate::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "123456".to_string(),
+        };
+        let cancel_b = crate::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "654321".to_string(),
+        };
+        let (action, kind) =
+            build_batch_cancel_action(&[&cancel_a, &cancel_b], 7).expect("batch cancel action");
+        assert_eq!(action["type"], "cancel");
+        assert_eq!(action["cancels"][0]["a"], 7);
+        assert_eq!(action["cancels"][0]["o"], 123456);
+        assert_eq!(kind, HyperliquidCancelBatchKind::Oid);
+    }
+
+    #[test]
+    fn batch_cancel_action_uses_cloid_shape_for_hex_client_ids() {
+        let cancel_a = crate::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "0x1234567890abcdef1234567890abcdef".to_string(),
+        };
+        let cancel_b = crate::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "0xfedcba0987654321fedcba0987654321".to_string(),
+        };
+        let (action, kind) =
+            build_batch_cancel_action(&[&cancel_a, &cancel_b], 7).expect("batch cancel action");
+        assert_eq!(action["type"], "cancelByCloid");
+        assert_eq!(action["cancels"][0]["asset"], 7);
+        assert_eq!(
+            action["cancels"][0]["cloid"],
+            "0x1234567890abcdef1234567890abcdef"
+        );
+        assert_eq!(kind, HyperliquidCancelBatchKind::Cloid);
+    }
+
+    #[test]
+    fn batch_cancel_action_rejects_mixed_id_kinds() {
+        let cancel_a = crate::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "123456".to_string(),
+        };
+        let cancel_b = crate::types::CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "hyperliquid".into(),
+            order_id: "0xfedcba0987654321fedcba0987654321".to_string(),
+        };
+        let err = build_batch_cancel_action(&[&cancel_a, &cancel_b], 7).expect_err("mixed ids");
+        assert!(err
+            .to_string()
+            .contains("mixed hyperliquid cancel batch id kinds"));
+    }
+
+    #[test]
+    fn build_noop_action_has_expected_shape() {
+        let action = build_noop_action();
+        assert_eq!(action["type"], "noop");
+    }
+
+    #[test]
+    fn serialize_action_for_hl_signing_supports_noop() {
+        let encoded = serialize_action_for_hl_signing(&build_noop_action())
+            .expect("noop should serialize for signing");
+        assert!(!encoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_batch_with_hint_routes_sync_control_cloid_batches_to_cancel_by_cloid() {
+        use tiny_http::{Response, Server};
+
+        let _env_lock = ENV_MUTEX.lock().expect("env mutex");
+        let _guard_transport = EnvVarGuard::new("PARAPHINA_HL_ACTION_TRANSPORT");
+        std::env::set_var("PARAPHINA_HL_ACTION_TRANSPORT", "ws_post");
+
+        let server = Server::http("127.0.0.1:0").expect("bind server");
+        let addr = server.server_addr();
+        let rest_url = format!("http://{}", addr);
+        let observed = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let observed_server = observed.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests().take(2) {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                let value: serde_json::Value =
+                    serde_json::from_str(&body).expect("http payload json");
+                if value.get("type").and_then(|value| value.as_str()) == Some("meta") {
+                    let _ = request.respond(Response::from_string(
+                        r#"{"universe":[{"name":"TAO","szDecimals":4}]}"#,
+                    ));
+                } else {
+                    *observed_server.lock().expect("observed lock") = Some(value);
+                    let _ = request.respond(Response::from_string(r#"{"status":"ok"}"#));
+                }
+            }
+        });
+
+        let cfg = HyperliquidConfig {
+            network: HyperliquidNetwork::Testnet,
+            ws_urls: vec!["ws://127.0.0.1:1".to_string()],
+            rest_urls: vec![rest_url.clone()],
+            info_urls: vec![rest_url],
+            coin: "TAO".to_string(),
+            n_sig_figs: 5,
+            n_levels: 5,
+            venue_index: 0,
+            paper_mode: false,
+            private_key_hex: Some(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
+            vault_address: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = HyperliquidConnector::new(cfg, market_tx, exec_tx);
+
+        let results = connector
+            .cancel_batch_with_hint(
+                vec![
+                    LiveRestCancelRequest {
+                        venue_index: 0,
+                        venue_id: "hyperliquid".to_string(),
+                        order_id: "0x1234567890abcdef1234567890abcdef".to_string(),
+                    },
+                    LiveRestCancelRequest {
+                        venue_index: 0,
+                        venue_id: "hyperliquid".to_string(),
+                        order_id: "0xfedcba0987654321fedcba0987654321".to_string(),
+                    },
+                ],
+                TransportHint::HyperliquidSyncControl,
+            )
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.is_ok()));
+
+        let observed = observed
+            .lock()
+            .expect("observed lock")
+            .clone()
+            .expect("captured http payload");
+        assert_eq!(observed["action"]["type"], "cancelByCloid");
+        assert_eq!(observed["action"]["cancels"][0]["asset"], 0);
+        assert_eq!(
+            observed["action"]["cancels"][0]["cloid"],
+            "0x1234567890abcdef1234567890abcdef"
+        );
+        assert!(observed["nonce"].as_u64().is_some());
+        assert!(observed["signature"]["r"].as_str().is_some());
     }
 
     #[test]
@@ -2983,6 +5402,90 @@ mod tests {
         assert!((snapshot.margin.balance_usd - 100.0).abs() < 1e-9);
         assert!((snapshot.margin.available_usd - 87.5).abs() < 1e-9);
         assert_eq!(snapshot.liquidation.price_liq, Some(2100.0));
+    }
+
+    #[test]
+    fn private_subscriptions_include_clearinghouse_state_when_account_user_is_present() {
+        let subscriptions = build_private_subscriptions(Some("0xdeadbeef"));
+        assert_eq!(subscriptions.len(), 3);
+        assert_eq!(subscriptions[0]["subscription"]["type"], "userFills");
+        assert_eq!(subscriptions[1]["subscription"]["type"], "userEvents");
+        assert_eq!(
+            subscriptions[2]["subscription"]["type"],
+            "clearinghouseState"
+        );
+        assert_eq!(subscriptions[2]["subscription"]["user"], "0xdeadbeef");
+    }
+
+    #[test]
+    fn private_subscriptions_skip_clearinghouse_state_without_account_user() {
+        let subscriptions = build_private_subscriptions(None);
+        assert_eq!(subscriptions.len(), 2);
+        assert_eq!(subscriptions[0]["subscription"]["type"], "userFills");
+        assert_eq!(subscriptions[1]["subscription"]["type"], "userEvents");
+    }
+
+    #[test]
+    fn translate_account_event_parses_wrapped_clearinghouse_state_payload() {
+        let msg = serde_json::json!({
+            "channel": "clearinghouseState",
+            "data": {
+                "user": "0xdeadbeef",
+                "dex": "",
+                "clearinghouseState": {
+                    "marginSummary": {
+                        "accountValue": "100.0",
+                        "totalMarginUsed": "12.5",
+                        "totalRawUsd": "100.0"
+                    },
+                    "withdrawable": "87.5",
+                    "assetPositions": [{
+                        "position": {
+                            "coin": "ETH",
+                            "szi": "0.25",
+                            "entryPx": "2500.0",
+                            "liqPx": "2100.0"
+                        }
+                    }],
+                    "time": 1_700_000_000_123i64
+                }
+            }
+        });
+        let event = translate_account_event(&msg, Some("ETH"), 7).expect("account event");
+        let AccountEvent::Snapshot(snapshot) = event;
+        assert_eq!(snapshot.venue_index, 7);
+        assert_eq!(snapshot.venue_id, "ETH");
+        assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
+        assert_eq!(snapshot.positions.len(), 1);
+        assert_eq!(snapshot.positions[0].symbol, "ETH");
+    }
+
+    #[test]
+    fn translate_account_event_stamps_local_time_when_clearinghouse_time_missing() {
+        let msg = serde_json::json!({
+            "channel": "clearinghouseState",
+            "data": {
+                "user": "0xdeadbeef",
+                "dex": "",
+                "clearinghouseState": {
+                    "marginSummary": {
+                        "accountValue": "50.0",
+                        "totalMarginUsed": "0.0",
+                        "totalRawUsd": "50.0"
+                    },
+                    "withdrawable": "50.0",
+                    "assetPositions": []
+                }
+            }
+        });
+        let before = now_ms();
+        let event = translate_account_event(&msg, Some("ETH"), 3).expect("account event");
+        let AccountEvent::Snapshot(snapshot) = event;
+        let after = now_ms();
+        assert_eq!(snapshot.venue_index, 3);
+        assert_eq!(snapshot.venue_id, "ETH");
+        assert!(snapshot.timestamp_ms >= before);
+        assert!(snapshot.timestamp_ms <= after);
     }
 
     #[test]
@@ -3432,31 +5935,333 @@ mod tests {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct SignedPayload {
-    action: serde_json::Value,
-    nonce: u64,
+#[derive(Debug, Deserialize)]
+struct HyperliquidWsPostEnvelope {
+    data: HyperliquidWsPostData,
+}
+
+#[derive(Debug, Deserialize)]
+struct HyperliquidWsPostData {
+    id: u64,
+    response: HyperliquidWsPostActionResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct HyperliquidWsPostActionResponse {
+    #[serde(rename = "type")]
+    response_type: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "status", content = "response")]
+enum HyperliquidExchangeResponseStatus {
+    #[serde(rename = "ok")]
+    Ok(HyperliquidExchangeResponse),
+    #[serde(rename = "err")]
+    Err(serde_json::Value),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct HyperliquidExchangeResponse {
+    #[serde(rename = "type")]
+    response_type: String,
+    data: Option<HyperliquidExchangeDataStatuses>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct HyperliquidExchangeDataStatuses {
+    statuses: Vec<HyperliquidExchangeDataStatus>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct HyperliquidRestingOrder {
+    oid: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HyperliquidFilledOrder {
+    total_sz: String,
+    avg_px: String,
+    oid: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+enum HyperliquidExchangeDataStatus {
+    Success,
+    WaitingForFill,
+    WaitingForTrigger,
+    Error(String),
+    Resting(HyperliquidRestingOrder),
+    Filled(HyperliquidFilledOrder),
+}
+
+fn normalize_hl_address(address: &str) -> anyhow::Result<String> {
+    let trimmed = address.trim();
+    let hex_part = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if hex_part.len() != 40 || !hex_part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid Hyperliquid address format: {address}");
+    }
+    Ok(format!("0x{}", hex_part.to_ascii_lowercase()))
+}
+
+fn decode_hl_address_bytes(address: &str) -> anyhow::Result<[u8; 20]> {
+    let normalized = normalize_hl_address(address)?;
+    let mut out = [0u8; 20];
+    hex::decode_to_slice(&normalized[2..], &mut out)
+        .map_err(|err| anyhow::anyhow!("invalid Hyperliquid address hex: {err}"))?;
+    Ok(out)
+}
+
+fn keccak_bytes(input: impl AsRef<[u8]>) -> [u8; 32] {
+    let digest = Keccak256::digest(input.as_ref());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn abi_word_from_u64(value: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[24..].copy_from_slice(&value.to_be_bytes());
+    out
+}
+
+fn abi_word_from_address(address: [u8; 20]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[12..].copy_from_slice(&address);
+    out
+}
+
+fn serialize_action_for_hl_signing(action: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
+    let action_type = action
+        .get("type")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Hyperliquid action missing type"))?;
+    match action_type {
+        "order" => {
+            let parsed: HlOrderAction = serde_json::from_value(action.clone())?;
+            Ok(rmp_serde::to_vec_named(&parsed)?)
+        }
+        "cancel" => {
+            let parsed: HlCancelOidAction = serde_json::from_value(action.clone())?;
+            Ok(rmp_serde::to_vec_named(&parsed)?)
+        }
+        "cancelByCloid" => {
+            let parsed: HlCancelCloidAction = serde_json::from_value(action.clone())?;
+            Ok(rmp_serde::to_vec_named(&parsed)?)
+        }
+        "cancelAll" => {
+            let parsed: HlCancelAllAction = serde_json::from_value(action.clone())?;
+            Ok(rmp_serde::to_vec_named(&parsed)?)
+        }
+        "noop" => {
+            let parsed: HlNoopAction = serde_json::from_value(action.clone())?;
+            Ok(rmp_serde::to_vec_named(&parsed)?)
+        }
+        "reserveRequestWeight" => {
+            let parsed: HlReserveRequestWeightAction = serde_json::from_value(action.clone())?;
+            Ok(rmp_serde::to_vec_named(&parsed)?)
+        }
+        other => anyhow::bail!("unsupported Hyperliquid action type for signing parity: {other}"),
+    }
+}
+
+fn action_hash(
+    action: &serde_json::Value,
+    vault_address: Option<&str>,
+    nonce: TimestampMs,
+    expires_after: Option<TimestampMs>,
+) -> anyhow::Result<[u8; 32]> {
+    let mut packed = serialize_action_for_hl_signing(action)?;
+    packed.extend_from_slice(&(nonce as u64).to_be_bytes());
+    if let Some(vault_address) = vault_address {
+        packed.push(1);
+        packed.extend_from_slice(&decode_hl_address_bytes(vault_address)?);
+    } else {
+        packed.push(0);
+    }
+    if let Some(expires_after) = expires_after {
+        packed.push(0);
+        packed.extend_from_slice(&(expires_after as u64).to_be_bytes());
+    }
+    Ok(keccak_bytes(packed))
+}
+
+fn l1_domain_separator() -> [u8; 32] {
+    let type_hash = keccak_bytes(
+        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let name_hash = keccak_bytes("Exchange");
+    let version_hash = keccak_bytes("1");
+    let chain_id = abi_word_from_u64(1337);
+    let verifying_contract = abi_word_from_address([0u8; 20]);
+    let mut encoded = Vec::with_capacity(32 * 5);
+    encoded.extend_from_slice(&type_hash);
+    encoded.extend_from_slice(&name_hash);
+    encoded.extend_from_slice(&version_hash);
+    encoded.extend_from_slice(&chain_id);
+    encoded.extend_from_slice(&verifying_contract);
+    keccak_bytes(encoded)
+}
+
+fn l1_struct_hash(connection_id: [u8; 32], is_mainnet: bool) -> [u8; 32] {
+    let type_hash = keccak_bytes("Agent(string source,bytes32 connectionId)");
+    let source_hash = keccak_bytes(if is_mainnet { "a" } else { "b" });
+    let mut encoded = Vec::with_capacity(32 * 3);
+    encoded.extend_from_slice(&type_hash);
+    encoded.extend_from_slice(&source_hash);
+    encoded.extend_from_slice(&connection_id);
+    keccak_bytes(encoded)
+}
+
+fn eip712_l1_digest(connection_id: [u8; 32], is_mainnet: bool) -> [u8; 32] {
+    let domain_separator = l1_domain_separator();
+    let struct_hash = l1_struct_hash(connection_id, is_mainnet);
+    let mut encoded = Vec::with_capacity(2 + 32 + 32);
+    encoded.extend_from_slice(b"\x19\x01");
+    encoded.extend_from_slice(&domain_separator);
+    encoded.extend_from_slice(&struct_hash);
+    keccak_bytes(encoded)
+}
+
+fn format_hl_signature(signature: &Signature, recovery_id: RecoveryId) -> serde_json::Value {
+    let (r, s) = signature.split_bytes();
+    let v: u8 = 27 + recovery_id.to_byte();
+    json!({
+        "r": format!("0x{}", hex::encode(r)),
+        "s": format!("0x{}", hex::encode(s)),
+        "v": v,
+    })
 }
 
 fn sign_action(
     action: &serde_json::Value,
+    vault_address: Option<&str>,
     nonce: TimestampMs,
+    is_mainnet: bool,
     signing_key: &SigningKey,
 ) -> anyhow::Result<serde_json::Value> {
-    let payload = SignedPayload {
-        action: action.clone(),
-        nonce: nonce as u64,
+    let connection_id = action_hash(action, vault_address, nonce, None)?;
+    let digest = eip712_l1_digest(connection_id, is_mainnet);
+    let (sig, recid) = signing_key.sign_prehash_recoverable(&digest)?;
+    Ok(format_hl_signature(&sig, recid))
+}
+
+#[cfg(test)]
+fn recover_action_signer_address(
+    action: &serde_json::Value,
+    vault_address: Option<&str>,
+    nonce: TimestampMs,
+    is_mainnet: bool,
+    signature: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let connection_id = action_hash(action, vault_address, nonce, None)?;
+    let digest = eip712_l1_digest(connection_id, is_mainnet);
+    let r = signature
+        .get("r")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("signature missing r"))?;
+    let s = signature
+        .get("s")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow::anyhow!("signature missing s"))?;
+    let v = signature
+        .get("v")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("signature missing v"))?;
+    let r_bytes = hex::decode(r.trim_start_matches("0x"))?;
+    let s_bytes = hex::decode(s.trim_start_matches("0x"))?;
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes[..32].copy_from_slice(&r_bytes);
+    sig_bytes[32..].copy_from_slice(&s_bytes);
+    let signature = Signature::try_from(sig_bytes.as_slice())?;
+    let recovery_id = RecoveryId::try_from((v as u8).saturating_sub(27))?;
+    let verifying_key =
+        k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id)?;
+    let pubkey = verifying_key.to_encoded_point(false);
+    let pubkey_bytes = pubkey.as_bytes();
+    let hashed = keccak_bytes(&pubkey_bytes[1..]);
+    Ok(format!("0x{}", hex::encode(&hashed[12..])))
+}
+
+fn parse_ws_post_response(value: &serde_json::Value) -> Option<(u64, String, anyhow::Result<()>)> {
+    let envelope: HyperliquidWsPostEnvelope = serde_json::from_value(value.clone()).ok()?;
+    let id = envelope.data.id;
+    let response_type = envelope.data.response.response_type;
+    let payload = envelope.data.response.payload;
+
+    if response_type.eq_ignore_ascii_case("error") {
+        let detail = ws_post_json_detail(&payload);
+        return Some((
+            id,
+            response_type,
+            Err(anyhow::anyhow!("Hyperliquid ws_post failed: {detail}")),
+        ));
+    }
+
+    if !response_type.eq_ignore_ascii_case("action") {
+        return Some((id, response_type, Ok(())));
+    }
+
+    let action_status: HyperliquidExchangeResponseStatus =
+        match serde_json::from_value(payload.clone()) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return Some((
+                    id,
+                    response_type,
+                    Err(anyhow::anyhow!(
+                        "Hyperliquid ws_post action payload decode failed: {err}; payload={}",
+                        ws_post_json_detail(&payload)
+                    )),
+                ));
+            }
+        };
+
+    let result = match action_status {
+        HyperliquidExchangeResponseStatus::Err(detail) => Err(anyhow::anyhow!(
+            "Hyperliquid ws_post action top_level_err={}",
+            ws_post_json_detail(&detail)
+        )),
+        HyperliquidExchangeResponseStatus::Ok(exchange_response) => {
+            if let Some(exchange_data) = exchange_response.data {
+                let mut errors = Vec::new();
+                for status in exchange_data.statuses {
+                    match status {
+                        HyperliquidExchangeDataStatus::Error(detail) => errors.push(detail),
+                        HyperliquidExchangeDataStatus::Success
+                        | HyperliquidExchangeDataStatus::WaitingForFill
+                        | HyperliquidExchangeDataStatus::WaitingForTrigger
+                        | HyperliquidExchangeDataStatus::Resting(_)
+                        | HyperliquidExchangeDataStatus::Filled(_) => {}
+                    }
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Hyperliquid ws_post action exchange_errors={} response_type={} payload={}",
+                        errors.join(" | "),
+                        exchange_response.response_type,
+                        ws_post_json_detail(&payload)
+                    ))
+                }
+            } else {
+                Ok(())
+            }
+        }
     };
-    let packed = rmp_serde::to_vec_named(&payload)?;
-    let digest = Keccak256::new().chain_update(&packed);
-    let (sig, recid) = signing_key.sign_digest_recoverable(digest)?;
-    let (r, s) = sig.split_bytes();
-    let v: u8 = recid.to_byte();
-    Ok(json!({
-        "r": format!("0x{}", hex::encode(r)),
-        "s": format!("0x{}", hex::encode(s)),
-        "v": v,
-    }))
+
+    Some((id, response_type, result))
+}
+
+fn ws_post_json_detail(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        _ => value.to_string(),
+    }
 }
 
 pub fn translate_private_events(msg: &serde_json::Value) -> Vec<ExecutionEvent> {
@@ -3489,13 +6294,26 @@ pub fn translate_private_events(msg: &serde_json::Value) -> Vec<ExecutionEvent> 
     out
 }
 
-pub fn translate_account_event(msg: &serde_json::Value) -> Option<AccountEvent> {
+pub fn translate_account_event(
+    msg: &serde_json::Value,
+    default_venue_id: Option<&str>,
+    venue_index: usize,
+) -> Option<AccountEvent> {
     let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("");
     if channel != "userState" && channel != "clearinghouseState" {
         return None;
     }
     let data = msg.get("data")?;
-    parse_account_snapshot(data).map(AccountEvent::Snapshot)
+    let payload = match channel {
+        "clearinghouseState" => data.get("clearinghouseState").unwrap_or(data),
+        "userState" => data.get("userState").unwrap_or(data),
+        _ => data,
+    };
+    let mut snapshot = parse_account_snapshot_with_meta(payload, default_venue_id, venue_index)?;
+    if snapshot.timestamp_ms <= 0 {
+        snapshot.timestamp_ms = now_ms();
+    }
+    Some(AccountEvent::Snapshot(snapshot))
 }
 
 fn parse_user_event(data: &serde_json::Value, seq: u64) -> Option<ExecutionEvent> {

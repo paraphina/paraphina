@@ -65,6 +65,7 @@ async fn live_telemetry_contract_passes_fixture_run() {
                 intents,
                 action_batch,
                 now_ms,
+                transport_hint: _,
                 response,
             } = req;
             let events = shadow.handle_intents(intents, action_batch.tick_index, now_ms);

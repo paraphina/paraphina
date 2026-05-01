@@ -1,5 +1,12 @@
 # Roadmap‑B Readiness Report
 
+Scope: generated historical connector snapshot.
+
+This report is useful provenance for the connector state on its generation date,
+but it is not the current roadmap and must not be used as the live topology
+authority. Use `ROADMAP.md` for strategy and read-only `phase5/status.md` plus
+`phase5/queue.yaml` for current Phase 5 context.
+
 - Generated (UTC): 2026-01-31T21:24:04Z
 
 ## Connector Matrix

@@ -488,6 +488,7 @@ impl PaperExecutionAdapter {
             orders.push(OpenOrderSnapshot {
                 order_id: order_id.clone(),
                 client_order_id: order.client_order_id.clone(),
+                exchange_order_id: None,
                 side: order.side,
                 price: order.price,
                 size: order.size,

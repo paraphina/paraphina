@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "updated_utc": "2026-05-01T01:43:33Z",
+  "tranche_id": "phase5_reopened_wallet_econ_full_cost_opportunity_adjusted_gate_requal",
+  "duration_sec": 7200,
+  "clean": {
+    "passed": true,
+    "decision_effect": "pass",
+    "failed_rules": [],
+    "blocking_rules": [],
+    "hard_failed_rules": [],
+    "hold_rules": [],
+    "rollback_rules": [],
+    "warnings": []
+  },
+  "mechanism": {
+    "passed": true,
+    "decision_effect": "pass",
+    "failed_rules": [],
+    "blocking_rules": [],
+    "hard_failed_rules": [],
+    "hold_rules": [],
+    "rollback_rules": [],
+    "warnings": []
+  },
+  "promotion": {
+    "passed": true,
+    "decision_effect": "pass",
+    "failed_rules": [],
+    "blocking_rules": [],
+    "hard_failed_rules": [],
+    "hold_rules": [],
+    "rollback_rules": [],
+    "warnings": []
+  },
+  "has_promotion_rules": true,
+  "is_final_rung": true,
+  "suggested_action": "promote"
+}

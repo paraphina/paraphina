@@ -31,7 +31,7 @@ use super::super::types::{
     LiquidationSnapshot, MarginSnapshot, MarketDataEvent, OpenOrderSnapshot, OrderSnapshot,
     PositionSnapshot, TopOfBook,
 };
-use crate::live::MarketPublisher;
+use crate::live::{live_market_pub_drain_max, live_market_pub_queue_cap, MarketPublisher};
 use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
 
 #[cfg(feature = "live_aster")]
@@ -45,6 +45,7 @@ pub const SUPPORTS_EXECUTION: bool = true;
 
 // FIX: Normalized default to 10,000ms to match other venues (was 1,800ms)
 const ASTER_STALE_MS_DEFAULT: u64 = 10_000;
+const ASTER_BRIDGE_WAIT_STALE_MS_DEFAULT: u64 = 2_000;
 const ASTER_WATCHDOG_TICK_MS: u64 = 200;
 const ASTER_MARKET_PUB_QUEUE_CAP_LIVE: usize = 256;
 const ASTER_MARKET_PUB_QUEUE_CAP_FIXTURE: usize = 4096;
@@ -65,6 +66,13 @@ fn aster_stale_ms() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(ASTER_STALE_MS_DEFAULT)
+}
+
+fn aster_bridge_wait_stale_ms() -> u64 {
+    std::env::var("PARAPHINA_ASTER_BRIDGE_WAIT_STALE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| aster_stale_ms().max(ASTER_BRIDGE_WAIT_STALE_MS_DEFAULT))
 }
 
 #[allow(dead_code)]
@@ -441,12 +449,14 @@ impl AsterConnector {
         let cap = if is_aster_fixture_mode_now() {
             ASTER_MARKET_PUB_QUEUE_CAP_FIXTURE
         } else {
-            ASTER_MARKET_PUB_QUEUE_CAP_LIVE
+            live_market_pub_queue_cap(ASTER_MARKET_PUB_QUEUE_CAP_LIVE)
         };
+        let drain_max = live_market_pub_drain_max(ASTER_MARKET_PUB_DRAIN_MAX);
         let freshness = Arc::new(Freshness::default());
         let market_publisher = MarketPublisher::new(
             cap,
-            ASTER_MARKET_PUB_DRAIN_MAX,
+            drain_max,
+            "aster",
             market_tx.clone(),
             Some(Arc::new(move || is_fixture || is_aster_fixture_mode_now())),
             Arc::new(|event: &MarketDataEvent| {
@@ -840,6 +850,8 @@ impl AsterConnector {
                 }
             }
         }
+        #[allow(unreachable_code)]
+        Ok(())
     }
 
     async fn public_ws_once(&self) -> anyhow::Result<()> {
@@ -881,7 +893,6 @@ impl AsterConnector {
         let mut last_watchdog_trigger_at: Option<Instant> = None;
         let mut watchdog = tokio::time::interval(Duration::from_millis(250));
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        const STALE_MS: u64 = 2_000;
         const COOLDOWN_MS: u64 = 7_000;
         // WS-level ping timer to prevent idle connection drops.
         let ping_interval_ms: u64 = std::env::var("PARAPHINA_ASTER_PING_INTERVAL_MS")
@@ -899,6 +910,7 @@ impl AsterConnector {
             || std::env::var_os("ROADMAP_B_FIXTURE_DIR").is_some();
         // FIX: Use configurable stale threshold (normalized to 10,000ms default)
         let stale_ms = aster_stale_ms();
+        let bridge_wait_stale_ms = aster_bridge_wait_stale_ms();
         let mut _stale_tx_guard = None;
         if fixture_mode {
             _stale_tx_guard = Some(stale_tx);
@@ -1090,6 +1102,10 @@ impl AsterConnector {
                             // Stay in loop 1 but remember the snapshot ID so
                             // incoming WS frames can be checked for a bridge.
                             snapshot_last_id = Some(snap_id);
+                            // Keep the snapshot future pending while waiting for a
+                            // bridging delta; otherwise loop1 will refetch snapshots
+                            // continuously and starve the actual bridge path.
+                            snapshot_future = Some(Box::pin(std::future::pending()));
                             aster_audit_book_recovery(
                                 "snapshot_wait_bridge",
                                 "loop1",
@@ -1162,10 +1178,15 @@ impl AsterConnector {
                     _ = watchdog.tick() => {
                         let now = Instant::now();
                         let stale = now.duration_since(last_applied_at);
+                        let stale_threshold_ms = if snapshot_last_id.is_some() {
+                            bridge_wait_stale_ms
+                        } else {
+                            ASTER_BRIDGE_WAIT_STALE_MS_DEFAULT
+                        };
                         let cooldown_ok = last_watchdog_trigger_at
                             .map(|last| now.duration_since(last) >= Duration::from_millis(COOLDOWN_MS))
                             .unwrap_or(true);
-                        if stale > Duration::from_millis(STALE_MS)
+                        if stale > Duration::from_millis(stale_threshold_ms)
                             && (cooldown_ok || stale >= Duration::from_millis(15_000))
                         {
                             aster_audit_reconnect("stale_watchdog");
@@ -1183,12 +1204,14 @@ impl AsterConnector {
                                     ("parsed_age_ms", ages.parsed_age_ms.to_string()),
                                     ("pub_age_ms", ages.pub_age_ms.to_string()),
                                     ("book_age_ms", ages.book_age_ms.to_string()),
+                                    ("threshold_ms", stale_threshold_ms.to_string()),
                                 ],
                             );
                             eprintln!(
-                                "WARN: Aster WS stale; resyncing url={} stale_ms={}",
+                                "WARN: Aster WS stale; resyncing url={} stale_ms={} threshold_ms={}",
                                 self.cfg.ws_url,
-                                stale.as_millis()
+                                stale.as_millis(),
+                                stale_threshold_ms
                             );
                             buffered_updates.clear();
                             last_update_id = None;
@@ -1601,7 +1624,7 @@ impl AsterConnector {
                     let cooldown_ok = last_watchdog_trigger_at
                         .map(|last| now.duration_since(last) >= Duration::from_millis(COOLDOWN_MS))
                         .unwrap_or(true);
-                    if stale > Duration::from_millis(STALE_MS)
+                    if stale > Duration::from_millis(stale_ms)
                         && (cooldown_ok || stale >= Duration::from_millis(15_000))
                     {
                         aster_audit_reconnect("stale_watchdog");
@@ -1785,6 +1808,25 @@ impl AsterRestClient {
         self.cfg.has_auth()
     }
 
+    async fn send_api_key_request(
+        &self,
+        method: Method,
+        path: &str,
+    ) -> LiveResult<reqwest::Response> {
+        let api_key = self
+            .cfg
+            .api_key
+            .as_ref()
+            .ok_or_else(|| LiveGatewayError::fatal("aster api key missing"))?;
+        let url = format!("{}{}", self.cfg.rest_url, path);
+        self.http
+            .request(method, url)
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+            .map_err(|err| LiveGatewayError::retryable(format!("rest_error: {err}")))
+    }
+
     async fn resolve_price_tick_size(&self) -> LiveResult<f64> {
         {
             let guard = self.price_tick_size.lock().await;
@@ -1866,7 +1908,50 @@ impl AsterRestClient {
         Ok(resp)
     }
 
-    async fn fetch_account_snapshot(
+    async fn start_user_stream(&self) -> LiveResult<String> {
+        let resp = self
+            .send_api_key_request(Method::POST, "/fapi/v1/listenKey")
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        let value: Value = serde_json::from_str(&body).map_err(|err| {
+            LiveGatewayError::fatal(format!("aster listenKey parse error: {err}"))
+        })?;
+        value
+            .get("listenKey")
+            .and_then(|raw| raw.as_str())
+            .map(|listen_key| listen_key.to_string())
+            .ok_or_else(|| LiveGatewayError::fatal("aster listenKey missing from response"))
+    }
+
+    async fn keepalive_user_stream(&self) -> LiveResult<()> {
+        let resp = self
+            .send_api_key_request(Method::PUT, "/fapi/v1/listenKey")
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        Ok(())
+    }
+
+    async fn close_user_stream(&self) -> LiveResult<()> {
+        let resp = self
+            .send_api_key_request(Method::DELETE, "/fapi/v1/listenKey")
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(map_rest_error(status.as_u16(), &body));
+        }
+        Ok(())
+    }
+
+    pub async fn fetch_account_snapshot(
         &self,
         venue_id: &str,
         venue_index: usize,
@@ -1885,6 +1970,10 @@ impl AsterRestClient {
             parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
                 LiveGatewayError::fatal("aster account snapshot missing required fields")
             })?;
+        // Aster's REST account `updateTime` can be absent/zero or stale even when
+        // the poll itself is fresh. Use the shared connector sequence so REST
+        // account refreshes remain monotonic with private-stream account updates.
+        snapshot.seq = self.poll_seq.fetch_add(1, Ordering::Relaxed);
         // Treat freshness as the time we successfully polled the venue. Aster's
         // `updateTime` reflects the last account mutation and can remain unchanged
         // for long periods, which would make a fresh poll look stale downstream.
@@ -1909,13 +1998,14 @@ impl AsterRestClient {
         let value: Value = serde_json::from_str(&body).map_err(|err| {
             LiveGatewayError::fatal(format!("aster open orders parse error: {err}"))
         })?;
-        Ok(OrderSnapshot {
+        let snapshot = OrderSnapshot {
             venue_index,
             venue_id: venue_id.to_string(),
             seq: self.poll_seq.fetch_add(1, Ordering::Relaxed),
             timestamp_ms: (self.timestamp_fn)(),
             open_orders: parse_open_orders(&value, &self.cfg.market),
-        })
+        };
+        Ok(snapshot)
     }
 
     pub async fn run_account_polling(
@@ -1962,6 +2052,217 @@ impl AsterRestClient {
         }
     }
 
+    pub async fn run_private_ws(
+        self: Arc<Self>,
+        account_tx: mpsc::Sender<AccountEvent>,
+        exec_tx: mpsc::Sender<ExecutionEvent>,
+        venue_id: String,
+        venue_index: usize,
+    ) {
+        let mut backoff = Duration::from_secs(1);
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
+        loop {
+            let session_start = Instant::now();
+            if let Err(err) = self
+                .private_ws_once(account_tx.clone(), exec_tx.clone(), &venue_id, venue_index)
+                .await
+            {
+                eprintln!("Aster private WS error: {err}");
+            }
+
+            if session_start.elapsed() >= healthy_threshold {
+                backoff = Duration::from_secs(1);
+            }
+
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
+    async fn private_ws_once(
+        &self,
+        account_tx: mpsc::Sender<AccountEvent>,
+        exec_tx: mpsc::Sender<ExecutionEvent>,
+        venue_id: &str,
+        venue_index: usize,
+    ) -> anyhow::Result<()> {
+        let listen_key = self
+            .start_user_stream()
+            .await
+            .map_err(|err| anyhow::anyhow!("aster listenKey start failed: {}", err.message))?;
+
+        let bootstrap_account = self
+            .fetch_account_snapshot(venue_id, venue_index)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("aster bootstrap account snapshot failed: {}", err.message)
+            })?;
+        let mut account_state = AsterAccountState::from_snapshot(bootstrap_account.clone());
+        account_tx
+            .send(AccountEvent::Snapshot(bootstrap_account))
+            .await
+            .map_err(|_| anyhow::anyhow!("aster account_tx closed during bootstrap"))?;
+
+        let bootstrap_orders = self
+            .fetch_open_order_snapshot(venue_id, venue_index)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("aster bootstrap order snapshot failed: {}", err.message)
+            })?;
+        let mut order_state =
+            AsterOrderState::from_snapshot(&self.cfg.market, bootstrap_orders.clone());
+        exec_tx
+            .send(ExecutionEvent::OrderSnapshot(bootstrap_orders))
+            .await
+            .map_err(|_| anyhow::anyhow!("aster exec_tx closed during bootstrap"))?;
+
+        let ws_url = format!("{}/{}", self.cfg.ws_url.trim_end_matches('/'), listen_key);
+        eprintln!("INFO: Aster private WS connecting url={}", ws_url);
+        let (ws_stream, _) =
+            tokio::time::timeout(Duration::from_secs(15), connect_async(ws_url.as_str()))
+                .await
+                .map_err(|_| anyhow::anyhow!("Aster private WS connect timeout (15s)"))?
+                .map_err(|err| anyhow::anyhow!("Aster private WS connect error: {err}"))?;
+        eprintln!("INFO: Aster private WS connected url={}", ws_url);
+
+        let (mut write, mut read) = ws_stream.split();
+        let ping_interval_ms: u64 = std::env::var("PARAPHINA_ASTER_PING_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        let mut ping_timer = tokio::time::interval(Duration::from_millis(ping_interval_ms));
+        ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ping_timer.tick().await;
+
+        let keepalive_ms: u64 = std::env::var("PARAPHINA_ASTER_USER_STREAM_KEEPALIVE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30 * 60 * 1_000);
+        let mut keepalive_timer = tokio::time::interval(Duration::from_millis(keepalive_ms));
+        keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive_timer.tick().await;
+
+        let result: anyhow::Result<()> = async {
+        loop {
+            tokio::select! {
+                _ = ping_timer.tick() => {
+                    if let Err(err) = write.send(Message::Ping(vec![].into())).await {
+                        anyhow::bail!("Aster private WS ping send failed: {err}");
+                    }
+                }
+                _ = keepalive_timer.tick() => {
+                    self.keepalive_user_stream()
+                        .await
+                        .map_err(|err| anyhow::anyhow!("aster listenKey keepalive failed: {}", err.message))?;
+                }
+                read_result = tokio::time::timeout(Duration::from_secs(30), read.next()) => {
+                    let maybe = match read_result {
+                        Ok(msg) => msg,
+                        Err(_) => anyhow::bail!("Aster private WS read timeout after 30s"),
+                    };
+                    let Some(msg) = maybe else {
+                        break;
+                    };
+                    match msg? {
+                        Message::Text(text) => {
+                            self.handle_private_ws_message(
+                                &text,
+                                &account_tx,
+                                &exec_tx,
+                                &mut account_state,
+                                &mut order_state,
+                            ).await?;
+                        }
+                        Message::Binary(bytes) => {
+                            let text = String::from_utf8(bytes)
+                                .map_err(|_| anyhow::anyhow!("Aster private WS non-utf8 binary frame"))?;
+                            self.handle_private_ws_message(
+                                &text,
+                                &account_tx,
+                                &exec_tx,
+                                &mut account_state,
+                                &mut order_state,
+                            ).await?;
+                        }
+                        Message::Ping(payload) => {
+                            write.send(Message::Pong(payload)).await?;
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok(())
+        }.await;
+
+        if let Err(err) = self.close_user_stream().await {
+            eprintln!("WARN: Aster listenKey close failed: {}", err.message);
+        }
+        result
+    }
+
+    async fn handle_private_ws_message(
+        &self,
+        text: &str,
+        account_tx: &mpsc::Sender<AccountEvent>,
+        exec_tx: &mpsc::Sender<ExecutionEvent>,
+        account_state: &mut AsterAccountState,
+        order_state: &mut AsterOrderState,
+    ) -> anyhow::Result<()> {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|err| anyhow::anyhow!("Aster private WS parse error: {err}"))?;
+        let event_type = value.get("e").and_then(|raw| raw.as_str()).unwrap_or("");
+        match event_type {
+            "ACCOUNT_UPDATE" => {
+                let seq = self.poll_seq.fetch_add(1, Ordering::Relaxed);
+                let timestamp_ms = value
+                    .get("E")
+                    .and_then(|raw| raw.as_i64())
+                    .or_else(|| value.get("T").and_then(|raw| raw.as_i64()))
+                    .unwrap_or((self.timestamp_fn)());
+                let Some(snapshot) = account_state.apply_update(&value, seq, timestamp_ms) else {
+                    eprintln!(
+                        "WARN: Aster private WS stale ACCOUNT_UPDATE ignored event_ms={} last_state_ms={}",
+                        timestamp_ms,
+                        account_state.last_event_ms()
+                    );
+                    return Ok(());
+                };
+                account_tx
+                    .send(AccountEvent::Snapshot(snapshot))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("aster account_tx closed"))?;
+            }
+            "ORDER_TRADE_UPDATE" => {
+                let seq = self.poll_seq.fetch_add(1, Ordering::Relaxed);
+                let timestamp_ms = value
+                    .get("E")
+                    .and_then(|raw| raw.as_i64())
+                    .or_else(|| value.get("T").and_then(|raw| raw.as_i64()))
+                    .unwrap_or((self.timestamp_fn)());
+                if let Some(snapshot) = order_state.apply_update(&value, seq, timestamp_ms) {
+                    exec_tx
+                        .send(ExecutionEvent::OrderSnapshot(snapshot))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("aster exec_tx closed"))?;
+                }
+            }
+            "listenKeyExpired" => {
+                anyhow::bail!("Aster private WS listenKey expired");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     // Note: funding polling lives on AsterConnector (market publisher).
 }
 
@@ -1997,7 +2298,10 @@ impl LiveRestClient for AsterRestClient {
                 return Err(map_rest_error(status.as_u16(), &body));
             }
             let order_id = parse_order_id(&body).or(Some(req.client_order_id));
-            Ok(LiveRestResponse { order_id })
+            Ok(LiveRestResponse {
+                order_id,
+                client_order_id: None,
+            })
         })
     }
 
@@ -2021,11 +2325,15 @@ impl LiveRestClient for AsterRestClient {
                 if is_aster_unknown_order(&body) {
                     return Ok(LiveRestResponse {
                         order_id: Some(req.order_id),
+                        client_order_id: None,
                     });
                 }
                 return Err(map_rest_error(status.as_u16(), &body));
             }
-            Ok(LiveRestResponse { order_id: None })
+            Ok(LiveRestResponse {
+                order_id: None,
+                client_order_id: None,
+            })
         })
     }
 
@@ -2043,7 +2351,10 @@ impl LiveRestClient for AsterRestClient {
             if !status.is_success() {
                 return Err(map_rest_error(status.as_u16(), &body));
             }
-            Ok(LiveRestResponse { order_id: None })
+            Ok(LiveRestResponse {
+                order_id: None,
+                client_order_id: None,
+            })
         })
     }
 }
@@ -2221,6 +2532,7 @@ fn parse_open_orders(value: &Value, market: &str) -> Vec<OpenOrderSnapshot> {
             (size > 0.0).then_some(OpenOrderSnapshot {
                 order_id,
                 client_order_id,
+                exchange_order_id: None,
                 side,
                 price,
                 size,
@@ -2312,6 +2624,242 @@ fn parse_account_snapshot(
         margin,
         liquidation,
     })
+}
+
+#[derive(Debug, Clone)]
+struct AsterAccountState {
+    snapshot: AccountSnapshot,
+    positions: BTreeMap<String, PositionSnapshot>,
+    balances: BTreeMap<String, BalanceSnapshot>,
+    last_event_ms: TimestampMs,
+}
+
+impl AsterAccountState {
+    fn from_snapshot(snapshot: AccountSnapshot) -> Self {
+        let last_event_ms = snapshot.timestamp_ms;
+        let positions = snapshot
+            .positions
+            .iter()
+            .cloned()
+            .map(|position| (position.symbol.clone(), position))
+            .collect();
+        let balances = snapshot
+            .balances
+            .iter()
+            .cloned()
+            .map(|balance| (balance.asset.clone(), balance))
+            .collect();
+        Self {
+            snapshot,
+            positions,
+            balances,
+            last_event_ms,
+        }
+    }
+
+    fn apply_update(
+        &mut self,
+        value: &Value,
+        seq: u64,
+        timestamp_ms: TimestampMs,
+    ) -> Option<AccountSnapshot> {
+        if timestamp_ms < self.last_event_ms {
+            return None;
+        }
+        let data = value.get("a").unwrap_or(value);
+
+        if let Some(balances) = data.get("B").and_then(|raw| raw.as_array()) {
+            for balance in balances {
+                let Some(asset) = balance.get("a").and_then(|raw| raw.as_str()) else {
+                    continue;
+                };
+                let total = balance
+                    .get("wb")
+                    .and_then(parse_f64)
+                    .unwrap_or_else(|| self.balances.get(asset).map(|b| b.total).unwrap_or(0.0));
+                let available = balance.get("cw").and_then(parse_f64).unwrap_or_else(|| {
+                    self.balances
+                        .get(asset)
+                        .map(|b| b.available)
+                        .unwrap_or(total)
+                });
+                self.balances.insert(
+                    asset.to_string(),
+                    BalanceSnapshot {
+                        asset: asset.to_string(),
+                        total,
+                        available,
+                    },
+                );
+            }
+        }
+
+        if let Some(positions) = data.get("P").and_then(|raw| raw.as_array()) {
+            for position in positions {
+                let Some(symbol) = position.get("s").and_then(|raw| raw.as_str()) else {
+                    continue;
+                };
+                let size = position.get("pa").and_then(parse_f64).unwrap_or(0.0);
+                let entry_price = position.get("ep").and_then(parse_f64).unwrap_or_else(|| {
+                    self.positions
+                        .get(symbol)
+                        .map(|existing| existing.entry_price)
+                        .unwrap_or(0.0)
+                });
+                if size.abs() < 1e-12 {
+                    self.positions.remove(symbol);
+                } else {
+                    self.positions.insert(
+                        symbol.to_string(),
+                        PositionSnapshot {
+                            symbol: symbol.to_string(),
+                            size,
+                            entry_price,
+                        },
+                    );
+                }
+            }
+        }
+
+        self.snapshot.seq = seq;
+        self.snapshot.timestamp_ms = timestamp_ms;
+        self.last_event_ms = timestamp_ms;
+        self.snapshot.positions = self.positions.values().cloned().collect();
+        self.snapshot.balances = self.balances.values().cloned().collect();
+        let balance_usd = self
+            .snapshot
+            .balances
+            .iter()
+            .map(|balance| balance.total)
+            .sum::<f64>();
+        let available_usd = self
+            .snapshot
+            .balances
+            .iter()
+            .map(|balance| balance.available)
+            .sum::<f64>();
+        self.snapshot.margin.balance_usd = balance_usd;
+        self.snapshot.margin.available_usd = available_usd;
+        self.snapshot.margin.used_usd = (balance_usd - available_usd).max(0.0);
+        Some(self.snapshot.clone())
+    }
+
+    fn last_event_ms(&self) -> TimestampMs {
+        self.last_event_ms
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AsterOrderState {
+    market: String,
+    snapshot: OrderSnapshot,
+    open_orders: BTreeMap<String, OpenOrderSnapshot>,
+    order_event_ms: BTreeMap<String, TimestampMs>,
+    snapshot_watermark_ms: TimestampMs,
+}
+
+impl AsterOrderState {
+    fn from_snapshot(market: &str, snapshot: OrderSnapshot) -> Self {
+        let snapshot_watermark_ms = snapshot.timestamp_ms;
+        let open_orders = snapshot
+            .open_orders
+            .iter()
+            .cloned()
+            .map(|order| (order.order_id.clone(), order))
+            .collect();
+        let order_event_ms = snapshot
+            .open_orders
+            .iter()
+            .map(|order| (order.order_id.clone(), snapshot_watermark_ms))
+            .collect();
+        Self {
+            market: market.to_string(),
+            snapshot,
+            open_orders,
+            order_event_ms,
+            snapshot_watermark_ms,
+        }
+    }
+
+    fn apply_update(
+        &mut self,
+        value: &Value,
+        seq: u64,
+        timestamp_ms: TimestampMs,
+    ) -> Option<OrderSnapshot> {
+        let order = value.get("o")?;
+        let symbol = order.get("s").and_then(|raw| raw.as_str()).unwrap_or("");
+        if !symbol_matches(symbol, &self.market) {
+            return None;
+        }
+
+        let order_id = order
+            .get("i")
+            .and_then(|raw| raw.as_i64().map(|id| id.to_string()))
+            .or_else(|| {
+                order
+                    .get("i")
+                    .and_then(|raw| raw.as_u64().map(|id| id.to_string()))
+            })
+            .or_else(|| {
+                order
+                    .get("i")
+                    .and_then(|raw| raw.as_str().map(|id| id.to_string()))
+            })?;
+        let status = order.get("X").and_then(|raw| raw.as_str()).unwrap_or("");
+        let side = match order.get("S").and_then(|raw| raw.as_str()) {
+            Some(side) if side.eq_ignore_ascii_case("BUY") => Side::Buy,
+            Some(side) if side.eq_ignore_ascii_case("SELL") => Side::Sell,
+            _ => return None,
+        };
+        let price = order.get("p").and_then(parse_f64).unwrap_or(0.0);
+        let original_qty = order.get("q").and_then(parse_f64).unwrap_or(0.0);
+        let executed_qty = order.get("z").and_then(parse_f64).unwrap_or(0.0);
+        let remaining_size = (original_qty - executed_qty).max(0.0);
+        let client_order_id = order
+            .get("c")
+            .and_then(|raw| raw.as_str())
+            .map(|id| id.to_string());
+
+        if timestamp_ms < self.snapshot_watermark_ms {
+            return None;
+        }
+        if let Some(last_event_ms) = self.order_event_ms.get(&order_id) {
+            if timestamp_ms < *last_event_ms {
+                return None;
+            }
+        }
+
+        if status.eq_ignore_ascii_case("NEW")
+            || status.eq_ignore_ascii_case("PARTIALLY_FILLED")
+            || status.eq_ignore_ascii_case("OPEN")
+        {
+            if remaining_size > 0.0 {
+                self.open_orders.insert(
+                    order_id.clone(),
+                    OpenOrderSnapshot {
+                        order_id: order_id.clone(),
+                        client_order_id,
+                        exchange_order_id: None,
+                        side,
+                        price,
+                        size: remaining_size,
+                        purpose: None,
+                    },
+                );
+            } else {
+                self.open_orders.remove(&order_id);
+            }
+        } else {
+            self.open_orders.remove(&order_id);
+        }
+        self.order_event_ms.insert(order_id, timestamp_ms);
+
+        self.snapshot.seq = seq;
+        self.snapshot.timestamp_ms = timestamp_ms;
+        self.snapshot.open_orders = self.open_orders.values().cloned().collect();
+        Some(self.snapshot.clone())
+    }
 }
 
 async fn fetch_public_funding(client: &Client, cfg: &AsterConfig) -> anyhow::Result<FundingUpdate> {
@@ -3014,7 +3562,7 @@ fn read_json_lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use httpmock::Method::{DELETE, GET, POST};
+    use httpmock::Method::{DELETE, GET, POST, PUT};
     use httpmock::MockServer;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -3695,7 +4243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_account_snapshot_uses_poll_time_for_freshness() {
+    async fn fetch_account_snapshot_uses_poll_time_for_freshness_and_monotonic_seq() {
         let server = MockServer::start_async().await;
         let cfg = AsterConfig {
             ws_url: "wss://example.invalid".to_string(),
@@ -3747,10 +4295,297 @@ mod tests {
             .expect("account snapshot");
 
         mock.assert_async().await;
-        assert_eq!(snapshot.seq, 1_700_000_000_000u64);
+        assert_eq!(snapshot.seq, 1);
         assert_eq!(snapshot.timestamp_ms, 1_700_000_123_456);
         assert_eq!(snapshot.positions.len(), 1);
         assert!((snapshot.positions[0].size - 0.14).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn user_stream_listen_key_endpoints_use_api_key_only() {
+        let server = MockServer::start_async().await;
+        let cfg = AsterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETHUSDT".to_string(),
+            depth_limit: 10,
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            api_key: Some("test-key".to_string()),
+            api_secret: Some("testsecret".to_string()),
+            recv_window: Some(5000),
+            record_dir: None,
+        };
+        let client = AsterRestClient::new(cfg);
+
+        let start = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/fapi/v1/listenKey")
+                    .header("X-MBX-APIKEY", "test-key");
+                then.status(200)
+                    .json_body(serde_json::json!({ "listenKey": "lk_test" }));
+            })
+            .await;
+        let keepalive = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path("/fapi/v1/listenKey")
+                    .header("X-MBX-APIKEY", "test-key");
+                then.status(200).json_body(serde_json::json!({}));
+            })
+            .await;
+        let close = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/fapi/v1/listenKey")
+                    .header("X-MBX-APIKEY", "test-key");
+                then.status(200).json_body(serde_json::json!({}));
+            })
+            .await;
+
+        let listen_key = client.start_user_stream().await.expect("listen key");
+        assert_eq!(listen_key, "lk_test");
+        client.keepalive_user_stream().await.expect("keepalive");
+        client.close_user_stream().await.expect("close");
+
+        start.assert_async().await;
+        keepalive.assert_async().await;
+        close.assert_async().await;
+    }
+
+    #[test]
+    fn account_state_applies_account_update_deltas() {
+        let snapshot = AccountSnapshot {
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            seq: 1,
+            timestamp_ms: 1000,
+            positions: vec![PositionSnapshot {
+                symbol: "ETHUSDT".to_string(),
+                size: 0.05,
+                entry_price: 2100.0,
+            }],
+            balances: vec![BalanceSnapshot {
+                asset: "USDT".to_string(),
+                total: 100.0,
+                available: 90.0,
+            }],
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: 100.0,
+                used_usd: 10.0,
+                available_usd: 90.0,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+        let mut state = AsterAccountState::from_snapshot(snapshot);
+        let update = serde_json::json!({
+            "e": "ACCOUNT_UPDATE",
+            "E": 2000,
+            "a": {
+                "B": [{
+                    "a": "USDT",
+                    "wb": "102.5",
+                    "cw": "96.0",
+                    "bc": "2.5"
+                }],
+                "P": [{
+                    "s": "ETHUSDT",
+                    "pa": "0",
+                    "ep": "0",
+                    "ps": "BOTH"
+                }, {
+                    "s": "BTCUSDT",
+                    "pa": "0.01",
+                    "ep": "65000",
+                    "ps": "BOTH"
+                }]
+            }
+        });
+
+        let next = state
+            .apply_update(&update, 2, 2000)
+            .expect("snapshot after account update");
+
+        assert_eq!(next.seq, 2);
+        assert_eq!(next.timestamp_ms, 2000);
+        assert_eq!(next.positions.len(), 1);
+        assert_eq!(next.positions[0].symbol, "BTCUSDT");
+        assert!((next.positions[0].size - 0.01).abs() < 1e-9);
+        assert_eq!(next.balances.len(), 1);
+        assert!((next.balances[0].total - 102.5).abs() < 1e-9);
+        assert!((next.balances[0].available - 96.0).abs() < 1e-9);
+        assert!((next.margin.balance_usd - 102.5).abs() < 1e-9);
+        assert!((next.margin.available_usd - 96.0).abs() < 1e-9);
+        assert!((next.margin.used_usd - 6.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn account_state_ignores_out_of_order_updates() {
+        let snapshot = AccountSnapshot {
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            seq: 7,
+            timestamp_ms: 2_000,
+            positions: vec![PositionSnapshot {
+                symbol: "ETHUSDT".to_string(),
+                size: 0.02,
+                entry_price: 2100.0,
+            }],
+            balances: vec![BalanceSnapshot {
+                asset: "USDT".to_string(),
+                total: 100.0,
+                available: 95.0,
+            }],
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: 100.0,
+                used_usd: 5.0,
+                available_usd: 95.0,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+        let mut state = AsterAccountState::from_snapshot(snapshot.clone());
+        let stale = serde_json::json!({
+            "e": "ACCOUNT_UPDATE",
+            "E": 1500,
+            "a": {
+                "B": [{ "a": "USDT", "wb": "99.0", "cw": "94.0" }],
+                "P": [{ "s": "ETHUSDT", "pa": "0.01", "ep": "2095", "ps": "BOTH" }]
+            }
+        });
+        assert!(state.apply_update(&stale, 8, 1_500).is_none());
+        assert_eq!(state.snapshot.timestamp_ms, snapshot.timestamp_ms);
+        assert_eq!(state.snapshot.seq, snapshot.seq);
+        assert_eq!(state.snapshot.positions[0].size, snapshot.positions[0].size);
+    }
+
+    #[test]
+    fn order_state_applies_order_trade_update_to_remaining_open_orders() {
+        let snapshot = OrderSnapshot {
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            seq: 1,
+            timestamp_ms: 1000,
+            open_orders: vec![OpenOrderSnapshot {
+                order_id: "10".to_string(),
+                client_order_id: Some("co_1_v2_mm_1".to_string()),
+                exchange_order_id: None,
+                side: Side::Buy,
+                price: 2100.0,
+                size: 0.02,
+                purpose: None,
+            }],
+        };
+        let mut state = AsterOrderState::from_snapshot("ETHUSDT", snapshot);
+        let partial_fill = serde_json::json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 2000,
+            "o": {
+                "s": "ETHUSDT",
+                "c": "co_1_v2_mm_2",
+                "S": "SELL",
+                "q": "0.05",
+                "p": "2105",
+                "X": "PARTIALLY_FILLED",
+                "i": 77,
+                "z": "0.01"
+            }
+        });
+        let cancel = serde_json::json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 3000,
+            "o": {
+                "s": "ETHUSDT",
+                "c": "co_1_v2_mm_1",
+                "S": "BUY",
+                "q": "0.02",
+                "p": "2100",
+                "X": "CANCELED",
+                "i": 10,
+                "z": "0"
+            }
+        });
+
+        let after_fill = state
+            .apply_update(&partial_fill, 2, 2000)
+            .expect("snapshot after fill");
+        assert_eq!(after_fill.open_orders.len(), 2);
+        let partial = after_fill
+            .open_orders
+            .iter()
+            .find(|order| order.order_id == "77")
+            .expect("partial order");
+        assert!((partial.size - 0.04).abs() < 1e-9);
+        assert_eq!(partial.side, Side::Sell);
+
+        let after_cancel = state
+            .apply_update(&cancel, 3, 3000)
+            .expect("snapshot after cancel");
+        assert_eq!(after_cancel.open_orders.len(), 1);
+        assert_eq!(after_cancel.open_orders[0].order_id, "77");
+    }
+
+    #[test]
+    fn order_state_ignores_out_of_order_updates_for_same_order() {
+        let snapshot = OrderSnapshot {
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            seq: 1,
+            timestamp_ms: 1000,
+            open_orders: vec![OpenOrderSnapshot {
+                order_id: "10".to_string(),
+                client_order_id: Some("co_1_v2_mm_1".to_string()),
+                exchange_order_id: None,
+                side: Side::Buy,
+                price: 2100.0,
+                size: 0.02,
+                purpose: None,
+            }],
+        };
+        let mut state = AsterOrderState::from_snapshot("ETHUSDT", snapshot);
+        let cancel = serde_json::json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 3000,
+            "o": {
+                "s": "ETHUSDT",
+                "c": "co_1_v2_mm_1",
+                "S": "BUY",
+                "q": "0.02",
+                "p": "2100",
+                "X": "CANCELED",
+                "i": 10,
+                "z": "0"
+            }
+        });
+        let stale_new = serde_json::json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 2000,
+            "o": {
+                "s": "ETHUSDT",
+                "c": "co_1_v2_mm_1",
+                "S": "BUY",
+                "q": "0.02",
+                "p": "2100",
+                "X": "NEW",
+                "i": 10,
+                "z": "0"
+            }
+        });
+
+        let after_cancel = state
+            .apply_update(&cancel, 2, 3000)
+            .expect("snapshot after cancel");
+        assert!(after_cancel.open_orders.is_empty());
+        assert!(state.apply_update(&stale_new, 3, 2000).is_none());
+        assert!(state.snapshot.open_orders.is_empty());
     }
 
     #[test]

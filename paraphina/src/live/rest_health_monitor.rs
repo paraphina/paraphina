@@ -44,6 +44,7 @@ pub type RestFetcher = Box<dyn Fn() -> BoxFut + Send + Sync>;
 type BoxFut =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<RestFetchOutcome>> + Send>>;
 
+#[derive(Debug)]
 pub enum RestFetchOutcome {
     Inject(MarketDataEvent),
     ProbeOk,
@@ -83,6 +84,8 @@ pub struct RestMonitorConfig {
     pub rest_threshold_ms: i64,
     /// How often the monitor checks ages.
     pub poll_interval: Duration,
+    /// One-shot startup seed delay (ms) for inject-snapshot venues.
+    pub startup_seed_delay_ms: i64,
 }
 
 impl Default for RestMonitorConfig {
@@ -93,6 +96,11 @@ impl Default for RestMonitorConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20_000),
             poll_interval: Duration::from_secs(5),
+            startup_seed_delay_ms: std::env::var("PARAPHINA_REST_MONITOR_STARTUP_SEED_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &i64| *v > 0)
+                .unwrap_or(1_000),
         }
     }
 }
@@ -112,6 +120,13 @@ fn rest_monitor_ws_audit_enabled() -> bool {
     std::env::var("PARAPHINA_WS_AUDIT")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+#[cfg(feature = "live_paradex")]
+fn paradex_rest_backstop_wall_ts_enabled() -> bool {
+    std::env::var("PARAPHINA_PARADEX_REST_BACKSTOP_WALL_TS_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
 }
 
 fn maybe_log_rest_audit(
@@ -156,6 +171,9 @@ pub async fn run_rest_health_monitor(
     let ws_audit_enabled = rest_monitor_ws_audit_enabled();
     let mut interval = tokio::time::interval(cfg.poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let startup_seed_enabled = cfg.startup_seed_delay_ms > 0;
+    let mut startup_seed_interval = tokio::time::interval(Duration::from_millis(200));
+    startup_seed_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let monitor_start_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -164,9 +182,23 @@ pub async fn run_rest_health_monitor(
     // Track whether each venue was logged as active/inactive.
     let mut active: Vec<bool> = vec![false; venues.len()];
     let mut audit: Vec<VenueRestAuditStats> = vec![VenueRestAuditStats::default(); venues.len()];
+    let mut startup_seed_done: Vec<bool> = venues
+        .iter()
+        .map(|venue| !matches!(venue.mode, RestMonitorMode::InjectSnapshot))
+        .collect();
 
     loop {
-        interval.tick().await;
+        let startup_seed_pending =
+            startup_seed_enabled && startup_seed_done.iter().any(|done| !*done);
+        let startup_seed_tick = if startup_seed_pending {
+            tokio::select! {
+                _ = interval.tick() => false,
+                _ = startup_seed_interval.tick() => true,
+            }
+        } else {
+            interval.tick().await;
+            false
+        };
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -174,7 +206,6 @@ pub async fn run_rest_health_monitor(
 
         for (i, venue) in venues.iter().enumerate() {
             let stats = &mut audit[i];
-            stats.rest_check_count += 1;
             let raw_age = ages.age_ms(venue.venue_index);
             // i64::MAX means "unknown/uninitialized"; avoid instant startup fallback.
             // Treat unknown as elapsed time since monitor start so fallback can still
@@ -184,6 +215,143 @@ pub async fn run_rest_health_monitor(
             } else {
                 raw_age
             };
+
+            if startup_seed_tick {
+                if startup_seed_done[i] {
+                    continue;
+                }
+                if raw_age != i64::MAX && age < cfg.startup_seed_delay_ms {
+                    startup_seed_done[i] = true;
+                    if ws_audit_enabled {
+                        eprintln!(
+                            "WS_AUDIT subsystem=rest_monitor venue={} mode={} startup_seed_suppressed=1 suppression_reason=already_fresh delay_ms={} age_ms={}",
+                            venue.name,
+                            venue.mode.as_str(),
+                            cfg.startup_seed_delay_ms,
+                            age,
+                        );
+                    }
+                    continue;
+                }
+                if age < cfg.startup_seed_delay_ms {
+                    continue;
+                }
+                startup_seed_done[i] = true;
+                if ws_audit_enabled {
+                    eprintln!(
+                        "WS_AUDIT subsystem=rest_monitor venue={} mode={} startup_seed_attempted=1 delay_ms={} age_ms={}",
+                        venue.name,
+                        venue.mode.as_str(),
+                        cfg.startup_seed_delay_ms,
+                        age,
+                    );
+                }
+                let fetch_timeout = Duration::from_secs(5);
+                stats.rest_attempt_count += 1;
+                match tokio::time::timeout(fetch_timeout, (venue.fetcher)()).await {
+                    Ok(Ok(outcome)) => match outcome {
+                        RestFetchOutcome::Inject(event) => {
+                            stats.rest_success_count += 1;
+                            if market_tx.send(event).await.is_err() {
+                                stats.rest_fail_count += 1;
+                                eprintln!(
+                                    "WARN: REST health monitor: market_tx closed for {} during startup seed",
+                                    venue.name
+                                );
+                                if ws_audit_enabled {
+                                    eprintln!(
+                                        "WS_AUDIT subsystem=rest_monitor venue={} mode={} startup_seed_failed=1 reason=market_tx_closed delay_ms={} age_ms={}",
+                                        venue.name,
+                                        venue.mode.as_str(),
+                                        cfg.startup_seed_delay_ms,
+                                        age,
+                                    );
+                                }
+                            } else {
+                                stats.rest_inject_count += 1;
+                                if ws_audit_enabled {
+                                    eprintln!(
+                                        "WS_AUDIT subsystem=rest_monitor venue={} mode={} startup_seed_injected=1 delay_ms={} age_ms={}",
+                                        venue.name,
+                                        venue.mode.as_str(),
+                                        cfg.startup_seed_delay_ms,
+                                        age,
+                                    );
+                                }
+                            }
+                        }
+                        RestFetchOutcome::ProbeOk => {
+                            stats.rest_success_count += 1;
+                            if ws_audit_enabled {
+                                eprintln!(
+                                    "WS_AUDIT subsystem=rest_monitor venue={} mode={} startup_seed_suppressed=1 suppression_reason=probe_only_result delay_ms={} age_ms={}",
+                                    venue.name,
+                                    venue.mode.as_str(),
+                                    cfg.startup_seed_delay_ms,
+                                    age,
+                                );
+                            }
+                        }
+                        RestFetchOutcome::Suppressed { reason } => {
+                            stats.rest_suppressed_count += 1;
+                            if ws_audit_enabled {
+                                eprintln!(
+                                    "WS_AUDIT subsystem=rest_monitor venue={} mode={} startup_seed_suppressed=1 suppression_reason={} delay_ms={} age_ms={}",
+                                    venue.name,
+                                    venue.mode.as_str(),
+                                    reason,
+                                    cfg.startup_seed_delay_ms,
+                                    age,
+                                );
+                            }
+                        }
+                    },
+                    Ok(Err(err)) => {
+                        stats.rest_fail_count += 1;
+                        eprintln!(
+                            "WARN: REST health monitor: {} startup seed fetch error: {err}",
+                            venue.name
+                        );
+                        if ws_audit_enabled {
+                            eprintln!(
+                                "WS_AUDIT subsystem=rest_monitor venue={} mode={} startup_seed_failed=1 reason=fetch_error delay_ms={} age_ms={}",
+                                venue.name,
+                                venue.mode.as_str(),
+                                cfg.startup_seed_delay_ms,
+                                age,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        stats.rest_fail_count += 1;
+                        eprintln!(
+                            "WARN: REST health monitor: {} startup seed timed out ({}s)",
+                            venue.name,
+                            fetch_timeout.as_secs()
+                        );
+                        if ws_audit_enabled {
+                            eprintln!(
+                                "WS_AUDIT subsystem=rest_monitor venue={} mode={} startup_seed_failed=1 reason=timeout delay_ms={} age_ms={}",
+                                venue.name,
+                                venue.mode.as_str(),
+                                cfg.startup_seed_delay_ms,
+                                age,
+                            );
+                        }
+                    }
+                }
+                maybe_log_rest_audit(
+                    ws_audit_enabled,
+                    now_ms,
+                    venue,
+                    age,
+                    cfg.rest_threshold_ms,
+                    stats,
+                );
+                continue;
+            }
+
+            stats.rest_check_count += 1;
             if age < cfg.rest_threshold_ms {
                 if active[i] {
                     eprintln!(
@@ -523,26 +691,42 @@ pub async fn fetch_paradex_l2_snapshot(
     venue_index: usize,
 ) -> anyhow::Result<RestFetchOutcome> {
     let url = format!("{rest_url}/orderbook/{market}?depth={depth}");
+    let received_ms = wall_ms();
     let resp = client.get(&url).send().await?.error_for_status()?;
     let value: Value = resp.json().await?;
+    Ok(RestFetchOutcome::Inject(
+        build_paradex_l2_snapshot_from_value(&value, market, venue_index, received_ms)?,
+    ))
+}
+
+#[cfg(feature = "live_paradex")]
+fn build_paradex_l2_snapshot_from_value(
+    value: &Value,
+    market: &str,
+    venue_index: usize,
+    received_ms: TimestampMs,
+) -> anyhow::Result<MarketDataEvent> {
     let results = value.get("results").unwrap_or(&value);
     let bids = parse_string_pair_levels(results.get("bids"), "bids")?;
     let asks = parse_string_pair_levels(results.get("asks"), "asks")?;
     let seq = results.get("seq_no").and_then(|v| v.as_u64()).unwrap_or(0);
-    let timestamp_ms = results
+    let exchange_timestamp_ms = results
         .get("last_updated_at")
         .and_then(|v| v.as_i64())
-        .unwrap_or_else(wall_ms);
-    Ok(RestFetchOutcome::Inject(MarketDataEvent::L2Snapshot(
-        L2Snapshot {
-            venue_index,
-            venue_id: market.to_string(),
-            seq,
-            timestamp_ms,
-            bids,
-            asks,
-        },
-    )))
+        .unwrap_or(received_ms);
+    let timestamp_ms = if paradex_rest_backstop_wall_ts_enabled() {
+        received_ms
+    } else {
+        exchange_timestamp_ms
+    };
+    Ok(MarketDataEvent::L2Snapshot(L2Snapshot {
+        venue_index,
+        venue_id: market.to_string(),
+        seq,
+        timestamp_ms,
+        bids,
+        asks,
+    }))
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────────
@@ -745,6 +929,8 @@ fn parse_str_or_number(v: Option<&Value>, label: &str, field: &str) -> anyhow::R
 mod tests {
     use super::*;
     use crate::live::shared_venue_ages::SharedVenueAges;
+    use crate::live::types::{L2Snapshot, MarketDataEvent};
+    use crate::orderbook_l2::BookLevel;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -785,6 +971,34 @@ mod tests {
         assert!(matches!(result, RestFetchOutcome::ProbeOk));
     }
 
+    #[cfg(feature = "live_paradex")]
+    #[test]
+    fn paradex_rest_backstop_uses_receive_time_for_snapshot_liveness() {
+        let received_ms = wall_ms();
+        let stale_exchange_ts = received_ms - 30_000;
+        let value = serde_json::json!({
+            "bids": [["3000.0", "0.25"]],
+            "asks": [["3000.5", "0.20"]],
+            "last_updated_at": stale_exchange_ts,
+            "market": "ETH-USD-PERP",
+            "seq_no": 77
+        });
+
+        let event = build_paradex_l2_snapshot_from_value(&value, "ETH-USD-PERP", 4, received_ms)
+            .expect("paradex rest snapshot");
+
+        match event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.venue_index, 4);
+                assert_eq!(snapshot.venue_id, "ETH-USD-PERP");
+                assert_eq!(snapshot.seq, 77);
+                assert_eq!(snapshot.timestamp_ms, received_ms);
+                assert_ne!(snapshot.timestamp_ms, stale_exchange_ts);
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn probe_only_mode_does_not_inject_market_events() {
         let ages = SharedVenueAges::new(1);
@@ -811,6 +1025,7 @@ mod tests {
             RestMonitorConfig {
                 rest_threshold_ms: 1,
                 poll_interval: Duration::from_millis(10),
+                startup_seed_delay_ms: 0,
             },
         ));
 
@@ -818,6 +1033,127 @@ mod tests {
         assert!(
             calls.load(Ordering::Relaxed) > 0,
             "probe-only fetcher should still run for stale venues"
+        );
+        assert!(matches!(market_rx.try_recv(), Err(TryRecvError::Empty)));
+        monitor.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_seed_injects_once_for_stale_inject_snapshot_venue() {
+        let ages = SharedVenueAges::new(1);
+        let (market_tx, mut market_rx) = mpsc::channel(4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let venues = vec![VenueRestEntry {
+            name: "paradex".to_string(),
+            venue_index: 0,
+            mode: RestMonitorMode::InjectSnapshot,
+            fetcher: Box::new(move || {
+                let calls = calls_clone.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(RestFetchOutcome::Inject(MarketDataEvent::L2Snapshot(
+                        L2Snapshot {
+                            venue_index: 0,
+                            venue_id: "paradex".to_string(),
+                            seq: 1,
+                            timestamp_ms: 1_000,
+                            bids: vec![BookLevel {
+                                price: 2_000.0,
+                                size: 1.0,
+                            }],
+                            asks: vec![BookLevel {
+                                price: 2_000.5,
+                                size: 1.0,
+                            }],
+                        },
+                    )))
+                })
+            }),
+        }];
+        let monitor = tokio::spawn(run_rest_health_monitor(
+            ages,
+            venues,
+            market_tx,
+            RestMonitorConfig {
+                rest_threshold_ms: 60_000,
+                poll_interval: Duration::from_secs(60),
+                startup_seed_delay_ms: 10,
+            },
+        ));
+
+        let event = tokio::time::timeout(Duration::from_millis(250), market_rx.recv())
+            .await
+            .expect("startup seed should inject before timeout")
+            .expect("market event");
+        match event {
+            MarketDataEvent::L2Snapshot(snapshot) => {
+                assert_eq!(snapshot.venue_id, "paradex");
+                assert_eq!(snapshot.seq, 1);
+            }
+            other => panic!("expected snapshot startup seed, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "startup seed should fire once"
+        );
+        monitor.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_seed_is_suppressed_when_venue_becomes_fresh_before_delay() {
+        let ages = SharedVenueAges::new(1);
+        let (market_tx, mut market_rx) = mpsc::channel(4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let venues = vec![VenueRestEntry {
+            name: "paradex".to_string(),
+            venue_index: 0,
+            mode: RestMonitorMode::InjectSnapshot,
+            fetcher: Box::new(move || {
+                let calls = calls_clone.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(RestFetchOutcome::Inject(MarketDataEvent::L2Snapshot(
+                        L2Snapshot {
+                            venue_index: 0,
+                            venue_id: "paradex".to_string(),
+                            seq: 1,
+                            timestamp_ms: 1_000,
+                            bids: vec![BookLevel {
+                                price: 2_000.0,
+                                size: 1.0,
+                            }],
+                            asks: vec![BookLevel {
+                                price: 2_000.5,
+                                size: 1.0,
+                            }],
+                        },
+                    )))
+                })
+            }),
+        }];
+        let monitor = tokio::spawn(run_rest_health_monitor(
+            ages.clone(),
+            venues,
+            market_tx,
+            RestMonitorConfig {
+                rest_threshold_ms: 60_000,
+                poll_interval: Duration::from_secs(60),
+                startup_seed_delay_ms: 50,
+            },
+        ));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        ages.set_age(0, 1);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "startup seed should be suppressed once venue becomes fresh"
         );
         assert!(matches!(market_rx.try_recv(), Err(TryRecvError::Empty)));
         monitor.abort();

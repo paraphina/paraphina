@@ -7,7 +7,7 @@ mod tests {
     use paraphina::config::Config;
     use paraphina::io::GatewayPolicy;
     use paraphina::live::gateway::{
-        LiveGateway, LiveGatewayError, LiveRestClient, LiveRestResponse,
+        LiveGateway, LiveGatewayError, LiveRestClient, LiveRestResponse, TransportHint,
     };
     use paraphina::live::mock_exchange::{
         spawn_mock_exchange, MockExchangeConfig, MockExchangeHandle,
@@ -98,6 +98,7 @@ mod tests {
                     intents: vec![intent],
                     action_batch: ActionBatch::new(0, 0, "test"),
                     now_ms: 1_000,
+                    transport_hint: TransportHint::Default,
                     response: paraphina::live::ResponseMode::Oneshot(response_tx),
                 };
                 let _ = handle.order_tx.send(request).await;
@@ -120,7 +121,10 @@ mod tests {
                         }
                     }
                 }
-                Ok(LiveRestResponse { order_id })
+                Ok(LiveRestResponse {
+                    order_id,
+                    client_order_id: None,
+                })
             })
         }
 
@@ -149,11 +153,15 @@ mod tests {
                     intents: vec![intent],
                     action_batch: ActionBatch::new(0, 0, "test"),
                     now_ms: 1_000,
+                    transport_hint: TransportHint::Default,
                     response: paraphina::live::ResponseMode::Oneshot(response_tx),
                 };
                 let _ = handle.order_tx.send(request).await;
                 let _ = response_rx.await;
-                Ok(LiveRestResponse { order_id: None })
+                Ok(LiveRestResponse {
+                    order_id: None,
+                    client_order_id: None,
+                })
             })
         }
 
@@ -181,11 +189,15 @@ mod tests {
                     intents: vec![intent],
                     action_batch: ActionBatch::new(0, 0, "test"),
                     now_ms: 1_000,
+                    transport_hint: TransportHint::Default,
                     response: paraphina::live::ResponseMode::Oneshot(response_tx),
                 };
                 let _ = handle.order_tx.send(request).await;
                 let _ = response_rx.await;
-                Ok(LiveRestResponse { order_id: None })
+                Ok(LiveRestResponse {
+                    order_id: None,
+                    client_order_id: None,
+                })
             })
         }
     }
@@ -231,7 +243,9 @@ mod tests {
             reduce_only: false,
             client_order_id: None,
         });
-        let res = gateway.submit_intent(&intent, 1, 1_000).await;
+        let res = gateway
+            .submit_intent(&intent, 1, 1_000, TransportHint::Default)
+            .await;
         assert!(res.is_ok());
         assert_eq!(client.place_call_count(), 2);
         assert_eq!(metrics_value(&metrics, "paraphina_live_retry_count"), 1);
@@ -267,7 +281,9 @@ mod tests {
             reduce_only: false,
             client_order_id: None,
         });
-        let res = gateway.submit_intent(&intent, 2, 1_000).await;
+        let res = gateway
+            .submit_intent(&intent, 2, 1_000, TransportHint::Default)
+            .await;
         assert!(res.is_err());
         assert_eq!(client.place_call_count(), 1);
         assert_eq!(
@@ -305,7 +321,9 @@ mod tests {
             reduce_only: true,
             client_order_id: None,
         });
-        let res = gateway.submit_intent(&intent, 3, 1_000).await;
+        let res = gateway
+            .submit_intent(&intent, 3, 1_000, TransportHint::Default)
+            .await;
         assert!(res.is_err());
         assert_eq!(client.place_call_count(), 1);
         assert_eq!(
@@ -346,8 +364,12 @@ mod tests {
             reduce_only: false,
             client_order_id: None,
         });
-        let _ = gateway.submit_intent(&intent, 4, 1_000).await;
-        let _ = gateway.submit_intent(&intent, 4, 1_000).await;
+        let _ = gateway
+            .submit_intent(&intent, 4, 1_000, TransportHint::Default)
+            .await;
+        let _ = gateway
+            .submit_intent(&intent, 4, 1_000, TransportHint::Default)
+            .await;
         assert!(metrics_value(&metrics, "paraphina_live_rate_limit_sleep_total_ms") > 0);
     }
 
@@ -379,7 +401,10 @@ mod tests {
             reduce_only: false,
             client_order_id: None,
         });
-        let placed = gateway.submit_intent(&intent, 5, 1_000).await.unwrap();
+        let placed = gateway
+            .submit_intent(&intent, 5, 1_000, TransportHint::Default)
+            .await
+            .unwrap();
         let order_id = placed.order_id.expect("order id");
 
         let cancel_intent = OrderIntent::Cancel(paraphina::types::CancelOrderIntent {
@@ -387,13 +412,17 @@ mod tests {
             venue_id: cfg.venues[0].id_arc.clone(),
             order_id,
         });
-        let _ = gateway.submit_intent(&cancel_intent, 5, 1_000).await;
+        let _ = gateway
+            .submit_intent(&cancel_intent, 5, 1_000, TransportHint::Default)
+            .await;
 
         let cancel_all_intent = OrderIntent::CancelAll(paraphina::types::CancelAllOrderIntent {
             venue_index: Some(0),
             venue_id: Some(cfg.venues[0].id_arc.clone()),
         });
-        let _ = gateway.submit_intent(&cancel_all_intent, 5, 1_000).await;
+        let _ = gateway
+            .submit_intent(&cancel_all_intent, 5, 1_000, TransportHint::Default)
+            .await;
 
         assert_eq!(metrics_value(&metrics, "paraphina_live_cancel_ok"), 2);
     }
@@ -425,14 +454,19 @@ mod tests {
             reduce_only: false,
             client_order_id: Some("co_cancel_all_1".to_string()),
         });
-        let _ = gateway.submit_intent(&intent, 10, 1_000).await.unwrap();
+        let _ = gateway
+            .submit_intent(&intent, 10, 1_000, TransportHint::Default)
+            .await
+            .unwrap();
         assert_eq!(handle.open_orders_len().await, 1);
 
         let cancel_all_intent = OrderIntent::CancelAll(paraphina::types::CancelAllOrderIntent {
             venue_index: Some(0),
             venue_id: Some(cfg.venues[0].id_arc.clone()),
         });
-        let _ = gateway.submit_intent(&cancel_all_intent, 10, 1_000).await;
+        let _ = gateway
+            .submit_intent(&cancel_all_intent, 10, 1_000, TransportHint::Default)
+            .await;
         assert_eq!(handle.open_orders_len().await, 0);
     }
 
@@ -463,8 +497,14 @@ mod tests {
             reduce_only: false,
             client_order_id: Some("co_replay_1".to_string()),
         });
-        let _ = gateway.submit_intent(&intent, 11, 1_000).await.unwrap();
-        let _ = gateway.submit_intent(&intent, 11, 1_000).await.unwrap();
+        let _ = gateway
+            .submit_intent(&intent, 11, 1_000, TransportHint::Default)
+            .await
+            .unwrap();
+        let _ = gateway
+            .submit_intent(&intent, 11, 1_000, TransportHint::Default)
+            .await
+            .unwrap();
         assert_eq!(handle.open_orders_len().await, 1);
     }
 
@@ -496,7 +536,9 @@ mod tests {
             reduce_only: false,
             client_order_id: None,
         });
-        let _ = gateway.submit_intent(&intent, 42, 1_000).await;
+        let _ = gateway
+            .submit_intent(&intent, 42, 1_000, TransportHint::Default)
+            .await;
         let id = client.last_client_order_id().expect("client id");
         assert!(id.contains(cfg.venues[0].id.as_str()));
         assert!(id.contains("42"));

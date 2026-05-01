@@ -5,7 +5,8 @@ mod tests {
 
     use paraphina::config::Config;
     use paraphina::live::runner::{
-        run_live_loop, LiveChannels, LiveRunMode, LiveTelemetry, LiveTelemetryStats,
+        run_live_loop, LiveAccountRequest, LiveChannels, LiveRunMode, LiveTelemetry,
+        LiveTelemetryStats,
     };
     use paraphina::live::types::{
         AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, Fill, L2Snapshot,
@@ -1000,6 +1001,87 @@ mod tests {
 
         std::env::remove_var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS");
         std::env::remove_var("PARAPHINA_LIVE_ACCOUNT_POLL_MS");
+        std::env::remove_var("PARAPHINA_LIVE_AUDIT_DIR");
+    }
+
+    #[tokio::test]
+    async fn account_reconcile_request_tx_is_not_used_without_explicit_opt_in() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS", "1");
+        std::env::set_var("PARAPHINA_LIVE_ACCOUNT_POLL_MS", "5000");
+        std::env::remove_var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_REQUEST_TX");
+
+        let temp = tempdir().expect("tempdir");
+        std::env::set_var("PARAPHINA_LIVE_AUDIT_DIR", temp.path());
+
+        let mut cfg = Config::default();
+        cfg.venues = vec![cfg.venues[0].clone()];
+
+        let (market_tx, market_rx) = mpsc::channel::<MarketDataEvent>(32);
+        let (account_tx, account_rx) = mpsc::channel::<AccountEvent>(32);
+        let (order_tx, _order_rx) = mpsc::channel::<paraphina::live::runner::LiveOrderRequest>(32);
+        let (account_request_tx, mut account_request_rx) = mpsc::channel::<LiveAccountRequest>(32);
+
+        let start_ms = 1_000;
+        let step_ms = 1_000;
+        let ticks = 3_u64;
+        let venue_id = cfg.venues[0].id.clone();
+        let _ = market_tx
+            .send(MarketDataEvent::L2Snapshot(L2Snapshot {
+                venue_index: 0,
+                venue_id: venue_id.clone(),
+                seq: 1,
+                timestamp_ms: start_ms,
+                bids: vec![paraphina::live::orderbook_l2::BookLevel {
+                    price: 100.0,
+                    size: 1.0,
+                }],
+                asks: vec![paraphina::live::orderbook_l2::BookLevel {
+                    price: 101.0,
+                    size: 1.0,
+                }],
+            }))
+            .await;
+        let _ = account_tx
+            .send(AccountEvent::Snapshot(build_account_snapshot(
+                &venue_id, 0, 0.0, 100.0, 90.0, start_ms, 1,
+            )))
+            .await;
+
+        let channels = LiveChannels {
+            market_rx,
+            account_rx,
+            exec_rx: None,
+            account_reconcile_tx: Some(account_request_tx),
+            priority_order_tx: order_tx.clone(),
+            order_tx,
+            order_snapshot_rx: None,
+            shared_venue_ages: None,
+        };
+
+        let summary = run_live_loop(
+            &cfg,
+            channels,
+            LiveRunMode::Step {
+                start_ms,
+                step_ms,
+                ticks,
+            },
+            None,
+        )
+        .await;
+        assert!(
+            !summary.kill_switch,
+            "request channel should not change reconcile health without opt-in"
+        );
+        assert!(
+            account_request_rx.try_recv().is_err(),
+            "account request channel must remain unused unless PARAPHINA_LIVE_ACCOUNT_RECONCILE_REQUEST_TX is enabled"
+        );
+
+        std::env::remove_var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_MS");
+        std::env::remove_var("PARAPHINA_LIVE_ACCOUNT_POLL_MS");
+        std::env::remove_var("PARAPHINA_LIVE_ACCOUNT_RECONCILE_REQUEST_TX");
         std::env::remove_var("PARAPHINA_LIVE_AUDIT_DIR");
     }
 }

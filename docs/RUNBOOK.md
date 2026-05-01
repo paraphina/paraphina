@@ -1,5 +1,12 @@
 # Live Trading Runbook
 
+Scope: operator procedure.
+
+This runbook describes operational controls and trade-mode procedures. It is
+not the strategic roadmap or current Phase 5 topology source. Use `ROADMAP.md`
+for strategy and read-only `phase5/status.md` plus `phase5/queue.yaml` for
+current Phase 5 context.
+
 This runbook covers operational controls for live trading. It is designed for
 offline CI safety and manual use in production-like environments.
 

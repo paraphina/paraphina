@@ -609,19 +609,23 @@ fn test_markout_ewma_telemetry_updated() {
 // =============================================================================
 
 #[test]
-fn test_no_mid_sets_high_toxicity() {
+fn test_startup_no_mid_keeps_neutral_toxicity() {
     let cfg = make_test_config();
     let mut state = GlobalState::new(&cfg);
 
-    // Venue with no mid price
+    // Before the first valid book has ever been applied, missing mid/depth is
+    // bootstrap state. Readiness and quote gates block trading; toxicity stays
+    // neutral until the venue has real market data history.
     state.venues[0].mid = None;
+    state.venues[0].depth_near_mid = 0.0;
+    state.venues[0].last_mid_apply_ms = None;
     state.venues[0].toxicity = 0.0;
 
     update_toxicity_and_health(&mut state, &cfg, 0);
 
     assert_eq!(
-        state.venues[0].toxicity, 1.0,
-        "Missing mid should result in max toxicity"
+        state.venues[0].toxicity, 0.0,
+        "Startup missing mid should remain toxicity-neutral"
     );
 }
 

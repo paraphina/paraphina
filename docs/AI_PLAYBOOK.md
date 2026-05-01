@@ -1,5 +1,7 @@
 # AI Playbook for Paraphina
 
+For first-time orientation, read `docs/AGENT_START_HERE.md` before this file.
+
 This playbook is for using an AI assistant (LLM) to make safe, testable,
 reviewable changes in Paraphina.
 

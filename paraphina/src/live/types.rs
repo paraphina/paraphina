@@ -227,6 +227,7 @@ pub struct CancelAllRejected {
 pub struct OpenOrderSnapshot {
     pub order_id: String,
     pub client_order_id: Option<String>,
+    pub exchange_order_id: Option<String>,
     pub side: Side,
     pub price: f64,
     pub size: f64,

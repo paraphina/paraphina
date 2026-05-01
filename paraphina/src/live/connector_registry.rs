@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use clap::ValueEnum;
 
-use crate::venues::{canonical_order_indices, VenueId, ROADMAP_B_VENUES};
+use super::venues::{canonical_venue_ids, ROADMAP_B_VENUES};
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq, Hash)]
 pub enum ConnectorArg {
@@ -43,13 +43,13 @@ impl ConnectorArg {
         }
     }
 
-    pub fn venue_id(&self) -> Option<VenueId> {
+    pub fn venue_id(&self) -> Option<&'static str> {
         match self {
-            ConnectorArg::Extended => Some(VenueId::Extended),
-            ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => Some(VenueId::Hyperliquid),
-            ConnectorArg::Aster => Some(VenueId::Aster),
-            ConnectorArg::Lighter => Some(VenueId::Lighter),
-            ConnectorArg::Paradex => Some(VenueId::Paradex),
+            ConnectorArg::Extended => Some("extended"),
+            ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => Some("hyperliquid"),
+            ConnectorArg::Aster => Some("aster"),
+            ConnectorArg::Lighter => Some("lighter"),
+            ConnectorArg::Paradex => Some("paradex"),
             ConnectorArg::Mock => None,
         }
     }
@@ -58,7 +58,7 @@ impl ConnectorArg {
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectorSpec {
     pub connector: ConnectorArg,
-    pub venue: Option<VenueId>,
+    pub venue: Option<&'static str>,
     pub feature_flags: &'static [&'static str],
     pub supports_market_data: bool,
     pub supports_account: bool,
@@ -90,7 +90,7 @@ pub const CONNECTOR_SPECS: [ConnectorSpec; 7] = [
     },
     ConnectorSpec {
         connector: ConnectorArg::Hyperliquid,
-        venue: Some(VenueId::Hyperliquid),
+        venue: Some("hyperliquid"),
         feature_flags: &["live_hyperliquid"],
         supports_market_data: true,
         supports_account: true,
@@ -105,7 +105,7 @@ pub const CONNECTOR_SPECS: [ConnectorSpec; 7] = [
     },
     ConnectorSpec {
         connector: ConnectorArg::HyperliquidFixture,
-        venue: Some(VenueId::Hyperliquid),
+        venue: Some("hyperliquid"),
         feature_flags: &["live_hyperliquid"],
         supports_market_data: true,
         supports_account: true,
@@ -120,7 +120,7 @@ pub const CONNECTOR_SPECS: [ConnectorSpec; 7] = [
     },
     ConnectorSpec {
         connector: ConnectorArg::Lighter,
-        venue: Some(VenueId::Lighter),
+        venue: Some("lighter"),
         feature_flags: &["live_lighter"],
         supports_market_data: true,
         supports_account: true,
@@ -135,7 +135,7 @@ pub const CONNECTOR_SPECS: [ConnectorSpec; 7] = [
     },
     ConnectorSpec {
         connector: ConnectorArg::Extended,
-        venue: Some(VenueId::Extended),
+        venue: Some("extended"),
         feature_flags: &[],
         supports_market_data: false,
         supports_account: false,
@@ -150,7 +150,7 @@ pub const CONNECTOR_SPECS: [ConnectorSpec; 7] = [
     },
     ConnectorSpec {
         connector: ConnectorArg::Aster,
-        venue: Some(VenueId::Aster),
+        venue: Some("aster"),
         feature_flags: &[],
         supports_market_data: false,
         supports_account: false,
@@ -165,7 +165,7 @@ pub const CONNECTOR_SPECS: [ConnectorSpec; 7] = [
     },
     ConnectorSpec {
         connector: ConnectorArg::Paradex,
-        venue: Some(VenueId::Paradex),
+        venue: Some("paradex"),
         feature_flags: &[],
         supports_market_data: false,
         supports_account: false,
@@ -180,7 +180,7 @@ pub const CONNECTOR_SPECS: [ConnectorSpec; 7] = [
     },
 ];
 
-pub fn roadmap_b_selectable_venues() -> Vec<VenueId> {
+pub fn roadmap_b_selectable_venues() -> Vec<&'static str> {
     let mut present = BTreeSet::new();
     for spec in &CONNECTOR_SPECS {
         if let Some(venue) = spec.venue {
@@ -189,10 +189,8 @@ pub fn roadmap_b_selectable_venues() -> Vec<VenueId> {
             }
         }
     }
-    let canonical = canonical_order_indices(&ROADMAP_B_VENUES, |v| v.as_str());
     let mut ordered = Vec::with_capacity(present.len());
-    for idx in canonical {
-        let venue = ROADMAP_B_VENUES[idx];
+    for &venue in canonical_venue_ids() {
         if present.contains(&venue) {
             ordered.push(venue);
         }

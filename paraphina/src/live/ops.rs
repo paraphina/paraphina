@@ -694,6 +694,7 @@ mod tests {
             "{\"kill_reason\":\"historical\"}\n",
         )
         .expect("write stale kill file");
+        sleep(Duration::from_millis(25));
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind port");
         let addr = listener.local_addr().expect("local addr");

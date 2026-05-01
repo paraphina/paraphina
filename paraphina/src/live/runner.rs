@@ -8,13 +8,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot};
 
+use super::gateway::TransportHint;
 use super::ops::{
     append_account_reconcile_audit, append_reconcile_drift_audit, default_audit_dir, HealthState,
     LiveMetrics,
 };
+use super::order_state::{LiveOrder, OrderStatus};
 use super::venue_health::{VenueHealthErrorSource, VenueHealthManager};
 use crate::actions::{intents_to_actions, ActionBatch, ActionIdGenerator};
-use crate::config::Config;
+use crate::config::{Config, MmVenueRole};
 use crate::engine::Engine;
 #[cfg(feature = "event_log")]
 use crate::event_log::read_event_log;
@@ -31,7 +33,9 @@ use crate::mm::{
 };
 use crate::order_management::{plan_mm_order_actions, MmOrderDecisionSummary};
 use crate::sim_eval::AblationSet;
-use crate::state::{FundingState, GlobalState, MmOpenOrder, OpenOrderRecord, VenueState};
+use crate::state::{
+    FundingState, GlobalState, MmOpenOrder, MmOpenTrackingSource, OpenOrderRecord, VenueState,
+};
 use crate::telemetry::{
     ensure_schema_v1, AccountPositionSyncRecord, ReconcileDriftRecord, TelemetryBuilder,
     TelemetryInputs, TelemetrySink, TelemetrySinkHandle, VenueHealthDiagnostics,
@@ -44,7 +48,7 @@ use crate::types::{
 };
 
 use super::orderbook_l2::OrderBookL2;
-use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache};
+use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache, VenueAccountSnapshot};
 use super::types::ExecutionEvent as LiveExecutionEvent;
 use serde::Serialize;
 use serde_json::json;
@@ -69,11 +73,239 @@ enum OrderWaitOutcomeKind {
     Timeout,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CanaryFlattenDispatchResult {
+    submitted: bool,
+    submitted_venues: Vec<usize>,
+    accepted_venues: Vec<usize>,
+}
+
+impl CanaryFlattenDispatchResult {
+    fn merge(&mut self, other: CanaryFlattenDispatchResult) {
+        self.submitted |= other.submitted;
+        for venue_index in other.submitted_venues {
+            if !self.submitted_venues.contains(&venue_index) {
+                self.submitted_venues.push(venue_index);
+            }
+        }
+        for venue_index in other.accepted_venues {
+            if !self.accepted_venues.contains(&venue_index) {
+                self.accepted_venues.push(venue_index);
+            }
+        }
+    }
+
+    fn submitted_venue(&self, venue_index: usize) -> bool {
+        self.submitted_venues.contains(&venue_index)
+    }
+
+    fn accepted_venue(&self, venue_index: usize) -> bool {
+        self.accepted_venues.contains(&venue_index)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CanaryFlattenObservationState {
+    until_ms: Option<TimestampMs>,
+    baselines: Vec<(usize, f64)>,
+    retry_count: u32,
+    last_retry_ms: Option<TimestampMs>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CanaryBreachResponseTargetSnapshot {
+    target_venues: Vec<usize>,
+    positioned_target_venues: Vec<usize>,
+    cancel_scope_venues: Vec<usize>,
+    observation_venues: Vec<usize>,
+    raw_observation_active: bool,
+    observation_covers_positioned_targets: bool,
+}
+
+fn record_canary_flatten_observation_retry_attempt(
+    observation: &mut CanaryFlattenObservationState,
+    submitted: bool,
+    now_ms: TimestampMs,
+) {
+    if submitted {
+        observation.retry_count = observation.retry_count.saturating_add(1);
+    }
+    observation.last_retry_ms = Some(now_ms);
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EmergencyRequestTransportMode {
+    #[default]
+    None,
+    SyncWait,
+    SingleFlightLatch,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EmergencyRequestDispatchOutcome {
+    #[default]
+    None,
+    Events,
+    ChannelFull,
+    HandlerDropped,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct EmergencyRequestDispatchStatus {
+    class: EmergencyRequestClass,
+    venue_index: usize,
+    venue_id: String,
+    transport_mode: EmergencyRequestTransportMode,
+    outcome: EmergencyRequestDispatchOutcome,
+}
+
+impl Default for EmergencyRequestDispatchStatus {
+    fn default() -> Self {
+        Self {
+            class: EmergencyRequestClass::DisabledCancelAll,
+            venue_index: 0,
+            venue_id: String::new(),
+            transport_mode: EmergencyRequestTransportMode::None,
+            outcome: EmergencyRequestDispatchOutcome::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EmergencyResidualFallbackDecision {
+    #[default]
+    Rejected,
+    Used,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum EmergencyResidualFallbackReason {
+    #[default]
+    UnsupportedVenue,
+    NoFreshAccount,
+    LiveOrdersPresent,
+    NotExactOneLot,
+    FallbackSizeTooLarge,
+    SignMismatch,
+    FeeGuardSuppressed,
+    BelowMinNotional,
+    TerminalSubLot,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+struct AsterResidualMarkoutGuardStatus {
+    enabled: bool,
+    max_abs_tao: f64,
+    max_age_ms: TimestampMs,
+    min_adverse_usd: f64,
+    max_unrealised_usd: f64,
+    taker_fee_rate: f64,
+    force_flat_after_ms: TimestampMs,
+    force_flat_max_fee_usd: f64,
+    require_fresh_account: bool,
+    refresh_enabled: bool,
+    terminal_refresh_enabled: bool,
+    refresh_attempted: bool,
+    refresh_outcome: Option<String>,
+    refresh_latency_ms: Option<u64>,
+    fresh_account_age_ms: Option<TimestampMs>,
+    refresh_suppressed_reason: Option<String>,
+    decision: Option<String>,
+    reason: Option<String>,
+    residual_age_ms: Option<TimestampMs>,
+    position_tao: Option<f64>,
+    reference_price: Option<f64>,
+    reference_source: Option<String>,
+    current_mark: Option<f64>,
+    adverse_markout_usd: Option<f64>,
+    residual_unrealised_usd: Option<f64>,
+    cleanup_notional_usd: Option<f64>,
+    cleanup_fee_estimate_usd: Option<f64>,
+    suppressed_orders: u64,
+    allowed_orders: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct EmergencyResidualFallbackRecord {
+    class: EmergencyRequestClass,
+    venue_index: usize,
+    venue_id: String,
+    status: EmergencyResidualFallbackDecision,
+    reason: EmergencyResidualFallbackReason,
+    state_position_tao: f64,
+    clamped_size_tao: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+struct EmergencyResidualFallbackStatus {
+    records: Vec<EmergencyResidualFallbackRecord>,
+    aster_soft_unwind_fee_guard_enabled: bool,
+    aster_soft_unwind_fee_guard_max_abs_tao: f64,
+    aster_soft_unwind_fee_guard_skipped_orders: u64,
+    aster_soft_unwind_fee_guard_skipped_base_tao: f64,
+    aster_soft_unwind_fee_guard_skipped_notional_usd: f64,
+    aster_inventory_brake_fee_guard_enabled: bool,
+    aster_inventory_brake_fee_guard_skipped_orders: u64,
+    aster_inventory_brake_fee_guard_skipped_base_tao: f64,
+    aster_inventory_brake_fee_guard_skipped_notional_usd: f64,
+    aster_residual_markout_guard: AsterResidualMarkoutGuardStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct AsterSoftUnwindFeeGuardConfig {
+    enabled: bool,
+    inventory_brake_fee_guard_enabled: bool,
+    max_abs_position_tao: f64,
+    residual_markout_guard_enabled: bool,
+    residual_markout_guard_max_age_ms: TimestampMs,
+    residual_markout_guard_min_adverse_usd: f64,
+    residual_markout_guard_max_unrealised_usd: f64,
+    residual_markout_guard_taker_fee_rate: f64,
+    residual_markout_guard_force_flat_after_ms: TimestampMs,
+    residual_markout_guard_force_flat_max_fee_usd: f64,
+    residual_markout_guard_require_fresh_account: bool,
+    residual_markout_guard_refresh_enabled: bool,
+    residual_markout_guard_refresh_timeout_ms: u64,
+    residual_markout_guard_refresh_min_interval_ms: TimestampMs,
+    residual_markout_guard_terminal_refresh_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct AsterResidualMarkoutGuardTracker {
+    first_seen_ms: Option<TimestampMs>,
+    last_seen_ms: Option<TimestampMs>,
+    position_sign: f64,
+    reference_price: f64,
+    reference_source: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AsterResidualMarkoutGuardEvaluation {
+    suppress: bool,
+    decision: &'static str,
+    reason: &'static str,
+    residual_age_ms: Option<TimestampMs>,
+    position_tao: f64,
+    reference_price: Option<f64>,
+    reference_source: Option<String>,
+    current_mark: Option<f64>,
+    adverse_markout_usd: Option<f64>,
+    residual_unrealised_usd: Option<f64>,
+    cleanup_notional_usd: Option<f64>,
+    cleanup_fee_estimate_usd: Option<f64>,
+}
+
 #[derive(Debug)]
 pub struct LiveOrderRequest {
     pub intents: Vec<OrderIntent>,
     pub action_batch: ActionBatch,
     pub now_ms: TimestampMs,
+    pub transport_hint: TransportHint,
     pub response: ResponseMode,
 }
 
@@ -204,6 +436,8 @@ struct InventoryBrakeStatus {
     configured: bool,
     triggered: bool,
     sent: bool,
+    request_dispatches: Vec<EmergencyRequestDispatchStatus>,
+    projection_source: ProjectedExposureSource,
     grace_active: bool,
     grace_applied: bool,
     grace_deadline_ms: Option<TimestampMs>,
@@ -217,11 +451,135 @@ struct InventoryBrakeStatus {
     q_global_tao: f64,
     q_gross_tao: f64,
     q_max_abs_venue_tao: f64,
+    raw_projected_q_global_tao: f64,
+    raw_projected_q_gross_tao: f64,
+    raw_projected_q_max_abs_venue_tao: f64,
     projected_q_global_tao: f64,
     projected_q_gross_tao: f64,
     projected_q_max_abs_venue_tao: f64,
+    budget_would_clear_projected_brake: bool,
+    projected_brake_consistent_with_effective_state: bool,
+    raw_projected_global_reasons: Vec<String>,
+    effective_projected_global_reasons: Vec<String>,
     global_reasons: Vec<String>,
     blocked_venues: Vec<InventorySoftGovernorVenueStatus>,
+}
+
+const PROJECTED_MM_BUDGET_ROTATION_MS: TimestampMs = 15_000;
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+struct ProjectedMmBudgetVenueStatus {
+    venue_index: usize,
+    venue_id: String,
+    selected: bool,
+    keep_bid: bool,
+    keep_ask: bool,
+    suppress_bid: bool,
+    suppress_ask: bool,
+    live_worsening_exposure_tao: f64,
+    candidate_size_tao: f64,
+    net_delta_tao: f64,
+    gross_increment_tao: f64,
+    projected_abs_venue_tao: f64,
+    rotation_rank: usize,
+    tracked_live_bid_tao: f64,
+    tracked_live_ask_tao: f64,
+    unmanaged_live_bid_tao: f64,
+    unmanaged_live_ask_tao: f64,
+    cancel_covered_live_bid_tao: f64,
+    cancel_covered_live_ask_tao: f64,
+    pending_new_bid_tao: f64,
+    pending_new_ask_tao: f64,
+    effective_bid_tao: f64,
+    effective_ask_tao: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+struct ProjectedMmBudgetStatus {
+    configured: bool,
+    applied: bool,
+    rotation_epoch: u64,
+    rotation_frozen: bool,
+    net_limit_tao: Option<f64>,
+    gross_limit_tao: Option<f64>,
+    venue_limit_tao: Option<f64>,
+    projected_q_global_before_tao: f64,
+    projected_q_gross_before_tao: f64,
+    projected_q_max_abs_venue_before_tao: f64,
+    projected_q_global_after_tao: f64,
+    projected_q_gross_after_tao: f64,
+    projected_q_max_abs_venue_after_tao: f64,
+    effective_q_global_after_tao: f64,
+    effective_q_gross_after_tao: f64,
+    effective_q_max_abs_venue_after_tao: f64,
+    budget_after_within_limits: bool,
+    effective_projection_within_limits: bool,
+    live_order_projection_consistent: bool,
+    selected_venues: Vec<String>,
+    suppressed_venues: Vec<String>,
+    venues: Vec<ProjectedMmBudgetVenueStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProjectedExposureSource {
+    #[default]
+    RawState,
+    PostPlan,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectedExposureView {
+    source: ProjectedExposureSource,
+    bid_sizes_tao: Vec<f64>,
+    ask_sizes_tao: Vec<f64>,
+    q_global_tao: f64,
+    q_gross_tao: f64,
+    q_max_abs_venue_tao: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MmSideExposureLedger {
+    tracked_accepted_max_tao: f64,
+    tracked_pending_sum_tao: f64,
+    unmanaged_accepted_max_tao: f64,
+    unmanaged_pending_sum_tao: f64,
+    cancel_covered_accepted_max_tao: f64,
+    cancel_covered_pending_sum_tao: f64,
+    pending_new_tao: f64,
+}
+
+impl MmSideExposureLedger {
+    fn tracked_live_tao(&self) -> f64 {
+        self.tracked_accepted_max_tao + self.tracked_pending_sum_tao
+    }
+
+    fn unmanaged_live_tao(&self) -> f64 {
+        self.unmanaged_accepted_max_tao + self.unmanaged_pending_sum_tao
+    }
+
+    fn cancel_covered_live_tao(&self) -> f64 {
+        self.cancel_covered_accepted_max_tao + self.cancel_covered_pending_sum_tao
+    }
+
+    fn uncancelled_live_tao(&self) -> f64 {
+        self.tracked_accepted_max_tao
+            .max(self.unmanaged_accepted_max_tao)
+            + self.tracked_pending_sum_tao
+            + self.unmanaged_pending_sum_tao
+    }
+
+    fn effective_after_plan_tao(&self) -> f64 {
+        self.uncancelled_live_tao() + self.pending_new_tao
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MmVenueExposureLedger {
+    venue_index: usize,
+    venue_id: String,
+    bid: MmSideExposureLedger,
+    ask: MmSideExposureLedger,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -237,6 +595,7 @@ struct EmergencyRequestLatch {
     class: EmergencyRequestClass,
     venue_index: usize,
     venue_id: String,
+    flat_baseline_retry_required: bool,
     active_since_ms: TimestampMs,
     retry_latch_ms: TimestampMs,
     expires_at_ms: TimestampMs,
@@ -288,6 +647,98 @@ impl InventoryBrakeGraceConfig {
     fn enabled(self) -> bool {
         self.grace_ms > 0 && self.grace_ticks > 0 && self.excess_fraction > 0.0
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct CanaryBreachResponseConfig {
+    response_ms: TimestampMs,
+    response_ticks: u32,
+}
+
+impl CanaryBreachResponseConfig {
+    fn enabled(self) -> bool {
+        self.response_ms > 0 && self.response_ticks > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CanaryBreachResponseMode {
+    #[default]
+    Inactive,
+    Dispatch,
+    Retry,
+    Observation,
+    ZeroTargetHold,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+struct CanaryBreachResponseStatus {
+    configured: bool,
+    eligible: bool,
+    active: bool,
+    response_mode: CanaryBreachResponseMode,
+    sent_this_tick: bool,
+    cleared_this_tick: bool,
+    zero_target_hold_this_tick: bool,
+    target_venues: Vec<String>,
+    positioned_target_venues: Vec<String>,
+    candidate_target_venues: Vec<String>,
+    candidate_positioned_target_venues: Vec<String>,
+    cancel_scope_venues: Vec<String>,
+    candidate_cancel_scope_venues: Vec<String>,
+    flatten_venues: Vec<String>,
+    observation_active: bool,
+    observation_venues: Vec<String>,
+    observation_covers_candidate_targets: bool,
+    preserved_existing_cancel_intents: bool,
+    request_dispatches: Vec<EmergencyRequestDispatchStatus>,
+    deadline_ms: Option<TimestampMs>,
+    ticks_remaining: u32,
+    net_breached: bool,
+    gross_breached: bool,
+    venue_breached: bool,
+    open_orders_breached: bool,
+    max_position_tao: Option<f64>,
+    max_gross_position_tao: Option<f64>,
+    max_abs_venue_position_tao: Option<f64>,
+    max_open_orders: Option<usize>,
+    q_global_tao: f64,
+    q_gross_tao: f64,
+    q_max_abs_venue_tao: f64,
+    open_order_count: usize,
+    net_excess_tao: f64,
+    gross_excess_tao: f64,
+    venue_excess_tao: f64,
+    open_order_excess: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+struct StaleMarketHygieneStatus {
+    configured: bool,
+    consecutive_stale_ticks: u64,
+    stale_count_incremented_this_tick: bool,
+    stale_count_reset_this_tick: bool,
+    kill_triggered_this_tick: bool,
+    ready_market_count: usize,
+    stale_market_count: usize,
+    stale_venues: Vec<String>,
+    venue_age_ms: Vec<TimestampMs>,
+    venue_age_event_ms: Vec<TimestampMs>,
+    canary_stale_max_ticks: u64,
+    kill_would_fire_next_tick: bool,
+    startup_arming: StartupStaleArmingStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+struct StartupStaleArmingStatus {
+    enabled: bool,
+    armed: bool,
+    armed_this_tick: bool,
+    elapsed_ms: TimestampMs,
+    arming_ms: TimestampMs,
+    pending_venues: Vec<String>,
+    arm_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -391,12 +842,584 @@ fn parse_reconcile_interval_ms() -> Option<i64> {
     None
 }
 
+fn account_reconcile_request_tx_enabled() -> bool {
+    parse_bool_env_default("PARAPHINA_LIVE_ACCOUNT_RECONCILE_REQUEST_TX", false)
+}
+
+fn aster_soft_unwind_fee_guard_config_from_env() -> AsterSoftUnwindFeeGuardConfig {
+    let enabled = parse_bool_env_default("PARAPHINA_ASTER_SOFT_UNWIND_FEE_GUARD_ENABLED", false);
+    let inventory_brake_fee_guard_enabled =
+        parse_bool_env_default("PARAPHINA_ASTER_INVENTORY_BRAKE_FEE_GUARD_ENABLED", false);
+    let max_abs_position_tao =
+        parse_optional_positive_f64_env("PARAPHINA_ASTER_SOFT_UNWIND_FEE_GUARD_MAX_ABS_TAO")
+            .unwrap_or(0.02);
+    let residual_markout_guard_enabled =
+        parse_bool_env_default("PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_ENABLED", false);
+    let residual_markout_guard_max_age_ms =
+        parse_optional_positive_i64_env("PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_MAX_AGE_MS")
+            .unwrap_or(180_000);
+    let residual_markout_guard_min_adverse_usd =
+        parse_optional_positive_f64_env("PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_MIN_ADVERSE_USD")
+            .unwrap_or(0.03);
+    let residual_markout_guard_max_unrealised_usd = parse_optional_positive_f64_env(
+        "PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_MAX_UNREALISED_USD",
+    )
+    .unwrap_or(0.10);
+    let residual_markout_guard_taker_fee_rate =
+        parse_optional_positive_f64_env("PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_TAKER_FEE_RATE")
+            .unwrap_or(0.0004);
+    let residual_markout_guard_force_flat_after_ms = parse_optional_positive_i64_env(
+        "PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_FORCE_FLAT_AFTER_MS",
+    )
+    .unwrap_or(0);
+    let residual_markout_guard_force_flat_max_fee_usd = parse_optional_positive_f64_env(
+        "PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_FORCE_FLAT_MAX_FEE_USD",
+    )
+    .unwrap_or(0.05);
+    let residual_markout_guard_require_fresh_account = parse_bool_env_default(
+        "PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_REQUIRE_FRESH_ACCOUNT",
+        true,
+    );
+    let residual_markout_guard_refresh_enabled = parse_bool_env_default(
+        "PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_REFRESH_ENABLED",
+        false,
+    );
+    let residual_markout_guard_refresh_timeout_ms = parse_optional_positive_i64_env(
+        "PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_REFRESH_TIMEOUT_MS",
+    )
+    .unwrap_or(500) as u64;
+    let residual_markout_guard_refresh_min_interval_ms = parse_optional_positive_i64_env(
+        "PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_REFRESH_MIN_INTERVAL_MS",
+    )
+    .unwrap_or(2_000);
+    let residual_markout_guard_terminal_refresh_enabled = parse_bool_env_default(
+        "PARAPHINA_ASTER_RESIDUAL_MARKOUT_GUARD_TERMINAL_REFRESH_ENABLED",
+        false,
+    );
+
+    AsterSoftUnwindFeeGuardConfig {
+        enabled,
+        inventory_brake_fee_guard_enabled,
+        max_abs_position_tao,
+        residual_markout_guard_enabled,
+        residual_markout_guard_max_age_ms,
+        residual_markout_guard_min_adverse_usd,
+        residual_markout_guard_max_unrealised_usd,
+        residual_markout_guard_taker_fee_rate,
+        residual_markout_guard_force_flat_after_ms,
+        residual_markout_guard_force_flat_max_fee_usd,
+        residual_markout_guard_require_fresh_account,
+        residual_markout_guard_refresh_enabled,
+        residual_markout_guard_refresh_timeout_ms,
+        residual_markout_guard_refresh_min_interval_ms,
+        residual_markout_guard_terminal_refresh_enabled,
+    }
+}
+
+fn seed_aster_soft_unwind_fee_guard_status(
+    status: &mut EmergencyResidualFallbackStatus,
+    config: AsterSoftUnwindFeeGuardConfig,
+) {
+    status.aster_soft_unwind_fee_guard_enabled = config.enabled;
+    status.aster_soft_unwind_fee_guard_max_abs_tao = config.max_abs_position_tao;
+    status.aster_inventory_brake_fee_guard_enabled = config.inventory_brake_fee_guard_enabled;
+    status.aster_residual_markout_guard.enabled = config.residual_markout_guard_enabled;
+    status.aster_residual_markout_guard.max_abs_tao = config.max_abs_position_tao;
+    status.aster_residual_markout_guard.max_age_ms = config.residual_markout_guard_max_age_ms;
+    status.aster_residual_markout_guard.min_adverse_usd =
+        config.residual_markout_guard_min_adverse_usd;
+    status.aster_residual_markout_guard.max_unrealised_usd =
+        config.residual_markout_guard_max_unrealised_usd;
+    status.aster_residual_markout_guard.taker_fee_rate =
+        config.residual_markout_guard_taker_fee_rate;
+    status.aster_residual_markout_guard.force_flat_after_ms =
+        config.residual_markout_guard_force_flat_after_ms;
+    status.aster_residual_markout_guard.force_flat_max_fee_usd =
+        config.residual_markout_guard_force_flat_max_fee_usd;
+    status.aster_residual_markout_guard.require_fresh_account =
+        config.residual_markout_guard_require_fresh_account;
+    status.aster_residual_markout_guard.refresh_enabled =
+        config.residual_markout_guard_refresh_enabled;
+    status.aster_residual_markout_guard.terminal_refresh_enabled =
+        config.residual_markout_guard_terminal_refresh_enabled;
+}
+
+fn should_suppress_aster_soft_unwind_for_fee_guard(
+    venue_id: &str,
+    reference_position_tao: f64,
+    unwind_position_tao: f64,
+    price: f64,
+    config: AsterSoftUnwindFeeGuardConfig,
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    venue_index: usize,
+    now_ms: TimestampMs,
+    residual_tracker: Option<&mut AsterResidualMarkoutGuardTracker>,
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> bool {
+    should_suppress_aster_reduce_only_for_fee_guard(
+        EmergencyRequestClass::SoftUnwind,
+        venue_id,
+        reference_position_tao,
+        unwind_position_tao,
+        price,
+        config,
+        cfg,
+        state,
+        snapshot,
+        venue_index,
+        now_ms,
+        residual_tracker,
+        residual_fallback,
+    )
+}
+
+fn should_suppress_aster_reduce_only_for_fee_guard(
+    class: EmergencyRequestClass,
+    venue_id: &str,
+    reference_position_tao: f64,
+    unwind_position_tao: f64,
+    price: f64,
+    config: AsterSoftUnwindFeeGuardConfig,
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    venue_index: usize,
+    now_ms: TimestampMs,
+    residual_tracker: Option<&mut AsterResidualMarkoutGuardTracker>,
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> bool {
+    let enabled_for_class = match class {
+        EmergencyRequestClass::SoftUnwind => config.enabled,
+        EmergencyRequestClass::InventoryBrake => config.inventory_brake_fee_guard_enabled,
+        EmergencyRequestClass::DisabledCancelAll => false,
+    };
+    if !enabled_for_class || !venue_id.eq_ignore_ascii_case("aster") {
+        return false;
+    }
+    let within_fee_guard_band = reference_position_tao.abs() <= config.max_abs_position_tao + 1e-9;
+    if !within_fee_guard_band {
+        record_aster_residual_markout_guard_evaluation(
+            residual_fallback,
+            AsterResidualMarkoutGuardEvaluation {
+                suppress: false,
+                decision: "allow",
+                reason: "allowed_over_band",
+                residual_age_ms: None,
+                position_tao: reference_position_tao,
+                reference_price: None,
+                reference_source: None,
+                current_mark: None,
+                adverse_markout_usd: None,
+                residual_unrealised_usd: None,
+                cleanup_notional_usd: cleanup_notional_usd(unwind_position_tao, price),
+                cleanup_fee_estimate_usd: cleanup_fee_estimate_usd(
+                    unwind_position_tao,
+                    price,
+                    config.residual_markout_guard_taker_fee_rate,
+                ),
+            },
+        );
+        return false;
+    }
+    if !config.residual_markout_guard_enabled {
+        return true;
+    }
+    let evaluation = evaluate_aster_residual_markout_guard(
+        cfg,
+        state,
+        snapshot,
+        venue_index,
+        now_ms,
+        reference_position_tao,
+        unwind_position_tao,
+        price,
+        config,
+        residual_tracker,
+    );
+    let suppress = evaluation.suppress;
+    record_aster_residual_markout_guard_evaluation(residual_fallback, evaluation);
+    suppress
+}
+
+fn cleanup_notional_usd(unwind_position_tao: f64, price: f64) -> Option<f64> {
+    if unwind_position_tao.is_finite() && price.is_finite() && price > 0.0 {
+        Some(unwind_position_tao.abs() * price)
+    } else {
+        None
+    }
+}
+
+fn cleanup_fee_estimate_usd(
+    unwind_position_tao: f64,
+    price: f64,
+    taker_fee_rate: f64,
+) -> Option<f64> {
+    cleanup_notional_usd(unwind_position_tao, price).map(|notional| {
+        if taker_fee_rate.is_finite() && taker_fee_rate > 0.0 {
+            notional * taker_fee_rate
+        } else {
+            0.0
+        }
+    })
+}
+
+fn fresh_account_snapshot_for_venue<'a>(
+    cfg: &Config,
+    snapshot: &'a CanonicalCacheSnapshot,
+    venue_index: usize,
+    now_ms: TimestampMs,
+) -> Option<&'a VenueAccountSnapshot> {
+    snapshot.account.get(venue_index).filter(|acct| {
+        account_cache_snapshot_fresh(
+            acct,
+            now_ms,
+            account_snapshot_max_age_ms_for_venue(cfg, acct.venue_id.as_ref()),
+        )
+    })
+}
+
+fn residual_mark_price(state: &GlobalState, venue_index: usize) -> Option<f64> {
+    state
+        .venues
+        .get(venue_index)
+        .and_then(|venue| venue.mid)
+        .or(state.fair_value)
+        .or_else(|| {
+            (state.fair_value_prev.is_finite() && state.fair_value_prev > 0.0)
+                .then_some(state.fair_value_prev)
+        })
+        .filter(|price| price.is_finite() && *price > 0.0)
+}
+
+fn evaluate_aster_residual_markout_guard(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    venue_index: usize,
+    now_ms: TimestampMs,
+    reference_position_tao: f64,
+    unwind_position_tao: f64,
+    price: f64,
+    config: AsterSoftUnwindFeeGuardConfig,
+    residual_tracker: Option<&mut AsterResidualMarkoutGuardTracker>,
+) -> AsterResidualMarkoutGuardEvaluation {
+    let fresh_account = fresh_account_snapshot_for_venue(cfg, snapshot, venue_index, now_ms);
+    if config.residual_markout_guard_require_fresh_account && fresh_account.is_none() {
+        return AsterResidualMarkoutGuardEvaluation {
+            suppress: true,
+            decision: "suppress",
+            reason: "held_no_fresh_account",
+            residual_age_ms: None,
+            position_tao: reference_position_tao,
+            reference_price: None,
+            reference_source: None,
+            current_mark: residual_mark_price(state, venue_index),
+            adverse_markout_usd: None,
+            residual_unrealised_usd: None,
+            cleanup_notional_usd: cleanup_notional_usd(unwind_position_tao, price),
+            cleanup_fee_estimate_usd: cleanup_fee_estimate_usd(
+                unwind_position_tao,
+                price,
+                config.residual_markout_guard_taker_fee_rate,
+            ),
+        };
+    }
+
+    let current_mark = residual_mark_price(state, venue_index);
+    let Some(current_mark) = current_mark else {
+        return AsterResidualMarkoutGuardEvaluation {
+            suppress: true,
+            decision: "suppress",
+            reason: "missing_mark",
+            residual_age_ms: None,
+            position_tao: reference_position_tao,
+            reference_price: None,
+            reference_source: None,
+            current_mark: None,
+            adverse_markout_usd: None,
+            residual_unrealised_usd: None,
+            cleanup_notional_usd: cleanup_notional_usd(unwind_position_tao, price),
+            cleanup_fee_estimate_usd: cleanup_fee_estimate_usd(
+                unwind_position_tao,
+                price,
+                config.residual_markout_guard_taker_fee_rate,
+            ),
+        };
+    };
+
+    let position_tao = fresh_account
+        .map(|acct| acct.position_tao)
+        .unwrap_or(reference_position_tao);
+    let position_sign = position_tao.signum();
+    let fresh_reference = fresh_account
+        .map(|acct| acct.avg_entry_price)
+        .filter(|value: &f64| value.is_finite() && *value > 0.0);
+    let fallback_reference = residual_tracker
+        .as_ref()
+        .filter(|tracker| {
+            tracker.first_seen_ms.is_some()
+                && tracker.position_sign == position_sign
+                && tracker.reference_price.is_finite()
+                && tracker.reference_price > 0.0
+        })
+        .map(|tracker| (tracker.reference_price, tracker.reference_source.clone()));
+    let (reference_price, reference_source) = if let Some(price) = fresh_reference {
+        (price, "fresh_account_avg_entry".to_string())
+    } else if let Some((price, source)) = fallback_reference {
+        (price, source)
+    } else {
+        (current_mark, "current_mark_seed".to_string())
+    };
+
+    let residual_age_ms = if let Some(tracker) = residual_tracker {
+        let reset_tracker = tracker.first_seen_ms.is_none()
+            || tracker.position_sign != position_sign
+            || position_tao.abs() < 1e-12;
+        if reset_tracker {
+            tracker.first_seen_ms = Some(now_ms);
+            tracker.position_sign = position_sign;
+        }
+        tracker.last_seen_ms = Some(now_ms);
+        tracker.reference_price = reference_price;
+        tracker.reference_source = reference_source.clone();
+        tracker
+            .first_seen_ms
+            .map(|first_seen| now_ms.saturating_sub(first_seen))
+    } else {
+        None
+    };
+
+    let residual_unrealised_usd = position_tao * (current_mark - reference_price);
+    let adverse_markout_usd = (-residual_unrealised_usd).max(0.0);
+    let cleanup_notional_usd = cleanup_notional_usd(unwind_position_tao, price);
+    let cleanup_fee_estimate_usd = cleanup_fee_estimate_usd(
+        unwind_position_tao,
+        price,
+        config.residual_markout_guard_taker_fee_rate,
+    );
+    let cleanup_fee_floor = cleanup_fee_estimate_usd.unwrap_or(0.0);
+    let adverse_trigger_usd = config
+        .residual_markout_guard_min_adverse_usd
+        .max(cleanup_fee_floor);
+    let force_flat_stale_residual = config.residual_markout_guard_force_flat_after_ms > 0
+        && residual_age_ms
+            .is_some_and(|age| age >= config.residual_markout_guard_force_flat_after_ms)
+        && cleanup_fee_estimate_usd
+            .is_some_and(|fee| fee <= config.residual_markout_guard_force_flat_max_fee_usd + 1e-9);
+
+    let (suppress, reason) =
+        if residual_unrealised_usd <= -config.residual_markout_guard_max_unrealised_usd {
+            (false, "allowed_unrealised")
+        } else if adverse_markout_usd >= adverse_trigger_usd {
+            (false, "allowed_markout")
+        } else if residual_age_ms.is_some_and(|age| age >= config.residual_markout_guard_max_age_ms)
+            && adverse_markout_usd > cleanup_fee_floor
+        {
+            (false, "allowed_age")
+        } else if force_flat_stale_residual {
+            (false, "allowed_force_flat_age")
+        } else {
+            (true, "suppressed_benign")
+        };
+
+    AsterResidualMarkoutGuardEvaluation {
+        suppress,
+        decision: if suppress { "suppress" } else { "allow" },
+        reason,
+        residual_age_ms,
+        position_tao,
+        reference_price: Some(reference_price),
+        reference_source: Some(reference_source),
+        current_mark: Some(current_mark),
+        adverse_markout_usd: Some(adverse_markout_usd),
+        residual_unrealised_usd: Some(residual_unrealised_usd),
+        cleanup_notional_usd,
+        cleanup_fee_estimate_usd,
+    }
+}
+
+fn record_aster_residual_markout_guard_evaluation(
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    evaluation: AsterResidualMarkoutGuardEvaluation,
+) {
+    let Some(status) = residual_fallback else {
+        return;
+    };
+    let guard = &mut status.aster_residual_markout_guard;
+    if !guard.enabled {
+        return;
+    }
+    guard.decision = Some(evaluation.decision.to_string());
+    guard.reason = Some(evaluation.reason.to_string());
+    guard.residual_age_ms = evaluation.residual_age_ms;
+    guard.position_tao = Some(evaluation.position_tao);
+    guard.reference_price = evaluation.reference_price;
+    guard.reference_source = evaluation.reference_source;
+    guard.current_mark = evaluation.current_mark;
+    guard.adverse_markout_usd = evaluation.adverse_markout_usd;
+    guard.residual_unrealised_usd = evaluation.residual_unrealised_usd;
+    guard.cleanup_notional_usd = evaluation.cleanup_notional_usd;
+    guard.cleanup_fee_estimate_usd = evaluation.cleanup_fee_estimate_usd;
+    if evaluation.suppress {
+        guard.suppressed_orders = guard.suppressed_orders.saturating_add(1);
+    } else {
+        guard.allowed_orders = guard.allowed_orders.saturating_add(1);
+    }
+}
+
+fn record_aster_residual_markout_guard_refresh(
+    residual_fallback: &mut EmergencyResidualFallbackStatus,
+    config: AsterSoftUnwindFeeGuardConfig,
+    attempted: bool,
+    outcome: &'static str,
+    latency_ms: Option<u64>,
+    fresh_account_age_ms: Option<TimestampMs>,
+    suppressed_reason: Option<&'static str>,
+) {
+    seed_aster_soft_unwind_fee_guard_status(residual_fallback, config);
+    let guard = &mut residual_fallback.aster_residual_markout_guard;
+    if !guard.enabled {
+        return;
+    }
+    guard.refresh_attempted = attempted;
+    guard.refresh_outcome = Some(outcome.to_string());
+    guard.refresh_latency_ms = latency_ms;
+    guard.fresh_account_age_ms = fresh_account_age_ms;
+    guard.refresh_suppressed_reason = suppressed_reason.map(str::to_string);
+}
+
+fn should_attempt_aster_residual_markout_account_refresh(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    config: AsterSoftUnwindFeeGuardConfig,
+    last_refresh_ms: Option<TimestampMs>,
+    terminal_exit_quiesce_active: bool,
+) -> Option<usize> {
+    if !config.enabled
+        || !config.residual_markout_guard_enabled
+        || !config.residual_markout_guard_require_fresh_account
+        || !config.residual_markout_guard_refresh_enabled
+    {
+        return None;
+    }
+    let venue_index = aster_venue_index(cfg)?;
+    if fresh_account_snapshot_for_venue(cfg, snapshot, venue_index, now_ms).is_some() {
+        return None;
+    }
+    if last_refresh_ms.is_some_and(|last| {
+        now_ms.saturating_sub(last) < config.residual_markout_guard_refresh_min_interval_ms
+    }) {
+        return None;
+    }
+    let lot_size = cfg.venues[venue_index].lot_size_tao.max(1e-9);
+    let target_position_tao =
+        soft_unwind_target_position_tao(cfg, state, snapshot, venue_index, now_ms);
+    if target_position_tao.abs() < lot_size {
+        if terminal_exit_quiesce_active && config.residual_markout_guard_terminal_refresh_enabled {
+            let reference_position_tao =
+                fresh_account_or_state_position_tao(cfg, state, snapshot, venue_index, now_ms);
+            if reference_position_tao.abs() <= config.max_abs_position_tao + 1e-9 {
+                return Some(venue_index);
+            }
+        }
+        return None;
+    }
+    let reference_position_tao =
+        fresh_account_or_state_position_tao(cfg, state, snapshot, venue_index, now_ms);
+    if reference_position_tao.abs() > config.max_abs_position_tao + 1e-9 {
+        return None;
+    }
+    Some(venue_index)
+}
+
+fn record_aster_reduce_only_fee_guard_suppression(
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    class: EmergencyRequestClass,
+    venue_index: usize,
+    venue_id: &str,
+    reference_position_tao: f64,
+    unwind_position_tao: f64,
+    price: f64,
+) {
+    let Some(status) = residual_fallback else {
+        return;
+    };
+    let abs_size = unwind_position_tao.abs();
+    let skipped_notional = if price.is_finite() && price > 0.0 {
+        abs_size * price
+    } else {
+        0.0
+    };
+    match class {
+        EmergencyRequestClass::SoftUnwind => {
+            status.aster_soft_unwind_fee_guard_skipped_orders = status
+                .aster_soft_unwind_fee_guard_skipped_orders
+                .saturating_add(1);
+            status.aster_soft_unwind_fee_guard_skipped_base_tao += abs_size;
+            status.aster_soft_unwind_fee_guard_skipped_notional_usd += skipped_notional;
+        }
+        EmergencyRequestClass::InventoryBrake => {
+            status.aster_inventory_brake_fee_guard_skipped_orders = status
+                .aster_inventory_brake_fee_guard_skipped_orders
+                .saturating_add(1);
+            status.aster_inventory_brake_fee_guard_skipped_base_tao += abs_size;
+            status.aster_inventory_brake_fee_guard_skipped_notional_usd += skipped_notional;
+        }
+        EmergencyRequestClass::DisabledCancelAll => {}
+    }
+    status.records.push(EmergencyResidualFallbackRecord {
+        class,
+        venue_index,
+        venue_id: venue_id.to_string(),
+        status: EmergencyResidualFallbackDecision::Rejected,
+        reason: EmergencyResidualFallbackReason::FeeGuardSuppressed,
+        state_position_tao: reference_position_tao,
+        clamped_size_tao: abs_size,
+    });
+}
+
+fn record_aster_soft_unwind_fee_guard_suppression(
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    venue_index: usize,
+    venue_id: &str,
+    reference_position_tao: f64,
+    unwind_position_tao: f64,
+    price: f64,
+) {
+    record_aster_reduce_only_fee_guard_suppression(
+        residual_fallback,
+        EmergencyRequestClass::SoftUnwind,
+        venue_index,
+        venue_id,
+        reference_position_tao,
+        unwind_position_tao,
+        price,
+    );
+}
+
 fn default_account_poll_ms() -> i64 {
     std::env::var("PARAPHINA_LIVE_ACCOUNT_POLL_MS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(5_000)
+}
+
+fn env_bool(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn sum_same_side_live_exposure_for_venue(venue_id: &str) -> bool {
+    (venue_id.eq_ignore_ascii_case("extended")
+        && env_bool("PARAPHINA_MM_SUM_SAME_SIDE_LIVE_EXPOSURE_EXTENDED"))
+        || (venue_id.eq_ignore_ascii_case("aster")
+            && env_bool("PARAPHINA_MM_SUM_SAME_SIDE_LIVE_EXPOSURE_ASTER"))
 }
 
 fn parse_positive_i64_env_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<i64> {
@@ -505,6 +1528,41 @@ fn update_applied_account_position_baselines(
             *slot = Some(acct.position_tao);
         }
     }
+}
+
+fn account_position_drift_explained_by_live_orders(
+    state: &GlobalState,
+    snapshot: &super::types::AccountSnapshot,
+    pos_internal: f64,
+    pos_venue: f64,
+    now_ms: TimestampMs,
+) -> bool {
+    const EPS: f64 = 1e-9;
+
+    let position_delta_tao = pos_venue - pos_internal;
+    if position_delta_tao.abs() <= EPS {
+        return false;
+    }
+
+    let inference_now_ms = if snapshot.timestamp_ms > 0 {
+        snapshot.timestamp_ms.max(now_ms)
+    } else {
+        now_ms
+    };
+    let explained_abs = state
+        .live_order_state
+        .infer_fills_from_position_delta(
+            snapshot.venue_index,
+            &snapshot.venue_id,
+            position_delta_tao,
+            snapshot.seq,
+            inference_now_ms,
+        )
+        .into_iter()
+        .map(|fill| fill.size.abs())
+        .sum::<f64>();
+
+    explained_abs + EPS >= position_delta_tao.abs()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -730,6 +1788,7 @@ async fn send_order_and_wait(
     action_batch: ActionBatch,
     now_ms: TimestampMs,
     timeout_ms: u64,
+    transport_hint: TransportHint,
     label: &str,
     tick: u64,
 ) -> Option<Vec<super::types::ExecutionEvent>> {
@@ -739,6 +1798,7 @@ async fn send_order_and_wait(
         action_batch,
         now_ms,
         timeout_ms,
+        transport_hint,
         label,
         tick,
     )
@@ -755,6 +1815,7 @@ async fn send_order_and_wait_with_status(
     action_batch: ActionBatch,
     now_ms: TimestampMs,
     timeout_ms: u64,
+    transport_hint: TransportHint,
     label: &str,
     tick: u64,
 ) -> (
@@ -766,6 +1827,7 @@ async fn send_order_and_wait_with_status(
         intents,
         action_batch,
         now_ms,
+        transport_hint,
         response: ResponseMode::Oneshot(response_tx),
     };
     if let Err(_) = priority_order_tx.try_send(request) {
@@ -801,6 +1863,7 @@ fn send_order_fire_and_forget(
     intents: Vec<OrderIntent>,
     action_batch: ActionBatch,
     now_ms: TimestampMs,
+    transport_hint: TransportHint,
     label: &str,
     tick: u64,
 ) -> bool {
@@ -808,6 +1871,7 @@ fn send_order_fire_and_forget(
         intents,
         action_batch,
         now_ms,
+        transport_hint,
         response: ResponseMode::FireAndForget,
     };
     if let Err(_) = order_tx.try_send(request) {
@@ -820,6 +1884,174 @@ fn send_order_fire_and_forget(
         return false;
     }
     true
+}
+
+fn emergency_request_dispatch_outcome(
+    outcome: OrderWaitOutcomeKind,
+) -> EmergencyRequestDispatchOutcome {
+    match outcome {
+        OrderWaitOutcomeKind::Events => EmergencyRequestDispatchOutcome::Events,
+        OrderWaitOutcomeKind::ChannelFull => EmergencyRequestDispatchOutcome::ChannelFull,
+        OrderWaitOutcomeKind::HandlerDropped => EmergencyRequestDispatchOutcome::HandlerDropped,
+        OrderWaitOutcomeKind::Timeout => EmergencyRequestDispatchOutcome::Timeout,
+    }
+}
+
+fn split_canary_flatten_intents_by_cancel_mode(
+    flatten_intents: Vec<OrderIntent>,
+    cancel_intents: &[OrderIntent],
+    defer_cancel_all_venues: bool,
+) -> (Vec<OrderIntent>, Vec<OrderIntent>) {
+    if !defer_cancel_all_venues {
+        return (flatten_intents, Vec::new());
+    }
+    let global_cancel_all = cancel_intents.iter().any(|intent| {
+        matches!(
+            intent,
+            OrderIntent::CancelAll(cancel_all) if cancel_all.venue_index.is_none()
+        )
+    });
+    flatten_intents.into_iter().partition(|intent| {
+        let Some(venue_index) = venue_index_for_order_intent(intent) else {
+            return false;
+        };
+        if global_cancel_all {
+            return false;
+        }
+        !cancel_intents.iter().any(|cancel_intent| {
+            matches!(
+                cancel_intent,
+                OrderIntent::CancelAll(cancel_all) if cancel_all.venue_index == Some(venue_index)
+            )
+        })
+    })
+}
+
+async fn dispatch_canary_breach_flatten_intents_sync_wait(
+    cfg: &Config,
+    state: &mut GlobalState,
+    priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    flatten_intents: Vec<OrderIntent>,
+    now_ms: TimestampMs,
+    batch_id: u64,
+    tick: u64,
+    label: &str,
+    hooks: Option<&LiveRuntimeHooks>,
+    would_send_intents: &mut Vec<OrderIntent>,
+    last_exit_intent: &mut Option<OrderIntent>,
+) -> CanaryFlattenDispatchResult {
+    if flatten_intents.is_empty() {
+        return CanaryFlattenDispatchResult::default();
+    }
+    *last_exit_intent = flatten_intents.first().cloned();
+    let async_observation_venues = async_canary_flatten_observation_venue_indices(cfg);
+    let (mut async_intents, mut sync_intents): (Vec<_>, Vec<_>) =
+        flatten_intents.into_iter().partition(|intent| {
+            venue_index_for_order_intent(intent)
+                .is_some_and(|venue_index| async_observation_venues.contains(&venue_index))
+        });
+    let mut result = CanaryFlattenDispatchResult::default();
+
+    if !async_intents.is_empty() {
+        normalize_live_client_order_ids(&mut async_intents, tick);
+        would_send_intents.extend(async_intents.iter().cloned());
+        if let Some(hooks_ref) = hooks {
+            hooks_ref.metrics.inc_orders(async_intents.len());
+        }
+        let submitted_venues = venue_indices_for_order_intents(&async_intents);
+        let action_batch = build_live_action_batch(cfg, &async_intents, now_ms, batch_id);
+        let async_label = format!("{label}_async_submit");
+        if send_order_fire_and_forget(
+            priority_order_tx,
+            async_intents,
+            action_batch,
+            now_ms,
+            TransportHint::Default,
+            &async_label,
+            tick,
+        ) {
+            result.submitted = true;
+            for venue_index in submitted_venues {
+                if !result.submitted_venues.contains(&venue_index) {
+                    result.submitted_venues.push(venue_index);
+                }
+            }
+        }
+    }
+
+    if sync_intents.is_empty() {
+        return result;
+    }
+
+    normalize_live_client_order_ids(&mut sync_intents, tick);
+    would_send_intents.extend(sync_intents.iter().cloned());
+    if let Some(hooks_ref) = hooks {
+        hooks_ref.metrics.inc_orders(sync_intents.len());
+    }
+    let submitted_venues = venue_indices_for_order_intents(&sync_intents);
+    let sync_batch_id = if result.submitted {
+        batch_id.saturating_add(1)
+    } else {
+        batch_id
+    };
+    let action_batch = build_live_action_batch(cfg, &sync_intents, now_ms, sync_batch_id);
+    let (outcome, events) = send_order_and_wait_with_status(
+        priority_order_tx,
+        sync_intents,
+        action_batch,
+        now_ms,
+        KILL_FLATTEN_TIMEOUT_MS,
+        TransportHint::Default,
+        label,
+        tick,
+    )
+    .await;
+    if !matches!(outcome, OrderWaitOutcomeKind::ChannelFull) {
+        result.submitted = true;
+        for venue_index in submitted_venues {
+            if !result.submitted_venues.contains(&venue_index) {
+                result.submitted_venues.push(venue_index);
+            }
+        }
+    }
+    if let Some(events) = events {
+        for event in &events {
+            if let super::types::ExecutionEvent::OrderAccepted(ack) = event {
+                if !result.accepted_venues.contains(&ack.venue_index) {
+                    result.accepted_venues.push(ack.venue_index);
+                }
+            }
+        }
+        #[cfg(feature = "event_log")]
+        log_live_execution_events_env(tick, now_ms, "gateway", &events);
+        let core_events = live_events_to_core(&events);
+        let fills = apply_execution_events(state, &core_events, now_ms);
+        if !fills.is_empty() {
+            apply_live_fills(cfg, state, &fills, now_ms);
+            state.recompute_after_fills(cfg);
+        }
+    }
+    result
+}
+
+fn emergency_request_dispatch_status(
+    cfg: &Config,
+    class: EmergencyRequestClass,
+    venue_index: usize,
+    transport_mode: EmergencyRequestTransportMode,
+    outcome: EmergencyRequestDispatchOutcome,
+) -> EmergencyRequestDispatchStatus {
+    EmergencyRequestDispatchStatus {
+        class,
+        venue_index,
+        venue_id: cfg
+            .venues
+            .get(venue_index)
+            .map(|venue| venue.id.clone())
+            .unwrap_or_default(),
+        transport_mode,
+        outcome,
+    }
 }
 
 /// Send an account reconciliation request and wait for the response with a deterministic
@@ -1317,6 +2549,12 @@ const KILL_CANCEL_ALL_TIMEOUT_MS_MIN: u64 = 5_000;
 const KILL_CANCEL_ALL_TIMEOUT_MS_PER_VENUE: u64 = 1_000;
 const KILL_FLATTEN_TIMEOUT_MS: u64 = 2_000;
 
+fn realtime_tick_interval(interval_ms: u64) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
 fn diff_exceeds(lhs: f64, rhs: f64, tol: f64) -> bool {
     let diff = (lhs - rhs).abs();
     let tol_eps = RECONCILE_TOL_EPSILON.max(tol.abs() * 1e-9);
@@ -1393,6 +2631,7 @@ pub async fn run_live_loop(
     fill_batcher.set_last_flush_ms(scheduler.next_main_ms() - cfg.fill_agg_interval_ms);
 
     let account_reconcile_ms = parse_reconcile_interval_ms();
+    let account_reconcile_request_tx_enabled = account_reconcile_request_tx_enabled();
     let mut last_account_reconcile_ms: Option<TimestampMs> = None;
     let mut last_account_snapshot_ms: Vec<Option<TimestampMs>> = vec![None; cfg.venues.len()];
     let mut account_state_initialized: Vec<bool> = vec![false; cfg.venues.len()];
@@ -1404,6 +2643,10 @@ pub async fn run_live_loop(
     let mut inventory_brake_grace_until_ms: Option<TimestampMs> = None;
     let mut inventory_brake_grace_remaining_ticks: u32 = 0;
     let mut inventory_brake_grace_available = true;
+    let mut canary_breach_response_until_ms: Option<TimestampMs> = None;
+    let mut canary_breach_response_remaining_ticks: u32 = 0;
+    let mut canary_breach_response_sent = false;
+    let mut canary_flatten_observation = CanaryFlattenObservationState::default();
 
     let mut tick: u64 = 0;
     #[cfg(feature = "event_log")]
@@ -1515,6 +2758,60 @@ pub async fn run_live_loop(
     } else {
         InventoryBrakeGraceConfig::default()
     };
+    let canary_breach_response_config = if canary_enabled {
+        CanaryBreachResponseConfig {
+            response_ms: parse_optional_positive_i64_env("PARAPHINA_CANARY_BREACH_RESPONSE_MS")
+                .unwrap_or(1_500),
+            response_ticks: std::env::var("PARAPHINA_CANARY_BREACH_RESPONSE_TICKS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(3),
+        }
+    } else {
+        CanaryBreachResponseConfig::default()
+    };
+    let canary_flatten_observation_ms = if canary_enabled {
+        parse_optional_positive_i64_env("PARAPHINA_CANARY_FLATTEN_OBSERVATION_MS")
+            .or_else(|| {
+                parse_optional_positive_i64_env("PARAPHINA_CANARY_LIGHTER_FLATTEN_OBSERVATION_MS")
+            })
+            .unwrap_or_else(|| {
+                let account_poll_ms =
+                    venue_specific_account_poll_ms("lighter", default_account_poll_ms());
+                let upper_bound_ms =
+                    lighter_emergency_max_latch_ms.max(canary_breach_response_config.response_ms);
+                account_poll_ms
+                    .saturating_add(500)
+                    .max(canary_breach_response_config.response_ms)
+                    .min(upper_bound_ms)
+            })
+    } else {
+        0
+    };
+    let canary_flatten_observation_retry_enabled = canary_enabled
+        && parse_bool_env_default(
+            "PARAPHINA_CANARY_FLATTEN_OBSERVATION_RETRY_WITHOUT_PROGRESS_ENABLED",
+            false,
+        );
+    let canary_flatten_observation_retry_ms = if canary_flatten_observation_retry_enabled {
+        parse_optional_positive_i64_env("PARAPHINA_CANARY_FLATTEN_OBSERVATION_RETRY_MS")
+            .unwrap_or_else(|| (canary_breach_response_config.response_ms / 2).max(500))
+            .max(250)
+    } else {
+        0
+    };
+    let canary_flatten_observation_max_retries = if canary_flatten_observation_retry_enabled {
+        parse_optional_positive_u32_env("PARAPHINA_CANARY_FLATTEN_OBSERVATION_MAX_RETRIES")
+            .unwrap_or(2)
+    } else {
+        0
+    };
+    let canary_flatten_observation_from_inventory_brake_enabled = canary_enabled
+        && parse_bool_env_default(
+            "PARAPHINA_CANARY_FLATTEN_OBSERVATION_FROM_INVENTORY_BRAKE_ENABLED",
+            false,
+        );
     let canary_max_open_orders = std::env::var("PARAPHINA_CANARY_MAX_OPEN_ORDERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
@@ -1522,8 +2819,22 @@ pub async fn run_live_loop(
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    let startup_stale_arming_ms =
+        startup_stale_arming_ms_from_env(canary_enabled && trade_mode == "live");
     let startup_pnl_baseline_cfg =
         startup_pnl_baseline_config_from_env(canary_enabled && trade_mode == "live");
+    let terminal_exit_quiesce_config =
+        terminal_exit_quiesce_config_from_env(canary_enabled && trade_mode == "live");
+    let mut terminal_exit_cancel_state = vec![TerminalExitCancelState::default(); cfg.venues.len()];
+    let mut last_aster_terminal_quiesce_explicit_cancel_retry_ms: Option<TimestampMs> = None;
+    let terminal_residual_convergence_config =
+        terminal_residual_convergence_config_from_env(canary_enabled && trade_mode == "live");
+    let terminal_residual_convergence_venues =
+        terminal_residual_convergence_venue_indices(cfg, &terminal_residual_convergence_config);
+    let mut last_terminal_residual_account_refresh_ms = vec![None; cfg.venues.len()];
+    let aster_soft_unwind_fee_guard_config = aster_soft_unwind_fee_guard_config_from_env();
+    let mut aster_residual_markout_guard_tracker = AsterResidualMarkoutGuardTracker::default();
+    let mut last_aster_residual_markout_guard_refresh_ms: Option<TimestampMs> = None;
     let canary_enforce_post_only = std::env::var("PARAPHINA_CANARY_ENFORCE_POST_ONLY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -1539,6 +2850,14 @@ pub async fn run_live_loop(
     let ext_apply_any = std::env::var("PARAPHINA_EXTENDED_APPLY_AGE_ON_ANY_L2")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let extended_freeze_progress_age_enabled =
+        std::env::var("PARAPHINA_EXTENDED_FREEZE_PROGRESS_AGE_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let extended_freeze_local_quarantine_enabled =
+        std::env::var("PARAPHINA_EXTENDED_FREEZE_LOCAL_QUARANTINE_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     let market_rx_stats_every = std::env::var("PARAPHINA_MARKET_RX_STATS_EVERY_TICKS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1552,6 +2871,10 @@ pub async fn run_live_loop(
         .map(|v| v != "0")
         .unwrap_or(true);
     let mut canary_stale_ticks: u64 = 0;
+    let startup_stale_started_ms = now_ms();
+    let mut startup_stale_armed = startup_stale_arming_ms <= 0;
+    let mut startup_stale_wait_log_count: u64 = 0;
+    let mut startup_stale_last_pending_venues: Vec<String> = Vec::new();
     let pos_tol = std::env::var("PARAPHINA_RECONCILE_POS_TAO_TOL")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -1589,15 +2912,14 @@ pub async fn run_live_loop(
     let mut position_drift_streaks: Vec<usize> = vec![0; cfg.venues.len()];
     let mut startup_pnl_baseline_resolved = !startup_pnl_baseline_cfg.enabled;
     let mut startup_pnl_baseline_wait_ticks: u64 = 0;
+    let mut extended_quote_quarantine_logged = false;
     let fv_ablations = if disable_fv_gate {
         AblationSet::from_ids(&vec!["disable_fair_value_gating".to_string()]).unwrap_or_default()
     } else {
         AblationSet::new()
     };
     let mut interval = match mode {
-        LiveRunMode::Realtime { interval_ms, .. } => {
-            Some(tokio::time::interval(Duration::from_millis(interval_ms)))
-        }
+        LiveRunMode::Realtime { interval_ms, .. } => Some(realtime_tick_interval(interval_ms)),
         LiveRunMode::Step { .. } => None,
     };
 
@@ -1634,6 +2956,17 @@ pub async fn run_live_loop(
     let mut ext_core_apply_called_total: u64 = 0;
     let mut ext_mid_apply_set_total: u64 = 0;
     let mut ext_cache_err_sample: Option<String> = None;
+    let mut ext_apply_eligible_total: u64 = 0;
+    let mut ext_apply_same_tick_repeat_total: u64 = 0;
+    let mut ext_apply_frozen_total: u64 = 0;
+    let mut ext_apply_missing_metrics_total: u64 = 0;
+    let mut ext_freeze_nonpositive_spread: u64 = 0;
+    let mut ext_freeze_rel_spread: u64 = 0;
+    let mut ext_freeze_mid_jump: u64 = 0;
+    let mut last_ext_candidate_mid: Option<f64> = None;
+    let mut last_ext_candidate_spread: Option<f64> = None;
+    let mut last_ext_prev_mid: Option<f64> = None;
+    let mut last_ext_prev_spread: Option<f64> = None;
     let mut last_runner_apply_audit = Instant::now();
 
     let min_inter_tick = Duration::from_millis(
@@ -1713,8 +3046,12 @@ pub async fn run_live_loop(
             });
         }
 
-        if let (Some(interval_ms), Some(tx)) = (account_reconcile_ms, account_reconcile_tx.as_ref())
-        {
+        if let (Some(interval_ms), Some(tx)) = (
+            account_reconcile_ms,
+            account_reconcile_tx
+                .as_ref()
+                .filter(|_| account_reconcile_request_tx_enabled),
+        ) {
             let should_reconcile = last_account_reconcile_ms
                 .map(|prev| now_ms.saturating_sub(prev) >= interval_ms)
                 .unwrap_or(true);
@@ -1762,6 +3099,17 @@ pub async fn run_live_loop(
         let mut tick_account_position_syncs: Vec<AccountPositionSyncRecord> = Vec::new();
         let mut inventory_soft_governor = InventorySoftGovernorStatus::default();
         let mut inventory_brake = InventoryBrakeStatus::default();
+        let mut emergency_residual_fallback = EmergencyResidualFallbackStatus::default();
+        seed_aster_soft_unwind_fee_guard_status(
+            &mut emergency_residual_fallback,
+            aster_soft_unwind_fee_guard_config,
+        );
+        let mut projected_mm_budget = ProjectedMmBudgetStatus::default();
+        let mut canary_breach_response = CanaryBreachResponseStatus {
+            configured: canary_breach_response_config.enabled(),
+            ..CanaryBreachResponseStatus::default()
+        };
+        let stale_market_hygiene;
         let mut startup_pnl_baseline = StartupPnlBaselineStatus {
             enabled: startup_pnl_baseline_cfg.enabled,
             resolved: startup_pnl_baseline_resolved,
@@ -1960,17 +3308,66 @@ pub async fn run_live_loop(
                         } else {
                             None
                         };
-                        apply_market_event_to_core(&mut state, cfg, &event, now_ms, ext_apply_any);
-                        if is_extended_event {
+                        let ext_apply_truth = apply_market_event_to_core_with_extended_truth(
+                            &mut state,
+                            cfg,
+                            &event,
+                            now_ms,
+                            ext_apply_any,
+                        );
+                        if let Some(truth) = ext_apply_truth {
+                            if truth.apply_eligible {
+                                ext_apply_eligible_total =
+                                    ext_apply_eligible_total.saturating_add(1);
+                            }
+                            if truth.missing_metrics {
+                                ext_apply_missing_metrics_total =
+                                    ext_apply_missing_metrics_total.saturating_add(1);
+                            }
+                            if truth.frozen {
+                                ext_apply_frozen_total = ext_apply_frozen_total.saturating_add(1);
+                                match truth.freeze_reason {
+                                    Some(ExtendedFreezeReason::NonPositiveSpread) => {
+                                        ext_freeze_nonpositive_spread =
+                                            ext_freeze_nonpositive_spread.saturating_add(1);
+                                    }
+                                    Some(ExtendedFreezeReason::RelativeSpread) => {
+                                        ext_freeze_rel_spread =
+                                            ext_freeze_rel_spread.saturating_add(1);
+                                    }
+                                    Some(ExtendedFreezeReason::MidJump) => {
+                                        ext_freeze_mid_jump = ext_freeze_mid_jump.saturating_add(1);
+                                    }
+                                    None => {}
+                                }
+                                apply_extended_freeze_progress_and_quarantine(
+                                    &mut state,
+                                    now_ms,
+                                    &truth,
+                                    extended_freeze_progress_age_enabled,
+                                    extended_freeze_local_quarantine_enabled,
+                                );
+                            }
+                            last_ext_candidate_mid = truth.candidate_mid;
+                            last_ext_candidate_spread = truth.candidate_spread;
+                            last_ext_prev_mid = truth.prev_mid;
+                            last_ext_prev_spread = truth.prev_spread;
+                        }
+                        if let Some(truth) = ext_apply_truth {
                             let new_ext_mid_apply_ms = state
                                 .venues
                                 .get(EXTENDED_IDX)
                                 .and_then(|v| v.last_mid_apply_ms);
-                            if new_ext_mid_apply_ms == Some(now_ms)
-                                && prev_ext_mid_apply_ms != Some(now_ms)
-                            {
-                                ext_mid_apply_set_total = ext_mid_apply_set_total.saturating_add(1);
+                            if truth.apply_eligible && new_ext_mid_apply_ms == Some(now_ms) {
+                                if prev_ext_mid_apply_ms == Some(now_ms) {
+                                    ext_apply_same_tick_repeat_total =
+                                        ext_apply_same_tick_repeat_total.saturating_add(1);
+                                } else {
+                                    ext_mid_apply_set_total =
+                                        ext_mid_apply_set_total.saturating_add(1);
+                                }
                             }
+                            clear_extended_quote_quarantine_on_success(&mut state, now_ms, &truth);
                         }
                         let venue_index = match &event {
                             super::types::MarketDataEvent::L2Snapshot(s) => s.venue_index,
@@ -2066,12 +3463,25 @@ pub async fn run_live_loop(
                                     .is_some_and(|applied| {
                                         !diff_exceeds(applied, pos_venue, pos_tol)
                                     });
+                            let position_drift_explained_by_live_orders =
+                                account_position_drift_explained_by_live_orders(
+                                    &state,
+                                    snapshot,
+                                    pos_internal,
+                                    pos_venue,
+                                    now_ms,
+                                );
                             let pos_kill_exempt = reconcile_pos_kill_exempt_venues
                                 .contains(&snapshot.venue_id.to_ascii_lowercase());
                             // A fresh account-side position change should be synchronized into
                             // state first. Reconciliation kills are reserved for stable,
                             // already-applied venue positions that state still fails to match.
-                            if pos_kill_exempt || venue_position_changed_since_apply {
+                            // When tracked live orders fully explain the venue-side delta,
+                            // let account-sync fill inference converge before escalating.
+                            if pos_kill_exempt
+                                || venue_position_changed_since_apply
+                                || position_drift_explained_by_live_orders
+                            {
                                 if let Some(streak) =
                                     position_drift_streaks.get_mut(snapshot.venue_index)
                                 {
@@ -2180,8 +3590,17 @@ pub async fn run_live_loop(
                             tick_fills.extend(fills.iter().cloned());
                             fill_batcher.push(now_ms, fills);
                         }
-                        state.live_order_state.reconcile(&snapshot, now_ms);
+                        state
+                            .live_order_state
+                            .reconcile_with_supported_replace_gap_grace_ms(
+                                &snapshot,
+                                now_ms,
+                                cfg.mm
+                                    .supported_replace_snapshot_gap_grace_ms_for(&snapshot.venue_id)
+                                    as TimestampMs,
+                            );
                         sync_venue_order_tracking_from_live_order_state(
+                            cfg,
                             &mut state,
                             snapshot.venue_index,
                         );
@@ -2234,8 +3653,17 @@ pub async fn run_live_loop(
                         tick_fills.extend(fills.iter().cloned());
                         fill_batcher.push(now_ms, fills);
                     }
-                    state.live_order_state.reconcile(&snapshot, now_ms);
+                    state
+                        .live_order_state
+                        .reconcile_with_supported_replace_gap_grace_ms(
+                            &snapshot,
+                            now_ms,
+                            cfg.mm
+                                .supported_replace_snapshot_gap_grace_ms_for(&snapshot.venue_id)
+                                as TimestampMs,
+                        );
                     sync_venue_order_tracking_from_live_order_state(
+                        cfg,
                         &mut state,
                         snapshot.venue_index,
                     );
@@ -2282,6 +3710,45 @@ pub async fn run_live_loop(
                 age_event_ms,
                 err_sample
             );
+            let venue_state_stale_ms = cfg
+                .venues
+                .get(EXTENDED_IDX)
+                .map(|v| v.effective_stale_ms(cfg.book.stale_ms))
+                .unwrap_or(cfg.book.stale_ms);
+            eprintln!(
+                concat!(
+                    "WS_AUDIT venue=extended component=runner_apply_truth reason=periodic interval_ms=1000 ",
+                    "tick={} now_ms={} ext_seen_total={} ext_seen_snapshot={} ext_seen_delta={} ",
+                    "ext_future_total={} ext_cache_ok_total={} ext_cache_err_total={} ",
+                    "ext_apply_eligible_total={} ext_apply_same_tick_repeat_total={} ",
+                    "ext_apply_frozen_total={} ext_apply_missing_metrics_total={} ",
+                    "ext_freeze_nonpositive_spread={} ext_freeze_rel_spread={} ext_freeze_mid_jump={} ",
+                    "last_candidate_mid={} last_candidate_spread={} last_prev_mid={} last_prev_spread={} ",
+                    "venue_state_stale_ms={} age_apply_ms={} age_event_ms={}",
+                ),
+                tick,
+                now_ms,
+                ext_seen_total,
+                ext_seen_snapshot,
+                ext_seen_delta,
+                ext_deferred_future_total,
+                ext_cache_ok_total,
+                ext_cache_err_total,
+                ext_apply_eligible_total,
+                ext_apply_same_tick_repeat_total,
+                ext_apply_frozen_total,
+                ext_apply_missing_metrics_total,
+                ext_freeze_nonpositive_spread,
+                ext_freeze_rel_spread,
+                ext_freeze_mid_jump,
+                last_ext_candidate_mid.unwrap_or(-1.0),
+                last_ext_candidate_spread.unwrap_or(-1.0),
+                last_ext_prev_mid.unwrap_or(-1.0),
+                last_ext_prev_spread.unwrap_or(-1.0),
+                venue_state_stale_ms,
+                age_apply_ms,
+                age_event_ms
+            );
             last_runner_apply_audit = Instant::now();
         }
 
@@ -2321,7 +3788,14 @@ pub async fn run_live_loop(
             }
         }
 
-        last_snapshot = Some(cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms));
+        let mut snapshot = cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
+        apply_extended_freeze_market_progress_snapshot_overrides(
+            &mut snapshot,
+            &state,
+            cfg,
+            now_ms,
+        );
+        last_snapshot = Some(snapshot);
         let snapshot = last_snapshot.as_ref().unwrap();
         if snapshot.ready_market_count() > 0 || saw_l2_snapshot_mask_this_tick != 0 {
             saw_ready_once = true;
@@ -2363,10 +3837,11 @@ pub async fn run_live_loop(
             }
         }
         // Update SharedVenueAges for Layer A (enforcer) and Layer B (REST monitor)
-        // using local apply-age semantics.
+        // using local apply-age semantics, unless a venue is intentionally
+        // quarantined on fresh market progress.
         if let Some(ref ages) = shared_venue_ages {
             for (idx, venue) in state.venues.iter().enumerate() {
-                let age = match venue.last_mid_apply_ms {
+                let age = match venue_health_age_anchor_ms(venue) {
                     None => i64::MAX,
                     Some(ts) => (now_ms - ts).max(0),
                 };
@@ -2374,99 +3849,67 @@ pub async fn run_live_loop(
             }
             ages.mark_write(now_ms);
         }
+        let extended_quote_quarantine_active = apply_local_quote_quarantine_overrides(
+            &mut state,
+            &mut disabled,
+            extended_freeze_local_quarantine_enabled,
+        );
+        if extended_quote_quarantine_active != extended_quote_quarantine_logged {
+            if let Some(venue) = state.venues.get(EXTENDED_IDX) {
+                let action = if venue.quote_quarantined {
+                    "activated"
+                } else {
+                    "cleared"
+                };
+                let quarantine_age_ms = venue
+                    .quote_quarantined_at_ms
+                    .map(|ts| now_ms.saturating_sub(ts))
+                    .unwrap_or(0);
+                let market_age_ms = venue
+                    .last_mid_update_ms
+                    .map(|ts| now_ms.saturating_sub(ts))
+                    .unwrap_or(-1);
+                eprintln!(
+                    "WS_AUDIT venue=extended component=freeze_quarantine action={} quarantine_age_ms={} market_age_ms={}",
+                    action,
+                    quarantine_age_ms,
+                    market_age_ms
+                );
+            }
+            extended_quote_quarantine_logged = extended_quote_quarantine_active;
+        }
         let stale_count = snapshot.market.iter().filter(|m| m.is_stale).count() as u64;
         refresh_emergency_request_latches(&mut emergency_request_latches, cfg, &state, now_ms);
         if !disabled.is_empty() {
             // Batch all disabled-venue cancel-all intents into a single channel send.
-            let mut cancel_intents: Vec<OrderIntent> = Vec::with_capacity(disabled.len());
-            for venue_index in &disabled {
-                if emergency_request_latched(
-                    &mut emergency_request_latches,
-                    EmergencyRequestClass::DisabledCancelAll,
-                    cfg,
-                    &state,
-                    now_ms,
-                    *venue_index,
-                ) {
-                    continue;
-                }
-                let intent =
-                    crate::types::OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
-                        venue_index: Some(*venue_index),
-                        venue_id: Some(cfg.venues[*venue_index].id_arc.clone()),
-                    });
-                would_send_intents.push(intent.clone());
-                cancel_intents.push(intent);
-            }
+            let cancel_intents = build_unlatched_disabled_cancel_intents_for_venues(
+                cfg,
+                &state,
+                &mut emergency_request_latches,
+                now_ms,
+                &disabled,
+            );
             if !cancel_intents.is_empty() {
+                would_send_intents.extend(cancel_intents.iter().cloned());
                 if let Some(hooks_ref) = hooks.as_ref() {
                     hooks_ref.metrics.inc_cancel_all();
                 }
                 let tick = now_ms.max(0) as u64;
-                let mut sync_cancel_intents = cancel_intents;
-                let async_cancel_requests =
-                    take_emergency_single_flight_intents(cfg, &mut sync_cancel_intents);
-                let _ = send_emergency_single_flight_requests(
+                dispatch_disabled_cancel_intents(
                     cfg,
+                    &mut state,
                     &priority_order_tx,
                     &mut emergency_request_latches,
-                    &state,
-                    async_cancel_requests,
-                    EmergencyRequestClass::DisabledCancelAll,
+                    cancel_intents,
                     now_ms,
+                    tick.saturating_mul(2),
                     tick,
                     lighter_emergency_latch_ms,
                     lighter_emergency_max_latch_ms,
+                    TransportHint::HyperliquidSyncControl,
                     "disabled_cancel_all",
-                );
-                let sync_cancel_venues = venue_indices_for_order_intents(&sync_cancel_intents);
-                let (cancel_outcome, cancel_events) = if !sync_cancel_intents.is_empty() {
-                    let action_batch = build_live_action_batch(
-                        cfg,
-                        &sync_cancel_intents,
-                        now_ms,
-                        tick.saturating_mul(2),
-                    );
-                    send_order_and_wait_with_status(
-                        &priority_order_tx,
-                        sync_cancel_intents,
-                        action_batch,
-                        now_ms,
-                        1000,
-                        "disabled_cancel_all",
-                        tick,
-                    )
-                    .await
-                } else {
-                    (OrderWaitOutcomeKind::Events, None)
-                };
-                if matches!(
-                    cancel_outcome,
-                    OrderWaitOutcomeKind::Timeout | OrderWaitOutcomeKind::HandlerDropped
-                ) {
-                    for venue_index in sync_cancel_venues {
-                        latch_emergency_request(
-                            &mut emergency_request_latches,
-                            EmergencyRequestClass::DisabledCancelAll,
-                            cfg,
-                            &state,
-                            venue_index,
-                            now_ms,
-                            lighter_emergency_latch_ms,
-                            lighter_emergency_max_latch_ms,
-                        );
-                    }
-                }
-                if let Some(events) = cancel_events {
-                    #[cfg(feature = "event_log")]
-                    log_live_execution_events_env(now_ms.max(0) as u64, now_ms, "gateway", &events);
-                    let core_events = live_events_to_core(&events);
-                    let fills = apply_execution_events(&mut state, &core_events, now_ms);
-                    if !fills.is_empty() {
-                        apply_live_fills(cfg, &mut state, &fills, now_ms);
-                        state.recompute_after_fills(cfg);
-                    }
-                }
+                )
+                .await;
             }
         }
         if let Some(hooks) = hooks.as_ref() {
@@ -2499,18 +3942,255 @@ pub async fn run_live_loop(
             now_ms,
         );
         refresh_emergency_request_latches(&mut emergency_request_latches, cfg, &state, now_ms);
+        let terminal_exit_quiesce_active =
+            terminal_exit_quiesce_active(&terminal_exit_quiesce_config);
+        let mut terminal_residual_refreshed_snapshot: Option<CanonicalCacheSnapshot> = None;
+        if terminal_exit_quiesce_active
+            && terminal_residual_convergence_config.account_refresh_enabled
+            && !terminal_residual_convergence_venues.is_empty()
+        {
+            if let Some(tx) = account_reconcile_tx.as_ref() {
+                let mut refreshed_any = false;
+                for venue_index in terminal_residual_convergence_venues.iter().copied() {
+                    let Some(last_refresh) =
+                        last_terminal_residual_account_refresh_ms.get_mut(venue_index)
+                    else {
+                        continue;
+                    };
+                    if last_refresh
+                        .map(|last_ms| {
+                            now_ms.saturating_sub(last_ms)
+                                < terminal_residual_convergence_config
+                                    .account_refresh_min_interval_ms
+                        })
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    *last_refresh = Some(now_ms);
+                    let account_snapshot = send_account_and_wait(
+                        tx,
+                        venue_index,
+                        now_ms,
+                        terminal_residual_convergence_config.account_refresh_timeout_ms,
+                        tick,
+                    )
+                    .await;
+                    let Some(account_snapshot) = account_snapshot else {
+                        continue;
+                    };
+                    if account_snapshot.timestamp_ms > 0 {
+                        if let Some(last) =
+                            last_account_snapshot_ms.get_mut(account_snapshot.venue_index)
+                        {
+                            *last = Some(account_snapshot.timestamp_ms);
+                        }
+                    }
+                    let account_available =
+                        account_snapshot_available(cfg, &account_snapshot, now_ms);
+                    let (report, diff) =
+                        cache.reconcile_account_snapshot_with_diff(&account_snapshot);
+                    if let Some(diff) = diff {
+                        let _ = append_account_reconcile_audit(&audit_dir, now_ms, diff);
+                    }
+                    if report.account_ok && account_available {
+                        refreshed_any = true;
+                    }
+                }
+                if refreshed_any {
+                    let mut refreshed_snapshot =
+                        cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
+                    apply_extended_freeze_market_progress_snapshot_overrides(
+                        &mut refreshed_snapshot,
+                        &state,
+                        cfg,
+                        now_ms,
+                    );
+                    let refresh_account_apply = apply_account_snapshot_to_state(
+                        cfg,
+                        &refreshed_snapshot,
+                        &mut state,
+                        now_ms,
+                    );
+                    let refresh_position_syncs = refresh_account_apply.position_syncs;
+                    if !refresh_position_syncs.is_empty() {
+                        let (account_fill_events, account_fills) =
+                            infer_fills_from_account_position_syncs(
+                                cfg,
+                                &mut state,
+                                &refresh_position_syncs,
+                                now_ms,
+                            );
+                        tick_exec_events.extend(account_fill_events);
+                        tick_fills.extend(account_fills);
+                        tick_account_position_syncs.extend(refresh_position_syncs);
+                    }
+                    mark_initialized_account_venues(
+                        cfg,
+                        &refreshed_snapshot,
+                        &mut account_state_initialized,
+                        now_ms,
+                    );
+                    update_applied_account_position_baselines(
+                        cfg,
+                        &refreshed_snapshot,
+                        &mut applied_account_position_baselines,
+                        now_ms,
+                    );
+                    terminal_residual_refreshed_snapshot = Some(refreshed_snapshot);
+                }
+            }
+        }
+        let risk_control_snapshot = terminal_residual_refreshed_snapshot
+            .as_ref()
+            .unwrap_or(snapshot);
+        let terminal_defer_reduce_venues = if terminal_exit_quiesce_active
+            && terminal_residual_convergence_config.reduce_after_cancel_confirm_enabled
+            && !terminal_residual_convergence_venues.is_empty()
+        {
+            Some(&terminal_residual_convergence_venues)
+        } else {
+            None
+        };
+        let terminal_stale_order_reduce_venues =
+            if let Some(defer_venues) = terminal_defer_reduce_venues {
+                terminal_stale_order_reduce_ready_venues(
+                    cfg,
+                    &state,
+                    risk_control_snapshot,
+                    now_ms,
+                    &terminal_exit_cancel_state,
+                    &terminal_residual_convergence_config,
+                    defer_venues,
+                )
+            } else {
+                HashSet::new()
+            };
+        let terminal_effective_defer_reduce_venues;
+        let terminal_inventory_defer_reduce_venues =
+            if let Some(defer_venues) = terminal_defer_reduce_venues {
+                if terminal_stale_order_reduce_venues.is_empty() {
+                    Some(defer_venues)
+                } else {
+                    terminal_effective_defer_reduce_venues = defer_venues
+                        .difference(&terminal_stale_order_reduce_venues)
+                        .copied()
+                        .collect::<HashSet<_>>();
+                    Some(&terminal_effective_defer_reduce_venues)
+                }
+            } else {
+                None
+            };
 
-        if canary_enabled && !state.kill_switch {
-            inventory_brake = evaluate_inventory_brake(
+        let should_quote = should_quote_this_tick(
+            cfg,
+            risk_control_snapshot,
+            &state,
+            conditional_quoting,
+            smoke_intents,
+            &last_quoted_mid,
+            &last_quoted_book_seq,
+            &last_quote_ts_ms,
+            max_quote_age_ms,
+            now_ms,
+        );
+        let canary_breach_response_active = canary_breach_response_is_active(
+            canary_breach_response_until_ms,
+            canary_breach_response_remaining_ticks,
+            now_ms,
+        );
+        let mut effective_inventory_projection = None;
+        if canary_enabled
+            && !state.kill_switch
+            && should_quote
+            && risk_control_snapshot.ready_market_count() > 0
+            && !canary_breach_response_active
+        {
+            let mut provisional_mm_quotes = if disable_fv_gate {
+                compute_mm_quotes_with_ablations(cfg, &state, &fv_ablations)
+            } else {
+                compute_mm_quotes_with_now(cfg, &state, Some(now_ms))
+            };
+            let _provisional_projected_mm_budget = apply_projected_mm_budget_to_quotes(
+                cfg,
+                &state,
+                now_ms,
+                inventory_brake_limits,
+                &mut provisional_mm_quotes,
+            );
+            let mut provisional_action_id_gen = crate::actions::ActionIdGenerator::new(tick);
+            let provisional_mm_plan = plan_mm_order_actions(
+                cfg,
+                &state,
+                &provisional_mm_quotes,
+                now_ms,
+                &mut provisional_action_id_gen,
+            );
+            effective_inventory_projection = Some(effective_projected_exposure_from_mm_intents(
+                &state,
+                &provisional_mm_plan.intents,
+            ));
+        }
+
+        let canary_response_pending_before_inventory_brake = if canary_enabled && !state.kill_switch
+        {
+            let limits = canary_limit_status(
+                &state,
+                canary_max_position_tao,
+                canary_max_gross_position_tao,
+                canary_max_abs_venue_position_tao,
+                canary_max_open_orders,
+            );
+            canary_actual_position_control_pending_before_inventory_brake(
+                cfg,
+                &state,
+                &limits,
+                canary_breach_response_config,
+                canary_breach_response_sent,
+                canary_breach_response_until_ms,
+                canary_breach_response_remaining_ticks,
+                &canary_flatten_observation,
+                now_ms,
+            )
+        } else {
+            false
+        };
+
+        if canary_enabled && !state.kill_switch && !canary_response_pending_before_inventory_brake {
+            inventory_brake = evaluate_inventory_brake_with_projection(
                 cfg,
                 &state,
                 inventory_brake_fractions,
                 inventory_brake_limits,
+                effective_inventory_projection.as_ref(),
             );
             if inventory_brake.triggered {
                 soft_unwind_cooldown_until_ms = None;
-                let mut brake_intents =
-                    build_inventory_brake_intents(cfg, &state, snapshot, now_ms, &inventory_brake);
+                let mut brake_intents = build_inventory_brake_intents_with_terminal_defer_status(
+                    cfg,
+                    &state,
+                    risk_control_snapshot,
+                    now_ms,
+                    &inventory_brake,
+                    aster_soft_unwind_fee_guard_config,
+                    Some(&mut emergency_residual_fallback),
+                    Some(&mut aster_residual_markout_guard_tracker),
+                    terminal_inventory_defer_reduce_venues,
+                );
+                brake_intents = effective_inventory_brake_intents(&inventory_brake, brake_intents);
+                if terminal_exit_quiesce_active {
+                    brake_intents.extend(
+                        build_extended_terminal_sub_lot_residual_convergence_intents(
+                            cfg,
+                            &state,
+                            risk_control_snapshot,
+                            now_ms,
+                            Some(&terminal_stale_order_reduce_venues),
+                            EmergencyRequestClass::InventoryBrake,
+                            Some(&mut emergency_residual_fallback),
+                        ),
+                    );
+                }
                 let removed_brake_venues = remove_latched_intents_for_class(
                     &mut brake_intents,
                     &mut emergency_request_latches,
@@ -2527,6 +4207,28 @@ pub async fn run_live_loop(
                     canary_enforce_post_only,
                     canary_enforce_reduce_only,
                 );
+                if canary_breach_response_is_active(
+                    canary_breach_response_until_ms,
+                    canary_breach_response_remaining_ticks,
+                    now_ms,
+                ) {
+                    let breach_limits = canary_limit_status(
+                        &state,
+                        canary_max_position_tao,
+                        canary_max_gross_position_tao,
+                        canary_max_abs_venue_position_tao,
+                        canary_max_open_orders,
+                    );
+                    let target_venues =
+                        canary_breach_response_target_venues(&state, &breach_limits);
+                    let _ = retain_canary_breach_preferred_intents(
+                        cfg,
+                        &state,
+                        &mut brake_intents,
+                        &target_venues,
+                        false,
+                    );
+                }
                 if !brake_intents.is_empty() {
                     inventory_brake.sent = true;
                     last_hedge_intent = brake_intents
@@ -2545,9 +4247,18 @@ pub async fn run_live_loop(
                         hooks.metrics.inc_orders(brake_intents.len());
                     }
                     let mut sync_brake_intents = brake_intents;
-                    let async_brake_requests =
-                        take_emergency_single_flight_intents(cfg, &mut sync_brake_intents);
-                    let _ = send_emergency_single_flight_requests(
+                    let async_brake_requests = take_emergency_single_flight_intents(
+                        EmergencyRequestClass::InventoryBrake,
+                        cfg,
+                        &mut sync_brake_intents,
+                    );
+                    let mut brake_reduce_only_venues =
+                        reduce_only_place_venues_for_emergency_requests(&async_brake_requests);
+                    extend_unique_venue_indices(
+                        &mut brake_reduce_only_venues,
+                        reduce_only_place_venues_for_order_intents(&sync_brake_intents),
+                    );
+                    inventory_brake.request_dispatches = send_emergency_single_flight_requests(
                         cfg,
                         &priority_order_tx,
                         &mut emergency_request_latches,
@@ -2558,6 +4269,7 @@ pub async fn run_live_loop(
                         tick,
                         lighter_emergency_latch_ms,
                         lighter_emergency_max_latch_ms,
+                        TransportHint::HyperliquidSyncControl,
                         "inventory_brake",
                     );
                     let sync_brake_venues = venue_indices_for_order_intents(&sync_brake_intents);
@@ -2568,19 +4280,58 @@ pub async fn run_live_loop(
                             now_ms,
                             tick.saturating_mul(2),
                         );
-                        send_order_and_wait_with_status(
+                        if inventory_brake_waits_for_responses(&inventory_brake) {
+                            send_order_and_wait_with_status(
+                                &priority_order_tx,
+                                sync_brake_intents,
+                                action_batch,
+                                now_ms,
+                                1_000,
+                                TransportHint::HyperliquidSyncControl,
+                                "inventory_brake",
+                                tick,
+                            )
+                            .await
+                        } else if send_order_fire_and_forget(
                             &priority_order_tx,
                             sync_brake_intents,
                             action_batch,
                             now_ms,
-                            1_000,
+                            TransportHint::HyperliquidSyncControl,
                             "inventory_brake",
                             tick,
-                        )
-                        .await
+                        ) {
+                            for venue_index in &sync_brake_venues {
+                                latch_emergency_request(
+                                    &mut emergency_request_latches,
+                                    EmergencyRequestClass::InventoryBrake,
+                                    cfg,
+                                    &state,
+                                    *venue_index,
+                                    now_ms,
+                                    lighter_emergency_latch_ms,
+                                    lighter_emergency_max_latch_ms,
+                                );
+                            }
+                            (OrderWaitOutcomeKind::Events, None)
+                        } else {
+                            (OrderWaitOutcomeKind::ChannelFull, None)
+                        }
                     } else {
                         (OrderWaitOutcomeKind::Events, None)
                     };
+                    let sync_brake_outcome = emergency_request_dispatch_outcome(brake_outcome);
+                    for venue_index in &sync_brake_venues {
+                        inventory_brake
+                            .request_dispatches
+                            .push(emergency_request_dispatch_status(
+                                cfg,
+                                EmergencyRequestClass::InventoryBrake,
+                                *venue_index,
+                                EmergencyRequestTransportMode::SyncWait,
+                                sync_brake_outcome,
+                            ));
+                    }
                     if matches!(
                         brake_outcome,
                         OrderWaitOutcomeKind::Timeout | OrderWaitOutcomeKind::HandlerDropped
@@ -2615,11 +4366,43 @@ pub async fn run_live_loop(
                             state.recompute_after_fills(cfg);
                         }
                     }
+                    if canary_flatten_observation_from_inventory_brake_enabled {
+                        let canary_limits_after_brake = canary_limit_status(
+                            &state,
+                            canary_max_position_tao,
+                            canary_max_gross_position_tao,
+                            canary_max_abs_venue_position_tao,
+                            canary_max_open_orders,
+                        );
+                        if canary_limits_after_brake.breached
+                            && !canary_breach_is_open_order_only(&canary_limits_after_brake)
+                        {
+                            let brake_observation_dispatch =
+                                canary_flatten_dispatch_from_emergency_dispatches(
+                                    cfg,
+                                    &state,
+                                    &inventory_brake.request_dispatches,
+                                    &brake_reduce_only_venues,
+                                    EmergencyRequestClass::InventoryBrake,
+                                );
+                            let _ = arm_canary_flatten_observation(
+                                cfg,
+                                &state,
+                                &brake_observation_dispatch,
+                                now_ms,
+                                canary_flatten_observation_ms,
+                                &mut canary_flatten_observation,
+                            );
+                        }
+                    }
                 }
             }
         }
 
         if canary_enabled && !state.kill_switch {
+            let mut stale_count_incremented_this_tick = false;
+            let mut stale_count_reset_this_tick = false;
+            let mut stale_market_kill_triggered_this_tick = false;
             let canary_limits = canary_limit_status(
                 &state,
                 canary_max_position_tao,
@@ -2628,6 +4411,65 @@ pub async fn run_live_loop(
                 canary_max_open_orders,
             );
             if canary_limits.breached {
+                canary_breach_response.response_mode = CanaryBreachResponseMode::Inactive;
+                canary_breach_response.zero_target_hold_this_tick = false;
+                canary_breach_response.target_venues.clear();
+                canary_breach_response.positioned_target_venues.clear();
+                canary_breach_response.cancel_scope_venues.clear();
+                canary_breach_response.flatten_venues.clear();
+                canary_breach_response.request_dispatches.clear();
+                canary_breach_response.preserved_existing_cancel_intents = false;
+                let response_eligible = canary_breach_response_config.enabled();
+                let mut response_active = canary_breach_response_is_active(
+                    canary_breach_response_until_ms,
+                    canary_breach_response_remaining_ticks,
+                    now_ms,
+                );
+                let mut target_snapshot = canary_breach_response_target_snapshot(
+                    cfg,
+                    &state,
+                    &canary_limits,
+                    &canary_flatten_observation,
+                    now_ms,
+                );
+                let mut flatten_observation_active = target_snapshot.raw_observation_active
+                    && target_snapshot.observation_covers_positioned_targets;
+                if canary_breach_response_should_rearm_after_observed_progress(
+                    cfg,
+                    &state,
+                    canary_breach_response_sent,
+                    canary_breach_response_until_ms,
+                    canary_breach_response_remaining_ticks,
+                    &canary_flatten_observation,
+                    now_ms,
+                ) {
+                    canary_breach_response_until_ms = None;
+                    canary_breach_response_remaining_ticks = 0;
+                    canary_breach_response_sent = false;
+                    canary_flatten_observation = CanaryFlattenObservationState::default();
+                    response_active = false;
+                    flatten_observation_active = false;
+                } else if canary_breach_response_should_rearm_for_uncovered_targets(
+                    canary_breach_response_sent,
+                    canary_breach_response_until_ms,
+                    canary_breach_response_remaining_ticks,
+                    &target_snapshot,
+                    now_ms,
+                ) {
+                    canary_breach_response_until_ms = None;
+                    canary_breach_response_remaining_ticks = 0;
+                    canary_breach_response_sent = false;
+                    canary_flatten_observation = CanaryFlattenObservationState::default();
+                    response_active = false;
+                    flatten_observation_active = false;
+                    target_snapshot = canary_breach_response_target_snapshot(
+                        cfg,
+                        &state,
+                        &canary_limits,
+                        &canary_flatten_observation,
+                        now_ms,
+                    );
+                }
                 let grace_eligible = inventory_brake_grace_allowed(
                     &canary_limits,
                     &inventory_brake,
@@ -2650,21 +4492,280 @@ pub async fn run_live_loop(
                         now_ms,
                     );
                 }
+                clear_ineligible_inventory_brake_grace(
+                    &mut inventory_brake_grace_until_ms,
+                    &mut inventory_brake_grace_remaining_ticks,
+                    &mut grace_active,
+                    grace_eligible,
+                );
+
+                let mut canary_limits_after_response = canary_limits;
+                let mut sent_response_this_tick = false;
+                let mut cleared_response_this_tick = false;
+                if !grace_active
+                    && canary_breach_response_should_send(
+                        &canary_limits_after_response,
+                        canary_breach_response_config,
+                        canary_breach_response_sent,
+                        canary_breach_response_until_ms,
+                        canary_breach_response_remaining_ticks,
+                        now_ms,
+                    )
+                {
+                    let response_dispatch = handle_canary_breach_response(
+                        cfg,
+                        &mut state,
+                        &canary_limits_after_response,
+                        &mut canary_breach_response,
+                        &priority_order_tx,
+                        &mut emergency_request_latches,
+                        now_ms,
+                        tick,
+                        lighter_emergency_latch_ms,
+                        lighter_emergency_max_latch_ms,
+                        hooks.as_ref(),
+                        &mut would_send_intents,
+                        &mut last_exit_intent,
+                    )
+                    .await;
+                    let _ = arm_canary_flatten_observation(
+                        cfg,
+                        &state,
+                        &response_dispatch,
+                        now_ms,
+                        canary_flatten_observation_ms,
+                        &mut canary_flatten_observation,
+                    );
+                    canary_breach_response_sent = true;
+                    canary_breach_response_until_ms =
+                        Some(now_ms.saturating_add(canary_breach_response_config.response_ms));
+                    canary_breach_response_remaining_ticks =
+                        canary_breach_response_config.response_ticks;
+                    sent_response_this_tick = response_dispatch.submitted;
+                    canary_limits_after_response = canary_limit_status(
+                        &state,
+                        canary_max_position_tao,
+                        canary_max_gross_position_tao,
+                        canary_max_abs_venue_position_tao,
+                        canary_max_open_orders,
+                    );
+                    if !canary_limits_after_response.breached {
+                        canary_breach_response_until_ms = None;
+                        canary_breach_response_remaining_ticks = 0;
+                        canary_breach_response_sent = false;
+                        cleared_response_this_tick = true;
+                    }
+                    response_active = canary_breach_response_is_active(
+                        canary_breach_response_until_ms,
+                        canary_breach_response_remaining_ticks,
+                        now_ms,
+                    );
+                    target_snapshot = canary_breach_response_target_snapshot(
+                        cfg,
+                        &state,
+                        &canary_limits_after_response,
+                        &canary_flatten_observation,
+                        now_ms,
+                    );
+                    flatten_observation_active = target_snapshot.raw_observation_active
+                        && target_snapshot.observation_covers_positioned_targets;
+                } else if !grace_active
+                    && canary_breach_response_should_retry_flatten(
+                        &canary_limits_after_response,
+                        canary_breach_response_sent,
+                        canary_breach_response_until_ms,
+                        canary_breach_response_remaining_ticks,
+                        now_ms,
+                    )
+                {
+                    let retry_dispatch = retry_canary_breach_flatten_response(
+                        cfg,
+                        &mut state,
+                        &canary_limits_after_response,
+                        &mut canary_breach_response,
+                        &priority_order_tx,
+                        now_ms,
+                        tick,
+                        hooks.as_ref(),
+                        &mut would_send_intents,
+                        &mut last_exit_intent,
+                    )
+                    .await;
+                    sent_response_this_tick = retry_dispatch.submitted;
+                    let _ = arm_canary_flatten_observation(
+                        cfg,
+                        &state,
+                        &retry_dispatch,
+                        now_ms,
+                        canary_flatten_observation_ms,
+                        &mut canary_flatten_observation,
+                    );
+                    canary_limits_after_response = canary_limit_status(
+                        &state,
+                        canary_max_position_tao,
+                        canary_max_gross_position_tao,
+                        canary_max_abs_venue_position_tao,
+                        canary_max_open_orders,
+                    );
+                    if !canary_limits_after_response.breached {
+                        canary_breach_response_until_ms = None;
+                        canary_breach_response_remaining_ticks = 0;
+                        canary_breach_response_sent = false;
+                        cleared_response_this_tick = true;
+                    }
+                    response_active = canary_breach_response_is_active(
+                        canary_breach_response_until_ms,
+                        canary_breach_response_remaining_ticks,
+                        now_ms,
+                    );
+                    target_snapshot = canary_breach_response_target_snapshot(
+                        cfg,
+                        &state,
+                        &canary_limits_after_response,
+                        &canary_flatten_observation,
+                        now_ms,
+                    );
+                    flatten_observation_active = target_snapshot.raw_observation_active
+                        && target_snapshot.observation_covers_positioned_targets;
+                } else if !grace_active
+                    && !response_active
+                    && canary_flatten_observation_retry_due(
+                        cfg,
+                        &state,
+                        &canary_flatten_observation,
+                        now_ms,
+                        canary_flatten_observation_retry_enabled,
+                        canary_flatten_observation_retry_ms,
+                        canary_flatten_observation_max_retries,
+                    )
+                {
+                    let retry_dispatch = retry_canary_breach_flatten_response(
+                        cfg,
+                        &mut state,
+                        &canary_limits_after_response,
+                        &mut canary_breach_response,
+                        &priority_order_tx,
+                        now_ms,
+                        tick,
+                        hooks.as_ref(),
+                        &mut would_send_intents,
+                        &mut last_exit_intent,
+                    )
+                    .await;
+                    sent_response_this_tick = retry_dispatch.submitted;
+                    record_canary_flatten_observation_retry_attempt(
+                        &mut canary_flatten_observation,
+                        retry_dispatch.submitted,
+                        now_ms,
+                    );
+                    canary_limits_after_response = canary_limit_status(
+                        &state,
+                        canary_max_position_tao,
+                        canary_max_gross_position_tao,
+                        canary_max_abs_venue_position_tao,
+                        canary_max_open_orders,
+                    );
+                    if !canary_limits_after_response.breached {
+                        canary_breach_response_until_ms = None;
+                        canary_breach_response_remaining_ticks = 0;
+                        canary_breach_response_sent = false;
+                        canary_flatten_observation = CanaryFlattenObservationState::default();
+                        cleared_response_this_tick = true;
+                    }
+                    canary_breach_response.response_mode = CanaryBreachResponseMode::Retry;
+                    target_snapshot = canary_breach_response_target_snapshot(
+                        cfg,
+                        &state,
+                        &canary_limits_after_response,
+                        &canary_flatten_observation,
+                        now_ms,
+                    );
+                    flatten_observation_active = target_snapshot.raw_observation_active
+                        && target_snapshot.observation_covers_positioned_targets;
+                }
 
                 if grace_active && grace_eligible {
                     inventory_brake.grace_applied = true;
                     inventory_brake_grace_remaining_ticks =
                         inventory_brake_grace_remaining_ticks.saturating_sub(1);
+                } else if response_active && canary_breach_response_sent {
+                    canary_breach_response_remaining_ticks =
+                        canary_breach_response_remaining_ticks.saturating_sub(1);
+                } else if flatten_observation_active {
+                    // Some venue order acknowledgements can lag the account truth that
+                    // proves an IOC reduce-only flatten converged. Hold only inside
+                    // the bounded venue-local non-worsening observation window.
                 } else {
                     inventory_brake_grace_until_ms = None;
                     inventory_brake_grace_remaining_ticks = 0;
+                    canary_breach_response_until_ms = None;
+                    canary_breach_response_remaining_ticks = 0;
+                    canary_breach_response_sent = false;
+                    canary_flatten_observation = CanaryFlattenObservationState::default();
                     state.kill_switch = true;
                     state.kill_reason = crate::state::KillReason::CanaryLimitBreach;
                 }
+                let telemetry_response_active =
+                    (response_active && canary_breach_response_sent) || flatten_observation_active;
+                if flatten_observation_active
+                    && !sent_response_this_tick
+                    && matches!(
+                        canary_breach_response.response_mode,
+                        CanaryBreachResponseMode::Inactive
+                    )
+                {
+                    canary_breach_response.response_mode = CanaryBreachResponseMode::Observation;
+                }
+                let telemetry_response_deadline_ms =
+                    if flatten_observation_active && !response_active {
+                        canary_flatten_observation.until_ms
+                    } else {
+                        canary_breach_response_until_ms
+                    };
+                let telemetry_target_snapshot = canary_breach_response_target_snapshot(
+                    cfg,
+                    &state,
+                    &canary_limits_after_response,
+                    &canary_flatten_observation,
+                    now_ms,
+                );
+                apply_canary_breach_response_target_snapshot(
+                    &mut canary_breach_response,
+                    cfg,
+                    &telemetry_target_snapshot,
+                );
+                let zero_target_hold_this_tick = telemetry_response_active
+                    && !grace_active
+                    && !sent_response_this_tick
+                    && canary_breach_response.target_venues.is_empty()
+                    && canary_breach_response.flatten_venues.is_empty()
+                    && canary_breach_response.request_dispatches.is_empty()
+                    && !telemetry_target_snapshot
+                        .positioned_target_venues
+                        .is_empty()
+                    && !telemetry_target_snapshot.observation_covers_positioned_targets;
+                canary_breach_response.zero_target_hold_this_tick = zero_target_hold_this_tick;
+                if zero_target_hold_this_tick {
+                    canary_breach_response.response_mode = CanaryBreachResponseMode::ZeroTargetHold;
+                }
+                apply_canary_breach_response_telemetry(
+                    &mut canary_breach_response,
+                    &canary_limits_after_response,
+                    response_eligible,
+                    telemetry_response_active,
+                    sent_response_this_tick,
+                    cleared_response_this_tick,
+                    telemetry_response_deadline_ms,
+                    canary_breach_response_remaining_ticks,
+                );
             } else {
                 inventory_brake_grace_until_ms = None;
                 inventory_brake_grace_remaining_ticks = 0;
                 inventory_brake_grace_available = true;
+                canary_breach_response_until_ms = None;
+                canary_breach_response_remaining_ticks = 0;
+                canary_breach_response_sent = false;
+                canary_flatten_observation = CanaryFlattenObservationState::default();
             }
             apply_inventory_brake_grace_telemetry(
                 &mut inventory_brake,
@@ -2672,17 +4773,129 @@ pub async fn run_live_loop(
                 inventory_brake_grace_remaining_ticks,
                 now_ms,
             );
-            if canary_stale_max_ticks > 0 {
+            let startup_stale_arming = evaluate_startup_stale_arming(
+                snapshot,
+                now_ms,
+                startup_stale_started_ms,
+                startup_stale_arming_ms,
+                startup_stale_armed,
+            );
+            if startup_stale_arming.enabled {
+                if startup_stale_arming.armed_this_tick {
+                    if ws_audit_enabled {
+                        eprintln!(
+                            "WS_AUDIT subsystem=runner component=startup_stale_arming action=armed elapsed_ms={} arming_ms={} reason={} pending_venues={}",
+                            startup_stale_arming.elapsed_ms,
+                            startup_stale_arming.arming_ms,
+                            startup_stale_arming.arm_reason.as_deref().unwrap_or("unknown"),
+                            if startup_stale_arming.pending_venues.is_empty() {
+                                "none".to_string()
+                            } else {
+                                startup_stale_arming.pending_venues.join(",")
+                            },
+                        );
+                    }
+                } else if !startup_stale_arming.armed {
+                    let pending_changed =
+                        startup_stale_arming.pending_venues != startup_stale_last_pending_venues;
+                    if ws_audit_enabled && (startup_stale_wait_log_count < 3 || pending_changed) {
+                        startup_stale_wait_log_count =
+                            startup_stale_wait_log_count.saturating_add(1);
+                        eprintln!(
+                            "WS_AUDIT subsystem=runner component=startup_stale_arming action=waiting elapsed_ms={} arming_ms={} pending_venues={}",
+                            startup_stale_arming.elapsed_ms,
+                            startup_stale_arming.arming_ms,
+                            if startup_stale_arming.pending_venues.is_empty() {
+                                "none".to_string()
+                            } else {
+                                startup_stale_arming.pending_venues.join(",")
+                            },
+                        );
+                    }
+                }
+            }
+            startup_stale_last_pending_venues = startup_stale_arming.pending_venues.clone();
+            startup_stale_armed = startup_stale_arming.armed;
+            if canary_stale_max_ticks > 0 && startup_stale_arming.armed {
+                let previous_canary_stale_ticks = canary_stale_ticks;
                 if stale_count > 0 {
                     canary_stale_ticks = canary_stale_ticks.saturating_add(1);
+                    stale_count_incremented_this_tick =
+                        canary_stale_ticks > previous_canary_stale_ticks;
                 } else {
                     canary_stale_ticks = 0;
+                    stale_count_reset_this_tick = previous_canary_stale_ticks > 0;
+                }
+                let stale_venues = snapshot
+                    .market
+                    .iter()
+                    .filter(|market| market.is_stale)
+                    .map(|market| market.venue_id.as_ref())
+                    .collect::<Vec<_>>();
+                if stale_count_incremented_this_tick {
+                    eprintln!(
+                        "[runner] tick={} stale_market_hygiene consecutive_stale_ticks={} max_ticks={} stale_market_count={} ready_market_count={} stale_venues={}",
+                        tick,
+                        canary_stale_ticks,
+                        canary_stale_max_ticks,
+                        stale_count,
+                        snapshot.ready_market_count(),
+                        stale_venues.join(","),
+                    );
+                } else if stale_count_reset_this_tick {
+                    eprintln!(
+                        "[runner] tick={} stale_market_hygiene reset_from={} ready_market_count={} stale_market_count={}",
+                        tick,
+                        previous_canary_stale_ticks,
+                        snapshot.ready_market_count(),
+                        stale_count,
+                    );
                 }
                 if canary_stale_ticks >= canary_stale_max_ticks {
                     state.kill_switch = true;
                     state.kill_reason = crate::state::KillReason::StaleMarket;
+                    stale_market_kill_triggered_this_tick = true;
+                    eprintln!(
+                        "[runner] tick={} stale_market_hygiene kill_triggered consecutive_stale_ticks={} max_ticks={} stale_market_count={} stale_venues={}",
+                        tick,
+                        canary_stale_ticks,
+                        canary_stale_max_ticks,
+                        stale_count,
+                        stale_venues.join(","),
+                    );
                 }
+            } else if canary_stale_max_ticks > 0 {
+                canary_stale_ticks = 0;
             }
+            stale_market_hygiene = build_stale_market_hygiene_status(
+                &state,
+                snapshot,
+                now_ms,
+                canary_stale_ticks,
+                canary_stale_max_ticks,
+                stale_count_incremented_this_tick,
+                stale_count_reset_this_tick,
+                stale_market_kill_triggered_this_tick,
+                startup_stale_arming,
+            );
+        } else {
+            stale_market_hygiene = build_stale_market_hygiene_status(
+                &state,
+                snapshot,
+                now_ms,
+                canary_stale_ticks,
+                canary_stale_max_ticks,
+                false,
+                false,
+                false,
+                evaluate_startup_stale_arming(
+                    snapshot,
+                    now_ms,
+                    startup_stale_started_ms,
+                    startup_stale_arming_ms,
+                    startup_stale_armed,
+                ),
+            );
         }
 
         engine.main_tick_without_risk(&mut state, now_ms);
@@ -2768,8 +4981,10 @@ pub async fn run_live_loop(
         }
 
         // Build tick timing snapshot for telemetry (total_us updated at tick end).
-        let order_tx_pending = (priority_order_tx.max_capacity() - priority_order_tx.capacity())
-            + (order_tx.max_capacity() - order_tx.capacity());
+        let priority_order_tx_pending =
+            priority_order_tx.max_capacity() - priority_order_tx.capacity();
+        let normal_order_tx_pending = order_tx.max_capacity() - order_tx.capacity();
+        let order_tx_pending = priority_order_tx_pending + normal_order_tx_pending;
         let mut tick_timing = TickTiming {
             reconcile_us: reconcile_elapsed_us,
             event_drain_us: event_drain_elapsed_us,
@@ -2777,6 +4992,8 @@ pub async fn run_live_loop(
             submit_us: 0,
             total_us: tick_start.elapsed().as_micros() as u64,
             order_tx_pending,
+            priority_order_tx_pending,
+            normal_order_tx_pending,
         };
         let mut mm_order_management = MmOrderDecisionSummary::default();
         // Only emit tick timing in Realtime mode; Step mode uses non-deterministic
@@ -2816,6 +5033,10 @@ pub async fn run_live_loop(
                         &tick_account_position_syncs,
                         &inventory_soft_governor,
                         &inventory_brake,
+                        &emergency_residual_fallback,
+                        &projected_mm_budget,
+                        &canary_breach_response,
+                        &stale_market_hygiene,
                         &startup_pnl_baseline,
                         &emergency_request_latches,
                         &mm_order_management,
@@ -2865,6 +5086,10 @@ pub async fn run_live_loop(
                         &tick_account_position_syncs,
                         &inventory_soft_governor,
                         &inventory_brake,
+                        &emergency_residual_fallback,
+                        &projected_mm_budget,
+                        &canary_breach_response,
+                        &stale_market_hygiene,
                         &startup_pnl_baseline,
                         &emergency_request_latches,
                         &mm_order_management,
@@ -2913,6 +5138,10 @@ pub async fn run_live_loop(
                         &tick_account_position_syncs,
                         &inventory_soft_governor,
                         &inventory_brake,
+                        &emergency_residual_fallback,
+                        &projected_mm_budget,
+                        &canary_breach_response,
+                        &stale_market_hygiene,
                         &startup_pnl_baseline,
                         &emergency_request_latches,
                         &mm_order_management,
@@ -2932,55 +5161,19 @@ pub async fn run_live_loop(
             continue;
         }
 
-        // Conditional quoting: skip requote for venues with unchanged data.
-        let mut should_quote = true;
-        if conditional_quoting && !smoke_intents {
-            let mut any_changed = false;
-            for vm in &snapshot.market {
-                let vi = vm.venue_index;
-                if vm.is_stale {
-                    continue;
-                }
-                let mid = vm.mid;
-                let seq = vm.seq;
-                let prev_mid = last_quoted_mid.get(vi).copied().flatten();
-                let prev_seq = last_quoted_book_seq.get(vi).copied().unwrap_or(0);
-                let prev_ts = last_quote_ts_ms.get(vi).copied().unwrap_or(0);
-                // Force requote if max quote age exceeded.
-                if now_ms.saturating_sub(prev_ts) > max_quote_age_ms {
-                    any_changed = true;
-                    break;
-                }
-                // Force requote if book sequence advanced (new data).
-                if seq > prev_seq {
-                    any_changed = true;
-                    break;
-                }
-                // Force requote if mid changed meaningfully.
-                if let (Some(cur), Some(prev)) = (mid, prev_mid) {
-                    let tick_size = cfg.venues.get(vi).map(|v| v.tick_size).unwrap_or(0.01);
-                    if (cur - prev).abs() > tick_size * 0.5 {
-                        any_changed = true;
-                        break;
-                    }
-                } else if mid.is_some() != prev_mid.is_some() {
-                    any_changed = true;
-                    break;
-                }
-            }
-            // Also force quote if no live orders exist (need to establish quotes).
-            let has_live_orders = has_tracked_mm_orders(&state);
-            if !any_changed && has_live_orders {
-                should_quote = false;
-            }
-        }
-
         let mut mm_quotes = if disable_fv_gate {
             compute_mm_quotes_with_ablations(cfg, &state, &fv_ablations)
         } else {
             // Use staleness-guarded quoting in live mode with current timestamp.
             compute_mm_quotes_with_now(cfg, &state, Some(now_ms))
         };
+        projected_mm_budget = apply_projected_mm_budget_to_quotes(
+            cfg,
+            &state,
+            now_ms,
+            inventory_brake_limits,
+            &mut mm_quotes,
+        );
         apply_inventory_brake_to_quotes(&mut mm_quotes, &inventory_brake);
         inventory_soft_governor =
             apply_inventory_soft_governor(&state, &mut mm_quotes, soft_inventory_governor_limits);
@@ -3005,33 +5198,234 @@ pub async fn run_live_loop(
             );
             inventory_soft_governor.triggered = true;
         }
+        let orderly_exit_position_tol_tao = if startup_pnl_baseline_cfg.position_tol_tao > 0.0 {
+            startup_pnl_baseline_cfg.position_tol_tao
+        } else {
+            0.0025
+        };
+        let lighter_orderly_exit_residual_convergence_needed =
+            has_lighter_orderly_exit_residual_convergence(
+                cfg,
+                &state,
+                risk_control_snapshot,
+                now_ms,
+                orderly_exit_position_tol_tao,
+            );
+        if lighter_orderly_exit_residual_convergence_needed {
+            push_reason(
+                &mut inventory_soft_governor.global_reasons,
+                "lighter_orderly_exit_residual_convergence",
+            );
+            inventory_soft_governor.triggered = true;
+        }
+        let soft_unwind_material_positions = soft_unwind_has_material_positions(cfg, &state);
+        let tracked_mm_orders = has_tracked_mm_orders(&state);
+        let terminal_exit_residual_convergence_needed =
+            terminal_exit_quiesce_active && (soft_unwind_material_positions || tracked_mm_orders);
+        let terminal_aster_account_refresh_needed = terminal_exit_quiesce_active
+            && should_attempt_aster_residual_markout_account_refresh(
+                cfg,
+                &state,
+                risk_control_snapshot,
+                now_ms,
+                aster_soft_unwind_fee_guard_config,
+                last_aster_residual_markout_guard_refresh_ms,
+                true,
+            )
+            .is_some();
+        let terminal_aster_sub_lot_residual_convergence_needed = terminal_exit_quiesce_active
+            && aster_terminal_sub_lot_residual_position_tao(
+                cfg,
+                &state,
+                risk_control_snapshot,
+                now_ms,
+                aster_soft_unwind_fee_guard_config,
+            )
+            .is_some();
+        let terminal_hyperliquid_sub_lot_residual_convergence_needed = terminal_exit_quiesce_active
+            && hyperliquid_terminal_sub_lot_residual_position_tao(
+                cfg,
+                &state,
+                risk_control_snapshot,
+                now_ms,
+            )
+            .is_some();
+        let terminal_extended_sub_lot_residual_convergence_needed = terminal_exit_quiesce_active
+            && extended_terminal_sub_lot_residual_position_tao(
+                cfg,
+                &state,
+                risk_control_snapshot,
+                now_ms,
+                Some(&terminal_stale_order_reduce_venues),
+            )
+            .is_some();
+        if terminal_exit_quiesce_active {
+            push_reason(
+                &mut inventory_soft_governor.global_reasons,
+                "terminal_exit_quiesce",
+            );
+            inventory_soft_governor.triggered = true;
+        }
         let soft_unwind_state = soft_unwind_runtime_state(
             soft_limit_triggered,
             soft_unwind_cooldown_active,
             soft_unwind_response_backoff_active,
-            soft_unwind_has_material_positions(cfg, &state),
-            has_tracked_mm_orders(&state),
+            soft_unwind_material_positions,
+            tracked_mm_orders,
+            lighter_orderly_exit_residual_convergence_needed
+                || terminal_exit_residual_convergence_needed
+                || terminal_aster_account_refresh_needed
+                || terminal_aster_sub_lot_residual_convergence_needed
+                || terminal_hyperliquid_sub_lot_residual_convergence_needed
+                || terminal_extended_sub_lot_residual_convergence_needed,
+            terminal_exit_quiesce_active,
         );
+        let inventory_brake_pause_mm_quotes = inventory_brake_requires_mm_pause(&inventory_brake);
+        let canary_breach_pause_mm_quotes = canary_breach_response.active;
+        let inventory_brake_cancel_only_mode =
+            inventory_brake_cancel_only_mm_mode(&inventory_brake);
         let reserve_priority_path = reserve_priority_path_for_inventory_control(
             soft_unwind_state,
-            inventory_brake.triggered,
+            inventory_brake_pause_mm_quotes || canary_breach_pause_mm_quotes,
         );
-        let pause_mm_quotes = soft_unwind_state.pause_mm_quotes || inventory_brake.triggered;
+        let pause_mm_quotes = soft_unwind_state.pause_mm_quotes
+            || inventory_brake_pause_mm_quotes
+            || canary_breach_pause_mm_quotes;
         let mut action_id_gen = crate::actions::ActionIdGenerator::new(tick);
-        let mm_plan = plan_mm_order_actions(cfg, &state, &mm_quotes, now_ms, &mut action_id_gen);
-        if should_quote && !pause_mm_quotes {
+        let mut mm_plan =
+            plan_mm_order_actions(cfg, &state, &mm_quotes, now_ms, &mut action_id_gen);
+        let mut projected_budget_cleanup_intents = Vec::new();
+        let appended_budget_cancels = if !pause_mm_quotes {
+            append_projected_mm_budget_unmanaged_suppression_cancels(
+                cfg,
+                &state,
+                &projected_mm_budget,
+                now_ms,
+                &mut projected_budget_cleanup_intents,
+            )
+        } else {
+            0
+        };
+        if should_quote && appended_budget_cancels > 0 {
+            mm_plan
+                .intents
+                .extend(projected_budget_cleanup_intents.iter().cloned());
+        }
+        mm_plan.decision_summary.cancel_count += appended_budget_cancels as u64;
+        let effective_projection = if should_quote && !pause_mm_quotes {
+            effective_projected_exposure_from_mm_intents(&state, &mm_plan.intents)
+        } else if !pause_mm_quotes {
+            effective_projected_exposure_from_mm_intents(&state, &projected_budget_cleanup_intents)
+        } else {
+            effective_projected_exposure_from_mm_intents(&state, &[])
+        };
+        projected_mm_budget.effective_q_global_after_tao = effective_projection.q_global_tao;
+        projected_mm_budget.effective_q_gross_after_tao = effective_projection.q_gross_tao;
+        projected_mm_budget.effective_q_max_abs_venue_after_tao =
+            effective_projection.q_max_abs_venue_tao;
+        projected_mm_budget.effective_projection_within_limits =
+            projected_exposure_within_limits(&effective_projection, inventory_brake_limits);
+        projected_mm_budget.live_order_projection_consistent = !projected_mm_budget
+            .budget_after_within_limits
+            || projected_mm_budget.effective_projection_within_limits;
+        if should_quote && !pause_mm_quotes && !inventory_brake_cancel_only_mode {
             mm_order_management = mm_plan.decision_summary.clone();
         }
-        let mut intents = if should_quote && !pause_mm_quotes {
-            mm_plan.intents.clone()
+        let mut intents = mm_submission_intents_for_quote_gate(
+            should_quote,
+            pause_mm_quotes,
+            inventory_brake_cancel_only_mode,
+            mm_plan.intents.clone(),
+            projected_budget_cleanup_intents.clone(),
+        );
+        if terminal_exit_quiesce_active {
+            intents.extend(build_terminal_exit_quiesce_cancel_intents(
+                cfg,
+                &state,
+                &mut terminal_exit_cancel_state,
+                now_ms,
+                terminal_residual_convergence_config.cancel_retry_interval_ms,
+                Some(&terminal_residual_convergence_venues),
+            ));
+            if aster_terminal_quiesce_explicit_cancel_retry_enabled()
+                && aster_terminal_quiesce_explicit_cancel_retry_due(
+                    now_ms,
+                    last_aster_terminal_quiesce_explicit_cancel_retry_ms,
+                )
+            {
+                let aster_cancel_intents =
+                    build_aster_terminal_quiesce_explicit_cancel_retry_intents(cfg, &state);
+                if aster_cancel_intents.is_empty() {
+                    last_aster_terminal_quiesce_explicit_cancel_retry_ms = None;
+                } else {
+                    last_aster_terminal_quiesce_explicit_cancel_retry_ms = Some(now_ms);
+                    would_send_intents.extend(aster_cancel_intents.iter().cloned());
+                    if let Some(hooks_ref) = hooks.as_ref() {
+                        hooks_ref.metrics.inc_orders(aster_cancel_intents.len());
+                    }
+                    let (outcome, events, _) = send_terminal_exit_cancel_intents_sync(
+                        cfg,
+                        &priority_order_tx,
+                        aster_cancel_intents,
+                        now_ms,
+                        tick,
+                    )
+                    .await;
+                    if matches!(outcome, OrderWaitOutcomeKind::ChannelFull) {
+                        last_aster_terminal_quiesce_explicit_cancel_retry_ms = None;
+                    }
+                    if let Some(events) = events {
+                        let terminal_cancel_fills = apply_priority_response_events(
+                            cfg,
+                            &mut state,
+                            &mut deduper,
+                            events,
+                            now_ms,
+                            order_snapshot_fill_inference_enabled,
+                            &mut tick_exec_events,
+                            &mut tick_fills,
+                            &mut order_state_initialized,
+                        );
+                        if !terminal_cancel_fills.is_empty() {
+                            apply_live_fills(cfg, &mut state, &terminal_cancel_fills, now_ms);
+                            state.recompute_after_fills(cfg);
+                        }
+                    }
+                }
+            }
         } else {
-            Vec::new() // Skip requote — data unchanged and live orders exist.
-        };
+            last_aster_terminal_quiesce_explicit_cancel_retry_ms = None;
+        }
         apply_canary_intent_overrides(
             &mut intents,
             canary_enforce_post_only,
             canary_enforce_reduce_only,
         );
+        let _ = suppress_non_cancel_intents_for_disabled_cancel_latches(
+            &mut intents,
+            &mut emergency_request_latches,
+            cfg,
+            &state,
+            now_ms,
+        );
+        if pending_place_guard_should_run(
+            pause_mm_quotes,
+            inventory_brake_cancel_only_mode,
+            &emergency_request_latches,
+        ) {
+            let (place_suppressed, cancel_suppressed, replace_suppressed) =
+                apply_pending_place_guard(cfg, &state, &mut intents, now_ms);
+            mm_order_management.paradex_pending_place_guard_place_suppressed = mm_order_management
+                .paradex_pending_place_guard_place_suppressed
+                .saturating_add(place_suppressed);
+            mm_order_management.paradex_pending_place_guard_cancel_suppressed = mm_order_management
+                .paradex_pending_place_guard_cancel_suppressed
+                .saturating_add(cancel_suppressed);
+            mm_order_management.paradex_pending_place_guard_replace_suppressed =
+                mm_order_management
+                    .paradex_pending_place_guard_replace_suppressed
+                    .saturating_add(replace_suppressed);
+        }
         if intents.is_empty() && smoke_intents {
             let fair = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
             let vcfg = &cfg.venues[0];
@@ -3085,13 +5479,201 @@ pub async fn run_live_loop(
                 intents,
                 action_batch,
                 now_ms,
+                TransportHint::Default,
                 "mm_quote",
                 tick,
             );
         }
 
         if soft_unwind_state.send_unwind && !inventory_brake.sent {
-            let mut soft_unwind_intents = build_soft_unwind_intents(cfg, &state, snapshot, now_ms);
+            let mut refreshed_soft_unwind_snapshot: Option<CanonicalCacheSnapshot> = None;
+            if let Some(aster_index) = should_attempt_aster_residual_markout_account_refresh(
+                cfg,
+                &state,
+                risk_control_snapshot,
+                now_ms,
+                aster_soft_unwind_fee_guard_config,
+                last_aster_residual_markout_guard_refresh_ms,
+                terminal_exit_quiesce_active,
+            ) {
+                if let Some(tx) = account_reconcile_tx.as_ref() {
+                    last_aster_residual_markout_guard_refresh_ms = Some(now_ms);
+                    let refresh_started = Instant::now();
+                    let account_snapshot = send_account_and_wait(
+                        tx,
+                        aster_index,
+                        now_ms,
+                        aster_soft_unwind_fee_guard_config
+                            .residual_markout_guard_refresh_timeout_ms,
+                        tick,
+                    )
+                    .await;
+                    let refresh_latency_ms = refresh_started.elapsed().as_millis() as u64;
+                    if let Some(account_snapshot) = account_snapshot {
+                        let fresh_account_age_ms = (account_snapshot.timestamp_ms > 0)
+                            .then_some(now_ms.saturating_sub(account_snapshot.timestamp_ms));
+                        if account_snapshot.timestamp_ms > 0 {
+                            if let Some(last) =
+                                last_account_snapshot_ms.get_mut(account_snapshot.venue_index)
+                            {
+                                *last = Some(account_snapshot.timestamp_ms);
+                            }
+                        }
+                        let account_available =
+                            account_snapshot_available(cfg, &account_snapshot, now_ms);
+                        let (report, diff) =
+                            cache.reconcile_account_snapshot_with_diff(&account_snapshot);
+                        if let Some(diff) = diff {
+                            let _ = append_account_reconcile_audit(&audit_dir, now_ms, diff);
+                        }
+                        if report.account_ok && account_available {
+                            let mut refreshed_snapshot =
+                                cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
+                            apply_extended_freeze_market_progress_snapshot_overrides(
+                                &mut refreshed_snapshot,
+                                &state,
+                                cfg,
+                                now_ms,
+                            );
+                            let refresh_account_apply = apply_account_snapshot_to_state(
+                                cfg,
+                                &refreshed_snapshot,
+                                &mut state,
+                                now_ms,
+                            );
+                            let refresh_position_syncs = refresh_account_apply.position_syncs;
+                            if !refresh_position_syncs.is_empty() {
+                                let (account_fill_events, account_fills) =
+                                    infer_fills_from_account_position_syncs(
+                                        cfg,
+                                        &mut state,
+                                        &refresh_position_syncs,
+                                        now_ms,
+                                    );
+                                tick_exec_events.extend(account_fill_events);
+                                tick_fills.extend(account_fills);
+                                tick_account_position_syncs.extend(refresh_position_syncs);
+                            }
+                            record_aster_residual_markout_guard_refresh(
+                                &mut emergency_residual_fallback,
+                                aster_soft_unwind_fee_guard_config,
+                                true,
+                                "success",
+                                Some(refresh_latency_ms),
+                                fresh_account_age_ms,
+                                None,
+                            );
+                            refreshed_soft_unwind_snapshot = Some(refreshed_snapshot);
+                        } else {
+                            let outcome = if report.account_ok {
+                                "stale"
+                            } else {
+                                "reconcile_failed"
+                            };
+                            let suppressed_reason = if report.account_ok {
+                                "held_refresh_stale"
+                            } else {
+                                "held_refresh_reconcile_failed"
+                            };
+                            record_aster_residual_markout_guard_refresh(
+                                &mut emergency_residual_fallback,
+                                aster_soft_unwind_fee_guard_config,
+                                true,
+                                outcome,
+                                Some(refresh_latency_ms),
+                                fresh_account_age_ms,
+                                Some(suppressed_reason),
+                            );
+                        }
+                    } else {
+                        record_aster_residual_markout_guard_refresh(
+                            &mut emergency_residual_fallback,
+                            aster_soft_unwind_fee_guard_config,
+                            true,
+                            "timeout_or_unavailable",
+                            Some(refresh_latency_ms),
+                            None,
+                            Some("held_refresh_unavailable"),
+                        );
+                    }
+                } else {
+                    record_aster_residual_markout_guard_refresh(
+                        &mut emergency_residual_fallback,
+                        aster_soft_unwind_fee_guard_config,
+                        false,
+                        "account_channel_unavailable",
+                        None,
+                        None,
+                        Some("held_refresh_unavailable"),
+                    );
+                }
+            }
+            let soft_unwind_snapshot = refreshed_soft_unwind_snapshot
+                .as_ref()
+                .unwrap_or(risk_control_snapshot);
+            let mut soft_unwind_intents =
+                if let Some(defer_venues) = terminal_inventory_defer_reduce_venues {
+                    build_soft_unwind_intents_with_terminal_defer_status(
+                        cfg,
+                        &state,
+                        soft_unwind_snapshot,
+                        now_ms,
+                        aster_soft_unwind_fee_guard_config,
+                        Some(&mut emergency_residual_fallback),
+                        Some(&mut aster_residual_markout_guard_tracker),
+                        defer_venues,
+                    )
+                } else {
+                    build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status(
+                        cfg,
+                        &state,
+                        soft_unwind_snapshot,
+                        now_ms,
+                        aster_soft_unwind_fee_guard_config,
+                        Some(&mut emergency_residual_fallback),
+                        Some(&mut aster_residual_markout_guard_tracker),
+                    )
+                };
+            soft_unwind_intents.extend(build_lighter_orderly_exit_residual_convergence_intents(
+                cfg,
+                &state,
+                soft_unwind_snapshot,
+                now_ms,
+                orderly_exit_position_tol_tao,
+                Some(&terminal_stale_order_reduce_venues),
+            ));
+            if terminal_exit_quiesce_active {
+                soft_unwind_intents.extend(
+                    build_aster_terminal_sub_lot_residual_convergence_intents(
+                        cfg,
+                        &state,
+                        soft_unwind_snapshot,
+                        now_ms,
+                        aster_soft_unwind_fee_guard_config,
+                        Some(&mut emergency_residual_fallback),
+                    ),
+                );
+                soft_unwind_intents.extend(
+                    build_hyperliquid_terminal_sub_lot_residual_convergence_intents(
+                        cfg,
+                        &state,
+                        soft_unwind_snapshot,
+                        now_ms,
+                        Some(&mut emergency_residual_fallback),
+                    ),
+                );
+                soft_unwind_intents.extend(
+                    build_extended_terminal_sub_lot_residual_convergence_intents(
+                        cfg,
+                        &state,
+                        soft_unwind_snapshot,
+                        now_ms,
+                        Some(&terminal_stale_order_reduce_venues),
+                        EmergencyRequestClass::SoftUnwind,
+                        Some(&mut emergency_residual_fallback),
+                    ),
+                );
+            }
             let _ = remove_latched_intents_for_class(
                 &mut soft_unwind_intents,
                 &mut emergency_request_latches,
@@ -3113,8 +5695,11 @@ pub async fn run_live_loop(
                     hooks.metrics.inc_orders(soft_unwind_intents.len());
                 }
                 let mut sync_soft_unwind_intents = soft_unwind_intents;
-                let async_soft_unwind_requests =
-                    take_emergency_single_flight_intents(cfg, &mut sync_soft_unwind_intents);
+                let async_soft_unwind_requests = take_emergency_single_flight_intents(
+                    EmergencyRequestClass::SoftUnwind,
+                    cfg,
+                    &mut sync_soft_unwind_intents,
+                );
                 let _ = send_emergency_single_flight_requests(
                     cfg,
                     &priority_order_tx,
@@ -3126,6 +5711,7 @@ pub async fn run_live_loop(
                     tick,
                     lighter_emergency_latch_ms,
                     lighter_emergency_max_latch_ms,
+                    TransportHint::HyperliquidSyncControl,
                     "soft_unwind",
                 );
                 let sync_soft_unwind_venues =
@@ -3144,6 +5730,7 @@ pub async fn run_live_loop(
                             action_batch,
                             now_ms,
                             1_000,
+                            TransportHint::HyperliquidSyncControl,
                             "soft_unwind",
                             tick,
                         )
@@ -3225,6 +5812,7 @@ pub async fn run_live_loop(
                     action_batch,
                     now_ms,
                     500,
+                    TransportHint::Default,
                     "exit",
                     tick,
                 )
@@ -3250,8 +5838,17 @@ pub async fn run_live_loop(
                                 tick_fills.extend(fills.iter().cloned());
                                 exit_fills.extend(fills);
                             }
-                            state.live_order_state.reconcile(&snapshot, now_ms);
+                            state
+                                .live_order_state
+                                .reconcile_with_supported_replace_gap_grace_ms(
+                                    &snapshot,
+                                    now_ms,
+                                    cfg.mm.supported_replace_snapshot_gap_grace_ms_for(
+                                        &snapshot.venue_id,
+                                    ) as TimestampMs,
+                                );
                             sync_venue_order_tracking_from_live_order_state(
+                                cfg,
                                 &mut state,
                                 snapshot.venue_index,
                             );
@@ -3311,6 +5908,7 @@ pub async fn run_live_loop(
                         action_batch,
                         now_ms,
                         500,
+                        TransportHint::Default,
                         "hedge",
                         tick,
                     )
@@ -3336,8 +5934,17 @@ pub async fn run_live_loop(
                                     tick_fills.extend(fills.iter().cloned());
                                     hedge_fills.extend(fills);
                                 }
-                                state.live_order_state.reconcile(&snapshot, now_ms);
+                                state
+                                    .live_order_state
+                                    .reconcile_with_supported_replace_gap_grace_ms(
+                                        &snapshot,
+                                        now_ms,
+                                        cfg.mm.supported_replace_snapshot_gap_grace_ms_for(
+                                            &snapshot.venue_id,
+                                        ) as TimestampMs,
+                                    );
                                 sync_venue_order_tracking_from_live_order_state(
+                                    cfg,
                                     &mut state,
                                     snapshot.venue_index,
                                 );
@@ -3442,6 +6049,10 @@ pub async fn run_live_loop(
                         &tick_account_position_syncs,
                         &inventory_soft_governor,
                         &inventory_brake,
+                        &emergency_residual_fallback,
+                        &projected_mm_budget,
+                        &canary_breach_response,
+                        &stale_market_hygiene,
                         &startup_pnl_baseline,
                         &emergency_request_latches,
                         &mm_order_management,
@@ -3474,10 +6085,11 @@ pub async fn run_live_loop(
             let budget_us = (interval_ms as u64) * 1000;
             if tick_timing.total_us > budget_us {
                 eprintln!(
-                    "[runner] tick={} OVERRUN: {}us > {}us budget (reconcile={}us drain={}us engine={}us submit={}us order_tx_pending={})",
+                    "[runner] tick={} OVERRUN: {}us > {}us budget (reconcile={}us drain={}us engine={}us submit={}us order_tx_pending={} priority_order_tx_pending={} normal_order_tx_pending={})",
                     tick, tick_timing.total_us, budget_us,
                     tick_timing.reconcile_us, tick_timing.event_drain_us,
                     tick_timing.engine_us, tick_timing.submit_us, tick_timing.order_tx_pending,
+                    tick_timing.priority_order_tx_pending, tick_timing.normal_order_tx_pending,
                 );
             } else if tick_timing.total_us > budget_us * 4 / 5 {
                 eprintln!(
@@ -3514,6 +6126,10 @@ pub async fn run_live_loop(
                     &tick_account_position_syncs,
                     &inventory_soft_governor,
                     &inventory_brake,
+                    &emergency_residual_fallback,
+                    &projected_mm_budget,
+                    &canary_breach_response,
+                    &stale_market_hygiene,
                     &startup_pnl_baseline,
                     &emergency_request_latches,
                     &mm_order_management,
@@ -3583,13 +6199,19 @@ pub async fn handle_kill_switch(
         }
     }
 
-    // Batch all venue cancel-all intents into a single channel send.
+    // Prefer explicit Hyperliquid order cancels when tracked IDs exist; fall back to
+    // venue-wide cancel-all only when we have nothing concrete to target.
     let mut cancel_intents: Vec<OrderIntent> = Vec::with_capacity(cfg.venues.len());
     for (venue_index, venue) in cfg.venues.iter().enumerate() {
-        cancel_intents.push(OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
-            venue_index: Some(venue_index),
-            venue_id: Some(venue.id_arc.clone()),
-        }));
+        let venue_intents = build_disabled_cancel_intents_for_venue(cfg, state, venue_index);
+        if venue_intents.is_empty() {
+            cancel_intents.push(OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
+                venue_index: Some(venue_index),
+                venue_id: Some(venue.id_arc.clone()),
+            }));
+        } else {
+            cancel_intents.extend(venue_intents);
+        }
     }
     if !cancel_intents.is_empty() {
         let mut action_id_gen = ActionIdGenerator::new(tick);
@@ -3607,6 +6229,7 @@ pub async fn handle_kill_switch(
             action_batch,
             now_ms,
             kill_cancel_all_timeout_ms(cfg.venues.len()),
+            TransportHint::Default,
             "kill_cancel_all",
             tick,
         )
@@ -3639,6 +6262,7 @@ pub async fn handle_kill_switch(
                 action_batch,
                 now_ms,
                 KILL_FLATTEN_TIMEOUT_MS,
+                TransportHint::Default,
                 "flatten",
                 tick,
             )
@@ -3655,6 +6279,167 @@ pub async fn handle_kill_switch(
             }
         }
     }
+}
+
+async fn handle_canary_breach_response(
+    cfg: &Config,
+    state: &mut GlobalState,
+    limits: &CanaryLimitStatus,
+    status: &mut CanaryBreachResponseStatus,
+    priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    emergency_request_latches: &mut EmergencyRequestLatchSet,
+    now_ms: TimestampMs,
+    tick: u64,
+    lighter_emergency_latch_ms: TimestampMs,
+    lighter_emergency_max_latch_ms: TimestampMs,
+    hooks: Option<&LiveRuntimeHooks>,
+    would_send_intents: &mut Vec<OrderIntent>,
+    last_exit_intent: &mut Option<OrderIntent>,
+) -> CanaryFlattenDispatchResult {
+    let target_venues = canary_breach_response_target_venues(state, limits);
+    status.response_mode = CanaryBreachResponseMode::Dispatch;
+    status.zero_target_hold_this_tick = false;
+    status.target_venues = venue_ids_for_indices(cfg, &target_venues);
+    status.positioned_target_venues = venue_ids_for_indices(
+        cfg,
+        &canary_breach_positioned_target_venues(cfg, state, &target_venues),
+    );
+    let open_order_only_breach = canary_breach_is_open_order_only(limits);
+    let cancel_target_venues =
+        canary_breach_response_cancel_scope_venues(state, limits, &target_venues);
+    let _ = retain_canary_breach_preferred_intents(
+        cfg,
+        state,
+        would_send_intents,
+        &cancel_target_venues,
+        canary_breach_response_drop_cancels_for_positioned_venues(limits),
+    );
+    status.cancel_scope_venues = venue_ids_for_indices(cfg, &cancel_target_venues);
+    status.preserved_existing_cancel_intents = !open_order_only_breach
+        && would_send_intents.iter().any(|intent| {
+            let Some(venue_index) = venue_index_for_order_intent(intent) else {
+                return false;
+            };
+            target_venues.contains(&venue_index)
+                && venue_has_material_position(cfg, state, venue_index)
+                && matches!(intent, OrderIntent::Cancel(_) | OrderIntent::CancelAll(_))
+        });
+    let cancel_intents = build_unlatched_disabled_cancel_intents_for_venues(
+        cfg,
+        state,
+        emergency_request_latches,
+        now_ms,
+        &cancel_target_venues,
+    );
+    let (early_flatten_intents, deferred_flatten_intents) = if open_order_only_breach {
+        (Vec::new(), Vec::new())
+    } else {
+        let flatten_intents = build_canary_breach_flatten_intents(cfg, state, &target_venues, tick);
+        status.flatten_venues =
+            venue_ids_for_indices(cfg, &venue_indices_for_order_intents(&flatten_intents));
+        split_canary_flatten_intents_by_cancel_mode(flatten_intents, &cancel_intents, false)
+    };
+    let mut flatten_dispatch = dispatch_canary_breach_flatten_intents_sync_wait(
+        cfg,
+        state,
+        priority_order_tx,
+        early_flatten_intents,
+        now_ms,
+        tick.saturating_mul(2).saturating_add(2),
+        tick,
+        "canary_breach_flatten_pre_cancel",
+        hooks,
+        would_send_intents,
+        last_exit_intent,
+    )
+    .await;
+    if !cancel_intents.is_empty() {
+        would_send_intents.extend(cancel_intents.iter().cloned());
+        if let Some(hooks_ref) = hooks {
+            hooks_ref.metrics.inc_cancel_all();
+            hooks_ref.metrics.inc_orders(cancel_intents.len());
+        }
+        status.request_dispatches = dispatch_disabled_cancel_intents(
+            cfg,
+            state,
+            priority_order_tx,
+            emergency_request_latches,
+            cancel_intents,
+            now_ms,
+            tick.saturating_mul(2).saturating_add(1),
+            tick,
+            lighter_emergency_latch_ms,
+            lighter_emergency_max_latch_ms,
+            TransportHint::Default,
+            "canary_breach_cancel",
+        )
+        .await;
+        flatten_dispatch.submitted |= !status.request_dispatches.is_empty();
+    }
+
+    let post_cancel_dispatch = dispatch_canary_breach_flatten_intents_sync_wait(
+        cfg,
+        state,
+        priority_order_tx,
+        deferred_flatten_intents,
+        now_ms,
+        tick.saturating_mul(2).saturating_add(4),
+        tick,
+        "canary_breach_flatten_post_cancel",
+        hooks,
+        would_send_intents,
+        last_exit_intent,
+    )
+    .await;
+    flatten_dispatch.merge(post_cancel_dispatch);
+    flatten_dispatch
+}
+
+async fn retry_canary_breach_flatten_response(
+    cfg: &Config,
+    state: &mut GlobalState,
+    limits: &CanaryLimitStatus,
+    status: &mut CanaryBreachResponseStatus,
+    priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    now_ms: TimestampMs,
+    tick: u64,
+    hooks: Option<&LiveRuntimeHooks>,
+    would_send_intents: &mut Vec<OrderIntent>,
+    last_exit_intent: &mut Option<OrderIntent>,
+) -> CanaryFlattenDispatchResult {
+    let target_venues = canary_breach_response_target_venues(state, limits);
+    status.response_mode = CanaryBreachResponseMode::Retry;
+    status.zero_target_hold_this_tick = false;
+    status.target_venues = venue_ids_for_indices(cfg, &target_venues);
+    status.positioned_target_venues = venue_ids_for_indices(
+        cfg,
+        &canary_breach_positioned_target_venues(cfg, state, &target_venues),
+    );
+    status.cancel_scope_venues.clear();
+    status.request_dispatches.clear();
+    status.preserved_existing_cancel_intents = false;
+
+    let flatten_intents = build_canary_breach_flatten_intents(cfg, state, &target_venues, tick);
+    status.flatten_venues =
+        venue_ids_for_indices(cfg, &venue_indices_for_order_intents(&flatten_intents));
+    if flatten_intents.is_empty() {
+        return CanaryFlattenDispatchResult::default();
+    }
+
+    dispatch_canary_breach_flatten_intents_sync_wait(
+        cfg,
+        state,
+        priority_order_tx,
+        flatten_intents,
+        now_ms,
+        tick.saturating_mul(2).saturating_add(3),
+        tick,
+        "canary_breach_flatten_retry",
+        hooks,
+        would_send_intents,
+        last_exit_intent,
+    )
+    .await
 }
 
 fn now_ms() -> TimestampMs {
@@ -3674,7 +6459,194 @@ fn is_hyperliquid_cloid(value: &str) -> bool {
         && value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn can_cancel_pending_mm_by_client_id(venue_id: &str, client_order_id: &str) -> bool {
+    if venue_id.eq_ignore_ascii_case("hyperliquid") {
+        return is_hyperliquid_cloid(client_order_id);
+    }
+    if venue_id.eq_ignore_ascii_case("paradex")
+        || venue_id.eq_ignore_ascii_case("aster")
+        || venue_id.eq_ignore_ascii_case("extended")
+    {
+        return client_order_id.starts_with("co_");
+    }
+    if venue_id.eq_ignore_ascii_case("lighter") {
+        return is_lighter_client_order_index(client_order_id);
+    }
+    false
+}
+
+#[derive(Debug, Clone)]
+struct PendingPlaceGuardOrder {
+    venue_index: usize,
+    venue_id: String,
+    side: Side,
+    client_order_id: Option<String>,
+    exchange_order_id: Option<String>,
+    age_ms: TimestampMs,
+    grace_ms: TimestampMs,
+}
+
+fn collect_pending_place_guard_orders(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: TimestampMs,
+) -> Vec<PendingPlaceGuardOrder> {
+    state
+        .live_order_state
+        .active_orders()
+        .into_iter()
+        .filter_map(|order| {
+            if !matches!(order.status, OrderStatus::Pending)
+                || order.purpose != Some(OrderPurpose::Mm)
+            {
+                return None;
+            }
+            let venue_cfg = cfg.venues.get(order.venue_index)?;
+            let grace_ms = cfg.mm.pending_place_grace_ms_for(&venue_cfg.id) as TimestampMs;
+            if grace_ms <= 0 {
+                return None;
+            }
+            let age_ms = now_ms.saturating_sub(order.created_ms);
+            if age_ms > grace_ms {
+                return None;
+            }
+            Some(PendingPlaceGuardOrder {
+                venue_index: order.venue_index,
+                venue_id: venue_cfg.id.to_string(),
+                side: order.side?,
+                client_order_id: order.client_order_id.clone(),
+                exchange_order_id: order.exchange_order_id.clone(),
+                age_ms,
+                grace_ms,
+            })
+        })
+        .collect()
+}
+
+fn pending_place_guard_matches_order_id(
+    candidate: &PendingPlaceGuardOrder,
+    order_id: &str,
+) -> bool {
+    candidate.client_order_id.as_deref() == Some(order_id)
+        || candidate.exchange_order_id.as_deref() == Some(order_id)
+}
+
+fn apply_pending_place_guard(
+    cfg: &Config,
+    state: &GlobalState,
+    intents: &mut Vec<OrderIntent>,
+    now_ms: TimestampMs,
+) -> (u64, u64, u64) {
+    let candidates = collect_pending_place_guard_orders(cfg, state, now_ms);
+    if candidates.is_empty() {
+        return (0, 0, 0);
+    }
+
+    let mut place_suppressed = 0;
+    let mut cancel_suppressed = 0;
+    let mut replace_suppressed = 0;
+    intents.retain(|intent| match intent {
+        OrderIntent::Place(place) if place.purpose == OrderPurpose::Mm => {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.venue_index == place.venue_index && candidate.side == place.side
+                })
+            {
+                place_suppressed += 1;
+                eprintln!(
+                    "PENDING_PLACE_GUARD action=drop_place venue={} side={:?} pending_client_id={} pending_exchange_id={} desired_client_id={} age_ms={} grace_ms={}",
+                    candidate.venue_id,
+                    place.side,
+                    candidate.client_order_id.as_deref().unwrap_or("-"),
+                    candidate.exchange_order_id.as_deref().unwrap_or("-"),
+                    place.client_order_id.as_deref().unwrap_or("-"),
+                    candidate.age_ms,
+                    candidate.grace_ms
+                );
+                false
+            } else {
+                true
+            }
+        }
+        OrderIntent::Cancel(cancel) => {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.venue_index == cancel.venue_index
+                        && pending_place_guard_matches_order_id(candidate, &cancel.order_id)
+                })
+            {
+                cancel_suppressed += 1;
+                eprintln!(
+                    "PENDING_PLACE_GUARD action=drop_cancel venue={} side={:?} order_id={} pending_client_id={} pending_exchange_id={} age_ms={} grace_ms={}",
+                    candidate.venue_id,
+                    candidate.side,
+                    cancel.order_id,
+                    candidate.client_order_id.as_deref().unwrap_or("-"),
+                    candidate.exchange_order_id.as_deref().unwrap_or("-"),
+                    candidate.age_ms,
+                    candidate.grace_ms
+                );
+                false
+            } else {
+                true
+            }
+        }
+        OrderIntent::Replace(replace) if replace.purpose == OrderPurpose::Mm => {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.venue_index == replace.venue_index
+                        && (candidate.side == replace.side
+                            || pending_place_guard_matches_order_id(candidate, &replace.order_id))
+                })
+            {
+                replace_suppressed += 1;
+                eprintln!(
+                    "PENDING_PLACE_GUARD action=drop_replace venue={} side={:?} order_id={} pending_client_id={} pending_exchange_id={} age_ms={} grace_ms={}",
+                    candidate.venue_id,
+                    candidate.side,
+                    replace.order_id,
+                    candidate.client_order_id.as_deref().unwrap_or("-"),
+                    candidate.exchange_order_id.as_deref().unwrap_or("-"),
+                    candidate.age_ms,
+                    candidate.grace_ms
+                );
+                false
+            } else {
+                true
+            }
+        }
+        _ => true,
+    });
+
+    (place_suppressed, cancel_suppressed, replace_suppressed)
+}
+
+fn pending_place_guard_should_run(
+    pause_mm_quotes: bool,
+    inventory_brake_cancel_only_mode: bool,
+    emergency_request_latches: &EmergencyRequestLatchSet,
+) -> bool {
+    !pause_mm_quotes
+        && !inventory_brake_cancel_only_mode
+        && emergency_request_latches.disabled_cancel_all.is_empty()
+        && emergency_request_latches.inventory_brake.is_empty()
+        && emergency_request_latches.soft_unwind.is_empty()
+}
+
 const LIGHTER_CLIENT_ORDER_INDEX_MAX: u64 = 0x0000_ffff_ffff_ffff;
+
+fn is_lighter_client_order_index(value: &str) -> bool {
+    if !is_numeric_id(value) {
+        return false;
+    }
+    value
+        .parse::<u64>()
+        .map(|parsed| (1..=LIGHTER_CLIENT_ORDER_INDEX_MAX).contains(&parsed))
+        .unwrap_or(false)
+}
 
 fn lighter_numeric_client_order_id(seed: &str) -> String {
     if let Ok(parsed) = seed.parse::<u64>() {
@@ -3731,9 +6703,19 @@ fn tracked_mm_open_order_count(state: &GlobalState) -> usize {
         .venues
         .iter()
         .map(|venue| {
-            usize::from(venue.mm_open_bid.is_some()) + usize::from(venue.mm_open_ask.is_some())
+            usize::from(mm_open_counts_as_live(venue.mm_open_bid.as_ref()))
+                + usize::from(mm_open_counts_as_live(venue.mm_open_ask.as_ref()))
         })
         .sum()
+}
+
+fn live_mm_active_order_count(state: &GlobalState) -> usize {
+    state
+        .live_order_state
+        .active_orders()
+        .into_iter()
+        .filter(|order| order.purpose == Some(OrderPurpose::Mm))
+        .count()
 }
 
 fn live_open_order_count_for_venue(state: &GlobalState, venue_index: usize) -> usize {
@@ -3745,7 +6727,73 @@ fn live_open_order_count_for_venue(state: &GlobalState, venue_index: usize) -> u
         .count()
 }
 
-fn sync_venue_order_tracking_from_live_order_state(state: &mut GlobalState, venue_index: usize) {
+fn live_active_order_count_for_venue(state: &GlobalState, venue_index: usize) -> usize {
+    state
+        .live_order_state
+        .active_orders()
+        .into_iter()
+        .filter(|order| order.venue_index == venue_index)
+        .count()
+}
+
+fn mm_open_counts_as_live(order: Option<&MmOpenOrder>) -> bool {
+    order.is_some_and(|tracked| {
+        matches!(tracked.tracking_source, MmOpenTrackingSource::OpenSnapshot)
+    })
+}
+
+fn supported_replace_venue_id(venue_id: &str) -> bool {
+    venue_id.eq_ignore_ascii_case("hyperliquid")
+        || venue_id.eq_ignore_ascii_case("paradex")
+        || venue_id.eq_ignore_ascii_case("extended")
+        || venue_id.eq_ignore_ascii_case("lighter")
+}
+
+fn matching_gap_grace_order<'a>(
+    state: &'a GlobalState,
+    venue_index: usize,
+    side: Side,
+    previous: &MmOpenOrder,
+    now_ms: TimestampMs,
+    supported_replace_gap_grace_ms: TimestampMs,
+) -> Option<&'a LiveOrder> {
+    let supported_replace_gap_grace_ms = supported_replace_gap_grace_ms.max(1);
+    state
+        .live_order_state
+        .active_orders()
+        .into_iter()
+        .filter(|order| {
+            order.venue_index == venue_index
+                && order.purpose == Some(OrderPurpose::Mm)
+                && order.side == Some(side)
+        })
+        .find(|order| {
+            let grace_anchor_ms = order.gap_grace_started_ms.unwrap_or(order.updated_ms);
+            if now_ms.saturating_sub(grace_anchor_ms) > supported_replace_gap_grace_ms {
+                return false;
+            }
+            let lineage_match = previous
+                .client_order_id
+                .as_deref()
+                .zip(order.client_order_id.as_deref())
+                .is_some_and(|(lhs, rhs)| lhs == rhs)
+                || order
+                    .exchange_order_id
+                    .as_deref()
+                    .is_some_and(|value| value == previous.order_id)
+                || order
+                    .client_order_id
+                    .as_deref()
+                    .is_some_and(|value| value == previous.order_id);
+            lineage_match
+        })
+}
+
+fn sync_venue_order_tracking_from_live_order_state(
+    cfg: &Config,
+    state: &mut GlobalState,
+    venue_index: usize,
+) {
     #[derive(Clone)]
     struct SyncedOrder {
         order_id: String,
@@ -3789,6 +6837,56 @@ fn sync_venue_order_tracking_from_live_order_state(state: &mut GlobalState, venu
             .then_with(|| a.order_id.cmp(&b.order_id))
     });
 
+    let (venue_id, previous_bid, previous_ask) = match state.venues.get(venue_index) {
+        Some(venue) => (
+            venue.id.to_string(),
+            venue.mm_open_bid.clone(),
+            venue.mm_open_ask.clone(),
+        ),
+        None => return,
+    };
+
+    let build_gap_grace = |side: Side, previous: Option<MmOpenOrder>| -> Option<MmOpenOrder> {
+        if !supported_replace_venue_id(&venue_id) {
+            return None;
+        }
+        let previous = previous?;
+        let now_ms = crate::types::now_ms();
+        let active_order = matching_gap_grace_order(
+            state,
+            venue_index,
+            side,
+            &previous,
+            now_ms,
+            cfg.mm
+                .supported_replace_snapshot_gap_grace_ms_for(&venue_id) as TimestampMs,
+        )?;
+        let order_id = active_order
+            .exchange_order_id
+            .clone()
+            .or_else(|| {
+                (!previous.order_id.starts_with("co_")).then_some(previous.order_id.clone())
+            })
+            .or_else(|| active_order.client_order_id.clone())?;
+        Some(MmOpenOrder {
+            price: active_order.price.unwrap_or(previous.price),
+            size: active_order
+                .remaining_qty
+                .or(active_order.total_qty)
+                .unwrap_or(previous.size),
+            timestamp_ms: previous.timestamp_ms,
+            order_id,
+            client_order_id: active_order
+                .client_order_id
+                .clone()
+                .or(previous.client_order_id.clone()),
+            tracking_source: MmOpenTrackingSource::GapGrace,
+        })
+    };
+
+    let gap_grace_bid = build_gap_grace(Side::Buy, previous_bid);
+    let gap_grace_ask = build_gap_grace(Side::Sell, previous_ask);
+
     let Some(venue) = state.venues.get_mut(venue_index) else {
         return;
     };
@@ -3824,18 +6922,34 @@ fn sync_venue_order_tracking_from_live_order_state(state: &mut GlobalState, venu
             size: order.size,
             timestamp_ms: order.updated_ms,
             order_id: order.order_id,
+            client_order_id: order.client_order_id,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         };
         match order.side {
             Side::Buy => venue.mm_open_bid = Some(tracked),
             Side::Sell => venue.mm_open_ask = Some(tracked),
         }
     }
+    if venue.mm_open_bid.is_none() {
+        venue.mm_open_bid = gap_grace_bid;
+    }
+    if venue.mm_open_ask.is_none() {
+        venue.mm_open_ask = gap_grace_ask;
+    }
 }
 
 fn live_mm_open_exposure_for_venue(state: &GlobalState, venue_index: usize) -> (f64, f64) {
-    let mut bid_size = 0.0;
-    let mut ask_size = 0.0;
-    for order in state.live_order_state.open_orders() {
+    let venue_id = state
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.id.as_ref())
+        .unwrap_or("");
+    let sum_live_same_side = sum_same_side_live_exposure_for_venue(venue_id);
+    let mut live_bid_size: f64 = 0.0;
+    let mut live_ask_size: f64 = 0.0;
+    let mut pending_bid_size: f64 = 0.0;
+    let mut pending_ask_size: f64 = 0.0;
+    for order in state.live_order_state.active_orders() {
         if order.venue_index != venue_index {
             continue;
         }
@@ -3847,13 +6961,1138 @@ fn live_mm_open_exposure_for_venue(state: &GlobalState, venue_index: usize) -> (
             .or(order.total_qty)
             .unwrap_or(0.0)
             .max(0.0);
-        match order.side {
-            Some(Side::Buy) => bid_size += qty,
-            Some(Side::Sell) => ask_size += qty,
+        match (order.status, order.side) {
+            // The strategy targets at most one MM quote per side per venue. During replace/cancel
+            // overlap, live order state can transiently contain multiple same-side MM orders.
+            // By default, accepted overlap is treated as the largest still-live order per side.
+            // Extended can opt into summing accepted same-side exposure because venue/account
+            // evidence showed those accepted orders can fill together before risk projection reacts.
+            // Pending same-side MM orders are additive risk because each can still land before the
+            // brake cancel reaches the venue, so include their full stacked size in projected exposure.
+            (OrderStatus::Pending, Some(Side::Buy)) => pending_bid_size += qty,
+            (OrderStatus::Pending, Some(Side::Sell)) => pending_ask_size += qty,
+            (
+                OrderStatus::Accepted
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::SnapshotGapGrace,
+                Some(Side::Buy),
+            ) => {
+                if sum_live_same_side {
+                    live_bid_size += qty;
+                } else {
+                    live_bid_size = live_bid_size.max(qty);
+                }
+            }
+            (
+                OrderStatus::Accepted
+                | OrderStatus::PartiallyFilled
+                | OrderStatus::SnapshotGapGrace,
+                Some(Side::Sell),
+            ) => {
+                if sum_live_same_side {
+                    live_ask_size += qty;
+                } else {
+                    live_ask_size = live_ask_size.max(qty);
+                }
+            }
             _ => {}
         }
     }
-    (bid_size, ask_size)
+    (
+        live_bid_size + pending_bid_size,
+        live_ask_size + pending_ask_size,
+    )
+}
+
+fn live_order_matches_cancel_id(order: &LiveOrder, order_id: &str) -> bool {
+    order.exchange_order_id.as_deref() == Some(order_id)
+        || order.client_order_id.as_deref() == Some(order_id)
+}
+
+fn mm_exposure_side_mut(
+    ledger: &mut MmVenueExposureLedger,
+    side: Side,
+) -> &mut MmSideExposureLedger {
+    match side {
+        Side::Buy => &mut ledger.bid,
+        Side::Sell => &mut ledger.ask,
+    }
+}
+
+fn apply_live_mm_exposure_to_side(
+    side_ledger: &mut MmSideExposureLedger,
+    qty: f64,
+    pending: bool,
+    tracked: bool,
+    cancel_covered: bool,
+    sum_accepted_same_side: bool,
+) {
+    if qty <= 0.0 {
+        return;
+    }
+    if cancel_covered {
+        if pending {
+            side_ledger.cancel_covered_pending_sum_tao += qty;
+        } else if sum_accepted_same_side {
+            side_ledger.cancel_covered_accepted_max_tao += qty;
+        } else {
+            side_ledger.cancel_covered_accepted_max_tao =
+                side_ledger.cancel_covered_accepted_max_tao.max(qty);
+        }
+        return;
+    }
+    match (tracked, pending) {
+        (true, true) => side_ledger.tracked_pending_sum_tao += qty,
+        (true, false) if sum_accepted_same_side => {
+            side_ledger.tracked_accepted_max_tao += qty;
+        }
+        (true, false) => {
+            side_ledger.tracked_accepted_max_tao = side_ledger.tracked_accepted_max_tao.max(qty);
+        }
+        (false, true) => side_ledger.unmanaged_pending_sum_tao += qty,
+        (false, false) if sum_accepted_same_side => {
+            side_ledger.unmanaged_accepted_max_tao += qty;
+        }
+        (false, false) => {
+            side_ledger.unmanaged_accepted_max_tao =
+                side_ledger.unmanaged_accepted_max_tao.max(qty);
+        }
+    }
+}
+
+fn build_mm_venue_exposure_ledgers(
+    state: &GlobalState,
+    intents: &[OrderIntent],
+) -> Vec<MmVenueExposureLedger> {
+    let venue_count = state.venues.len();
+    let mut ledgers = state
+        .venues
+        .iter()
+        .enumerate()
+        .map(|(venue_index, venue)| MmVenueExposureLedger {
+            venue_index,
+            venue_id: venue.id.to_string(),
+            ..MmVenueExposureLedger::default()
+        })
+        .collect::<Vec<_>>();
+    let mut cancel_all_venues = HashSet::new();
+    let mut cancel_order_ids_by_venue = vec![HashSet::new(); venue_count];
+    let mut matched_tracked_bid = vec![false; venue_count];
+    let mut matched_tracked_ask = vec![false; venue_count];
+
+    for intent in intents {
+        match intent {
+            OrderIntent::Cancel(cancel) => {
+                if let Some(ids) = cancel_order_ids_by_venue.get_mut(cancel.venue_index) {
+                    ids.insert(cancel.order_id.clone());
+                }
+            }
+            OrderIntent::CancelAll(cancel_all) => {
+                if let Some(venue_index) = cancel_all.venue_index {
+                    cancel_all_venues.insert(venue_index);
+                } else {
+                    cancel_all_venues.extend(0..venue_count);
+                }
+            }
+            OrderIntent::Place(place) if place.purpose == OrderPurpose::Mm => {
+                if let Some(ledger) = ledgers.get_mut(place.venue_index) {
+                    mm_exposure_side_mut(ledger, place.side).pending_new_tao += place.size.max(0.0);
+                }
+            }
+            OrderIntent::Replace(replace) if replace.purpose == OrderPurpose::Mm => {
+                if let Some(ledger) = ledgers.get_mut(replace.venue_index) {
+                    mm_exposure_side_mut(ledger, replace.side).pending_new_tao +=
+                        replace.size.max(0.0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for order in state.live_order_state.active_orders() {
+        if order.purpose != Some(OrderPurpose::Mm) {
+            continue;
+        }
+        let Some(side) = order.side else {
+            continue;
+        };
+        if order.venue_index >= venue_count {
+            continue;
+        }
+        let qty = order
+            .remaining_qty
+            .or(order.total_qty)
+            .unwrap_or(0.0)
+            .max(0.0);
+        if qty <= 0.0 {
+            continue;
+        }
+        let pending = matches!(order.status, OrderStatus::Pending);
+        let tracked = match side {
+            Side::Buy => state.venues[order.venue_index]
+                .mm_open_bid
+                .as_ref()
+                .is_some_and(|tracked| live_order_matches_cancel_id(order, &tracked.order_id)),
+            Side::Sell => state.venues[order.venue_index]
+                .mm_open_ask
+                .as_ref()
+                .is_some_and(|tracked| live_order_matches_cancel_id(order, &tracked.order_id)),
+        };
+        if tracked {
+            match side {
+                Side::Buy => matched_tracked_bid[order.venue_index] = true,
+                Side::Sell => matched_tracked_ask[order.venue_index] = true,
+            }
+        }
+        let cancel_covered = cancel_all_venues.contains(&order.venue_index)
+            || cancel_order_ids_by_venue
+                .get(order.venue_index)
+                .is_some_and(|ids| ids.iter().any(|id| live_order_matches_cancel_id(order, id)));
+        let sum_accepted_same_side =
+            sum_same_side_live_exposure_for_venue(&state.venues[order.venue_index].id);
+        let ledger = &mut ledgers[order.venue_index];
+        apply_live_mm_exposure_to_side(
+            mm_exposure_side_mut(ledger, side),
+            qty,
+            pending,
+            tracked,
+            cancel_covered,
+            sum_accepted_same_side,
+        );
+    }
+
+    for (venue_index, venue) in state.venues.iter().enumerate() {
+        let sum_accepted_same_side = sum_same_side_live_exposure_for_venue(&venue.id);
+        if let Some(order) = venue
+            .mm_open_bid
+            .as_ref()
+            .filter(|_| !matched_tracked_bid[venue_index])
+        {
+            let cancel_covered = cancel_all_venues.contains(&venue_index)
+                || cancel_order_ids_by_venue[venue_index].contains(&order.order_id);
+            apply_live_mm_exposure_to_side(
+                &mut ledgers[venue_index].bid,
+                order.size.max(0.0),
+                false,
+                true,
+                cancel_covered,
+                sum_accepted_same_side,
+            );
+        }
+        if let Some(order) = venue
+            .mm_open_ask
+            .as_ref()
+            .filter(|_| !matched_tracked_ask[venue_index])
+        {
+            let cancel_covered = cancel_all_venues.contains(&venue_index)
+                || cancel_order_ids_by_venue[venue_index].contains(&order.order_id);
+            apply_live_mm_exposure_to_side(
+                &mut ledgers[venue_index].ask,
+                order.size.max(0.0),
+                false,
+                true,
+                cancel_covered,
+                sum_accepted_same_side,
+            );
+        }
+    }
+
+    for (venue_index, ledger) in ledgers.iter_mut().enumerate() {
+        ledger.venue_index = venue_index;
+        ledger.venue_id = state.venues[venue_index].id.to_string();
+    }
+
+    ledgers
+}
+
+fn projected_exposure_from_mm_venue_ledgers(
+    state: &GlobalState,
+    ledgers: &[MmVenueExposureLedger],
+    source: ProjectedExposureSource,
+    include_pending_new: bool,
+) -> ProjectedExposureView {
+    let bid_sizes_tao = ledgers
+        .iter()
+        .map(|ledger| {
+            if include_pending_new {
+                ledger.bid.effective_after_plan_tao()
+            } else {
+                ledger.bid.uncancelled_live_tao()
+            }
+        })
+        .collect();
+    let ask_sizes_tao = ledgers
+        .iter()
+        .map(|ledger| {
+            if include_pending_new {
+                ledger.ask.effective_after_plan_tao()
+            } else {
+                ledger.ask.uncancelled_live_tao()
+            }
+        })
+        .collect();
+    projected_exposure_from_sizes(state, bid_sizes_tao, ask_sizes_tao, source)
+}
+
+fn live_mm_open_order_ids_for_venue_side(
+    cfg: &Config,
+    state: &GlobalState,
+    venue_index: usize,
+    side: Side,
+) -> Vec<String> {
+    let venue_id = cfg
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.id.as_str())
+        .unwrap_or("");
+    let mut seen = HashSet::new();
+    let mut order_ids = Vec::new();
+    for order in state.live_order_state.active_orders() {
+        if order.venue_index != venue_index {
+            continue;
+        }
+        if order.purpose != Some(OrderPurpose::Mm) || order.side != Some(side) {
+            continue;
+        }
+        let order_id = match order.status {
+            OrderStatus::Pending => order.client_order_id.as_ref().filter(|client_order_id| {
+                can_cancel_pending_mm_by_client_id(venue_id, client_order_id)
+            }),
+            OrderStatus::Accepted
+            | OrderStatus::PartiallyFilled
+            | OrderStatus::SnapshotGapGrace => order
+                .exchange_order_id
+                .as_ref()
+                .or(order.client_order_id.as_ref()),
+            _ => None,
+        };
+        let Some(order_id) = order_id else {
+            continue;
+        };
+        if seen.insert(order_id.clone()) {
+            order_ids.push(order_id.clone());
+        }
+    }
+    order_ids.sort();
+    order_ids
+}
+
+fn unmanaged_live_mm_open_order_ids_for_venue_side(
+    cfg: &Config,
+    state: &GlobalState,
+    venue_index: usize,
+    side: Side,
+    now_ms: TimestampMs,
+) -> Vec<String> {
+    let venue_id = cfg
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.id.as_str())
+        .unwrap_or("");
+    let tracked = state.venues.get(venue_index).and_then(|venue| match side {
+        Side::Buy => venue.mm_open_bid.as_ref(),
+        Side::Sell => venue.mm_open_ask.as_ref(),
+    });
+    let mut seen = HashSet::new();
+    let mut order_ids = Vec::new();
+    for order in state.live_order_state.active_orders() {
+        if order.venue_index != venue_index {
+            continue;
+        }
+        if order.purpose != Some(OrderPurpose::Mm) || order.side != Some(side) {
+            continue;
+        }
+        if tracked.is_some_and(|tracked| live_order_matches_cancel_id(order, &tracked.order_id)) {
+            continue;
+        }
+        if matches!(order.status, OrderStatus::Pending)
+            && pending_mm_cancel_deferred_by_grace(cfg, order, venue_id, now_ms)
+        {
+            continue;
+        }
+        let order_id = match order.status {
+            OrderStatus::Pending => order.client_order_id.as_ref().filter(|client_order_id| {
+                can_cancel_pending_mm_by_client_id(venue_id, client_order_id)
+            }),
+            OrderStatus::Accepted
+            | OrderStatus::PartiallyFilled
+            | OrderStatus::SnapshotGapGrace => order
+                .exchange_order_id
+                .as_ref()
+                .or(order.client_order_id.as_ref()),
+            _ => None,
+        };
+        let Some(order_id) = order_id else {
+            continue;
+        };
+        if seen.insert(order_id.clone()) {
+            order_ids.push(order_id.clone());
+        }
+    }
+    order_ids.sort();
+    order_ids
+}
+
+fn pending_mm_cancel_deferred_by_grace(
+    cfg: &Config,
+    order: &LiveOrder,
+    venue_id: &str,
+    now_ms: TimestampMs,
+) -> bool {
+    if order.purpose != Some(OrderPurpose::Mm) || !matches!(order.status, OrderStatus::Pending) {
+        return false;
+    }
+    let Some(client_order_id) = order.client_order_id.as_deref() else {
+        return false;
+    };
+    if !can_cancel_pending_mm_by_client_id(venue_id, client_order_id) {
+        return false;
+    }
+    let grace_ms = cfg.mm.pending_place_grace_ms_for(venue_id) as TimestampMs;
+    grace_ms > 0 && now_ms.saturating_sub(order.created_ms) <= grace_ms
+}
+
+fn cancel_intent_already_covers_order(
+    intents: &[OrderIntent],
+    venue_index: usize,
+    order_id: &str,
+) -> bool {
+    intents.iter().any(|intent| match intent {
+        OrderIntent::Cancel(cancel) => {
+            cancel.venue_index == venue_index && cancel.order_id == order_id
+        }
+        OrderIntent::CancelAll(cancel_all) => {
+            cancel_all.venue_index.is_none_or(|idx| idx == venue_index)
+        }
+        _ => false,
+    })
+}
+
+fn append_unmanaged_live_mm_cancel_intents_for_venue_side(
+    cfg: &Config,
+    state: &GlobalState,
+    venue_index: usize,
+    side: Side,
+    now_ms: TimestampMs,
+    intents: &mut Vec<OrderIntent>,
+) -> usize {
+    let Some(venue_cfg) = cfg.venues.get(venue_index) else {
+        return 0;
+    };
+    let mut appended = 0;
+    for order_id in
+        unmanaged_live_mm_open_order_ids_for_venue_side(cfg, state, venue_index, side, now_ms)
+    {
+        if cancel_intent_already_covers_order(intents, venue_index, &order_id) {
+            continue;
+        }
+        intents.push(OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index,
+            venue_id: venue_cfg.id_arc.clone(),
+            order_id,
+        }));
+        appended += 1;
+    }
+    appended
+}
+
+fn append_projected_mm_budget_unmanaged_suppression_cancels(
+    cfg: &Config,
+    state: &GlobalState,
+    projected_mm_budget: &ProjectedMmBudgetStatus,
+    now_ms: TimestampMs,
+    intents: &mut Vec<OrderIntent>,
+) -> usize {
+    let mut appended = 0;
+    for venue_status in &projected_mm_budget.venues {
+        for (side, suppressed) in [
+            (Side::Buy, venue_status.suppress_bid),
+            (Side::Sell, venue_status.suppress_ask),
+        ] {
+            if !suppressed {
+                continue;
+            }
+            appended += append_unmanaged_live_mm_cancel_intents_for_venue_side(
+                cfg,
+                state,
+                venue_status.venue_index,
+                side,
+                now_ms,
+                intents,
+            );
+        }
+    }
+    appended
+}
+
+fn live_open_order_ids_for_venue(state: &GlobalState, venue_index: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut order_ids = Vec::new();
+    for order in state.live_order_state.open_orders() {
+        if order.venue_index != venue_index {
+            continue;
+        }
+        let Some(order_id) = order
+            .exchange_order_id
+            .as_ref()
+            .or(order.client_order_id.as_ref())
+        else {
+            continue;
+        };
+        if seen.insert(order_id.clone()) {
+            order_ids.push(order_id.clone());
+        }
+    }
+    order_ids.sort();
+    order_ids
+}
+
+fn build_disabled_cancel_intents_for_venue(
+    cfg: &Config,
+    state: &GlobalState,
+    venue_index: usize,
+) -> Vec<OrderIntent> {
+    let Some(venue_cfg) = cfg.venues.get(venue_index) else {
+        return Vec::new();
+    };
+    if venue_cfg.id.eq_ignore_ascii_case("hyperliquid") {
+        let order_ids = live_open_order_ids_for_venue(state, venue_index);
+        if !order_ids.is_empty() {
+            return order_ids
+                .into_iter()
+                .map(|order_id| {
+                    OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                        venue_index,
+                        venue_id: venue_cfg.id_arc.clone(),
+                        order_id,
+                    })
+                })
+                .collect();
+        }
+    }
+    vec![OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
+        venue_index: Some(venue_index),
+        venue_id: Some(venue_cfg.id_arc.clone()),
+    })]
+}
+
+fn build_terminal_exit_quiesce_cancel_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    cancel_state: &mut [TerminalExitCancelState],
+    now_ms: TimestampMs,
+    retry_interval_ms: TimestampMs,
+    retry_venues: Option<&HashSet<usize>>,
+) -> Vec<OrderIntent> {
+    let mut cancel_intents = Vec::new();
+    for venue_index in 0..cfg.venues.len() {
+        let open_orders = live_open_order_count_for_venue(state, venue_index);
+        if open_orders == 0 {
+            if let Some(state) = cancel_state.get_mut(venue_index) {
+                state.reset();
+            }
+            continue;
+        }
+        let retry_allowed = retry_venues
+            .map(|venues| venues.contains(&venue_index))
+            .unwrap_or(false);
+        let retry_due = cancel_state
+            .get(venue_index)
+            .map(|state| state.retry_due(now_ms, retry_interval_ms))
+            .unwrap_or(false);
+        if cancel_state
+            .get(venue_index)
+            .and_then(|state| state.first_sent_ms)
+            .is_some()
+            && !(retry_allowed && retry_due)
+        {
+            continue;
+        }
+        let before = cancel_intents.len();
+        cancel_intents.extend(build_disabled_cancel_intents_for_venue(
+            cfg,
+            state,
+            venue_index,
+        ));
+        if cancel_intents.len() > before {
+            if let Some(state) = cancel_state.get_mut(venue_index) {
+                state.mark_sent(now_ms);
+            }
+        }
+    }
+    cancel_intents
+}
+
+fn terminal_stale_order_reduce_ready_venues(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    cancel_state: &[TerminalExitCancelState],
+    config: &TerminalResidualConvergenceConfig,
+    defer_venues: &HashSet<usize>,
+) -> HashSet<usize> {
+    if config.stale_order_reduce_after_ms <= 0 {
+        return HashSet::new();
+    }
+    defer_venues
+        .iter()
+        .copied()
+        .filter(|venue_index| {
+            if live_open_order_count_for_venue(state, *venue_index) == 0 {
+                return false;
+            }
+            let Some(first_sent_ms) = cancel_state
+                .get(*venue_index)
+                .and_then(|state| state.first_sent_ms)
+            else {
+                return false;
+            };
+            if now_ms.saturating_sub(first_sent_ms) < config.stale_order_reduce_after_ms {
+                return false;
+            }
+            fresh_account_position_tao(cfg, snapshot, *venue_index, now_ms)
+                .map(|position| position.is_finite() && position.abs() > 0.0025 + 1e-9)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn aster_terminal_quiesce_explicit_cancel_retry_enabled() -> bool {
+    parse_bool_env_default(
+        "PARAPHINA_ASTER_TERMINAL_QUIESCE_EXPLICIT_CANCEL_RETRY_ENABLED",
+        false,
+    )
+}
+
+fn aster_terminal_quiesce_explicit_cancel_retry_interval_ms() -> TimestampMs {
+    parse_optional_positive_i64_env(
+        "PARAPHINA_ASTER_TERMINAL_QUIESCE_EXPLICIT_CANCEL_RETRY_INTERVAL_MS",
+    )
+    .unwrap_or(2_000)
+    .max(250) as TimestampMs
+}
+
+fn aster_terminal_quiesce_explicit_cancel_retry_due(
+    now_ms: TimestampMs,
+    last_attempt_ms: Option<TimestampMs>,
+) -> bool {
+    last_attempt_ms
+        .map(|last| {
+            now_ms.saturating_sub(last)
+                >= aster_terminal_quiesce_explicit_cancel_retry_interval_ms()
+        })
+        .unwrap_or(true)
+}
+
+fn push_unique_terminal_cancel_id(ids: &mut Vec<String>, seen: &mut HashSet<String>, id: &str) {
+    if id.trim().is_empty() {
+        return;
+    }
+    let id = id.to_string();
+    if seen.insert(id.clone()) {
+        ids.push(id);
+    }
+}
+
+fn build_aster_terminal_quiesce_explicit_cancel_retry_intents(
+    cfg: &Config,
+    state: &GlobalState,
+) -> Vec<OrderIntent> {
+    let Some(venue_index) = aster_venue_index(cfg) else {
+        return Vec::new();
+    };
+    if live_open_order_count_for_venue(state, venue_index) == 0 {
+        return Vec::new();
+    }
+    let Some(venue_cfg) = cfg.venues.get(venue_index) else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    let mut order_ids = Vec::new();
+    for order_id in live_open_order_ids_for_venue(state, venue_index) {
+        push_unique_terminal_cancel_id(&mut order_ids, &mut seen, &order_id);
+    }
+    if let Some(venue_state) = state.venues.get(venue_index) {
+        for order in [
+            venue_state.mm_open_bid.as_ref(),
+            venue_state.mm_open_ask.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            push_unique_terminal_cancel_id(&mut order_ids, &mut seen, &order.order_id);
+            if let Some(client_order_id) = order.client_order_id.as_deref() {
+                push_unique_terminal_cancel_id(&mut order_ids, &mut seen, client_order_id);
+            }
+        }
+    }
+    order_ids
+        .into_iter()
+        .map(|order_id| {
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index,
+                venue_id: venue_cfg.id_arc.clone(),
+                order_id,
+            })
+        })
+        .collect()
+}
+
+async fn send_terminal_exit_cancel_intents_sync(
+    cfg: &Config,
+    priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    mut cancel_intents: Vec<OrderIntent>,
+    now_ms: TimestampMs,
+    tick: u64,
+) -> (
+    OrderWaitOutcomeKind,
+    Option<Vec<LiveExecutionEvent>>,
+    Vec<usize>,
+) {
+    let venues = venue_indices_for_order_intents(&cancel_intents);
+    normalize_live_client_order_ids(&mut cancel_intents, tick);
+    let action_batch = build_live_action_batch(
+        cfg,
+        &cancel_intents,
+        now_ms,
+        tick.saturating_mul(32).saturating_add(31),
+    );
+    let (outcome, events) = send_order_and_wait_with_status(
+        priority_order_tx,
+        cancel_intents,
+        action_batch,
+        now_ms,
+        1_000,
+        TransportHint::Default,
+        "terminal_exit_cancel",
+        tick,
+    )
+    .await;
+    (outcome, events, venues)
+}
+
+fn build_unlatched_disabled_cancel_intents_for_venues(
+    cfg: &Config,
+    state: &GlobalState,
+    emergency_request_latches: &mut EmergencyRequestLatchSet,
+    now_ms: TimestampMs,
+    target_venues: &[usize],
+) -> Vec<OrderIntent> {
+    let mut cancel_intents = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for venue_index in target_venues.iter().copied() {
+        if !seen.insert(venue_index) {
+            continue;
+        }
+        if emergency_request_latched(
+            emergency_request_latches,
+            EmergencyRequestClass::DisabledCancelAll,
+            cfg,
+            state,
+            now_ms,
+            venue_index,
+        ) {
+            continue;
+        }
+        cancel_intents.extend(build_disabled_cancel_intents_for_venue(
+            cfg,
+            state,
+            venue_index,
+        ));
+    }
+    cancel_intents
+}
+
+async fn dispatch_disabled_cancel_intents(
+    cfg: &Config,
+    state: &mut GlobalState,
+    priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    emergency_request_latches: &mut EmergencyRequestLatchSet,
+    cancel_intents: Vec<OrderIntent>,
+    now_ms: TimestampMs,
+    batch_id: u64,
+    tick: u64,
+    lighter_emergency_latch_ms: TimestampMs,
+    lighter_emergency_max_latch_ms: TimestampMs,
+    transport_hint: TransportHint,
+    label: &str,
+) -> Vec<EmergencyRequestDispatchStatus> {
+    if cancel_intents.is_empty() {
+        return Vec::new();
+    }
+    let mut dispatches = Vec::new();
+    let mut sync_cancel_intents = cancel_intents;
+    let async_cancel_requests = take_emergency_single_flight_intents(
+        EmergencyRequestClass::DisabledCancelAll,
+        cfg,
+        &mut sync_cancel_intents,
+    );
+    dispatches.extend(send_emergency_single_flight_requests(
+        cfg,
+        priority_order_tx,
+        emergency_request_latches,
+        state,
+        async_cancel_requests,
+        EmergencyRequestClass::DisabledCancelAll,
+        now_ms,
+        tick,
+        lighter_emergency_latch_ms,
+        lighter_emergency_max_latch_ms,
+        TransportHint::HyperliquidSyncControl,
+        label,
+    ));
+    let sync_cancel_venues = venue_indices_for_order_intents(&sync_cancel_intents);
+    let (cancel_outcome, cancel_events) = if !sync_cancel_intents.is_empty() {
+        let action_batch = build_live_action_batch(cfg, &sync_cancel_intents, now_ms, batch_id);
+        send_order_and_wait_with_status(
+            priority_order_tx,
+            sync_cancel_intents,
+            action_batch,
+            now_ms,
+            1000,
+            transport_hint,
+            label,
+            tick,
+        )
+        .await
+    } else {
+        (OrderWaitOutcomeKind::Events, None)
+    };
+    let sync_outcome = emergency_request_dispatch_outcome(cancel_outcome);
+    for venue_index in &sync_cancel_venues {
+        dispatches.push(emergency_request_dispatch_status(
+            cfg,
+            EmergencyRequestClass::DisabledCancelAll,
+            *venue_index,
+            EmergencyRequestTransportMode::SyncWait,
+            sync_outcome,
+        ));
+    }
+    if matches!(
+        cancel_outcome,
+        OrderWaitOutcomeKind::Timeout | OrderWaitOutcomeKind::HandlerDropped
+    ) {
+        for venue_index in sync_cancel_venues {
+            latch_emergency_request(
+                emergency_request_latches,
+                EmergencyRequestClass::DisabledCancelAll,
+                cfg,
+                state,
+                venue_index,
+                now_ms,
+                lighter_emergency_latch_ms,
+                lighter_emergency_max_latch_ms,
+            );
+        }
+    }
+    if let Some(events) = cancel_events {
+        #[cfg(feature = "event_log")]
+        log_live_execution_events_env(now_ms.max(0) as u64, now_ms, "gateway", &events);
+        let core_events = live_events_to_core(&events);
+        let fills = apply_execution_events(state, &core_events, now_ms);
+        if !fills.is_empty() {
+            apply_live_fills(cfg, state, &fills, now_ms);
+            state.recompute_after_fills(cfg);
+        }
+    }
+    dispatches
+}
+
+fn canary_breach_is_open_order_only(limits: &CanaryLimitStatus) -> bool {
+    limits.open_orders_breached
+        && !limits.net_breached
+        && !limits.gross_breached
+        && !limits.venue_breached
+}
+
+fn venue_ids_for_indices(cfg: &Config, venue_indices: &[usize]) -> Vec<String> {
+    venue_indices
+        .iter()
+        .filter_map(|venue_index| cfg.venues.get(*venue_index).map(|venue| venue.id.clone()))
+        .collect()
+}
+
+fn canary_breach_response_drop_cancels_for_positioned_venues(limits: &CanaryLimitStatus) -> bool {
+    canary_breach_is_open_order_only(limits)
+}
+
+fn canary_breach_open_order_target_venues(state: &GlobalState) -> Vec<usize> {
+    state
+        .venues
+        .iter()
+        .enumerate()
+        .filter_map(|(venue_index, _)| {
+            (live_open_order_count_for_venue(state, venue_index) > 0).then_some(venue_index)
+        })
+        .collect()
+}
+
+fn canary_breach_target_venues(state: &GlobalState) -> Vec<usize> {
+    let mut targets = std::collections::BTreeSet::new();
+    for (venue_index, venue) in state.venues.iter().enumerate() {
+        if venue.position_tao.abs() > 1e-9
+            || live_open_order_count_for_venue(state, venue_index) > 0
+        {
+            targets.insert(venue_index);
+        }
+    }
+    targets.into_iter().collect()
+}
+
+fn accumulate_breach_cover(
+    selected: &mut std::collections::BTreeSet<usize>,
+    candidates: &[(usize, f64)],
+    required: f64,
+) {
+    let mut remaining = required.max(0.0);
+    for (venue_index, weight) in candidates {
+        if selected.contains(venue_index) {
+            remaining -= *weight;
+        }
+    }
+    if remaining <= 1e-12 {
+        return;
+    }
+    for (venue_index, weight) in candidates {
+        if *weight <= 1e-12 {
+            continue;
+        }
+        if selected.insert(*venue_index) {
+            remaining -= *weight;
+        }
+        if remaining <= 1e-12 {
+            break;
+        }
+    }
+}
+
+fn canary_breach_response_target_venues(
+    state: &GlobalState,
+    limits: &CanaryLimitStatus,
+) -> Vec<usize> {
+    if canary_breach_is_open_order_only(limits) {
+        return canary_breach_open_order_target_venues(state);
+    }
+    let mut selected = std::collections::BTreeSet::new();
+
+    if limits.venue_breached {
+        if let Some(limit) = limits.max_abs_venue_position_tao {
+            for (venue_index, venue) in state.venues.iter().enumerate() {
+                if venue.position_tao.abs() > limit + 1e-12 {
+                    selected.insert(venue_index);
+                }
+            }
+        }
+    }
+
+    if limits.net_breached {
+        let net_sign = limits.q_global_tao.signum();
+        let mut same_side = state
+            .venues
+            .iter()
+            .enumerate()
+            .filter_map(|(venue_index, venue)| {
+                let size = venue.position_tao.abs();
+                if size <= 1e-12 || venue.position_tao.signum() != net_sign {
+                    return None;
+                }
+                Some((venue_index, size))
+            })
+            .collect::<Vec<_>>();
+        same_side.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        accumulate_breach_cover(&mut selected, &same_side, limits.net_excess_tao);
+    }
+
+    if limits.gross_breached {
+        let mut positioned = state
+            .venues
+            .iter()
+            .enumerate()
+            .filter_map(|(venue_index, venue)| {
+                let size = venue.position_tao.abs();
+                (size > 1e-12).then_some((venue_index, size))
+            })
+            .collect::<Vec<_>>();
+        positioned.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        accumulate_breach_cover(&mut selected, &positioned, limits.gross_excess_tao);
+    }
+
+    if limits.open_orders_breached {
+        let mut open_order_venues = state
+            .venues
+            .iter()
+            .enumerate()
+            .filter_map(|(venue_index, _)| {
+                let count = live_open_order_count_for_venue(state, venue_index);
+                (count > 0).then_some((venue_index, count as f64))
+            })
+            .collect::<Vec<_>>();
+        open_order_venues
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        accumulate_breach_cover(
+            &mut selected,
+            &open_order_venues,
+            limits.open_order_excess as f64,
+        );
+    }
+
+    if selected.is_empty() {
+        return canary_breach_target_venues(state);
+    }
+
+    selected.into_iter().collect()
+}
+
+fn canary_breach_response_cancel_scope_venues(
+    state: &GlobalState,
+    limits: &CanaryLimitStatus,
+    target_venues: &[usize],
+) -> Vec<usize> {
+    if canary_breach_is_open_order_only(limits) {
+        return target_venues.to_vec();
+    }
+
+    let mut cancel_scope = target_venues
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (venue_index, _) in state.venues.iter().enumerate() {
+        if live_active_order_count_for_venue(state, venue_index) > 0 {
+            cancel_scope.insert(venue_index);
+        }
+    }
+    cancel_scope.into_iter().collect()
+}
+
+fn canary_breach_positioned_target_venues(
+    cfg: &Config,
+    state: &GlobalState,
+    target_venues: &[usize],
+) -> Vec<usize> {
+    target_venues
+        .iter()
+        .copied()
+        .filter(|venue_index| venue_has_material_position(cfg, state, *venue_index))
+        .collect()
+}
+
+fn canary_flatten_observation_venues(observation: &CanaryFlattenObservationState) -> Vec<usize> {
+    observation
+        .baselines
+        .iter()
+        .map(|(venue_index, _)| *venue_index)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn canary_flatten_observation_covers_target_venues(
+    observation: &CanaryFlattenObservationState,
+    target_venues: &[usize],
+) -> bool {
+    if target_venues.is_empty() {
+        return true;
+    }
+    if observation.baselines.is_empty() {
+        return false;
+    }
+    let observed = observation
+        .baselines
+        .iter()
+        .map(|(venue_index, _)| *venue_index)
+        .collect::<std::collections::BTreeSet<_>>();
+    target_venues
+        .iter()
+        .all(|venue_index| observed.contains(venue_index))
+}
+
+fn canary_breach_response_target_snapshot(
+    cfg: &Config,
+    state: &GlobalState,
+    limits: &CanaryLimitStatus,
+    observation: &CanaryFlattenObservationState,
+    now_ms: TimestampMs,
+) -> CanaryBreachResponseTargetSnapshot {
+    let target_venues = canary_breach_response_target_venues(state, limits);
+    let positioned_target_venues =
+        canary_breach_positioned_target_venues(cfg, state, &target_venues);
+    let cancel_scope_venues =
+        canary_breach_response_cancel_scope_venues(state, limits, &target_venues);
+    let observation_venues = canary_flatten_observation_venues(observation);
+    let raw_observation_active = canary_flatten_observation_active(cfg, state, observation, now_ms);
+    let observation_covers_positioned_targets =
+        canary_flatten_observation_covers_target_venues(observation, &positioned_target_venues);
+    CanaryBreachResponseTargetSnapshot {
+        target_venues,
+        positioned_target_venues,
+        cancel_scope_venues,
+        observation_venues,
+        raw_observation_active,
+        observation_covers_positioned_targets,
+    }
+}
+
+fn apply_canary_breach_response_target_snapshot(
+    status: &mut CanaryBreachResponseStatus,
+    cfg: &Config,
+    snapshot: &CanaryBreachResponseTargetSnapshot,
+) {
+    status.candidate_target_venues = venue_ids_for_indices(cfg, &snapshot.target_venues);
+    status.candidate_positioned_target_venues =
+        venue_ids_for_indices(cfg, &snapshot.positioned_target_venues);
+    status.candidate_cancel_scope_venues =
+        venue_ids_for_indices(cfg, &snapshot.cancel_scope_venues);
+    status.observation_active = snapshot.raw_observation_active;
+    status.observation_venues = venue_ids_for_indices(cfg, &snapshot.observation_venues);
+    status.observation_covers_candidate_targets = snapshot.observation_covers_positioned_targets;
+}
+
+fn build_canary_breach_flatten_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    target_venues: &[usize],
+    tick: u64,
+) -> Vec<OrderIntent> {
+    let mut intents = Vec::new();
+    let target_venues = target_venues.iter().copied().collect::<HashSet<_>>();
+    for (venue_index, venue) in state.venues.iter().enumerate() {
+        if !target_venues.contains(&venue_index) {
+            continue;
+        }
+        let Some(venue_cfg) = cfg.venues.get(venue_index) else {
+            continue;
+        };
+        if venue.status != VenueStatus::Healthy {
+            continue;
+        }
+        let size = venue.position_tao.abs();
+        if size < venue_cfg.lot_size_tao.max(1e-9) {
+            continue;
+        }
+        let side = if venue.position_tao > 0.0 {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let Some(price) = inventory_brake_unwind_price(cfg, state, venue_index, side) else {
+            continue;
+        };
+        intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
+            venue_index,
+            venue_id: venue_cfg.id_arc.clone(),
+            side,
+            price,
+            size,
+            purpose: OrderPurpose::Exit,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: Some(format!("canary_exit_{}_{}", venue_index, tick)),
+        }));
+    }
+    intents
 }
 
 fn venue_index_for_order_intent(intent: &OrderIntent) -> Option<usize> {
@@ -3900,14 +8139,29 @@ fn build_live_action_batch(
     action_batch
 }
 
-fn emergency_single_flight_enabled_for_venue_id(venue_id: &str) -> bool {
-    matches!(
-        venue_id.to_ascii_lowercase().as_str(),
-        "lighter" | "aster" | "paradex"
-    )
+fn emergency_single_flight_enabled_for(class: EmergencyRequestClass, venue_id: &str) -> bool {
+    match (class, venue_id.to_ascii_lowercase().as_str()) {
+        (
+            EmergencyRequestClass::DisabledCancelAll
+            | EmergencyRequestClass::InventoryBrake
+            | EmergencyRequestClass::SoftUnwind,
+            "hyperliquid",
+        ) => true,
+        (
+            EmergencyRequestClass::DisabledCancelAll | EmergencyRequestClass::InventoryBrake,
+            "extended",
+        ) => true,
+        (_, "lighter" | "aster") => true,
+        (
+            EmergencyRequestClass::DisabledCancelAll | EmergencyRequestClass::InventoryBrake,
+            "paradex",
+        ) => true,
+        _ => false,
+    }
 }
 
 fn take_emergency_single_flight_intents(
+    class: EmergencyRequestClass,
     cfg: &Config,
     intents: &mut Vec<OrderIntent>,
 ) -> Vec<(usize, Vec<OrderIntent>)> {
@@ -3916,7 +8170,7 @@ fn take_emergency_single_flight_intents(
         let Some(venue_cfg) = cfg.venues.get(venue_index) else {
             continue;
         };
-        if !emergency_single_flight_enabled_for_venue_id(venue_cfg.id.as_str()) {
+        if !emergency_single_flight_enabled_for(class, venue_cfg.id.as_str()) {
             continue;
         }
         let venue_intents = intents_for_venue(intents, venue_index);
@@ -3940,9 +8194,10 @@ fn send_emergency_single_flight_requests(
     tick: u64,
     latch_ms: TimestampMs,
     max_latch_ms: TimestampMs,
+    transport_hint: TransportHint,
     label_prefix: &str,
-) -> Vec<usize> {
-    let mut sent = Vec::new();
+) -> Vec<EmergencyRequestDispatchStatus> {
+    let mut statuses = Vec::new();
     for (venue_index, intents) in requests {
         if intents.is_empty() {
             continue;
@@ -3959,21 +8214,46 @@ fn send_emergency_single_flight_requests(
             "{label_prefix}_{}_single_flight",
             cfg.venues[venue_index].id
         );
-        if send_order_fire_and_forget(order_tx, intents, action_batch, now_ms, &label, tick) {
-            latch_emergency_request(
-                latches,
-                class,
+        let accepted = send_order_fire_and_forget(
+            order_tx,
+            intents,
+            action_batch,
+            now_ms,
+            transport_hint,
+            &label,
+            tick,
+        );
+        // Channel-full means immediate per-tick retries would only keep the lane saturated.
+        // Use the same bounded latch/backoff whether this request was accepted or dropped.
+        latch_emergency_request(
+            latches,
+            class,
+            cfg,
+            state,
+            venue_index,
+            now_ms,
+            latch_ms,
+            max_latch_ms,
+        );
+        if accepted {
+            statuses.push(emergency_request_dispatch_status(
                 cfg,
-                state,
+                class,
                 venue_index,
-                now_ms,
-                latch_ms,
-                max_latch_ms,
-            );
-            sent.push(venue_index);
+                EmergencyRequestTransportMode::SingleFlightLatch,
+                EmergencyRequestDispatchOutcome::Events,
+            ));
+        } else {
+            statuses.push(emergency_request_dispatch_status(
+                cfg,
+                class,
+                venue_index,
+                EmergencyRequestTransportMode::SingleFlightLatch,
+                EmergencyRequestDispatchOutcome::ChannelFull,
+            ));
         }
     }
-    sent
+    statuses
 }
 
 fn emergency_request_latch_entries_mut(
@@ -4037,7 +8317,8 @@ fn clear_emergency_request_latch_if_progressed(
             resolved_open_orders || open_order_progress || max_expired
         }
         EmergencyRequestClass::InventoryBrake | EmergencyRequestClass::SoftUnwind => {
-            (resolved_position && resolved_open_orders)
+            ((resolved_position && resolved_open_orders)
+                && !(latch.flat_baseline_retry_required && now_ms < latch.expires_at_ms))
                 || position_progress
                 || open_order_progress
                 || max_expired
@@ -4119,12 +8400,17 @@ fn latch_emergency_request(
         .map(|venue| venue.position_tao.abs())
         .unwrap_or(0.0);
     let baseline_open_orders = live_open_order_count_for_venue(state, venue_index);
+    let progress_tao = emergency_request_latch_progress_tao(cfg, venue_index);
+    let flat_baseline_retry_required = class == EmergencyRequestClass::InventoryBrake
+        && baseline_abs_position_tao <= progress_tao
+        && baseline_open_orders == 0;
     let bounded_max_latch_ms = max_latch_ms.max(latch_ms);
     let entries = emergency_request_latch_entries_mut(latches, class);
     let replacement = EmergencyRequestLatch {
         class,
         venue_index,
         venue_id: venue_cfg.id.to_string(),
+        flat_baseline_retry_required,
         active_since_ms: now_ms,
         retry_latch_ms: latch_ms,
         expires_at_ms: now_ms.saturating_add(latch_ms),
@@ -4196,23 +8482,40 @@ fn max_abs_venue_position_tao(state: &GlobalState) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
-fn projected_worsening_position_tao(state: &GlobalState, venue_index: usize) -> f64 {
+fn tracked_and_live_mm_open_exposure_for_venue(
+    state: &GlobalState,
+    venue_index: usize,
+) -> (f64, f64) {
     let Some(venue) = state.venues.get(venue_index) else {
-        return 0.0;
+        return (0.0, 0.0);
     };
     let tracked_bid_size = venue
         .mm_open_bid
         .as_ref()
+        .filter(|order| matches!(order.tracking_source, MmOpenTrackingSource::OpenSnapshot))
         .map(|order| order.size.max(0.0))
         .unwrap_or(0.0);
     let tracked_ask_size = venue
         .mm_open_ask
         .as_ref()
+        .filter(|order| matches!(order.tracking_source, MmOpenTrackingSource::OpenSnapshot))
         .map(|order| order.size.max(0.0))
         .unwrap_or(0.0);
     let (live_bid_size, live_ask_size) = live_mm_open_exposure_for_venue(state, venue_index);
     let bid_size = tracked_bid_size.max(live_bid_size);
     let ask_size = tracked_ask_size.max(live_ask_size);
+    (bid_size, ask_size)
+}
+
+fn projected_worsening_position_from_exposure(
+    state: &GlobalState,
+    venue_index: usize,
+    bid_size: f64,
+    ask_size: f64,
+) -> f64 {
+    let Some(venue) = state.venues.get(venue_index) else {
+        return 0.0;
+    };
     let global_sign = state
         .q_global_tao
         .partial_cmp(&0.0)
@@ -4238,48 +8541,671 @@ fn projected_worsening_position_tao(state: &GlobalState, venue_index: usize) -> 
     }
 }
 
+fn projected_worsening_position_tao(state: &GlobalState, venue_index: usize) -> f64 {
+    let (bid_size, ask_size) = tracked_and_live_mm_open_exposure_for_venue(state, venue_index);
+    projected_worsening_position_from_exposure(state, venue_index, bid_size, ask_size)
+}
+
+fn projected_directional_net_position_from_exposure(
+    state: &GlobalState,
+    venue_index: usize,
+    bid_size: f64,
+    ask_size: f64,
+) -> f64 {
+    let Some(venue) = state.venues.get(venue_index) else {
+        return 0.0;
+    };
+    let global_sign = state
+        .q_global_tao
+        .partial_cmp(&0.0)
+        .unwrap_or(Ordering::Equal);
+    match venue
+        .position_tao
+        .partial_cmp(&0.0)
+        .unwrap_or(Ordering::Equal)
+    {
+        Ordering::Greater => venue.position_tao + bid_size,
+        Ordering::Less => venue.position_tao - ask_size,
+        Ordering::Equal => match global_sign {
+            Ordering::Greater => bid_size,
+            Ordering::Less => -ask_size,
+            Ordering::Equal => {
+                if bid_size > 0.0 && ask_size > 0.0 {
+                    bid_size - ask_size
+                } else if bid_size > 0.0 {
+                    bid_size
+                } else {
+                    -ask_size
+                }
+            }
+        },
+    }
+}
+
+fn projected_directional_net_position_tao(state: &GlobalState, venue_index: usize) -> f64 {
+    let (bid_size, ask_size) = tracked_and_live_mm_open_exposure_for_venue(state, venue_index);
+    projected_directional_net_position_from_exposure(state, venue_index, bid_size, ask_size)
+}
+
+fn projected_exposure_from_sizes(
+    state: &GlobalState,
+    bid_sizes_tao: Vec<f64>,
+    ask_sizes_tao: Vec<f64>,
+    source: ProjectedExposureSource,
+) -> ProjectedExposureView {
+    let mut q_global_tao = 0.0;
+    let mut q_gross_tao = 0.0;
+    let mut q_max_abs_venue_tao: f64 = 0.0;
+    for venue_index in 0..state.venues.len() {
+        let bid_size = bid_sizes_tao.get(venue_index).copied().unwrap_or(0.0);
+        let ask_size = ask_sizes_tao.get(venue_index).copied().unwrap_or(0.0);
+        q_global_tao += projected_directional_net_position_from_exposure(
+            state,
+            venue_index,
+            bid_size,
+            ask_size,
+        );
+        let worsening =
+            projected_worsening_position_from_exposure(state, venue_index, bid_size, ask_size)
+                .abs();
+        q_gross_tao += worsening;
+        q_max_abs_venue_tao = q_max_abs_venue_tao.max(worsening);
+    }
+    ProjectedExposureView {
+        source,
+        bid_sizes_tao,
+        ask_sizes_tao,
+        q_global_tao,
+        q_gross_tao,
+        q_max_abs_venue_tao,
+    }
+}
+
+fn raw_projected_exposure_view(state: &GlobalState) -> ProjectedExposureView {
+    let ledgers = build_mm_venue_exposure_ledgers(state, &[]);
+    projected_exposure_from_mm_venue_ledgers(
+        state,
+        &ledgers,
+        ProjectedExposureSource::RawState,
+        false,
+    )
+}
+
+fn effective_projected_exposure_from_mm_intents(
+    state: &GlobalState,
+    intents: &[OrderIntent],
+) -> ProjectedExposureView {
+    let ledgers = build_mm_venue_exposure_ledgers(state, intents);
+    projected_exposure_from_mm_venue_ledgers(
+        state,
+        &ledgers,
+        ProjectedExposureSource::PostPlan,
+        true,
+    )
+}
+
 fn projected_gross_position_tao(state: &GlobalState) -> f64 {
-    state
-        .venues
-        .iter()
-        .enumerate()
-        .map(|(venue_index, _)| projected_worsening_position_tao(state, venue_index).abs())
-        .sum()
+    raw_projected_exposure_view(state).q_gross_tao
 }
 
 fn projected_max_abs_venue_position_tao(state: &GlobalState) -> f64 {
-    state
-        .venues
-        .iter()
-        .enumerate()
-        .map(|(venue_index, _)| projected_worsening_position_tao(state, venue_index).abs())
-        .fold(0.0_f64, f64::max)
+    raw_projected_exposure_view(state).q_max_abs_venue_tao
 }
 
 fn projected_net_position_tao(state: &GlobalState) -> f64 {
-    state
-        .venues
-        .iter()
-        .enumerate()
-        .map(|(venue_index, _)| projected_worsening_position_tao(state, venue_index))
-        .sum()
+    raw_projected_exposure_view(state).q_global_tao
 }
 
-fn evaluate_inventory_brake(
+#[derive(Debug, Clone, Copy)]
+struct ProjectedMmBudgetCandidate {
+    venue_index: usize,
+    keep_bid: bool,
+    keep_ask: bool,
+    suppress_bid: bool,
+    suppress_ask: bool,
+    candidate_size_tao: f64,
+    live_worsening_exposure_tao: f64,
+    net_delta_tao: f64,
+    gross_increment_tao: f64,
+    projected_abs_venue_tao: f64,
+    rotation_rank: usize,
+    tracked_live_bid_tao: f64,
+    tracked_live_ask_tao: f64,
+    unmanaged_live_bid_tao: f64,
+    unmanaged_live_ask_tao: f64,
+    cancel_covered_live_bid_tao: f64,
+    cancel_covered_live_ask_tao: f64,
+    pending_new_bid_tao: f64,
+    pending_new_ask_tao: f64,
+    effective_bid_tao: f64,
+    effective_ask_tao: f64,
+}
+
+fn append_projected_mm_budget_candidate_cleanup_cancels(
+    cfg: &Config,
+    state: &GlobalState,
+    candidate: &ProjectedMmBudgetCandidate,
+    now_ms: TimestampMs,
+    intents: &mut Vec<OrderIntent>,
+) -> usize {
+    let mut appended = 0;
+    if candidate.suppress_bid {
+        appended += append_unmanaged_live_mm_cancel_intents_for_venue_side(
+            cfg,
+            state,
+            candidate.venue_index,
+            Side::Buy,
+            now_ms,
+            intents,
+        );
+    }
+    if candidate.suppress_ask {
+        appended += append_unmanaged_live_mm_cancel_intents_for_venue_side(
+            cfg,
+            state,
+            candidate.venue_index,
+            Side::Sell,
+            now_ms,
+            intents,
+        );
+    }
+    appended
+}
+
+fn projected_mm_candidate_size_tao(cfg: &Config, venue_index: usize) -> f64 {
+    let Some(vcfg) = cfg.venues.get(venue_index) else {
+        return 0.0;
+    };
+    cfg.mm
+        .max_quote_size_tao_for(&vcfg.id)
+        .unwrap_or(vcfg.lot_size_tao)
+        .max(vcfg.lot_size_tao)
+        .max(0.0)
+}
+
+fn projected_mm_budget_candidate(
+    cfg: &Config,
+    state: &GlobalState,
+    quote: &crate::mm::MmQuote,
+    rotation_rank: usize,
+    venue_ledger: &MmVenueExposureLedger,
+) -> Option<ProjectedMmBudgetCandidate> {
+    let venue_index = quote.venue_index;
+    let venue = state.venues.get(venue_index)?;
+    let Some(_vcfg) = cfg.venues.get(venue_index) else {
+        return None;
+    };
+    let candidate_size_tao = projected_mm_candidate_size_tao(cfg, venue_index);
+    if candidate_size_tao <= 0.0 {
+        return None;
+    }
+    let bid_live = quote.bid.is_some();
+    let ask_live = quote.ask.is_some();
+    if !bid_live && !ask_live {
+        return None;
+    }
+
+    let global_sign = state
+        .q_global_tao
+        .partial_cmp(&0.0)
+        .unwrap_or(Ordering::Equal);
+    let base_bid_exposure = venue_ledger.bid.uncancelled_live_tao();
+    let base_ask_exposure = venue_ledger.ask.uncancelled_live_tao();
+    let base_directional = projected_directional_net_position_from_exposure(
+        state,
+        venue_index,
+        base_bid_exposure,
+        base_ask_exposure,
+    );
+    let base_worsening = projected_worsening_position_from_exposure(
+        state,
+        venue_index,
+        base_bid_exposure,
+        base_ask_exposure,
+    )
+    .abs();
+    let build_candidate =
+        |keep_bid: bool, keep_ask: bool, suppress_bid: bool, suppress_ask: bool| {
+            let selected_bid = if keep_bid {
+                base_bid_exposure.max(
+                    quote
+                        .bid
+                        .as_ref()
+                        .map(|level| level.size.max(0.0))
+                        .unwrap_or(0.0),
+                )
+            } else {
+                base_bid_exposure
+            };
+            let selected_ask = if keep_ask {
+                base_ask_exposure.max(
+                    quote
+                        .ask
+                        .as_ref()
+                        .map(|level| level.size.max(0.0))
+                        .unwrap_or(0.0),
+                )
+            } else {
+                base_ask_exposure
+            };
+            let selected_directional = projected_directional_net_position_from_exposure(
+                state,
+                venue_index,
+                selected_bid,
+                selected_ask,
+            );
+            let selected_worsening = projected_worsening_position_from_exposure(
+                state,
+                venue_index,
+                selected_bid,
+                selected_ask,
+            )
+            .abs();
+            ProjectedMmBudgetCandidate {
+                venue_index,
+                keep_bid,
+                keep_ask,
+                suppress_bid,
+                suppress_ask,
+                candidate_size_tao: selected_worsening.max(candidate_size_tao),
+                live_worsening_exposure_tao: base_worsening,
+                net_delta_tao: selected_directional - base_directional,
+                gross_increment_tao: (selected_worsening - base_worsening).max(0.0),
+                projected_abs_venue_tao: selected_worsening,
+                rotation_rank,
+                tracked_live_bid_tao: venue_ledger.bid.tracked_live_tao(),
+                tracked_live_ask_tao: venue_ledger.ask.tracked_live_tao(),
+                unmanaged_live_bid_tao: venue_ledger.bid.unmanaged_live_tao(),
+                unmanaged_live_ask_tao: venue_ledger.ask.unmanaged_live_tao(),
+                cancel_covered_live_bid_tao: venue_ledger.bid.cancel_covered_live_tao(),
+                cancel_covered_live_ask_tao: venue_ledger.ask.cancel_covered_live_tao(),
+                pending_new_bid_tao: venue_ledger.bid.pending_new_tao,
+                pending_new_ask_tao: venue_ledger.ask.pending_new_tao,
+                effective_bid_tao: selected_bid,
+                effective_ask_tao: selected_ask,
+            }
+        };
+
+    match venue
+        .position_tao
+        .partial_cmp(&0.0)
+        .unwrap_or(Ordering::Equal)
+    {
+        Ordering::Greater => {
+            if !bid_live {
+                return None;
+            }
+            Some(build_candidate(true, ask_live, true, false))
+        }
+        Ordering::Less => {
+            if !ask_live {
+                return None;
+            }
+            Some(build_candidate(bid_live, true, false, true))
+        }
+        Ordering::Equal => match global_sign {
+            Ordering::Greater => {
+                if !bid_live {
+                    return None;
+                }
+                Some(build_candidate(true, ask_live, true, false))
+            }
+            Ordering::Less => {
+                if !ask_live {
+                    return None;
+                }
+                Some(build_candidate(bid_live, true, false, true))
+            }
+            Ordering::Equal => {
+                if bid_live && ask_live {
+                    Some(build_candidate(true, true, true, true))
+                } else if bid_live {
+                    Some(build_candidate(true, false, true, false))
+                } else if ask_live {
+                    Some(build_candidate(false, true, false, true))
+                } else {
+                    None
+                }
+            }
+        },
+    }
+}
+
+fn projected_exposure_within_limits(
+    projection: &ProjectedExposureView,
+    limits: InventoryBrakeLimits,
+) -> bool {
+    limits
+        .max_position_tao
+        .is_none_or(|limit| projection.q_global_tao.abs() <= limit + 1e-9)
+        && limits
+            .max_gross_position_tao
+            .is_none_or(|limit| projection.q_gross_tao <= limit + 1e-9)
+        && limits
+            .max_abs_venue_position_tao
+            .is_none_or(|limit| projection.q_max_abs_venue_tao <= limit + 1e-9)
+}
+
+fn apply_projected_mm_budget_to_quotes(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: TimestampMs,
+    limits: InventoryBrakeLimits,
+    quotes: &mut [crate::mm::MmQuote],
+) -> ProjectedMmBudgetStatus {
+    let raw_venue_ledgers = build_mm_venue_exposure_ledgers(state, &[]);
+    let raw_base_projection = projected_exposure_from_mm_venue_ledgers(
+        state,
+        &raw_venue_ledgers,
+        ProjectedExposureSource::RawState,
+        false,
+    );
+    let mut status = ProjectedMmBudgetStatus {
+        configured: limits.configured(),
+        applied: false,
+        rotation_epoch: (now_ms.max(0) / PROJECTED_MM_BUDGET_ROTATION_MS.max(1)) as u64,
+        rotation_frozen: false,
+        net_limit_tao: limits.max_position_tao,
+        gross_limit_tao: limits.max_gross_position_tao,
+        venue_limit_tao: limits.max_abs_venue_position_tao,
+        projected_q_global_before_tao: raw_base_projection.q_global_tao,
+        projected_q_gross_before_tao: raw_base_projection.q_gross_tao,
+        projected_q_max_abs_venue_before_tao: raw_base_projection.q_max_abs_venue_tao,
+        projected_q_global_after_tao: raw_base_projection.q_global_tao,
+        projected_q_gross_after_tao: raw_base_projection.q_gross_tao,
+        projected_q_max_abs_venue_after_tao: raw_base_projection.q_max_abs_venue_tao,
+        effective_q_global_after_tao: raw_base_projection.q_global_tao,
+        effective_q_gross_after_tao: raw_base_projection.q_gross_tao,
+        effective_q_max_abs_venue_after_tao: raw_base_projection.q_max_abs_venue_tao,
+        budget_after_within_limits: projected_exposure_within_limits(&raw_base_projection, limits),
+        effective_projection_within_limits: projected_exposure_within_limits(
+            &raw_base_projection,
+            limits,
+        ),
+        live_order_projection_consistent: true,
+        selected_venues: Vec::new(),
+        suppressed_venues: Vec::new(),
+        venues: Vec::new(),
+    };
+    if !status.configured {
+        return status;
+    }
+
+    let fill_quotes: Vec<usize> = quotes
+        .iter()
+        .enumerate()
+        .filter(|(_, quote)| {
+            cfg.venues
+                .get(quote.venue_index)
+                .is_some_and(|vcfg| cfg.mm.venue_role_for(&vcfg.id) == MmVenueRole::Fill)
+                && (quote.bid.is_some() || quote.ask.is_some())
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    if fill_quotes.len() < 3 {
+        return status;
+    }
+
+    let rotation_offset = (status.rotation_epoch as usize) % fill_quotes.len();
+    let rotated_fill_quotes: Vec<usize> = fill_quotes
+        .iter()
+        .cycle()
+        .skip(rotation_offset)
+        .take(fill_quotes.len())
+        .copied()
+        .collect();
+
+    let mut candidates = Vec::new();
+    for (rotation_rank, quote_index) in rotated_fill_quotes.iter().enumerate() {
+        let quote = &quotes[*quote_index];
+        let Some(venue_ledger) = raw_venue_ledgers.get(quote.venue_index) else {
+            continue;
+        };
+        if let Some(candidate) =
+            projected_mm_budget_candidate(cfg, state, quote, rotation_rank, venue_ledger)
+        {
+            candidates.push(candidate);
+        }
+    }
+
+    status.rotation_frozen = candidates
+        .iter()
+        .any(|candidate| candidate.live_worsening_exposure_tao > 1e-9);
+    if status.rotation_frozen {
+        candidates.sort_by(|lhs, rhs| {
+            rhs.live_worsening_exposure_tao
+                .partial_cmp(&lhs.live_worsening_exposure_tao)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| lhs.rotation_rank.cmp(&rhs.rotation_rank))
+        });
+    }
+
+    let mut preselection_cleanup_intents = Vec::new();
+    for candidate in &candidates {
+        append_projected_mm_budget_candidate_cleanup_cancels(
+            cfg,
+            state,
+            candidate,
+            now_ms,
+            &mut preselection_cleanup_intents,
+        );
+    }
+    let cleanup_venue_ledgers =
+        build_mm_venue_exposure_ledgers(state, &preselection_cleanup_intents);
+    let cleanup_base_projection = projected_exposure_from_mm_venue_ledgers(
+        state,
+        &cleanup_venue_ledgers,
+        ProjectedExposureSource::RawState,
+        false,
+    );
+    let mut selected: HashSet<usize> = HashSet::new();
+    let mut projected_bid_sizes = cleanup_base_projection.bid_sizes_tao.clone();
+    let mut projected_ask_sizes = cleanup_base_projection.ask_sizes_tao.clone();
+    let mut projected_net = cleanup_base_projection.q_global_tao;
+    let mut projected_gross = cleanup_base_projection.q_gross_tao;
+    let mut projected_max_abs_venue = cleanup_base_projection.q_max_abs_venue_tao;
+    for candidate in &candidates {
+        let mut bid_after = projected_bid_sizes.clone();
+        let mut ask_after = projected_ask_sizes.clone();
+        if candidate.keep_bid {
+            if let Some(size) = bid_after.get_mut(candidate.venue_index) {
+                *size = candidate.effective_bid_tao;
+            }
+        }
+        if candidate.keep_ask {
+            if let Some(size) = ask_after.get_mut(candidate.venue_index) {
+                *size = candidate.effective_ask_tao;
+            }
+        }
+        let projection_after = projected_exposure_from_sizes(
+            state,
+            bid_after,
+            ask_after,
+            ProjectedExposureSource::RawState,
+        );
+        if projected_exposure_within_limits(&projection_after, limits) {
+            selected.insert(candidate.venue_index);
+            projected_bid_sizes = projection_after.bid_sizes_tao;
+            projected_ask_sizes = projection_after.ask_sizes_tao;
+            projected_net = projection_after.q_global_tao;
+            projected_gross = projection_after.q_gross_tao;
+            projected_max_abs_venue = projection_after.q_max_abs_venue_tao;
+        }
+    }
+
+    status.projected_q_global_after_tao = projected_net;
+    status.projected_q_gross_after_tao = projected_gross;
+    status.projected_q_max_abs_venue_after_tao = projected_max_abs_venue;
+    status.budget_after_within_limits = projected_net.abs()
+        <= limits.max_position_tao.unwrap_or(f64::INFINITY) + 1e-9
+        && projected_gross <= limits.max_gross_position_tao.unwrap_or(f64::INFINITY) + 1e-9
+        && projected_max_abs_venue
+            <= limits.max_abs_venue_position_tao.unwrap_or(f64::INFINITY) + 1e-9;
+
+    let mut final_cleanup_intents = Vec::new();
+    for candidate in &candidates {
+        if selected.contains(&candidate.venue_index) {
+            continue;
+        }
+        append_projected_mm_budget_candidate_cleanup_cancels(
+            cfg,
+            state,
+            candidate,
+            now_ms,
+            &mut final_cleanup_intents,
+        );
+    }
+    let final_venue_ledgers = build_mm_venue_exposure_ledgers(state, &final_cleanup_intents);
+
+    for candidate in candidates {
+        let selected_candidate = selected.contains(&candidate.venue_index);
+        let quote = quotes
+            .iter_mut()
+            .find(|quote| quote.venue_index == candidate.venue_index)
+            .expect("candidate venue quote must exist");
+        let final_ledger = final_venue_ledgers.get(candidate.venue_index);
+        if !selected_candidate {
+            if candidate.suppress_bid && quote.bid.is_some() {
+                quote.bid = None;
+                quote.bid_terminal_reason = "projected_mm_budget_suppressed";
+            }
+            if candidate.suppress_ask && quote.ask.is_some() {
+                quote.ask = None;
+                quote.ask_terminal_reason = "projected_mm_budget_suppressed";
+            }
+            status.applied = true;
+            if !status
+                .suppressed_venues
+                .iter()
+                .any(|venue_id| venue_id == &quote.venue_id.to_string())
+            {
+                status.suppressed_venues.push(quote.venue_id.to_string());
+            }
+        } else if !status
+            .selected_venues
+            .iter()
+            .any(|venue_id| venue_id == &quote.venue_id.to_string())
+        {
+            status.selected_venues.push(quote.venue_id.to_string());
+        }
+        status.venues.push(ProjectedMmBudgetVenueStatus {
+            venue_index: candidate.venue_index,
+            venue_id: quote.venue_id.to_string(),
+            selected: selected_candidate,
+            keep_bid: selected_candidate && candidate.keep_bid,
+            keep_ask: selected_candidate && candidate.keep_ask,
+            suppress_bid: !selected_candidate && candidate.suppress_bid,
+            suppress_ask: !selected_candidate && candidate.suppress_ask,
+            live_worsening_exposure_tao: candidate.live_worsening_exposure_tao,
+            candidate_size_tao: candidate.candidate_size_tao,
+            net_delta_tao: candidate.net_delta_tao,
+            gross_increment_tao: candidate.gross_increment_tao,
+            projected_abs_venue_tao: candidate.projected_abs_venue_tao,
+            rotation_rank: candidate.rotation_rank,
+            tracked_live_bid_tao: final_ledger
+                .map(|ledger| ledger.bid.tracked_live_tao())
+                .unwrap_or(candidate.tracked_live_bid_tao),
+            tracked_live_ask_tao: final_ledger
+                .map(|ledger| ledger.ask.tracked_live_tao())
+                .unwrap_or(candidate.tracked_live_ask_tao),
+            unmanaged_live_bid_tao: final_ledger
+                .map(|ledger| ledger.bid.unmanaged_live_tao())
+                .unwrap_or(candidate.unmanaged_live_bid_tao),
+            unmanaged_live_ask_tao: final_ledger
+                .map(|ledger| ledger.ask.unmanaged_live_tao())
+                .unwrap_or(candidate.unmanaged_live_ask_tao),
+            cancel_covered_live_bid_tao: final_ledger
+                .map(|ledger| ledger.bid.cancel_covered_live_tao())
+                .unwrap_or(candidate.cancel_covered_live_bid_tao),
+            cancel_covered_live_ask_tao: final_ledger
+                .map(|ledger| ledger.ask.cancel_covered_live_tao())
+                .unwrap_or(candidate.cancel_covered_live_ask_tao),
+            pending_new_bid_tao: final_ledger
+                .map(|ledger| ledger.bid.pending_new_tao)
+                .unwrap_or(candidate.pending_new_bid_tao),
+            pending_new_ask_tao: final_ledger
+                .map(|ledger| ledger.ask.pending_new_tao)
+                .unwrap_or(candidate.pending_new_ask_tao),
+            effective_bid_tao: candidate.effective_bid_tao,
+            effective_ask_tao: candidate.effective_ask_tao,
+        });
+    }
+    status
+}
+
+fn should_quote_this_tick(
+    cfg: &Config,
+    snapshot: &CanonicalCacheSnapshot,
+    state: &GlobalState,
+    conditional_quoting: bool,
+    smoke_intents: bool,
+    last_quoted_mid: &[Option<f64>],
+    last_quoted_book_seq: &[u64],
+    last_quote_ts_ms: &[TimestampMs],
+    max_quote_age_ms: TimestampMs,
+    now_ms: TimestampMs,
+) -> bool {
+    if !conditional_quoting || smoke_intents {
+        return true;
+    }
+
+    let mut any_changed = false;
+    for vm in &snapshot.market {
+        let vi = vm.venue_index;
+        if vm.is_stale {
+            continue;
+        }
+        let mid = vm.mid;
+        let seq = vm.seq;
+        let prev_mid = last_quoted_mid.get(vi).copied().flatten();
+        let prev_seq = last_quoted_book_seq.get(vi).copied().unwrap_or(0);
+        let prev_ts = last_quote_ts_ms.get(vi).copied().unwrap_or(0);
+        if now_ms.saturating_sub(prev_ts) > max_quote_age_ms {
+            any_changed = true;
+            break;
+        }
+        if seq > prev_seq {
+            any_changed = true;
+            break;
+        }
+        if let (Some(cur), Some(prev)) = (mid, prev_mid) {
+            let tick_size = cfg.venues.get(vi).map(|v| v.tick_size).unwrap_or(0.01);
+            if (cur - prev).abs() > tick_size * 0.5 {
+                any_changed = true;
+                break;
+            }
+        } else if mid.is_some() != prev_mid.is_some() {
+            any_changed = true;
+            break;
+        }
+    }
+
+    if !any_changed && has_tracked_mm_orders(state) {
+        return false;
+    }
+    true
+}
+
+fn evaluate_inventory_brake_with_projection(
     cfg: &Config,
     state: &GlobalState,
     fractions: InventoryBrakeFractions,
     limits: InventoryBrakeLimits,
+    effective_projection: Option<&ProjectedExposureView>,
 ) -> InventoryBrakeStatus {
     let q_gross_tao = gross_position_tao(state);
     let q_max_abs_venue_tao = max_abs_venue_position_tao(state);
-    let projected_q_global_tao = projected_net_position_tao(state);
-    let projected_q_gross_tao = projected_gross_position_tao(state);
-    let projected_q_max_abs_venue_tao = projected_max_abs_venue_position_tao(state);
+    let raw_projection = raw_projected_exposure_view(state);
+    let projection = effective_projection.unwrap_or(&raw_projection);
+    let projected_q_global_tao = projection.q_global_tao;
+    let projected_q_gross_tao = projection.q_gross_tao;
+    let projected_q_max_abs_venue_tao = projection.q_max_abs_venue_tao;
     let mut status = InventoryBrakeStatus {
         configured: limits.configured() && fractions.configured(),
         triggered: false,
         sent: false,
+        request_dispatches: Vec::new(),
+        projection_source: projection.source,
         grace_active: false,
         grace_applied: false,
         grace_deadline_ms: None,
@@ -4293,9 +9219,16 @@ fn evaluate_inventory_brake(
         q_global_tao: state.q_global_tao,
         q_gross_tao,
         q_max_abs_venue_tao,
+        raw_projected_q_global_tao: raw_projection.q_global_tao,
+        raw_projected_q_gross_tao: raw_projection.q_gross_tao,
+        raw_projected_q_max_abs_venue_tao: raw_projection.q_max_abs_venue_tao,
         projected_q_global_tao,
         projected_q_gross_tao,
         projected_q_max_abs_venue_tao,
+        budget_would_clear_projected_brake: false,
+        projected_brake_consistent_with_effective_state: true,
+        raw_projected_global_reasons: Vec::new(),
+        effective_projected_global_reasons: Vec::new(),
         global_reasons: Vec::new(),
         blocked_venues: Vec::new(),
     };
@@ -4309,6 +9242,12 @@ fn evaluate_inventory_brake(
     let net_short_breach = limits
         .max_position_tao
         .is_some_and(|limit| state.q_global_tao <= -limit);
+    let raw_projected_net_long_breach = limits
+        .max_position_tao
+        .is_some_and(|limit| raw_projection.q_global_tao >= limit);
+    let raw_projected_net_short_breach = limits
+        .max_position_tao
+        .is_some_and(|limit| raw_projection.q_global_tao <= -limit);
     let projected_net_long_breach = limits
         .max_position_tao
         .is_some_and(|limit| projected_q_global_tao >= limit);
@@ -4318,9 +9257,17 @@ fn evaluate_inventory_brake(
     let gross_breach = limits
         .max_gross_position_tao
         .is_some_and(|limit| q_gross_tao >= limit);
+    let raw_projected_gross_breach = limits
+        .max_gross_position_tao
+        .is_some_and(|limit| raw_projection.q_gross_tao >= limit);
     let projected_gross_breach = limits
         .max_gross_position_tao
         .is_some_and(|limit| projected_q_gross_tao >= limit);
+    let budget_would_clear_projected_brake = (raw_projected_net_long_breach
+        || raw_projected_net_short_breach
+        || raw_projected_gross_breach)
+        && !(projected_net_long_breach || projected_net_short_breach || projected_gross_breach);
+    status.budget_would_clear_projected_brake = budget_would_clear_projected_brake;
 
     if net_long_breach {
         push_reason(&mut status.global_reasons, "net_long_brake");
@@ -4328,22 +9275,71 @@ fn evaluate_inventory_brake(
     if net_short_breach {
         push_reason(&mut status.global_reasons, "net_short_brake");
     }
-    if projected_net_long_breach {
-        push_reason(&mut status.global_reasons, "projected_net_long_brake");
-    }
-    if projected_net_short_breach {
-        push_reason(&mut status.global_reasons, "projected_net_short_brake");
-    }
     if gross_breach {
         push_reason(&mut status.global_reasons, "gross_brake");
     }
+    if raw_projected_net_long_breach {
+        push_reason(
+            &mut status.raw_projected_global_reasons,
+            "projected_net_long_brake",
+        );
+    }
+    if raw_projected_net_short_breach {
+        push_reason(
+            &mut status.raw_projected_global_reasons,
+            "projected_net_short_brake",
+        );
+    }
+    if raw_projected_gross_breach {
+        push_reason(
+            &mut status.raw_projected_global_reasons,
+            "projected_gross_brake",
+        );
+    }
+    if projected_net_long_breach {
+        push_reason(
+            &mut status.effective_projected_global_reasons,
+            "projected_net_long_brake",
+        );
+        push_reason(&mut status.global_reasons, "projected_net_long_brake");
+    }
+    if projected_net_short_breach {
+        push_reason(
+            &mut status.effective_projected_global_reasons,
+            "projected_net_short_brake",
+        );
+        push_reason(&mut status.global_reasons, "projected_net_short_brake");
+    }
     if projected_gross_breach {
+        push_reason(
+            &mut status.effective_projected_global_reasons,
+            "projected_gross_brake",
+        );
         push_reason(&mut status.global_reasons, "projected_gross_brake");
     }
+    status.projected_brake_consistent_with_effective_state =
+        status.effective_projected_global_reasons.is_empty()
+            || status
+                .global_reasons
+                .iter()
+                .any(|reason| status.effective_projected_global_reasons.contains(reason));
 
     for (venue_index, venue) in state.venues.iter().enumerate() {
         let position_tao = venue.position_tao;
-        let projected_position_tao = projected_worsening_position_tao(state, venue_index);
+        let projected_position_tao = projected_worsening_position_from_exposure(
+            state,
+            venue_index,
+            projection
+                .bid_sizes_tao
+                .get(venue_index)
+                .copied()
+                .unwrap_or(0.0),
+            projection
+                .ask_sizes_tao
+                .get(venue_index)
+                .copied()
+                .unwrap_or(0.0),
+        );
         let venue_breach = limits
             .max_abs_venue_position_tao
             .is_some_and(|limit| position_tao.abs() >= limit);
@@ -4397,6 +9393,15 @@ fn evaluate_inventory_brake(
     status
 }
 
+fn evaluate_inventory_brake(
+    cfg: &Config,
+    state: &GlobalState,
+    fractions: InventoryBrakeFractions,
+    limits: InventoryBrakeLimits,
+) -> InventoryBrakeStatus {
+    evaluate_inventory_brake_with_projection(cfg, state, fractions, limits, None)
+}
+
 fn apply_inventory_brake_to_quotes(
     quotes: &mut [crate::mm::MmQuote],
     status: &InventoryBrakeStatus,
@@ -4411,11 +9416,13 @@ fn apply_inventory_brake_to_quotes(
         else {
             continue;
         };
-        if blocked.blocked_bid {
+        if blocked.blocked_bid && quote.bid.is_some() {
             quote.bid = None;
+            quote.bid_terminal_reason = "inventory_brake_suppressed";
         }
-        if blocked.blocked_ask {
+        if blocked.blocked_ask && quote.ask.is_some() {
             quote.ask = None;
+            quote.ask_terminal_reason = "inventory_brake_suppressed";
         }
     }
 }
@@ -4487,7 +9494,7 @@ fn canary_limit_breached(
 }
 
 fn has_tracked_mm_orders(state: &GlobalState) -> bool {
-    tracked_mm_open_order_count(state) > 0
+    tracked_mm_open_order_count(state) > 0 || live_mm_active_order_count(state) > 0
 }
 
 fn inventory_brake_grace_is_active(
@@ -4496,6 +9503,21 @@ fn inventory_brake_grace_is_active(
     now_ms: TimestampMs,
 ) -> bool {
     grace_ticks_remaining > 0 && grace_until_ms.is_some_and(|deadline| deadline >= now_ms)
+}
+
+fn clear_ineligible_inventory_brake_grace(
+    grace_until_ms: &mut Option<TimestampMs>,
+    grace_ticks_remaining: &mut u32,
+    grace_active: &mut bool,
+    grace_eligible: bool,
+) -> bool {
+    if !*grace_active || grace_eligible {
+        return false;
+    }
+    *grace_until_ms = None;
+    *grace_ticks_remaining = 0;
+    *grace_active = false;
+    true
 }
 
 fn inventory_brake_grace_allowed(
@@ -4533,6 +9555,469 @@ fn apply_inventory_brake_grace_telemetry(
         None
     };
     brake.grace_ticks_remaining = grace_ticks_remaining;
+}
+
+fn canary_breach_response_is_active(
+    response_until_ms: Option<TimestampMs>,
+    response_ticks_remaining: u32,
+    now_ms: TimestampMs,
+) -> bool {
+    response_until_ms.is_some_and(|deadline| deadline >= now_ms) || response_ticks_remaining > 0
+}
+
+fn canary_breach_response_should_send(
+    limits: &CanaryLimitStatus,
+    config: CanaryBreachResponseConfig,
+    response_sent: bool,
+    response_until_ms: Option<TimestampMs>,
+    response_ticks_remaining: u32,
+    now_ms: TimestampMs,
+) -> bool {
+    config.enabled()
+        && limits.breached
+        && !response_sent
+        && !canary_breach_response_is_active(response_until_ms, response_ticks_remaining, now_ms)
+}
+
+fn canary_breach_response_should_retry_flatten(
+    limits: &CanaryLimitStatus,
+    response_sent: bool,
+    response_until_ms: Option<TimestampMs>,
+    response_ticks_remaining: u32,
+    now_ms: TimestampMs,
+) -> bool {
+    limits.breached
+        && response_sent
+        && canary_breach_response_is_active(response_until_ms, response_ticks_remaining, now_ms)
+}
+
+fn canary_breach_response_should_rearm_after_observed_progress(
+    cfg: &Config,
+    state: &GlobalState,
+    response_sent: bool,
+    response_until_ms: Option<TimestampMs>,
+    response_ticks_remaining: u32,
+    observation: &CanaryFlattenObservationState,
+    now_ms: TimestampMs,
+) -> bool {
+    let Some(observation_until_ms) = observation.until_ms else {
+        return false;
+    };
+    response_sent
+        && !canary_breach_response_is_active(response_until_ms, response_ticks_remaining, now_ms)
+        && observation_until_ms < now_ms
+        && canary_flatten_observation_made_progress(cfg, state, observation)
+}
+
+fn canary_breach_response_should_rearm_for_uncovered_targets(
+    response_sent: bool,
+    response_until_ms: Option<TimestampMs>,
+    response_ticks_remaining: u32,
+    snapshot: &CanaryBreachResponseTargetSnapshot,
+    now_ms: TimestampMs,
+) -> bool {
+    response_sent
+        && !canary_breach_response_is_active(response_until_ms, response_ticks_remaining, now_ms)
+        && snapshot.raw_observation_active
+        && !snapshot.positioned_target_venues.is_empty()
+        && !snapshot.observation_covers_positioned_targets
+}
+
+fn canary_actual_position_breached(limits: &CanaryLimitStatus) -> bool {
+    limits.net_breached || limits.gross_breached || limits.venue_breached
+}
+
+fn canary_actual_position_response_pending_before_inventory_brake(
+    limits: &CanaryLimitStatus,
+    config: CanaryBreachResponseConfig,
+    response_sent: bool,
+    response_until_ms: Option<TimestampMs>,
+    response_ticks_remaining: u32,
+    now_ms: TimestampMs,
+) -> bool {
+    canary_actual_position_breached(limits)
+        && (canary_breach_response_should_send(
+            limits,
+            config,
+            response_sent,
+            response_until_ms,
+            response_ticks_remaining,
+            now_ms,
+        ) || canary_breach_response_should_retry_flatten(
+            limits,
+            response_sent,
+            response_until_ms,
+            response_ticks_remaining,
+            now_ms,
+        ))
+}
+
+fn canary_actual_position_control_pending_before_inventory_brake(
+    cfg: &Config,
+    state: &GlobalState,
+    limits: &CanaryLimitStatus,
+    config: CanaryBreachResponseConfig,
+    response_sent: bool,
+    response_until_ms: Option<TimestampMs>,
+    response_ticks_remaining: u32,
+    observation: &CanaryFlattenObservationState,
+    now_ms: TimestampMs,
+) -> bool {
+    let observation_snapshot =
+        canary_breach_response_target_snapshot(cfg, state, limits, observation, now_ms);
+    canary_actual_position_response_pending_before_inventory_brake(
+        limits,
+        config,
+        response_sent,
+        response_until_ms,
+        response_ticks_remaining,
+        now_ms,
+    ) || (canary_actual_position_breached(limits)
+        && observation_snapshot.raw_observation_active
+        && observation_snapshot.observation_covers_positioned_targets)
+}
+
+fn lighter_venue_index(cfg: &Config) -> Option<usize> {
+    cfg.venues
+        .iter()
+        .position(|venue| venue.id.eq_ignore_ascii_case("lighter"))
+}
+
+fn hyperliquid_venue_index(cfg: &Config) -> Option<usize> {
+    cfg.venues
+        .iter()
+        .position(|venue| venue.id.eq_ignore_ascii_case("hyperliquid"))
+}
+
+fn extended_venue_index(cfg: &Config) -> Option<usize> {
+    cfg.venues
+        .iter()
+        .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+}
+
+fn aster_venue_index(cfg: &Config) -> Option<usize> {
+    cfg.venues
+        .iter()
+        .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+}
+
+fn paradex_venue_index(cfg: &Config) -> Option<usize> {
+    cfg.venues
+        .iter()
+        .position(|venue| venue.id.eq_ignore_ascii_case("paradex"))
+}
+
+fn aster_canary_flatten_sync_wait_enabled() -> bool {
+    parse_bool_env_default("PARAPHINA_ASTER_CANARY_FLATTEN_SYNC_WAIT", false)
+}
+
+fn aster_sync_wait_observation_bridge_enabled() -> bool {
+    parse_bool_env_default(
+        "PARAPHINA_ASTER_CANARY_FLATTEN_SYNC_WAIT_OBSERVATION_BRIDGE",
+        false,
+    )
+}
+
+fn async_canary_flatten_observation_venue_indices_with_aster_sync_wait(
+    cfg: &Config,
+    aster_sync_wait: bool,
+) -> Vec<usize> {
+    let mut venues = Vec::new();
+    if let Some(venue_index) = lighter_venue_index(cfg) {
+        venues.push(venue_index);
+    }
+    if let Some(venue_index) = hyperliquid_venue_index(cfg) {
+        if !venues.contains(&venue_index) {
+            venues.push(venue_index);
+        }
+    }
+    // Extended reduce-only IOC exits can clear through account truth after the order
+    // response path times out; observe bounded non-worsening convergence instead.
+    if let Some(venue_index) = extended_venue_index(cfg) {
+        if !venues.contains(&venue_index) {
+            venues.push(venue_index);
+        }
+    }
+    if !aster_sync_wait {
+        if let Some(venue_index) = aster_venue_index(cfg) {
+            if !venues.contains(&venue_index) {
+                venues.push(venue_index);
+            }
+        }
+    }
+    // ParaDex reduce-only IOC exits can be accepted through REST/order truth but
+    // settle through private fill/account truth after the synchronous response wait.
+    if let Some(venue_index) = paradex_venue_index(cfg) {
+        if !venues.contains(&venue_index) {
+            venues.push(venue_index);
+        }
+    }
+    venues
+}
+
+fn async_canary_flatten_observation_venue_indices(cfg: &Config) -> Vec<usize> {
+    async_canary_flatten_observation_venue_indices_with_aster_sync_wait(
+        cfg,
+        aster_canary_flatten_sync_wait_enabled(),
+    )
+}
+
+fn canary_flatten_observation_venue_indices_for_dispatch_with_aster_bridge(
+    cfg: &Config,
+    dispatch: &CanaryFlattenDispatchResult,
+    aster_sync_wait: bool,
+    bridge_enabled: bool,
+) -> Vec<usize> {
+    let mut venues =
+        async_canary_flatten_observation_venue_indices_with_aster_sync_wait(cfg, aster_sync_wait);
+    if bridge_enabled && aster_sync_wait {
+        if let Some(aster) = aster_venue_index(cfg) {
+            let aster_flatten_submitted =
+                dispatch.submitted_venue(aster) || dispatch.accepted_venue(aster);
+            if aster_flatten_submitted && !venues.contains(&aster) {
+                venues.push(aster);
+            }
+        }
+    }
+    venues
+}
+
+fn canary_flatten_observation_venue_indices_for_dispatch(
+    cfg: &Config,
+    dispatch: &CanaryFlattenDispatchResult,
+) -> Vec<usize> {
+    canary_flatten_observation_venue_indices_for_dispatch_with_aster_bridge(
+        cfg,
+        dispatch,
+        aster_canary_flatten_sync_wait_enabled(),
+        aster_sync_wait_observation_bridge_enabled(),
+    )
+}
+
+fn extend_unique_venue_indices(target: &mut Vec<usize>, source: Vec<usize>) {
+    for venue_index in source {
+        if !target.contains(&venue_index) {
+            target.push(venue_index);
+        }
+    }
+}
+
+fn reduce_only_place_venues_for_order_intents(intents: &[OrderIntent]) -> Vec<usize> {
+    let mut venues = Vec::new();
+    for intent in intents {
+        let OrderIntent::Place(place) = intent else {
+            continue;
+        };
+        if !place.reduce_only {
+            continue;
+        }
+        if !venues.contains(&place.venue_index) {
+            venues.push(place.venue_index);
+        }
+    }
+    venues
+}
+
+fn reduce_only_place_venues_for_emergency_requests(
+    requests: &[(usize, Vec<OrderIntent>)],
+) -> Vec<usize> {
+    let mut venues = Vec::new();
+    for (_, intents) in requests {
+        extend_unique_venue_indices(
+            &mut venues,
+            reduce_only_place_venues_for_order_intents(intents),
+        );
+    }
+    venues
+}
+
+fn canary_flatten_dispatch_from_emergency_dispatches(
+    cfg: &Config,
+    state: &GlobalState,
+    dispatches: &[EmergencyRequestDispatchStatus],
+    reduce_only_venues: &[usize],
+    class: EmergencyRequestClass,
+) -> CanaryFlattenDispatchResult {
+    let async_venues = async_canary_flatten_observation_venue_indices(cfg);
+    let mut result = CanaryFlattenDispatchResult::default();
+    for dispatch in dispatches {
+        if dispatch.class != class
+            || dispatch.outcome != EmergencyRequestDispatchOutcome::Events
+            || !reduce_only_venues.contains(&dispatch.venue_index)
+            || !async_venues.contains(&dispatch.venue_index)
+            || !venue_has_material_position(cfg, state, dispatch.venue_index)
+        {
+            continue;
+        }
+        result.submitted = true;
+        if !result.submitted_venues.contains(&dispatch.venue_index) {
+            result.submitted_venues.push(dispatch.venue_index);
+        }
+    }
+    result
+}
+
+fn venue_position_abs_tao(state: &GlobalState, venue_index: usize) -> Option<f64> {
+    state
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.position_tao.abs())
+}
+
+fn arm_canary_flatten_observation(
+    cfg: &Config,
+    state: &GlobalState,
+    dispatch: &CanaryFlattenDispatchResult,
+    now_ms: TimestampMs,
+    observation_ms: TimestampMs,
+    observation: &mut CanaryFlattenObservationState,
+) -> bool {
+    if observation_ms <= 0 {
+        return false;
+    }
+    let mut baselines = Vec::new();
+    for venue_index in canary_flatten_observation_venue_indices_for_dispatch(cfg, dispatch) {
+        if !dispatch.submitted_venue(venue_index) && !dispatch.accepted_venue(venue_index) {
+            continue;
+        }
+        let Some(position_abs_tao) = venue_position_abs_tao(state, venue_index) else {
+            continue;
+        };
+        if position_abs_tao > 1e-9 {
+            let baseline_abs_tao = observation
+                .baselines
+                .iter()
+                .find(|(existing_venue_index, _)| *existing_venue_index == venue_index)
+                .map(|(_, existing_baseline)| {
+                    if position_abs_tao <= *existing_baseline + 1e-9 {
+                        *existing_baseline
+                    } else {
+                        position_abs_tao
+                    }
+                })
+                .unwrap_or(position_abs_tao);
+            baselines.push((venue_index, baseline_abs_tao));
+        }
+    }
+    if baselines.is_empty() {
+        return false;
+    }
+    observation.until_ms = Some(now_ms.saturating_add(observation_ms));
+    observation.baselines = baselines;
+    true
+}
+
+fn canary_flatten_observation_active(
+    _cfg: &Config,
+    state: &GlobalState,
+    observation: &CanaryFlattenObservationState,
+    now_ms: TimestampMs,
+) -> bool {
+    let Some(until_ms) = observation.until_ms else {
+        return false;
+    };
+    if until_ms < now_ms {
+        return false;
+    }
+    if observation.baselines.is_empty() {
+        return false;
+    };
+    let mut has_residual = false;
+    for (venue_index, baseline_abs_tao) in &observation.baselines {
+        let Some(position_abs_tao) = venue_position_abs_tao(state, *venue_index) else {
+            return false;
+        };
+        if position_abs_tao > baseline_abs_tao + 1e-9 {
+            return false;
+        }
+        has_residual |= position_abs_tao > 1e-9;
+    }
+    has_residual
+}
+
+fn canary_flatten_observation_made_progress(
+    cfg: &Config,
+    state: &GlobalState,
+    observation: &CanaryFlattenObservationState,
+) -> bool {
+    if observation.baselines.is_empty() {
+        return false;
+    }
+    let mut improved = false;
+    for (venue_index, baseline_abs_tao) in &observation.baselines {
+        let Some(position_abs_tao) = venue_position_abs_tao(state, *venue_index) else {
+            return false;
+        };
+        if position_abs_tao > baseline_abs_tao + 1e-9 {
+            return false;
+        }
+        let progress_tao = emergency_request_latch_progress_tao(cfg, *venue_index);
+        if baseline_abs_tao - position_abs_tao >= progress_tao {
+            improved = true;
+        }
+    }
+    improved
+}
+
+fn canary_flatten_observation_retry_due(
+    cfg: &Config,
+    state: &GlobalState,
+    observation: &CanaryFlattenObservationState,
+    now_ms: TimestampMs,
+    retry_enabled: bool,
+    retry_ms: TimestampMs,
+    max_retries: u32,
+) -> bool {
+    if !retry_enabled || retry_ms <= 0 || max_retries == 0 {
+        return false;
+    }
+    if observation.retry_count >= max_retries {
+        return false;
+    }
+    if !canary_flatten_observation_active(cfg, state, observation, now_ms) {
+        return false;
+    }
+    if canary_flatten_observation_made_progress(cfg, state, observation) {
+        return false;
+    }
+    observation
+        .last_retry_ms
+        .map(|last_retry_ms| now_ms.saturating_sub(last_retry_ms) >= retry_ms)
+        .unwrap_or(true)
+}
+
+fn apply_canary_breach_response_telemetry(
+    status: &mut CanaryBreachResponseStatus,
+    limits: &CanaryLimitStatus,
+    eligible: bool,
+    active: bool,
+    sent_this_tick: bool,
+    cleared_this_tick: bool,
+    response_until_ms: Option<TimestampMs>,
+    response_ticks_remaining: u32,
+) {
+    status.eligible = eligible;
+    status.active = active;
+    status.sent_this_tick = sent_this_tick;
+    status.cleared_this_tick = cleared_this_tick;
+    status.deadline_ms = if active { response_until_ms } else { None };
+    status.ticks_remaining = if active { response_ticks_remaining } else { 0 };
+    status.net_breached = limits.net_breached;
+    status.gross_breached = limits.gross_breached;
+    status.venue_breached = limits.venue_breached;
+    status.open_orders_breached = limits.open_orders_breached;
+    status.max_position_tao = limits.max_position_tao;
+    status.max_gross_position_tao = limits.max_gross_position_tao;
+    status.max_abs_venue_position_tao = limits.max_abs_venue_position_tao;
+    status.max_open_orders = limits.max_open_orders;
+    status.q_global_tao = limits.q_global_tao;
+    status.q_gross_tao = limits.q_gross_tao;
+    status.q_max_abs_venue_tao = limits.q_max_abs_venue_tao;
+    status.open_order_count = limits.open_order_count;
+    status.net_excess_tao = limits.net_excess_tao;
+    status.gross_excess_tao = limits.gross_excess_tao;
+    status.venue_excess_tao = limits.venue_excess_tao;
+    status.open_order_excess = limits.open_order_excess;
 }
 
 fn normalize_live_client_order_ids(intents: &mut [OrderIntent], tick: u64) {
@@ -4667,6 +10152,65 @@ fn parse_optional_positive_f64_env(key: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+fn extended_soft_unwind_state_fallback_max_lots() -> f64 {
+    parse_optional_positive_f64_env("PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS")
+        .map(|lots| lots.clamp(1.0, 2.0))
+        .unwrap_or(1.0)
+}
+
+fn extended_state_fallback_step_lots() -> Option<f64> {
+    parse_optional_positive_f64_env("PARAPHINA_EXTENDED_STATE_FALLBACK_STEP_LOTS")
+        .map(|lots| lots.clamp(1.0, 3.0))
+}
+
+fn aster_soft_unwind_full_target_max_lots() -> f64 {
+    parse_optional_positive_f64_env("PARAPHINA_ASTER_SOFT_UNWIND_FULL_TARGET_MAX_LOTS")
+        .map(|lots| lots.clamp(1.0, 2.0))
+        .unwrap_or(1.0)
+}
+
+fn aster_terminal_sub_lot_reduce_enabled() -> bool {
+    parse_bool_env_default(
+        "PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+        false,
+    )
+}
+
+fn aster_terminal_sub_lot_reduce_min_abs_tao() -> f64 {
+    parse_optional_positive_f64_env("PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_MIN_ABS_TAO")
+        .unwrap_or(0.0025)
+}
+
+fn hyperliquid_terminal_sub_lot_reduce_enabled() -> bool {
+    parse_bool_env_default(
+        "PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+        false,
+    )
+}
+
+fn hyperliquid_terminal_sub_lot_reduce_min_abs_tao() -> f64 {
+    parse_optional_positive_f64_env("PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_MIN_ABS_TAO")
+        .unwrap_or(0.0025)
+}
+
+fn extended_terminal_sub_lot_reduce_enabled() -> bool {
+    parse_bool_env_default(
+        "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+        false,
+    )
+}
+
+fn extended_terminal_sub_lot_reduce_min_abs_tao() -> f64 {
+    parse_optional_positive_f64_env("PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_MIN_ABS_TAO")
+        .unwrap_or(0.0025)
+}
+
+fn extended_terminal_sub_lot_reduce_max_lots() -> f64 {
+    parse_optional_positive_f64_env("PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_MAX_LOTS")
+        .unwrap_or(1.0)
+        .max(1.0)
+}
+
 fn parse_optional_fraction_env(key: &str) -> Option<f64> {
     std::env::var(key)
         .ok()
@@ -4679,6 +10223,161 @@ fn parse_optional_positive_i64_env(key: &str) -> Option<i64> {
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|v| *v > 0)
+}
+
+fn parse_optional_positive_u32_env(key: &str) -> Option<u32> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+}
+
+fn parse_bool_env_default(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(default)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TerminalExitQuiesceConfig {
+    enabled: bool,
+    signal_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TerminalExitCancelState {
+    first_sent_ms: Option<TimestampMs>,
+    last_sent_ms: Option<TimestampMs>,
+}
+
+impl TerminalExitCancelState {
+    fn reset(&mut self) {
+        self.first_sent_ms = None;
+        self.last_sent_ms = None;
+    }
+
+    fn mark_sent(&mut self, now_ms: TimestampMs) {
+        if self.first_sent_ms.is_none() {
+            self.first_sent_ms = Some(now_ms);
+        }
+        self.last_sent_ms = Some(now_ms);
+    }
+
+    fn retry_due(&self, now_ms: TimestampMs, retry_interval_ms: TimestampMs) -> bool {
+        retry_interval_ms > 0
+            && self
+                .last_sent_ms
+                .map(|last_ms| now_ms.saturating_sub(last_ms) >= retry_interval_ms)
+                .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TerminalResidualConvergenceConfig {
+    account_refresh_enabled: bool,
+    reduce_after_cancel_confirm_enabled: bool,
+    venue_ids: HashSet<String>,
+    account_refresh_timeout_ms: u64,
+    account_refresh_min_interval_ms: TimestampMs,
+    cancel_retry_interval_ms: TimestampMs,
+    stale_order_reduce_after_ms: TimestampMs,
+}
+
+fn terminal_exit_quiesce_config_from_env(canary_live_enabled: bool) -> TerminalExitQuiesceConfig {
+    if !canary_live_enabled
+        || !parse_bool_env_default("PARAPHINA_TERMINAL_EXIT_QUIESCE_ENABLED", false)
+    {
+        return TerminalExitQuiesceConfig::default();
+    }
+    let signal_file = std::env::var("PARAPHINA_TERMINAL_EXIT_SIGNAL_FILE")
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    TerminalExitQuiesceConfig {
+        enabled: signal_file.is_some(),
+        signal_file,
+    }
+}
+
+fn terminal_exit_quiesce_active(config: &TerminalExitQuiesceConfig) -> bool {
+    config.enabled
+        && config
+            .signal_file
+            .as_ref()
+            .map(|path| path.exists())
+            .unwrap_or(false)
+}
+
+fn terminal_residual_convergence_config_from_env(
+    canary_live_enabled: bool,
+) -> TerminalResidualConvergenceConfig {
+    if !canary_live_enabled {
+        return TerminalResidualConvergenceConfig::default();
+    }
+    let account_refresh_enabled =
+        parse_bool_env_default("PARAPHINA_TERMINAL_RESIDUAL_ACCOUNT_REFRESH_ENABLED", false);
+    let reduce_after_cancel_confirm_enabled = parse_bool_env_default(
+        "PARAPHINA_TERMINAL_RESIDUAL_REDUCE_AFTER_CANCEL_CONFIRM_ENABLED",
+        false,
+    );
+    if !account_refresh_enabled && !reduce_after_cancel_confirm_enabled {
+        return TerminalResidualConvergenceConfig::default();
+    }
+    let venue_ids = std::env::var("PARAPHINA_TERMINAL_RESIDUAL_VENUES")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|venue| venue.trim().to_ascii_lowercase())
+                .filter(|venue| !venue.is_empty())
+                .collect::<HashSet<_>>()
+        })
+        .filter(|venues| !venues.is_empty())
+        .unwrap_or_else(|| {
+            ["extended".to_string(), "paradex".to_string()]
+                .into_iter()
+                .collect()
+        });
+    TerminalResidualConvergenceConfig {
+        account_refresh_enabled,
+        reduce_after_cancel_confirm_enabled,
+        venue_ids,
+        account_refresh_timeout_ms: parse_optional_positive_i64_env(
+            "PARAPHINA_TERMINAL_RESIDUAL_ACCOUNT_REFRESH_TIMEOUT_MS",
+        )
+        .unwrap_or(500) as u64,
+        account_refresh_min_interval_ms: parse_optional_positive_i64_env(
+            "PARAPHINA_TERMINAL_RESIDUAL_ACCOUNT_REFRESH_MIN_INTERVAL_MS",
+        )
+        .unwrap_or(2_000),
+        cancel_retry_interval_ms: parse_optional_positive_i64_env(
+            "PARAPHINA_TERMINAL_RESIDUAL_CANCEL_RETRY_INTERVAL_MS",
+        )
+        .unwrap_or(0),
+        stale_order_reduce_after_ms: parse_optional_positive_i64_env(
+            "PARAPHINA_TERMINAL_RESIDUAL_STALE_ORDER_REDUCE_AFTER_MS",
+        )
+        .unwrap_or(0),
+    }
+}
+
+fn terminal_residual_convergence_venue_indices(
+    cfg: &Config,
+    config: &TerminalResidualConvergenceConfig,
+) -> HashSet<usize> {
+    if !config.account_refresh_enabled && !config.reduce_after_cancel_confirm_enabled {
+        return HashSet::new();
+    }
+    cfg.venues
+        .iter()
+        .enumerate()
+        .filter_map(|(venue_index, venue)| {
+            config
+                .venue_ids
+                .contains(&venue.id.to_ascii_lowercase())
+                .then_some(venue_index)
+        })
+        .collect()
 }
 
 fn startup_pnl_baseline_config_from_env(canary_enabled: bool) -> StartupPnlBaselineConfig {
@@ -4702,6 +10401,60 @@ fn startup_pnl_baseline_config_from_env(canary_enabled: bool) -> StartupPnlBasel
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(40),
+    }
+}
+
+fn startup_stale_arming_ms_from_env(canary_enabled: bool) -> TimestampMs {
+    if !canary_enabled {
+        return 0;
+    }
+    parse_optional_positive_i64_env("PARAPHINA_STARTUP_STALE_ARMING_MS").unwrap_or(4_000)
+}
+
+fn startup_stale_pending_venues(snapshot: &CanonicalCacheSnapshot) -> Vec<String> {
+    snapshot
+        .market
+        .iter()
+        .filter(|market| market.mid.is_none() || market.is_stale)
+        .map(|market| market.venue_id.to_string())
+        .collect()
+}
+
+fn evaluate_startup_stale_arming(
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    startup_started_ms: TimestampMs,
+    startup_arming_ms: TimestampMs,
+    armed_before_tick: bool,
+) -> StartupStaleArmingStatus {
+    let enabled = startup_arming_ms > 0;
+    let elapsed_ms = now_ms.saturating_sub(startup_started_ms).max(0);
+    let pending_venues = startup_stale_pending_venues(snapshot);
+    let all_ready = pending_venues.is_empty();
+    let armed_this_tick = enabled && !armed_before_tick && elapsed_ms >= startup_arming_ms;
+    let armed = !enabled || armed_before_tick || armed_this_tick;
+    let arm_reason = if !enabled {
+        Some("disabled".to_string())
+    } else if armed {
+        Some(
+            if all_ready {
+                "all_ready_after_min"
+            } else {
+                "timeout"
+            }
+            .to_string(),
+        )
+    } else {
+        None
+    };
+    StartupStaleArmingStatus {
+        enabled,
+        armed,
+        armed_this_tick,
+        elapsed_ms,
+        arming_ms: startup_arming_ms,
+        pending_venues,
+        arm_reason,
     }
 }
 
@@ -4837,11 +10590,13 @@ fn apply_inventory_soft_governor(
 
         let blocked_bid = !bid_reasons.is_empty();
         let blocked_ask = !ask_reasons.is_empty();
-        if blocked_bid {
+        if blocked_bid && quote.bid.is_some() {
             quote.bid = None;
+            quote.bid_terminal_reason = "inventory_soft_governor_suppressed";
         }
-        if blocked_ask {
+        if blocked_ask && quote.ask.is_some() {
             quote.ask = None;
+            quote.ask_terminal_reason = "inventory_soft_governor_suppressed";
         }
         if blocked_bid || blocked_ask {
             status
@@ -4936,6 +10691,60 @@ fn fresh_account_position_tao(
             )
         })
         .map(|acct| acct.position_tao)
+}
+
+fn lighter_orderly_exit_residual_position_tao(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    venue_index: usize,
+    now_ms: TimestampMs,
+    position_tol_tao: f64,
+    allow_live_orders: bool,
+) -> Option<f64> {
+    let venue_cfg = cfg.venues.get(venue_index)?;
+    if !venue_cfg.id.eq_ignore_ascii_case("lighter") {
+        return None;
+    }
+    let venue = state.venues.get(venue_index)?;
+    if venue.status != VenueStatus::Healthy {
+        return None;
+    }
+    if live_open_order_count_for_venue(state, venue_index) != 0 && !allow_live_orders {
+        return None;
+    }
+    let account_position_tao = fresh_account_position_tao(cfg, snapshot, venue_index, now_ms)?;
+    if !account_position_tao.is_finite() {
+        return None;
+    }
+    let lot_size = venue_cfg.lot_size_tao.max(1e-9);
+    let position_abs = account_position_tao.abs();
+    let position_tol = position_tol_tao.max(0.0025).min(lot_size);
+    if position_abs <= position_tol + 1e-9 || position_abs + 1e-9 >= lot_size {
+        return None;
+    }
+    Some(account_position_tao)
+}
+
+fn has_lighter_orderly_exit_residual_convergence(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    position_tol_tao: f64,
+) -> bool {
+    (0..state.venues.len()).any(|venue_index| {
+        lighter_orderly_exit_residual_position_tao(
+            cfg,
+            state,
+            snapshot,
+            venue_index,
+            now_ms,
+            position_tol_tao,
+            false,
+        )
+        .is_some()
+    })
 }
 
 fn evaluate_startup_pnl_baseline(
@@ -5047,19 +10856,53 @@ fn evaluate_startup_pnl_baseline(
     status
 }
 
-fn clamp_aster_emergency_target_position_tao(
+fn clamp_confirmed_reduce_only_target_position_tao(
     cfg: &Config,
+    state: &GlobalState,
     snapshot: &CanonicalCacheSnapshot,
     venue_index: usize,
     now_ms: TimestampMs,
     target_position_tao: f64,
+    treat_live_orders_as_cancelling: bool,
+    class: EmergencyRequestClass,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
 ) -> Option<f64> {
     let venue = cfg.venues.get(venue_index)?;
-    if !venue.id.eq_ignore_ascii_case("aster") {
-        return Some(target_position_tao);
-    }
     let lot_size = venue.lot_size_tao.max(1e-9);
-    let account_position_tao = fresh_account_position_tao(cfg, snapshot, venue_index, now_ms)?;
+    let live_open_order_count = live_open_order_count_for_venue(state, venue_index);
+    let has_live_orders = live_open_order_count > 0 && !treat_live_orders_as_cancelling;
+    let mut used_state_fallback = false;
+    let account_position_tao = if let Some(account_position_tao) =
+        fresh_account_position_tao(cfg, snapshot, venue_index, now_ms)
+    {
+        Some(account_position_tao)
+    } else if venue.id.eq_ignore_ascii_case("lighter") {
+        if has_live_orders {
+            None
+        } else {
+            let state_position_tao = state.venues.get(venue_index)?.position_tao;
+            let confirmed_abs = snap_size_down_to_lot(state_position_tao.abs(), lot_size);
+            let max_fallback_abs = snap_size_down_to_lot(lot_size * 4.0, lot_size);
+            if confirmed_abs < lot_size || confirmed_abs > max_fallback_abs {
+                None
+            } else {
+                Some(state_position_tao.signum() * confirmed_abs)
+            }
+        }
+    } else {
+        used_state_fallback = true;
+        bounded_state_fallback_position_tao(
+            cfg,
+            state,
+            venue_index,
+            target_position_tao,
+            live_open_order_count,
+            lot_size,
+            treat_live_orders_as_cancelling,
+            class,
+            residual_fallback.as_mut().map(|status| &mut **status),
+        )
+    }?;
     if account_position_tao.abs() < lot_size {
         return None;
     }
@@ -5072,7 +10915,38 @@ fn clamp_aster_emergency_target_position_tao(
     if confirmed_abs < lot_size {
         return None;
     }
-    let max_send_abs = snap_size_down_to_lot((confirmed_abs - lot_size).max(0.0), lot_size);
+    // Reduce-only emergency hedges must only target confirmed same-side inventory.
+    // Aster keeps an extra one-lot haircut by default because its account stream can
+    // still lag just enough around the emergency path that a full-size reduce_only
+    // IOC gets rejected after the first partial flatten. The exact two-lot terminal
+    // residual case is reversible/env-gated and only bypasses the haircut once live
+    // orders are already gone.
+    let max_send_abs = if venue.id.eq_ignore_ascii_case("aster") {
+        let max_full_target_abs = snap_size_down_to_lot(
+            lot_size * aster_soft_unwind_full_target_max_lots(),
+            lot_size,
+        );
+        if (confirmed_abs <= lot_size + 1e-9 && !has_live_orders)
+            || (live_open_order_count == 0 && confirmed_abs <= max_full_target_abs + 1e-9)
+        {
+            confirmed_abs
+        } else {
+            snap_size_down_to_lot((confirmed_abs - lot_size).max(0.0), lot_size)
+        }
+    } else if treat_live_orders_as_cancelling
+        && !(used_state_fallback
+            && venue.id.eq_ignore_ascii_case("extended")
+            && extended_state_fallback_step_lots().is_some())
+    {
+        // When same-side live orders are already being canceled, allow one extra lot
+        // so a last worsening maker fill racing the cancel can still be flattened in
+        // the same emergency path. Do not re-expand env-stepped Extended fallback
+        // when account truth is stale; that path is deliberately one-step to avoid
+        // reduce-only size conflicts against venue-truth position.
+        snap_size_down_to_lot(confirmed_abs + lot_size, lot_size)
+    } else {
+        confirmed_abs
+    };
     if max_send_abs < lot_size {
         return None;
     }
@@ -5081,6 +10955,168 @@ fn clamp_aster_emergency_target_position_tao(
         return None;
     }
     Some(target_position_tao.signum() * clamped_abs)
+}
+
+fn push_emergency_residual_fallback_record(
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    class: EmergencyRequestClass,
+    venue_index: usize,
+    venue_id: &str,
+    status: EmergencyResidualFallbackDecision,
+    reason: EmergencyResidualFallbackReason,
+    state_position_tao: f64,
+    clamped_size_tao: f64,
+) {
+    let Some(residual_fallback) = residual_fallback else {
+        return;
+    };
+    residual_fallback
+        .records
+        .push(EmergencyResidualFallbackRecord {
+            class,
+            venue_index,
+            venue_id: venue_id.to_string(),
+            status,
+            reason,
+            state_position_tao,
+            clamped_size_tao,
+        });
+}
+
+fn bounded_state_fallback_position_tao(
+    cfg: &Config,
+    state: &GlobalState,
+    venue_index: usize,
+    target_position_tao: f64,
+    live_open_order_count: usize,
+    lot_size: f64,
+    treat_live_orders_as_cancelling: bool,
+    class: EmergencyRequestClass,
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Option<f64> {
+    let venue = cfg.venues.get(venue_index)?;
+    let aster_soft_unwind_fallback = venue.id.eq_ignore_ascii_case("aster")
+        && matches!(class, EmergencyRequestClass::SoftUnwind);
+    if !venue.id.eq_ignore_ascii_case("extended")
+        && !venue.id.eq_ignore_ascii_case("paradex")
+        && !aster_soft_unwind_fallback
+    {
+        return None;
+    }
+    let state_position_tao = state.venues.get(venue_index)?.position_tao;
+    if live_open_order_count > 0 && !treat_live_orders_as_cancelling {
+        push_emergency_residual_fallback_record(
+            residual_fallback,
+            class,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::LiveOrdersPresent,
+            state_position_tao,
+            0.0,
+        );
+        return None;
+    }
+    let confirmed_abs = snap_size_down_to_lot(state_position_tao.abs(), lot_size);
+    if confirmed_abs < lot_size {
+        return None;
+    }
+    let max_fallback_lots = if aster_soft_unwind_fallback {
+        // Aster user/account updates can lag a just-acked cancel_all. Permit the
+        // exact observed post-cancel residual class without widening hard caps.
+        2.0
+    } else if venue.id.eq_ignore_ascii_case("extended")
+        && matches!(class, EmergencyRequestClass::SoftUnwind)
+    {
+        extended_soft_unwind_state_fallback_max_lots()
+    } else if venue.id.eq_ignore_ascii_case("paradex")
+        || (venue.id.eq_ignore_ascii_case("extended")
+            && matches!(class, EmergencyRequestClass::InventoryBrake))
+    {
+        3.0
+    } else {
+        1.0
+    };
+    let max_fallback_abs = snap_size_down_to_lot(lot_size * max_fallback_lots, lot_size);
+    if confirmed_abs > max_fallback_abs + 1e-9 {
+        push_emergency_residual_fallback_record(
+            residual_fallback,
+            class,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            if max_fallback_lots <= 1.0 {
+                EmergencyResidualFallbackReason::NotExactOneLot
+            } else {
+                EmergencyResidualFallbackReason::FallbackSizeTooLarge
+            },
+            state_position_tao,
+            confirmed_abs,
+        );
+        return None;
+    }
+    let clamped_abs = target_position_tao.abs().min(confirmed_abs);
+    if clamped_abs > max_fallback_abs + 1e-9 {
+        push_emergency_residual_fallback_record(
+            residual_fallback,
+            class,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::FallbackSizeTooLarge,
+            state_position_tao,
+            clamped_abs,
+        );
+        return None;
+    }
+    let clamped_abs = if venue.id.eq_ignore_ascii_case("extended") {
+        if let Some(step_lots) = extended_state_fallback_step_lots() {
+            clamped_abs.min(snap_size_down_to_lot(lot_size * step_lots, lot_size))
+        } else {
+            clamped_abs
+        }
+    } else {
+        clamped_abs
+    };
+    if target_position_tao.signum() == 0.0
+        || state_position_tao.signum() != target_position_tao.signum()
+    {
+        push_emergency_residual_fallback_record(
+            residual_fallback,
+            class,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::SignMismatch,
+            state_position_tao,
+            clamped_abs,
+        );
+        return None;
+    }
+    if clamped_abs < lot_size {
+        push_emergency_residual_fallback_record(
+            residual_fallback,
+            class,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::NotExactOneLot,
+            state_position_tao,
+            clamped_abs,
+        );
+        return None;
+    }
+    push_emergency_residual_fallback_record(
+        residual_fallback,
+        class,
+        venue_index,
+        venue.id.as_str(),
+        EmergencyResidualFallbackDecision::Used,
+        EmergencyResidualFallbackReason::NoFreshAccount,
+        state_position_tao,
+        clamped_abs,
+    );
+    Some(state_position_tao.signum() * clamped_abs)
 }
 
 fn is_benign_reduce_only_reject(reject: &OrderReject) -> bool {
@@ -5110,6 +11146,34 @@ fn soft_unwind_target_position_tao(
     let snapped_abs = snap_size_down_to_lot(position_source.abs(), lot_size);
     if snapped_abs < lot_size {
         return 0.0;
+    }
+    if cfg
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.id.eq_ignore_ascii_case("extended"))
+        .unwrap_or(false)
+    {
+        let max_full_target_abs = snap_size_down_to_lot(
+            lot_size * extended_soft_unwind_state_fallback_max_lots(),
+            lot_size,
+        );
+        if snapped_abs <= max_full_target_abs + 1e-9 {
+            return position_source.signum() * snapped_abs;
+        }
+    }
+    if cfg
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.id.eq_ignore_ascii_case("aster"))
+        .unwrap_or(false)
+    {
+        let max_full_target_abs = snap_size_down_to_lot(
+            lot_size * aster_soft_unwind_full_target_max_lots(),
+            lot_size,
+        );
+        if snapped_abs <= max_full_target_abs + 1e-9 {
+            return position_source.signum() * snapped_abs;
+        }
     }
     let conservative_abs = if snapped_abs > lot_size {
         snap_size_down_to_lot(snapped_abs - lot_size, lot_size).max(lot_size)
@@ -5164,22 +11228,173 @@ fn soft_unwind_runtime_state(
     response_backoff_active: bool,
     has_material_positions: bool,
     has_live_mm_orders: bool,
+    orderly_exit_residual_convergence_needed: bool,
+    terminal_exit_quiesce_active: bool,
 ) -> SoftUnwindRuntimeState {
     let send_unwind = !response_backoff_active
-        && (soft_limit_triggered || cooldown_active)
-        && (has_material_positions || has_live_mm_orders);
+        && (((soft_limit_triggered || cooldown_active)
+            && (has_material_positions || has_live_mm_orders))
+            || orderly_exit_residual_convergence_needed);
     SoftUnwindRuntimeState {
-        pause_mm_quotes: soft_limit_triggered || cooldown_active || response_backoff_active,
+        pause_mm_quotes: soft_limit_triggered
+            || cooldown_active
+            || response_backoff_active
+            || orderly_exit_residual_convergence_needed
+            || terminal_exit_quiesce_active,
         send_unwind,
         refresh_cooldown: soft_limit_triggered,
     }
 }
 
+fn inventory_brake_requires_mm_pause(status: &InventoryBrakeStatus) -> bool {
+    if !status.triggered {
+        return false;
+    }
+    let has_actual_global_exposure = status.q_global_tao.abs() > 1e-9
+        || status.q_gross_tao.abs() > 1e-9
+        || status.q_max_abs_venue_tao.abs() > 1e-9;
+    let has_positioned_blocked_venue = status
+        .blocked_venues
+        .iter()
+        .any(|venue| venue.position_tao.abs() > 1e-9);
+    let has_non_projected_reason = status
+        .global_reasons
+        .iter()
+        .any(|reason| !reason.starts_with("projected_"));
+    has_actual_global_exposure || has_positioned_blocked_venue || has_non_projected_reason
+}
+
+fn inventory_brake_cancel_only_mm_mode(status: &InventoryBrakeStatus) -> bool {
+    status.triggered && !inventory_brake_requires_mm_pause(status)
+}
+
+fn inventory_brake_waits_for_responses(status: &InventoryBrakeStatus) -> bool {
+    inventory_brake_requires_mm_pause(status)
+}
+
+fn effective_inventory_brake_intents(
+    status: &InventoryBrakeStatus,
+    intents: Vec<OrderIntent>,
+) -> Vec<OrderIntent> {
+    if inventory_brake_cancel_only_mm_mode(status) {
+        retain_cancel_only_intents(intents)
+    } else {
+        intents
+    }
+}
+
+fn retain_cancel_only_intents(intents: Vec<OrderIntent>) -> Vec<OrderIntent> {
+    intents
+        .into_iter()
+        .filter(|intent| matches!(intent, OrderIntent::Cancel(_)))
+        .collect()
+}
+
+fn mm_submission_intents_for_quote_gate(
+    should_quote: bool,
+    pause_mm_quotes: bool,
+    inventory_brake_cancel_only_mode: bool,
+    mm_plan_intents: Vec<OrderIntent>,
+    projected_budget_cleanup_intents: Vec<OrderIntent>,
+) -> Vec<OrderIntent> {
+    if pause_mm_quotes {
+        return Vec::new();
+    }
+    if should_quote {
+        if inventory_brake_cancel_only_mode {
+            return retain_cancel_only_intents(mm_plan_intents);
+        }
+        return mm_plan_intents;
+    }
+    projected_budget_cleanup_intents
+}
+
+fn suppress_non_cancel_intents_for_disabled_cancel_latches(
+    intents: &mut Vec<OrderIntent>,
+    emergency_request_latches: &mut EmergencyRequestLatchSet,
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: TimestampMs,
+) -> Vec<usize> {
+    refresh_emergency_request_latches(emergency_request_latches, cfg, state, now_ms);
+    let latched_venues = emergency_request_latch_entries(
+        emergency_request_latches,
+        EmergencyRequestClass::DisabledCancelAll,
+    )
+    .iter()
+    .map(|latch| latch.venue_index)
+    .collect::<HashSet<_>>();
+    if latched_venues.is_empty() {
+        return Vec::new();
+    }
+
+    let mut suppressed = std::collections::BTreeSet::new();
+    intents.retain(|intent| {
+        let Some(venue_index) = venue_index_for_order_intent(intent) else {
+            return true;
+        };
+        if !latched_venues.contains(&venue_index) {
+            return true;
+        }
+        match intent {
+            OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => true,
+            OrderIntent::Place(_) | OrderIntent::Replace(_) => {
+                suppressed.insert(venue_index);
+                false
+            }
+        }
+    });
+    suppressed.into_iter().collect()
+}
+
+fn venue_has_material_position(cfg: &Config, state: &GlobalState, venue_index: usize) -> bool {
+    let Some(venue_cfg) = cfg.venues.get(venue_index) else {
+        return false;
+    };
+    let Some(venue) = state.venues.get(venue_index) else {
+        return false;
+    };
+    venue.position_tao.abs() >= venue_cfg.lot_size_tao.max(1e-9)
+}
+
+fn retain_canary_breach_preferred_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    intents: &mut Vec<OrderIntent>,
+    target_venues: &[usize],
+    drop_cancels_for_positioned_venues: bool,
+) -> usize {
+    let target_venues = target_venues.iter().copied().collect::<HashSet<_>>();
+    let mut removed = 0usize;
+    intents.retain(|intent| {
+        let Some(venue_index) = venue_index_for_order_intent(intent) else {
+            return true;
+        };
+        if !target_venues.contains(&venue_index) {
+            return true;
+        }
+        let drop_intent = match intent {
+            OrderIntent::Place(_) | OrderIntent::Replace(_) => true,
+            OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => {
+                drop_cancels_for_positioned_venues
+                    && venue_has_material_position(cfg, state, venue_index)
+            }
+        };
+        if drop_intent {
+            removed = removed.saturating_add(1);
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
 fn reserve_priority_path_for_inventory_control(
     soft_unwind_state: SoftUnwindRuntimeState,
-    inventory_brake_triggered: bool,
+    inventory_brake_pause_mm_quotes: bool,
 ) -> bool {
-    soft_unwind_state.pause_mm_quotes || inventory_brake_triggered
+    soft_unwind_state.pause_mm_quotes || inventory_brake_pause_mm_quotes
 }
 
 fn aggressive_unwind_price(
@@ -5255,7 +11470,106 @@ fn build_soft_unwind_intents(
     snapshot: &CanonicalCacheSnapshot,
     now_ms: TimestampMs,
 ) -> Vec<OrderIntent> {
+    build_soft_unwind_intents_with_fallback_status(cfg, state, snapshot, now_ms, None)
+}
+
+fn build_soft_unwind_intents_with_fallback_status(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Vec<OrderIntent> {
+    build_soft_unwind_intents_with_fallback_and_fee_guard_status(
+        cfg,
+        state,
+        snapshot,
+        now_ms,
+        AsterSoftUnwindFeeGuardConfig::default(),
+        residual_fallback.as_mut().map(|status| &mut **status),
+    )
+}
+
+fn build_soft_unwind_intents_with_fallback_and_fee_guard_status(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    fee_guard_config: AsterSoftUnwindFeeGuardConfig,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Vec<OrderIntent> {
+    build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status(
+        cfg,
+        state,
+        snapshot,
+        now_ms,
+        fee_guard_config,
+        residual_fallback.as_mut().map(|status| &mut **status),
+        None,
+    )
+}
+
+fn build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    fee_guard_config: AsterSoftUnwindFeeGuardConfig,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    mut aster_residual_tracker: Option<&mut AsterResidualMarkoutGuardTracker>,
+) -> Vec<OrderIntent> {
+    build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status_impl(
+        cfg,
+        state,
+        snapshot,
+        now_ms,
+        fee_guard_config,
+        residual_fallback.as_mut().map(|status| &mut **status),
+        aster_residual_tracker
+            .as_mut()
+            .map(|tracker| &mut **tracker),
+        None,
+    )
+}
+
+fn build_soft_unwind_intents_with_terminal_defer_status(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    fee_guard_config: AsterSoftUnwindFeeGuardConfig,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    mut aster_residual_tracker: Option<&mut AsterResidualMarkoutGuardTracker>,
+    defer_reduce_while_canceling_venues: &HashSet<usize>,
+) -> Vec<OrderIntent> {
+    build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status_impl(
+        cfg,
+        state,
+        snapshot,
+        now_ms,
+        fee_guard_config,
+        residual_fallback.as_mut().map(|status| &mut **status),
+        aster_residual_tracker
+            .as_mut()
+            .map(|tracker| &mut **tracker),
+        Some(defer_reduce_while_canceling_venues),
+    )
+}
+
+fn build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status_impl(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    fee_guard_config: AsterSoftUnwindFeeGuardConfig,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    mut aster_residual_tracker: Option<&mut AsterResidualMarkoutGuardTracker>,
+    defer_reduce_while_canceling_venues: Option<&HashSet<usize>>,
+) -> Vec<OrderIntent> {
     let mut intents = Vec::new();
+    if let Some(status) = residual_fallback.as_mut() {
+        seed_aster_soft_unwind_fee_guard_status(status, fee_guard_config);
+    }
 
     for (venue_index, venue) in state.venues.iter().enumerate() {
         if let Some(order) = venue.mm_open_bid.as_ref() {
@@ -5275,13 +11589,66 @@ fn build_soft_unwind_intents(
     }
 
     for venue_index in 0..state.venues.len() {
-        let lot_size = cfg.venues[venue_index].lot_size_tao.max(1e-9);
-        let Some(unwind_position_tao) = clamp_aster_emergency_target_position_tao(
+        if !venue_has_material_position(cfg, state, venue_index)
+            || live_open_order_count_for_venue(state, venue_index) == 0
+        {
+            continue;
+        }
+        let _ = remove_intents_for_venue(&mut intents, venue_index);
+        intents.extend(build_disabled_cancel_intents_for_venue(
             cfg,
+            state,
+            venue_index,
+        ));
+    }
+
+    let cancelling_venues = intents
+        .iter()
+        .filter_map(|intent| match intent {
+            OrderIntent::Cancel(cancel) => Some(cancel.venue_index),
+            OrderIntent::CancelAll(cancel_all) => cancel_all.venue_index,
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    for venue_index in 0..state.venues.len() {
+        let lot_size = cfg.venues[venue_index].lot_size_tao.max(1e-9);
+        let target_position_tao =
+            soft_unwind_target_position_tao(cfg, state, snapshot, venue_index, now_ms);
+        if cancelling_venues.contains(&venue_index)
+            && defer_reduce_while_canceling_venues
+                .map(|venues| venues.contains(&venue_index))
+                .unwrap_or(false)
+        {
+            if target_position_tao.abs() >= lot_size {
+                let state_position_tao = state
+                    .venues
+                    .get(venue_index)
+                    .map(|venue| venue.position_tao)
+                    .unwrap_or_default();
+                push_emergency_residual_fallback_record(
+                    residual_fallback.as_mut().map(|status| &mut **status),
+                    EmergencyRequestClass::SoftUnwind,
+                    venue_index,
+                    cfg.venues[venue_index].id.as_str(),
+                    EmergencyResidualFallbackDecision::Rejected,
+                    EmergencyResidualFallbackReason::LiveOrdersPresent,
+                    state_position_tao,
+                    0.0,
+                );
+            }
+            continue;
+        }
+        let Some(unwind_position_tao) = clamp_confirmed_reduce_only_target_position_tao(
+            cfg,
+            state,
             snapshot,
             venue_index,
             now_ms,
-            soft_unwind_target_position_tao(cfg, state, snapshot, venue_index, now_ms),
+            target_position_tao,
+            cancelling_venues.contains(&venue_index),
+            EmergencyRequestClass::SoftUnwind,
+            residual_fallback.as_mut().map(|status| &mut **status),
         ) else {
             continue;
         };
@@ -5296,12 +11663,622 @@ fn build_soft_unwind_intents(
         let Some(price) = aggressive_unwind_price(cfg, state, venue_index, side) else {
             continue;
         };
+        let venue_id = cfg.venues[venue_index].id_arc.clone();
+        let fee_guard_reference_position_tao =
+            fresh_account_or_state_position_tao(cfg, state, snapshot, venue_index, now_ms);
+        if should_suppress_aster_soft_unwind_for_fee_guard(
+            &venue_id,
+            fee_guard_reference_position_tao,
+            unwind_position_tao,
+            price,
+            fee_guard_config,
+            cfg,
+            state,
+            snapshot,
+            venue_index,
+            now_ms,
+            aster_residual_tracker
+                .as_mut()
+                .map(|tracker| &mut **tracker),
+            residual_fallback.as_mut().map(|status| &mut **status),
+        ) {
+            record_aster_soft_unwind_fee_guard_suppression(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                venue_index,
+                &venue_id,
+                fee_guard_reference_position_tao,
+                unwind_position_tao,
+                price,
+            );
+            continue;
+        }
+        intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
+            venue_index,
+            venue_id,
+            side,
+            price,
+            size: unwind_position_tao.abs(),
+            purpose: OrderPurpose::Hedge,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: None,
+        }));
+    }
+
+    intents
+}
+
+fn aster_terminal_sub_lot_residual_position_tao(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    fee_guard_config: AsterSoftUnwindFeeGuardConfig,
+) -> Option<f64> {
+    if !aster_terminal_sub_lot_reduce_enabled()
+        || !fee_guard_config.residual_markout_guard_enabled
+        || !fee_guard_config.residual_markout_guard_terminal_refresh_enabled
+    {
+        return None;
+    }
+    let venue_index = aster_venue_index(cfg)?;
+    if live_open_order_count_for_venue(state, venue_index) > 0 {
+        return None;
+    }
+    let venue = cfg.venues.get(venue_index)?;
+    let account = fresh_account_snapshot_for_venue(cfg, snapshot, venue_index, now_ms)?;
+    let residual_position_tao = account.position_tao;
+    let residual_abs = residual_position_tao.abs();
+    let min_abs = aster_terminal_sub_lot_reduce_min_abs_tao();
+    let configured_lot = venue.lot_size_tao.max(1e-9);
+    if residual_abs <= min_abs + 1e-9
+        || residual_abs >= configured_lot - 1e-9
+        || residual_abs > fee_guard_config.max_abs_position_tao + 1e-9
+    {
+        return None;
+    }
+    let side = if residual_position_tao > 0.0 {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    let price = inventory_brake_unwind_price(cfg, state, venue_index, side)?;
+    if residual_abs * price + 1e-9 < venue.min_notional_usd {
+        return None;
+    }
+    let fee_estimate = cleanup_fee_estimate_usd(
+        residual_position_tao,
+        price,
+        fee_guard_config.residual_markout_guard_taker_fee_rate,
+    )?;
+    if fee_estimate > fee_guard_config.residual_markout_guard_force_flat_max_fee_usd + 1e-9 {
+        return None;
+    }
+    Some(residual_position_tao)
+}
+
+fn hyperliquid_terminal_sub_lot_residual_position_tao(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+) -> Option<f64> {
+    if !hyperliquid_terminal_sub_lot_reduce_enabled() {
+        return None;
+    }
+    let venue_index = hyperliquid_venue_index(cfg)?;
+    if live_open_order_count_for_venue(state, venue_index) > 0 {
+        return None;
+    }
+    let venue = cfg.venues.get(venue_index)?;
+    let account = fresh_account_snapshot_for_venue(cfg, snapshot, venue_index, now_ms)?;
+    let residual_position_tao = account.position_tao;
+    let residual_abs = residual_position_tao.abs();
+    let min_abs = hyperliquid_terminal_sub_lot_reduce_min_abs_tao();
+    let configured_lot = venue.lot_size_tao.max(1e-9);
+    if residual_abs <= min_abs + 1e-9 || residual_abs >= configured_lot - 1e-9 {
+        return None;
+    }
+    let side = if residual_position_tao > 0.0 {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    let price = inventory_brake_unwind_price(cfg, state, venue_index, side)?;
+    if residual_abs * price + 1e-9 < venue.min_notional_usd {
+        return None;
+    }
+    Some(residual_position_tao)
+}
+
+fn extended_terminal_sub_lot_residual_position_tao(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    terminal_stale_order_reduce_venues: Option<&HashSet<usize>>,
+) -> Option<f64> {
+    if !extended_terminal_sub_lot_reduce_enabled() {
+        return None;
+    }
+    let venue_index = extended_venue_index(cfg)?;
+    let allow_live_orders = terminal_stale_order_reduce_venues
+        .map(|venues| venues.contains(&venue_index))
+        .unwrap_or(false);
+    if live_open_order_count_for_venue(state, venue_index) > 0 && !allow_live_orders {
+        return None;
+    }
+    let venue = cfg.venues.get(venue_index)?;
+    let account = fresh_account_snapshot_for_venue(cfg, snapshot, venue_index, now_ms)?;
+    let residual_position_tao = account.position_tao;
+    let residual_abs = residual_position_tao.abs();
+    let min_abs = extended_terminal_sub_lot_reduce_min_abs_tao();
+    let configured_lot = venue.lot_size_tao.max(1e-9);
+    let max_abs = configured_lot * extended_terminal_sub_lot_reduce_max_lots();
+    if residual_abs <= min_abs + 1e-9 || residual_abs > max_abs + 1e-9 {
+        return None;
+    }
+    let side = if residual_position_tao > 0.0 {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    let price = inventory_brake_unwind_price(cfg, state, venue_index, side)?;
+    if residual_abs * price + 1e-9 < venue.min_notional_usd {
+        return None;
+    }
+    Some(residual_position_tao)
+}
+
+fn build_aster_terminal_sub_lot_residual_convergence_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    fee_guard_config: AsterSoftUnwindFeeGuardConfig,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Vec<OrderIntent> {
+    let mut intents = Vec::new();
+    if let Some(status) = residual_fallback.as_mut() {
+        seed_aster_soft_unwind_fee_guard_status(status, fee_guard_config);
+    }
+    if !aster_terminal_sub_lot_reduce_enabled()
+        || !fee_guard_config.residual_markout_guard_enabled
+        || !fee_guard_config.residual_markout_guard_terminal_refresh_enabled
+    {
+        return intents;
+    }
+    let Some(venue_index) = aster_venue_index(cfg) else {
+        return intents;
+    };
+    let venue = &cfg.venues[venue_index];
+    let state_position_tao = state
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.position_tao)
+        .unwrap_or_default();
+    if live_open_order_count_for_venue(state, venue_index) > 0 {
+        if state_position_tao.abs() > aster_terminal_sub_lot_reduce_min_abs_tao() + 1e-9 {
+            push_emergency_residual_fallback_record(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                EmergencyRequestClass::SoftUnwind,
+                venue_index,
+                venue.id.as_str(),
+                EmergencyResidualFallbackDecision::Rejected,
+                EmergencyResidualFallbackReason::LiveOrdersPresent,
+                state_position_tao,
+                0.0,
+            );
+        }
+        return intents;
+    }
+    let Some(account) = fresh_account_snapshot_for_venue(cfg, snapshot, venue_index, now_ms) else {
+        if state_position_tao.abs() > aster_terminal_sub_lot_reduce_min_abs_tao() + 1e-9 {
+            push_emergency_residual_fallback_record(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                EmergencyRequestClass::SoftUnwind,
+                venue_index,
+                venue.id.as_str(),
+                EmergencyResidualFallbackDecision::Rejected,
+                EmergencyResidualFallbackReason::NoFreshAccount,
+                state_position_tao,
+                0.0,
+            );
+        }
+        return intents;
+    };
+    let residual_position_tao = account.position_tao;
+    let residual_abs = residual_position_tao.abs();
+    let min_abs = aster_terminal_sub_lot_reduce_min_abs_tao();
+    let configured_lot = venue.lot_size_tao.max(1e-9);
+    if residual_abs <= min_abs + 1e-9 {
+        return intents;
+    }
+    if residual_abs >= configured_lot - 1e-9
+        || residual_abs > fee_guard_config.max_abs_position_tao + 1e-9
+    {
+        push_emergency_residual_fallback_record(
+            residual_fallback.as_mut().map(|status| &mut **status),
+            EmergencyRequestClass::SoftUnwind,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::FallbackSizeTooLarge,
+            residual_position_tao,
+            residual_abs,
+        );
+        return intents;
+    }
+    let side = if residual_position_tao > 0.0 {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    let Some(price) = inventory_brake_unwind_price(cfg, state, venue_index, side) else {
+        return intents;
+    };
+    if residual_abs * price + 1e-9 < venue.min_notional_usd {
+        push_emergency_residual_fallback_record(
+            residual_fallback.as_mut().map(|status| &mut **status),
+            EmergencyRequestClass::SoftUnwind,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::BelowMinNotional,
+            residual_position_tao,
+            residual_abs,
+        );
+        return intents;
+    }
+    let fee_estimate = cleanup_fee_estimate_usd(
+        residual_position_tao,
+        price,
+        fee_guard_config.residual_markout_guard_taker_fee_rate,
+    )
+    .unwrap_or(f64::INFINITY);
+    if fee_estimate > fee_guard_config.residual_markout_guard_force_flat_max_fee_usd + 1e-9 {
+        push_emergency_residual_fallback_record(
+            residual_fallback.as_mut().map(|status| &mut **status),
+            EmergencyRequestClass::SoftUnwind,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::FeeGuardSuppressed,
+            residual_position_tao,
+            residual_abs,
+        );
+        return intents;
+    }
+
+    let current_mark = residual_mark_price(state, venue_index);
+    let reference_price = (account.avg_entry_price.is_finite() && account.avg_entry_price > 0.0)
+        .then_some(account.avg_entry_price);
+    let residual_unrealised_usd = current_mark
+        .zip(reference_price)
+        .map(|(mark, reference)| residual_position_tao * (mark - reference));
+    record_aster_residual_markout_guard_evaluation(
+        residual_fallback.as_mut().map(|status| &mut **status),
+        AsterResidualMarkoutGuardEvaluation {
+            suppress: false,
+            decision: "allow",
+            reason: "allowed_terminal_sub_lot",
+            residual_age_ms: None,
+            position_tao: residual_position_tao,
+            reference_price,
+            reference_source: reference_price.map(|_| "fresh_account_avg_entry".to_string()),
+            current_mark,
+            adverse_markout_usd: residual_unrealised_usd.map(|value| (-value).max(0.0)),
+            residual_unrealised_usd,
+            cleanup_notional_usd: cleanup_notional_usd(residual_position_tao, price),
+            cleanup_fee_estimate_usd: Some(fee_estimate),
+        },
+    );
+    push_emergency_residual_fallback_record(
+        residual_fallback.as_mut().map(|status| &mut **status),
+        EmergencyRequestClass::SoftUnwind,
+        venue_index,
+        venue.id.as_str(),
+        EmergencyResidualFallbackDecision::Used,
+        EmergencyResidualFallbackReason::TerminalSubLot,
+        residual_position_tao,
+        residual_abs,
+    );
+    intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
+        venue_index,
+        venue_id: venue.id_arc.clone(),
+        side,
+        price,
+        size: residual_abs,
+        purpose: OrderPurpose::Hedge,
+        time_in_force: TimeInForce::Ioc,
+        post_only: false,
+        reduce_only: true,
+        client_order_id: None,
+    }));
+
+    intents
+}
+
+fn build_hyperliquid_terminal_sub_lot_residual_convergence_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Vec<OrderIntent> {
+    let mut intents = Vec::new();
+    if !hyperliquid_terminal_sub_lot_reduce_enabled() {
+        return intents;
+    }
+    let Some(venue_index) = hyperliquid_venue_index(cfg) else {
+        return intents;
+    };
+    let venue = &cfg.venues[venue_index];
+    let state_position_tao = state
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.position_tao)
+        .unwrap_or_default();
+    let min_abs = hyperliquid_terminal_sub_lot_reduce_min_abs_tao();
+    if live_open_order_count_for_venue(state, venue_index) > 0 {
+        if state_position_tao.abs() > min_abs + 1e-9 {
+            push_emergency_residual_fallback_record(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                EmergencyRequestClass::SoftUnwind,
+                venue_index,
+                venue.id.as_str(),
+                EmergencyResidualFallbackDecision::Rejected,
+                EmergencyResidualFallbackReason::LiveOrdersPresent,
+                state_position_tao,
+                0.0,
+            );
+        }
+        return intents;
+    }
+    let Some(account) = fresh_account_snapshot_for_venue(cfg, snapshot, venue_index, now_ms) else {
+        if state_position_tao.abs() > min_abs + 1e-9 {
+            push_emergency_residual_fallback_record(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                EmergencyRequestClass::SoftUnwind,
+                venue_index,
+                venue.id.as_str(),
+                EmergencyResidualFallbackDecision::Rejected,
+                EmergencyResidualFallbackReason::NoFreshAccount,
+                state_position_tao,
+                0.0,
+            );
+        }
+        return intents;
+    };
+    let residual_position_tao = account.position_tao;
+    let residual_abs = residual_position_tao.abs();
+    let configured_lot = venue.lot_size_tao.max(1e-9);
+    if residual_abs <= min_abs + 1e-9 {
+        return intents;
+    }
+    if residual_abs >= configured_lot - 1e-9 {
+        push_emergency_residual_fallback_record(
+            residual_fallback.as_mut().map(|status| &mut **status),
+            EmergencyRequestClass::SoftUnwind,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::FallbackSizeTooLarge,
+            residual_position_tao,
+            residual_abs,
+        );
+        return intents;
+    }
+    let side = if residual_position_tao > 0.0 {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    let Some(price) = inventory_brake_unwind_price(cfg, state, venue_index, side) else {
+        return intents;
+    };
+    if residual_abs * price + 1e-9 < venue.min_notional_usd {
+        push_emergency_residual_fallback_record(
+            residual_fallback.as_mut().map(|status| &mut **status),
+            EmergencyRequestClass::SoftUnwind,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::BelowMinNotional,
+            residual_position_tao,
+            residual_abs,
+        );
+        return intents;
+    }
+    push_emergency_residual_fallback_record(
+        residual_fallback.as_mut().map(|status| &mut **status),
+        EmergencyRequestClass::SoftUnwind,
+        venue_index,
+        venue.id.as_str(),
+        EmergencyResidualFallbackDecision::Used,
+        EmergencyResidualFallbackReason::TerminalSubLot,
+        residual_position_tao,
+        residual_abs,
+    );
+    intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
+        venue_index,
+        venue_id: venue.id_arc.clone(),
+        side,
+        price,
+        size: residual_abs,
+        purpose: OrderPurpose::Hedge,
+        time_in_force: TimeInForce::Ioc,
+        post_only: false,
+        reduce_only: true,
+        client_order_id: None,
+    }));
+
+    intents
+}
+
+fn build_extended_terminal_sub_lot_residual_convergence_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    terminal_stale_order_reduce_venues: Option<&HashSet<usize>>,
+    class: EmergencyRequestClass,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Vec<OrderIntent> {
+    let mut intents = Vec::new();
+    if !extended_terminal_sub_lot_reduce_enabled() {
+        return intents;
+    }
+    let Some(venue_index) = extended_venue_index(cfg) else {
+        return intents;
+    };
+    let venue = &cfg.venues[venue_index];
+    let state_position_tao = state
+        .venues
+        .get(venue_index)
+        .map(|venue| venue.position_tao)
+        .unwrap_or_default();
+    let min_abs = extended_terminal_sub_lot_reduce_min_abs_tao();
+    let allow_live_orders = terminal_stale_order_reduce_venues
+        .map(|venues| venues.contains(&venue_index))
+        .unwrap_or(false);
+    if live_open_order_count_for_venue(state, venue_index) > 0 && !allow_live_orders {
+        if state_position_tao.abs() > min_abs + 1e-9 {
+            push_emergency_residual_fallback_record(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                class,
+                venue_index,
+                venue.id.as_str(),
+                EmergencyResidualFallbackDecision::Rejected,
+                EmergencyResidualFallbackReason::LiveOrdersPresent,
+                state_position_tao,
+                0.0,
+            );
+        }
+        return intents;
+    }
+    let Some(account) = fresh_account_snapshot_for_venue(cfg, snapshot, venue_index, now_ms) else {
+        if state_position_tao.abs() > min_abs + 1e-9 {
+            push_emergency_residual_fallback_record(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                class,
+                venue_index,
+                venue.id.as_str(),
+                EmergencyResidualFallbackDecision::Rejected,
+                EmergencyResidualFallbackReason::NoFreshAccount,
+                state_position_tao,
+                0.0,
+            );
+        }
+        return intents;
+    };
+    let residual_position_tao = account.position_tao;
+    let residual_abs = residual_position_tao.abs();
+    let configured_lot = venue.lot_size_tao.max(1e-9);
+    let max_abs = configured_lot * extended_terminal_sub_lot_reduce_max_lots();
+    if residual_abs <= min_abs + 1e-9 {
+        return intents;
+    }
+    if residual_abs > max_abs + 1e-9 {
+        push_emergency_residual_fallback_record(
+            residual_fallback.as_mut().map(|status| &mut **status),
+            class,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::FallbackSizeTooLarge,
+            residual_position_tao,
+            residual_abs,
+        );
+        return intents;
+    }
+    let side = if residual_position_tao > 0.0 {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    let Some(price) = inventory_brake_unwind_price(cfg, state, venue_index, side) else {
+        return intents;
+    };
+    if residual_abs * price + 1e-9 < venue.min_notional_usd {
+        push_emergency_residual_fallback_record(
+            residual_fallback.as_mut().map(|status| &mut **status),
+            class,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::BelowMinNotional,
+            residual_position_tao,
+            residual_abs,
+        );
+        return intents;
+    }
+    push_emergency_residual_fallback_record(
+        residual_fallback.as_mut().map(|status| &mut **status),
+        class,
+        venue_index,
+        venue.id.as_str(),
+        EmergencyResidualFallbackDecision::Used,
+        EmergencyResidualFallbackReason::TerminalSubLot,
+        residual_position_tao,
+        residual_abs,
+    );
+    intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
+        venue_index,
+        venue_id: venue.id_arc.clone(),
+        side,
+        price,
+        size: residual_abs,
+        purpose: OrderPurpose::Hedge,
+        time_in_force: TimeInForce::Ioc,
+        post_only: false,
+        reduce_only: true,
+        client_order_id: None,
+    }));
+
+    intents
+}
+
+fn build_lighter_orderly_exit_residual_convergence_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    position_tol_tao: f64,
+    terminal_stale_order_reduce_venues: Option<&HashSet<usize>>,
+) -> Vec<OrderIntent> {
+    let mut intents = Vec::new();
+
+    for venue_index in 0..state.venues.len() {
+        let allow_live_orders = terminal_stale_order_reduce_venues
+            .map(|venues| venues.contains(&venue_index))
+            .unwrap_or(false);
+        let Some(residual_position_tao) = lighter_orderly_exit_residual_position_tao(
+            cfg,
+            state,
+            snapshot,
+            venue_index,
+            now_ms,
+            position_tol_tao,
+            allow_live_orders,
+        ) else {
+            continue;
+        };
+        let side = if residual_position_tao > 0.0 {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let Some(price) = inventory_brake_unwind_price(cfg, state, venue_index, side) else {
+            continue;
+        };
         intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
             venue_index,
             venue_id: cfg.venues[venue_index].id_arc.clone(),
             side,
             price,
-            size: unwind_position_tao.abs(),
+            size: residual_position_tao.abs(),
             purpose: OrderPurpose::Hedge,
             time_in_force: TimeInForce::Ioc,
             post_only: false,
@@ -5320,40 +12297,179 @@ fn build_inventory_brake_intents(
     now_ms: TimestampMs,
     brake: &InventoryBrakeStatus,
 ) -> Vec<OrderIntent> {
+    build_inventory_brake_intents_with_fallback_status(cfg, state, snapshot, now_ms, brake, None)
+}
+
+fn build_inventory_brake_intents_with_fallback_status(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    brake: &InventoryBrakeStatus,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Vec<OrderIntent> {
+    build_inventory_brake_intents_with_fallback_fee_guard_and_markout_status(
+        cfg,
+        state,
+        snapshot,
+        now_ms,
+        brake,
+        AsterSoftUnwindFeeGuardConfig::default(),
+        residual_fallback.as_mut().map(|status| &mut **status),
+        None,
+    )
+}
+
+fn build_inventory_brake_intents_with_fallback_fee_guard_and_markout_status(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    brake: &InventoryBrakeStatus,
+    fee_guard_config: AsterSoftUnwindFeeGuardConfig,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    mut aster_residual_tracker: Option<&mut AsterResidualMarkoutGuardTracker>,
+) -> Vec<OrderIntent> {
+    build_inventory_brake_intents_with_terminal_defer_status(
+        cfg,
+        state,
+        snapshot,
+        now_ms,
+        brake,
+        fee_guard_config,
+        residual_fallback.as_mut().map(|status| &mut **status),
+        aster_residual_tracker
+            .as_mut()
+            .map(|tracker| &mut **tracker),
+        None,
+    )
+}
+
+fn build_inventory_brake_intents_with_terminal_defer_status(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    brake: &InventoryBrakeStatus,
+    fee_guard_config: AsterSoftUnwindFeeGuardConfig,
+    mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+    mut aster_residual_tracker: Option<&mut AsterResidualMarkoutGuardTracker>,
+    defer_reduce_while_canceling_venues: Option<&HashSet<usize>>,
+) -> Vec<OrderIntent> {
     let mut intents = Vec::new();
+    if let Some(status) = residual_fallback.as_mut() {
+        seed_aster_soft_unwind_fee_guard_status(status, fee_guard_config);
+    }
 
     for blocked in &brake.blocked_venues {
         let Some(venue) = state.venues.get(blocked.venue_index) else {
             continue;
         };
         if blocked.blocked_bid {
-            if let Some(order) = venue.mm_open_bid.as_ref() {
-                intents.push(OrderIntent::Cancel(crate::types::CancelOrderIntent {
-                    venue_index: blocked.venue_index,
-                    venue_id: cfg.venues[blocked.venue_index].id_arc.clone(),
-                    order_id: order.order_id.clone(),
-                }));
+            let order_ids =
+                live_mm_open_order_ids_for_venue_side(cfg, state, blocked.venue_index, Side::Buy);
+            if order_ids.is_empty() {
+                if let Some(order) = venue.mm_open_bid.as_ref() {
+                    intents.push(OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                        venue_index: blocked.venue_index,
+                        venue_id: cfg.venues[blocked.venue_index].id_arc.clone(),
+                        order_id: order.order_id.clone(),
+                    }));
+                }
+            } else {
+                for order_id in order_ids {
+                    intents.push(OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                        venue_index: blocked.venue_index,
+                        venue_id: cfg.venues[blocked.venue_index].id_arc.clone(),
+                        order_id,
+                    }));
+                }
             }
         }
         if blocked.blocked_ask {
-            if let Some(order) = venue.mm_open_ask.as_ref() {
-                intents.push(OrderIntent::Cancel(crate::types::CancelOrderIntent {
-                    venue_index: blocked.venue_index,
-                    venue_id: cfg.venues[blocked.venue_index].id_arc.clone(),
-                    order_id: order.order_id.clone(),
-                }));
+            let order_ids =
+                live_mm_open_order_ids_for_venue_side(cfg, state, blocked.venue_index, Side::Sell);
+            if order_ids.is_empty() {
+                if let Some(order) = venue.mm_open_ask.as_ref() {
+                    intents.push(OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                        venue_index: blocked.venue_index,
+                        venue_id: cfg.venues[blocked.venue_index].id_arc.clone(),
+                        order_id: order.order_id.clone(),
+                    }));
+                }
+            } else {
+                for order_id in order_ids {
+                    intents.push(OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                        venue_index: blocked.venue_index,
+                        venue_id: cfg.venues[blocked.venue_index].id_arc.clone(),
+                        order_id,
+                    }));
+                }
             }
         }
     }
 
     for venue_index in 0..state.venues.len() {
-        let lot_size = cfg.venues[venue_index].lot_size_tao.max(1e-9);
-        let Some(unwind_position_tao) = clamp_aster_emergency_target_position_tao(
+        if !venue_has_material_position(cfg, state, venue_index)
+            || live_open_order_count_for_venue(state, venue_index) == 0
+        {
+            continue;
+        }
+        let _ = remove_intents_for_venue(&mut intents, venue_index);
+        intents.extend(build_disabled_cancel_intents_for_venue(
             cfg,
+            state,
+            venue_index,
+        ));
+    }
+
+    let cancelling_venues = intents
+        .iter()
+        .filter_map(|intent| match intent {
+            OrderIntent::Cancel(cancel) => Some(cancel.venue_index),
+            OrderIntent::CancelAll(cancel_all) => cancel_all.venue_index,
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    for venue_index in 0..state.venues.len() {
+        let lot_size = cfg.venues[venue_index].lot_size_tao.max(1e-9);
+        let target_position_tao =
+            inventory_brake_target_position_tao(cfg, state, snapshot, venue_index, now_ms);
+        if cancelling_venues.contains(&venue_index)
+            && defer_reduce_while_canceling_venues
+                .map(|venues| venues.contains(&venue_index))
+                .unwrap_or(false)
+        {
+            if target_position_tao.abs() >= lot_size {
+                let state_position_tao = state
+                    .venues
+                    .get(venue_index)
+                    .map(|venue| venue.position_tao)
+                    .unwrap_or_default();
+                push_emergency_residual_fallback_record(
+                    residual_fallback.as_mut().map(|status| &mut **status),
+                    EmergencyRequestClass::InventoryBrake,
+                    venue_index,
+                    cfg.venues[venue_index].id.as_str(),
+                    EmergencyResidualFallbackDecision::Rejected,
+                    EmergencyResidualFallbackReason::LiveOrdersPresent,
+                    state_position_tao,
+                    0.0,
+                );
+            }
+            continue;
+        }
+        let Some(unwind_position_tao) = clamp_confirmed_reduce_only_target_position_tao(
+            cfg,
+            state,
             snapshot,
             venue_index,
             now_ms,
-            inventory_brake_target_position_tao(cfg, state, snapshot, venue_index, now_ms),
+            target_position_tao,
+            cancelling_venues.contains(&venue_index),
+            EmergencyRequestClass::InventoryBrake,
+            residual_fallback.as_mut().map(|status| &mut **status),
         ) else {
             continue;
         };
@@ -5368,9 +12484,40 @@ fn build_inventory_brake_intents(
         let Some(price) = inventory_brake_unwind_price(cfg, state, venue_index, side) else {
             continue;
         };
+        let venue_id = cfg.venues[venue_index].id_arc.clone();
+        let fee_guard_reference_position_tao =
+            fresh_account_or_state_position_tao(cfg, state, snapshot, venue_index, now_ms);
+        if should_suppress_aster_reduce_only_for_fee_guard(
+            EmergencyRequestClass::InventoryBrake,
+            &venue_id,
+            fee_guard_reference_position_tao,
+            unwind_position_tao,
+            price,
+            fee_guard_config,
+            cfg,
+            state,
+            snapshot,
+            venue_index,
+            now_ms,
+            aster_residual_tracker
+                .as_mut()
+                .map(|tracker| &mut **tracker),
+            residual_fallback.as_mut().map(|status| &mut **status),
+        ) {
+            record_aster_reduce_only_fee_guard_suppression(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                EmergencyRequestClass::InventoryBrake,
+                venue_index,
+                &venue_id,
+                fee_guard_reference_position_tao,
+                unwind_position_tao,
+                price,
+            );
+            continue;
+        }
         intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
             venue_index,
-            venue_id: cfg.venues[venue_index].id_arc.clone(),
+            venue_id,
             side,
             price,
             size: unwind_position_tao.abs(),
@@ -5409,12 +12556,16 @@ fn build_inventory_attribution(
                 .venues
                 .get(venue_index)
                 .and_then(|venue_state| venue_state.mm_open_bid.as_ref())
-                .is_some(),
+                .is_some_and(|order| {
+                    matches!(order.tracking_source, MmOpenTrackingSource::OpenSnapshot)
+                }),
             tracked_mm_ask_live: state
                 .venues
                 .get(venue_index)
                 .and_then(|venue_state| venue_state.mm_open_ask.as_ref())
-                .is_some(),
+                .is_some_and(|order| {
+                    matches!(order.tracking_source, MmOpenTrackingSource::OpenSnapshot)
+                }),
             ..InventoryAttributionVenue::default()
         })
         .collect::<Vec<_>>();
@@ -5591,6 +12742,25 @@ fn snapshot_to_core_events(
     events
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtendedFreezeReason {
+    NonPositiveSpread,
+    RelativeSpread,
+    MidJump,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ExtendedApplyTruth {
+    apply_eligible: bool,
+    frozen: bool,
+    missing_metrics: bool,
+    freeze_reason: Option<ExtendedFreezeReason>,
+    candidate_mid: Option<f64>,
+    candidate_spread: Option<f64>,
+    prev_mid: Option<f64>,
+    prev_spread: Option<f64>,
+}
+
 fn apply_market_event_to_core(
     state: &mut GlobalState,
     cfg: &Config,
@@ -5598,6 +12768,17 @@ fn apply_market_event_to_core(
     now_ms: TimestampMs,
     ext_apply_any: bool,
 ) {
+    let _ =
+        apply_market_event_to_core_with_extended_truth(state, cfg, event, now_ms, ext_apply_any);
+}
+
+fn apply_market_event_to_core_with_extended_truth(
+    state: &mut GlobalState,
+    cfg: &Config,
+    event: &super::types::MarketDataEvent,
+    now_ms: TimestampMs,
+    ext_apply_any: bool,
+) -> Option<ExtendedApplyTruth> {
     const EXTENDED_IDX: usize = 0;
     let max_levels = cfg.book.depth_levels.max(1) as usize;
     let alpha_short = cfg.volatility.fv_vol_alpha_short;
@@ -5617,21 +12798,42 @@ fn apply_market_event_to_core(
                     alpha_short,
                     alpha_long,
                 ) {
-                    if is_extended
-                        && current.as_ref().is_some_and(|prev| {
-                            should_freeze_extended_top_of_book(cfg, prev, &candidate)
-                        })
+                    let mut truth = is_extended.then(|| ExtendedApplyTruth {
+                        apply_eligible: ext_apply_any
+                            || (metrics.mid.is_some() && metrics.spread.is_some()),
+                        frozen: false,
+                        missing_metrics: !ext_apply_any
+                            && !(metrics.mid.is_some() && metrics.spread.is_some()),
+                        freeze_reason: None,
+                        candidate_mid: candidate.mid.filter(|v| v.is_finite()),
+                        candidate_spread: candidate.spread.filter(|v| v.is_finite()),
+                        prev_mid: current
+                            .as_ref()
+                            .and_then(|prev| prev.mid)
+                            .filter(|v| v.is_finite()),
+                        prev_spread: current
+                            .as_ref()
+                            .and_then(|prev| prev.spread)
+                            .filter(|v| v.is_finite()),
+                    });
+                    if let Some(reason) = current
+                        .as_ref()
+                        .and_then(|prev| extended_freeze_reason(cfg, prev, &candidate))
                     {
                         // Keep Extended's internal book/sequence in sync, but do not let a
                         // distorted top of book overwrite the last good quoted state.
                         v.orderbook_l2 = candidate.orderbook_l2;
                         v.last_book_update_ms = candidate.last_book_update_ms;
+                        if let Some(truth) = truth.as_mut() {
+                            truth.frozen = true;
+                            truth.freeze_reason = Some(reason);
+                        }
                         eprintln!(
                             "WARN: Extended core book update frozen mid={} spread={}",
                             candidate.mid.unwrap_or(0.0),
                             candidate.spread.unwrap_or(0.0)
                         );
-                        return;
+                        return truth;
                     }
                     *v = candidate;
                     if ext_apply_any && snapshot.venue_index == EXTENDED_IDX {
@@ -5639,6 +12841,7 @@ fn apply_market_event_to_core(
                     } else if metrics.mid.is_some() && metrics.spread.is_some() {
                         v.last_mid_apply_ms = Some(now_ms);
                     }
+                    return truth;
                 }
             }
         }
@@ -5655,21 +12858,42 @@ fn apply_market_event_to_core(
                     alpha_short,
                     alpha_long,
                 ) {
-                    if is_extended
-                        && current.as_ref().is_some_and(|prev| {
-                            should_freeze_extended_top_of_book(cfg, prev, &candidate)
-                        })
+                    let mut truth = is_extended.then(|| ExtendedApplyTruth {
+                        apply_eligible: ext_apply_any
+                            || (metrics.mid.is_some() && metrics.spread.is_some()),
+                        frozen: false,
+                        missing_metrics: !ext_apply_any
+                            && !(metrics.mid.is_some() && metrics.spread.is_some()),
+                        freeze_reason: None,
+                        candidate_mid: candidate.mid.filter(|v| v.is_finite()),
+                        candidate_spread: candidate.spread.filter(|v| v.is_finite()),
+                        prev_mid: current
+                            .as_ref()
+                            .and_then(|prev| prev.mid)
+                            .filter(|v| v.is_finite()),
+                        prev_spread: current
+                            .as_ref()
+                            .and_then(|prev| prev.spread)
+                            .filter(|v| v.is_finite()),
+                    });
+                    if let Some(reason) = current
+                        .as_ref()
+                        .and_then(|prev| extended_freeze_reason(cfg, prev, &candidate))
                     {
                         // Keep Extended's internal book/sequence in sync, but do not let a
                         // distorted top of book overwrite the last good quoted state.
                         v.orderbook_l2 = candidate.orderbook_l2;
                         v.last_book_update_ms = candidate.last_book_update_ms;
+                        if let Some(truth) = truth.as_mut() {
+                            truth.frozen = true;
+                            truth.freeze_reason = Some(reason);
+                        }
                         eprintln!(
                             "WARN: Extended core book update frozen mid={} spread={}",
                             candidate.mid.unwrap_or(0.0),
                             candidate.spread.unwrap_or(0.0)
                         );
-                        return;
+                        return truth;
                     }
                     *v = candidate;
                     if ext_apply_any && delta.venue_index == EXTENDED_IDX {
@@ -5677,6 +12901,7 @@ fn apply_market_event_to_core(
                     } else if metrics.mid.is_some() && metrics.spread.is_some() {
                         v.last_mid_apply_ms = Some(now_ms);
                     }
+                    return truth;
                 }
             }
         }
@@ -5706,6 +12931,7 @@ fn apply_market_event_to_core(
             }
         }
     }
+    None
 }
 
 fn should_freeze_extended_top_of_book(
@@ -5713,14 +12939,22 @@ fn should_freeze_extended_top_of_book(
     current: &VenueState,
     candidate: &VenueState,
 ) -> bool {
+    extended_freeze_reason(cfg, current, candidate).is_some()
+}
+
+fn extended_freeze_reason(
+    cfg: &Config,
+    current: &VenueState,
+    candidate: &VenueState,
+) -> Option<ExtendedFreezeReason> {
     let Some(mid) = candidate.mid.filter(|v| v.is_finite() && *v > 0.0) else {
-        return false;
+        return None;
     };
     let Some(spread) = candidate.spread.filter(|v| v.is_finite()) else {
-        return false;
+        return None;
     };
     if spread <= 0.0 {
-        return true;
+        return Some(ExtendedFreezeReason::NonPositiveSpread);
     }
 
     // Extended occasionally emits transient books with wide spreads or large
@@ -5728,14 +12962,14 @@ fn should_freeze_extended_top_of_book(
     // top-of-book outliers contaminate local vol/toxicity and disable the venue.
     let rel_limit = cfg.book.max_mid_jump_pct.abs().clamp(0.005, 0.01);
     if spread / mid > rel_limit {
-        return true;
+        return Some(ExtendedFreezeReason::RelativeSpread);
     }
     if let Some(prev_mid) = current.mid.filter(|v| v.is_finite() && *v > 0.0) {
         if ((mid - prev_mid) / prev_mid).abs() > rel_limit {
-            return true;
+            return Some(ExtendedFreezeReason::MidJump);
         }
     }
-    false
+    None
 }
 
 fn compute_local_vol_avgs(venues: &[VenueState]) -> (f64, f64) {
@@ -5814,6 +13048,185 @@ fn update_live_telemetry_stats(
     }
 }
 
+fn compute_stale_market_age_ms(
+    now_ms: TimestampMs,
+    last_update_ms: Option<TimestampMs>,
+) -> TimestampMs {
+    match last_update_ms {
+        None => -1,
+        Some(ts) if now_ms >= ts => now_ms - ts,
+        Some(_) => 0,
+    }
+}
+
+fn apply_extended_freeze_market_progress_snapshot_overrides(
+    snapshot: &mut CanonicalCacheSnapshot,
+    state: &GlobalState,
+    cfg: &Config,
+    now_ms: TimestampMs,
+) {
+    const EXTENDED_IDX: usize = 0;
+    let Some(venue_state) = state.venues.get(EXTENDED_IDX) else {
+        return;
+    };
+    if !venue_state.quote_quarantined {
+        return;
+    }
+    let Some(last_mid_update_ms) = venue_state.last_mid_update_ms else {
+        return;
+    };
+    let stale_ms = cfg
+        .venues
+        .get(EXTENDED_IDX)
+        .map(|venue| venue.effective_stale_ms(cfg.book.stale_ms))
+        .unwrap_or(cfg.book.stale_ms);
+    if compute_stale_market_age_ms(now_ms, Some(last_mid_update_ms)) > stale_ms {
+        return;
+    }
+    if venue_state.mid.is_none() || venue_state.spread.is_none() {
+        return;
+    }
+    let Some(market) = snapshot
+        .market
+        .iter_mut()
+        .find(|market| market.venue_index == EXTENDED_IDX)
+    else {
+        return;
+    };
+    market.timestamp_ms = Some(last_mid_update_ms);
+    market.mid = venue_state.mid;
+    market.spread = venue_state.spread;
+    market.depth_near_mid = venue_state.depth_near_mid;
+    market.is_stale = false;
+}
+
+fn venue_health_age_anchor_ms(venue: &VenueState) -> Option<TimestampMs> {
+    if venue.quote_quarantined {
+        venue.last_mid_update_ms
+    } else {
+        venue.last_mid_apply_ms
+    }
+}
+
+fn apply_extended_freeze_progress_and_quarantine(
+    state: &mut GlobalState,
+    now_ms: TimestampMs,
+    truth: &ExtendedApplyTruth,
+    progress_age_enabled: bool,
+    local_quarantine_enabled: bool,
+) {
+    const EXTENDED_IDX: usize = 0;
+    if !truth.frozen {
+        return;
+    }
+    let Some(venue) = state.venues.get_mut(EXTENDED_IDX) else {
+        return;
+    };
+    if progress_age_enabled {
+        if let Some(book_update_ms) = venue.last_book_update_ms {
+            venue.last_mid_update_ms = Some(book_update_ms);
+        }
+    }
+    if local_quarantine_enabled {
+        if !venue.quote_quarantined {
+            venue.quote_quarantined = true;
+            venue.quote_quarantined_at_ms = venue.last_book_update_ms.or(Some(now_ms));
+        } else if venue.quote_quarantined_at_ms.is_none() {
+            venue.quote_quarantined_at_ms = venue.last_book_update_ms.or(Some(now_ms));
+        }
+    }
+}
+
+fn clear_extended_quote_quarantine_on_success(
+    state: &mut GlobalState,
+    now_ms: TimestampMs,
+    truth: &ExtendedApplyTruth,
+) {
+    const EXTENDED_IDX: usize = 0;
+    if truth.frozen || !truth.apply_eligible {
+        return;
+    }
+    let Some(venue) = state.venues.get_mut(EXTENDED_IDX) else {
+        return;
+    };
+    if venue.last_mid_apply_ms == Some(now_ms) {
+        venue.quote_quarantined = false;
+        venue.quote_quarantined_at_ms = None;
+    }
+}
+
+fn apply_local_quote_quarantine_overrides(
+    state: &mut GlobalState,
+    disabled: &mut Vec<usize>,
+    enabled: bool,
+) -> bool {
+    const EXTENDED_IDX: usize = 0;
+    if !enabled {
+        return false;
+    }
+    let Some(venue) = state.venues.get_mut(EXTENDED_IDX) else {
+        return false;
+    };
+    if !venue.quote_quarantined {
+        return false;
+    }
+    venue.status = VenueStatus::Disabled;
+    if !disabled.contains(&EXTENDED_IDX) {
+        disabled.push(EXTENDED_IDX);
+    }
+    true
+}
+
+fn build_stale_market_hygiene_status(
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    canary_stale_ticks: u64,
+    canary_stale_max_ticks: u64,
+    stale_count_incremented_this_tick: bool,
+    stale_count_reset_this_tick: bool,
+    kill_triggered_this_tick: bool,
+    startup_arming: StartupStaleArmingStatus,
+) -> StaleMarketHygieneStatus {
+    let stale_market_count = snapshot
+        .market
+        .iter()
+        .filter(|market| market.is_stale)
+        .count();
+    StaleMarketHygieneStatus {
+        configured: canary_stale_max_ticks > 0,
+        consecutive_stale_ticks: canary_stale_ticks,
+        stale_count_incremented_this_tick,
+        stale_count_reset_this_tick,
+        kill_triggered_this_tick,
+        ready_market_count: snapshot.ready_market_count(),
+        stale_market_count,
+        stale_venues: snapshot
+            .market
+            .iter()
+            .filter(|market| market.is_stale)
+            .map(|market| market.venue_id.to_string())
+            .collect(),
+        venue_age_ms: state
+            .venues
+            .iter()
+            .map(|venue| compute_stale_market_age_ms(now_ms, venue_health_age_anchor_ms(venue)))
+            .collect(),
+        venue_age_event_ms: state
+            .venues
+            .iter()
+            .map(|venue| compute_stale_market_age_ms(now_ms, venue.last_mid_update_ms))
+            .collect(),
+        canary_stale_max_ticks,
+        kill_would_fire_next_tick: canary_stale_max_ticks > 0
+            && startup_arming.armed
+            && stale_market_count > 0
+            && !kill_triggered_this_tick
+            && canary_stale_ticks.saturating_add(1) >= canary_stale_max_ticks,
+        startup_arming,
+    }
+}
+
 /// Per-tick timing breakdown (microseconds) for telemetry and overrun detection.
 #[derive(Debug, Clone, Default)]
 struct TickTiming {
@@ -5829,6 +13242,10 @@ struct TickTiming {
     total_us: u64,
     /// Approximate pending requests across the priority and MM order channels.
     order_tx_pending: usize,
+    /// Pending requests in the emergency/priority order channel.
+    priority_order_tx_pending: usize,
+    /// Pending requests in the normal MM order channel.
+    normal_order_tx_pending: usize,
 }
 
 fn emit_live_telemetry(
@@ -5847,6 +13264,10 @@ fn emit_live_telemetry(
     account_position_syncs: &[AccountPositionSyncRecord],
     inventory_soft_governor: &InventorySoftGovernorStatus,
     inventory_brake: &InventoryBrakeStatus,
+    emergency_residual_fallback: &EmergencyResidualFallbackStatus,
+    projected_mm_budget: &ProjectedMmBudgetStatus,
+    canary_breach_response: &CanaryBreachResponseStatus,
+    stale_market_hygiene: &StaleMarketHygieneStatus,
     startup_pnl_baseline: &StartupPnlBaselineStatus,
     emergency_request_latches: &EmergencyRequestLatchSet,
     mm_order_management: &MmOrderDecisionSummary,
@@ -5881,6 +13302,22 @@ fn emit_live_telemetry(
         map.insert(
             "inventory_brake".to_string(),
             serde_json::to_value(inventory_brake).unwrap_or_default(),
+        );
+        map.insert(
+            "emergency_residual_fallback".to_string(),
+            serde_json::to_value(emergency_residual_fallback).unwrap_or_default(),
+        );
+        map.insert(
+            "projected_mm_budget".to_string(),
+            serde_json::to_value(projected_mm_budget).unwrap_or_default(),
+        );
+        map.insert(
+            "canary_breach_response".to_string(),
+            serde_json::to_value(canary_breach_response).unwrap_or_default(),
+        );
+        map.insert(
+            "stale_market_hygiene".to_string(),
+            serde_json::to_value(stale_market_hygiene).unwrap_or_default(),
         );
         map.insert(
             "startup_pnl_baseline".to_string(),
@@ -5941,6 +13378,8 @@ fn emit_live_telemetry(
                     "total_us": timing.total_us,
                     "total_ms": timing.total_us / 1000,
                     "order_tx_pending": timing.order_tx_pending,
+                    "priority_order_tx_pending": timing.priority_order_tx_pending,
+                    "normal_order_tx_pending": timing.normal_order_tx_pending,
                 }),
             );
         }
@@ -5984,8 +13423,16 @@ fn apply_priority_response_events(
                 tick_fills.extend(fills.iter().cloned());
                 response_fills.extend(fills);
             }
-            state.live_order_state.reconcile(&snapshot, now_ms);
-            sync_venue_order_tracking_from_live_order_state(state, snapshot.venue_index);
+            state
+                .live_order_state
+                .reconcile_with_supported_replace_gap_grace_ms(
+                    &snapshot,
+                    now_ms,
+                    cfg.mm
+                        .supported_replace_snapshot_gap_grace_ms_for(&snapshot.venue_id)
+                        as TimestampMs,
+                );
+            sync_venue_order_tracking_from_live_order_state(cfg, state, snapshot.venue_index);
             mark_venue_state_initialized(order_state_initialized, snapshot.venue_index);
             continue;
         }
@@ -6294,6 +13741,9 @@ pub fn apply_account_snapshot_to_state(
             v.dist_liq_sigma = dist;
         }
     }
+    if position_changed {
+        state.recompute_after_fills(cfg);
+    }
     AccountSnapshotApplyResult {
         position_changed,
         position_syncs,
@@ -6459,8 +13909,20 @@ pub fn replay_event_log(
                 }
             }
             EventLogPayload::OrderSnapshot(snapshot) => {
-                state.live_order_state.reconcile(snapshot, current_now_ms);
-                sync_venue_order_tracking_from_live_order_state(&mut state, snapshot.venue_index);
+                state
+                    .live_order_state
+                    .reconcile_with_supported_replace_gap_grace_ms(
+                        snapshot,
+                        current_now_ms,
+                        cfg.mm
+                            .supported_replace_snapshot_gap_grace_ms_for(&snapshot.venue_id)
+                            as TimestampMs,
+                    );
+                sync_venue_order_tracking_from_live_order_state(
+                    cfg,
+                    &mut state,
+                    snapshot.venue_index,
+                );
             }
             EventLogPayload::Execution(event) => {
                 let core_events = vec![event.to_execution_event()];
@@ -6528,7 +13990,8 @@ fn flush_replay_tick(
     exec_events: &[ExecutionEvent],
     fills: &[crate::types::FillEvent],
 ) -> CanonicalCacheSnapshot {
-    let snapshot = cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
+    let mut snapshot = cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
+    apply_extended_freeze_market_progress_snapshot_overrides(&mut snapshot, state, cfg, now_ms);
     let update = health_manager.update_from_snapshot(cfg, state, &snapshot);
     let disabled = update.disabled;
     let venue_health_diagnostics = health_manager.diagnostics();
@@ -6552,6 +14015,42 @@ fn flush_replay_tick(
         max_wait_ticks: startup_pnl_baseline_cfg.max_wait_ticks,
         ..StartupPnlBaselineStatus::default()
     };
+    let mut emergency_residual_fallback = EmergencyResidualFallbackStatus::default();
+    seed_aster_soft_unwind_fee_guard_status(
+        &mut emergency_residual_fallback,
+        aster_soft_unwind_fee_guard_config_from_env(),
+    );
+    let trade_mode = std::env::var("PARAPHINA_TRADE_MODE")
+        .ok()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let canary_enabled = std::env::var("PARAPHINA_CANARY_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let canary_stale_max_ticks = std::env::var("PARAPHINA_CANARY_STALE_MAX_TICKS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let startup_stale_arming_ms =
+        startup_stale_arming_ms_from_env(canary_enabled && trade_mode == "live");
+    let startup_stale_arming = evaluate_startup_stale_arming(
+        &snapshot,
+        now_ms,
+        now_ms,
+        startup_stale_arming_ms,
+        startup_stale_arming_ms <= 0,
+    );
+    let stale_market_hygiene = build_stale_market_hygiene_status(
+        state,
+        &snapshot,
+        now_ms,
+        0,
+        canary_stale_max_ticks,
+        false,
+        false,
+        false,
+        startup_stale_arming,
+    );
     update_live_telemetry_stats(
         telemetry,
         state.fv_available,
@@ -6576,6 +14075,10 @@ fn flush_replay_tick(
         &account_apply.position_syncs,
         &InventorySoftGovernorStatus::default(),
         &InventoryBrakeStatus::default(),
+        &emergency_residual_fallback,
+        &ProjectedMmBudgetStatus::default(),
+        &CanaryBreachResponseStatus::default(),
+        &stale_market_hygiene,
         &startup_pnl_baseline,
         &EmergencyRequestLatchSet::default(),
         &MmOrderDecisionSummary::default(),
@@ -6599,7 +14102,9 @@ mod tests {
     use crate::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
     use crate::state::{MmOpenOrder, OpenOrderRecord};
     use crate::telemetry::{TelemetryBuilder, TelemetryInputs};
-    use crate::types::{FundingSource, OrderPurpose, SettlementPriceKind, Side, TimeInForce};
+    use crate::types::{
+        CancelOrderIntent, FundingSource, OrderPurpose, SettlementPriceKind, Side, TimeInForce,
+    };
     use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
 
@@ -6866,6 +14371,53 @@ mod tests {
     }
 
     #[test]
+    fn account_snapshot_position_sync_recomputes_global_inventory_before_canary_status() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        let paradex = 4;
+        let now_ms = 1_700_000_000_000;
+
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.venues[lighter].position_tao = 0.16;
+        state.venues[paradex].position_tao = -0.01;
+        state.recompute_after_fills(&cfg);
+        assert!((state.q_global_tao - 0.15).abs() < 1e-9);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: vec![VenueAccountSnapshot {
+                venue_index: lighter,
+                venue_id: "lighter".into(),
+                seq: 7,
+                timestamp_ms: Some(now_ms),
+                position_tao: 0.0,
+                avg_entry_price: 0.0,
+                funding_8h: None,
+                margin_balance_usd: 100.0,
+                margin_used_usd: 0.0,
+                margin_available_usd: 100.0,
+                price_liq: None,
+                dist_liq_sigma: None,
+                is_stale: false,
+            }],
+        };
+
+        let applied = apply_account_snapshot_to_state(&cfg, &snapshot, &mut state, now_ms);
+        assert!(applied.position_changed);
+        assert_eq!(state.venues[lighter].position_tao, 0.0);
+        assert!((state.q_global_tao + 0.01).abs() < 1e-9);
+
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(!limits.breached);
+        assert!(!limits.net_breached);
+        assert!(!limits.gross_breached);
+        assert!(!limits.venue_breached);
+    }
+
+    #[test]
     fn account_position_syncs_infer_fills_without_reapplying_inventory() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -6936,6 +14488,89 @@ mod tests {
     }
 
     #[test]
+    fn account_position_drift_explained_by_live_orders_matches_open_order_delta() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 1_700_000_000_000;
+
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(crate::types::OrderAck {
+                venue_index: 0,
+                venue_id: "extended".into(),
+                order_id: "oid_1".to_string(),
+                client_order_id: Some("co_1".to_string()),
+                seq: Some(1),
+                side: Some(Side::Buy),
+                price: Some(100.0),
+                size: Some(0.05),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            now_ms,
+        );
+
+        let snapshot = types::AccountSnapshot {
+            venue_index: 0,
+            venue_id: "extended".to_string(),
+            seq: 2,
+            timestamp_ms: now_ms + 500,
+            positions: vec![types::PositionSnapshot {
+                symbol: "ETH".to_string(),
+                size: 0.05,
+                entry_price: 100.0,
+            }],
+            balances: Vec::new(),
+            funding_8h: None,
+            margin: types::MarginSnapshot {
+                balance_usd: 100.0,
+                used_usd: 0.0,
+                available_usd: 100.0,
+            },
+            liquidation: types::LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+
+        assert!(account_position_drift_explained_by_live_orders(
+            &state, &snapshot, 0.0, 0.05, now_ms
+        ));
+    }
+
+    #[test]
+    fn account_position_drift_explained_by_live_orders_rejects_unattributed_delta() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let now_ms = 1_700_000_000_000;
+
+        let snapshot = types::AccountSnapshot {
+            venue_index: 0,
+            venue_id: "extended".to_string(),
+            seq: 2,
+            timestamp_ms: now_ms + 500,
+            positions: vec![types::PositionSnapshot {
+                symbol: "ETH".to_string(),
+                size: 0.05,
+                entry_price: 100.0,
+            }],
+            balances: Vec::new(),
+            funding_8h: None,
+            margin: types::MarginSnapshot {
+                balance_usd: 100.0,
+                used_usd: 0.0,
+                available_usd: 100.0,
+            },
+            liquidation: types::LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+
+        assert!(!account_position_drift_explained_by_live_orders(
+            &state, &snapshot, 0.0, 0.05, now_ms
+        ));
+    }
+
+    #[test]
     fn order_snapshot_fill_inference_can_be_disabled_for_paper_mode() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -6964,6 +14599,7 @@ mod tests {
             open_orders: vec![types::OpenOrderSnapshot {
                 order_id: "oid_1".to_string(),
                 client_order_id: Some("co_1".to_string()),
+                exchange_order_id: None,
                 side: Side::Buy,
                 price: 100.0,
                 size: 0.4,
@@ -7023,18 +14659,24 @@ mod tests {
         let good_spread = state.venues[0].spread.expect("good spread");
         let good_prev_ln_mid = state.venues[0].prev_ln_mid;
 
-        apply_market_event_to_core(
+        let truth = apply_market_event_to_core_with_extended_truth(
             &mut state,
             &cfg,
             &extended_snapshot(2, 1_100, 1999.5, 2081.7),
             1_100,
             false,
-        );
+        )
+        .expect("extended truth");
 
         assert_eq!(state.venues[0].mid, Some(good_mid));
         assert_eq!(state.venues[0].spread, Some(good_spread));
         assert_eq!(state.venues[0].prev_ln_mid, good_prev_ln_mid);
         assert_eq!(state.venues[0].last_book_update_ms, Some(1_100));
+        assert!(truth.frozen);
+        assert_eq!(
+            truth.freeze_reason,
+            Some(ExtendedFreezeReason::RelativeSpread)
+        );
         assert_eq!(
             state.venues[0]
                 .orderbook_l2
@@ -7070,17 +14712,20 @@ mod tests {
         let good_mid = state.venues[0].mid.expect("good mid");
         let good_spread = state.venues[0].spread.expect("good spread");
 
-        apply_market_event_to_core(
+        let truth = apply_market_event_to_core_with_extended_truth(
             &mut state,
             &cfg,
             &extended_snapshot(2, 1_100, 2111.45, 2111.55),
             1_100,
             false,
-        );
+        )
+        .expect("extended truth");
 
         assert_eq!(state.venues[0].mid, Some(good_mid));
         assert_eq!(state.venues[0].spread, Some(good_spread));
         assert_eq!(state.venues[0].last_book_update_ms, Some(1_100));
+        assert!(truth.frozen);
+        assert_eq!(truth.freeze_reason, Some(ExtendedFreezeReason::MidJump));
         assert_eq!(
             state.venues[0]
                 .orderbook_l2
@@ -7089,6 +14734,199 @@ mod tests {
                 .price,
             2111.45
         );
+    }
+
+    #[test]
+    fn extended_nonpositive_spread_snapshot_freezes_last_good_top() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        apply_market_event_to_core(
+            &mut state,
+            &cfg,
+            &extended_snapshot(1, 1_000, 2080.0, 2080.1),
+            1_000,
+            false,
+        );
+
+        let truth = apply_market_event_to_core_with_extended_truth(
+            &mut state,
+            &cfg,
+            &extended_snapshot(2, 1_100, 2080.1, 2080.1),
+            1_100,
+            false,
+        )
+        .expect("extended truth");
+
+        assert!(truth.frozen);
+        assert_eq!(
+            truth.freeze_reason,
+            Some(ExtendedFreezeReason::NonPositiveSpread)
+        );
+    }
+
+    #[test]
+    fn extended_freeze_quarantine_anchors_health_age_to_market_progress() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        apply_market_event_to_core(
+            &mut state,
+            &cfg,
+            &extended_snapshot(1, 1_000, 2080.0, 2080.1),
+            1_000,
+            false,
+        );
+
+        let truth = apply_market_event_to_core_with_extended_truth(
+            &mut state,
+            &cfg,
+            &extended_snapshot(2, 1_100, 1999.5, 2081.7),
+            1_100,
+            false,
+        )
+        .expect("extended truth");
+
+        assert!(truth.frozen);
+        apply_extended_freeze_progress_and_quarantine(&mut state, 1_100, &truth, true, true);
+
+        assert_eq!(state.venues[0].last_mid_apply_ms, Some(1_000));
+        assert_eq!(state.venues[0].last_mid_update_ms, Some(1_100));
+        assert!(state.venues[0].quote_quarantined);
+        assert_eq!(state.venues[0].quote_quarantined_at_ms, Some(1_100));
+        assert_eq!(venue_health_age_anchor_ms(&state.venues[0]), Some(1_100));
+    }
+
+    #[test]
+    fn extended_quote_quarantine_uses_disabled_cancel_path() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let mut disabled = Vec::new();
+        let now_ms = 5_000;
+        state.venues[0].quote_quarantined = true;
+
+        assert!(apply_local_quote_quarantine_overrides(
+            &mut state,
+            &mut disabled,
+            true,
+        ));
+        assert_eq!(state.venues[0].status, VenueStatus::Disabled);
+        assert_eq!(disabled, vec![0]);
+
+        let mut latches = EmergencyRequestLatchSet::default();
+        let cancel_intents = build_unlatched_disabled_cancel_intents_for_venues(
+            &cfg,
+            &state,
+            &mut latches,
+            now_ms,
+            &disabled,
+        );
+        assert_eq!(cancel_intents.len(), 1);
+        assert!(matches!(cancel_intents[0], OrderIntent::CancelAll(_)));
+    }
+
+    #[test]
+    fn extended_quote_quarantine_overrides_snapshot_staleness_with_last_good_top() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        apply_market_event_to_core(
+            &mut state,
+            &cfg,
+            &extended_snapshot(1, 1_000, 2080.0, 2080.1),
+            1_000,
+            false,
+        );
+
+        let truth = apply_market_event_to_core_with_extended_truth(
+            &mut state,
+            &cfg,
+            &extended_snapshot(2, 1_100, 1999.5, 2081.7),
+            1_100,
+            false,
+        )
+        .expect("extended truth");
+        apply_extended_freeze_progress_and_quarantine(&mut state, 1_100, &truth, true, true);
+
+        let mut snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: 1_200,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 2,
+                    timestamp_ms: Some(1_000),
+                    mid: Some(1999.5 + venue_index as f64),
+                    spread: Some(82.2),
+                    depth_near_mid: 1.0,
+                    is_stale: true,
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        apply_extended_freeze_market_progress_snapshot_overrides(
+            &mut snapshot,
+            &state,
+            &cfg,
+            1_200,
+        );
+
+        assert!(!snapshot.market[0].is_stale);
+        assert_eq!(snapshot.market[0].timestamp_ms, Some(1_100));
+        assert_eq!(snapshot.market[0].mid, state.venues[0].mid);
+        assert_eq!(snapshot.market[0].spread, state.venues[0].spread);
+        assert_eq!(
+            snapshot.market[0].depth_near_mid,
+            state.venues[0].depth_near_mid
+        );
+    }
+
+    #[test]
+    fn extended_quote_quarantine_keeps_snapshot_stale_when_market_progress_is_old() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let stale_ms = cfg.venues[0].effective_stale_ms(cfg.book.stale_ms);
+        state.venues[0].mid = Some(2_080.05);
+        state.venues[0].spread = Some(0.1);
+        state.venues[0].depth_near_mid = 10_000.0;
+        state.venues[0].last_mid_update_ms = Some(1_000);
+        state.venues[0].quote_quarantined = true;
+        state.venues[0].quote_quarantined_at_ms = Some(1_000);
+
+        let mut snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: 1_000 + stale_ms + 1,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(1_000),
+                    mid: Some(1_900.0 + venue_index as f64),
+                    spread: Some(10.0),
+                    depth_near_mid: 1.0,
+                    is_stale: true,
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        apply_extended_freeze_market_progress_snapshot_overrides(
+            &mut snapshot,
+            &state,
+            &cfg,
+            1_000 + stale_ms + 1,
+        );
+
+        assert!(snapshot.market[0].is_stale);
+        assert_eq!(snapshot.market[0].timestamp_ms, Some(1_000));
+        assert_eq!(snapshot.market[0].mid, Some(1_900.0));
     }
 
     #[test]
@@ -7515,16 +15353,272 @@ mod tests {
             size: 1.0,
             timestamp_ms: 1_700_000_000_001,
             order_id: "mm_bid".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         });
         state.venues[0].mm_open_ask = Some(MmOpenOrder {
             price: 101.0,
             size: 1.0,
             timestamp_ms: 1_700_000_000_001,
             order_id: "mm_ask".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         });
 
         assert_eq!(tracked_mm_open_order_count(&state), 2);
         assert!(has_tracked_mm_orders(&state));
+    }
+
+    #[test]
+    fn pending_mm_orders_count_as_tracked_live_orders() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        state.live_order_state.register_mm_decision_lineage(
+            1,
+            &hyperliquid_cloid("co_pending_bid"),
+            Side::Buy,
+            2_000.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_pending_mm_bid",
+            1_700_000_000_000,
+        );
+
+        assert_eq!(tracked_mm_open_order_count(&state), 0);
+        assert!(has_tracked_mm_orders(&state));
+    }
+
+    #[test]
+    fn paradex_pending_place_guard_drops_mm_cancel_and_duplicate_place_within_grace() {
+        let mut cfg = Config::default();
+        cfg.mm.paradex_pending_place_grace_ms = Some(8_000);
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let paradex = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("paradex"))
+            .expect("paradex venue");
+        let pending_client_id = "co_pending_pdx_bid".to_string();
+
+        state.live_order_state.register_mm_decision_lineage(
+            paradex,
+            &pending_client_id,
+            Side::Buy,
+            2_000.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_pending_pdx_bid",
+            now_ms,
+        );
+
+        let mut intents = vec![
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: paradex,
+                venue_id: cfg.venues[paradex].id_arc.clone(),
+                order_id: pending_client_id,
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: paradex,
+                venue_id: cfg.venues[paradex].id_arc.clone(),
+                side: Side::Buy,
+                price: 1_999.5,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("co_new_pdx_bid".to_string()),
+            }),
+        ];
+
+        let suppressed = apply_pending_place_guard(&cfg, &state, &mut intents, now_ms + 1_000);
+
+        assert_eq!(suppressed, (1, 1, 0));
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn paradex_pending_place_guard_expires_and_does_not_touch_hyperliquid() {
+        let mut cfg = Config::default();
+        cfg.mm.paradex_pending_place_grace_ms = Some(8_000);
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let hyperliquid = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("hyperliquid"))
+            .expect("hyperliquid venue");
+        let paradex = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("paradex"))
+            .expect("paradex venue");
+        let hyperliquid_client_id = hyperliquid_cloid("co_pending_hl_bid");
+        let paradex_client_id = "co_pending_pdx_bid".to_string();
+
+        state.live_order_state.register_mm_decision_lineage(
+            hyperliquid,
+            &hyperliquid_client_id,
+            Side::Buy,
+            2_000.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_pending_hl_bid",
+            now_ms,
+        );
+        state.live_order_state.register_mm_decision_lineage(
+            paradex,
+            &paradex_client_id,
+            Side::Buy,
+            2_000.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_pending_pdx_bid",
+            now_ms,
+        );
+
+        let mut intents = vec![
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                order_id: hyperliquid_client_id,
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                side: Side::Buy,
+                price: 1_999.5,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("co_new_hl_bid".to_string()),
+            }),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: paradex,
+                venue_id: cfg.venues[paradex].id_arc.clone(),
+                order_id: paradex_client_id,
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: paradex,
+                venue_id: cfg.venues[paradex].id_arc.clone(),
+                side: Side::Buy,
+                price: 1_999.5,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("co_new_pdx_bid".to_string()),
+            }),
+        ];
+
+        let suppressed = apply_pending_place_guard(&cfg, &state, &mut intents, now_ms + 9_000);
+
+        assert_eq!(suppressed, (0, 0, 0));
+        assert_eq!(intents.len(), 4);
+    }
+
+    #[test]
+    fn pending_place_guard_drops_venue_scoped_duplicate_same_side_intents() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .pending_place_grace_ms_by_venue
+            .insert("lighter".to_string(), 8_000);
+        cfg.mm
+            .pending_place_grace_ms_by_venue
+            .insert("extended".to_string(), 8_000);
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 20_000;
+        let lighter = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("lighter"))
+            .expect("lighter venue");
+        let extended = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+            .expect("extended venue");
+
+        state.live_order_state.register_mm_decision_lineage(
+            lighter,
+            "151880531745290",
+            Side::Sell,
+            2_001.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_pending_lighter_ask",
+            now_ms,
+        );
+        state.live_order_state.register_mm_decision_lineage(
+            extended,
+            "co_pending_extended_ask",
+            Side::Sell,
+            2_001.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_pending_extended_ask",
+            now_ms,
+        );
+
+        let mut intents = vec![
+            OrderIntent::Replace(crate::types::ReplaceOrderIntent {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                order_id: "151115615896010".to_string(),
+                side: Side::Sell,
+                price: 2_001.5,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("235635911036591".to_string()),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: extended,
+                venue_id: cfg.venues[extended].id_arc.clone(),
+                side: Side::Sell,
+                price: 2_001.5,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("co_duplicate_extended_ask".to_string()),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: extended,
+                venue_id: cfg.venues[extended].id_arc.clone(),
+                side: Side::Buy,
+                price: 1_999.5,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("co_extended_bid".to_string()),
+            }),
+        ];
+
+        let suppressed = apply_pending_place_guard(&cfg, &state, &mut intents, now_ms + 1_000);
+
+        assert_eq!(suppressed, (1, 0, 1));
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(&intents[0], OrderIntent::Place(place) if place.side == Side::Buy));
+    }
+
+    #[test]
+    fn pending_place_guard_runs_on_cancel_only_quote_gate_ticks() {
+        let latches = EmergencyRequestLatchSet::default();
+
+        assert!(pending_place_guard_should_run(false, false, &latches));
+        assert!(!pending_place_guard_should_run(true, false, &latches));
+        assert!(!pending_place_guard_should_run(false, true, &latches));
     }
 
     #[test]
@@ -7548,7 +15642,7 @@ mod tests {
             }),
             now_ms,
         );
-        sync_venue_order_tracking_from_live_order_state(&mut state, venue_index);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, venue_index);
         assert!(state.venues[venue_index].mm_open_bid.is_some());
         assert_eq!(state.venues[venue_index].open_orders.len(), 1);
         assert!(has_tracked_mm_orders(&state));
@@ -7561,12 +15655,255 @@ mod tests {
             open_orders: Vec::new(),
         };
         state.live_order_state.reconcile(&snapshot, now_ms + 1);
-        sync_venue_order_tracking_from_live_order_state(&mut state, venue_index);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, venue_index);
 
         assert!(state.venues[venue_index].mm_open_bid.is_none());
         assert!(state.venues[venue_index].mm_open_ask.is_none());
         assert!(state.venues[venue_index].open_orders.is_empty());
         assert!(!has_tracked_mm_orders(&state));
+    }
+
+    #[test]
+    fn supported_replace_gap_grace_preserves_same_side_visibility_without_counting_live_open() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = crate::types::now_ms();
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "hyperliquid")
+            .expect("hyperliquid venue in config");
+        let client_order_id = hyperliquid_cloid("co_gap_grace_bid");
+
+        state.venues[venue_index].mm_open_bid = Some(MmOpenOrder {
+            price: 2_200.0,
+            size: 0.01,
+            timestamp_ms: now_ms - 500,
+            order_id: "12345".to_string(),
+            client_order_id: Some(client_order_id.clone()),
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
+        });
+        state.live_order_state.register_mm_decision_lineage(
+            venue_index,
+            &client_order_id,
+            Side::Buy,
+            2_200.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_gap_grace_bid",
+            now_ms,
+        );
+
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, venue_index);
+
+        let bid = state.venues[venue_index]
+            .mm_open_bid
+            .as_ref()
+            .expect("gap grace mm_open_bid");
+        assert_eq!(bid.order_id, "12345");
+        assert_eq!(
+            bid.client_order_id.as_deref(),
+            Some(client_order_id.as_str())
+        );
+        assert!(matches!(
+            bid.tracking_source,
+            MmOpenTrackingSource::GapGrace
+        ));
+        assert!(state.venues[venue_index].open_orders.is_empty());
+        assert_eq!(tracked_mm_open_order_count(&state), 0);
+        assert!(has_tracked_mm_orders(&state));
+    }
+
+    #[test]
+    fn paradex_snapshot_gap_grace_preserves_same_side_visibility_without_live_open_count() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = crate::types::now_ms();
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue in config");
+        let client_order_id = "co_gap_grace_paradex".to_string();
+        let order_id = "1774991842690201709221360000".to_string();
+
+        state.venues[venue_index].mm_open_bid = Some(MmOpenOrder {
+            price: 2_200.0,
+            size: 0.01,
+            timestamp_ms: now_ms - 500,
+            order_id: order_id.clone(),
+            client_order_id: Some(client_order_id.clone()),
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
+        });
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index,
+                venue_id: cfg.venues[venue_index].id_arc.clone(),
+                order_id: order_id.clone(),
+                client_order_id: Some(client_order_id.clone()),
+                seq: Some(1),
+                side: Some(Side::Buy),
+                price: Some(2_200.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            now_ms,
+        );
+        state.live_order_state.reconcile(
+            &crate::live::types::OrderSnapshot {
+                venue_index,
+                venue_id: "paradex".to_string(),
+                seq: 2,
+                timestamp_ms: now_ms + 1,
+                open_orders: Vec::new(),
+            },
+            now_ms + 1,
+        );
+
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, venue_index);
+
+        let bid = state.venues[venue_index]
+            .mm_open_bid
+            .as_ref()
+            .expect("gap grace mm_open_bid");
+        assert_eq!(bid.order_id, order_id);
+        assert_eq!(
+            bid.client_order_id.as_deref(),
+            Some(client_order_id.as_str())
+        );
+        assert!(matches!(
+            bid.tracking_source,
+            MmOpenTrackingSource::GapGrace
+        ));
+        assert!(state.venues[venue_index].open_orders.is_empty());
+        assert_eq!(tracked_mm_open_order_count(&state), 0);
+        assert!(has_tracked_mm_orders(&state));
+    }
+
+    #[test]
+    fn extended_snapshot_gap_grace_preserves_same_side_visibility_without_live_open_count() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .supported_replace_snapshot_gap_grace_ms_by_venue
+            .insert("extended".to_string(), 45_000);
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = crate::types::now_ms();
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "extended")
+            .expect("extended venue in config");
+        let client_order_id = "co_gap_grace_extended".to_string();
+        let order_id = "2045229488450969600".to_string();
+
+        state.venues[venue_index].mm_open_ask = Some(MmOpenOrder {
+            price: 2_201.0,
+            size: 0.01,
+            timestamp_ms: now_ms - 500,
+            order_id: order_id.clone(),
+            client_order_id: Some(client_order_id.clone()),
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
+        });
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index,
+                venue_id: cfg.venues[venue_index].id_arc.clone(),
+                order_id: order_id.clone(),
+                client_order_id: Some(client_order_id.clone()),
+                seq: Some(1),
+                side: Some(Side::Sell),
+                price: Some(2_201.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            now_ms,
+        );
+        state
+            .live_order_state
+            .reconcile_with_supported_replace_gap_grace_ms(
+                &crate::live::types::OrderSnapshot {
+                    venue_index,
+                    venue_id: "extended".to_string(),
+                    seq: 2,
+                    timestamp_ms: now_ms + 1,
+                    open_orders: Vec::new(),
+                },
+                now_ms + 1,
+                cfg.mm
+                    .supported_replace_snapshot_gap_grace_ms_for("extended")
+                    as TimestampMs,
+            );
+
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, venue_index);
+
+        let ask = state.venues[venue_index]
+            .mm_open_ask
+            .as_ref()
+            .expect("gap grace mm_open_ask");
+        assert_eq!(ask.order_id, order_id);
+        assert_eq!(
+            ask.client_order_id.as_deref(),
+            Some(client_order_id.as_str())
+        );
+        assert!(matches!(
+            ask.tracking_source,
+            MmOpenTrackingSource::GapGrace
+        ));
+        assert!(state.venues[venue_index].open_orders.is_empty());
+        assert_eq!(tracked_mm_open_order_count(&state), 0);
+        assert!(has_tracked_mm_orders(&state));
+    }
+
+    #[test]
+    fn lighter_snapshot_gap_grace_preserves_same_side_visibility_without_live_open_count() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = crate::types::now_ms();
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "lighter")
+            .expect("lighter venue in config");
+        let client_order_id = "55".to_string();
+        let order_id = "55".to_string();
+
+        state.venues[venue_index].mm_open_ask = Some(MmOpenOrder {
+            price: 2_201.0,
+            size: 0.01,
+            timestamp_ms: now_ms - 500,
+            order_id: order_id.clone(),
+            client_order_id: Some(client_order_id.clone()),
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
+        });
+        state.live_order_state.register_mm_decision_lineage(
+            venue_index,
+            &client_order_id,
+            Side::Sell,
+            2_201.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_gap_grace_lighter_ask",
+            now_ms,
+        );
+
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, venue_index);
+
+        let ask = state.venues[venue_index]
+            .mm_open_ask
+            .as_ref()
+            .expect("gap grace mm_open_ask");
+        assert_eq!(ask.order_id, order_id);
+        assert_eq!(
+            ask.client_order_id.as_deref(),
+            Some(client_order_id.as_str())
+        );
+        assert!(matches!(
+            ask.tracking_source,
+            MmOpenTrackingSource::GapGrace
+        ));
+        assert!(state.venues[venue_index].open_orders.is_empty());
+        assert_eq!(tracked_mm_open_order_count(&state), 0);
+        assert!(has_tracked_mm_orders(&state));
     }
 
     #[test]
@@ -7623,6 +15960,11 @@ mod tests {
                 size: 0.01,
             }),
             generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "active",
+            ask_terminal_reason: "active",
         };
 
         let mut quotes = vec![
@@ -7659,6 +16001,763 @@ mod tests {
     }
 
     #[test]
+    fn projected_net_position_is_flat_for_symmetric_all5_mm_quotes() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        for venue in &mut state.venues {
+            venue.mm_open_bid = Some(MmOpenOrder {
+                price: 2_000.0,
+                size: 0.01,
+                timestamp_ms: 1_000,
+                order_id: format!("{}_bid", venue.id.to_ascii_lowercase()),
+                client_order_id: None,
+                tracking_source: MmOpenTrackingSource::OpenSnapshot,
+            });
+            venue.mm_open_ask = Some(MmOpenOrder {
+                price: 2_001.0,
+                size: 0.01,
+                timestamp_ms: 1_000,
+                order_id: format!("{}_ask", venue.id.to_ascii_lowercase()),
+                client_order_id: None,
+                tracking_source: MmOpenTrackingSource::OpenSnapshot,
+            });
+        }
+
+        assert!((projected_net_position_tao(&state) - 0.0).abs() < 1e-9);
+        assert!((projected_gross_position_tao(&state) - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn projected_mm_budget_limits_flat_all5_surface_to_three_one_lot_venues() {
+        let mut cfg = Config::default();
+        for venue in &cfg.venues {
+            cfg.mm
+                .venue_role_by_venue
+                .insert(venue.id.clone(), MmVenueRole::Fill);
+            cfg.mm
+                .max_quote_size_tao_by_venue
+                .insert(venue.id.clone(), 0.01);
+        }
+        let state = GlobalState::new(&cfg);
+        let mut quotes = cfg
+            .venues
+            .iter()
+            .enumerate()
+            .map(|(venue_index, venue)| MmQuote {
+                venue_index,
+                venue_id: venue.id_arc.clone(),
+                bid: Some(MmLevel {
+                    price: 2_000.0,
+                    size: 0.01,
+                }),
+                ask: Some(MmLevel {
+                    price: 2_001.0,
+                    size: 0.01,
+                }),
+                generated_spread_cap_applied: false,
+                generated_spread_cap_bid_suppressed: false,
+                generated_spread_cap_ask_suppressed: false,
+                touch_mode_kind: None,
+                bid_terminal_reason: "active",
+                ask_terminal_reason: "active",
+            })
+            .collect::<Vec<_>>();
+
+        let status = apply_projected_mm_budget_to_quotes(
+            &cfg,
+            &state,
+            0,
+            inventory_brake_limits(
+                Some(0.03),
+                Some(0.05),
+                Some(0.03),
+                InventoryBrakeFractions {
+                    net_fraction: Some(0.75),
+                    gross_fraction: Some(0.75),
+                    venue_fraction: Some(0.75),
+                },
+            ),
+            &mut quotes,
+        );
+
+        assert!(status.configured);
+        assert!(status.applied);
+        assert_eq!(status.selected_venues.len(), 3);
+        assert_eq!(status.suppressed_venues.len(), 2);
+        assert!((status.projected_q_global_after_tao - 0.0).abs() < 1e-9);
+        assert!((status.projected_q_gross_after_tao - 0.03).abs() < 1e-9);
+        assert_eq!(
+            quotes
+                .iter()
+                .filter(|quote| quote.bid.is_some() && quote.ask.is_some())
+                .count(),
+            3
+        );
+        assert_eq!(
+            quotes
+                .iter()
+                .filter(|quote| quote.bid.is_none() && quote.ask.is_none())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn projected_mm_budget_can_admit_flat_all5_surface_with_wider_net_gross_budget() {
+        let mut cfg = Config::default();
+        for venue in &cfg.venues {
+            cfg.mm
+                .venue_role_by_venue
+                .insert(venue.id.clone(), MmVenueRole::Fill);
+            cfg.mm
+                .max_quote_size_tao_by_venue
+                .insert(venue.id.clone(), 0.01);
+        }
+        let state = GlobalState::new(&cfg);
+        let mut quotes = cfg
+            .venues
+            .iter()
+            .enumerate()
+            .map(|(venue_index, venue)| MmQuote {
+                venue_index,
+                venue_id: venue.id_arc.clone(),
+                bid: Some(MmLevel {
+                    price: 2_000.0,
+                    size: 0.01,
+                }),
+                ask: Some(MmLevel {
+                    price: 2_001.0,
+                    size: 0.01,
+                }),
+                generated_spread_cap_applied: false,
+                generated_spread_cap_bid_suppressed: false,
+                generated_spread_cap_ask_suppressed: false,
+                touch_mode_kind: None,
+                bid_terminal_reason: "active",
+                ask_terminal_reason: "active",
+            })
+            .collect::<Vec<_>>();
+
+        let status = apply_projected_mm_budget_to_quotes(
+            &cfg,
+            &state,
+            0,
+            inventory_brake_limits(
+                Some(0.08),
+                Some(0.08),
+                Some(0.03),
+                InventoryBrakeFractions {
+                    net_fraction: Some(0.75),
+                    gross_fraction: Some(0.75),
+                    venue_fraction: Some(0.75),
+                },
+            ),
+            &mut quotes,
+        );
+
+        assert!(status.configured);
+        assert!(!status.applied);
+        assert_eq!(status.selected_venues.len(), 5);
+        assert!(status.suppressed_venues.is_empty());
+        assert!(status.budget_after_within_limits);
+        assert!((status.projected_q_global_after_tao - 0.0).abs() < 1e-9);
+        assert!((status.projected_q_gross_after_tao - 0.05).abs() < 1e-9);
+        assert_eq!(
+            quotes
+                .iter()
+                .filter(|quote| quote.bid.is_some() && quote.ask.is_some())
+                .count(),
+            5
+        );
+    }
+
+    #[test]
+    fn projected_mm_budget_rotates_selected_venues_across_epochs() {
+        let mut cfg = Config::default();
+        for venue in &cfg.venues {
+            cfg.mm
+                .venue_role_by_venue
+                .insert(venue.id.clone(), MmVenueRole::Fill);
+            cfg.mm
+                .max_quote_size_tao_by_venue
+                .insert(venue.id.clone(), 0.01);
+        }
+        let state = GlobalState::new(&cfg);
+        let mk_quotes = || {
+            cfg.venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| MmQuote {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    bid: Some(MmLevel {
+                        price: 2_000.0,
+                        size: 0.01,
+                    }),
+                    ask: Some(MmLevel {
+                        price: 2_001.0,
+                        size: 0.01,
+                    }),
+                    generated_spread_cap_applied: false,
+                    generated_spread_cap_bid_suppressed: false,
+                    generated_spread_cap_ask_suppressed: false,
+                    touch_mode_kind: None,
+                    bid_terminal_reason: "active",
+                    ask_terminal_reason: "active",
+                })
+                .collect::<Vec<_>>()
+        };
+        let limits = inventory_brake_limits(
+            Some(0.03),
+            Some(0.05),
+            Some(0.03),
+            InventoryBrakeFractions {
+                net_fraction: Some(0.75),
+                gross_fraction: Some(0.75),
+                venue_fraction: Some(0.75),
+            },
+        );
+
+        let mut quotes_epoch_0 = mk_quotes();
+        let status_epoch_0 =
+            apply_projected_mm_budget_to_quotes(&cfg, &state, 0, limits, &mut quotes_epoch_0);
+        let mut quotes_epoch_1 = mk_quotes();
+        let status_epoch_1 = apply_projected_mm_budget_to_quotes(
+            &cfg,
+            &state,
+            PROJECTED_MM_BUDGET_ROTATION_MS,
+            limits,
+            &mut quotes_epoch_1,
+        );
+
+        assert_ne!(
+            status_epoch_0.selected_venues,
+            status_epoch_1.selected_venues
+        );
+        assert_eq!(status_epoch_0.selected_venues.len(), 3);
+        assert_eq!(status_epoch_1.selected_venues.len(), 3);
+    }
+
+    #[test]
+    fn projected_mm_budget_suppression_cancels_unmanaged_mm_live_orders() {
+        let mut cfg = Config::default();
+        for venue in &cfg.venues {
+            cfg.mm
+                .venue_role_by_venue
+                .insert(venue.id.clone(), MmVenueRole::Fill);
+            cfg.mm
+                .max_quote_size_tao_by_venue
+                .insert(venue.id.clone(), 0.01);
+        }
+        let mut state = GlobalState::new(&cfg);
+        let lighter = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("lighter"))
+            .expect("lighter venue");
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                order_id: "lighter_unmanaged_ask".to_string(),
+                client_order_id: Some("co_lighter_unmanaged_ask".to_string()),
+                seq: Some(1),
+                side: Some(Side::Sell),
+                price: Some(2_001.0),
+                size: Some(0.07),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            1_000,
+        );
+        state.venues[lighter].mm_open_ask = None;
+
+        let mut quotes = cfg
+            .venues
+            .iter()
+            .enumerate()
+            .map(|(venue_index, venue)| MmQuote {
+                venue_index,
+                venue_id: venue.id_arc.clone(),
+                bid: Some(MmLevel {
+                    price: 2_000.0,
+                    size: 0.01,
+                }),
+                ask: Some(MmLevel {
+                    price: 2_001.0,
+                    size: 0.01,
+                }),
+                generated_spread_cap_applied: false,
+                generated_spread_cap_bid_suppressed: false,
+                generated_spread_cap_ask_suppressed: false,
+                touch_mode_kind: None,
+                bid_terminal_reason: "active",
+                ask_terminal_reason: "active",
+            })
+            .collect::<Vec<_>>();
+        let limits = inventory_brake_limits(
+            Some(0.06),
+            Some(0.06),
+            Some(0.0225),
+            InventoryBrakeFractions {
+                net_fraction: Some(0.75),
+                gross_fraction: Some(0.75),
+                venue_fraction: Some(0.75),
+            },
+        );
+        let projected_mm_budget =
+            apply_projected_mm_budget_to_quotes(&cfg, &state, 0, limits, &mut quotes);
+        assert!(projected_mm_budget
+            .suppressed_venues
+            .iter()
+            .any(|venue| venue.eq_ignore_ascii_case("lighter")));
+
+        let mut intents = Vec::new();
+        let appended = append_projected_mm_budget_unmanaged_suppression_cancels(
+            &cfg,
+            &state,
+            &projected_mm_budget,
+            2_000,
+            &mut intents,
+        );
+
+        assert_eq!(appended, 1);
+        assert!(matches!(
+            &intents[0],
+            OrderIntent::Cancel(cancel)
+                if cancel.venue_index == lighter
+                    && cancel.order_id == "lighter_unmanaged_ask"
+        ));
+        let effective = effective_projected_exposure_from_mm_intents(&state, &intents);
+        assert!(projected_exposure_within_limits(&effective, limits));
+    }
+
+    #[test]
+    fn projected_mm_budget_selection_credits_cancel_covered_suppressed_unmanaged_orders() {
+        let mut cfg = Config::default();
+        for venue in &cfg.venues {
+            cfg.mm
+                .venue_role_by_venue
+                .insert(venue.id.clone(), MmVenueRole::Fill);
+            cfg.mm
+                .max_quote_size_tao_by_venue
+                .insert(venue.id.clone(), 0.01);
+        }
+        let mut state = GlobalState::new(&cfg);
+        for (venue_index, venue) in cfg.venues.iter().enumerate() {
+            let venue_id = venue.id.to_ascii_lowercase();
+            state.live_order_state.apply_execution_event(
+                &ExecutionEvent::OrderAck(OrderAck {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    order_id: format!("{venue_id}_unmanaged_ask"),
+                    client_order_id: Some(format!("co_{venue_id}_unmanaged_ask")),
+                    seq: Some(1),
+                    side: Some(Side::Sell),
+                    price: Some(2_001.0),
+                    size: Some(0.03),
+                    purpose: Some(OrderPurpose::Mm),
+                }),
+                1_000,
+            );
+            state.venues[venue_index].mm_open_ask = None;
+        }
+
+        let mut quotes = cfg
+            .venues
+            .iter()
+            .enumerate()
+            .map(|(venue_index, venue)| MmQuote {
+                venue_index,
+                venue_id: venue.id_arc.clone(),
+                bid: Some(MmLevel {
+                    price: 2_000.0,
+                    size: 0.01,
+                }),
+                ask: Some(MmLevel {
+                    price: 2_001.0,
+                    size: 0.01,
+                }),
+                generated_spread_cap_applied: false,
+                generated_spread_cap_bid_suppressed: false,
+                generated_spread_cap_ask_suppressed: false,
+                touch_mode_kind: None,
+                bid_terminal_reason: "active",
+                ask_terminal_reason: "active",
+            })
+            .collect::<Vec<_>>();
+        let limits = inventory_brake_limits(
+            Some(0.08),
+            Some(0.08),
+            Some(0.04),
+            InventoryBrakeFractions {
+                net_fraction: Some(0.75),
+                gross_fraction: Some(0.75),
+                venue_fraction: Some(0.75),
+            },
+        );
+
+        let projected_mm_budget =
+            apply_projected_mm_budget_to_quotes(&cfg, &state, 0, limits, &mut quotes);
+
+        assert!(projected_mm_budget.projected_q_gross_before_tao > 0.06);
+        assert!(projected_mm_budget.projected_q_global_before_tao < -0.06);
+        assert!(projected_mm_budget.budget_after_within_limits);
+        assert_eq!(projected_mm_budget.selected_venues.len(), 2);
+        assert_eq!(
+            projected_mm_budget.suppressed_venues.len(),
+            cfg.venues.len() - 2
+        );
+        assert!(projected_mm_budget
+            .venues
+            .iter()
+            .any(|venue| { !venue.selected && venue.cancel_covered_live_ask_tao >= 0.03 - 1e-9 }));
+
+        let mut intents = Vec::new();
+        let appended = append_projected_mm_budget_unmanaged_suppression_cancels(
+            &cfg,
+            &state,
+            &projected_mm_budget,
+            2_000,
+            &mut intents,
+        );
+
+        assert_eq!(
+            appended,
+            cfg.venues.len() - projected_mm_budget.selected_venues.len()
+        );
+        let effective = effective_projected_exposure_from_mm_intents(&state, &intents);
+        assert!(projected_exposure_within_limits(&effective, limits));
+    }
+
+    #[test]
+    fn projected_mm_budget_suppression_defers_pending_paradex_mm_cancel_within_grace() {
+        let mut cfg = Config::default();
+        cfg.mm.paradex_pending_place_grace_ms = Some(8_000);
+        for venue in &cfg.venues {
+            cfg.mm
+                .venue_role_by_venue
+                .insert(venue.id.clone(), MmVenueRole::Fill);
+            cfg.mm
+                .max_quote_size_tao_by_venue
+                .insert(venue.id.clone(), 0.01);
+        }
+        let mut state = GlobalState::new(&cfg);
+        let paradex = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("paradex"))
+            .expect("paradex venue");
+        let now_ms = 42_000;
+        let pending_client_id = "co_pending_paradex_ask";
+        state.live_order_state.register_mm_decision_lineage(
+            paradex,
+            pending_client_id,
+            Side::Sell,
+            2_001.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_pending_paradex_ask",
+            now_ms,
+        );
+        state.venues[paradex].mm_open_ask = None;
+
+        let projected_mm_budget = ProjectedMmBudgetStatus {
+            configured: true,
+            applied: true,
+            gross_limit_tao: Some(0.06),
+            net_limit_tao: Some(0.06),
+            venue_limit_tao: Some(0.0225),
+            projected_q_global_before_tao: 0.0,
+            projected_q_gross_before_tao: 0.0,
+            projected_q_max_abs_venue_before_tao: 0.0,
+            projected_q_global_after_tao: 0.0,
+            projected_q_gross_after_tao: 0.0,
+            projected_q_max_abs_venue_after_tao: 0.0,
+            budget_after_within_limits: true,
+            selected_venues: Vec::new(),
+            suppressed_venues: vec!["paradex".to_string()],
+            venues: vec![ProjectedMmBudgetVenueStatus {
+                venue_index: paradex,
+                venue_id: "paradex".to_string(),
+                keep_bid: false,
+                keep_ask: false,
+                suppress_bid: false,
+                suppress_ask: true,
+                selected: false,
+                ..Default::default()
+            }],
+            rotation_epoch: 0,
+            rotation_frozen: false,
+            effective_q_global_after_tao: 0.0,
+            effective_q_gross_after_tao: 0.0,
+            effective_q_max_abs_venue_after_tao: 0.0,
+            effective_projection_within_limits: true,
+            live_order_projection_consistent: true,
+        };
+        let mut intents = Vec::new();
+
+        let appended = append_projected_mm_budget_unmanaged_suppression_cancels(
+            &cfg,
+            &state,
+            &projected_mm_budget,
+            now_ms + 1_000,
+            &mut intents,
+        );
+
+        assert_eq!(appended, 0);
+        assert!(intents.is_empty());
+
+        let appended_after_grace = append_projected_mm_budget_unmanaged_suppression_cancels(
+            &cfg,
+            &state,
+            &projected_mm_budget,
+            now_ms + 9_000,
+            &mut intents,
+        );
+
+        assert_eq!(appended_after_grace, 1);
+        assert!(matches!(
+            &intents[0],
+            OrderIntent::Cancel(cancel)
+                if cancel.venue_index == paradex
+                    && cancel.order_id == pending_client_id
+        ));
+    }
+
+    #[test]
+    fn projected_mm_budget_suppression_defers_pending_extended_mm_cancel_within_grace() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .pending_place_grace_ms_by_venue
+            .insert("extended".to_string(), 8_000);
+        for venue in &cfg.venues {
+            cfg.mm
+                .venue_role_by_venue
+                .insert(venue.id.clone(), MmVenueRole::Fill);
+            cfg.mm
+                .max_quote_size_tao_by_venue
+                .insert(venue.id.clone(), 0.01);
+        }
+        let mut state = GlobalState::new(&cfg);
+        let extended = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+            .expect("extended venue");
+        let now_ms = 42_000;
+        let pending_client_id = "co_pending_extended_bid";
+        assert!(can_cancel_pending_mm_by_client_id(
+            "extended",
+            pending_client_id
+        ));
+        assert!(!can_cancel_pending_mm_by_client_id(
+            "extended",
+            "external_pending_extended_bid"
+        ));
+        state.live_order_state.register_mm_decision_lineage(
+            extended,
+            pending_client_id,
+            Side::Buy,
+            2_000.0,
+            0.01,
+            OrderPurpose::Mm,
+            "d_pending_extended_bid",
+            now_ms,
+        );
+        state.venues[extended].mm_open_bid = None;
+
+        let projected_mm_budget = ProjectedMmBudgetStatus {
+            configured: true,
+            applied: true,
+            gross_limit_tao: Some(0.06),
+            net_limit_tao: Some(0.06),
+            venue_limit_tao: Some(0.0225),
+            projected_q_global_before_tao: 0.0,
+            projected_q_gross_before_tao: 0.0,
+            projected_q_max_abs_venue_before_tao: 0.0,
+            projected_q_global_after_tao: 0.0,
+            projected_q_gross_after_tao: 0.0,
+            projected_q_max_abs_venue_after_tao: 0.0,
+            budget_after_within_limits: true,
+            selected_venues: Vec::new(),
+            suppressed_venues: vec!["extended".to_string()],
+            venues: vec![ProjectedMmBudgetVenueStatus {
+                venue_index: extended,
+                venue_id: "extended".to_string(),
+                keep_bid: false,
+                keep_ask: false,
+                suppress_bid: true,
+                suppress_ask: false,
+                selected: false,
+                ..Default::default()
+            }],
+            rotation_epoch: 0,
+            rotation_frozen: false,
+            effective_q_global_after_tao: 0.0,
+            effective_q_gross_after_tao: 0.0,
+            effective_q_max_abs_venue_after_tao: 0.0,
+            effective_projection_within_limits: true,
+            live_order_projection_consistent: true,
+        };
+        let mut intents = Vec::new();
+
+        let appended = append_projected_mm_budget_unmanaged_suppression_cancels(
+            &cfg,
+            &state,
+            &projected_mm_budget,
+            now_ms + 1_000,
+            &mut intents,
+        );
+
+        assert_eq!(appended, 0);
+        assert!(intents.is_empty());
+
+        let appended_after_grace = append_projected_mm_budget_unmanaged_suppression_cancels(
+            &cfg,
+            &state,
+            &projected_mm_budget,
+            now_ms + 9_000,
+            &mut intents,
+        );
+
+        assert_eq!(appended_after_grace, 1);
+        assert!(matches!(
+            &intents[0],
+            OrderIntent::Cancel(cancel)
+                if cancel.venue_index == extended
+                    && cancel.order_id == pending_client_id
+        ));
+    }
+
+    #[test]
+    fn inventory_brake_uses_post_plan_projection_when_supplied() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        for venue in &mut state.venues {
+            venue.mm_open_bid = Some(MmOpenOrder {
+                price: 2_000.0,
+                size: 0.01,
+                timestamp_ms: 1_000,
+                order_id: format!("{}_bid", venue.id.to_ascii_lowercase()),
+                client_order_id: None,
+                tracking_source: MmOpenTrackingSource::OpenSnapshot,
+            });
+            venue.mm_open_ask = Some(MmOpenOrder {
+                price: 2_001.0,
+                size: 0.01,
+                timestamp_ms: 1_000,
+                order_id: format!("{}_ask", venue.id.to_ascii_lowercase()),
+                client_order_id: None,
+                tracking_source: MmOpenTrackingSource::OpenSnapshot,
+            });
+        }
+        state.recompute_after_fills(&cfg);
+
+        let mut intents = Vec::new();
+        for venue_index in 0..2 {
+            let venue = &state.venues[venue_index];
+            intents.push(OrderIntent::Cancel(CancelOrderIntent {
+                venue_index,
+                venue_id: venue.id.clone(),
+                order_id: venue.mm_open_bid.as_ref().unwrap().order_id.clone(),
+            }));
+            intents.push(OrderIntent::Cancel(CancelOrderIntent {
+                venue_index,
+                venue_id: venue.id.clone(),
+                order_id: venue.mm_open_ask.as_ref().unwrap().order_id.clone(),
+            }));
+        }
+
+        let effective = effective_projected_exposure_from_mm_intents(&state, &intents);
+        assert_eq!(effective.source, ProjectedExposureSource::PostPlan);
+        assert!((effective.q_global_tao - 0.0).abs() < 1e-9);
+        assert!((effective.q_gross_tao - 0.03).abs() < 1e-9);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake_with_projection(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+            Some(&effective),
+        );
+
+        assert_eq!(brake.projection_source, ProjectedExposureSource::PostPlan);
+        assert!(brake
+            .raw_projected_global_reasons
+            .contains(&"projected_gross_brake".to_string()));
+        assert!(brake.effective_projected_global_reasons.is_empty());
+        assert!(brake.budget_would_clear_projected_brake);
+        assert!(brake.projected_brake_consistent_with_effective_state);
+        assert!(!brake.triggered);
+    }
+
+    #[test]
+    fn inventory_brake_preserves_actual_breach_with_post_plan_projection() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].position_tao = 0.04;
+        state.recompute_after_fills(&cfg);
+
+        let effective = projected_exposure_from_sizes(
+            &state,
+            vec![0.0; state.venues.len()],
+            vec![0.0; state.venues.len()],
+            ProjectedExposureSource::PostPlan,
+        );
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake_with_projection(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+            Some(&effective),
+        );
+
+        assert!(brake.triggered);
+        assert!(brake.blocked_venues.iter().any(|venue| {
+            venue.bid_reasons.contains(&"venue_brake".to_string())
+                || venue.ask_reasons.contains(&"venue_brake".to_string())
+        }));
+        assert!(brake.projected_brake_consistent_with_effective_state);
+    }
+
+    #[test]
+    fn effective_projection_excludes_canceled_tracked_mm_order() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].mm_open_bid = Some(MmOpenOrder {
+            price: 2_000.0,
+            size: 0.01,
+            timestamp_ms: 1_000,
+            order_id: "bid_0".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
+        });
+
+        let effective = effective_projected_exposure_from_mm_intents(
+            &state,
+            &[OrderIntent::Cancel(CancelOrderIntent {
+                venue_index: 0,
+                venue_id: state.venues[0].id.clone(),
+                order_id: "bid_0".to_string(),
+            })],
+        );
+
+        assert!((effective.bid_sizes_tao[0] - 0.0).abs() < 1e-9);
+        assert!((effective.ask_sizes_tao[0] - 0.0).abs() < 1e-9);
+        assert!((effective.q_global_tao - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn inventory_brake_triggers_before_hard_limit_on_distributed_short() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -7674,6 +16773,8 @@ mod tests {
             size: 0.01,
             timestamp_ms: 1_000,
             order_id: "aster_ask".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         });
         state.venues[3].position_tao = -0.025;
         state.venues[3].mid = Some(2_350.5);
@@ -7683,6 +16784,8 @@ mod tests {
             size: 0.01,
             timestamp_ms: 1_000,
             order_id: "lighter_ask".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         });
         state.venues[4].position_tao = -0.02;
         state.venues[4].mid = Some(2_350.8);
@@ -7692,6 +16795,8 @@ mod tests {
             size: 0.01,
             timestamp_ms: 1_000,
             order_id: "paradex_ask".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         });
         state.recompute_after_fills(&cfg);
 
@@ -7830,13 +16935,13 @@ mod tests {
             .global_reasons
             .iter()
             .any(|reason| reason == "projected_net_short_brake"));
-        assert!(brake
+        assert!(!brake
             .global_reasons
             .iter()
             .any(|reason| reason == "projected_gross_brake"));
-        assert!((brake.projected_q_global_tao + 0.224).abs() < 1e-9);
-        assert!((brake.projected_q_gross_tao - 0.224).abs() < 1e-9);
-        assert!((brake.projected_q_max_abs_venue_tao - 0.09).abs() < 1e-9);
+        assert!((brake.projected_q_global_tao + 0.104).abs() < 1e-9);
+        assert!((brake.projected_q_gross_tao - 0.104).abs() < 1e-9);
+        assert!((brake.projected_q_max_abs_venue_tao - 0.044).abs() < 1e-9);
         let lighter = brake
             .blocked_venues
             .iter()
@@ -7844,6 +16949,564 @@ mod tests {
             .expect("lighter brake venue");
         assert!(lighter.blocked_ask);
         assert!(!lighter.blocked_bid);
+    }
+
+    #[test]
+    fn inventory_brake_ignores_same_side_replace_stack_for_projected_exposure() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        seed_open_orders_with_side(&mut state, 1, 3, Side::Sell, 10_000);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+        );
+
+        assert!(!brake.triggered);
+        assert!(brake.global_reasons.is_empty());
+        assert!(brake.blocked_venues.is_empty());
+        assert!((brake.projected_q_global_tao + 0.01).abs() < 1e-9);
+        assert!((brake.projected_q_gross_tao - 0.01).abs() < 1e-9);
+        assert!((brake.projected_q_max_abs_venue_tao - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inventory_brake_sums_extended_same_side_live_exposure_when_enabled() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_MM_SUM_SAME_SIDE_LIVE_EXPOSURE_EXTENDED"]);
+        std::env::set_var("PARAPHINA_MM_SUM_SAME_SIDE_LIVE_EXPOSURE_EXTENDED", "1");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+            .expect("extended venue");
+
+        seed_open_orders_with_side(&mut state, extended, 4, Side::Sell, 10_000);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+        );
+
+        assert!(brake.triggered);
+        assert!(brake
+            .global_reasons
+            .iter()
+            .any(|reason| reason == "projected_net_short_brake"));
+        assert!(brake
+            .global_reasons
+            .iter()
+            .any(|reason| reason == "projected_gross_brake"));
+        assert!((brake.projected_q_global_tao + 0.04).abs() < 1e-9);
+        assert!((brake.projected_q_gross_tao - 0.04).abs() < 1e-9);
+        assert!((brake.projected_q_max_abs_venue_tao - 0.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inventory_brake_keeps_aster_same_side_live_exposure_largest_by_default() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_MM_SUM_SAME_SIDE_LIVE_EXPOSURE_ASTER"]);
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+            .expect("aster venue");
+
+        seed_open_orders_with_side(&mut state, aster, 4, Side::Sell, 10_000);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+        );
+
+        assert!(!brake.triggered);
+        assert!(brake.global_reasons.is_empty());
+        assert!(brake.blocked_venues.is_empty());
+        assert!((brake.projected_q_global_tao + 0.01).abs() < 1e-9);
+        assert!((brake.projected_q_gross_tao - 0.01).abs() < 1e-9);
+        assert!((brake.projected_q_max_abs_venue_tao - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inventory_brake_sums_aster_same_side_live_exposure_when_enabled() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_MM_SUM_SAME_SIDE_LIVE_EXPOSURE_ASTER"]);
+        std::env::set_var("PARAPHINA_MM_SUM_SAME_SIDE_LIVE_EXPOSURE_ASTER", "1");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+            .expect("aster venue");
+
+        seed_open_orders_with_side(&mut state, aster, 4, Side::Sell, 10_000);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+        );
+
+        assert!(brake.triggered);
+        assert!(brake
+            .global_reasons
+            .iter()
+            .any(|reason| reason == "projected_net_short_brake"));
+        assert!(brake
+            .global_reasons
+            .iter()
+            .any(|reason| reason == "projected_gross_brake"));
+        assert!((brake.projected_q_global_tao + 0.04).abs() < 1e-9);
+        assert!((brake.projected_q_gross_tao - 0.04).abs() < 1e-9);
+        assert!((brake.projected_q_max_abs_venue_tao - 0.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inventory_brake_projects_pending_hyperliquid_mm_bids_and_cancels_cloids() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 11_000;
+
+        for (idx, decision_id) in ["d401_mm_v0_buy", "d402_mm_v0_buy", "d403_mm_v0_buy"]
+            .into_iter()
+            .enumerate()
+        {
+            state.live_order_state.register_mm_decision_lineage(
+                1,
+                &hyperliquid_cloid(format!("co_pending_hl_bid_{idx}").as_str()),
+                Side::Buy,
+                2_000.0,
+                0.01,
+                OrderPurpose::Mm,
+                decision_id,
+                now_ms + idx as i64,
+            );
+        }
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+        );
+
+        assert!(brake.triggered);
+        assert!(brake
+            .global_reasons
+            .iter()
+            .any(|reason| reason == "projected_net_long_brake"));
+        assert!((brake.projected_q_global_tao - 0.03).abs() < 1e-9);
+        assert!((brake.projected_q_gross_tao - 0.03).abs() < 1e-9);
+        assert!((brake.projected_q_max_abs_venue_tao - 0.03).abs() < 1e-9);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: state.venues[venue_index].position_tao,
+                    avg_entry_price: 2_000.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let intents = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake);
+        let cancel_orders = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                OrderIntent::Cancel(cancel) if cancel.venue_index == 1 => {
+                    Some(cancel.order_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cancel_orders.len(), 3);
+        assert!(cancel_orders
+            .iter()
+            .all(|order_id| is_hyperliquid_cloid(order_id)));
+        assert!(!intents
+            .iter()
+            .any(|intent| matches!(intent, OrderIntent::Place(_))));
+    }
+
+    #[test]
+    fn inventory_brake_projects_pending_paradex_mm_bids_and_cancels_client_ids() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let paradex = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("paradex"))
+            .expect("paradex venue");
+
+        for (idx, decision_id) in ["d501_mm_v4_buy", "d502_mm_v4_buy", "d503_mm_v4_buy"]
+            .into_iter()
+            .enumerate()
+        {
+            state.live_order_state.register_mm_decision_lineage(
+                paradex,
+                &format!("co_pending_pdx_bid_{idx}"),
+                Side::Buy,
+                2_000.0,
+                0.01,
+                OrderPurpose::Mm,
+                decision_id,
+                now_ms + idx as i64,
+            );
+        }
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+        );
+
+        assert!(brake.triggered);
+        assert!(brake
+            .global_reasons
+            .iter()
+            .any(|reason| reason == "projected_net_long_brake"));
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: state.venues[venue_index].position_tao,
+                    avg_entry_price: 2_000.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let intents = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake);
+        let cancel_orders = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                OrderIntent::Cancel(cancel) if cancel.venue_index == paradex => {
+                    Some(cancel.order_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cancel_orders,
+            vec![
+                "co_pending_pdx_bid_0",
+                "co_pending_pdx_bid_1",
+                "co_pending_pdx_bid_2",
+            ]
+        );
+        assert!(!intents
+            .iter()
+            .any(|intent| matches!(intent, OrderIntent::Place(_))));
+    }
+
+    #[test]
+    fn inventory_brake_projects_pending_aster_and_lighter_mm_bids_and_cancels_client_ids() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_500;
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+            .expect("aster venue");
+        let lighter = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("lighter"))
+            .expect("lighter venue");
+
+        for (idx, decision_id) in ["d601_mm_v2_buy", "d602_mm_v2_buy", "d603_mm_v2_buy"]
+            .into_iter()
+            .enumerate()
+        {
+            state.live_order_state.register_mm_decision_lineage(
+                aster,
+                &format!("co_pending_aster_bid_{idx}"),
+                Side::Buy,
+                2_000.0,
+                0.01,
+                OrderPurpose::Mm,
+                decision_id,
+                now_ms + idx as i64,
+            );
+        }
+        for (idx, decision_id) in ["d701_mm_v3_buy", "d702_mm_v3_buy", "d703_mm_v3_buy"]
+            .into_iter()
+            .enumerate()
+        {
+            state.live_order_state.register_mm_decision_lineage(
+                lighter,
+                &format!("{}", 151_880_531_745_290_u64 + idx as u64),
+                Side::Buy,
+                2_000.0,
+                0.01,
+                OrderPurpose::Mm,
+                decision_id,
+                now_ms + 10 + idx as i64,
+            );
+        }
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.05), Some(0.03), fractions),
+        );
+
+        assert!(brake.triggered);
+        assert!(brake
+            .global_reasons
+            .iter()
+            .any(|reason| reason == "projected_net_long_brake"));
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: state.venues[venue_index].position_tao,
+                    avg_entry_price: 2_000.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let intents = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake);
+        let aster_cancel_orders = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                OrderIntent::Cancel(cancel) if cancel.venue_index == aster => {
+                    Some(cancel.order_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let lighter_cancel_orders = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                OrderIntent::Cancel(cancel) if cancel.venue_index == lighter => {
+                    Some(cancel.order_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            aster_cancel_orders,
+            vec![
+                "co_pending_aster_bid_0",
+                "co_pending_aster_bid_1",
+                "co_pending_aster_bid_2",
+            ]
+        );
+        assert_eq!(
+            lighter_cancel_orders,
+            vec!["151880531745290", "151880531745291", "151880531745292"]
+        );
+        assert!(lighter_cancel_orders
+            .iter()
+            .all(|order_id| is_lighter_client_order_index(order_id)));
+        assert!(!can_cancel_pending_mm_by_client_id(
+            "lighter",
+            &(LIGHTER_CLIENT_ORDER_INDEX_MAX + 1).to_string()
+        ));
+        assert!(!intents
+            .iter()
+            .any(|intent| matches!(intent, OrderIntent::Place(_))));
+    }
+
+    #[test]
+    fn inventory_brake_intents_cancel_all_live_mm_orders_on_blocked_side() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 10_000;
+
+        state.venues[1].position_tao = 0.02;
+        state.recompute_after_fills(&cfg);
+
+        seed_open_orders_with_side(&mut state, 1, 1, Side::Buy, now_ms);
+        seed_open_orders_with_side(&mut state, 1, 1, Side::Sell, now_ms);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, 1);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.03), Some(0.20), Some(0.08), fractions),
+        );
+
+        assert!(brake.triggered);
+        assert!(brake
+            .global_reasons
+            .iter()
+            .any(|reason| reason == "projected_net_long_brake"));
+        let hyperliquid = brake
+            .blocked_venues
+            .iter()
+            .find(|venue| venue.venue_id == "hyperliquid")
+            .expect("hyperliquid brake venue");
+        assert!(hyperliquid.blocked_bid);
+        assert!(!hyperliquid.blocked_ask);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: state.venues[venue_index].position_tao,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let intents = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake);
+        let cancel_orders = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                OrderIntent::Cancel(cancel) if cancel.venue_index == 1 => {
+                    Some(cancel.order_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cancel_orders, vec!["oid_1_0"]);
+        assert!(!cancel_orders.is_empty());
+        let hedge_places = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                OrderIntent::Place(place) => Some(place),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hedge_places.len(), 1);
+        assert_eq!(hedge_places[0].venue_index, 1);
+        assert_eq!(hedge_places[0].side, Side::Sell);
+        assert_eq!(hedge_places[0].size, 0.03);
+        assert!(hedge_places[0].reduce_only);
     }
 
     #[test]
@@ -7889,12 +17552,16 @@ mod tests {
                 size: 0.01,
                 timestamp_ms: 1_000,
                 order_id: "bid".to_string(),
+                client_order_id: None,
+                tracking_source: MmOpenTrackingSource::OpenSnapshot,
             });
             venue.mm_open_ask = Some(MmOpenOrder {
                 price: 2_351.0,
                 size: 0.01,
                 timestamp_ms: 1_000,
                 order_id: "ask".to_string(),
+                client_order_id: None,
+                tracking_source: MmOpenTrackingSource::OpenSnapshot,
             });
         }
         state.recompute_after_fills(&cfg);
@@ -7947,6 +17614,831 @@ mod tests {
     }
 
     #[test]
+    fn canary_breach_response_uses_max_of_deadline_and_ticks() {
+        assert!(canary_breach_response_is_active(Some(2_000), 2, 1_000));
+        assert!(canary_breach_response_is_active(Some(999), 2, 1_000));
+        assert!(canary_breach_response_is_active(Some(2_000), 0, 1_000));
+        assert!(canary_breach_response_is_active(None, 2, 1_000));
+        assert!(!canary_breach_response_is_active(Some(999), 0, 1_000));
+    }
+
+    #[test]
+    fn canary_breach_response_sends_for_actual_position_breach() {
+        let limits = CanaryLimitStatus {
+            breached: true,
+            net_breached: true,
+            max_position_tao: Some(0.03),
+            q_global_tao: -0.05,
+            net_excess_tao: 0.02,
+            ..CanaryLimitStatus::default()
+        };
+        let config = CanaryBreachResponseConfig {
+            response_ms: 1_500,
+            response_ticks: 3,
+        };
+
+        assert!(canary_breach_response_should_send(
+            &limits, config, false, None, 0, 1_000,
+        ));
+    }
+
+    #[test]
+    fn canary_breach_response_sends_for_open_order_breach() {
+        let limits = CanaryLimitStatus {
+            breached: true,
+            open_orders_breached: true,
+            max_open_orders: Some(4),
+            open_order_count: 6,
+            open_order_excess: 2,
+            ..CanaryLimitStatus::default()
+        };
+        let config = CanaryBreachResponseConfig {
+            response_ms: 1_500,
+            response_ticks: 3,
+        };
+
+        assert!(canary_breach_response_should_send(
+            &limits, config, false, None, 0, 1_000,
+        ));
+    }
+
+    #[test]
+    fn canary_breach_response_does_not_rearm_before_breach_clears() {
+        let limits = CanaryLimitStatus {
+            breached: true,
+            venue_breached: true,
+            max_abs_venue_position_tao: Some(0.03),
+            q_max_abs_venue_tao: 0.05,
+            venue_excess_tao: 0.02,
+            ..CanaryLimitStatus::default()
+        };
+        let config = CanaryBreachResponseConfig {
+            response_ms: 1_500,
+            response_ticks: 3,
+        };
+
+        assert!(!canary_breach_response_should_send(
+            &limits,
+            config,
+            true,
+            Some(2_500),
+            2,
+            1_000,
+        ));
+        assert!(!canary_breach_response_should_send(
+            &limits, config, true, None, 0, 4_000,
+        ));
+    }
+
+    #[test]
+    fn canary_breach_response_retries_flatten_while_active() {
+        let limits = CanaryLimitStatus {
+            breached: true,
+            venue_breached: true,
+            max_abs_venue_position_tao: Some(0.03),
+            q_max_abs_venue_tao: 0.09,
+            venue_excess_tao: 0.06,
+            ..CanaryLimitStatus::default()
+        };
+
+        assert!(canary_breach_response_should_retry_flatten(
+            &limits,
+            true,
+            Some(2_500),
+            1,
+            2_000,
+        ));
+        assert!(!canary_breach_response_should_retry_flatten(
+            &limits,
+            false,
+            Some(2_500),
+            1,
+            2_000,
+        ));
+        assert!(!canary_breach_response_should_retry_flatten(
+            &limits,
+            true,
+            Some(1_500),
+            0,
+            2_000,
+        ));
+    }
+
+    #[test]
+    fn canary_response_rearms_after_observed_async_flatten_progress() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        state.venues[hyperliquid].position_tao = 0.0362;
+        let observation = CanaryFlattenObservationState {
+            until_ms: Some(4_500),
+            baselines: vec![(hyperliquid, 0.0562)],
+            ..CanaryFlattenObservationState::default()
+        };
+
+        assert!(canary_breach_response_should_rearm_after_observed_progress(
+            &cfg,
+            &state,
+            true,
+            Some(3_000),
+            0,
+            &observation,
+            5_000,
+        ));
+    }
+
+    #[test]
+    fn canary_response_does_not_rearm_without_observed_progress() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        state.venues[hyperliquid].position_tao = 0.0562;
+        let observation = CanaryFlattenObservationState {
+            until_ms: Some(4_500),
+            baselines: vec![(hyperliquid, 0.0562)],
+            ..CanaryFlattenObservationState::default()
+        };
+
+        assert!(
+            !canary_breach_response_should_rearm_after_observed_progress(
+                &cfg,
+                &state,
+                true,
+                Some(3_000),
+                0,
+                &observation,
+                5_000,
+            )
+        );
+    }
+
+    #[test]
+    fn canary_response_does_not_rearm_on_worsened_observation() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        state.venues[hyperliquid].position_tao = 0.0662;
+        let observation = CanaryFlattenObservationState {
+            until_ms: Some(4_500),
+            baselines: vec![(hyperliquid, 0.0562)],
+            ..CanaryFlattenObservationState::default()
+        };
+
+        assert!(
+            !canary_breach_response_should_rearm_after_observed_progress(
+                &cfg,
+                &state,
+                true,
+                Some(3_000),
+                0,
+                &observation,
+                5_000,
+            )
+        );
+    }
+
+    #[test]
+    fn actual_canary_response_preempts_inventory_brake_dispatch() {
+        let limits = CanaryLimitStatus {
+            breached: true,
+            venue_breached: true,
+            max_abs_venue_position_tao: Some(0.03),
+            q_max_abs_venue_tao: 0.05,
+            venue_excess_tao: 0.02,
+            ..CanaryLimitStatus::default()
+        };
+        let config = CanaryBreachResponseConfig {
+            response_ms: 1_500,
+            response_ticks: 3,
+        };
+
+        assert!(
+            canary_actual_position_response_pending_before_inventory_brake(
+                &limits, config, false, None, 0, 1_000,
+            )
+        );
+        assert!(
+            canary_actual_position_response_pending_before_inventory_brake(
+                &limits,
+                config,
+                true,
+                Some(2_500),
+                1,
+                2_000,
+            )
+        );
+    }
+
+    #[test]
+    fn active_canary_observation_preempts_inventory_brake_dispatch() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        state.venues[lighter].position_tao = -0.04;
+        let limits = CanaryLimitStatus {
+            breached: true,
+            venue_breached: true,
+            max_abs_venue_position_tao: Some(0.03),
+            q_max_abs_venue_tao: 0.04,
+            venue_excess_tao: 0.01,
+            ..CanaryLimitStatus::default()
+        };
+        let config = CanaryBreachResponseConfig {
+            response_ms: 1_500,
+            response_ticks: 3,
+        };
+        let observation = CanaryFlattenObservationState {
+            until_ms: Some(2_000),
+            baselines: vec![(lighter, 0.04)],
+            ..CanaryFlattenObservationState::default()
+        };
+
+        assert!(
+            !canary_actual_position_response_pending_before_inventory_brake(
+                &limits,
+                config,
+                true,
+                Some(1_000),
+                0,
+                1_500,
+            )
+        );
+        assert!(
+            canary_actual_position_control_pending_before_inventory_brake(
+                &cfg,
+                &state,
+                &limits,
+                config,
+                true,
+                Some(1_000),
+                0,
+                &observation,
+                1_500,
+            )
+        );
+    }
+
+    #[test]
+    fn canary_flatten_observation_does_not_cover_expanded_targets() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+        let aster = aster_venue_index(&cfg).expect("aster venue");
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        state.venues[extended].position_tao = -0.06;
+        state.venues[aster].position_tao = -0.245;
+        state.venues[lighter].position_tao = -0.1768;
+        state.recompute_after_fills(&cfg);
+
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        let observation = CanaryFlattenObservationState {
+            until_ms: Some(1_500),
+            baselines: vec![(aster, 0.245)],
+            ..CanaryFlattenObservationState::default()
+        };
+        let snapshot =
+            canary_breach_response_target_snapshot(&cfg, &state, &limits, &observation, 1_000);
+
+        assert!(snapshot.raw_observation_active);
+        assert!(snapshot.positioned_target_venues.contains(&aster));
+        assert!(snapshot.positioned_target_venues.contains(&lighter));
+        assert!(snapshot.positioned_target_venues.contains(&extended));
+        assert!(!snapshot.observation_covers_positioned_targets);
+    }
+
+    #[test]
+    fn canary_response_rearms_when_observation_no_longer_covers_targets() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+        let aster = aster_venue_index(&cfg).expect("aster venue");
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        state.venues[extended].position_tao = -0.06;
+        state.venues[aster].position_tao = -0.245;
+        state.venues[lighter].position_tao = -0.1768;
+        state.recompute_after_fills(&cfg);
+
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        let observation = CanaryFlattenObservationState {
+            until_ms: Some(1_500),
+            baselines: vec![(aster, 0.245)],
+            ..CanaryFlattenObservationState::default()
+        };
+        let snapshot =
+            canary_breach_response_target_snapshot(&cfg, &state, &limits, &observation, 1_000);
+
+        assert!(canary_breach_response_should_rearm_for_uncovered_targets(
+            true,
+            Some(900),
+            0,
+            &snapshot,
+            1_000,
+        ));
+    }
+
+    #[test]
+    fn active_canary_observation_does_not_preempt_inventory_brake_when_targets_expand() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = aster_venue_index(&cfg).expect("aster venue");
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        state.venues[aster].position_tao = -0.05;
+        state.venues[lighter].position_tao = -0.04;
+        state.recompute_after_fills(&cfg);
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        let config = CanaryBreachResponseConfig {
+            response_ms: 1_500,
+            response_ticks: 3,
+        };
+        let observation = CanaryFlattenObservationState {
+            until_ms: Some(2_000),
+            baselines: vec![(lighter, 0.04)],
+            ..CanaryFlattenObservationState::default()
+        };
+
+        assert!(
+            !canary_actual_position_control_pending_before_inventory_brake(
+                &cfg,
+                &state,
+                &limits,
+                config,
+                true,
+                Some(1_000),
+                0,
+                &observation,
+                1_500,
+            )
+        );
+    }
+
+    #[test]
+    fn ineligible_inventory_brake_grace_is_cleared_before_canary_retry() {
+        let mut grace_until_ms = Some(2_500);
+        let mut grace_ticks_remaining = 3;
+        let mut grace_active = true;
+
+        assert!(clear_ineligible_inventory_brake_grace(
+            &mut grace_until_ms,
+            &mut grace_ticks_remaining,
+            &mut grace_active,
+            false,
+        ));
+        assert_eq!(grace_until_ms, None);
+        assert_eq!(grace_ticks_remaining, 0);
+        assert!(!grace_active);
+    }
+
+    #[test]
+    fn eligible_inventory_brake_grace_still_blocks_canary_retry() {
+        let mut grace_until_ms = Some(2_500);
+        let mut grace_ticks_remaining = 3;
+        let mut grace_active = true;
+
+        assert!(!clear_ineligible_inventory_brake_grace(
+            &mut grace_until_ms,
+            &mut grace_ticks_remaining,
+            &mut grace_active,
+            true,
+        ));
+        assert_eq!(grace_until_ms, Some(2_500));
+        assert_eq!(grace_ticks_remaining, 3);
+        assert!(grace_active);
+    }
+
+    #[test]
+    fn open_order_only_canary_response_does_not_preempt_inventory_brake() {
+        let limits = CanaryLimitStatus {
+            breached: true,
+            open_orders_breached: true,
+            max_open_orders: Some(4),
+            open_order_count: 6,
+            open_order_excess: 2,
+            ..CanaryLimitStatus::default()
+        };
+        let config = CanaryBreachResponseConfig {
+            response_ms: 1_500,
+            response_ticks: 3,
+        };
+
+        assert!(
+            !canary_actual_position_response_pending_before_inventory_brake(
+                &limits, config, false, None, 0, 1_000,
+            )
+        );
+    }
+
+    #[test]
+    fn canary_flatten_observation_arms_after_async_venue_submit() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        state.venues[hyperliquid].position_tao = 0.04;
+
+        let dispatch = CanaryFlattenDispatchResult {
+            submitted: true,
+            submitted_venues: vec![hyperliquid],
+            accepted_venues: Vec::new(),
+        };
+        let mut observation = CanaryFlattenObservationState::default();
+
+        assert!(arm_canary_flatten_observation(
+            &cfg,
+            &state,
+            &dispatch,
+            1_000,
+            3_500,
+            &mut observation,
+        ));
+        assert_eq!(observation.until_ms, Some(4_500));
+        assert_eq!(observation.baselines, vec![(hyperliquid, 0.04)]);
+        assert_eq!(observation.retry_count, 0);
+        assert_eq!(observation.last_retry_ms, None);
+        assert!(canary_flatten_observation_active(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+        ));
+    }
+
+    #[test]
+    fn async_canary_flatten_observation_venues_include_aster_by_default() {
+        let cfg = Config::default();
+        let aster = aster_venue_index(&cfg).expect("aster venue");
+        let venues =
+            async_canary_flatten_observation_venue_indices_with_aster_sync_wait(&cfg, false);
+
+        assert!(venues.contains(&aster));
+    }
+
+    #[test]
+    fn async_canary_flatten_observation_venues_include_extended_by_default() {
+        let cfg = Config::default();
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+        let venues =
+            async_canary_flatten_observation_venue_indices_with_aster_sync_wait(&cfg, false);
+
+        assert!(venues.contains(&extended));
+    }
+
+    #[test]
+    fn async_canary_flatten_observation_venues_include_paradex_by_default() {
+        let cfg = Config::default();
+        let paradex = paradex_venue_index(&cfg).expect("paradex venue");
+        let venues =
+            async_canary_flatten_observation_venue_indices_with_aster_sync_wait(&cfg, false);
+
+        assert!(venues.contains(&paradex));
+    }
+
+    #[test]
+    fn async_canary_flatten_observation_venues_exclude_aster_for_sync_wait() {
+        let cfg = Config::default();
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+        let paradex = paradex_venue_index(&cfg).expect("paradex venue");
+        let aster = aster_venue_index(&cfg).expect("aster venue");
+        let venues =
+            async_canary_flatten_observation_venue_indices_with_aster_sync_wait(&cfg, true);
+
+        assert!(venues.contains(&lighter));
+        assert!(venues.contains(&hyperliquid));
+        assert!(venues.contains(&extended));
+        assert!(venues.contains(&paradex));
+        assert!(!venues.contains(&aster));
+    }
+
+    #[test]
+    fn canary_flatten_observation_bridge_includes_sync_wait_aster_dispatch_when_enabled() {
+        let cfg = Config::default();
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        let aster = aster_venue_index(&cfg).expect("aster venue");
+        let dispatch = CanaryFlattenDispatchResult {
+            submitted: true,
+            submitted_venues: vec![aster],
+            accepted_venues: Vec::new(),
+        };
+
+        let bridged = canary_flatten_observation_venue_indices_for_dispatch_with_aster_bridge(
+            &cfg, &dispatch, true, true,
+        );
+        assert!(bridged.contains(&lighter));
+        assert!(bridged.contains(&hyperliquid));
+        assert!(bridged.contains(&aster));
+
+        let unbridged = canary_flatten_observation_venue_indices_for_dispatch_with_aster_bridge(
+            &cfg, &dispatch, true, false,
+        );
+        assert!(unbridged.contains(&lighter));
+        assert!(unbridged.contains(&hyperliquid));
+        assert!(!unbridged.contains(&aster));
+    }
+
+    #[test]
+    fn canary_flatten_observation_rejects_expired_or_worsened_residual() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        state.venues[lighter].position_tao = -0.04;
+        let observation = CanaryFlattenObservationState {
+            until_ms: Some(4_500),
+            baselines: vec![(lighter, 0.04)],
+            ..CanaryFlattenObservationState::default()
+        };
+
+        assert!(!canary_flatten_observation_active(
+            &cfg,
+            &state,
+            &observation,
+            4_501,
+        ));
+        state.venues[lighter].position_tao = -0.05;
+        assert!(!canary_flatten_observation_active(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+        ));
+    }
+
+    #[test]
+    fn canary_flatten_observation_ignores_non_async_venue_accept() {
+        let mut cfg = Config::default();
+        let sync_only = paradex_venue_index(&cfg).expect("paradex venue");
+        cfg.venues[sync_only].id = "sync_only_test".to_string();
+        cfg.venues[sync_only].id_arc = std::sync::Arc::from("sync_only_test");
+        let mut state = GlobalState::new(&cfg);
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        state.venues[lighter].position_tao = -0.04;
+        state.venues[sync_only].position_tao = -0.04;
+
+        let dispatch = CanaryFlattenDispatchResult {
+            submitted: true,
+            submitted_venues: vec![sync_only],
+            accepted_venues: vec![sync_only],
+        };
+        let mut observation = CanaryFlattenObservationState::default();
+
+        assert!(!arm_canary_flatten_observation(
+            &cfg,
+            &state,
+            &dispatch,
+            1_000,
+            3_500,
+            &mut observation,
+        ));
+        assert_eq!(observation.until_ms, None);
+        assert!(observation.baselines.is_empty());
+    }
+
+    #[test]
+    fn canary_flatten_observation_arms_from_inventory_brake_reduce_only_dispatch() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        state.venues[lighter].position_tao = 0.04;
+
+        let dispatches = vec![EmergencyRequestDispatchStatus {
+            class: EmergencyRequestClass::InventoryBrake,
+            venue_index: lighter,
+            venue_id: cfg.venues[lighter].id.clone(),
+            transport_mode: EmergencyRequestTransportMode::SingleFlightLatch,
+            outcome: EmergencyRequestDispatchOutcome::Events,
+        }];
+        let reduce_only_venues = vec![lighter];
+        let dispatch = canary_flatten_dispatch_from_emergency_dispatches(
+            &cfg,
+            &state,
+            &dispatches,
+            &reduce_only_venues,
+            EmergencyRequestClass::InventoryBrake,
+        );
+        assert!(dispatch.submitted);
+        assert!(dispatch.submitted_venue(lighter));
+
+        let mut observation = CanaryFlattenObservationState::default();
+        assert!(arm_canary_flatten_observation(
+            &cfg,
+            &state,
+            &dispatch,
+            10_000,
+            2_500,
+            &mut observation,
+        ));
+        assert_eq!(observation.until_ms, Some(12_500));
+        assert_eq!(observation.baselines, vec![(lighter, 0.04)]);
+
+        let no_reduce_only_dispatch = canary_flatten_dispatch_from_emergency_dispatches(
+            &cfg,
+            &state,
+            &dispatches,
+            &[],
+            EmergencyRequestClass::InventoryBrake,
+        );
+        assert!(!no_reduce_only_dispatch.submitted);
+
+        let channel_full_dispatches = vec![EmergencyRequestDispatchStatus {
+            class: EmergencyRequestClass::InventoryBrake,
+            venue_index: lighter,
+            venue_id: cfg.venues[lighter].id.clone(),
+            transport_mode: EmergencyRequestTransportMode::SingleFlightLatch,
+            outcome: EmergencyRequestDispatchOutcome::ChannelFull,
+        }];
+        let no_event_dispatch = canary_flatten_dispatch_from_emergency_dispatches(
+            &cfg,
+            &state,
+            &channel_full_dispatches,
+            &reduce_only_venues,
+            EmergencyRequestClass::InventoryBrake,
+        );
+        assert!(!no_event_dispatch.submitted);
+
+        state.venues[lighter].position_tao = 0.0;
+        let flat_dispatch = canary_flatten_dispatch_from_emergency_dispatches(
+            &cfg,
+            &state,
+            &dispatches,
+            &reduce_only_venues,
+            EmergencyRequestClass::InventoryBrake,
+        );
+        assert!(!flat_dispatch.submitted);
+    }
+
+    #[test]
+    fn canary_flatten_observation_rearm_preserves_progress_baseline() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = aster_venue_index(&cfg).expect("aster venue");
+        state.venues[aster].position_tao = -0.06;
+
+        let dispatch = CanaryFlattenDispatchResult {
+            submitted: true,
+            submitted_venues: vec![aster],
+            accepted_venues: Vec::new(),
+        };
+        let mut observation = CanaryFlattenObservationState::default();
+
+        assert!(arm_canary_flatten_observation(
+            &cfg,
+            &state,
+            &dispatch,
+            1_000,
+            3_500,
+            &mut observation,
+        ));
+        assert_eq!(observation.baselines, vec![(aster, 0.06)]);
+
+        state.venues[aster].position_tao = -0.05;
+        assert!(arm_canary_flatten_observation(
+            &cfg,
+            &state,
+            &dispatch,
+            2_000,
+            3_500,
+            &mut observation,
+        ));
+        assert_eq!(observation.until_ms, Some(5_500));
+        assert_eq!(observation.baselines, vec![(aster, 0.06)]);
+        assert!(canary_flatten_observation_made_progress(
+            &cfg,
+            &state,
+            &observation,
+        ));
+    }
+
+    #[test]
+    fn canary_flatten_observation_retry_due_requires_non_progress_and_cadence() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        state.venues[hyperliquid].position_tao = 0.04;
+
+        let mut observation = CanaryFlattenObservationState {
+            until_ms: Some(4_500),
+            baselines: vec![(hyperliquid, 0.04)],
+            ..CanaryFlattenObservationState::default()
+        };
+
+        assert!(canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+            true,
+            500,
+            2,
+        ));
+
+        observation.last_retry_ms = Some(3_800);
+        assert!(!canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+            true,
+            500,
+            2,
+        ));
+
+        observation.last_retry_ms = Some(3_400);
+        assert!(canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+            true,
+            500,
+            2,
+        ));
+
+        observation.retry_count = 2;
+        assert!(!canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+            true,
+            500,
+            2,
+        ));
+
+        observation.retry_count = 0;
+        state.venues[hyperliquid].position_tao = 0.03;
+        assert!(!canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+            true,
+            500,
+            2,
+        ));
+
+        state.venues[hyperliquid].position_tao = 0.05;
+        assert!(!canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+            true,
+            500,
+            2,
+        ));
+    }
+
+    #[test]
+    fn canary_flatten_retry_attempt_without_submission_still_enforces_cadence() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        state.venues[hyperliquid].position_tao = 0.04;
+
+        let mut observation = CanaryFlattenObservationState {
+            until_ms: Some(4_500),
+            baselines: vec![(hyperliquid, 0.04)],
+            ..CanaryFlattenObservationState::default()
+        };
+
+        assert!(canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_000,
+            true,
+            500,
+            2,
+        ));
+
+        record_canary_flatten_observation_retry_attempt(&mut observation, false, 4_000);
+        assert_eq!(observation.retry_count, 0);
+        assert_eq!(observation.last_retry_ms, Some(4_000));
+        assert!(!canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_250,
+            true,
+            500,
+            2,
+        ));
+        assert!(canary_flatten_observation_retry_due(
+            &cfg,
+            &state,
+            &observation,
+            4_500,
+            true,
+            500,
+            2,
+        ));
+
+        record_canary_flatten_observation_retry_attempt(&mut observation, true, 4_500);
+        assert_eq!(observation.retry_count, 1);
+        assert_eq!(observation.last_retry_ms, Some(4_500));
+    }
+
+    #[test]
     fn inventory_attribution_summarizes_fills_syncs_and_intents() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -7956,6 +18448,8 @@ mod tests {
             size: 0.01,
             timestamp_ms: 1_000,
             order_id: "mm_ask".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         });
         state.venues[4].position_tao = -0.04;
 
@@ -8162,12 +18656,16 @@ mod tests {
             size: 0.01,
             timestamp_ms: 1_000,
             order_id: "hl_bid".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         });
         state.venues[3].mm_open_ask = Some(MmOpenOrder {
             price: 2_350.0,
             size: 0.01,
             timestamp_ms: 1_000,
             order_id: "lighter_ask".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
         });
 
         let snapshot = CanonicalCacheSnapshot {
@@ -8285,13 +18783,13 @@ mod tests {
     }
 
     #[test]
-    fn soft_unwind_falls_back_to_internal_position_when_snapshot_is_stale() {
+    fn soft_unwind_falls_back_to_bounded_internal_position_when_snapshot_is_stale() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
         let now_ms = 12_000;
         state.fair_value = Some(2_350.0);
         state.fair_value_prev = 2_350.0;
-        state.venues[3].position_tao = 0.09;
+        state.venues[3].position_tao = 0.04;
         state.venues[3].mid = Some(2_349.5);
         state.venues[3].spread = Some(0.2);
 
@@ -8326,9 +18824,3963 @@ mod tests {
                 OrderIntent::Place(place) if place.venue_index == 3 => Some(place),
                 _ => None,
             })
-            .expect("lighter unwind from internal fallback");
+            .expect("bounded lighter unwind from internal fallback");
         assert_eq!(lighter.side, Side::Sell);
-        assert_eq!(lighter.size, 0.08);
+        assert!((lighter.size - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lighter_orderly_exit_residual_convergence_builds_sub_lot_reduce_only_ioc() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let lighter = 3;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[lighter].position_tao = -0.0094;
+        state.venues[lighter].mid = Some(2_350.0);
+        state.venues[lighter].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == lighter { -0.0094 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let lighter_exit = build_lighter_orderly_exit_residual_convergence_intents(
+            &cfg, &state, &snapshot, now_ms, 0.0025, None,
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == lighter => Some(place),
+            _ => None,
+        })
+        .expect("lighter sub-lot residual convergence exit");
+        assert_eq!(lighter_exit.side, Side::Buy);
+        assert!((lighter_exit.size - 0.0094).abs() < 1e-12);
+        assert!(lighter_exit.reduce_only);
+        assert_eq!(lighter_exit.time_in_force, TimeInForce::Ioc);
+        assert_eq!(lighter_exit.purpose, OrderPurpose::Hedge);
+        assert!(!lighter_exit.post_only);
+    }
+
+    #[test]
+    fn lighter_orderly_exit_residual_convergence_skips_live_orders_or_stale_account() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 120_000;
+        let lighter = 3;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[lighter].position_tao = -0.0094;
+        state.venues[lighter].mid = Some(2_350.0);
+        state.venues[lighter].spread = Some(0.2);
+
+        let fresh_snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == lighter { -0.0094 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+        assert!(build_lighter_orderly_exit_residual_convergence_intents(
+            &cfg,
+            &state,
+            &fresh_snapshot,
+            now_ms,
+            0.0025,
+            None
+        )
+        .is_empty());
+
+        state.live_order_state = crate::live::order_state::LiveOrderState::new();
+        let stale_snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: fresh_snapshot
+                .account
+                .iter()
+                .map(|acct| {
+                    let mut acct = acct.clone();
+                    acct.timestamp_ms = Some(now_ms - 60_000);
+                    acct
+                })
+                .collect(),
+        };
+        assert!(build_lighter_orderly_exit_residual_convergence_intents(
+            &cfg,
+            &state,
+            &stale_snapshot,
+            now_ms,
+            0.0025,
+            None
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn lighter_terminal_residual_convergence_allows_stale_internal_live_orders_after_terminal_grace(
+    ) {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 120_000;
+        let lighter = 3;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[lighter].position_tao = -0.006;
+        state.venues[lighter].mid = Some(2_350.0);
+        state.venues[lighter].spread = Some(0.2);
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == lighter { -0.006 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let terminal_ready_venues = std::collections::HashSet::from([lighter]);
+
+        let lighter_exit = build_lighter_orderly_exit_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            0.0025,
+            Some(&terminal_ready_venues),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == lighter => Some(place),
+            _ => None,
+        })
+        .expect("lighter terminal sub-lot residual convergence despite stale internal orders");
+
+        assert_eq!(lighter_exit.side, Side::Buy);
+        assert!((lighter_exit.size - 0.006).abs() < 1e-12);
+        assert!(lighter_exit.reduce_only);
+        assert_eq!(lighter_exit.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
+    fn soft_unwind_allows_exact_one_lot_aster_without_live_orders() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let aster = build_soft_unwind_intents(&cfg, &state, &snapshot, now_ms)
+            .into_iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+                _ => None,
+            })
+            .expect("aster unwind");
+        assert_eq!(aster.side, Side::Sell);
+        assert_eq!(aster.size, 0.01);
+    }
+
+    #[test]
+    fn soft_unwind_fee_guard_suppresses_small_aster_reduce_only_ioc_only() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+        let lighter = 3;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+        state.venues[lighter].position_tao = -0.03;
+        state.venues[lighter].mid = Some(2_349.0);
+        state.venues[lighter].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster {
+                        0.01
+                    } else if venue_index == lighter {
+                        -0.03
+                    } else {
+                        0.0
+                    },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_soft_unwind_intents_with_fallback_and_fee_guard_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                max_abs_position_tao: 0.02,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == aster)
+        }));
+        assert!(intents.iter().any(|intent| {
+            matches!(intent, OrderIntent::Place(place) if place.venue_index == lighter)
+        }));
+        assert!(residual_fallback.aster_soft_unwind_fee_guard_enabled);
+        assert_eq!(
+            residual_fallback.aster_soft_unwind_fee_guard_max_abs_tao,
+            0.02
+        );
+        assert_eq!(
+            residual_fallback.aster_soft_unwind_fee_guard_skipped_orders,
+            1
+        );
+        assert!(
+            (residual_fallback.aster_soft_unwind_fee_guard_skipped_base_tao - 0.01).abs() < 1e-12
+        );
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "aster"
+                    && record.reason == EmergencyResidualFallbackReason::FeeGuardSuppressed
+            })
+            .expect("aster fee guard suppression record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Rejected);
+        assert_eq!(record.state_position_tao, 0.01);
+        assert_eq!(record.clamped_size_tao, 0.01);
+    }
+
+    #[test]
+    fn soft_unwind_fee_guard_allows_aster_above_guard_band() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.03;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { 0.03 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let aster_unwind = build_soft_unwind_intents_with_fallback_and_fee_guard_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                max_abs_position_tao: 0.02,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+            _ => None,
+        })
+        .expect("aster unwind above guard band");
+
+        assert_eq!(aster_unwind.side, Side::Sell);
+        assert!(aster_unwind.size >= cfg.venues[aster].lot_size_tao);
+        assert_eq!(aster_unwind.time_in_force, TimeInForce::Ioc);
+        assert!(aster_unwind.reduce_only);
+        assert_eq!(
+            residual_fallback.aster_soft_unwind_fee_guard_skipped_orders,
+            0
+        );
+    }
+
+    #[test]
+    fn soft_unwind_markout_guard_suppresses_benign_aster_residual() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_351.0);
+        state.fair_value_prev = 2_351.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let mut tracker = AsterResidualMarkoutGuardTracker::default();
+        let intents = build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                max_abs_position_tao: 0.02,
+                residual_markout_guard_enabled: true,
+                residual_markout_guard_max_age_ms: 180_000,
+                residual_markout_guard_min_adverse_usd: 0.03,
+                residual_markout_guard_max_unrealised_usd: 0.10,
+                residual_markout_guard_taker_fee_rate: 0.0004,
+                residual_markout_guard_require_fresh_account: true,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+            Some(&mut tracker),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == aster)
+        }));
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .reason
+                .as_deref(),
+            Some("suppressed_benign")
+        );
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .suppressed_orders,
+            1
+        );
+    }
+
+    #[test]
+    fn soft_unwind_markout_guard_force_flattens_stale_benign_aster_residual_when_fee_bounded() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let first_seen_ms = 12_000;
+        let force_now_ms = first_seen_ms + 901_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_351.0);
+        state.fair_value_prev = 2_351.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let mk_snapshot = |timestamp_ms: TimestampMs| CanonicalCacheSnapshot {
+            timestamp_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: timestamp_ms as u64,
+                    timestamp_ms: Some(timestamp_ms),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let config = AsterSoftUnwindFeeGuardConfig {
+            enabled: true,
+            max_abs_position_tao: 0.02,
+            residual_markout_guard_enabled: true,
+            residual_markout_guard_max_age_ms: 180_000,
+            residual_markout_guard_min_adverse_usd: 0.03,
+            residual_markout_guard_max_unrealised_usd: 0.10,
+            residual_markout_guard_taker_fee_rate: 0.0004,
+            residual_markout_guard_force_flat_after_ms: 900_000,
+            residual_markout_guard_force_flat_max_fee_usd: 0.05,
+            residual_markout_guard_require_fresh_account: true,
+            ..AsterSoftUnwindFeeGuardConfig::default()
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let mut tracker = AsterResidualMarkoutGuardTracker::default();
+        let first_snapshot = mk_snapshot(first_seen_ms);
+        let first_intents = build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status(
+            &cfg,
+            &state,
+            &first_snapshot,
+            first_seen_ms,
+            config,
+            Some(&mut residual_fallback),
+            Some(&mut tracker),
+        );
+        assert!(first_intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == aster)
+        }));
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .reason
+                .as_deref(),
+            Some("suppressed_benign")
+        );
+
+        let force_snapshot = mk_snapshot(force_now_ms);
+        let aster_unwind = build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status(
+            &cfg,
+            &state,
+            &force_snapshot,
+            force_now_ms,
+            config,
+            Some(&mut residual_fallback),
+            Some(&mut tracker),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+            _ => None,
+        })
+        .expect("stale benign Aster residual should force-flat once fee-bounded");
+
+        assert_eq!(aster_unwind.side, Side::Sell);
+        assert!((aster_unwind.size - 0.01).abs() < 1e-12);
+        assert!(aster_unwind.reduce_only);
+        assert_eq!(aster_unwind.time_in_force, TimeInForce::Ioc);
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .reason
+                .as_deref(),
+            Some("allowed_force_flat_age")
+        );
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .force_flat_after_ms,
+            900_000
+        );
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .allowed_orders,
+            1
+        );
+    }
+
+    #[test]
+    fn soft_unwind_markout_guard_allows_adverse_aster_residual() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_345.0);
+        state.fair_value_prev = 2_345.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_345.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let mut tracker = AsterResidualMarkoutGuardTracker::default();
+        let aster_unwind = build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                max_abs_position_tao: 0.02,
+                residual_markout_guard_enabled: true,
+                residual_markout_guard_max_age_ms: 180_000,
+                residual_markout_guard_min_adverse_usd: 0.03,
+                residual_markout_guard_max_unrealised_usd: 0.10,
+                residual_markout_guard_taker_fee_rate: 0.0004,
+                residual_markout_guard_require_fresh_account: true,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+            Some(&mut tracker),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+            _ => None,
+        })
+        .expect("adverse aster residual should be allowed to unwind");
+
+        assert_eq!(aster_unwind.side, Side::Sell);
+        assert!(aster_unwind.reduce_only);
+        assert_eq!(aster_unwind.time_in_force, TimeInForce::Ioc);
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .decision
+                .as_deref(),
+            Some("allow")
+        );
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .reason
+                .as_deref(),
+            Some("allowed_markout")
+        );
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .allowed_orders,
+            1
+        );
+    }
+
+    #[test]
+    fn soft_unwind_markout_guard_requires_fresh_account_when_configured() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_345.0);
+        state.fair_value_prev = 2_345.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_345.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let mut tracker = AsterResidualMarkoutGuardTracker::default();
+        let intents = build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                max_abs_position_tao: 0.02,
+                residual_markout_guard_enabled: true,
+                residual_markout_guard_max_age_ms: 180_000,
+                residual_markout_guard_min_adverse_usd: 0.03,
+                residual_markout_guard_max_unrealised_usd: 0.10,
+                residual_markout_guard_taker_fee_rate: 0.0004,
+                residual_markout_guard_require_fresh_account: true,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+            Some(&mut tracker),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == aster)
+        }));
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .reason
+                .as_deref(),
+            Some("held_no_fresh_account")
+        );
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .suppressed_orders,
+            1
+        );
+    }
+
+    #[test]
+    fn aster_markout_refresh_candidate_requires_stale_account_and_throttle() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.venues[aster].position_tao = 0.01;
+
+        let stale_snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let config = AsterSoftUnwindFeeGuardConfig {
+            enabled: true,
+            max_abs_position_tao: 0.02,
+            residual_markout_guard_enabled: true,
+            residual_markout_guard_require_fresh_account: true,
+            residual_markout_guard_refresh_enabled: true,
+            residual_markout_guard_refresh_min_interval_ms: 2_000,
+            residual_markout_guard_refresh_timeout_ms: 500,
+            ..AsterSoftUnwindFeeGuardConfig::default()
+        };
+
+        assert_eq!(
+            should_attempt_aster_residual_markout_account_refresh(
+                &cfg,
+                &state,
+                &stale_snapshot,
+                now_ms,
+                config,
+                None,
+                false,
+            ),
+            Some(aster)
+        );
+        assert_eq!(
+            should_attempt_aster_residual_markout_account_refresh(
+                &cfg,
+                &state,
+                &stale_snapshot,
+                now_ms,
+                config,
+                Some(now_ms - 1_000),
+                false,
+            ),
+            None
+        );
+
+        let mut fresh_snapshot = stale_snapshot.clone();
+        fresh_snapshot.account[aster].timestamp_ms = Some(now_ms);
+        assert_eq!(
+            should_attempt_aster_residual_markout_account_refresh(
+                &cfg,
+                &state,
+                &fresh_snapshot,
+                now_ms,
+                config,
+                None,
+                false,
+            ),
+            None
+        );
+
+        state.venues[aster].position_tao = 0.0;
+        assert_eq!(
+            should_attempt_aster_residual_markout_account_refresh(
+                &cfg,
+                &state,
+                &stale_snapshot,
+                now_ms,
+                config,
+                None,
+                false,
+            ),
+            None
+        );
+        let terminal_config = AsterSoftUnwindFeeGuardConfig {
+            residual_markout_guard_terminal_refresh_enabled: true,
+            ..config
+        };
+        assert_eq!(
+            should_attempt_aster_residual_markout_account_refresh(
+                &cfg,
+                &state,
+                &stale_snapshot,
+                now_ms,
+                terminal_config,
+                None,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            should_attempt_aster_residual_markout_account_refresh(
+                &cfg,
+                &state,
+                &stale_snapshot,
+                now_ms,
+                terminal_config,
+                None,
+                true,
+            ),
+            Some(aster)
+        );
+
+        state.venues[aster].position_tao = 0.03;
+        assert_eq!(
+            should_attempt_aster_residual_markout_account_refresh(
+                &cfg,
+                &state,
+                &stale_snapshot,
+                now_ms,
+                config,
+                None,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn aster_markout_refresh_status_records_attempt_context() {
+        let config = AsterSoftUnwindFeeGuardConfig {
+            enabled: true,
+            max_abs_position_tao: 0.02,
+            residual_markout_guard_enabled: true,
+            residual_markout_guard_require_fresh_account: true,
+            residual_markout_guard_refresh_enabled: true,
+            ..AsterSoftUnwindFeeGuardConfig::default()
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+
+        record_aster_residual_markout_guard_refresh(
+            &mut residual_fallback,
+            config,
+            true,
+            "success",
+            Some(17),
+            Some(4),
+            None,
+        );
+
+        let guard = &residual_fallback.aster_residual_markout_guard;
+        assert!(guard.enabled);
+        assert!(guard.refresh_enabled);
+        assert!(guard.refresh_attempted);
+        assert_eq!(guard.refresh_outcome.as_deref(), Some("success"));
+        assert_eq!(guard.refresh_latency_ms, Some(17));
+        assert_eq!(guard.fresh_account_age_ms, Some(4));
+        assert_eq!(guard.refresh_suppressed_reason, None);
+    }
+
+    #[test]
+    fn aster_terminal_sub_lot_residual_convergence_builds_reduce_only_ioc() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED"]);
+        std::env::set_var("PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED", "1");
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = -0.008;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { -0.008 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_aster_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                max_abs_position_tao: 0.02,
+                residual_markout_guard_enabled: true,
+                residual_markout_guard_terminal_refresh_enabled: true,
+                residual_markout_guard_taker_fee_rate: 0.0004,
+                residual_markout_guard_force_flat_max_fee_usd: 0.05,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+        );
+
+        let place = intents
+            .iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+                _ => None,
+            })
+            .expect("aster terminal sub-lot reduce");
+        assert_eq!(place.side, Side::Buy);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!((place.size - 0.008).abs() < 1e-12);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "aster"
+                    && record.reason == EmergencyResidualFallbackReason::TerminalSubLot
+            })
+            .expect("terminal sub-lot record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert!((record.clamped_size_tao - 0.008).abs() < 1e-12);
+        assert_eq!(
+            residual_fallback
+                .aster_residual_markout_guard
+                .reason
+                .as_deref(),
+            Some("allowed_terminal_sub_lot")
+        );
+    }
+
+    #[test]
+    fn aster_terminal_sub_lot_residual_waits_for_live_orders_to_drain() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED"]);
+        std::env::set_var("PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED", "1");
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = -0.008;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+        seed_open_orders(&mut state, aster, 1, now_ms);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { -0.008 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_aster_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                max_abs_position_tao: 0.02,
+                residual_markout_guard_enabled: true,
+                residual_markout_guard_terminal_refresh_enabled: true,
+                residual_markout_guard_taker_fee_rate: 0.0004,
+                residual_markout_guard_force_flat_max_fee_usd: 0.05,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == aster)
+        }));
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "aster"
+                    && record.reason == EmergencyResidualFallbackReason::LiveOrdersPresent
+            })
+            .expect("live-orders-present record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Rejected);
+    }
+
+    #[test]
+    fn hyperliquid_terminal_sub_lot_residual_convergence_builds_reduce_only_ioc() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED"]);
+        std::env::set_var(
+            "PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[hyperliquid].position_tao = -0.0044;
+        state.venues[hyperliquid].mid = Some(2_351.0);
+        state.venues[hyperliquid].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == hyperliquid {
+                        -0.0044
+                    } else {
+                        0.0
+                    },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_hyperliquid_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        );
+
+        let place = intents
+            .iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == hyperliquid => Some(place),
+                _ => None,
+            })
+            .expect("hyperliquid terminal sub-lot reduce");
+        assert_eq!(place.side, Side::Buy);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!((place.size - 0.0044).abs() < 1e-12);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "hyperliquid"
+                    && record.reason == EmergencyResidualFallbackReason::TerminalSubLot
+            })
+            .expect("terminal sub-lot record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert!((record.clamped_size_tao - 0.0044).abs() < 1e-12);
+    }
+
+    #[test]
+    fn hyperliquid_terminal_sub_lot_residual_waits_for_live_orders_to_drain() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED"]);
+        std::env::set_var(
+            "PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[hyperliquid].position_tao = -0.0044;
+        state.venues[hyperliquid].mid = Some(2_351.0);
+        state.venues[hyperliquid].spread = Some(0.2);
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == hyperliquid {
+                        -0.0044
+                    } else {
+                        0.0
+                    },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_hyperliquid_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == hyperliquid)
+        }));
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "hyperliquid"
+                    && record.reason == EmergencyResidualFallbackReason::LiveOrdersPresent
+            })
+            .expect("live-orders-present record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Rejected);
+    }
+
+    #[test]
+    fn extended_terminal_sub_lot_residual_convergence_builds_reduce_only_ioc() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED"]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.006;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == extended { 0.006 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_extended_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            None,
+            EmergencyRequestClass::SoftUnwind,
+            Some(&mut residual_fallback),
+        );
+
+        let place = intents
+            .iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+                _ => None,
+            })
+            .expect("extended terminal sub-lot reduce");
+        assert_eq!(place.side, Side::Sell);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!((place.size - 0.006).abs() < 1e-12);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "extended"
+                    && record.reason == EmergencyResidualFallbackReason::TerminalSubLot
+            })
+            .expect("terminal sub-lot record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert!((record.clamped_size_tao - 0.006).abs() < 1e-12);
+    }
+
+    #[test]
+    fn extended_terminal_exact_one_lot_residual_convergence_builds_reduce_only_ioc() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_MAX_LOTS",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.01;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == extended { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_extended_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            None,
+            EmergencyRequestClass::SoftUnwind,
+            Some(&mut residual_fallback),
+        );
+
+        let place = intents
+            .iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+                _ => None,
+            })
+            .expect("extended exact one-lot terminal reduce");
+        assert_eq!(place.side, Side::Sell);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!((place.size - 0.01).abs() < 1e-12);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "extended"
+                    && record.reason == EmergencyResidualFallbackReason::TerminalSubLot
+            })
+            .expect("terminal exact one-lot record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert!((record.clamped_size_tao - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn extended_terminal_exact_short_one_lot_residual_convergence_builds_reduce_only_ioc() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_MAX_LOTS",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.01;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == extended { -0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_extended_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            None,
+            EmergencyRequestClass::SoftUnwind,
+            Some(&mut residual_fallback),
+        );
+
+        let place = intents
+            .iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+                _ => None,
+            })
+            .expect("extended exact short one-lot terminal reduce");
+        assert_eq!(place.side, Side::Buy);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!((place.size - 0.01).abs() < 1e-12);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "extended"
+                    && record.reason == EmergencyResidualFallbackReason::TerminalSubLot
+            })
+            .expect("terminal exact short one-lot record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert!((record.clamped_size_tao - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn extended_terminal_two_lot_residual_rejected_by_default() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_MAX_LOTS",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.02;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == extended { 0.02 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_extended_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            None,
+            EmergencyRequestClass::SoftUnwind,
+            Some(&mut residual_fallback),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == extended)
+        }));
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "extended"
+                    && record.reason == EmergencyResidualFallbackReason::FallbackSizeTooLarge
+            })
+            .expect("terminal two-lot rejection record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Rejected);
+        assert!((record.clamped_size_tao - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn extended_terminal_exact_one_lot_residual_waits_for_live_orders_to_drain() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_MAX_LOTS",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.01;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+        seed_open_orders(&mut state, extended, 1, now_ms);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == extended { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_extended_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            None,
+            EmergencyRequestClass::SoftUnwind,
+            Some(&mut residual_fallback),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == extended)
+        }));
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "extended"
+                    && record.reason == EmergencyResidualFallbackReason::LiveOrdersPresent
+            })
+            .expect("terminal live-order guard record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Rejected);
+    }
+
+    #[test]
+    fn extended_terminal_sub_lot_residual_allows_stale_internal_orders_after_terminal_grace() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED"]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.006;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+        seed_open_orders(&mut state, extended, 1, now_ms);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == extended { 0.006 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut blocked_fallback = EmergencyResidualFallbackStatus::default();
+        let blocked = build_extended_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            None,
+            EmergencyRequestClass::SoftUnwind,
+            Some(&mut blocked_fallback),
+        );
+        assert!(blocked.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == extended)
+        }));
+        assert!(blocked_fallback.records.iter().any(|record| {
+            record.venue_id == "extended"
+                && record.reason == EmergencyResidualFallbackReason::LiveOrdersPresent
+                && record.status == EmergencyResidualFallbackDecision::Rejected
+        }));
+
+        let stale_ready_venues = std::collections::HashSet::from([extended]);
+        let mut allowed_fallback = EmergencyResidualFallbackStatus::default();
+        let allowed = build_extended_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&stale_ready_venues),
+            EmergencyRequestClass::SoftUnwind,
+            Some(&mut allowed_fallback),
+        );
+        let place = allowed
+            .into_iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+                _ => None,
+            })
+            .expect("extended terminal sub-lot reduce after stale-order grace");
+        assert_eq!(place.side, Side::Sell);
+        assert!((place.size - 0.006).abs() < 1e-12);
+        assert!(place.reduce_only);
+    }
+
+    #[test]
+    fn soft_unwind_allows_exact_one_lot_aster_when_canceling_live_orders() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+        seed_open_orders(&mut state, aster, 1, now_ms);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let intents = build_soft_unwind_intents(&cfg, &state, &snapshot, now_ms);
+        assert!(
+            intents
+                .iter()
+                .any(|intent| matches!(intent, OrderIntent::CancelAll(cancel_all) if cancel_all.venue_index == Some(aster))),
+            "soft unwind should cancel positioned venue live orders before reducing"
+        );
+        let aster_unwind = intents.into_iter().find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+            _ => None,
+        });
+        let aster_unwind =
+            aster_unwind.expect("cancel-covered aster one-lot soft unwind should be sent");
+        assert_eq!(aster_unwind.side, Side::Sell);
+        assert_eq!(aster_unwind.size, 0.01);
+        assert!(aster_unwind.reduce_only);
+        assert_eq!(aster_unwind.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
+    fn soft_unwind_allows_two_lot_aster_state_fallback_after_cancel_ack() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_ASTER_SOFT_UNWIND_FULL_TARGET_MAX_LOTS"]);
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.02;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let aster_unwind = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+            _ => None,
+        })
+        .expect("post-cancel aster residual should use bounded state fallback");
+        assert_eq!(aster_unwind.side, Side::Sell);
+        assert_eq!(aster_unwind.size, 0.01);
+        assert!(aster_unwind.reduce_only);
+        assert_eq!(aster_unwind.time_in_force, TimeInForce::Ioc);
+
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "aster"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("aster used fallback record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, 0.02);
+        assert_eq!(record.clamped_size_tao, 0.01);
+    }
+
+    #[test]
+    fn soft_unwind_allows_two_lot_aster_full_target_when_env_gated() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_ASTER_SOFT_UNWIND_FULL_TARGET_MAX_LOTS"]);
+        std::env::set_var("PARAPHINA_ASTER_SOFT_UNWIND_FULL_TARGET_MAX_LOTS", "2");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+            .expect("aster venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.02;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        assert_eq!(aster_soft_unwind_full_target_max_lots(), 2.0);
+        assert_eq!(
+            soft_unwind_target_position_tao(&cfg, &state, &snapshot, aster, now_ms),
+            0.02
+        );
+        assert_eq!(
+            clamp_confirmed_reduce_only_target_position_tao(
+                &cfg,
+                &state,
+                &snapshot,
+                aster,
+                now_ms,
+                0.02,
+                false,
+                EmergencyRequestClass::SoftUnwind,
+                None,
+            )
+            .expect("two-lot Aster fallback should pass clamp when env-gated"),
+            0.02
+        );
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let aster_places = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .filter_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            aster_places.len(),
+            1,
+            "expected exactly one Aster unwind intent, got sizes {:?}",
+            aster_places
+                .iter()
+                .map(|place| place.size)
+                .collect::<Vec<_>>()
+        );
+        let aster_unwind = &aster_places[0];
+        assert_eq!(aster_unwind.side, Side::Sell);
+        assert_eq!(aster_unwind.size, 0.02);
+        assert!(aster_unwind.reduce_only);
+        assert_eq!(aster_unwind.time_in_force, TimeInForce::Ioc);
+
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "aster"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("aster used env-gated full-target fallback record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, 0.02);
+        assert_eq!(record.clamped_size_tao, 0.02);
+    }
+
+    #[test]
+    fn soft_unwind_rejects_three_lot_aster_when_full_target_env_gated_to_two() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_ASTER_SOFT_UNWIND_FULL_TARGET_MAX_LOTS"]);
+        std::env::set_var("PARAPHINA_ASTER_SOFT_UNWIND_FULL_TARGET_MAX_LOTS", "2");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+            .expect("aster venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.03;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let aster_unwind = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+            _ => None,
+        });
+        assert!(aster_unwind.is_none());
+
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "aster"
+                    && record.status == EmergencyResidualFallbackDecision::Rejected
+            })
+            .expect("aster rejected oversized full-target fallback record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::FallbackSizeTooLarge
+        );
+        assert_eq!(record.state_position_tao, 0.03);
+        assert_eq!(record.clamped_size_tao, 0.03);
+    }
+
+    #[test]
+    fn inventory_brake_allows_exact_one_lot_aster_without_live_orders() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let aster = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake)
+            .into_iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+                _ => None,
+            })
+            .expect("aster brake unwind");
+        assert_eq!(aster.side, Side::Sell);
+        assert_eq!(aster.size, 0.01);
+        assert!(aster.reduce_only);
+        assert_eq!(aster.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
+    fn inventory_brake_fee_guard_suppresses_small_benign_aster_reduce_only_ioc_only() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+        let lighter = 3;
+
+        state.fair_value = Some(2_351.0);
+        state.fair_value_prev = 2_351.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+        state.venues[lighter].position_tao = -0.03;
+        state.venues[lighter].mid = Some(2_349.0);
+        state.venues[lighter].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster {
+                        0.01
+                    } else if venue_index == lighter {
+                        -0.03
+                    } else {
+                        0.0
+                    },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let mut tracker = AsterResidualMarkoutGuardTracker::default();
+        let intents = build_inventory_brake_intents_with_fallback_fee_guard_and_markout_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                inventory_brake_fee_guard_enabled: true,
+                max_abs_position_tao: 0.02,
+                residual_markout_guard_enabled: true,
+                residual_markout_guard_max_age_ms: 180_000,
+                residual_markout_guard_min_adverse_usd: 0.03,
+                residual_markout_guard_max_unrealised_usd: 0.10,
+                residual_markout_guard_taker_fee_rate: 0.0004,
+                residual_markout_guard_require_fresh_account: true,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+            Some(&mut tracker),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == aster)
+        }));
+        assert!(intents.iter().any(|intent| {
+            matches!(intent, OrderIntent::Place(place) if place.venue_index == lighter)
+        }));
+        assert!(residual_fallback.aster_inventory_brake_fee_guard_enabled);
+        assert_eq!(
+            residual_fallback.aster_inventory_brake_fee_guard_skipped_orders,
+            1
+        );
+        assert!(
+            (residual_fallback.aster_inventory_brake_fee_guard_skipped_base_tao - 0.01).abs()
+                < 1e-12
+        );
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::InventoryBrake
+                    && record.venue_id == "aster"
+                    && record.reason == EmergencyResidualFallbackReason::FeeGuardSuppressed
+            })
+            .expect("aster inventory-brake fee guard suppression record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Rejected);
+        assert_eq!(record.state_position_tao, 0.01);
+        assert_eq!(record.clamped_size_tao, 0.01);
+    }
+
+    #[test]
+    fn inventory_brake_allows_small_lighter_state_fallback_without_fresh_account_snapshot() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let lighter = 3;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[lighter].position_tao = -0.03;
+        state.venues[lighter].mid = Some(2_349.0);
+        state.venues[lighter].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let lighter = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake)
+            .into_iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == lighter => Some(place),
+                _ => None,
+            })
+            .expect("lighter brake unwind from internal fallback");
+        assert_eq!(lighter.side, Side::Buy);
+        assert_eq!(lighter.size, 0.03);
+        assert!(lighter.reduce_only);
+        assert_eq!(lighter.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
+    fn inventory_brake_blocks_large_lighter_state_fallback_without_fresh_account_snapshot() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let lighter = 3;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[lighter].position_tao = -0.05;
+        state.venues[lighter].mid = Some(2_349.0);
+        state.venues[lighter].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let lighter = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake)
+            .into_iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == lighter => Some(place),
+                _ => None,
+            });
+        assert!(lighter.is_none());
+    }
+
+    #[test]
+    fn inventory_brake_cancels_all_lighter_orders_before_state_fallback_exit() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let lighter = 3;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[lighter].position_tao = 0.03;
+        state.venues[lighter].mid = Some(2_351.0);
+        state.venues[lighter].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+        seed_open_orders(&mut state, lighter, 2, now_ms);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let intents = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake);
+        assert!(intents.iter().any(|intent| matches!(
+            intent,
+            OrderIntent::CancelAll(cancel_all)
+                if cancel_all.venue_index == Some(lighter)
+        )));
+        let lighter_exit = intents
+            .into_iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == lighter => Some(place),
+                _ => None,
+            })
+            .expect("lighter brake exit");
+        assert_eq!(lighter_exit.side, Side::Sell);
+        assert_eq!(lighter_exit.size, 0.04);
+        assert!(lighter_exit.reduce_only);
+        assert_eq!(lighter_exit.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
+    fn inventory_brake_allows_exact_one_lot_aster_when_live_orders_are_being_cancelled() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let aster = 2;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = 0.01;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+        seed_open_orders(&mut state, aster, 1, now_ms);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { 0.01 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let intents = build_inventory_brake_intents(&cfg, &state, &snapshot, now_ms, &brake);
+        let aster_unwind = intents.into_iter().find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == aster => Some(place),
+            _ => None,
+        });
+        let aster_unwind = aster_unwind.expect("aster brake unwind while canceling live orders");
+        assert_eq!(aster_unwind.side, Side::Sell);
+        assert_eq!(aster_unwind.size, 0.01);
+        assert!(aster_unwind.reduce_only);
+        assert_eq!(aster_unwind.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
+    fn soft_unwind_allows_exact_one_lot_extended_without_fresh_account_snapshot() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = 0;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.01;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let extended = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+            _ => None,
+        })
+        .expect("extended unwind from exact one-lot fallback");
+        assert_eq!(extended.side, Side::Sell);
+        assert_eq!(extended.size, 0.01);
+        assert!(extended.reduce_only);
+        assert_eq!(extended.time_in_force, TimeInForce::Ioc);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("extended used fallback record");
+        assert_eq!(record.class, EmergencyRequestClass::SoftUnwind);
+        assert_eq!(record.venue_id, "extended");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, 0.01);
+        assert_eq!(record.clamped_size_tao, 0.01);
+    }
+
+    #[test]
+    fn soft_unwind_blocks_two_lot_extended_without_fresh_account_snapshot() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS"]);
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = 0;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.02;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let extended = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+            _ => None,
+        });
+        assert!(extended.is_none());
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Rejected
+            })
+            .expect("extended rejected fallback record");
+        assert_eq!(record.class, EmergencyRequestClass::SoftUnwind);
+        assert_eq!(record.venue_id, "extended");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Rejected);
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NotExactOneLot
+        );
+        assert_eq!(record.state_position_tao, 0.02);
+    }
+
+    #[test]
+    fn soft_unwind_allows_two_lot_extended_when_state_fallback_env_gated() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS"]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS",
+            "2",
+        );
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+            .expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.02;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let extended_unwind = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+            _ => None,
+        })
+        .expect("extended unwind from env-gated two-lot fallback");
+        assert_eq!(extended_unwind.side, Side::Buy);
+        assert_eq!(extended_unwind.size, 0.02);
+        assert!(extended_unwind.reduce_only);
+        assert_eq!(extended_unwind.time_in_force, TimeInForce::Ioc);
+
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("extended used env-gated fallback record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, -0.02);
+        assert_eq!(record.clamped_size_tao, 0.02);
+    }
+
+    #[test]
+    fn soft_unwind_extended_state_fallback_step_clamps_two_lot_without_fresh_account_snapshot() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS",
+            "PARAPHINA_EXTENDED_STATE_FALLBACK_STEP_LOTS",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS",
+            "2",
+        );
+        std::env::set_var("PARAPHINA_EXTENDED_STATE_FALLBACK_STEP_LOTS", "1");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+            .expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.02;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let extended_unwind = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+            _ => None,
+        })
+        .expect("extended one-step fallback unwind");
+        assert_eq!(extended_unwind.side, Side::Buy);
+        assert_eq!(extended_unwind.size, 0.01);
+        assert!(extended_unwind.reduce_only);
+        assert_eq!(extended_unwind.time_in_force, TimeInForce::Ioc);
+
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("extended used stepped fallback record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, -0.02);
+        assert_eq!(record.clamped_size_tao, 0.01);
+    }
+
+    #[test]
+    fn soft_unwind_extended_state_fallback_step_does_not_reexpand_while_canceling_orders() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS",
+            "PARAPHINA_EXTENDED_STATE_FALLBACK_STEP_LOTS",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS",
+            "2",
+        );
+        std::env::set_var("PARAPHINA_EXTENDED_STATE_FALLBACK_STEP_LOTS", "1");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+            .expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.02;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+        seed_open_orders(&mut state, extended, 1, now_ms);
+        state.recompute_after_fills(&cfg);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        );
+        assert!(intents.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::Cancel(cancel) if cancel.venue_index == extended
+            ) || matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all)
+                    if cancel_all.venue_index == Some(extended)
+            )
+        }));
+        let extended_unwind = intents
+            .into_iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+                _ => None,
+            })
+            .expect("extended one-step fallback unwind while canceling orders");
+        assert_eq!(extended_unwind.side, Side::Buy);
+        assert_eq!(extended_unwind.size, 0.01);
+        assert!(extended_unwind.reduce_only);
+        assert_eq!(extended_unwind.time_in_force, TimeInForce::Ioc);
+
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("extended used stepped fallback record");
+        assert_eq!(record.clamped_size_tao, 0.01);
+    }
+
+    #[test]
+    fn soft_unwind_terminal_defer_rejects_extended_reduce_until_orders_drain() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS"]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS",
+            "2",
+        );
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+            .expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.02;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+        seed_open_orders(&mut state, extended, 1, now_ms);
+        state.recompute_after_fills(&cfg);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let defer_venues = std::collections::HashSet::from([extended]);
+        let intents = build_soft_unwind_intents_with_terminal_defer_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig::default(),
+            Some(&mut residual_fallback),
+            None,
+            &defer_venues,
+        );
+        assert!(intents.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::Cancel(cancel) if cancel.venue_index == extended
+            ) || matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all)
+                    if cancel_all.venue_index == Some(extended)
+            )
+        }));
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == extended)
+        }));
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Rejected
+            })
+            .expect("extended terminal defer rejection record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::LiveOrdersPresent
+        );
+        assert_eq!(record.state_position_tao, -0.02);
+        assert_eq!(record.clamped_size_tao, 0.0);
+    }
+
+    #[test]
+    fn soft_unwind_rejects_three_lot_extended_when_state_fallback_env_gated_to_two() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS"]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_SOFT_UNWIND_STATE_FALLBACK_MAX_LOTS",
+            "2",
+        );
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("extended"))
+            .expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.03;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let extended_unwind = build_soft_unwind_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+            _ => None,
+        });
+        assert!(extended_unwind.is_none());
+
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::SoftUnwind
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Rejected
+            })
+            .expect("extended rejected oversized fallback record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::FallbackSizeTooLarge
+        );
+        assert_eq!(record.state_position_tao, -0.03);
+        assert_eq!(record.clamped_size_tao, 0.03);
+    }
+
+    #[test]
+    fn inventory_brake_allows_three_lot_extended_without_fresh_account_snapshot() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = 0;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.03;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let extended = build_inventory_brake_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+            _ => None,
+        })
+        .expect("extended brake unwind from three-lot fallback");
+        assert_eq!(extended.side, Side::Buy);
+        assert_eq!(extended.size, 0.03);
+        assert!(extended.reduce_only);
+        assert_eq!(extended.time_in_force, TimeInForce::Ioc);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::InventoryBrake
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("extended used fallback record");
+        assert_eq!(record.class, EmergencyRequestClass::InventoryBrake);
+        assert_eq!(record.venue_id, "extended");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, -0.03);
+        assert_eq!(record.clamped_size_tao, 0.03);
+    }
+
+    #[test]
+    fn inventory_brake_extended_state_fallback_step_clamps_three_lot_without_fresh_account_snapshot(
+    ) {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_EXTENDED_STATE_FALLBACK_STEP_LOTS"]);
+        std::env::set_var("PARAPHINA_EXTENDED_STATE_FALLBACK_STEP_LOTS", "1");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = 0;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.03;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let extended_unwind = build_inventory_brake_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+            _ => None,
+        })
+        .expect("extended brake unwind from stepped fallback");
+        assert_eq!(extended_unwind.side, Side::Buy);
+        assert_eq!(extended_unwind.size, 0.01);
+        assert!(extended_unwind.reduce_only);
+        assert_eq!(extended_unwind.time_in_force, TimeInForce::Ioc);
+
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::InventoryBrake
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("extended used stepped brake fallback record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, -0.03);
+        assert_eq!(record.clamped_size_tao, 0.01);
+    }
+
+    #[test]
+    fn inventory_brake_rejects_oversized_extended_state_fallback() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let extended = 0;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = -0.04;
+        state.venues[extended].mid = Some(2_349.0);
+        state.venues[extended].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let extended_unwind = build_inventory_brake_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+            _ => None,
+        });
+        assert!(extended_unwind.is_none());
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::InventoryBrake
+                    && record.venue_id == "extended"
+                    && record.status == EmergencyResidualFallbackDecision::Rejected
+            })
+            .expect("oversized extended fallback rejection record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::FallbackSizeTooLarge
+        );
+        assert_eq!(record.state_position_tao, -0.04);
+        assert_eq!(record.clamped_size_tao, 0.04);
+    }
+
+    #[test]
+    fn inventory_brake_allows_exact_one_lot_paradex_without_fresh_account_snapshot() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let paradex = 4;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[paradex].position_tao = -0.01;
+        state.venues[paradex].mid = Some(2_349.0);
+        state.venues[paradex].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let paradex = build_inventory_brake_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == paradex => Some(place),
+            _ => None,
+        })
+        .expect("paradex brake unwind from exact one-lot fallback");
+        assert_eq!(paradex.side, Side::Buy);
+        assert_eq!(paradex.size, 0.01);
+        assert!(paradex.reduce_only);
+        assert_eq!(paradex.time_in_force, TimeInForce::Ioc);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::InventoryBrake
+                    && record.venue_id == "paradex"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("paradex used fallback record");
+        assert_eq!(record.class, EmergencyRequestClass::InventoryBrake);
+        assert_eq!(record.venue_id, "paradex");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, -0.01);
+        assert_eq!(record.clamped_size_tao, 0.01);
+    }
+
+    #[test]
+    fn inventory_brake_allows_paradex_state_fallback_when_live_orders_are_being_cancelled() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let paradex = 4;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[paradex].position_tao = -0.03;
+        state.venues[paradex].mid = Some(2_351.0);
+        state.venues[paradex].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+        seed_open_orders(&mut state, paradex, 1, now_ms);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_inventory_brake_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            Some(&mut residual_fallback),
+        );
+        assert!(intents.iter().any(|intent| matches!(
+            intent,
+            OrderIntent::CancelAll(cancel_all)
+                if cancel_all.venue_index == Some(paradex)
+        )));
+        let paradex_unwind = intents.into_iter().find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == paradex => Some(place),
+            _ => None,
+        });
+        let paradex_unwind =
+            paradex_unwind.expect("paradex fallback unwind while canceling live orders");
+        assert_eq!(paradex_unwind.side, Side::Buy);
+        assert_eq!(paradex_unwind.size, 0.03);
+        assert!(paradex_unwind.reduce_only);
+        assert_eq!(paradex_unwind.time_in_force, TimeInForce::Ioc);
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::InventoryBrake
+                    && record.venue_id == "paradex"
+                    && record.status == EmergencyResidualFallbackDecision::Used
+            })
+            .expect("paradex used fallback record");
+        assert_eq!(record.class, EmergencyRequestClass::InventoryBrake);
+        assert_eq!(record.venue_id, "paradex");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::NoFreshAccount
+        );
+        assert_eq!(record.state_position_tao, -0.03);
+        assert_eq!(record.clamped_size_tao, 0.03);
+    }
+
+    #[test]
+    fn inventory_brake_terminal_defer_rejects_paradex_reduce_until_orders_drain() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let paradex = 4;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[paradex].position_tao = -0.03;
+        state.venues[paradex].mid = Some(2_351.0);
+        state.venues[paradex].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+        seed_open_orders(&mut state, paradex, 1, now_ms);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let defer_venues = std::collections::HashSet::from([paradex]);
+        let intents = build_inventory_brake_intents_with_terminal_defer_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            AsterSoftUnwindFeeGuardConfig::default(),
+            Some(&mut residual_fallback),
+            None,
+            Some(&defer_venues),
+        );
+        assert!(intents.iter().any(|intent| matches!(
+            intent,
+            OrderIntent::CancelAll(cancel_all)
+                if cancel_all.venue_index == Some(paradex)
+        )));
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == paradex)
+        }));
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::InventoryBrake
+                    && record.venue_id == "paradex"
+                    && record.status == EmergencyResidualFallbackDecision::Rejected
+            })
+            .expect("paradex terminal defer rejection record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::LiveOrdersPresent
+        );
+        assert_eq!(record.state_position_tao, -0.03);
+        assert_eq!(record.clamped_size_tao, 0.0);
+    }
+
+    #[test]
+    fn inventory_brake_terminal_defer_allows_paradex_reduce_after_orders_drain() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let paradex = 4;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[paradex].position_tao = -0.03;
+        state.venues[paradex].mid = Some(2_351.0);
+        state.venues[paradex].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let defer_venues = std::collections::HashSet::from([paradex]);
+        let paradex_unwind = build_inventory_brake_intents_with_terminal_defer_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            AsterSoftUnwindFeeGuardConfig::default(),
+            Some(&mut residual_fallback),
+            None,
+            Some(&defer_venues),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == paradex => Some(place),
+            _ => None,
+        })
+        .expect("paradex terminal reduce after orders drained");
+        assert_eq!(paradex_unwind.side, Side::Buy);
+        assert_eq!(paradex_unwind.size, 0.03);
+        assert!(paradex_unwind.reduce_only);
+        assert_eq!(paradex_unwind.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
+    fn inventory_brake_terminal_defer_allows_hyperliquid_reduce_after_stale_order_override() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[hyperliquid].position_tao = -0.01;
+        state.venues[hyperliquid].mid = Some(2_351.0);
+        state.venues[hyperliquid].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.005), Some(0.20), Some(0.005), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == hyperliquid {
+                        -0.01
+                    } else {
+                        0.0
+                    },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut deferred_fallback = EmergencyResidualFallbackStatus::default();
+        let defer_venues = std::collections::HashSet::from([hyperliquid]);
+        let deferred = build_inventory_brake_intents_with_terminal_defer_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            AsterSoftUnwindFeeGuardConfig::default(),
+            Some(&mut deferred_fallback),
+            None,
+            Some(&defer_venues),
+        );
+        assert!(deferred.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == hyperliquid)
+        }));
+
+        let stale_override_venues = std::collections::HashSet::new();
+        let hyperliquid_reduce = build_inventory_brake_intents_with_terminal_defer_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            AsterSoftUnwindFeeGuardConfig::default(),
+            None,
+            None,
+            Some(&stale_override_venues),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == hyperliquid => Some(place),
+            _ => None,
+        })
+        .expect("hyperliquid reduce after terminal stale-order override");
+        assert_eq!(hyperliquid_reduce.side, Side::Buy);
+        assert!((hyperliquid_reduce.size - 0.01).abs() < 1e-12);
+        assert!(hyperliquid_reduce.reduce_only);
+        assert_eq!(hyperliquid_reduce.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
+    fn inventory_brake_rejects_oversized_paradex_state_fallback() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let paradex = 4;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[paradex].position_tao = -0.04;
+        state.venues[paradex].mid = Some(2_351.0);
+        state.venues[paradex].spread = Some(0.2);
+        state.recompute_after_fills(&cfg);
+        seed_open_orders(&mut state, paradex, 1, now_ms);
+
+        let fractions = InventoryBrakeFractions {
+            net_fraction: Some(0.75),
+            gross_fraction: Some(0.75),
+            venue_fraction: Some(0.75),
+        };
+        let brake = evaluate_inventory_brake(
+            &cfg,
+            &state,
+            fractions,
+            inventory_brake_limits(Some(0.01), Some(0.20), Some(0.01), fractions),
+        );
+        assert!(brake.triggered);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms - 11_000),
+                    position_tao: 0.0,
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let paradex_unwind = build_inventory_brake_intents_with_fallback_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &brake,
+            Some(&mut residual_fallback),
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == paradex => Some(place),
+            _ => None,
+        });
+        assert!(paradex_unwind.is_none());
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.class == EmergencyRequestClass::InventoryBrake
+                    && record.venue_id == "paradex"
+                    && record.status == EmergencyResidualFallbackDecision::Rejected
+            })
+            .expect("oversized paradex fallback rejection record");
+        assert_eq!(
+            record.reason,
+            EmergencyResidualFallbackReason::FallbackSizeTooLarge
+        );
+        assert_eq!(record.state_position_tao, -0.04);
+        assert_eq!(record.clamped_size_tao, 0.04);
     }
 
     #[test]
@@ -8673,12 +23125,12 @@ mod tests {
 
     #[test]
     fn soft_unwind_runtime_state_holds_quotes_flat_during_cooldown() {
-        let state = soft_unwind_runtime_state(false, true, false, false, false);
+        let state = soft_unwind_runtime_state(false, true, false, false, false, false, false);
         assert!(state.pause_mm_quotes);
         assert!(!state.send_unwind);
         assert!(!state.refresh_cooldown);
 
-        let state = soft_unwind_runtime_state(true, false, false, true, true);
+        let state = soft_unwind_runtime_state(true, false, false, true, true, false, false);
         assert!(state.pause_mm_quotes);
         assert!(state.send_unwind);
         assert!(state.refresh_cooldown);
@@ -8686,10 +23138,42 @@ mod tests {
 
     #[test]
     fn soft_unwind_runtime_state_pauses_without_resend_during_response_backoff() {
-        let state = soft_unwind_runtime_state(true, false, true, true, true);
+        let state = soft_unwind_runtime_state(true, false, true, true, true, false, false);
         assert!(state.pause_mm_quotes);
         assert!(!state.send_unwind);
         assert!(state.refresh_cooldown);
+    }
+
+    #[test]
+    fn soft_unwind_runtime_state_sends_lighter_residual_without_refreshing_cooldown() {
+        let state = soft_unwind_runtime_state(false, false, false, false, false, true, false);
+        assert!(state.pause_mm_quotes);
+        assert!(state.send_unwind);
+        assert!(!state.refresh_cooldown);
+    }
+
+    #[test]
+    fn soft_unwind_runtime_state_terminal_quiesce_pauses_flat_without_refresh_need() {
+        let state = soft_unwind_runtime_state(false, false, false, false, false, false, true);
+        assert!(state.pause_mm_quotes);
+        assert!(!state.send_unwind);
+        assert!(!state.refresh_cooldown);
+    }
+
+    #[test]
+    fn soft_unwind_runtime_state_terminal_residual_sends_unwind() {
+        let state = soft_unwind_runtime_state(false, false, false, true, false, true, true);
+        assert!(state.pause_mm_quotes);
+        assert!(state.send_unwind);
+        assert!(!state.refresh_cooldown);
+    }
+
+    #[test]
+    fn soft_unwind_runtime_state_terminal_refresh_need_sends_unwind() {
+        let state = soft_unwind_runtime_state(false, false, false, false, false, true, true);
+        assert!(state.pause_mm_quotes);
+        assert!(state.send_unwind);
+        assert!(!state.refresh_cooldown);
     }
 
     #[test]
@@ -8711,6 +23195,375 @@ mod tests {
         assert!(reserve_priority_path_for_inventory_control(paused, true));
     }
 
+    #[test]
+    fn inventory_brake_requires_mm_pause_for_actual_position_breach() {
+        let status = InventoryBrakeStatus {
+            triggered: true,
+            q_global_tao: -0.01,
+            q_gross_tao: 0.01,
+            q_max_abs_venue_tao: 0.01,
+            projected_q_global_tao: -0.03,
+            projected_q_gross_tao: 0.03,
+            projected_q_max_abs_venue_tao: 0.03,
+            global_reasons: vec!["projected_net_short_brake".to_string()],
+            blocked_venues: vec![InventorySoftGovernorVenueStatus {
+                venue_index: 0,
+                venue_id: "hyperliquid".to_string(),
+                position_tao: -0.01,
+                blocked_bid: false,
+                blocked_ask: true,
+                bid_reasons: Vec::new(),
+                ask_reasons: vec!["net_short_brake".to_string()],
+            }],
+            ..InventoryBrakeStatus::default()
+        };
+
+        assert!(inventory_brake_requires_mm_pause(&status));
+    }
+
+    #[test]
+    fn inventory_brake_does_not_pause_mm_when_only_projected_open_order_exposure_is_flat() {
+        let status = InventoryBrakeStatus {
+            triggered: true,
+            q_global_tao: 0.0,
+            q_gross_tao: 0.0,
+            q_max_abs_venue_tao: 0.0,
+            projected_q_global_tao: -0.03,
+            projected_q_gross_tao: 0.03,
+            projected_q_max_abs_venue_tao: 0.03,
+            global_reasons: vec!["projected_net_short_brake".to_string()],
+            blocked_venues: vec![InventorySoftGovernorVenueStatus {
+                venue_index: 0,
+                venue_id: "hyperliquid".to_string(),
+                position_tao: 0.0,
+                blocked_bid: false,
+                blocked_ask: true,
+                bid_reasons: Vec::new(),
+                ask_reasons: vec!["net_short_brake".to_string()],
+            }],
+            ..InventoryBrakeStatus::default()
+        };
+
+        assert!(!inventory_brake_requires_mm_pause(&status));
+    }
+
+    #[test]
+    fn inventory_brake_projected_only_flat_state_uses_cancel_only_mm_mode() {
+        let status = InventoryBrakeStatus {
+            triggered: true,
+            q_global_tao: 0.0,
+            q_gross_tao: 0.0,
+            q_max_abs_venue_tao: 0.0,
+            projected_q_global_tao: -0.03,
+            projected_q_gross_tao: 0.03,
+            projected_q_max_abs_venue_tao: 0.03,
+            global_reasons: vec!["projected_net_short_brake".to_string()],
+            blocked_venues: vec![InventorySoftGovernorVenueStatus {
+                venue_index: 0,
+                venue_id: "hyperliquid".to_string(),
+                position_tao: 0.0,
+                blocked_bid: false,
+                blocked_ask: true,
+                bid_reasons: Vec::new(),
+                ask_reasons: vec!["net_short_brake".to_string()],
+            }],
+            ..InventoryBrakeStatus::default()
+        };
+
+        assert!(inventory_brake_cancel_only_mm_mode(&status));
+    }
+
+    #[test]
+    fn inventory_brake_projected_only_flat_state_filters_emergency_places_to_cancels() {
+        let cfg = Config::default();
+        let status = InventoryBrakeStatus {
+            triggered: true,
+            q_global_tao: 0.0,
+            q_gross_tao: 0.0,
+            q_max_abs_venue_tao: 0.0,
+            projected_q_global_tao: 0.03,
+            projected_q_gross_tao: 0.05,
+            projected_q_max_abs_venue_tao: 0.04,
+            global_reasons: vec![
+                "projected_net_long_brake".to_string(),
+                "projected_gross_brake".to_string(),
+            ],
+            blocked_venues: vec![InventorySoftGovernorVenueStatus {
+                venue_index: 3,
+                venue_id: "lighter".to_string(),
+                position_tao: 0.0,
+                blocked_bid: true,
+                blocked_ask: false,
+                bid_reasons: vec!["net_long_brake".to_string()],
+                ask_reasons: Vec::new(),
+            }],
+            ..InventoryBrakeStatus::default()
+        };
+
+        let intents = vec![
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 3,
+                venue_id: cfg.venues[3].id_arc.clone(),
+                order_id: "oid_3_0".to_string(),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: 3,
+                venue_id: cfg.venues[3].id_arc.clone(),
+                side: Side::Sell,
+                price: 2_050.0,
+                size: 0.04,
+                purpose: OrderPurpose::Hedge,
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: None,
+            }),
+        ];
+
+        let filtered = effective_inventory_brake_intents(&status, intents);
+        assert_eq!(filtered.len(), 1);
+        assert!(matches!(filtered[0], OrderIntent::Cancel(_)));
+    }
+
+    #[test]
+    fn inventory_brake_projected_only_flat_state_does_not_wait_for_responses() {
+        let status = InventoryBrakeStatus {
+            triggered: true,
+            q_global_tao: 0.0,
+            q_gross_tao: 0.0,
+            q_max_abs_venue_tao: 0.0,
+            projected_q_global_tao: -0.03,
+            projected_q_gross_tao: 0.03,
+            projected_q_max_abs_venue_tao: 0.03,
+            global_reasons: vec!["projected_net_short_brake".to_string()],
+            blocked_venues: vec![InventorySoftGovernorVenueStatus {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                position_tao: 0.0,
+                blocked_bid: false,
+                blocked_ask: true,
+                bid_reasons: Vec::new(),
+                ask_reasons: vec!["net_short_brake".to_string()],
+            }],
+            ..InventoryBrakeStatus::default()
+        };
+
+        assert!(!inventory_brake_waits_for_responses(&status));
+    }
+
+    #[test]
+    fn inventory_brake_actual_position_state_still_waits_for_responses() {
+        let status = InventoryBrakeStatus {
+            triggered: true,
+            q_global_tao: 0.01,
+            q_gross_tao: 0.01,
+            q_max_abs_venue_tao: 0.01,
+            projected_q_global_tao: 0.03,
+            projected_q_gross_tao: 0.03,
+            projected_q_max_abs_venue_tao: 0.03,
+            global_reasons: vec!["projected_net_long_brake".to_string()],
+            blocked_venues: vec![InventorySoftGovernorVenueStatus {
+                venue_index: 0,
+                venue_id: "aster".to_string(),
+                position_tao: 0.01,
+                blocked_bid: true,
+                blocked_ask: false,
+                bid_reasons: vec!["net_long_brake".to_string()],
+                ask_reasons: Vec::new(),
+            }],
+            ..InventoryBrakeStatus::default()
+        };
+
+        assert!(inventory_brake_waits_for_responses(&status));
+    }
+
+    #[test]
+    fn retain_cancel_only_intents_drops_place_and_replace() {
+        let intents = vec![
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 0,
+                venue_id: Arc::from("hyperliquid"),
+                order_id: "cancel_me".to_string(),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: 0,
+                venue_id: Arc::from("hyperliquid"),
+                side: Side::Buy,
+                price: 1_980.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            OrderIntent::Replace(crate::types::ReplaceOrderIntent {
+                venue_index: 0,
+                venue_id: Arc::from("hyperliquid"),
+                side: Side::Sell,
+                price: 1_981.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                order_id: "replace_me".to_string(),
+                client_order_id: None,
+            }),
+        ];
+
+        let filtered = retain_cancel_only_intents(intents);
+        assert_eq!(filtered.len(), 1);
+        assert!(matches!(filtered[0], OrderIntent::Cancel(_)));
+    }
+
+    #[test]
+    fn mm_submission_intents_for_quote_gate_keeps_budget_cleanup_when_quote_skipped() {
+        let mm_plan_intents = vec![
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: 0,
+                venue_id: Arc::from("hyperliquid"),
+                side: Side::Buy,
+                price: 1_980.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 0,
+                venue_id: Arc::from("hyperliquid"),
+                order_id: "normal_cancel".to_string(),
+            }),
+        ];
+        let budget_cleanup_intents = vec![OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index: 1,
+            venue_id: Arc::from("lighter"),
+            order_id: "budget_cleanup_cancel".to_string(),
+        })];
+
+        let intents = mm_submission_intents_for_quote_gate(
+            false,
+            false,
+            false,
+            mm_plan_intents,
+            budget_cleanup_intents,
+        );
+
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(
+            &intents[0],
+            OrderIntent::Cancel(cancel)
+                if cancel.venue_index == 1 && cancel.order_id == "budget_cleanup_cancel"
+        ));
+    }
+
+    #[test]
+    fn mm_submission_intents_for_quote_gate_holds_budget_cleanup_when_paused() {
+        let budget_cleanup_intents = vec![OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index: 1,
+            venue_id: Arc::from("lighter"),
+            order_id: "budget_cleanup_cancel".to_string(),
+        })];
+
+        let intents = mm_submission_intents_for_quote_gate(
+            false,
+            true,
+            false,
+            Vec::new(),
+            budget_cleanup_intents,
+        );
+
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn suppress_non_cancel_intents_for_disabled_cancel_latches_keeps_only_cancels() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let mut latches = EmergencyRequestLatchSet::default();
+        let lighter = 3;
+        let aster = 2;
+        let now_ms = 12_000;
+
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+        latch_emergency_request(
+            &mut latches,
+            EmergencyRequestClass::DisabledCancelAll,
+            &cfg,
+            &state,
+            lighter,
+            now_ms,
+            3_000,
+            9_000,
+        );
+
+        let mut intents = vec![
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                side: Side::Buy,
+                price: 2_300.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("co_lighter_place".to_string()),
+            }),
+            OrderIntent::Replace(crate::types::ReplaceOrderIntent {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                side: Side::Sell,
+                price: 2_301.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                order_id: "oid_lighter".to_string(),
+                client_order_id: Some("co_lighter_replace".to_string()),
+            }),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                order_id: "oid_lighter_cancel".to_string(),
+            }),
+            OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
+                venue_index: Some(lighter),
+                venue_id: Some(cfg.venues[lighter].id_arc.clone()),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: aster,
+                venue_id: cfg.venues[aster].id_arc.clone(),
+                side: Side::Buy,
+                price: 2_299.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("co_aster_place".to_string()),
+            }),
+        ];
+
+        let suppressed = suppress_non_cancel_intents_for_disabled_cancel_latches(
+            &mut intents,
+            &mut latches,
+            &cfg,
+            &state,
+            now_ms + 100,
+        );
+
+        assert_eq!(suppressed, vec![lighter]);
+        assert_eq!(intents.len(), 3);
+        assert!(matches!(intents[0], OrderIntent::Cancel(_)));
+        assert!(matches!(intents[1], OrderIntent::CancelAll(_)));
+        assert_eq!(venue_index_for_order_intent(&intents[2]), Some(aster));
+    }
+
     fn seed_open_orders_with_side(
         state: &mut GlobalState,
         venue_index: usize,
@@ -8728,6 +23581,7 @@ mod tests {
                 .map(|idx| types::OpenOrderSnapshot {
                     order_id: format!("oid_{venue_index}_{idx}"),
                     client_order_id: Some(format!("co_{venue_index}_{idx}")),
+                    exchange_order_id: None,
                     side,
                     price: 2_300.0 + idx as f64,
                     size: 0.01,
@@ -8825,6 +23679,1658 @@ mod tests {
             lighter,
         ));
         assert!(latches.disabled_cancel_all.is_empty());
+    }
+
+    #[test]
+    fn projected_inventory_brake_latch_holds_flat_actual_truth_until_retry() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let mut latches = EmergencyRequestLatchSet::default();
+        let paradex = 4;
+        let now_ms = 25_000;
+
+        latch_emergency_request(
+            &mut latches,
+            EmergencyRequestClass::InventoryBrake,
+            &cfg,
+            &state,
+            paradex,
+            now_ms,
+            3_000,
+            9_000,
+        );
+
+        assert!(emergency_request_latched(
+            &mut latches,
+            EmergencyRequestClass::InventoryBrake,
+            &cfg,
+            &state,
+            now_ms + 250,
+            paradex,
+        ));
+        assert!(latches.inventory_brake[0].flat_baseline_retry_required);
+
+        assert!(!emergency_request_latched(
+            &mut latches,
+            EmergencyRequestClass::InventoryBrake,
+            &cfg,
+            &state,
+            now_ms + 3_001,
+            paradex,
+        ));
+        assert!(latches.inventory_brake.is_empty());
+    }
+
+    #[test]
+    fn channel_full_inventory_brake_single_flight_latches_until_retry_window() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let mut latches = EmergencyRequestLatchSet::default();
+        let paradex = 4;
+        let now_ms = 27_000;
+        let tick = 108;
+        let (order_tx, _order_rx) = mpsc::channel(1);
+        order_tx
+            .try_send(LiveOrderRequest {
+                intents: Vec::new(),
+                action_batch: ActionBatch::new(now_ms, 0, &cfg.version),
+                now_ms,
+                transport_hint: TransportHint::HyperliquidSyncControl,
+                response: ResponseMode::FireAndForget,
+            })
+            .expect("pre-fill order channel");
+
+        let dispatches = send_emergency_single_flight_requests(
+            &cfg,
+            &order_tx,
+            &mut latches,
+            &state,
+            vec![(
+                paradex,
+                vec![OrderIntent::Cancel(CancelOrderIntent {
+                    venue_index: paradex,
+                    venue_id: cfg.venues[paradex].id_arc.clone(),
+                    order_id: "pd_cancel".to_string(),
+                })],
+            )],
+            EmergencyRequestClass::InventoryBrake,
+            now_ms,
+            tick,
+            3_000,
+            9_000,
+            TransportHint::HyperliquidSyncControl,
+            "inventory_brake",
+        );
+
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(
+            dispatches[0].outcome,
+            EmergencyRequestDispatchOutcome::ChannelFull
+        );
+        assert_eq!(latches.inventory_brake.len(), 1);
+        assert!(latches.inventory_brake[0].flat_baseline_retry_required);
+
+        let mut immediate_retry = vec![OrderIntent::Cancel(CancelOrderIntent {
+            venue_index: paradex,
+            venue_id: cfg.venues[paradex].id_arc.clone(),
+            order_id: "pd_cancel_retry".to_string(),
+        })];
+        let removed = remove_latched_intents_for_class(
+            &mut immediate_retry,
+            &mut latches,
+            EmergencyRequestClass::InventoryBrake,
+            &cfg,
+            &state,
+            now_ms + 250,
+        );
+        assert_eq!(removed, vec![paradex]);
+        assert!(immediate_retry.is_empty());
+
+        let mut retry_after_window = vec![OrderIntent::Cancel(CancelOrderIntent {
+            venue_index: paradex,
+            venue_id: cfg.venues[paradex].id_arc.clone(),
+            order_id: "pd_cancel_after_window".to_string(),
+        })];
+        let removed_after_window = remove_latched_intents_for_class(
+            &mut retry_after_window,
+            &mut latches,
+            EmergencyRequestClass::InventoryBrake,
+            &cfg,
+            &state,
+            now_ms + 3_001,
+        );
+        assert!(removed_after_window.is_empty());
+        assert_eq!(retry_after_window.len(), 1);
+        assert!(latches.inventory_brake.is_empty());
+    }
+
+    #[test]
+    fn actual_inventory_brake_latch_still_clears_on_open_order_progress() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let mut latches = EmergencyRequestLatchSet::default();
+        let aster = 2;
+        let now_ms = 26_000;
+
+        seed_open_orders(&mut state, aster, 2, now_ms);
+        latch_emergency_request(
+            &mut latches,
+            EmergencyRequestClass::InventoryBrake,
+            &cfg,
+            &state,
+            aster,
+            now_ms,
+            3_000,
+            9_000,
+        );
+        assert!(!latches.inventory_brake[0].flat_baseline_retry_required);
+
+        seed_open_orders(&mut state, aster, 1, now_ms + 100);
+        assert!(!emergency_request_latched(
+            &mut latches,
+            EmergencyRequestClass::InventoryBrake,
+            &cfg,
+            &state,
+            now_ms + 200,
+            aster,
+        ));
+        assert!(latches.inventory_brake.is_empty());
+    }
+
+    #[test]
+    fn disabled_hyperliquid_uses_explicit_order_cancels_when_orders_are_tracked() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 30_000;
+
+        seed_open_orders(&mut state, hyperliquid, 2, now_ms);
+
+        let intents = build_disabled_cancel_intents_for_venue(&cfg, &state, hyperliquid);
+        assert_eq!(intents.len(), 2);
+        assert!(intents
+            .iter()
+            .all(|intent| matches!(intent, OrderIntent::Cancel(_))));
+        let order_ids: Vec<_> = intents
+            .iter()
+            .map(|intent| match intent {
+                OrderIntent::Cancel(cancel) => cancel.order_id.clone(),
+                other => panic!("expected cancel intent, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            order_ids,
+            vec!["oid_1_0".to_string(), "oid_1_1".to_string(),]
+        );
+    }
+
+    #[test]
+    fn disabled_hyperliquid_falls_back_to_cancel_all_without_tracked_orders() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let intents = build_disabled_cancel_intents_for_venue(&cfg, &state, 1);
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(intents[0], OrderIntent::CancelAll(_)));
+    }
+
+    #[test]
+    fn disabled_non_hyperliquid_keeps_cancel_all_path() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        seed_open_orders(&mut state, lighter, 2, 40_000);
+
+        let intents = build_disabled_cancel_intents_for_venue(&cfg, &state, lighter);
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(intents[0], OrderIntent::CancelAll(_)));
+    }
+
+    #[test]
+    fn terminal_exit_quiesce_cancel_intents_send_once_and_reset_after_clean() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let lighter = 3;
+        let mut cancel_state = vec![TerminalExitCancelState::default(); cfg.venues.len()];
+        let now_ms = 45_000;
+
+        seed_open_orders(&mut state, hyperliquid, 2, now_ms);
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+
+        let intents = build_terminal_exit_quiesce_cancel_intents(
+            &cfg,
+            &state,
+            &mut cancel_state,
+            now_ms,
+            0,
+            None,
+        );
+        assert_eq!(intents.len(), 3);
+        assert_eq!(cancel_state[hyperliquid].first_sent_ms, Some(now_ms));
+        assert_eq!(cancel_state[lighter].first_sent_ms, Some(now_ms));
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| matches!(intent, OrderIntent::Cancel(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| matches!(intent, OrderIntent::CancelAll(_)))
+                .count(),
+            1
+        );
+
+        let duplicate = build_terminal_exit_quiesce_cancel_intents(
+            &cfg,
+            &state,
+            &mut cancel_state,
+            now_ms + 1_000,
+            0,
+            None,
+        );
+        assert!(duplicate.is_empty());
+
+        let clean_state = GlobalState::new(&cfg);
+        let clean = build_terminal_exit_quiesce_cancel_intents(
+            &cfg,
+            &clean_state,
+            &mut cancel_state,
+            now_ms + 2_000,
+            0,
+            None,
+        );
+        assert!(clean.is_empty());
+        assert_eq!(cancel_state[hyperliquid].first_sent_ms, None);
+        assert_eq!(cancel_state[lighter].first_sent_ms, None);
+
+        seed_open_orders(&mut state, lighter, 1, 46_000);
+        let resent = build_terminal_exit_quiesce_cancel_intents(
+            &cfg,
+            &state,
+            &mut cancel_state,
+            now_ms + 3_000,
+            0,
+            None,
+        );
+        assert!(!resent.is_empty());
+        assert_eq!(cancel_state[lighter].first_sent_ms, Some(now_ms + 3_000));
+    }
+
+    #[test]
+    fn aster_terminal_quiesce_explicit_cancel_retry_targets_exchange_and_client_ids() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = 2;
+        seed_open_orders(&mut state, aster, 1, 45_000);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, aster);
+
+        let intents = build_aster_terminal_quiesce_explicit_cancel_retry_intents(&cfg, &state);
+        let order_ids = intents
+            .iter()
+            .filter_map(|intent| match intent {
+                OrderIntent::Cancel(cancel) => Some(cancel.order_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(intents.len(), 2);
+        assert!(order_ids.contains(&"oid_2_0"));
+        assert!(order_ids.contains(&"co_2_0"));
+        assert!(intents
+            .iter()
+            .all(|intent| venue_index_for_order_intent(intent) == Some(aster)));
+    }
+
+    #[test]
+    fn aster_terminal_quiesce_explicit_cancel_retry_due_respects_interval() {
+        let _guard =
+            EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_QUIESCE_EXPLICIT_CANCEL_RETRY_INTERVAL_MS"]);
+        std::env::set_var(
+            "PARAPHINA_ASTER_TERMINAL_QUIESCE_EXPLICIT_CANCEL_RETRY_INTERVAL_MS",
+            "1500",
+        );
+
+        assert!(aster_terminal_quiesce_explicit_cancel_retry_due(
+            10_000, None
+        ));
+        assert!(!aster_terminal_quiesce_explicit_cancel_retry_due(
+            10_000,
+            Some(8_600)
+        ));
+        assert!(aster_terminal_quiesce_explicit_cancel_retry_due(
+            10_000,
+            Some(8_500)
+        ));
+    }
+
+    #[test]
+    fn build_unlatched_disabled_cancel_intents_for_venues_skips_latched_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let mut latches = EmergencyRequestLatchSet::default();
+        let hyperliquid = 1;
+        let lighter = 3;
+        let now_ms = 40_000;
+
+        seed_open_orders(&mut state, hyperliquid, 2, now_ms);
+        seed_open_orders(&mut state, lighter, 2, now_ms);
+        latch_emergency_request(
+            &mut latches,
+            EmergencyRequestClass::DisabledCancelAll,
+            &cfg,
+            &state,
+            lighter,
+            now_ms,
+            3_000,
+            9_000,
+        );
+
+        let intents = build_unlatched_disabled_cancel_intents_for_venues(
+            &cfg,
+            &state,
+            &mut latches,
+            now_ms + 100,
+            &[hyperliquid, lighter],
+        );
+
+        assert_eq!(intents.len(), 2);
+        assert!(intents
+            .iter()
+            .all(|intent| venue_index_for_order_intent(intent) == Some(hyperliquid)));
+        assert!(intents
+            .iter()
+            .all(|intent| matches!(intent, OrderIntent::Cancel(_))));
+    }
+
+    #[test]
+    fn canary_breach_target_venues_only_include_exposed_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let aster = 2;
+        let lighter = 3;
+        let now_ms = 41_000;
+
+        seed_open_orders(&mut state, hyperliquid, 2, now_ms);
+        state.venues[aster].position_tao = -0.02;
+        state.venues[lighter].position_tao = 0.0;
+
+        let targets = canary_breach_target_venues(&state);
+        assert_eq!(targets, vec![hyperliquid, aster]);
+    }
+
+    #[test]
+    fn canary_breach_target_venues_ignore_flat_venues_without_orders() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+
+        let targets = canary_breach_target_venues(&state);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn canary_breach_response_target_venues_focus_net_excess_on_largest_same_side() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = 2;
+        let lighter = 3;
+
+        state.venues[aster].position_tao = -0.03;
+        state.venues[lighter].position_tao = -0.01;
+        state.q_global_tao = -0.04;
+
+        let limits = canary_limit_status(&state, Some(0.03), Some(0.05), Some(0.03), Some(4));
+        let targets = canary_breach_response_target_venues(&state, &limits);
+
+        assert_eq!(targets, vec![aster]);
+    }
+
+    #[test]
+    fn canary_breach_response_target_venues_keep_over_limit_venue() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let aster = 2;
+
+        state.venues[hyperliquid].position_tao = 0.05;
+        state.venues[aster].position_tao = 0.01;
+        state.q_global_tao = 0.06;
+
+        let limits = canary_limit_status(&state, Some(0.03), Some(0.05), Some(0.03), Some(4));
+        let targets = canary_breach_response_target_venues(&state, &limits);
+
+        assert_eq!(targets, vec![hyperliquid]);
+    }
+
+    #[test]
+    fn canary_breach_response_target_venues_open_order_only_include_all_open_order_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let aster = 2;
+        let paradex = 4;
+        let now_ms = 53_000;
+
+        seed_open_orders(&mut state, hyperliquid, 2, now_ms);
+        seed_open_orders(&mut state, aster, 1, now_ms);
+        seed_open_orders(&mut state, paradex, 1, now_ms);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, hyperliquid);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, aster);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, paradex);
+
+        let limits = canary_limit_status(&state, Some(0.03), Some(0.05), Some(0.03), Some(2));
+        assert!(limits.open_orders_breached);
+        assert!(canary_breach_is_open_order_only(&limits));
+
+        let targets = canary_breach_response_target_venues(&state, &limits);
+        assert_eq!(targets, vec![hyperliquid, aster, paradex]);
+    }
+
+    #[test]
+    fn canary_breach_response_cancel_scope_actual_breach_includes_all_active_order_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = 0;
+        let aster = 2;
+        let lighter = 3;
+        let paradex = 4;
+        let now_ms = 54_000;
+
+        state.venues[aster].position_tao = -0.07;
+        seed_open_orders(&mut state, extended, 1, now_ms);
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+        state.live_order_state.register_mm_decision_lineage(
+            paradex,
+            "pd_pending_mm",
+            Side::Sell,
+            2_001.0,
+            0.01,
+            OrderPurpose::Mm,
+            "decision_pd_pending_mm",
+            now_ms,
+        );
+        state.recompute_after_fills(&cfg);
+
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.20), Some(0.03), Some(12));
+        assert!(limits.venue_breached);
+        assert!(!limits.open_orders_breached);
+
+        let targets = canary_breach_response_target_venues(&state, &limits);
+        assert_eq!(targets, vec![aster]);
+
+        let cancel_scope = canary_breach_response_cancel_scope_venues(&state, &limits, &targets);
+        assert_eq!(cancel_scope, vec![extended, aster, lighter, paradex]);
+
+        let flatten_intents = build_canary_breach_flatten_intents(&cfg, &state, &targets, 91);
+        assert_eq!(flatten_intents.len(), 1);
+        assert_eq!(
+            venue_index_for_order_intent(&flatten_intents[0]),
+            Some(aster)
+        );
+    }
+
+    #[test]
+    fn canary_breach_response_cancel_scope_open_order_only_does_not_expand_to_pending_orders() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let aster = 2;
+        let now_ms = 54_500;
+
+        seed_open_orders(&mut state, hyperliquid, 3, now_ms);
+        state.live_order_state.register_mm_decision_lineage(
+            aster,
+            "aster_pending_mm",
+            Side::Sell,
+            2_001.0,
+            0.01,
+            OrderPurpose::Mm,
+            "decision_aster_pending_mm",
+            now_ms,
+        );
+        state.recompute_after_fills(&cfg);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, hyperliquid);
+
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.20), Some(0.03), Some(0));
+        assert!(canary_breach_is_open_order_only(&limits));
+
+        let targets = canary_breach_response_target_venues(&state, &limits);
+        assert_eq!(targets, vec![hyperliquid]);
+
+        let cancel_scope = canary_breach_response_cancel_scope_venues(&state, &limits, &targets);
+        assert_eq!(cancel_scope, vec![hyperliquid]);
+    }
+
+    #[test]
+    fn canary_breach_response_quarantine_drops_off_target_mm_places_in_cancel_scope() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = 0;
+        let hyperliquid = 1;
+        let aster = 2;
+        let lighter = 3;
+        let now_ms = 55_000;
+
+        state.venues[aster].position_tao = -0.07;
+        seed_open_orders(&mut state, extended, 1, now_ms);
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+        state.recompute_after_fills(&cfg);
+
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.20), Some(0.03), Some(12));
+        let targets = canary_breach_response_target_venues(&state, &limits);
+        assert_eq!(targets, vec![aster]);
+        let cancel_scope = canary_breach_response_cancel_scope_venues(&state, &limits, &targets);
+
+        let mut intents = vec![
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: extended,
+                venue_id: cfg.venues[extended].id_arc.clone(),
+                side: Side::Sell,
+                price: 2_001.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("extended_mm".to_string()),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                side: Side::Sell,
+                price: 2_002.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("lighter_mm".to_string()),
+            }),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                order_id: "lighter_cancel".to_string(),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                side: Side::Sell,
+                price: 2_003.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("hyperliquid_mm".to_string()),
+            }),
+        ];
+
+        let removed = retain_canary_breach_preferred_intents(
+            &cfg,
+            &state,
+            &mut intents,
+            &cancel_scope,
+            false,
+        );
+
+        assert_eq!(removed, 2);
+        assert_eq!(intents.len(), 2);
+        assert!(matches!(intents[0], OrderIntent::Cancel(_)));
+        assert_eq!(venue_index_for_order_intent(&intents[1]), Some(hyperliquid));
+    }
+
+    #[test]
+    fn canary_breach_response_preserves_positioned_cancels_for_actual_breaches() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = 0;
+
+        state.venues[extended].position_tao = 0.04;
+        let limits = canary_limit_status(&state, Some(0.03), Some(0.05), Some(0.03), Some(4));
+
+        assert!(limits.venue_breached);
+        assert!(!canary_breach_response_drop_cancels_for_positioned_venues(
+            &limits
+        ));
+    }
+
+    #[test]
+    fn canary_breach_response_can_drop_positioned_cancels_for_open_order_only_breaches() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = 0;
+        let now_ms = 55_000;
+
+        seed_open_orders(&mut state, extended, 1, now_ms);
+        sync_venue_order_tracking_from_live_order_state(&cfg, &mut state, extended);
+
+        let limits = canary_limit_status(&state, Some(0.03), Some(0.05), Some(0.03), Some(0));
+
+        assert!(canary_breach_is_open_order_only(&limits));
+        assert!(canary_breach_response_drop_cancels_for_positioned_venues(
+            &limits
+        ));
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_fan_out_across_exposed_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let aster = 2;
+
+        state.fair_value = Some(2_000.0);
+        state.venues[hyperliquid].position_tao = 0.02;
+        state.venues[aster].position_tao = -0.03;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[hyperliquid, aster], 77);
+        assert_eq!(intents.len(), 2);
+        assert_eq!(
+            intents
+                .iter()
+                .map(|intent| venue_index_for_order_intent(intent).expect("venue index"))
+                .collect::<Vec<_>>(),
+            vec![hyperliquid, aster]
+        );
+        assert!(intents.iter().all(|intent| matches!(
+            intent,
+            OrderIntent::Place(place)
+                if place.reduce_only
+                    && place.time_in_force == TimeInForce::Ioc
+                    && place.purpose == OrderPurpose::Exit
+        )));
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_ignore_flat_or_unhealthy_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let aster = 2;
+
+        state.fair_value = Some(2_000.0);
+        state.venues[hyperliquid].position_tao = 0.02;
+        state.venues[hyperliquid].status = VenueStatus::Disabled;
+        state.venues[aster].position_tao = 0.0;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[hyperliquid, aster], 88);
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_scope_to_target_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let aster = 2;
+
+        state.fair_value = Some(2_000.0);
+        state.venues[hyperliquid].position_tao = 0.02;
+        state.venues[aster].position_tao = -0.03;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 91);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(venue_index_for_order_intent(&intents[0]), Some(aster));
+    }
+
+    #[test]
+    fn canary_breach_flatten_split_defers_cancel_all_venues() {
+        let cfg = Config::default();
+        let hyperliquid = 1;
+        let lighter = 3;
+        let flatten_intents = vec![
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                side: Side::Sell,
+                price: 2_000.0,
+                size: 0.05,
+                purpose: OrderPurpose::Exit,
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: Some("canary_exit_hl".to_string()),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                side: Side::Sell,
+                price: 2_000.0,
+                size: 0.05,
+                purpose: OrderPurpose::Exit,
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: Some("canary_exit_lighter".to_string()),
+            }),
+        ];
+        let cancel_intents = vec![
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                order_id: "hl_open".to_string(),
+            }),
+            OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
+                venue_index: Some(lighter),
+                venue_id: Some(cfg.venues[lighter].id_arc.clone()),
+            }),
+        ];
+
+        let (early, deferred) =
+            split_canary_flatten_intents_by_cancel_mode(flatten_intents, &cancel_intents, true);
+
+        assert_eq!(early.len(), 1);
+        assert_eq!(venue_index_for_order_intent(&early[0]), Some(hyperliquid));
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(venue_index_for_order_intent(&deferred[0]), Some(lighter));
+    }
+
+    #[tokio::test]
+    async fn canary_breach_response_sends_hyperliquid_cancel_without_sync_wait() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 54_000;
+        let tick = 216;
+
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.venues[hyperliquid].status = VenueStatus::Healthy;
+        state.venues[hyperliquid].mid = Some(2_000.0);
+        state.venues[hyperliquid].spread = Some(0.10);
+        state.venues[hyperliquid].position_tao = 0.13;
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+        state.recompute_after_fills(&cfg);
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits.breached);
+        assert!(limits.venue_breached);
+        let target_probe = canary_breach_response_target_venues(&state, &limits);
+        assert_eq!(target_probe, vec![hyperliquid]);
+        let flatten_probe = build_canary_breach_flatten_intents(&cfg, &state, &target_probe, tick);
+        assert_eq!(flatten_probe.len(), 1, "flatten_probe={flatten_probe:?}");
+
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut latches = EmergencyRequestLatchSet::default();
+        let mut status = CanaryBreachResponseStatus::default();
+        let mut would_send_intents = Vec::new();
+        let mut last_exit_intent = None;
+
+        {
+            let handle_fut = handle_canary_breach_response(
+                &cfg,
+                &mut state,
+                &limits,
+                &mut status,
+                &priority_order_tx,
+                &mut latches,
+                now_ms,
+                tick,
+                3_000,
+                9_000,
+                None,
+                &mut would_send_intents,
+                &mut last_exit_intent,
+            );
+            tokio::pin!(handle_fut);
+
+            let observe_fut = async {
+                let first = priority_order_rx
+                    .recv()
+                    .await
+                    .expect("pre-cancel flatten request");
+                let LiveOrderRequest {
+                    intents, response, ..
+                } = first;
+                assert!(
+                    intents.iter().any(|intent| matches!(
+                        intent,
+                        OrderIntent::Place(place)
+                            if place.venue_index == hyperliquid
+                                && place.purpose == OrderPurpose::Exit
+                                && place.reduce_only
+                                && place.time_in_force == TimeInForce::Ioc
+                    )),
+                    "first request did not contain hyperliquid IOC exit: {intents:?}"
+                );
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => panic!("expected async flatten response"),
+                }
+
+                let second = priority_order_rx.recv().await.expect("cancel wait request");
+                let LiveOrderRequest {
+                    intents,
+                    response,
+                    transport_hint,
+                    ..
+                } = second;
+                assert!(intents
+                    .iter()
+                    .all(|intent| matches!(intent, OrderIntent::Cancel(_))));
+                assert_eq!(transport_hint, TransportHint::HyperliquidSyncControl);
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => {
+                        panic!("expected async hyperliquid cancel response")
+                    }
+                }
+            };
+
+            tokio::join!(handle_fut, observe_fut);
+        }
+
+        assert_eq!(status.flatten_venues, vec!["hyperliquid".to_string()]);
+        assert!(matches!(
+            last_exit_intent,
+            Some(OrderIntent::Place(ref place)) if place.venue_index == hyperliquid
+        ));
+        assert_eq!(status.request_dispatches.len(), 1);
+        assert_eq!(status.request_dispatches[0].venue_id, "hyperliquid");
+        assert_eq!(
+            status.request_dispatches[0].transport_mode,
+            EmergencyRequestTransportMode::SingleFlightLatch
+        );
+    }
+
+    #[tokio::test]
+    async fn canary_breach_response_submits_ioc_flatten_before_cancel_all_latch() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 57_000;
+        let tick = 229;
+
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.venues[hyperliquid].status = VenueStatus::Healthy;
+        state.venues[hyperliquid].mid = Some(2_000.0);
+        state.venues[hyperliquid].spread = Some(0.10);
+        state.venues[hyperliquid].position_tao = 0.09;
+        state.recompute_after_fills(&cfg);
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits.breached);
+        assert!(limits.venue_breached);
+
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut latches = EmergencyRequestLatchSet::default();
+        let mut status = CanaryBreachResponseStatus::default();
+        let mut would_send_intents = Vec::new();
+        let mut last_exit_intent = None;
+
+        {
+            let handle_fut = handle_canary_breach_response(
+                &cfg,
+                &mut state,
+                &limits,
+                &mut status,
+                &priority_order_tx,
+                &mut latches,
+                now_ms,
+                tick,
+                3_000,
+                9_000,
+                None,
+                &mut would_send_intents,
+                &mut last_exit_intent,
+            );
+            tokio::pin!(handle_fut);
+
+            let observe_fut = async {
+                let first = priority_order_rx
+                    .recv()
+                    .await
+                    .expect("pre-cancel flatten request");
+                let LiveOrderRequest {
+                    intents, response, ..
+                } = first;
+                let place = intents
+                    .iter()
+                    .find_map(|intent| match intent {
+                        OrderIntent::Place(place) => Some(place.clone()),
+                        _ => None,
+                    })
+                    .expect("flatten place intent");
+                assert_eq!(place.venue_index, hyperliquid);
+                assert_eq!(place.side, Side::Sell);
+                assert_eq!(place.purpose, OrderPurpose::Exit);
+                assert_eq!(place.time_in_force, TimeInForce::Ioc);
+                assert!(place.reduce_only);
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => panic!("expected async flatten response"),
+                }
+
+                let second = priority_order_rx
+                    .recv()
+                    .await
+                    .expect("cancel-all wait request");
+                let LiveOrderRequest {
+                    intents,
+                    response,
+                    transport_hint,
+                    ..
+                } = second;
+                assert!(intents.iter().all(|intent| {
+                    matches!(
+                        intent,
+                        OrderIntent::CancelAll(cancel_all)
+                            if cancel_all.venue_index == Some(hyperliquid)
+                    )
+                }));
+                assert_eq!(transport_hint, TransportHint::HyperliquidSyncControl);
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => {
+                        panic!("expected async hyperliquid cancel-all response")
+                    }
+                }
+            };
+
+            tokio::join!(handle_fut, observe_fut);
+        }
+
+        assert_eq!(status.flatten_venues, vec!["hyperliquid".to_string()]);
+        assert!(matches!(
+            last_exit_intent,
+            Some(OrderIntent::Place(ref place)) if place.venue_index == hyperliquid
+        ));
+        assert_eq!(status.request_dispatches.len(), 1);
+        assert_eq!(status.request_dispatches[0].venue_id, "hyperliquid");
+        assert_eq!(
+            status.request_dispatches[0].transport_mode,
+            EmergencyRequestTransportMode::SingleFlightLatch
+        );
+        assert!((state.venues[hyperliquid].position_tao - 0.09).abs() < 1e-9);
+        let limits_after =
+            canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits_after.breached);
+    }
+
+    #[tokio::test]
+    async fn canary_breach_retry_submits_lighter_flatten_without_sync_wait() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        let now_ms = 56_000;
+        let tick = 224;
+
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.venues[lighter].mid = Some(2_000.0);
+        state.venues[lighter].spread = Some(0.10);
+        state.venues[lighter].position_tao = -0.05;
+        state.recompute_after_fills(&cfg);
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits.breached);
+        assert!(limits.venue_breached);
+
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut status = CanaryBreachResponseStatus::default();
+        let mut would_send_intents = Vec::new();
+        let mut last_exit_intent = None;
+
+        let sent = {
+            let retry_fut = retry_canary_breach_flatten_response(
+                &cfg,
+                &mut state,
+                &limits,
+                &mut status,
+                &priority_order_tx,
+                now_ms,
+                tick,
+                None,
+                &mut would_send_intents,
+                &mut last_exit_intent,
+            );
+            tokio::pin!(retry_fut);
+
+            let observe_fut = async {
+                let req = priority_order_rx
+                    .recv()
+                    .await
+                    .expect("sync retry flatten request");
+                let LiveOrderRequest {
+                    intents, response, ..
+                } = req;
+                let place = intents
+                    .iter()
+                    .find_map(|intent| match intent {
+                        OrderIntent::Place(place) => Some(place.clone()),
+                        _ => None,
+                    })
+                    .expect("retry flatten place intent");
+                assert_eq!(place.venue_index, lighter);
+                assert_eq!(place.side, Side::Buy);
+                assert_eq!(place.purpose, OrderPurpose::Exit);
+                assert_eq!(place.time_in_force, TimeInForce::Ioc);
+                assert!(place.reduce_only);
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => panic!("expected async lighter retry flatten"),
+                }
+            };
+
+            let (sent, _) = tokio::join!(retry_fut, observe_fut);
+            sent
+        };
+        assert!(sent.submitted);
+        assert!(sent.submitted_venue(lighter));
+        assert!(sent.accepted_venues.is_empty());
+        assert_eq!(status.flatten_venues, vec!["lighter".to_string()]);
+        assert!(matches!(
+            last_exit_intent,
+            Some(OrderIntent::Place(ref place)) if place.venue_index == lighter
+        ));
+        assert!((state.venues[lighter].position_tao + 0.05).abs() < 1e-9);
+        let limits_after =
+            canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits_after.breached);
+    }
+
+    #[tokio::test]
+    async fn canary_breach_retry_submits_hyperliquid_flatten_without_sync_wait() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 58_000;
+        let tick = 226;
+
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.venues[hyperliquid].mid = Some(2_000.0);
+        state.venues[hyperliquid].spread = Some(0.10);
+        state.venues[hyperliquid].position_tao = 0.09;
+        state.recompute_after_fills(&cfg);
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits.breached);
+        assert!(limits.venue_breached);
+
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut status = CanaryBreachResponseStatus::default();
+        let mut would_send_intents = Vec::new();
+        let mut last_exit_intent = None;
+
+        let sent = {
+            let retry_fut = retry_canary_breach_flatten_response(
+                &cfg,
+                &mut state,
+                &limits,
+                &mut status,
+                &priority_order_tx,
+                now_ms,
+                tick,
+                None,
+                &mut would_send_intents,
+                &mut last_exit_intent,
+            );
+            tokio::pin!(retry_fut);
+
+            let observe_fut = async {
+                let req = priority_order_rx
+                    .recv()
+                    .await
+                    .expect("retry flatten request");
+                let LiveOrderRequest {
+                    intents, response, ..
+                } = req;
+                let place = intents
+                    .iter()
+                    .find_map(|intent| match intent {
+                        OrderIntent::Place(place) => Some(place.clone()),
+                        _ => None,
+                    })
+                    .expect("retry flatten place intent");
+                assert_eq!(place.venue_index, hyperliquid);
+                assert_eq!(place.side, Side::Sell);
+                assert_eq!(place.purpose, OrderPurpose::Exit);
+                assert_eq!(place.time_in_force, TimeInForce::Ioc);
+                assert!(place.reduce_only);
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => panic!("expected async hyperliquid retry flatten"),
+                }
+            };
+
+            let (sent, _) = tokio::join!(retry_fut, observe_fut);
+            sent
+        };
+        assert!(sent.submitted);
+        assert!(sent.submitted_venue(hyperliquid));
+        assert!(sent.accepted_venues.is_empty());
+        assert_eq!(status.flatten_venues, vec!["hyperliquid".to_string()]);
+        assert!(matches!(
+            last_exit_intent,
+            Some(OrderIntent::Place(ref place)) if place.venue_index == hyperliquid
+        ));
+        assert!((state.venues[hyperliquid].position_tao - 0.09).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn canary_breach_retry_submits_extended_flatten_without_sync_wait() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = 0;
+        let now_ms = 58_500;
+        let tick = 228;
+
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.venues[extended].mid = Some(2_000.0);
+        state.venues[extended].spread = Some(0.10);
+        state.venues[extended].position_tao = -0.04;
+        state.recompute_after_fills(&cfg);
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits.breached);
+        assert!(limits.venue_breached);
+
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut status = CanaryBreachResponseStatus::default();
+        let mut would_send_intents = Vec::new();
+        let mut last_exit_intent = None;
+
+        let sent = {
+            let retry_fut = retry_canary_breach_flatten_response(
+                &cfg,
+                &mut state,
+                &limits,
+                &mut status,
+                &priority_order_tx,
+                now_ms,
+                tick,
+                None,
+                &mut would_send_intents,
+                &mut last_exit_intent,
+            );
+            tokio::pin!(retry_fut);
+
+            let observe_fut = async {
+                let req = priority_order_rx
+                    .recv()
+                    .await
+                    .expect("retry flatten request");
+                let LiveOrderRequest {
+                    intents, response, ..
+                } = req;
+                let place = intents
+                    .iter()
+                    .find_map(|intent| match intent {
+                        OrderIntent::Place(place) => Some(place.clone()),
+                        _ => None,
+                    })
+                    .expect("retry flatten place intent");
+                assert_eq!(place.venue_index, extended);
+                assert_eq!(place.side, Side::Buy);
+                assert_eq!(place.purpose, OrderPurpose::Exit);
+                assert_eq!(place.time_in_force, TimeInForce::Ioc);
+                assert!(place.reduce_only);
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => panic!("expected async extended retry flatten"),
+                }
+            };
+
+            let (sent, _) = tokio::join!(retry_fut, observe_fut);
+            sent
+        };
+        assert!(sent.submitted);
+        assert!(sent.submitted_venue(extended));
+        assert!(sent.accepted_venues.is_empty());
+        assert_eq!(status.flatten_venues, vec!["extended".to_string()]);
+        assert!(matches!(
+            last_exit_intent,
+            Some(OrderIntent::Place(ref place)) if place.venue_index == extended
+        ));
+        assert!((state.venues[extended].position_tao + 0.04).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn canary_breach_retry_submits_paradex_flatten_without_sync_wait() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let paradex = paradex_venue_index(&cfg).expect("paradex venue");
+        let now_ms = 58_750;
+        let tick = 229;
+
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.venues[paradex].mid = Some(2_000.0);
+        state.venues[paradex].spread = Some(0.10);
+        state.venues[paradex].position_tao = -0.07;
+        state.recompute_after_fills(&cfg);
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits.breached);
+        assert!(limits.venue_breached);
+
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut status = CanaryBreachResponseStatus::default();
+        let mut would_send_intents = Vec::new();
+        let mut last_exit_intent = None;
+
+        let sent = {
+            let retry_fut = retry_canary_breach_flatten_response(
+                &cfg,
+                &mut state,
+                &limits,
+                &mut status,
+                &priority_order_tx,
+                now_ms,
+                tick,
+                None,
+                &mut would_send_intents,
+                &mut last_exit_intent,
+            );
+            tokio::pin!(retry_fut);
+
+            let observe_fut = async {
+                let req = priority_order_rx
+                    .recv()
+                    .await
+                    .expect("retry flatten request");
+                let LiveOrderRequest {
+                    intents, response, ..
+                } = req;
+                let place = intents
+                    .iter()
+                    .find_map(|intent| match intent {
+                        OrderIntent::Place(place) => Some(place.clone()),
+                        _ => None,
+                    })
+                    .expect("retry flatten place intent");
+                assert_eq!(place.venue_index, paradex);
+                assert_eq!(place.side, Side::Buy);
+                assert_eq!(place.purpose, OrderPurpose::Exit);
+                assert_eq!(place.time_in_force, TimeInForce::Ioc);
+                assert!(place.reduce_only);
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => panic!("expected async paradex retry flatten"),
+                }
+            };
+
+            let (sent, _) = tokio::join!(retry_fut, observe_fut);
+            sent
+        };
+        assert!(sent.submitted);
+        assert!(sent.submitted_venue(paradex));
+        assert!(sent.accepted_venues.is_empty());
+        assert_eq!(status.flatten_venues, vec!["paradex".to_string()]);
+        assert!(matches!(
+            last_exit_intent,
+            Some(OrderIntent::Place(ref place)) if place.venue_index == paradex
+        ));
+        assert!((state.venues[paradex].position_tao + 0.07).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn canary_breach_retry_submits_aster_flatten_without_sync_wait() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = 2;
+        let now_ms = 59_000;
+        let tick = 227;
+
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.venues[aster].mid = Some(2_000.0);
+        state.venues[aster].spread = Some(0.10);
+        state.venues[aster].position_tao = 0.04;
+        state.recompute_after_fills(&cfg);
+        let limits = canary_limit_status(&state, Some(0.08), Some(0.08), Some(0.03), Some(12));
+        assert!(limits.breached);
+        assert!(limits.venue_breached);
+
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(8);
+        let mut status = CanaryBreachResponseStatus::default();
+        let mut would_send_intents = Vec::new();
+        let mut last_exit_intent = None;
+
+        let sent = {
+            let retry_fut = retry_canary_breach_flatten_response(
+                &cfg,
+                &mut state,
+                &limits,
+                &mut status,
+                &priority_order_tx,
+                now_ms,
+                tick,
+                None,
+                &mut would_send_intents,
+                &mut last_exit_intent,
+            );
+            tokio::pin!(retry_fut);
+
+            let observe_fut = async {
+                let req = priority_order_rx
+                    .recv()
+                    .await
+                    .expect("retry flatten request");
+                let LiveOrderRequest {
+                    intents, response, ..
+                } = req;
+                let place = intents
+                    .iter()
+                    .find_map(|intent| match intent {
+                        OrderIntent::Place(place) => Some(place.clone()),
+                        _ => None,
+                    })
+                    .expect("retry flatten place intent");
+                assert_eq!(place.venue_index, aster);
+                assert_eq!(place.side, Side::Sell);
+                assert_eq!(place.purpose, OrderPurpose::Exit);
+                assert_eq!(place.time_in_force, TimeInForce::Ioc);
+                assert!(place.reduce_only);
+                match response {
+                    ResponseMode::FireAndForget => {}
+                    ResponseMode::Oneshot(_) => panic!("expected async aster retry flatten"),
+                }
+            };
+
+            let (sent, _) = tokio::join!(retry_fut, observe_fut);
+            sent
+        };
+        assert!(sent.submitted);
+        assert!(sent.submitted_venue(aster));
+        assert!(sent.accepted_venues.is_empty());
+        assert_eq!(status.flatten_venues, vec!["aster".to_string()]);
+        assert!(matches!(
+            last_exit_intent,
+            Some(OrderIntent::Place(ref place)) if place.venue_index == aster
+        ));
+        assert!((state.venues[aster].position_tao - 0.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn retain_canary_breach_preferred_intents_drops_competing_places_for_target_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let aster = 2;
+        let now_ms = 52_000;
+
+        state.venues[hyperliquid].position_tao = -0.07;
+        seed_open_orders(&mut state, hyperliquid, 2, now_ms);
+
+        let mut intents = vec![
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                side: Side::Buy,
+                price: 2_014.78,
+                size: 0.07,
+                purpose: OrderPurpose::Hedge,
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: Some("hl_hedge".to_string()),
+            }),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                order_id: "hl_cancel".to_string(),
+            }),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: aster,
+                venue_id: cfg.venues[aster].id_arc.clone(),
+                side: Side::Buy,
+                price: 2_010.0,
+                size: 0.01,
+                purpose: OrderPurpose::Hedge,
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: Some("aster_hedge".to_string()),
+            }),
+        ];
+
+        let removed = retain_canary_breach_preferred_intents(
+            &cfg,
+            &state,
+            &mut intents,
+            &[hyperliquid],
+            false,
+        );
+
+        assert_eq!(removed, 1);
+        assert_eq!(intents.len(), 2);
+        assert!(matches!(intents[0], OrderIntent::Cancel(_)));
+        assert_eq!(venue_index_for_order_intent(&intents[1]), Some(aster));
+    }
+
+    #[test]
+    fn retain_canary_breach_preferred_intents_can_drop_cancels_for_positioned_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+
+        state.venues[hyperliquid].position_tao = -0.07;
+
+        let mut intents = vec![
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                order_id: "hl_cancel".to_string(),
+            }),
+            OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
+                venue_index: Some(hyperliquid),
+                venue_id: Some(cfg.venues[hyperliquid].id_arc.clone()),
+            }),
+        ];
+
+        let removed = retain_canary_breach_preferred_intents(
+            &cfg,
+            &state,
+            &mut intents,
+            &[hyperliquid],
+            true,
+        );
+
+        assert_eq!(removed, 2);
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn kill_switch_hyperliquid_prefers_explicit_cancels_when_orders_are_tracked() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 45_000;
+
+        seed_open_orders(&mut state, hyperliquid, 2, now_ms);
+
+        let mut cancel_intents = Vec::new();
+        for venue_index in 0..cfg.venues.len() {
+            cancel_intents.extend(build_disabled_cancel_intents_for_venue(
+                &cfg,
+                &state,
+                venue_index,
+            ));
+        }
+
+        let hyperliquid_intents: Vec<_> = cancel_intents
+            .iter()
+            .filter(|intent| venue_index_for_order_intent(intent) == Some(hyperliquid))
+            .collect();
+        assert_eq!(hyperliquid_intents.len(), 2);
+        assert!(hyperliquid_intents
+            .iter()
+            .all(|intent| matches!(intent, OrderIntent::Cancel(_))));
+    }
+
+    #[test]
+    fn terminal_exit_quiesce_cancel_retries_configured_venues_after_interval() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 45_000;
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+        let retry_venues = std::collections::HashSet::from([hyperliquid]);
+        let mut cancel_state = vec![TerminalExitCancelState::default(); cfg.venues.len()];
+
+        let first = build_terminal_exit_quiesce_cancel_intents(
+            &cfg,
+            &state,
+            &mut cancel_state,
+            now_ms,
+            2_000,
+            Some(&retry_venues),
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(cancel_state[hyperliquid].first_sent_ms, Some(now_ms));
+        assert_eq!(cancel_state[hyperliquid].last_sent_ms, Some(now_ms));
+
+        let suppressed = build_terminal_exit_quiesce_cancel_intents(
+            &cfg,
+            &state,
+            &mut cancel_state,
+            now_ms + 1_000,
+            2_000,
+            Some(&retry_venues),
+        );
+        assert!(suppressed.is_empty());
+
+        let retry = build_terminal_exit_quiesce_cancel_intents(
+            &cfg,
+            &state,
+            &mut cancel_state,
+            now_ms + 2_000,
+            2_000,
+            Some(&retry_venues),
+        );
+        assert_eq!(retry.len(), 1);
+        assert_eq!(cancel_state[hyperliquid].first_sent_ms, Some(now_ms));
+        assert_eq!(cancel_state[hyperliquid].last_sent_ms, Some(now_ms + 2_000));
+    }
+
+    #[test]
+    fn terminal_stale_order_reduce_ready_requires_cancel_grace_and_fresh_account() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 60_000;
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == hyperliquid {
+                        -0.01
+                    } else {
+                        0.0
+                    },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let mut cancel_state = vec![TerminalExitCancelState::default(); cfg.venues.len()];
+        cancel_state[hyperliquid].mark_sent(now_ms - 15_000);
+        let config = TerminalResidualConvergenceConfig {
+            stale_order_reduce_after_ms: 15_000,
+            ..TerminalResidualConvergenceConfig::default()
+        };
+        let defer_venues = std::collections::HashSet::from([hyperliquid]);
+
+        let ready = terminal_stale_order_reduce_ready_venues(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            &cancel_state,
+            &config,
+            &defer_venues,
+        );
+
+        assert_eq!(ready, defer_venues);
+    }
+
+    #[test]
+    fn soft_unwind_terminal_defer_allows_hyperliquid_reduce_after_stale_order_override() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 60_000;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[hyperliquid].position_tao = -0.01;
+        state.venues[hyperliquid].mid = Some(2_350.0);
+        state.venues[hyperliquid].spread = Some(0.2);
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+        state.recompute_after_fills(&cfg);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == hyperliquid {
+                        -0.01
+                    } else {
+                        0.0
+                    },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let defer_venues = std::collections::HashSet::new();
+
+        let intents = build_soft_unwind_intents_with_terminal_defer_status(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig::default(),
+            None,
+            None,
+            &defer_venues,
+        );
+        assert!(intents.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::Cancel(cancel) if cancel.venue_index == hyperliquid
+            )
+        }));
+        let hyperliquid_reduce = intents
+            .into_iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == hyperliquid => Some(place),
+                _ => None,
+            })
+            .expect("hyperliquid reduce after terminal stale-order override");
+        assert_eq!(hyperliquid_reduce.side, Side::Buy);
+        assert!((hyperliquid_reduce.size - 0.01).abs() < 1e-12);
+        assert!(hyperliquid_reduce.reduce_only);
     }
 
     #[test]
@@ -9040,13 +25546,117 @@ mod tests {
     }
 
     #[test]
-    fn emergency_single_flight_targets_fill_venues() {
-        assert!(emergency_single_flight_enabled_for_venue_id("lighter"));
-        assert!(emergency_single_flight_enabled_for_venue_id("LIGHTER"));
-        assert!(emergency_single_flight_enabled_for_venue_id("aster"));
-        assert!(emergency_single_flight_enabled_for_venue_id("paradex"));
-        assert!(!emergency_single_flight_enabled_for_venue_id("hyperliquid"));
-        assert!(!emergency_single_flight_enabled_for_venue_id("extended"));
+    fn emergency_single_flight_targets_are_class_specific() {
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::DisabledCancelAll,
+            "lighter"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::DisabledCancelAll,
+            "LIGHTER"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::DisabledCancelAll,
+            "aster"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::DisabledCancelAll,
+            "paradex"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::InventoryBrake,
+            "paradex"
+        ));
+        assert!(!emergency_single_flight_enabled_for(
+            EmergencyRequestClass::SoftUnwind,
+            "paradex"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::DisabledCancelAll,
+            "extended"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::DisabledCancelAll,
+            "hyperliquid"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::InventoryBrake,
+            "hyperliquid"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::SoftUnwind,
+            "hyperliquid"
+        ));
+        assert!(emergency_single_flight_enabled_for(
+            EmergencyRequestClass::InventoryBrake,
+            "extended"
+        ));
+        assert!(!emergency_single_flight_enabled_for(
+            EmergencyRequestClass::SoftUnwind,
+            "extended"
+        ));
+    }
+
+    #[test]
+    fn take_emergency_single_flight_intents_moves_hyperliquid_for_disabled_cancel() {
+        let cfg = Config::default();
+        let mk_place = |venue_index: usize, venue_id: &str| {
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index,
+                venue_id: venue_id.into(),
+                side: Side::Buy,
+                price: 2_000.0,
+                size: 0.01,
+                purpose: OrderPurpose::Hedge,
+                time_in_force: TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: Some(format!("co_{venue_id}")),
+            })
+        };
+
+        let mut brake_intents = vec![mk_place(1, "hyperliquid"), mk_place(3, "lighter")];
+        let brake_requests = take_emergency_single_flight_intents(
+            EmergencyRequestClass::InventoryBrake,
+            &cfg,
+            &mut brake_intents,
+        );
+        assert!(brake_intents.is_empty());
+        assert_eq!(brake_requests.len(), 2);
+        assert!(brake_requests
+            .iter()
+            .any(|(venue_index, _)| *venue_index == 1));
+        assert!(brake_requests
+            .iter()
+            .any(|(venue_index, _)| *venue_index == 3));
+
+        let mut paradex_soft_unwind_intents = vec![mk_place(4, "paradex")];
+        let paradex_soft_unwind_requests = take_emergency_single_flight_intents(
+            EmergencyRequestClass::SoftUnwind,
+            &cfg,
+            &mut paradex_soft_unwind_intents,
+        );
+        assert!(paradex_soft_unwind_requests.is_empty());
+        assert_eq!(paradex_soft_unwind_intents.len(), 1);
+        assert_eq!(
+            venue_index_for_order_intent(&paradex_soft_unwind_intents[0]),
+            Some(4)
+        );
+
+        let mut disabled_cancel_intents = vec![mk_place(1, "hyperliquid"), mk_place(3, "lighter")];
+        let disabled_cancel_requests = take_emergency_single_flight_intents(
+            EmergencyRequestClass::DisabledCancelAll,
+            &cfg,
+            &mut disabled_cancel_intents,
+        );
+        assert!(disabled_cancel_intents.is_empty());
+        assert_eq!(disabled_cancel_requests.len(), 2);
+        assert!(disabled_cancel_requests
+            .iter()
+            .any(|(venue_index, _)| *venue_index == 1));
+        assert!(disabled_cancel_requests
+            .iter()
+            .any(|(venue_index, _)| *venue_index == 3));
     }
 
     #[test]
@@ -9067,5 +25677,254 @@ mod tests {
         );
         assert_eq!(kill_cancel_all_timeout_ms(5), 5_000);
         assert_eq!(kill_cancel_all_timeout_ms(7), 7_000);
+    }
+
+    #[tokio::test]
+    async fn realtime_tick_interval_skips_missed_ticks() {
+        let interval = realtime_tick_interval(250);
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip
+        );
+    }
+
+    #[test]
+    fn stale_market_hygiene_marks_next_tick_kill_and_reports_stale_venues() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        state.venues[4].last_mid_apply_ms = Some(now_ms - 3_427);
+        state.venues[4].last_mid_update_ms = Some(now_ms - 3_574);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    mid: Some(2_100.0 + venue_index as f64),
+                    spread: Some(0.1),
+                    depth_near_mid: 10_000.0,
+                    is_stale: venue.id == "paradex",
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        let status = build_stale_market_hygiene_status(
+            &state,
+            &snapshot,
+            now_ms,
+            11,
+            12,
+            true,
+            false,
+            false,
+            StartupStaleArmingStatus {
+                enabled: true,
+                armed: true,
+                armed_this_tick: false,
+                elapsed_ms: 4_000,
+                arming_ms: 4_000,
+                pending_venues: Vec::new(),
+                arm_reason: Some("timeout".to_string()),
+            },
+        );
+
+        assert!(status.configured);
+        assert_eq!(status.consecutive_stale_ticks, 11);
+        assert_eq!(status.ready_market_count, cfg.venues.len() - 1);
+        assert_eq!(status.stale_market_count, 1);
+        assert_eq!(status.stale_venues, vec!["paradex".to_string()]);
+        assert_eq!(status.venue_age_ms[4], 3_427);
+        assert_eq!(status.venue_age_event_ms[4], 3_574);
+        assert!(status.kill_would_fire_next_tick);
+        assert!(status.stale_count_incremented_this_tick);
+        assert!(!status.stale_count_reset_this_tick);
+        assert!(!status.kill_triggered_this_tick);
+    }
+
+    #[test]
+    fn stale_market_hygiene_reset_is_reported() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let now_ms = 15_000;
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    mid: Some(2_100.0 + venue_index as f64),
+                    spread: Some(0.1),
+                    depth_near_mid: 10_000.0,
+                    is_stale: false,
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        let status = build_stale_market_hygiene_status(
+            &state,
+            &snapshot,
+            now_ms,
+            0,
+            12,
+            false,
+            true,
+            false,
+            StartupStaleArmingStatus {
+                enabled: true,
+                armed: true,
+                armed_this_tick: false,
+                elapsed_ms: 4_000,
+                arming_ms: 4_000,
+                pending_venues: Vec::new(),
+                arm_reason: Some("timeout".to_string()),
+            },
+        );
+
+        assert!(status.configured);
+        assert_eq!(status.stale_market_count, 0);
+        assert!(status.stale_count_reset_this_tick);
+        assert!(!status.kill_would_fire_next_tick);
+    }
+
+    #[test]
+    fn startup_stale_arming_waits_for_timeout_when_markets_pending() {
+        let cfg = Config::default();
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: 1_000,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(1_000),
+                    mid: Some(2_000.0 + venue_index as f64),
+                    spread: Some(0.1),
+                    depth_near_mid: 10_000.0,
+                    is_stale: venue.id == "paradex",
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        let status = evaluate_startup_stale_arming(&snapshot, 1_000, 0, 4_000, false);
+
+        assert!(status.enabled);
+        assert!(!status.armed);
+        assert!(!status.armed_this_tick);
+        assert_eq!(status.elapsed_ms, 1_000);
+        assert_eq!(status.pending_venues, vec!["paradex".to_string()]);
+        assert!(status.arm_reason.is_none());
+    }
+
+    #[test]
+    fn startup_stale_arming_respects_minimum_grace_when_all_markets_ready() {
+        let cfg = Config::default();
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: 1_000,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(1_000),
+                    mid: Some(2_000.0 + venue_index as f64),
+                    spread: Some(0.1),
+                    depth_near_mid: 10_000.0,
+                    is_stale: false,
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        let status = evaluate_startup_stale_arming(&snapshot, 1_000, 0, 4_000, false);
+
+        assert!(status.enabled);
+        assert!(!status.armed);
+        assert!(!status.armed_this_tick);
+        assert!(status.pending_venues.is_empty());
+        assert!(status.arm_reason.is_none());
+
+        let status = evaluate_startup_stale_arming(&snapshot, 4_000, 0, 4_000, false);
+
+        assert!(status.enabled);
+        assert!(status.armed);
+        assert!(status.armed_this_tick);
+        assert!(status.pending_venues.is_empty());
+        assert_eq!(status.arm_reason.as_deref(), Some("all_ready_after_min"));
+    }
+
+    #[test]
+    fn stale_market_hygiene_does_not_threaten_kill_before_startup_arming() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        state.venues[4].last_mid_apply_ms = Some(now_ms - 3_427);
+        state.venues[4].last_mid_update_ms = Some(now_ms - 3_574);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    mid: Some(2_100.0 + venue_index as f64),
+                    spread: Some(0.1),
+                    depth_near_mid: 10_000.0,
+                    is_stale: venue.id == "paradex",
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        let status = build_stale_market_hygiene_status(
+            &state,
+            &snapshot,
+            now_ms,
+            11,
+            12,
+            true,
+            false,
+            false,
+            StartupStaleArmingStatus {
+                enabled: true,
+                armed: false,
+                armed_this_tick: false,
+                elapsed_ms: 1_000,
+                arming_ms: 4_000,
+                pending_venues: vec!["paradex".to_string()],
+                arm_reason: None,
+            },
+        );
+
+        assert!(status.configured);
+        assert_eq!(status.stale_venues, vec!["paradex".to_string()]);
+        assert!(!status.startup_arming.armed);
+        assert!(!status.kill_would_fire_next_tick);
     }
 }

@@ -37,6 +37,22 @@ fn update_max(cell: &AtomicU64, candidate: u64) {
     }
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+pub(crate) fn live_market_pub_queue_cap(default_live: usize) -> usize {
+    env_usize("PARAPHINA_MARKET_PUB_QUEUE_CAP_LIVE", default_live)
+}
+
+pub(crate) fn live_market_pub_drain_max(default_live: usize) -> usize {
+    env_usize("PARAPHINA_MARKET_PUB_DRAIN_MAX_LIVE", default_live)
+}
+
 struct MarketPublisherAudit {
     queue_cap: usize,
     drain_max: usize,
@@ -51,6 +67,10 @@ struct MarketPublisherAudit {
     try_send_full: AtomicU64,
     out_send_ok: AtomicU64,
     out_send_err: AtomicU64,
+    out_send_block_max_ms: AtomicU64,
+    out_send_block_gt_5ms: AtomicU64,
+    out_send_block_gt_50ms: AtomicU64,
+    out_send_block_gt_250ms: AtomicU64,
 }
 
 impl MarketPublisherAudit {
@@ -69,6 +89,10 @@ impl MarketPublisherAudit {
             try_send_full: AtomicU64::new(0),
             out_send_ok: AtomicU64::new(0),
             out_send_err: AtomicU64::new(0),
+            out_send_block_max_ms: AtomicU64::new(0),
+            out_send_block_gt_5ms: AtomicU64::new(0),
+            out_send_block_gt_50ms: AtomicU64::new(0),
+            out_send_block_gt_250ms: AtomicU64::new(0),
         }
     }
 
@@ -110,6 +134,19 @@ impl MarketPublisherAudit {
         self.out_send_err.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn observe_out_send_block_ms(&self, block_ms: u64) {
+        update_max(&self.out_send_block_max_ms, block_ms);
+        if block_ms > 5 {
+            self.out_send_block_gt_5ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if block_ms > 50 {
+            self.out_send_block_gt_50ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if block_ms > 250 {
+            self.out_send_block_gt_250ms.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn maybe_emit(&self, sender: &mpsc::Sender<MarketDataEvent>) {
         let queued_len = self.queue_len(sender);
         self.observe_queue_len(queued_len);
@@ -139,13 +176,19 @@ impl MarketPublisherAudit {
                 let try_send_full = self.try_send_full.swap(0, Ordering::Relaxed);
                 let out_send_ok = self.out_send_ok.swap(0, Ordering::Relaxed);
                 let out_send_err = self.out_send_err.swap(0, Ordering::Relaxed);
+                let out_send_block_max_ms = self.out_send_block_max_ms.swap(0, Ordering::Relaxed);
+                let out_send_block_gt_5ms = self.out_send_block_gt_5ms.swap(0, Ordering::Relaxed);
+                let out_send_block_gt_50ms = self.out_send_block_gt_50ms.swap(0, Ordering::Relaxed);
+                let out_send_block_gt_250ms =
+                    self.out_send_block_gt_250ms.swap(0, Ordering::Relaxed);
 
                 eprintln!(
                     "WS_AUDIT component=market_publisher reason=periodic interval_ms=1000 \
 queue_cap={} drain_max={} queued_len={} queued_hiwater={} pending_latest_present={} \
 pending_overwrite={} mp_pending_latest_replaced_count={} lossless_send_count={} \
 lossless_send_wait_ms_max={} try_send_ok={} try_send_full={} mp_try_send_full_count={} \
-out_send_ok={} out_send_err={} emit_since_ms={} venue={}",
+out_send_ok={} out_send_err={} out_send_block_max_ms={} out_send_block_gt_5ms={} \
+out_send_block_gt_50ms={} out_send_block_gt_250ms={} emit_since_ms={} venue={}",
                     self.queue_cap,
                     self.drain_max,
                     queued_len,
@@ -160,6 +203,10 @@ out_send_ok={} out_send_err={} emit_since_ms={} venue={}",
                     try_send_full,
                     out_send_ok,
                     out_send_err,
+                    out_send_block_max_ms,
+                    out_send_block_gt_5ms,
+                    out_send_block_gt_50ms,
+                    out_send_block_gt_250ms,
                     emit_since_ms,
                     self.venue,
                 );
@@ -195,6 +242,7 @@ impl MarketPublisher {
     pub(crate) fn new(
         queue_cap: usize,
         drain_max: usize,
+        venue: &'static str,
         out_tx: mpsc::Sender<MarketDataEvent>,
         fixture_mode_now: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
         is_lossless: Arc<dyn Fn(&MarketDataEvent) -> bool + Send + Sync>,
@@ -205,7 +253,7 @@ impl MarketPublisher {
         let (market_pub_tx, mut market_pub_rx) = mpsc::channel::<MarketDataEvent>(queue_cap);
         let pending_latest = Arc::new(Mutex::new(None));
         let audit = market_publisher_ws_audit_enabled()
-            .then(|| Arc::new(MarketPublisherAudit::new(queue_cap, drain_max, "all")));
+            .then(|| Arc::new(MarketPublisherAudit::new(queue_cap, drain_max, venue)));
         let forward_out_tx = out_tx.clone();
         let forward_pending = pending_latest.clone();
         let forward_on_published = on_published.clone();
@@ -223,8 +271,10 @@ impl MarketPublisher {
                     }
                 }
                 for ev in batch {
+                    let send_started = Instant::now();
                     let send_result = forward_out_tx.send(ev).await;
                     if let Some(audit) = &forward_audit {
+                        audit.observe_out_send_block_ms(send_started.elapsed().as_millis() as u64);
                         if send_result.is_ok() {
                             audit.record_out_send_ok();
                         } else {
@@ -250,8 +300,10 @@ impl MarketPublisher {
                     overflow
                 };
                 if let Some(ev) = overflow {
+                    let send_started = Instant::now();
                     let send_result = forward_out_tx.send(ev).await;
                     if let Some(audit) = &forward_audit {
+                        audit.observe_out_send_block_ms(send_started.elapsed().as_millis() as u64);
                         if send_result.is_ok() {
                             audit.record_out_send_ok();
                         } else {
@@ -283,8 +335,10 @@ impl MarketPublisher {
 
     pub(crate) async fn publish_market(&self, event: MarketDataEvent) -> anyhow::Result<()> {
         if self.fixture_mode_now.as_ref().is_some_and(|f| f()) {
+            let send_started = Instant::now();
             let send_result = self.out_tx.send(event).await;
             if let Some(audit) = &self.audit {
+                audit.observe_out_send_block_ms(send_started.elapsed().as_millis() as u64);
                 if send_result.is_ok() {
                     audit.record_out_send_ok();
                 } else {
@@ -339,5 +393,32 @@ impl MarketPublisher {
                 anyhow::bail!("{}", self.err_queue_closed)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{live_market_pub_drain_max, live_market_pub_queue_cap};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn live_market_pub_queue_cap_reads_override() {
+        let _guard = env_lock().lock().expect("env mutex");
+        std::env::set_var("PARAPHINA_MARKET_PUB_QUEUE_CAP_LIVE", "1024");
+        assert_eq!(live_market_pub_queue_cap(256), 1024);
+        std::env::remove_var("PARAPHINA_MARKET_PUB_QUEUE_CAP_LIVE");
+    }
+
+    #[test]
+    fn live_market_pub_drain_max_reads_override() {
+        let _guard = env_lock().lock().expect("env mutex");
+        std::env::set_var("PARAPHINA_MARKET_PUB_DRAIN_MAX_LIVE", "256");
+        assert_eq!(live_market_pub_drain_max(64), 256);
+        std::env::remove_var("PARAPHINA_MARKET_PUB_DRAIN_MAX_LIVE");
     }
 }

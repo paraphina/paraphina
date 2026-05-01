@@ -20,7 +20,8 @@
 //   - Half-spread (Section 9.2):
 //       δ* = (1/γ) * ln(1 + γ/k)
 //       then apply spread_mult
-//       then enforce min half-spread based on (EDGE_LOCAL_MIN + maker_cost + vol_buffer)/2
+//       then enforce min half-spread based on
+//       (EDGE_LOCAL_MIN + optional hedge_cost_floor + maker_cost + vol_buffer)/2
 //   - Size (Section 10):
 //       Q_raw = e / η (if e > 0)
 //       then apply constraints: size_mult, per-venue max, margin cap, liq-distance shrink
@@ -60,6 +61,11 @@ pub struct MmQuote {
     pub bid: Option<MmLevel>,
     pub ask: Option<MmLevel>,
     pub generated_spread_cap_applied: bool,
+    pub generated_spread_cap_bid_suppressed: bool,
+    pub generated_spread_cap_ask_suppressed: bool,
+    pub touch_mode_kind: Option<&'static str>,
+    pub bid_terminal_reason: &'static str,
+    pub ask_terminal_reason: &'static str,
 }
 
 /// Active MM order state for order lifetime management.
@@ -152,6 +158,52 @@ struct AsterTouchLocalResult {
     applied: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct HyperliquidTouchClipResult {
+    bid_price: f64,
+    ask_price: f64,
+    applied: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SingleVenueQuoteResult {
+    bid: Option<MmLevel>,
+    ask: Option<MmLevel>,
+    generated_spread_cap_applied: bool,
+    generated_spread_cap_bid_suppressed: bool,
+    generated_spread_cap_ask_suppressed: bool,
+    touch_mode_kind: Option<&'static str>,
+    bid_terminal_reason: &'static str,
+    ask_terminal_reason: &'static str,
+}
+
+#[inline]
+fn single_venue_quote_result(
+    bid: Option<MmLevel>,
+    ask: Option<MmLevel>,
+    generated_spread_cap_applied: bool,
+    generated_spread_cap_bid_suppressed: bool,
+    generated_spread_cap_ask_suppressed: bool,
+    touch_mode_kind: Option<&'static str>,
+    bid_terminal_reason: &'static str,
+    ask_terminal_reason: &'static str,
+) -> SingleVenueQuoteResult {
+    SingleVenueQuoteResult {
+        bid,
+        ask,
+        generated_spread_cap_applied,
+        generated_spread_cap_bid_suppressed,
+        generated_spread_cap_ask_suppressed,
+        touch_mode_kind,
+        bid_terminal_reason,
+        ask_terminal_reason,
+    }
+}
+
+pub const HYPERLIQUID_TOUCH_CLIP_MAX_TICKS: f64 = 8.0;
+pub const TOUCH_MODE_ASTER_FILL: &str = "aster_fill";
+pub const TOUCH_MODE_HYPERLIQUID_CLIP: &str = "hyperliquid_clip";
+
 #[inline]
 fn aster_touch_delta_ticks(side: Side, price: f64, best_bid: f64, best_ask: f64, tick: f64) -> f64 {
     match side {
@@ -208,6 +260,67 @@ fn apply_aster_fill_touch_local(
         (snapped_bid - bid_price).abs() > 1e-9 || (snapped_ask - ask_price).abs() > 1e-9;
     result.bid_price = snapped_bid.min(best_bid);
     result.ask_price = snapped_ask.max(best_ask);
+    result
+}
+
+#[inline]
+fn hyperliquid_touch_clip_eligible(
+    mm_cfg: &MmConfig,
+    vcfg: &VenueConfig,
+    vstate: &VenueState,
+    mid: f64,
+    spread: f64,
+) -> bool {
+    vcfg.id == "hyperliquid"
+        && matches!(
+            mm_cfg.venue_role_for(&vcfg.id),
+            MmVenueRole::Probationary | MmVenueRole::Fill
+        )
+        && matches!(vstate.status, VenueStatus::Healthy)
+        && quote_spread_gate_reason(mm_cfg, &vcfg.id, Some(mid), Some(spread)).is_none()
+}
+
+#[inline]
+fn apply_hyperliquid_touch_clip(
+    mm_cfg: &MmConfig,
+    vcfg: &VenueConfig,
+    vstate: &VenueState,
+    mid: f64,
+    spread: f64,
+    tick: f64,
+    best_bid: f64,
+    best_ask: f64,
+    passive_bid_limit: f64,
+    passive_ask_limit: f64,
+    bid_price: f64,
+    ask_price: f64,
+) -> HyperliquidTouchClipResult {
+    let mut result = HyperliquidTouchClipResult {
+        bid_price,
+        ask_price,
+        applied: false,
+    };
+    if !hyperliquid_touch_clip_eligible(mm_cfg, vcfg, vstate, mid, spread) {
+        return result;
+    }
+
+    let max_offset = HYPERLIQUID_TOUCH_CLIP_MAX_TICKS * tick;
+    let clipped_bid = bid_price.max(best_bid - max_offset).min(passive_bid_limit);
+    let clipped_ask = ask_price.min(best_ask + max_offset).max(passive_ask_limit);
+
+    let mut snapped_bid = ((clipped_bid / tick) - 1e-9).ceil() * tick;
+    if snapped_bid > passive_bid_limit {
+        snapped_bid = (passive_bid_limit / tick).floor() * tick;
+    }
+    let mut snapped_ask = ((clipped_ask / tick) + 1e-9).floor() * tick;
+    if snapped_ask < passive_ask_limit {
+        snapped_ask = (passive_ask_limit / tick).ceil() * tick;
+    }
+
+    result.applied =
+        (snapped_bid - bid_price).abs() > 1e-9 || (snapped_ask - ask_price).abs() > 1e-9;
+    result.bid_price = snapped_bid.min(passive_bid_limit);
+    result.ask_price = snapped_ask.max(passive_ask_limit);
     result
 }
 
@@ -629,7 +742,14 @@ pub(crate) fn venue_utility_conversion_penalties_enabled() -> bool {
 }
 
 #[inline]
-fn scale_level(level: &mut Option<MmLevel>, factor: f64, venue: &VenueConfig) {
+fn scale_level(
+    level: &mut Option<MmLevel>,
+    factor: f64,
+    venue: &VenueConfig,
+    terminal_reason: &mut &'static str,
+    below_lot_reason: &'static str,
+    below_min_notional_reason: &'static str,
+) {
     if factor >= 1.0 {
         return;
     }
@@ -638,6 +758,11 @@ fn scale_level(level: &mut Option<MmLevel>, factor: f64, venue: &VenueConfig) {
     };
     let scaled = (current.size * factor).min(venue.max_order_size).max(0.0);
     if scaled < venue.lot_size_tao || scaled * current.price < venue.min_notional_usd {
+        *terminal_reason = if scaled < venue.lot_size_tao {
+            below_lot_reason
+        } else {
+            below_min_notional_reason
+        };
         *level = None;
         return;
     }
@@ -666,14 +791,30 @@ fn apply_pre_soft_inventory_taper(
     vcfg: &VenueConfig,
     bid: &mut Option<MmLevel>,
     ask: &mut Option<MmLevel>,
+    bid_terminal_reason: &mut &'static str,
+    ask_terminal_reason: &mut &'static str,
 ) {
     if !decision.pre_soft_taper_active || decision.pre_soft_taper_size_multiplier >= 1.0 {
         return;
     }
 
     match decision.pre_soft_taper_side {
-        Some(Side::Buy) => scale_level(bid, decision.pre_soft_taper_size_multiplier, vcfg),
-        Some(Side::Sell) => scale_level(ask, decision.pre_soft_taper_size_multiplier, vcfg),
+        Some(Side::Buy) => scale_level(
+            bid,
+            decision.pre_soft_taper_size_multiplier,
+            vcfg,
+            bid_terminal_reason,
+            "pre_soft_taper_below_lot",
+            "pre_soft_taper_below_min_notional",
+        ),
+        Some(Side::Sell) => scale_level(
+            ask,
+            decision.pre_soft_taper_size_multiplier,
+            vcfg,
+            ask_terminal_reason,
+            "pre_soft_taper_below_lot",
+            "pre_soft_taper_below_min_notional",
+        ),
         None => {}
     }
 }
@@ -686,30 +827,74 @@ fn apply_venue_utility_tier(
     decision: VenueUtilityDecision,
     bid: &mut Option<MmLevel>,
     ask: &mut Option<MmLevel>,
+    bid_terminal_reason: &mut &'static str,
+    ask_terminal_reason: &mut &'static str,
 ) {
     match decision.tier {
         VenueUtilityTier::Full => {}
         VenueUtilityTier::Reduced => {
-            scale_level(bid, decision.size_multiplier, vcfg);
-            scale_level(ask, decision.size_multiplier, vcfg);
+            scale_level(
+                bid,
+                decision.size_multiplier,
+                vcfg,
+                bid_terminal_reason,
+                "utility_scale_below_lot",
+                "utility_scale_below_min_notional",
+            );
+            scale_level(
+                ask,
+                decision.size_multiplier,
+                vcfg,
+                ask_terminal_reason,
+                "utility_scale_below_lot",
+                "utility_scale_below_min_notional",
+            );
         }
         VenueUtilityTier::AnchorOnly => {
-            scale_level(bid, decision.size_multiplier, vcfg);
-            scale_level(ask, decision.size_multiplier, vcfg);
+            scale_level(
+                bid,
+                decision.size_multiplier,
+                vcfg,
+                bid_terminal_reason,
+                "utility_scale_below_lot",
+                "utility_scale_below_min_notional",
+            );
+            scale_level(
+                ask,
+                decision.size_multiplier,
+                vcfg,
+                ask_terminal_reason,
+                "utility_scale_below_lot",
+                "utility_scale_below_min_notional",
+            );
             match inventory_reducing_side(q_global_tao, vstate.position_tao) {
                 Some(Side::Buy) => {
+                    if ask.is_some() {
+                        *ask_terminal_reason = "anchor_inventory_gate";
+                    }
                     *ask = None;
                 }
                 Some(Side::Sell) => {
+                    if bid.is_some() {
+                        *bid_terminal_reason = "anchor_inventory_gate";
+                    }
                     *bid = None;
                 }
                 None => {
+                    if bid.is_some() {
+                        *bid_terminal_reason = "anchor_inventory_gate";
+                    }
+                    if ask.is_some() {
+                        *ask_terminal_reason = "anchor_inventory_gate";
+                    }
                     *bid = None;
                     *ask = None;
                 }
             }
         }
         VenueUtilityTier::Suppressed => {
+            *bid_terminal_reason = "utility_tier_suppressed";
+            *ask_terminal_reason = "utility_tier_suppressed";
             *bid = None;
             *ask = None;
         }
@@ -1156,7 +1341,24 @@ fn clear_mm_quote_levels(out: &mut [MmQuote]) {
         q.bid = None;
         q.ask = None;
         q.generated_spread_cap_applied = false;
+        q.generated_spread_cap_bid_suppressed = false;
+        q.generated_spread_cap_ask_suppressed = false;
+        q.touch_mode_kind = None;
+        q.bid_terminal_reason = "not_quoted";
+        q.ask_terminal_reason = "not_quoted";
     }
+}
+
+#[inline]
+fn clear_mm_quote_slot(q: &mut MmQuote, reason: &'static str) {
+    q.bid = None;
+    q.ask = None;
+    q.generated_spread_cap_applied = false;
+    q.generated_spread_cap_bid_suppressed = false;
+    q.generated_spread_cap_ask_suppressed = false;
+    q.touch_mode_kind = None;
+    q.bid_terminal_reason = reason;
+    q.ask_terminal_reason = reason;
 }
 
 /// Core MM quoting implementation with scratch buffer reuse.
@@ -1191,6 +1393,11 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
                 bid: None,
                 ask: None,
                 generated_spread_cap_applied: false,
+                generated_spread_cap_bid_suppressed: false,
+                generated_spread_cap_ask_suppressed: false,
+                touch_mode_kind: None,
+                bid_terminal_reason: "not_quoted",
+                ask_terminal_reason: "not_quoted",
             });
         }
     }
@@ -1275,6 +1482,7 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
         // Risk regime flags
         is_warning_regime: matches!(risk_regime, RiskRegime::Warning),
     };
+    let hedge_cost_edge_floor = compute_hedge_cost_edge_floor(cfg, state, s_t);
 
     // Compute per-venue target inventories using scratch buffer (no allocation).
     compute_venue_targets_into(cfg, state, now_ms, &mut scratch.venue_targets);
@@ -1294,9 +1502,12 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
 
         // Disabled venue => no quotes. Opt23: Explicitly clear since no pre-loop reset.
         if matches!(vstate.status, VenueStatus::Disabled) {
-            out[i].bid = None;
-            out[i].ask = None;
-            out[i].generated_spread_cap_applied = false;
+            clear_mm_quote_slot(&mut out[i], "venue_disabled");
+            continue;
+        }
+
+        if vstate.quote_quarantined {
+            clear_mm_quote_slot(&mut out[i], "venue_local_quarantine");
             continue;
         }
 
@@ -1311,26 +1522,20 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
             if let Some(last_update) = vstate.last_mid_update_ms {
                 let age_ms = now - last_update;
                 if age_ms > quote_max_age {
-                    out[i].bid = None;
-                    out[i].ask = None;
-                    out[i].generated_spread_cap_applied = false;
+                    clear_mm_quote_slot(&mut out[i], "book_stale");
                     continue;
                 }
             } else {
                 // No book data yet => skip quoting (fail-closed).
-                out[i].bid = None;
-                out[i].ask = None;
-                out[i].generated_spread_cap_applied = false;
+                clear_mm_quote_slot(&mut out[i], "book_missing");
                 continue;
             }
         }
 
         // Venue mid: prefer local mid if present, else fall back to fair value.
         let mid = vstate.mid.unwrap_or(s_t);
-        if quote_spread_gate_reason(mm_cfg, &vcfg.id, Some(mid), vstate.spread).is_some() {
-            out[i].bid = None;
-            out[i].ask = None;
-            out[i].generated_spread_cap_applied = false;
+        if let Some(reason) = quote_spread_gate_reason(mm_cfg, &vcfg.id, Some(mid), vstate.spread) {
+            clear_mm_quote_slot(&mut out[i], reason);
             continue;
         }
 
@@ -1342,43 +1547,58 @@ fn compute_mm_quotes_impl_with_scratch<const DISABLE_FV: bool, const DISABLE_TOX
             conversion_penalties_enabled,
         );
         if matches!(utility.tier, VenueUtilityTier::Suppressed) {
-            out[i].bid = None;
-            out[i].ask = None;
-            out[i].generated_spread_cap_applied = false;
+            clear_mm_quote_slot(&mut out[i], "utility_tier_suppressed");
             continue;
         }
 
         let funding_8h = funding_rate_for_mm(cfg, vstate, now_ms);
         let (mut bid_edge_threshold, mut ask_edge_threshold) =
             edge_local_min_thresholds(mm_cfg, &vcfg.id);
+        bid_edge_threshold += hedge_cost_edge_floor;
+        ask_edge_threshold += hedge_cost_edge_floor;
         bid_edge_threshold += utility.extra_edge_usd;
         ask_edge_threshold += utility.extra_edge_usd;
-        let (mut bid, mut ask, generated_spread_cap_applied) =
-            compute_single_venue_quotes_fast::<DISABLE_FV, DISABLE_TOX>(
-                mm_cfg,
-                vcfg,
-                vstate,
-                mid,
-                target.q_target,
-                funding_8h,
-                &scalars,
-                bid_edge_threshold,
-                ask_edge_threshold,
-            );
+        let mut quote_result = compute_single_venue_quotes_fast::<DISABLE_FV, DISABLE_TOX>(
+            mm_cfg,
+            vcfg,
+            vstate,
+            mid,
+            target.q_target,
+            funding_8h,
+            &scalars,
+            bid_edge_threshold,
+            ask_edge_threshold,
+        );
         apply_venue_utility_tier(
             state.q_global_tao,
             vcfg,
             vstate,
             utility,
-            &mut bid,
-            &mut ask,
+            &mut quote_result.bid,
+            &mut quote_result.ask,
+            &mut quote_result.bid_terminal_reason,
+            &mut quote_result.ask_terminal_reason,
         );
-        apply_pre_soft_inventory_taper(utility, vcfg, &mut bid, &mut ask);
+        apply_pre_soft_inventory_taper(
+            utility,
+            vcfg,
+            &mut quote_result.bid,
+            &mut quote_result.ask,
+            &mut quote_result.bid_terminal_reason,
+            &mut quote_result.ask_terminal_reason,
+        );
 
         // Update in place (stable slots: venue_id already set, just update bid/ask).
-        out[i].bid = bid;
-        out[i].ask = ask;
-        out[i].generated_spread_cap_applied = generated_spread_cap_applied;
+        out[i].bid = quote_result.bid;
+        out[i].ask = quote_result.ask;
+        out[i].generated_spread_cap_applied = quote_result.generated_spread_cap_applied;
+        out[i].generated_spread_cap_bid_suppressed =
+            quote_result.generated_spread_cap_bid_suppressed;
+        out[i].generated_spread_cap_ask_suppressed =
+            quote_result.generated_spread_cap_ask_suppressed;
+        out[i].touch_mode_kind = quote_result.touch_mode_kind;
+        out[i].bid_terminal_reason = quote_result.bid_terminal_reason;
+        out[i].ask_terminal_reason = quote_result.ask_terminal_reason;
     }
 }
 
@@ -1448,6 +1668,48 @@ fn compute_maker_cost(vcfg: &VenueConfig, price: f64) -> f64 {
     (fee_rate - rebate_rate) * price
 }
 
+/// Estimate the cheapest currently available taker hedge/forced-unwind cost.
+///
+/// This is env-gated through `PARAPHINA_MM_HEDGE_COST_EDGE_MULT` and defaults
+/// to zero impact. When enabled it prevents passive MM quotes from clearing at
+/// maker-fee breakeven while the controller later pays taker/exit costs.
+#[inline]
+fn compute_hedge_cost_edge_floor(cfg: &Config, state: &GlobalState, fallback_price: f64) -> f64 {
+    let mult = cfg.mm.hedge_cost_edge_mult.max(0.0);
+    if mult <= 0.0 {
+        return 0.0;
+    }
+
+    let mut best_cost = f64::INFINITY;
+    for (i, vcfg) in cfg.venues.iter().enumerate() {
+        if !vcfg.is_hedge_allowed {
+            continue;
+        }
+        let Some(vstate) = state.venues.get(i) else {
+            continue;
+        };
+        if !matches!(vstate.status, VenueStatus::Healthy) {
+            continue;
+        }
+        let mid = vstate.mid.unwrap_or(fallback_price);
+        if !mid.is_finite() || mid <= 0.0 {
+            continue;
+        }
+        let spread = vstate.spread.unwrap_or(0.0).max(0.0);
+        let taker_fee = (vcfg.taker_fee_bps / 10_000.0).abs() * mid;
+        let cost = 0.5 * spread + taker_fee + cfg.hedge.slippage_buffer.max(0.0);
+        if cost.is_finite() && cost >= 0.0 {
+            best_cost = best_cost.min(cost);
+        }
+    }
+
+    if best_cost.is_finite() {
+        mult * best_cost
+    } else {
+        0.0
+    }
+}
+
 /// Optimized single-venue quote computation using precomputed tick scalars.
 ///
 /// This is the hot-path version that avoids repeated config lookups by using
@@ -1467,30 +1729,66 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     sc: &TickScalars,
     bid_edge_threshold: f64,
     ask_edge_threshold: f64,
-) -> (Option<MmLevel>, Option<MmLevel>, bool) {
+) -> SingleVenueQuoteResult {
     // ---------------------------------------------------------------------
     // 0) Venue-level gating
     // ---------------------------------------------------------------------
 
     // If the venue is Disabled, no quoting (unless toxicity gating is disabled).
     if !DISABLE_TOX && matches!(vstate.status, VenueStatus::Disabled) {
-        return (None, None, false);
+        return single_venue_quote_result(
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            "venue_disabled",
+            "venue_disabled",
+        );
     }
 
     // If liquidation distance is below critical, do not quote at all.
     let dist_liq = vstate.dist_liq_sigma;
     if dist_liq <= sc.liq_crit_sigma {
-        return (None, None, false);
+        return single_venue_quote_result(
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            "liq_critical",
+            "liq_critical",
+        );
     }
 
     // Toxicity gating: if toxicity >= TOX_HIGH_THRESHOLD, skip venue.
     if !DISABLE_TOX && vstate.toxicity >= sc.tox_high_threshold {
-        return (None, None, false);
+        return single_venue_quote_result(
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            "toxicity_high",
+            "toxicity_high",
+        );
     }
 
     // Stale book check: if we have no mid or it's stale, don't quote.
     if vstate.mid.is_none() && !DISABLE_FV {
-        return (None, None, false);
+        return single_venue_quote_result(
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            "mid_missing",
+            "mid_missing",
+        );
     }
 
     // Check for valid spread/depth.
@@ -1501,7 +1799,16 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
         vstate.depth_near_mid
     };
     if spread <= 0.0 || depth <= 0.0 {
-        return (None, None, false);
+        return single_venue_quote_result(
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            "invalid_book",
+            "invalid_book",
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1544,7 +1851,16 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     }
 
     if bid_half_spread <= 0.0 && ask_half_spread <= 0.0 {
-        return (None, None, false);
+        return single_venue_quote_result(
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            "degenerate_half_spread",
+            "degenerate_half_spread",
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1617,10 +1933,24 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     );
     bid_price = aster_touch_local.bid_price;
     ask_price = aster_touch_local.ask_price;
+    let mut touch_mode_kind = if aster_touch_local.applied {
+        Some(TOUCH_MODE_ASTER_FILL)
+    } else {
+        None
+    };
 
     // Sanity checks.
     if bid_price <= 0.0 || ask_price <= bid_price {
-        return (None, None, false);
+        return single_venue_quote_result(
+            None,
+            None,
+            false,
+            false,
+            false,
+            touch_mode_kind,
+            "invalid_quote_pair",
+            "invalid_quote_pair",
+        );
     }
 
     let generated_spread_cap = apply_generated_spread_cap(
@@ -1641,7 +1971,36 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     let suppress_ask_from_generated_spread_cap = generated_spread_cap.suppress_ask;
 
     if suppress_bid_from_generated_spread_cap && suppress_ask_from_generated_spread_cap {
-        return (None, None, generated_spread_cap_applied);
+        return single_venue_quote_result(
+            None,
+            None,
+            generated_spread_cap_applied,
+            suppress_bid_from_generated_spread_cap,
+            suppress_ask_from_generated_spread_cap,
+            touch_mode_kind,
+            "generated_spread_cap_suppress_bid",
+            "generated_spread_cap_suppress_ask",
+        );
+    }
+
+    let hyperliquid_touch_clip = apply_hyperliquid_touch_clip(
+        mm_cfg,
+        vcfg,
+        vstate,
+        mid,
+        spread,
+        tick,
+        best_bid,
+        best_ask,
+        passive_bid_limit,
+        passive_ask_limit,
+        bid_price,
+        ask_price,
+    );
+    bid_price = hyperliquid_touch_clip.bid_price;
+    ask_price = hyperliquid_touch_clip.ask_price;
+    if hyperliquid_touch_clip.applied {
+        touch_mode_kind = Some(TOUCH_MODE_HYPERLIQUID_CLIP);
     }
 
     // ---------------------------------------------------------------------
@@ -1654,6 +2013,16 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
 
     let bid_edge_ok = edge_bid >= bid_edge_threshold;
     let ask_edge_ok = edge_ask >= ask_edge_threshold;
+    let mut bid_terminal_reason = if bid_edge_ok {
+        "active"
+    } else {
+        "edge_below_min"
+    };
+    let mut ask_terminal_reason = if ask_edge_ok {
+        "active"
+    } else {
+        "edge_below_min"
+    };
 
     // ---------------------------------------------------------------------
     // 5) Size model (Section 10)
@@ -1739,15 +2108,30 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     let delta_ratio = (sc.delta_abs_usd / sc.delta_limit_usd).max(0.0);
 
     if delta_ratio >= 2.0 {
-        return (None, None, generated_spread_cap_applied);
+        return single_venue_quote_result(
+            None,
+            None,
+            generated_spread_cap_applied,
+            suppress_bid_from_generated_spread_cap,
+            suppress_ask_from_generated_spread_cap,
+            touch_mode_kind,
+            "delta_limit_block",
+            "delta_limit_block",
+        );
     } else if delta_ratio > 1.0 {
         let factor = (2.0 - delta_ratio).clamp(0.0, 1.0);
 
         if sc.q_global > 0.0 {
             size_bid = 0.0;
+            if bid_edge_ok {
+                bid_terminal_reason = "delta_directional_block_long";
+            }
             size_ask *= factor;
         } else if sc.q_global < 0.0 {
             size_ask = 0.0;
+            if ask_edge_ok {
+                ask_terminal_reason = "delta_directional_block_short";
+            }
             size_bid *= factor;
         } else {
             size_bid *= factor;
@@ -1761,6 +2145,11 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
         size_ask = size_ask.min(sc.q_warn_cap);
     }
 
+    if let Some(max_quote_size_tao) = mm_cfg.max_quote_size_tao_for(&vcfg.id) {
+        size_bid = size_bid.min(max_quote_size_tao);
+        size_ask = size_ask.min(max_quote_size_tao);
+    }
+
     // Hard cap by venue max size.
     size_bid = size_bid.min(vcfg.max_order_size);
     size_ask = size_ask.min(vcfg.max_order_size);
@@ -1772,9 +2161,11 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
 
     if suppress_bid_from_generated_spread_cap {
         size_bid = 0.0;
+        bid_terminal_reason = "generated_spread_cap_suppress_bid";
     }
     if suppress_ask_from_generated_spread_cap {
         size_ask = 0.0;
+        ask_terminal_reason = "generated_spread_cap_suppress_ask";
     }
 
     // Check minimum size.
@@ -1800,10 +2191,28 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
 
     let cap_applied = generated_spread_cap_applied;
     if cap_applied && bid.is_none() && ask.is_none() {
-        return (None, None, generated_spread_cap_applied);
+        return single_venue_quote_result(
+            None,
+            None,
+            generated_spread_cap_applied,
+            suppress_bid_from_generated_spread_cap,
+            suppress_ask_from_generated_spread_cap,
+            touch_mode_kind,
+            bid_terminal_reason,
+            ask_terminal_reason,
+        );
     }
 
-    (bid, ask, generated_spread_cap_applied)
+    single_venue_quote_result(
+        bid,
+        ask,
+        generated_spread_cap_applied,
+        suppress_bid_from_generated_spread_cap,
+        suppress_ask_from_generated_spread_cap,
+        touch_mode_kind,
+        bid_terminal_reason,
+        ask_terminal_reason,
+    )
 }
 
 /// Compute bid/ask for a single venue using an Avellaneda–Stoikov-style
@@ -3823,6 +4232,40 @@ mod tests {
     }
 
     #[test]
+    fn hedge_cost_edge_floor_suppresses_unprofitable_mm_quotes_when_enabled() {
+        let (mut cfg, state) = setup_test();
+        let aster_idx = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "aster")
+            .expect("aster venue");
+
+        cfg.mm.edge_local_min = 0.05;
+        cfg.mm.hedge_cost_edge_mult = 0.0;
+        let baseline_quotes = compute_mm_quotes(&cfg, &state);
+        let baseline_aster = &baseline_quotes[aster_idx];
+        let baseline_bid = baseline_aster.bid.as_ref().expect("baseline bid");
+        let baseline_ask = baseline_aster.ask.as_ref().expect("baseline ask");
+
+        cfg.mm.hedge_cost_edge_mult = 1.0;
+        let cost_aware_quotes = compute_mm_quotes(&cfg, &state);
+        let cost_aware_aster = &cost_aware_quotes[aster_idx];
+
+        assert!(
+            baseline_bid.size >= cfg.venues[aster_idx].lot_size_tao,
+            "baseline bid should clear lot size"
+        );
+        assert!(
+            baseline_ask.size >= cfg.venues[aster_idx].lot_size_tao,
+            "baseline ask should clear lot size"
+        );
+        assert!(
+            cost_aware_aster.bid.is_none() && cost_aware_aster.ask.is_none(),
+            "hedge-cost floor should suppress passive quotes that cannot cover modeled exit cost"
+        );
+    }
+
+    #[test]
     fn test_venue_targets_computed_from_depth() {
         let (cfg, mut state) = setup_test();
 
@@ -4209,6 +4652,11 @@ mod tests {
                 bid: None,
                 ask: None,
                 generated_spread_cap_applied: false,
+                generated_spread_cap_bid_suppressed: false,
+                generated_spread_cap_ask_suppressed: false,
+                touch_mode_kind: None,
+                bid_terminal_reason: "not_quoted",
+                ask_terminal_reason: "not_quoted",
             });
         }
 
@@ -4263,6 +4711,11 @@ mod tests {
                 bid: None,
                 ask: None,
                 generated_spread_cap_applied: false,
+                generated_spread_cap_bid_suppressed: false,
+                generated_spread_cap_ask_suppressed: false,
+                touch_mode_kind: None,
+                bid_terminal_reason: "not_quoted",
+                ask_terminal_reason: "not_quoted",
             });
         }
 
@@ -4317,6 +4770,11 @@ mod tests {
                 bid: None,
                 ask: None,
                 generated_spread_cap_applied: false,
+                generated_spread_cap_bid_suppressed: false,
+                generated_spread_cap_ask_suppressed: false,
+                touch_mode_kind: None,
+                bid_terminal_reason: "not_quoted",
+                ask_terminal_reason: "not_quoted",
             });
         }
 
@@ -4417,6 +4875,9 @@ mod tests {
     fn generated_spread_cap_compresses_aster_quotes() {
         let (mut cfg, mut state) = setup_test();
         cfg.mm
+            .venue_role_by_venue
+            .insert("aster".to_string(), MmVenueRole::Probationary);
+        cfg.mm
             .max_generated_quote_spread_bps_by_venue
             .insert("aster".to_string(), 10.0);
         cfg.mm
@@ -4514,6 +4975,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hyperliquid_touch_clip_limits_quotes_to_within_eight_ticks() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .venue_role_by_venue
+            .insert("hyperliquid".to_string(), MmVenueRole::Probationary);
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "hyperliquid")
+            .expect("hyperliquid venue in config");
+        let vcfg = &cfg.venues[venue_index];
+        let tick = vcfg.tick_size.max(1e-6);
+        let best_bid = 2_167.00;
+        let best_ask = 2_167.10;
+        let passive_bid_limit = best_bid - tick;
+        let passive_ask_limit = best_ask + tick;
+
+        state.venues[venue_index].status = VenueStatus::Healthy;
+        state.venues[venue_index].toxicity = 0.0;
+
+        let result = apply_hyperliquid_touch_clip(
+            &cfg.mm,
+            vcfg,
+            &state.venues[venue_index],
+            (best_bid + best_ask) * 0.5,
+            best_ask - best_bid,
+            tick,
+            best_bid,
+            best_ask,
+            passive_bid_limit,
+            passive_ask_limit,
+            best_bid - (22.0 * tick),
+            best_ask + (18.0 * tick),
+        );
+
+        assert!(result.applied, "expected Hyperliquid touch clip to bind");
+        let bid_offset_ticks = (best_bid - result.bid_price) / tick;
+        let ask_offset_ticks = (result.ask_price - best_ask) / tick;
+        assert!(
+            bid_offset_ticks <= HYPERLIQUID_TOUCH_CLIP_MAX_TICKS + 1e-9,
+            "bid offset {} should be clipped to <= {} ticks",
+            bid_offset_ticks,
+            HYPERLIQUID_TOUCH_CLIP_MAX_TICKS
+        );
+        assert!(
+            ask_offset_ticks <= HYPERLIQUID_TOUCH_CLIP_MAX_TICKS + 1e-9,
+            "ask offset {} should be clipped to <= {} ticks",
+            ask_offset_ticks,
+            HYPERLIQUID_TOUCH_CLIP_MAX_TICKS
+        );
+        assert!(
+            result.bid_price <= passive_bid_limit && result.ask_price >= passive_ask_limit,
+            "clip must preserve passive placement"
+        );
+    }
+
+    #[test]
+    fn hyperliquid_touch_clip_marks_quotes_with_touch_mode_kind() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .venue_role_by_venue
+            .insert("hyperliquid".to_string(), MmVenueRole::Probationary);
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "hyperliquid")
+            .expect("hyperliquid venue in config");
+        state.venues[venue_index].status = VenueStatus::Healthy;
+        state.venues[venue_index].toxicity = 0.0;
+        let best_bid = 299.95;
+        let best_ask = 300.05;
+        let tick = cfg.venues[venue_index].tick_size;
+
+        let result = apply_hyperliquid_touch_clip(
+            &cfg.mm,
+            &cfg.venues[venue_index],
+            &state.venues[venue_index],
+            300.0,
+            0.10,
+            tick,
+            best_bid,
+            best_ask,
+            best_bid - tick,
+            best_ask + tick,
+            best_bid - (16.0 * tick),
+            best_ask + (12.0 * tick),
+        );
+        let touch_mode_kind = if result.applied {
+            Some(TOUCH_MODE_HYPERLIQUID_CLIP)
+        } else {
+            None
+        };
+
+        assert_eq!(touch_mode_kind, Some(TOUCH_MODE_HYPERLIQUID_CLIP));
+        assert!((best_bid - result.bid_price) / tick <= HYPERLIQUID_TOUCH_CLIP_MAX_TICKS + 1e-9);
+        assert!((result.ask_price - best_ask) / tick <= HYPERLIQUID_TOUCH_CLIP_MAX_TICKS + 1e-9);
+    }
+
     /// Milestone F: Quote staleness guard prevents quoting on stale venue data.
     #[test]
     fn quote_staleness_guard_skips_stale_venues() {
@@ -4601,6 +5163,12 @@ mod tests {
     #[test]
     fn aster_pre_soft_taper_scales_only_worsening_side_on_venue_inventory() {
         let (mut cfg, mut state) = setup_test();
+        cfg.mm
+            .edge_local_min_bid_by_venue
+            .insert("aster".to_string(), 0.45);
+        cfg.mm
+            .edge_local_min_ask_by_venue
+            .insert("aster".to_string(), 0.45);
         let baseline_cfg = cfg.clone();
         cfg.mm
             .pre_soft_taper_venue_position_tao_by_venue
@@ -4643,6 +5211,12 @@ mod tests {
     #[test]
     fn aster_pre_soft_taper_scales_only_worsening_side_on_global_inventory() {
         let (mut cfg, mut state) = setup_test();
+        cfg.mm
+            .edge_local_min_bid_by_venue
+            .insert("aster".to_string(), 0.45);
+        cfg.mm
+            .edge_local_min_ask_by_venue
+            .insert("aster".to_string(), 0.45);
         let baseline_cfg = cfg.clone();
         cfg.mm
             .pre_soft_taper_global_position_tao_by_venue

@@ -739,6 +739,80 @@ def seed_state_source_age_from_path(state: "WatchState", telemetry_path: Path) -
     state._last_update_mono = max(0.0, time.monotonic() - age_s)
 
 
+def _safe_float_from_any(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _load_balance_pnl_state(run_dir: Path) -> BalancePnlState:
+    comparison_path = run_dir / "balance_snapshot_comparison.json"
+    if comparison_path.exists():
+        try:
+            payload = json.loads(comparison_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return BalancePnlState(status="unreadable", source_path=str(comparison_path))
+        total = payload.get("total") if isinstance(payload, dict) else None
+        total = total if isinstance(total, dict) else {}
+        return BalancePnlState(
+            status="available",
+            delta_usd=_safe_float_from_any(total.get("delta_usd")),
+            pre_usd=_safe_float_from_any(total.get("pre_usd")),
+            post_usd=_safe_float_from_any(total.get("post_usd")),
+            venue_count=safe_int(payload.get("venue_count")) if isinstance(payload, dict) else None,
+            generated_at_utc=(
+                str(payload.get("generated_at_utc"))
+                if isinstance(payload, dict) and payload.get("generated_at_utc") is not None
+                else None
+            ),
+            source_path=str(comparison_path),
+        )
+
+    pre_snapshot_path = run_dir / "balance_pre_snapshot.json"
+    if pre_snapshot_path.exists():
+        try:
+            payload = json.loads(pre_snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return BalancePnlState(status="pending_post", source_path=str(pre_snapshot_path))
+        return BalancePnlState(
+            status="pending_post",
+            pre_usd=_safe_float_from_any(payload.get("total_balance_usd")) if isinstance(payload, dict) else None,
+            venue_count=safe_int(payload.get("venue_count")) if isinstance(payload, dict) else None,
+            generated_at_utc=(
+                str(payload.get("captured_at_utc"))
+                if isinstance(payload, dict) and payload.get("captured_at_utc") is not None
+                else None
+            ),
+            source_path=str(pre_snapshot_path),
+        )
+    return BalancePnlState(status="missing")
+
+
+def refresh_balance_pnl_from_run_dir(
+    state: "WatchState",
+    run_dir: Path,
+    *,
+    now_mono: float | None = None,
+    force: bool = False,
+) -> None:
+    now = time.monotonic() if now_mono is None else now_mono
+    run_dir_text = str(run_dir)
+    if (
+        not force
+        and state.balance_pnl_run_dir == run_dir_text
+        and now - state._balance_pnl_last_refresh_mono < 1.0
+    ):
+        return
+    state.balance_pnl = _load_balance_pnl_state(run_dir)
+    state.balance_pnl_run_dir = run_dir_text
+    state._balance_pnl_last_refresh_mono = now
+
+
 def format_num(value: Any, width: int = 8) -> str:
     if value is None:
         return " " * (width - 3) + "n/a"
@@ -1073,6 +1147,17 @@ class TapeEvent:
 
 
 @dataclass
+class BalancePnlState:
+    status: str = "missing"
+    delta_usd: float | None = None
+    pre_usd: float | None = None
+    post_usd: float | None = None
+    venue_count: int | None = None
+    generated_at_utc: str | None = None
+    source_path: str | None = None
+
+
+@dataclass
 class WatchState:
     sort_mode: str = "agee"
     flash_ttl_s: float = 0.65
@@ -1094,7 +1179,30 @@ class WatchState:
     rx_rate_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
     pnl_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
     pos_history: Deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    run_fill_count: int = 0
+    run_base_volume: float = 0.0
+    run_notional_volume: float = 0.0
+    run_fill_count_by_venue: dict[str, int] = field(default_factory=dict)
+    run_base_volume_by_venue: dict[str, float] = field(default_factory=dict)
+    run_notional_volume_by_venue: dict[str, float] = field(default_factory=dict)
+    aster_guard_enabled: bool = False
+    aster_guard_decision: str | None = None
+    aster_guard_reason: str | None = None
+    aster_guard_age_ms: int | None = None
+    aster_guard_adverse_usd: float | None = None
+    aster_guard_unrealised_usd: float | None = None
+    aster_guard_cleanup_fee_usd: float | None = None
+    aster_guard_allowed_orders: int = 0
+    aster_guard_suppressed_orders: int = 0
+    aster_guard_refresh_attempted: bool = False
+    aster_guard_refresh_outcome: str | None = None
+    aster_guard_refresh_latency_ms: int | None = None
+    aster_guard_fresh_account_age_ms: int | None = None
+    aster_guard_refresh_suppressed_reason: str | None = None
     rx_rate_ema: float | None = None
+    balance_pnl: BalancePnlState = field(default_factory=BalancePnlState)
+    balance_pnl_run_dir: str | None = None
+    _balance_pnl_last_refresh_mono: float = 0.0
     _last_update_mono: float | None = None
     tick_count: int = 0
     prev_venue_status: dict[str, str] = field(default_factory=dict)
@@ -1109,6 +1217,7 @@ class WatchState:
     runner_status: RunnerStatus | None = None
     _seen_event_ids: Deque[str] = field(default_factory=deque)
     _seen_event_set: set[str] = field(default_factory=set)
+    _seen_fill_volume_ids: set[str] = field(default_factory=set)
 
     def _remember_event_id(self, event_id: str) -> bool:
         if event_id in self._seen_event_set:
@@ -1258,24 +1367,73 @@ class WatchState:
                 self._append_series(self.rx_rate_history, self.rx_rate_ema)
         self._last_update_mono = now_mono
 
-        pnl_value = _pick_number(
-            [record],
-            (
-                "pnl_total_usd",
-                "pnl_usd",
-                "unrealized_pnl_usd",
-            ),
-        )
-        pos_value = _pick_number(
-            [record],
-            (
-                "q_global_tao",
-                "net_position_tao",
-                "position_tao",
-            ),
-        )
+        pnl_value = _extract_pnl_usd(record)
+        pos_value = _extract_net_pos_base(record)
         self._append_series(self.pnl_history, pnl_value)
         self._append_series(self.pos_history, pos_value)
+
+        emergency_residual_fallback = record.get("emergency_residual_fallback")
+        aster_guard = (
+            emergency_residual_fallback.get("aster_residual_markout_guard")
+            if isinstance(emergency_residual_fallback, dict)
+            else None
+        )
+        if isinstance(aster_guard, dict):
+            self.aster_guard_enabled = bool(aster_guard.get("enabled"))
+            decision = aster_guard.get("decision")
+            reason = aster_guard.get("reason")
+            self.aster_guard_decision = decision if isinstance(decision, str) else None
+            self.aster_guard_reason = reason if isinstance(reason, str) else None
+            self.aster_guard_age_ms = safe_int(aster_guard.get("residual_age_ms"))
+            self.aster_guard_adverse_usd = safe_float(
+                aster_guard.get("adverse_markout_usd")
+            )
+            self.aster_guard_unrealised_usd = safe_float(
+                aster_guard.get("residual_unrealised_usd")
+            )
+            self.aster_guard_cleanup_fee_usd = safe_float(
+                aster_guard.get("cleanup_fee_estimate_usd")
+            )
+            self.aster_guard_allowed_orders = (
+                safe_int(aster_guard.get("allowed_orders")) or 0
+            )
+            self.aster_guard_suppressed_orders = (
+                safe_int(aster_guard.get("suppressed_orders")) or 0
+            )
+            self.aster_guard_refresh_attempted = bool(
+                aster_guard.get("refresh_attempted")
+            )
+            refresh_outcome = aster_guard.get("refresh_outcome")
+            self.aster_guard_refresh_outcome = (
+                refresh_outcome if isinstance(refresh_outcome, str) else None
+            )
+            self.aster_guard_refresh_latency_ms = safe_int(
+                aster_guard.get("refresh_latency_ms")
+            )
+            self.aster_guard_fresh_account_age_ms = safe_int(
+                aster_guard.get("fresh_account_age_ms")
+            )
+            refresh_suppressed_reason = aster_guard.get("refresh_suppressed_reason")
+            self.aster_guard_refresh_suppressed_reason = (
+                refresh_suppressed_reason
+                if isinstance(refresh_suppressed_reason, str)
+                else None
+            )
+        else:
+            self.aster_guard_enabled = False
+            self.aster_guard_decision = None
+            self.aster_guard_reason = None
+            self.aster_guard_age_ms = None
+            self.aster_guard_adverse_usd = None
+            self.aster_guard_unrealised_usd = None
+            self.aster_guard_cleanup_fee_usd = None
+            self.aster_guard_allowed_orders = 0
+            self.aster_guard_suppressed_orders = 0
+            self.aster_guard_refresh_attempted = False
+            self.aster_guard_refresh_outcome = None
+            self.aster_guard_refresh_latency_ms = None
+            self.aster_guard_fresh_account_age_ms = None
+            self.aster_guard_refresh_suppressed_reason = None
 
         risk_events = record.get("risk_events", [])
         if isinstance(risk_events, list):
@@ -1353,11 +1511,33 @@ class WatchState:
                         else "n/a"
                     )
                     fill_text = f"{venue_id} {side} {size}@{price} age={age}"
-                    self.events.fills.appendleft(fill_text)
                     fill_key = (
                         f"fill:{fill.get('id') or fill.get('order_id') or fill_idx}:"
                         f"{venue_id}:{side}:{size}:{price}:{fill_time}"
                     )
+                    if fill_key not in self._seen_fill_volume_ids:
+                        self._seen_fill_volume_ids.add(fill_key)
+                        size_f = safe_float(size)
+                        price_f = safe_float(price)
+                        if size_f is not None:
+                            abs_size = abs(size_f)
+                            self.run_fill_count += 1
+                            self.run_base_volume += abs_size
+                            self.run_fill_count_by_venue[venue_id] = (
+                                self.run_fill_count_by_venue.get(venue_id, 0) + 1
+                            )
+                            self.run_base_volume_by_venue[venue_id] = (
+                                self.run_base_volume_by_venue.get(venue_id, 0.0)
+                                + abs_size
+                            )
+                            if price_f is not None:
+                                notional = abs_size * price_f
+                                self.run_notional_volume += notional
+                                self.run_notional_volume_by_venue[venue_id] = (
+                                    self.run_notional_volume_by_venue.get(venue_id, 0.0)
+                                    + notional
+                                )
+                    self.events.fills.appendleft(fill_text)
                     self._append_tape(
                         event_id=fill_key,
                         kind="buy" if side == "BUY" else "sell" if side == "SELL" else "warn",
@@ -1771,6 +1951,17 @@ def _extract_net_pos_usd(record: dict[str, Any]) -> float | None:
     )
 
 
+def _extract_net_pos_base(record: dict[str, Any]) -> float | None:
+    return _pick_number(
+        [record],
+        (
+            "q_global_tao",
+            "net_position_tao",
+            "position_tao",
+        ),
+    )
+
+
 def _extract_max_pos_cap_usd(record: dict[str, Any]) -> float | None:
     return _pick_number(
         [record],
@@ -1804,7 +1995,35 @@ def _extract_pnl_usd(record: dict[str, Any]) -> float | None:
 def _format_signed_dollars(value: float | None) -> str:
     if value is None:
         return "n/a"
-    return f"{int(round(value)):+,d}"
+    if abs(value) < 1.0:
+        return f"{value:+.4f}"
+    return f"{value:+,.2f}"
+
+
+def _format_balance_pnl_short(state: BalancePnlState) -> str:
+    if state.status == "available":
+        return _format_signed_dollars(state.delta_usd)
+    if state.status == "pending_post":
+        return "pending"
+    if state.status == "unreadable":
+        return "error"
+    return "n/a"
+
+
+def _balance_pnl_style(state: BalancePnlState) -> str:
+    if state.status == "available":
+        if state.delta_usd is None:
+            return "dim"
+        if state.delta_usd > 0:
+            return "green"
+        if state.delta_usd < 0:
+            return "red"
+        return "white"
+    if state.status == "pending_post":
+        return "yellow"
+    if state.status == "unreadable":
+        return "bold red"
+    return "dim"
 
 
 def _delta_pct_style(value: float | None) -> str:
@@ -1946,6 +2165,9 @@ def _build_frame_key(state: WatchState, now_mono: float) -> tuple[Any, ...]:
             ),
             _quantize_for_key(_extract_net_pos_usd(record), 0),
             _quantize_for_key(_extract_max_pos_cap_usd(record), 0),
+            _quantize_for_key(_extract_pnl_usd(record), 4),
+            state.balance_pnl.status,
+            _quantize_for_key(state.balance_pnl.delta_usd, 4),
         )
 
     venue_status = record.get("venue_status", [])
@@ -2033,6 +2255,9 @@ def _build_frame_key(state: WatchState, now_mono: float) -> tuple[Any, ...]:
         latest_tape.ts_ms if latest_tape else None,
         state.active_tab,
         now_mono < state.show_vn_map_until,
+        _quantize_for_key(_extract_pnl_usd(record), 4),
+        state.balance_pnl.status,
+        _quantize_for_key(state.balance_pnl.delta_usd, 4),
     )
 
 
@@ -2059,13 +2284,61 @@ def _format_pnl_short(value: float | None) -> str:
         return "—"
     if abs(value) >= 1000:
         return f"{value/1000.0:+.1f}k"
-    return f"{value:+.0f}"
+    if abs(value) < 1.0:
+        return f"{value:+.4f}"
+    return f"{value:+.2f}"
 
 
 def _format_pos_short(value: float | None) -> str:
     if value is None:
         return "—"
     return f"{value:+.3f}"
+
+
+def _format_base_volume_short(value: float) -> str:
+    if value >= 100:
+        return f"{value:,.1f}"
+    if value >= 10:
+        return f"{value:.2f}"
+    return f"{value:.4f}"
+
+
+def _format_notional_short(value: float) -> str:
+    if value >= 1_000_000:
+        return f"${value / 1_000_000.0:.2f}m"
+    if value >= 1000:
+        return f"${value / 1000.0:.2f}k"
+    return f"${value:.2f}"
+
+
+def _format_aster_guard_short(state: WatchState) -> str | None:
+    if not state.aster_guard_enabled:
+        return None
+    decision = state.aster_guard_decision or "armed"
+    reason = state.aster_guard_reason or "no_decision"
+    adverse = _format_pnl_short(state.aster_guard_adverse_usd)
+    age = _format_ms_short(float(state.aster_guard_age_ms) if state.aster_guard_age_ms is not None else None)
+    refresh = ""
+    if state.aster_guard_refresh_outcome:
+        refresh_latency = _format_ms_short(
+            float(state.aster_guard_refresh_latency_ms)
+            if state.aster_guard_refresh_latency_ms is not None
+            else None
+        )
+        refresh_age = _format_ms_short(
+            float(state.aster_guard_fresh_account_age_ms)
+            if state.aster_guard_fresh_account_age_ms is not None
+            else None
+        )
+        refresh = (
+            f" refresh={state.aster_guard_refresh_outcome}"
+            f"/{refresh_latency} acct_age={refresh_age}"
+        )
+    return (
+        f"{decision}:{reason} adv={adverse} age={age} "
+        f"a/s={state.aster_guard_allowed_orders}/{state.aster_guard_suppressed_orders}"
+        f"{refresh}"
+    )
 
 
 def _format_mid_cell(value: float | None) -> str:
@@ -2274,7 +2547,7 @@ def render_frame_expanded(
     )
 
     legend_line = Text(
-        "ageE(ts→rx)  ageA(rx→publish)  stale%=pct beyond SLA  flips=mid flips  Δmid(bps)=mid−median(mid_all)",
+        "ageE(ts→rx)  ageA(rx→publish)  stale%=pct beyond SLA  flips=mid flips  Δmid(bps)=mid−median(mid_all)  bPNL=balance pre/post",
         style="dim",
     )
 
@@ -2282,7 +2555,6 @@ def render_frame_expanded(
     sys_age_e_now = worst_age_e["age_e"] if worst_age_e else None
     sys_dmid_now = abs(float(worst_dmid["delta_mid_bps"])) if worst_dmid else None
     rx_now = state.rx_rate_history[-1] if state.rx_rate_history else None
-    pnl_now = state.pnl_history[-1] if state.pnl_history else None
     pos_now = state.pos_history[-1] if state.pos_history else None
     flat_hist = [0.0] * max(4, spark_w)
 
@@ -2305,18 +2577,26 @@ def render_frame_expanded(
     seg3.append(_sparkline(list(state.rx_rate_history), width=spark_w), style="cyan")
     graph_segments.append(seg3)
 
-    seg4 = Text("PNL ", style="dim")
+    seg4 = Text("bPNL ", style="dim")
     if in_shadow:
         seg4.append("— (shadow)", style="dim")
         seg4.append(" ")
         seg4.append(_sparkline(flat_hist, width=spark_w), style="dim")
+    elif state.balance_pnl.status in {"available", "pending_post", "unreadable"}:
+        seg4.append(
+            _format_balance_pnl_short(state.balance_pnl),
+            style=_balance_pnl_style(state.balance_pnl),
+        )
+        seg4.append(" ")
+        seg4.append("balances", style="dim")
     else:
+        pnl_now = state.pnl_history[-1] if state.pnl_history else None
         seg4.append(_format_pnl_short(pnl_now), style="white")
         seg4.append(" ")
-        seg4.append(_sparkline(list(state.pnl_history), width=spark_w), style="cyan")
+        seg4.append("tPNL", style="dim")
     graph_segments.append(seg4)
 
-    seg5 = Text("POS ", style="dim")
+    seg5 = Text("POSb ", style="dim")
     if in_shadow:
         seg5.append("— (shadow)", style="dim")
         seg5.append(" ")
@@ -2326,6 +2606,14 @@ def render_frame_expanded(
         seg5.append(" ")
         seg5.append(_sparkline(list(state.pos_history), width=spark_w), style="cyan")
     graph_segments.append(seg5)
+
+    seg6 = Text("sVOL ", style="dim")
+    seg6.append(str(state.run_fill_count), style="white")
+    seg6.append("f ", style="dim")
+    seg6.append(_format_base_volume_short(state.run_base_volume), style="white")
+    seg6.append("e ", style="dim")
+    seg6.append(_format_notional_short(state.run_notional_volume), style="white")
+    graph_segments.append(seg6)
 
     graph_line = Text()
     for idx, segment in enumerate(graph_segments):
@@ -2364,6 +2652,17 @@ def render_frame_expanded(
         status_strip.append("—", style="dim")
     status_strip.append(f"  cap {cap_hits}", style="dim")
     status_strip.append(f"  recon {recon_total}", style="dim")
+    aster_guard_text = _format_aster_guard_short(state)
+    if aster_guard_text:
+        guard_style = (
+            "green"
+            if state.aster_guard_decision == "allow"
+            else "yellow"
+            if state.aster_guard_decision == "suppress"
+            else "dim"
+        )
+        status_strip.append("  ag ", style="dim")
+        status_strip.append(aster_guard_text, style=guard_style)
     status_strip.append(f"  alerts {len(state.alerts)}", style="dim")
     if ui_mode:
         status_strip.append(f"  ui={ui_mode}", style="dim")
@@ -2577,7 +2876,7 @@ def render_frame_simple(
     header.append(f" {heartbeat}", style="cyan")
 
     legend = Text(
-        "EAGE (ts-rx)  AAGE (rx-publish)  PNL - n/a  POS n/a",
+        "EAGE (ts-rx)  AAGE (rx-publish)  bPNL balances pre/post  POSb base  Δ$ telemetry  sVOL session fills/base/notional",
         style="dim italic",
     )
 
@@ -2631,56 +2930,97 @@ def render_frame_simple(
                 line.append(payload, style=payload_style)
             tape_lines.append(line)
 
-    pos_value: float | None = None
+    delta_usd_value: float | None = None
     cap_value: float | None = None
+    pos_base_value: float | None = None
     if not in_shadow:
-        pos_value = _extract_net_pos_usd(record)
+        delta_usd_value = _extract_net_pos_usd(record)
         cap_value = _extract_max_pos_cap_usd(record)
-    pos_text = _format_signed_dollars(pos_value) if not in_shadow else "n/a"
+        pos_base_value = _extract_net_pos_base(record)
+    pos_text = _format_pos_short(pos_base_value) if not in_shadow else "n/a"
+    delta_usd_text = _format_signed_dollars(delta_usd_value) if not in_shadow else "n/a"
 
     delta_pct: float | None = None
     if (
         not in_shadow
-        and pos_value is not None
+        and delta_usd_value is not None
         and cap_value is not None
         and cap_value > 0
     ):
-        delta_pct = 100.0 * abs(pos_value) / max(1.0, cap_value)
+        delta_pct = 100.0 * abs(delta_usd_value) / max(1.0, cap_value)
     delta_text = f"{delta_pct:.1f}%" if delta_pct is not None else "n/a"
     delta_style = _delta_pct_style(delta_pct) if not in_shadow else "dim"
 
     pos_style = "dim"
-    if pos_value is not None and not in_shadow:
-        if pos_value > 0:
+    if pos_base_value is not None and not in_shadow:
+        if pos_base_value > 0:
             pos_style = "green"
-        elif pos_value < 0:
+        elif pos_base_value < 0:
             pos_style = "red"
         else:
             pos_style = "white"
 
-    pnl_value: float | None = None
-    if not in_shadow:
-        pnl_value = _extract_pnl_usd(record)
-    pnl_text = _format_signed_dollars(pnl_value)
-    pnl_style = "dim"
-    if pnl_value is not None:
-        if pnl_value > 0:
-            pnl_style = "green"
-        elif pnl_value < 0:
-            pnl_style = "red"
+    delta_usd_style = "dim"
+    if delta_usd_value is not None and not in_shadow:
+        if delta_usd_value > 0:
+            delta_usd_style = "green"
+        elif delta_usd_value < 0:
+            delta_usd_style = "red"
         else:
-            pnl_style = "white"
+            delta_usd_style = "white"
 
-    footer = Text("Δ ")
+    pnl_label = "bPNL"
+    pnl_text = _format_balance_pnl_short(state.balance_pnl)
+    pnl_style = _balance_pnl_style(state.balance_pnl)
+    if in_shadow:
+        pnl_text = "n/a"
+        pnl_style = "dim"
+    elif state.balance_pnl.status not in {"available", "pending_post", "unreadable"}:
+        pnl_label = "tPNL"
+        pnl_value = _extract_pnl_usd(record)
+        pnl_text = _format_signed_dollars(pnl_value)
+        pnl_style = "dim"
+        if pnl_value is not None:
+            if pnl_value > 0:
+                pnl_style = "green"
+            elif pnl_value < 0:
+                pnl_style = "red"
+            else:
+                pnl_style = "white"
+
+    footer = Text("Δcap ")
     footer.append(delta_text, style=delta_style)
     footer.append(" // ")
-    footer.append("POS", style="bold red")
+    footer.append("Δ$", style="bold red")
+    footer.append(" ")
+    footer.append(delta_usd_text, style=delta_usd_style)
+    footer.append(" // ")
+    footer.append("POSb", style="bold red")
     footer.append(" ")
     footer.append(pos_text, style=pos_style)
     footer.append(" \\ ")
-    footer.append("PNL", style="bold red")
+    footer.append(pnl_label, style="bold red")
     footer.append(" ")
     footer.append(pnl_text, style=pnl_style)
+    footer.append(" // ")
+    footer.append("sVOL", style="bold red")
+    footer.append(" ")
+    footer.append(str(state.run_fill_count), style="white")
+    footer.append("f ", style="dim")
+    footer.append(_format_base_volume_short(state.run_base_volume), style="white")
+    footer.append("e ", style="dim")
+    footer.append(_format_notional_short(state.run_notional_volume), style="white")
+    aster_guard_text = _format_aster_guard_short(state)
+    if aster_guard_text:
+        guard_style = (
+            "green"
+            if state.aster_guard_decision == "allow"
+            else "yellow"
+            if state.aster_guard_decision == "suppress"
+            else "dim"
+        )
+        footer.append(" // AG ", style="bold red")
+        footer.append(aster_guard_text, style=guard_style)
 
     frame_lines: list[Text] = [header, legend, *tape_lines]
     rows_remaining = term_height - (len(frame_lines) + 1)
@@ -3186,6 +3526,7 @@ def render_once(
         page=page,
     )
     seed_state_source_age_from_path(state, path)
+    refresh_balance_pnl_from_run_dir(state, path.parent, force=True)
     if use_rich and _RICH_AVAILABLE:
         term_size = shutil.get_terminal_size((140, 40))
         return render_frame_rich(
@@ -3266,6 +3607,7 @@ def main() -> int:
         page=args.page,
     )
     seed_state_source_age_from_path(state, telemetry_path)
+    refresh_balance_pnl_from_run_dir(state, telemetry_path.parent, force=True)
     state.runner_status = load_runner_status(telemetry_path)
     follower = TailFollower(telemetry_path)
     # Advance follower past already-consumed data so we don't double-count.
@@ -3310,6 +3652,7 @@ def main() -> int:
         )
         seed_state_source_age_from_path(state, latest_path)
         telemetry_path = latest_path
+        refresh_balance_pnl_from_run_dir(state, telemetry_path.parent, force=True)
         follower = TailFollower(telemetry_path)
         follower.seek_end()
         _refresh_runner_status()
@@ -3396,6 +3739,7 @@ def main() -> int:
                         _maybe_switch_auto_target(loop_started)
                         _ingest_new_records()
                         _refresh_runner_status()
+                        refresh_balance_pnl_from_run_dir(state, telemetry_path.parent, now_mono=loop_started)
                         key_seen = False
                         for key in key_reader.read_keys():
                             _apply_watch_key(state, key)
@@ -3458,6 +3802,7 @@ def main() -> int:
                     _maybe_switch_auto_target(loop_started)
                     _ingest_new_records()
                     _refresh_runner_status()
+                    refresh_balance_pnl_from_run_dir(state, telemetry_path.parent, now_mono=loop_started)
                     now = time.monotonic()
                     if now >= next_render_ts:
                         frame_key = _build_frame_key(state, now)
@@ -3529,6 +3874,7 @@ def main() -> int:
 
     while True:
         _maybe_switch_auto_target(time.monotonic())
+        loop_started = time.monotonic()
         for line in follower.read_new_lines():
             try:
                 record = json.loads(line)
@@ -3537,6 +3883,7 @@ def main() -> int:
             if isinstance(record, dict):
                 state.update(record)
         _refresh_runner_status()
+        refresh_balance_pnl_from_run_dir(state, telemetry_path.parent, now_mono=loop_started)
         frame = render_frame_classic(
             state,
             max_events,
