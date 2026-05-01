@@ -67,6 +67,8 @@ Every milestone follows this loop:
   Status: `complete`.
 - M5: Add Lighter venue-readiness evidence pack covering post-only semantics,
   account/profile assumptions, fees, rate limits, and connector observability.
+  Status: `complete_for_nonlive_evidence_pack`; promotion status remains `HOLD`
+  for live, canary, capital, or economic claims.
 - M6: Add risk/system invariant tests for no-live enforcement, metadata
   propagation, residual-state placeholders, and double-action prevention
   preconditions.

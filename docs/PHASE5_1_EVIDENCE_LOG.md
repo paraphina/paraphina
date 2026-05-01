@@ -68,3 +68,45 @@ missing_tail_risk_calibration: 2000
 sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
+
+## LTR-LIGHTER-VENUE-READINESS M5
+
+- Evidence id: `LTR-LIGHTER-VENUE-READINESS-M5`
+- Evidence document: `docs/PHASE5_1_LIGHTER_VENUE_READINESS.md`
+- Evidence date: `2026-05-01`
+- Scope: Lighter-only venue-readiness documentation and connector evidence
+- Gate status: `HOLD`
+- M5 status: `complete_for_nonlive_evidence_pack`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Official sources reviewed:
+
+```text
+https://docs.lighter.xyz/trading/trading-fees
+https://apidocs.lighter.xyz/docs/account-types
+https://apidocs.lighter.xyz/docs/api-keys
+https://apidocs.lighter.xyz/docs/rate-limits
+https://apidocs.lighter.xyz/docs/volume-quota-program
+https://docs.lighter.xyz/trading/order-types-and-matching
+https://apidocs.lighter.xyz/reference/sendtx
+https://apidocs.lighter.xyz/reference/orderbooks
+https://apidocs.lighter.xyz/reference/account-1
+https://apidocs.lighter.xyz/reference/accountlimits
+https://apidocs.lighter.xyz/reference/accountactiveorders
+https://apidocs.lighter.xyz/reference/trades
+https://apidocs.lighter.xyz/docs/websocket-reference
+```
+
+Evidence summary:
+
+```text
+PASS: Lighter remains the first Phase 5.1 venue-local non-live target.
+PASS: Local connector has create, IOC, cancel, replace, cancel-all, public WS,
+      private WS, and account polling coverage.
+FLAG: Account tier, fee tier, native venue limits, replace post-only
+      preservation, and fill/calibration evidence remain unresolved.
+HOLD: No live/canary/economic promotion is supported by M5.
+```
