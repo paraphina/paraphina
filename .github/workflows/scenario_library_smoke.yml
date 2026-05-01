@@ -13,6 +13,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           components: rustfmt, clippy
 
       - name: Set up Python
@@ -22,6 +23,9 @@ jobs:
 
       - name: Run unicode controls check
         run: python3 tools/check_unicode_controls.py
+
+      - name: Install Python test dependencies
+        run: python3 -m pip install -r requirements.txt --index-url https://pypi.org/simple
 
       - name: Run docs integrity check
         run: python3 tools/check_docs_integrity.py
@@ -90,4 +94,3 @@ jobs:
           path: |
             runs/ci/scenario_library_smoke/**
             scenarios/v1/scenario_library_v1/manifest_sha256.json
-

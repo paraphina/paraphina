@@ -9,7 +9,7 @@ import gzip
 import json
 import sys
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
@@ -32,6 +32,7 @@ from phase5_econ_attribution import (  # noqa: E402
     write_text,
 )
 
+UTC = timezone.utc
 ZERO = Decimal("0")
 DEFAULT_RUN_ROOT = Path(
     "/home/ubuntu/promotion_runs/"

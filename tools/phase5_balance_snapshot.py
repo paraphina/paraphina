@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -33,6 +33,7 @@ from phase5_econ_attribution import (
 
 ZERO = Decimal("0")
 VENUE_ORDER = ("hyperliquid", "extended", "lighter", "aster", "paradex")
+UTC = timezone.utc
 
 
 def write_json(path: Path, payload: Any) -> None:

@@ -188,6 +188,7 @@ impl VenueUtilityTier {
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for VenueUtilityTier {
     fn default() -> Self {
         Self::Full
@@ -216,6 +217,7 @@ impl VenueUtilityReason {
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for VenueUtilityReason {
     fn default() -> Self {
         Self::Healthy

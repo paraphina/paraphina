@@ -240,6 +240,7 @@ impl MmOrderDecisionSummary {
         self.supported_replace_visibility_records.push(record);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_replace_decision(
         &mut self,
         decision_id: &str,
@@ -392,6 +393,7 @@ impl MmOrderDecisionSummary {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_place_decision(
         &mut self,
         decision_id: &str,
@@ -645,6 +647,7 @@ fn supported_native_replace_order_id(venue_id: &str, current: &MmOpenOrder) -> O
     }
 }
 
+#[allow(clippy::needless_lifetimes)]
 fn quote_side_terminal_reason<'a>(quote: Option<&'a MmQuote>, side: Side) -> Option<&'a str> {
     let quote = quote?;
     Some(match side {

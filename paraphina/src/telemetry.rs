@@ -1621,6 +1621,7 @@ fn mm_hedge_cost_edge_floor(cfg: &Config, state: &GlobalState, fallback_price: f
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quote_diagnostics(
     cfg: &Config,
     state: &GlobalState,
@@ -1787,7 +1788,7 @@ fn telemetry_inventory_reducing_side(q_global_tao: f64, venue_position_tao: f64)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_update)]
 fn quote_prune_details(
     cfg: &Config,
     state: &GlobalState,

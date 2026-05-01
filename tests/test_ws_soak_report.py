@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 
-MODULE_PATH = Path("/home/ubuntu/paraphina_mm_pnl_harness/tools/ws_soak_report.py")
+MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "ws_soak_report.py"
 SPEC = importlib.util.spec_from_file_location("ws_soak_report", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 ws_soak_report = importlib.util.module_from_spec(SPEC)

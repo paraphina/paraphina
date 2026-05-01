@@ -26,9 +26,11 @@ jobs:
       - name: Install Python test deps
         run: |
           python3 -m pip install --upgrade pip --index-url https://pypi.org/simple
-          python3 -m pip install pytest --index-url https://pypi.org/simple
+          python3 -m pip install -r requirements.txt pytest --index-url https://pypi.org/simple
           python3 -c "import pytest; print('pytest', pytest.__version__)"
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
 
       - name: Disk usage (pre)
         run: |

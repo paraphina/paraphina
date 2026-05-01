@@ -19,6 +19,9 @@ jobs:
       - name: Show Python version
         run: python3 --version
 
+      - name: Install Python test dependencies
+        run: python3 -m pip install -r requirements.txt --index-url https://pypi.org/simple
+
       - name: Run Unicode controls scanner
         run: python3 tools/check_unicode_controls.py
 
@@ -27,4 +30,3 @@ jobs:
 
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -q
-

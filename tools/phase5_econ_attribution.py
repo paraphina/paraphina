@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ from typing import Any
 import yaml
 
 
+UTC = timezone.utc
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_FILE = Path("/etc/paraphina/current.env")
 DEFAULT_BASELINE = ROOT / "docs" / "INVESTIGATIONS" / "phase5_balance_baseline_20260416.yaml"

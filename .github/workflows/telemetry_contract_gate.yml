@@ -31,6 +31,9 @@ jobs:
       - name: Show Python version
         run: python3 --version
 
+      - name: Install Python test dependencies
+        run: python3 -m pip install -r requirements.txt --index-url https://pypi.org/simple
+
       # Run foundational integrity checks first
       - name: Run Unicode controls scanner
         run: python3 tools/check_unicode_controls.py
@@ -72,6 +75,8 @@ jobs:
 
       # Build Rust and run telemetry schema tests
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
 
       - name: Run Rust telemetry schema tests
         working-directory: paraphina

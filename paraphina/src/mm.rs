@@ -177,6 +177,7 @@ struct SingleVenueQuoteResult {
     ask_terminal_reason: &'static str,
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn single_venue_quote_result(
     bid: Option<MmLevel>,
@@ -228,6 +229,7 @@ fn aster_fill_touch_mode_eligible(
         && quote_spread_gate_reason(mm_cfg, &vcfg.id, Some(mid), Some(spread)).is_none()
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn apply_aster_fill_touch_local(
     mm_cfg: &MmConfig,
@@ -280,6 +282,7 @@ fn hyperliquid_touch_clip_eligible(
         && quote_spread_gate_reason(mm_cfg, &vcfg.id, Some(mid), Some(spread)).is_none()
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn apply_hyperliquid_touch_clip(
     mm_cfg: &MmConfig,
@@ -405,6 +408,7 @@ fn evaluate_aster_touch_offside_fastpath(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn apply_generated_spread_cap(
     mm_cfg: &MmConfig,
@@ -568,6 +572,7 @@ fn pre_soft_taper_side(
     }
 }
 
+#[allow(clippy::manual_clamp)]
 pub(crate) fn compute_venue_utility_decision(
     mm_cfg: &MmConfig,
     q_global_tao: f64,
@@ -819,6 +824,7 @@ fn apply_pre_soft_inventory_taper(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn apply_venue_utility_tier(
     q_global_tao: f64,
@@ -1718,6 +1724,7 @@ fn compute_hedge_cost_edge_floor(cfg: &Config, state: &GlobalState, fallback_pri
 ///
 /// Const generics DISABLE_FV and DISABLE_TOX allow the compiler to eliminate
 /// dead branches for each ablation combination.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: bool>(
     mm_cfg: &MmConfig,
@@ -3011,6 +3018,7 @@ fn price_reprice_cadence_ms(
         ) as TimestampMs
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn hyperliquid_sell_compression_guard_applies(
     ctx: &ShouldReplaceOrderCtx<'_>,
@@ -3082,6 +3090,7 @@ fn hyperliquid_sell_compression_guard_applies(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn hyperliquid_sell_touch_risk_eval(
     ctx: &ShouldReplaceOrderCtx<'_>,
@@ -3173,6 +3182,7 @@ fn hyperliquid_sell_touch_risk_eval(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn hyperliquid_sell_stationary_price_deadband_applies(
     ctx: &ShouldReplaceOrderCtx<'_>,
