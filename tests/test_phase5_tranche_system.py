@@ -2421,15 +2421,14 @@ class TestPhase5TrancheSystem(unittest.TestCase):
 
     def test_current_extended_rebootstrap_sleep_cap_overlay_preserves_stale_margin(self):
         repo_root = Path(__file__).resolve().parents[1]
-        overlay = (
-            repo_root
-            / "phase5"
-            / "runs"
-            / "phase5_all5_current_surface_extended_degraded_rebootstrap_sleep_cap_requal"
-            / "stage_overlay_live.env"
+        queue = yaml.safe_load((repo_root / "phase5" / "queue.yaml").read_text(encoding="utf-8"))
+        tranches = queue.get("serialized_mainline", []) + queue.get("parallel_support_tracks", [])
+        tranche = next(
+            item
+            for item in tranches
+            if item.get("id") == "phase5_all5_current_surface_extended_degraded_rebootstrap_sleep_cap_requal"
         )
-
-        env = self.mod.parse_env_file(overlay)
+        env = {key: str(value) for key, value in tranche.get("env_diff", {}).items()}
 
         self.assertEqual(env["PARAPHINA_EXTENDED_DEGRADED_REBOOTSTRAP_MAX_SLEEP_MS"], "500")
         cap_ms = int(env["PARAPHINA_EXTENDED_DEGRADED_REBOOTSTRAP_MAX_SLEEP_MS"])
