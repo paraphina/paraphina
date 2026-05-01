@@ -3,8 +3,8 @@
 //! This module is intentionally minimal: it defines the canonical cache
 //! and event model for live trading without introducing any network I/O.
 
-pub mod connectors;
 pub mod connector_registry;
+pub mod connectors;
 pub mod gateway;
 pub mod instrument;
 mod market_publisher;

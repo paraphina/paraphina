@@ -38,7 +38,9 @@ impl ConnectorArg {
             "aster" => Some(ConnectorArg::Aster),
             "lighter" => Some(ConnectorArg::Lighter),
             "paradex" => Some(ConnectorArg::Paradex),
-            "hyperliquid_fixture" | "hl_fixture" | "fixture" => Some(ConnectorArg::HyperliquidFixture),
+            "hyperliquid_fixture" | "hl_fixture" | "fixture" => {
+                Some(ConnectorArg::HyperliquidFixture)
+            }
             _ => None,
         }
     }

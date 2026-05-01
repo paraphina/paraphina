@@ -138,9 +138,7 @@ where
 
             let mut all_fills = Vec::new();
 
-            let mm_events = self
-                .gateway
-                .process_intents(self.cfg, &all_intents, now_ms);
+            let mm_events = self.gateway.process_intents(self.cfg, &all_intents, now_ms);
 
             let mm_fills = apply_execution_events(&mut self.state, &mm_events, now_ms);
             self.apply_fills(&mm_fills, now_ms);
@@ -159,7 +157,9 @@ where
                 // include in overall intents log
                 all_intents.extend(exit_intents.iter().cloned());
 
-                let exit_events = self.gateway.process_intents(self.cfg, &exit_intents, now_ms);
+                let exit_events = self
+                    .gateway
+                    .process_intents(self.cfg, &exit_intents, now_ms);
 
                 let exit_fills = apply_execution_events(&mut self.state, &exit_events, now_ms);
                 self.apply_fills(&exit_fills, now_ms);
