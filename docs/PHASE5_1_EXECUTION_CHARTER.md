@@ -72,6 +72,10 @@ Every milestone follows this loop:
 - M6: Add risk/system invariant tests for no-live enforcement, metadata
   propagation, residual-state placeholders, and double-action prevention
   preconditions.
+  Status: `complete_for_nonlive_scaffold`; schema v2 and shadow artifacts now
+  carry false live/canary/capital/risk authorization fields plus no-action
+  residual and double-action precondition states. The validator rejects unsafe
+  v2 authorization values.
 - M7: Run a Phase 5.1 non-live evidence pack on a bounded real Phase 5 telemetry
   segment and validate schema plus manifest.
 - M8: Produce board decision: `PROMOTE_FOR_NEXT_NONLIVE_STEP`, `HOLD`, or

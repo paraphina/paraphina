@@ -201,7 +201,8 @@ def validate_record(
     optional_fields = schema.get("optional_fields", [])
     field_types = schema.get("field_types", {})
     enums = schema.get("enums", {})
-    expected_schema_version = schema.get("invariants", {}).get("schema_version_value", 1)
+    invariants = schema.get("invariants", {})
+    expected_schema_version = invariants.get("schema_version_value", 1)
     
     # Check schema_version value
     if "schema_version" in record:
@@ -230,6 +231,14 @@ def validate_record(
             errors.append(ValidationError(
                 line_num,
                 f"field '{field}' has invalid value '{record[field]}', expected one of {allowed_values}"
+            ))
+
+    # Check exact boolean-value invariants for safety-critical flags.
+    for field, expected_value in invariants.get("boolean_values", {}).items():
+        if field in record and record[field] is not expected_value:
+            errors.append(ValidationError(
+                line_num,
+                f"field '{field}' must be {str(expected_value).lower()}, got {record[field]}"
             ))
     
     # Check index monotonicity if applicable

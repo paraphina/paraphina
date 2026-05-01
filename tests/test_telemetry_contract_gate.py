@@ -631,6 +631,12 @@ class TestValidatorSubprocess(unittest.TestCase):
             "run_id": "phase51_test",
             "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
             "no_live_flag": True,
+            "approved_for_live": False,
+            "approved_for_canary": False,
+            "approved_for_capital_escalation": False,
+            "live_orders_allowed": False,
+            "capital_change_allowed": False,
+            "risk_limit_relaxation_allowed": False,
         }
         record.update(overrides)
         return record
@@ -709,6 +715,39 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(result.returncode, 1, f"stdout: {result.stdout}\nstderr: {result.stderr}")
             self.assertIn("Unsupported schema_version", result.stderr)
 
+    def test_telemetry_v2_unsafe_boolean_invariants_fail(self):
+        """Schema v2 should reject records that grant live/canary/capital/risk authority."""
+        cases = [
+            ("no_live_flag", False, "must be true"),
+            ("approved_for_live", True, "must be false"),
+            ("approved_for_canary", True, "must be false"),
+            ("approved_for_capital_escalation", True, "must be false"),
+            ("live_orders_allowed", True, "must be false"),
+            ("capital_change_allowed", True, "must be false"),
+            ("risk_limit_relaxation_allowed", True, "must be false"),
+            ("capital_escalation_flag", True, "must be false"),
+            ("risk_limit_override_flag", True, "must be false"),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for field, unsafe_value, expected_text in cases:
+                telemetry_path = Path(tmpdir) / "telemetry.jsonl"
+                record = self._make_valid_telemetry_v2_record(0, **{field: unsafe_value})
+                telemetry_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+                result = subprocess.run(
+                    [sys.executable, str(self._get_validator_path()), str(telemetry_path)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    1,
+                    f"field={field} stdout={result.stdout} stderr={result.stderr}",
+                )
+                self.assertIn(field, result.stdout)
+                self.assertIn(expected_text, result.stdout)
+
     def test_phase51_shadow_harness_emits_valid_hold_artifact(self):
         """Phase 5.1 shadow harness should emit source-linked HOLD-only v2 artifacts."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -784,9 +823,23 @@ class TestValidatorSubprocess(unittest.TestCase):
             ]
             ev_records = [r for r in records if r["event_type"] == "V2_EV_EVALUATED"]
             replay_labels = [r for r in records if r["event_type"] == "V2_REPLAY_LABEL"]
+            forbidden_execution_events = {
+                "V2_ORDER_INTENT",
+                "V2_ORDER_LIFECYCLE",
+                "V2_FILL_OBSERVED",
+                "V2_FAST_HEDGE_DECISION",
+                "V2_HEDGE_LIFECYCLE",
+            }
             self.assertEqual(len(ev_records), 1)
             self.assertEqual(len(replay_labels), 1)
             self.assertTrue(all(r["no_live_flag"] is True for r in records))
+            self.assertTrue(all(r["approved_for_live"] is False for r in records))
+            self.assertTrue(all(r["approved_for_canary"] is False for r in records))
+            self.assertTrue(all(r["approved_for_capital_escalation"] is False for r in records))
+            self.assertTrue(all(r["live_orders_allowed"] is False for r in records))
+            self.assertTrue(all(r["capital_change_allowed"] is False for r in records))
+            self.assertTrue(all(r["risk_limit_relaxation_allowed"] is False for r in records))
+            self.assertFalse(forbidden_execution_events.intersection({r["event_type"] for r in records}))
             self.assertTrue(all(r.get("decision") == "HOLD" for r in records if "decision" in r))
             self.assertTrue(all(
                 r.get("admissible_for_financial_claim") is False
@@ -803,6 +856,13 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(ev["quote_state"], "active")
             self.assertEqual(ev["calibration_status"], "SPARSE")
             self.assertEqual(ev["calibration_sample_count"], 0)
+            self.assertFalse(ev["pair_conditioned_flag"])
+            self.assertFalse(ev["fast_hedge_allowed"])
+            self.assertEqual(ev["fast_hedge_serialization_state"], "NOT_APPLICABLE_NONLIVE_SHADOW")
+            self.assertFalse(ev["residual_state_required"])
+            self.assertEqual(ev["residual_state_status"], "NO_FILL_NO_RESIDUAL")
+            self.assertEqual(ev["action_owner"], "NO_ACTION_NONLIVE_SHADOW")
+            self.assertEqual(ev["double_action_prevention_state"], "NO_EXECUTION_EVENTS_EMITTED")
             self.assertEqual(ev["min_quote_candidates_required"], 1000)
             self.assertEqual(ev["min_fill_labels_required"], 200)
             self.assertEqual(ev["min_hedge_labels_required"], 100)
@@ -816,6 +876,9 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(label["label_type"], "COUNTERFACTUAL_DECISION")
             self.assertEqual(label["source_t"], 42)
             self.assertEqual(label["source_line"], 1)
+            self.assertEqual(label["source_record_sha256"], ev["source_record_sha256"])
+            self.assertEqual(label["run_id"], ev["run_id"])
+            self.assertEqual(label["baseline_commit"], ev["baseline_commit"])
             self.assertEqual(label["label_confidence"], 1.0)
 
             summary = json.loads((run_dir / "ev_shadow_summary.json").read_text(encoding="utf-8"))
@@ -824,7 +887,28 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(summary["gate_status"], "HOLD")
             self.assertEqual(summary["calibration_status"], "SPARSE")
             self.assertEqual(summary["hold_reason_counts"]["missing_pfill_calibration"], 1)
-            self.assertTrue((run_dir / "manifest.json").exists())
+            gate = json.loads((run_dir / "gate_result.json").read_text(encoding="utf-8"))
+            self.assertEqual(gate["status"], "HOLD")
+            self.assertFalse(gate["approved_for_live"])
+            self.assertFalse(gate["approved_for_canary"])
+            self.assertFalse(gate["approved_for_capital_escalation"])
+
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            artifact_index = json.loads(
+                (run_dir / "evidence_pack" / "artifact_index.json").read_text(encoding="utf-8")
+            )
+            for artifact in (manifest, artifact_index):
+                metadata = artifact["metadata"]
+                self.assertEqual(metadata["run_id"], run_id)
+                self.assertEqual(metadata["baseline_commit"], ev["baseline_commit"])
+                self.assertTrue(metadata["no_live_flag"])
+                self.assertEqual(metadata["input_sha256"], hashlib.sha256(input_path.read_bytes()).hexdigest())
+                self.assertFalse(metadata["approved_for_live"])
+                self.assertFalse(metadata["approved_for_canary"])
+                self.assertFalse(metadata["approved_for_capital_escalation"])
+                self.assertFalse(metadata["live_orders_allowed"])
+                self.assertFalse(metadata["capital_change_allowed"])
+                self.assertFalse(metadata["risk_limit_relaxation_allowed"])
 
             telemetry_hash = hashlib.sha256(telemetry_path.read_bytes()).hexdigest()
             manifest_hash = hashlib.sha256((run_dir / "manifest.json").read_bytes()).hexdigest()
@@ -845,6 +929,57 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(repeat.returncode, 0, f"stdout: {repeat.stdout}\nstderr: {repeat.stderr}")
             self.assertEqual(hashlib.sha256(telemetry_path.read_bytes()).hexdigest(), telemetry_hash)
             self.assertEqual(hashlib.sha256((run_dir / "manifest.json").read_bytes()).hexdigest(), manifest_hash)
+
+    def test_phase51_shadow_harness_rejects_live_or_relaxed_specs(self):
+        """Phase 5.1 shadow harness should fail closed on live/capital/risk spec drift."""
+        script_dir = Path(__file__).parent.parent
+        base_spec = json.loads((script_dir / "configs" / "phase51_lighter_only_ev_shadow.json").read_text())
+        cases = [
+            ("wrong_run_mode", {"run_mode": "LIVE"}, "run_mode must be SHADOW"),
+            ("no_live_false", {"no_live_flag": False}, "no_live_flag must be true"),
+            ("capital_escalation_true", {"capital_escalation_flag": True}, "capital escalation must be false"),
+            ("risk_override_true", {"risk_limit_override_flag": True}, "risk limit override must be false"),
+            ("wrong_venue", {"venue_id": "hyperliquid"}, "must be Lighter-only"),
+            (
+                "live_orders_allowed",
+                {"constraints": {**base_spec["constraints"], "live_orders_allowed": True}},
+                "live_orders_allowed must be false",
+            ),
+            (
+                "capital_change_allowed",
+                {"constraints": {**base_spec["constraints"], "capital_change_allowed": True}},
+                "capital_change_allowed must be false",
+            ),
+            (
+                "risk_limit_relaxation_allowed",
+                {"constraints": {**base_spec["constraints"], "risk_limit_relaxation_allowed": True}},
+                "risk_limit_relaxation_allowed must be false",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            for name, overrides, expected_error in cases:
+                spec = dict(base_spec)
+                spec.update(overrides)
+                spec_path = tmp_path / f"{name}.json"
+                spec_path.write_text(json.dumps(spec), encoding="utf-8")
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(self._get_phase51_shadow_path()),
+                        "--spec",
+                        str(spec_path),
+                        "--output-root",
+                        str(tmp_path / "runs"),
+                        "--run-id",
+                        name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 2, f"case={name} stdout={result.stdout} stderr={result.stderr}")
+                self.assertIn(expected_error, result.stderr)
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

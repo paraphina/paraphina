@@ -36,6 +36,10 @@ CALIBRATION_HOLD_REASONS = [
     "sparse_calibration_bucket",
     "counterfactual_only_nonfinancial",
 ]
+ACTION_OWNER_NONLIVE = "NO_ACTION_NONLIVE_SHADOW"
+DOUBLE_ACTION_STATE_NONLIVE = "NO_EXECUTION_EVENTS_EMITTED"
+FAST_HEDGE_STATE_NONLIVE = "NOT_APPLICABLE_NONLIVE_SHADOW"
+RESIDUAL_STATE_STATUS_NONLIVE = "NO_FILL_NO_RESIDUAL"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -99,6 +103,8 @@ def _resolve_output_dir(spec: dict[str, Any], output_root: Path | None, run_id: 
 def _validate_spec(spec: dict[str, Any]) -> None:
     if spec.get("baseline_commit") != BASELINE_COMMIT:
         raise ValueError("spec baseline_commit does not match clean Phase 5 baseline")
+    if spec.get("run_mode") != "SHADOW":
+        raise ValueError("Phase 5.1 first experiment run_mode must be SHADOW")
     if spec.get("venue_id") != "lighter":
         raise ValueError("Phase 5.1 first experiment spec must be Lighter-only")
     if spec.get("no_live_flag") is not True:
@@ -110,6 +116,10 @@ def _validate_spec(spec: dict[str, Any]) -> None:
     constraints = spec.get("constraints", {})
     if constraints.get("live_orders_allowed") is not False:
         raise ValueError("live_orders_allowed must be false")
+    if constraints.get("capital_change_allowed") is not False:
+        raise ValueError("capital_change_allowed must be false")
+    if constraints.get("risk_limit_relaxation_allowed") is not False:
+        raise ValueError("risk_limit_relaxation_allowed must be false")
 
 
 def _base_event(
@@ -127,6 +137,12 @@ def _base_event(
         "run_id": run_id,
         "baseline_commit": BASELINE_COMMIT,
         "no_live_flag": True,
+        "approved_for_live": False,
+        "approved_for_canary": False,
+        "approved_for_capital_escalation": False,
+        "live_orders_allowed": False,
+        "capital_change_allowed": False,
+        "risk_limit_relaxation_allowed": False,
     }
 
 
@@ -242,6 +258,13 @@ def _quote_candidates_from_record(
             "calibration_bucket_id": f"{venue_id}:{side_text}:{layer}:uncalibrated",
             "calibration_status": CALIBRATION_STATUS,
             "calibration_sample_count": CALIBRATION_SAMPLE_COUNT,
+            "pair_conditioned_flag": False,
+            "fast_hedge_allowed": False,
+            "fast_hedge_serialization_state": FAST_HEDGE_STATE_NONLIVE,
+            "residual_state_required": False,
+            "residual_state_status": RESIDUAL_STATE_STATUS_NONLIVE,
+            "action_owner": ACTION_OWNER_NONLIVE,
+            "double_action_prevention_state": DOUBLE_ACTION_STATE_NONLIVE,
             "min_quote_candidates_required": MIN_QUOTE_CANDIDATES_REQUIRED,
             "min_fill_labels_required": MIN_FILL_LABELS_REQUIRED,
             "min_hedge_labels_required": MIN_HEDGE_LABELS_REQUIRED,
@@ -297,6 +320,13 @@ def _ev_event(candidate: dict[str, Any], *, event_seq: int, run_id: str, timesta
         "calibration_bucket_id": candidate["calibration_bucket_id"],
         "calibration_status": candidate["calibration_status"],
         "calibration_sample_count": candidate["calibration_sample_count"],
+        "pair_conditioned_flag": candidate["pair_conditioned_flag"],
+        "fast_hedge_allowed": candidate["fast_hedge_allowed"],
+        "fast_hedge_serialization_state": candidate["fast_hedge_serialization_state"],
+        "residual_state_required": candidate["residual_state_required"],
+        "residual_state_status": candidate["residual_state_status"],
+        "action_owner": candidate["action_owner"],
+        "double_action_prevention_state": candidate["double_action_prevention_state"],
         "min_quote_candidates_required": candidate["min_quote_candidates_required"],
         "min_fill_labels_required": candidate["min_fill_labels_required"],
         "min_hedge_labels_required": candidate["min_hedge_labels_required"],
@@ -573,6 +603,14 @@ def run(
         "run_id": run_id,
         "baseline_commit": BASELINE_COMMIT,
         "no_live_flag": True,
+        "capital_escalation_flag": False,
+        "risk_limit_override_flag": False,
+        "approved_for_live": False,
+        "approved_for_canary": False,
+        "approved_for_capital_escalation": False,
+        "live_orders_allowed": False,
+        "capital_change_allowed": False,
+        "risk_limit_relaxation_allowed": False,
         "input_sha256": input_sha256,
         "replay_timestamp_ns": timestamp_ns,
         "replay_created_utc": replay_created_utc,

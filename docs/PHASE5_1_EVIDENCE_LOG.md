@@ -110,3 +110,85 @@ FLAG: Account tier, fee tier, native venue limits, replace post-only
       preservation, and fill/calibration evidence remain unresolved.
 HOLD: No live/canary/economic promotion is supported by M5.
 ```
+
+## LTR-EV-SHADOW-001 Phase 5 Tail M6
+
+- Run id: `LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_m6`
+- Local run directory: `runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_m6`
+- Source snapshot: `/tmp/phase51_inputs/phase5_tail_1000_20260501T214411Z.telemetry.jsonl`
+- Input records scanned: `1000`
+- Input SHA256: `c2b50d00912b22f877e6e79be0ae16e2342d5ea3eaad22b7be3049f059312b64`
+- Output telemetry records: `4001`
+- Candidates evaluated: `2000`
+- Replay labels emitted: `2000`
+- Gate status: `HOLD`
+- Calibration status: `SPARSE`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+- `admissible_for_financial_claim`: `false`
+- Replay timestamp: `1704529507787138797`
+- Replay timestamp UTC: `2024-01-06T08:25:07.787139+00:00`
+- Timestamp semantics: deterministic replay timestamp, not wall-clock artifact creation time.
+
+M6 invariant additions:
+
+```text
+pair_conditioned_flag: false
+fast_hedge_allowed: false
+fast_hedge_serialization_state: NOT_APPLICABLE_NONLIVE_SHADOW
+residual_state_required: false
+residual_state_status: NO_FILL_NO_RESIDUAL
+action_owner: NO_ACTION_NONLIVE_SHADOW
+double_action_prevention_state: NO_EXECUTION_EVENTS_EMITTED
+```
+
+Command:
+
+```bash
+python3 tools/phase51_ev_shadow.py \
+  --input-telemetry /tmp/phase51_inputs/phase5_tail_1000_20260501T214411Z.telemetry.jsonl \
+  --run-id LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_m6 \
+  --output-root runs/phase51_lighter_only_ev_shadow
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/check_telemetry_contract.py tools/phase51_ev_shadow.py
+python3 -m unittest tests.test_telemetry_contract_gate
+python3 tools/check_telemetry_contract.py \
+  runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_m6/telemetry.jsonl
+```
+
+Result:
+
+```text
+Ran 71 tests in 0.934s
+OK
+OK: 4001 record(s) validated against schema v2
+```
+
+Artifact hashes:
+
+```text
+6ddbf774f6fb05f11508866d604d6ac7da89a54ef22e83a9bca6c32eb59090dc  telemetry.jsonl
+884e4cd3459ff99d92db8ab25479253fd7f7b75a2f0296da205c4f3b8ac27b54  manifest.json
+08ffe38dc4e4b8a0f8e8f5918ddd963815583098f0f994987ab65be6dcd003e8  evidence_pack/artifact_index.json
+```
+
+HOLD reason counts:
+
+```text
+missing_pfill_calibration: 2000
+missing_markout_calibration: 2000
+missing_hedge_success_calibration: 2000
+missing_queue_reset_calibration: 2000
+missing_churn_calibration: 2000
+missing_tail_risk_calibration: 2000
+sparse_calibration_bucket: 2000
+counterfactual_only_nonfinancial: 2000
+```

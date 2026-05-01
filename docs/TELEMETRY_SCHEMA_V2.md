@@ -22,8 +22,19 @@ Every v2 event requires:
 - `run_id`
 - `baseline_commit`
 - `no_live_flag`
+- `approved_for_live`
+- `approved_for_canary`
+- `approved_for_capital_escalation`
+- `live_orders_allowed`
+- `capital_change_allowed`
+- `risk_limit_relaxation_allowed`
 
 `event_seq` must be monotonically increasing.
+
+For Phase 5.1 non-live evidence these safety fields must remain false. This
+prevents a replay/shadow artifact from being mistaken for live, canary, capital,
+or risk-limit authorization. The schema validator enforces these exact values
+for v2 records.
 
 ## Event Families
 
@@ -59,6 +70,22 @@ The current HOLD taxonomy includes missing P-fill, markout, hedge-success,
 queue-reset, churn, and tail-risk calibration, plus sparse bucket and
 counterfactual-only labels. These are review blockers for admission, not
 runtime order controls.
+
+M6 risk/system precondition fields are emitted on candidate EV records:
+
+- `pair_conditioned_flag`
+- `fast_hedge_allowed`
+- `fast_hedge_serialization_state`
+- `residual_state_required`
+- `residual_state_status`
+- `action_owner`
+- `double_action_prevention_state`
+
+The current non-live shadow scaffold sets these to no-action/no-fill states:
+there is no order intent, no fast hedge, no residual inventory, and no active
+inventory action owner. Future order/fill/hedge emitters must replace these
+placeholders with event-sourced ownership and residual-state records before
+any non-shadow execution path can be reviewed.
 
 Event-family-specific required fields can be tightened further once emitters are
 producing stable artifacts for order lifecycle, fill, hedge, inventory, and
