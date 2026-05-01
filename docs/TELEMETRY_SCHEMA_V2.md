@@ -47,12 +47,18 @@ revision addenda:
 The Phase 5.1 shadow harness currently emits source-linked
 `V2_EV_EVALUATED` and `V2_REPLAY_LABEL` records. These records include
 `source_t`, `source_line`, `source_record_sha256`, `model_features_hash`,
-`calibration_bucket_id`, and `binding_constraints` so candidates can be traced
-back to the v1 telemetry line that produced them.
+`calibration_bucket_id`, `calibration_status`, `decision_reason_secondary_list`,
+and `binding_constraints` so candidates can be traced back to the v1 telemetry
+line that produced them and reviewed against explicit calibration gaps.
 
 All Phase 5.1 shadow candidates remain `HOLD` until calibration evidence exists.
 `V2_REPLAY_LABEL` records are counterfactual decision labels, not realized fills
 or economic proof.
+
+The current HOLD taxonomy includes missing P-fill, markout, hedge-success,
+queue-reset, churn, and tail-risk calibration, plus sparse bucket and
+counterfactual-only labels. These are review blockers for admission, not
+runtime order controls.
 
 Event-family-specific required fields can be tightened further once emitters are
 producing stable artifacts for order lifecycle, fill, hedge, inventory, and

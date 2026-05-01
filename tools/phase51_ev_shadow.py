@@ -21,6 +21,21 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_COMMIT = "18dd09512288a85e440d3977e32432c3aabc1190"
+CALIBRATION_STATUS = "SPARSE"
+CALIBRATION_SAMPLE_COUNT = 0
+MIN_QUOTE_CANDIDATES_REQUIRED = 1_000
+MIN_FILL_LABELS_REQUIRED = 200
+MIN_HEDGE_LABELS_REQUIRED = 100
+CALIBRATION_HOLD_REASONS = [
+    "missing_pfill_calibration",
+    "missing_markout_calibration",
+    "missing_hedge_success_calibration",
+    "missing_queue_reset_calibration",
+    "missing_churn_calibration",
+    "missing_tail_risk_calibration",
+    "sparse_calibration_bucket",
+    "counterfactual_only_nonfinancial",
+]
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -225,14 +240,18 @@ def _quote_candidates_from_record(
             "utility_reason": _optional_text(quote.get("utility_reason")),
             "model_features_hash": _stable_hash(feature_payload),
             "calibration_bucket_id": f"{venue_id}:{side_text}:{layer}:uncalibrated",
-            "binding_constraints": ["missing_phase51_calibration", "nonlive_hold"],
-            "decision_reason_primary": "missing_phase51_calibration",
-            "decision_reason_secondary_list": [
-                "phase51_m2_context_only",
-                "no_pfill_calibration",
-                "no_markout_calibration",
-                "no_hedge_success_calibration",
+            "calibration_status": CALIBRATION_STATUS,
+            "calibration_sample_count": CALIBRATION_SAMPLE_COUNT,
+            "min_quote_candidates_required": MIN_QUOTE_CANDIDATES_REQUIRED,
+            "min_fill_labels_required": MIN_FILL_LABELS_REQUIRED,
+            "min_hedge_labels_required": MIN_HEDGE_LABELS_REQUIRED,
+            "binding_constraints": [
+                "phase51_nonlive_hold",
+                "missing_phase51_calibration",
+                *CALIBRATION_HOLD_REASONS,
             ],
+            "decision_reason_primary": "phase51_calibration_hold",
+            "decision_reason_secondary_list": CALIBRATION_HOLD_REASONS,
         })
     return candidates
 
@@ -276,6 +295,11 @@ def _ev_event(candidate: dict[str, Any], *, event_seq: int, run_id: str, timesta
         "utility_reason": candidate["utility_reason"],
         "model_features_hash": candidate["model_features_hash"],
         "calibration_bucket_id": candidate["calibration_bucket_id"],
+        "calibration_status": candidate["calibration_status"],
+        "calibration_sample_count": candidate["calibration_sample_count"],
+        "min_quote_candidates_required": candidate["min_quote_candidates_required"],
+        "min_fill_labels_required": candidate["min_fill_labels_required"],
+        "min_hedge_labels_required": candidate["min_hedge_labels_required"],
         "binding_constraints": candidate["binding_constraints"],
         "P_fill_hat": 0.0,
         "P_fill_ci_low": 0.0,
@@ -339,7 +363,8 @@ def _replay_label_event(
         "assumptions_hash": _stable_hash({
             "baseline_commit": BASELINE_COMMIT,
             "mode": "nonlive_shadow_hold",
-            "reason": "missing_phase51_calibration",
+            "reason": "phase51_calibration_hold",
+            "secondary_reasons": CALIBRATION_HOLD_REASONS,
         }),
         "label_confidence": 1.0,
         "decision": "HOLD",
@@ -384,6 +409,7 @@ def _write_root_manifest(
     manifest = {
         "schema_version": 1,
         "created_utc": created_utc,
+        "created_utc_semantics": "deterministic_replay_timestamp_not_wall_clock",
         "metadata": metadata,
         "files": _artifact_infos(out_dir, artifact_paths),
     }
@@ -440,6 +466,7 @@ def run(
     scanned_records = 0
     candidates = 0
     replay_labels = 0
+    hold_reason_counts = {reason: 0 for reason in CALIBRATION_HOLD_REASONS}
     if input_path:
         scanned_records, records = _iter_input_records(input_path)
         for line_num, record_hash, record in records:
@@ -468,6 +495,8 @@ def run(
                     run_id=run_id,
                     timestamp_ns=timestamp_ns,
                 ))
+                for reason in candidate["decision_reason_secondary_list"]:
+                    hold_reason_counts[reason] = hold_reason_counts.get(reason, 0) + 1
     else:
         events.append({
             **_base_event(
@@ -496,6 +525,11 @@ def run(
         "admit_count": 0,
         "reject_count": 0,
         "hold_count": candidates + (1 if not input_path else 0),
+        "hold_reason_counts": hold_reason_counts,
+        "calibration_status": CALIBRATION_STATUS,
+        "min_quote_candidates_required": MIN_QUOTE_CANDIDATES_REQUIRED,
+        "min_fill_labels_required": MIN_FILL_LABELS_REQUIRED,
+        "min_hedge_labels_required": MIN_HEDGE_LABELS_REQUIRED,
         "gate_status": "HOLD",
         "gate_reason": "nonlive_shadow_requires_calibration_and_board_review",
         "no_live_flag": True,
@@ -512,6 +546,7 @@ def run(
     command_log = {
         "argv": sys.argv,
         "created_utc": replay_created_utc,
+        "created_utc_semantics": "deterministic_replay_timestamp_not_wall_clock",
         "python_version": sys.version.split()[0],
         "replay_timestamp_ns": timestamp_ns,
     }

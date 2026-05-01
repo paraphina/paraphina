@@ -54,6 +54,11 @@
     "utility_reason",
     "model_features_hash",
     "calibration_bucket_id",
+    "calibration_status",
+    "calibration_sample_count",
+    "min_quote_candidates_required",
+    "min_fill_labels_required",
+    "min_hedge_labels_required",
     "binding_constraints",
     "P_fill_hat",
     "P_fill_ci_low",
@@ -123,6 +128,11 @@
     "utility_reason": ["string", "null"],
     "model_features_hash": "string",
     "calibration_bucket_id": "string",
+    "calibration_status": "string",
+    "calibration_sample_count": "integer",
+    "min_quote_candidates_required": "integer",
+    "min_fill_labels_required": "integer",
+    "min_hedge_labels_required": "integer",
     "binding_constraints": "array_of_string",
     "P_fill_hat": "number",
     "P_fill_ci_low": "number",
@@ -168,7 +178,8 @@
       "COUNTERFACTUAL_OUTCOME",
       "SIMULATED_OUTCOME",
       "PAPER_OUTCOME"
-    ]
+    ],
+    "calibration_status": ["READY", "SPARSE", "MISSING", "HOLD"]
   },
   "invariants": {
     "schema_version_value": 2,

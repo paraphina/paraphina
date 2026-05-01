@@ -801,9 +801,15 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(ev["passive_price"], 100.0)
             self.assertEqual(ev["candidate_size_Q"], 0.01)
             self.assertEqual(ev["quote_state"], "active")
-            self.assertEqual(ev["binding_constraints"], ["missing_phase51_calibration", "nonlive_hold"])
-            self.assertEqual(ev["decision_reason_primary"], "missing_phase51_calibration")
-            self.assertIn("no_pfill_calibration", ev["decision_reason_secondary_list"])
+            self.assertEqual(ev["calibration_status"], "SPARSE")
+            self.assertEqual(ev["calibration_sample_count"], 0)
+            self.assertEqual(ev["min_quote_candidates_required"], 1000)
+            self.assertEqual(ev["min_fill_labels_required"], 200)
+            self.assertEqual(ev["min_hedge_labels_required"], 100)
+            self.assertIn("missing_phase51_calibration", ev["binding_constraints"])
+            self.assertEqual(ev["decision_reason_primary"], "phase51_calibration_hold")
+            self.assertIn("missing_pfill_calibration", ev["decision_reason_secondary_list"])
+            self.assertIn("missing_tail_risk_calibration", ev["decision_reason_secondary_list"])
 
             label = replay_labels[0]
             self.assertEqual(label["candidate_id"], ev["candidate_id"])
@@ -816,6 +822,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(summary["candidates_evaluated"], 1)
             self.assertEqual(summary["replay_labels_emitted"], 1)
             self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["calibration_status"], "SPARSE")
+            self.assertEqual(summary["hold_reason_counts"]["missing_pfill_calibration"], 1)
             self.assertTrue((run_dir / "manifest.json").exists())
 
             telemetry_hash = hashlib.sha256(telemetry_path.read_bytes()).hexdigest()

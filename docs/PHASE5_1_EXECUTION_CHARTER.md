@@ -64,6 +64,7 @@ Every milestone follows this loop:
   support emits source-linked counterfactual decision labels only.
 - M4: Add sparse-bucket calibration placeholders and explicit `HOLD` reason
   taxonomy for missing P-fill, markout, hedge, queue, churn, and tail evidence.
+  Status: `complete`.
 - M5: Add Lighter venue-readiness evidence pack covering post-only semantics,
   account/profile assumptions, fees, rate limits, and connector observability.
 - M6: Add risk/system invariant tests for no-live enforcement, metadata
