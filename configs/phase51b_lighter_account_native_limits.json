@@ -1,0 +1,29 @@
+{
+  "experiment_id": "PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS",
+  "description": "Phase 5.1b Lighter-only read-only account-state/native-limit evidence gate.",
+  "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+  "run_mode": "READ_ONLY",
+  "venue_id": "lighter",
+  "instrument_id": "ETH-PERP",
+  "market_symbol": "ETH-USD",
+  "no_live_flag": true,
+  "capital_escalation_flag": false,
+  "risk_limit_override_flag": false,
+  "default_decision": "HOLD",
+  "default_hold_reason": "nonlive_lighter_native_limit_capture_only",
+  "output_root": "runs/phase51b_lighter_account_native_limits",
+  "constraints": {
+    "live_orders_allowed": false,
+    "capital_change_allowed": false,
+    "risk_limit_relaxation_allowed": false,
+    "sendtx_allowed": false,
+    "venue_scope": ["lighter"],
+    "read_only_endpoints": [
+      "account",
+      "accountLimits",
+      "accountActiveOrders",
+      "orderBooks",
+      "trades"
+    ]
+  }
+}

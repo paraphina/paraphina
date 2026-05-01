@@ -81,6 +81,22 @@ counterfactual_only_nonfinancial: 2000
 - Next non-live work: read-only Lighter account-state/native-limit capture and
   calibration-label ingestion
 
+## Phase 5.1b Lighter Account/Native-Limit Gate
+
+- Gate id: `PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS`
+- Gate spec: `configs/phase51b_lighter_account_native_limits.json`
+- Collector: `tools/phase51b_lighter_account_limits.py`
+- Scope: Lighter-only read-only account-state/native-limit evidence
+- Gate status: `implemented_for_readonly_capture`
+- Live/canary/capital/risk authorization: all false
+- Required accepted evidence before calibration-label ingestion:
+  `V2_LIGHTER_ACCOUNT_PROFILE`, `V2_LIGHTER_ACCOUNT_LIMITS`,
+  `V2_LIGHTER_ACTIVE_ORDERS`, optional
+  `V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE`, sanitized source snapshots, manifest,
+  artifact index, and schema v2 validation output.
+- Current limitation: no real account/native-limit evidence pack is accepted in
+  this log yet.
+
 ## LTR-LIGHTER-VENUE-READINESS M5
 
 - Evidence id: `LTR-LIGHTER-VENUE-READINESS-M5`

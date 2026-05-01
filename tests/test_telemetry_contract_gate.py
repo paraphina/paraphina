@@ -582,6 +582,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1 shadow harness."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51_ev_shadow.py"
+
+    def _get_phase51b_lighter_account_limits_path(self) -> Path:
+        """Get path to the Phase 5.1b Lighter account/native-limit collector."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51b_lighter_account_limits.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -674,6 +679,43 @@ class TestValidatorSubprocess(unittest.TestCase):
                     EV_hat=-0.1,
                     EV_lcb_alpha=-0.2,
                     alpha=0.05,
+                )) + "\n")
+
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(telemetry_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            self.assertIn("schema v2", result.stdout)
+
+    def test_valid_telemetry_v2_lighter_account_limit_events_exit_0(self):
+        """Phase 5.1b Lighter account/native-limit events should validate."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telemetry_path = Path(tmpdir) / "telemetry.jsonl"
+            with open(telemetry_path, "w") as f:
+                f.write(json.dumps(self._make_valid_telemetry_v2_record(0)) + "\n")
+                f.write(json.dumps(self._make_valid_telemetry_v2_record(
+                    1,
+                    event_type="V2_LIGHTER_ACCOUNT_LIMITS",
+                    venue_id="lighter",
+                    account_index=123,
+                    account_limits_status="OBSERVED",
+                    account_limits_source_sha256="abc123",
+                    account_limits_source_endpoint=None,
+                    account_limits_raw_keys=["active_orders_per_account_limit"],
+                    sendtx_per_minute_limit=60,
+                    sendtx_per_minute_remaining=None,
+                    rest_requests_per_minute_limit=None,
+                    weighted_requests_per_minute_limit=None,
+                    pending_orders_per_account_limit=None,
+                    pending_orders_per_market_limit=None,
+                    active_orders_per_account_limit=1000,
+                    active_orders_per_market_limit=100,
+                    volume_quota_remaining=None,
+                    rate_limit_headroom_status="OBSERVED",
+                    decision="HOLD",
+                    admissible_for_financial_claim=False,
                 )) + "\n")
 
             result = subprocess.run(
@@ -974,6 +1016,218 @@ class TestValidatorSubprocess(unittest.TestCase):
                         str(tmp_path / "runs"),
                         "--run-id",
                         name,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 2, f"case={name} stdout={result.stdout} stderr={result.stderr}")
+                self.assertIn(expected_error, result.stderr)
+
+    def test_phase51b_lighter_account_limits_collector_emits_valid_hold_artifact(self):
+        """Phase 5.1b collector should emit read-only HOLD v2 evidence."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            output_root = tmp_path / "phase51b_runs"
+            run_id = "phase51b_contract_test"
+            account_path = tmp_path / "account.json"
+            limits_path = tmp_path / "account_limits.json"
+            active_orders_path = tmp_path / "active_orders.json"
+            order_books_path = tmp_path / "order_books.json"
+            trades_path = tmp_path / "trades.json"
+            account_path.write_text(json.dumps({
+                "accounts": [{
+                    "account_index": 123,
+                    "l1_address": "0xabc",
+                    "account_type": "STANDARD",
+                    "auth_token": "should-redact",
+                    "authToken": "should-redact",
+                    "accessToken": "should-redact",
+                    "jwt": "should-redact",
+                    "password": "should-redact",
+                    "credential": "should-redact",
+                }]
+            }), encoding="utf-8")
+            limits_path.write_text(json.dumps({
+                "sendtx_per_minute_limit": 60,
+                "active_orders_per_account_limit": 1000,
+                "active_orders_per_market_limit": 100,
+                "volume_quota_remaining": 12.5,
+            }), encoding="utf-8")
+            active_orders_path.write_text(json.dumps({
+                "active_orders": [
+                    {"order_id": "1", "market_id": 7, "status": "OPEN"},
+                    {"order_id": "2", "market_id": 7, "status": "PENDING"},
+                    {"order_id": "3", "market_id": 8, "status": "OPEN"},
+                ]
+            }), encoding="utf-8")
+            order_books_path.write_text(json.dumps({
+                "order_books": [{
+                    "market_id": 7,
+                    "symbol": "ETH-USD",
+                    "maker_fee_bps": 0.0,
+                    "taker_fee_bps": 0.0,
+                    "price_decimals": 2,
+                    "size_decimals": 4,
+                }]
+            }), encoding="utf-8")
+            trades_path.write_text(json.dumps({
+                "trades": [
+                    {"trade_id": "t1", "role": "maker"},
+                    {"trade_id": "t2", "role": "taker"},
+                    {"trade_id": "t3"},
+                ]
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51b_lighter_account_limits_path()),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    run_id,
+                    "--account-json",
+                    str(account_path),
+                    "--account-limits-json",
+                    str(limits_path),
+                    "--active-orders-json",
+                    str(active_orders_path),
+                    "--order-books-json",
+                    str(order_books_path),
+                    "--trades-json",
+                    str(trades_path),
+                    "--account-index",
+                    "123",
+                    "--market-id",
+                    "7",
+                    "--market-symbol",
+                    "ETH-USD",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+
+            run_dir = output_root / run_id
+            telemetry_path = run_dir / "telemetry.jsonl"
+            self.assertTrue(telemetry_path.exists())
+            validator = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(telemetry_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(validator.returncode, 0, f"stdout: {validator.stdout}\nstderr: {validator.stderr}")
+
+            records = [
+                json.loads(line)
+                for line in telemetry_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            event_types = {record["event_type"] for record in records}
+            self.assertIn("V2_LIGHTER_ACCOUNT_PROFILE", event_types)
+            self.assertIn("V2_LIGHTER_ACCOUNT_LIMITS", event_types)
+            self.assertIn("V2_LIGHTER_ACTIVE_ORDERS", event_types)
+            self.assertIn("V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE", event_types)
+            self.assertTrue(all(r["no_live_flag"] is True for r in records))
+            self.assertTrue(all(r["approved_for_live"] is False for r in records))
+            self.assertTrue(all(r["live_orders_allowed"] is False for r in records))
+            self.assertTrue(all(r.get("decision") == "HOLD" for r in records if "decision" in r))
+            self.assertTrue(all(
+                r.get("admissible_for_financial_claim") is False
+                for r in records
+                if "admissible_for_financial_claim" in r
+            ))
+
+            profile = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACCOUNT_PROFILE")
+            self.assertEqual(profile["lighter_account_type"], "STANDARD")
+            self.assertEqual(profile["market_id"], 7)
+            self.assertEqual(profile["maker_fee_bps"], 0.0)
+            self.assertEqual(profile["taker_fee_bps"], 0.0)
+
+            limits = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACCOUNT_LIMITS")
+            self.assertEqual(limits["sendtx_per_minute_limit"], 60)
+            self.assertEqual(limits["active_orders_per_account_limit"], 1000)
+            self.assertEqual(limits["active_orders_per_market_limit"], 100)
+
+            active_orders = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACTIVE_ORDERS")
+            self.assertEqual(active_orders["active_orders_count_total"], 3)
+            self.assertEqual(active_orders["active_orders_count_market"], 2)
+            self.assertEqual(active_orders["pending_orders_count_total"], 1)
+            self.assertEqual(active_orders["active_order_headroom_account"], 997)
+            self.assertEqual(active_orders["active_order_headroom_market"], 98)
+
+            trades = next(r for r in records if r["event_type"] == "V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE")
+            self.assertEqual(trades["trade_sample_count"], 3)
+            self.assertEqual(trades["maker_trade_count"], 1)
+            self.assertEqual(trades["taker_trade_count"], 1)
+            self.assertEqual(trades["unknown_role_trade_count"], 1)
+
+            sanitized_account = json.loads(
+                (run_dir / "source_snapshots" / "account.sanitized.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(sanitized_account["accounts"][0]["auth_token"], "<redacted>")
+            self.assertEqual(sanitized_account["accounts"][0]["authToken"], "<redacted>")
+            self.assertEqual(sanitized_account["accounts"][0]["accessToken"], "<redacted>")
+            self.assertEqual(sanitized_account["accounts"][0]["jwt"], "<redacted>")
+            self.assertEqual(sanitized_account["accounts"][0]["password"], "<redacted>")
+            self.assertEqual(sanitized_account["accounts"][0]["credential"], "<redacted>")
+            summary = json.loads((run_dir / "lighter_account_native_limits_summary.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["phase51b_capture_complete"])
+            gate = json.loads((run_dir / "gate_result.json").read_text(encoding="utf-8"))
+            self.assertEqual(gate["status"], "HOLD")
+            self.assertTrue(gate["approved_for_nonlive_evidence_review"])
+            self.assertFalse(gate["approved_for_calibration_label_ingestion"])
+            self.assertEqual(
+                gate["calibration_label_ingestion_hold_reason"],
+                "requires_external_schema_validation_and_secret_audit",
+            )
+            self.assertFalse(gate["approved_for_live"])
+
+    def test_phase51b_lighter_account_limits_rejects_live_or_sendtx_specs(self):
+        """Phase 5.1b collector should fail closed on live or sendTx spec drift."""
+        script_dir = Path(__file__).parent.parent
+        base_spec = json.loads((script_dir / "configs" / "phase51b_lighter_account_native_limits.json").read_text())
+        cases = [
+            ("wrong_run_mode", {"run_mode": "LIVE"}, "run_mode must be READ_ONLY"),
+            ("no_live_false", {"no_live_flag": False}, "no_live_flag must be true"),
+            ("capital_escalation_true", {"capital_escalation_flag": True}, "capital escalation must be false"),
+            ("risk_override_true", {"risk_limit_override_flag": True}, "risk limit override must be false"),
+            ("wrong_venue", {"venue_id": "hyperliquid"}, "must be Lighter-only"),
+            (
+                "sendtx_allowed",
+                {"constraints": {**base_spec["constraints"], "sendtx_allowed": True}},
+                "sendtx_allowed must be false",
+            ),
+            (
+                "live_orders_allowed",
+                {"constraints": {**base_spec["constraints"], "live_orders_allowed": True}},
+                "live_orders_allowed must be false",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            account_limits_path = tmp_path / "account_limits.json"
+            account_limits_path.write_text(json.dumps({"active_orders_per_account_limit": 10}), encoding="utf-8")
+            for name, overrides, expected_error in cases:
+                spec = dict(base_spec)
+                spec.update(overrides)
+                spec_path = tmp_path / f"{name}.json"
+                spec_path.write_text(json.dumps(spec), encoding="utf-8")
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(self._get_phase51b_lighter_account_limits_path()),
+                        "--spec",
+                        str(spec_path),
+                        "--output-root",
+                        str(tmp_path / "runs"),
+                        "--run-id",
+                        name,
+                        "--account-limits-json",
+                        str(account_limits_path),
                     ],
                     capture_output=True,
                     text=True,

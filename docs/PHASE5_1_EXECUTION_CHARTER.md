@@ -85,6 +85,14 @@ Every milestone follows this loop:
   Status: `complete`; decision is `PROMOTE_FOR_NEXT_NONLIVE_STEP` for the
   non-live scaffold only, while EV admission, live/canary, capital, risk-limit,
   and economic claims remain `HOLD`.
+- M9 / Phase 5.1b: Formalize and implement the Lighter account/native-limit
+  evidence gate.
+  Status: `implemented_for_readonly_capture`; `configs/phase51b_lighter_account_native_limits.json`
+  defines the gate, `tools/phase51b_lighter_account_limits.py` emits read-only
+  v2 `HOLD` records for account profile, native limits, active-order headroom,
+  and maker/taker trade-role samples, and schema v2 validates those records.
+  Completion requires a real account/native-limit evidence pack before
+  calibration-label ingestion can proceed.
 
 ## Audit Cadence
 

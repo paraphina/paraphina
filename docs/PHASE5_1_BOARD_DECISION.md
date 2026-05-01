@@ -142,13 +142,29 @@ OK: 4001 record(s) validated against schema v2
 ## Next Move
 
 The next optimal move after this Phase 5.1 closeout is not live trading. It is
-the next non-live evidence step:
+the next non-live evidence step, now formalized as Phase 5.1b:
 
 ```text
-Add read-only Lighter account-state and native-limit capture to v2 evidence,
-then begin calibration-label ingestion for P-fill, markout, queue/churn, and
-maker/taker attribution.
+Phase 5.1b - Lighter account/native-limit evidence gate
 ```
 
-That next move should be treated as a new bounded non-live work package. It must
-not relax the Phase 5.1 holds above.
+Scope:
+
+- Add read-only Lighter account-state and native-limit capture to v2 evidence.
+- Capture account/profile, account limits, active-order headroom, fee/market
+  metadata, and maker/taker trade-role samples where available.
+- Emit only schema v2 `HOLD` records with `no_live_flag=true` and all live,
+  canary, capital, and risk-relaxation authorization fields false.
+- Then begin calibration-label ingestion for P-fill, markout, queue/churn, and
+  maker/taker attribution only after the account/native-limit evidence pack is
+  present.
+
+Repo-owned artifacts:
+
+- Gate spec: `configs/phase51b_lighter_account_native_limits.json`
+- Collector: `tools/phase51b_lighter_account_limits.py`
+- Schema events: `V2_LIGHTER_ACCOUNT_PROFILE`,
+  `V2_LIGHTER_ACCOUNT_LIMITS`, `V2_LIGHTER_ACTIVE_ORDERS`, and
+  `V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE`
+
+This Phase 5.1b work package must not relax the Phase 5.1 holds above.

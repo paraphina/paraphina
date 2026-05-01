@@ -80,6 +80,7 @@ structured closeout evidence.
 | `docs/WHITEPAPER_COMPLETION_*` | WP100 audit outputs | Historical/generated audit scope |
 | `docs/WORLD_CLASS_RUNTIME_GOALS.md` | Runtime objective and gate framework | Supporting objective framework |
 | `docs/PHASE5_AUTONOMOUS_TRANCHE_SYSTEM.md` | Phase 5 workflow model | Supporting workflow spec |
+| `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md` | Phase 5.1b-to-24/7 autonomous orchestration and resume procedure | Supporting workflow spec |
 | `phase5/status.md` | Human-readable Phase 5 status board | Read-only current runtime context |
 | `phase5/queue.yaml` | Structured Phase 5 queue and tranche lineage | Read-only current runtime context |
 | `phase5/control_pack.yaml` | Promoted/control artifacts and automation defaults | Read-only control context; may lag status/queue |
@@ -614,6 +615,19 @@ Hold/rollback condition:
 Do not change:
 
 - Live surface behavior from research-only work.
+
+#### Phase 5.1b - Lighter Account/Native-Limit Evidence Gate
+
+| Field | Value |
+|---|---|
+| target | Capture Lighter account/profile, native limits, active-order headroom, fee/market metadata, and maker/taker attribution samples as schema v2 non-live evidence. |
+| current status | `implemented_for_readonly_capture`; no real account/native-limit evidence pack has been accepted yet. |
+| next action | Run `tools/phase51b_lighter_account_limits.py` against authenticated read-only Lighter sources or captured endpoint JSON, then validate `telemetry.jsonl` with `tools/check_telemetry_contract.py`. |
+| required evidence | `V2_LIGHTER_ACCOUNT_PROFILE`, `V2_LIGHTER_ACCOUNT_LIMITS`, `V2_LIGHTER_ACTIVE_ORDERS`, optional `V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE`, sanitized source snapshots, manifest, artifact index, and schema validation output. |
+| promotion condition | `phase51b_capture_complete=true`, schema v2 passes, account/native-limit fields are present enough to begin P-fill, markout, queue/churn, and maker/taker calibration-label ingestion. |
+| hold/rollback condition | Missing account limits, missing active orders, unsafe spec flags, missing no-live guards, any sendTx/live-order path, unredacted secrets, or any attempt to use this evidence as live/canary/economic authority. |
+| lane | Phase 5.1 non-live evidence / execution microstructure. |
+| source files | `configs/phase51b_lighter_account_native_limits.json`, `tools/phase51b_lighter_account_limits.py`, `schemas/telemetry_schema_v2.json`, `docs/TELEMETRY_SCHEMA_V2.md`, `docs/PHASE5_1_BOARD_DECISION.md`, `docs/PHASE5_1_LIGHTER_VENUE_READINESS.md`, `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`. |
 
 ## 6. Current Queue
 
