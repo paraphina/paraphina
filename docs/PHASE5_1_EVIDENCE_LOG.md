@@ -69,6 +69,18 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1 Board Decision M8
+
+- Decision document: `docs/PHASE5_1_BOARD_DECISION.md`
+- Decision date: `2026-05-01`
+- Decision: `PROMOTE_FOR_NEXT_NONLIVE_STEP`
+- Scope: non-live scaffold only
+- EV admission status: `HOLD`
+- Live/canary status: `HOLD`
+- Economic/profitability status: `HOLD`
+- Next non-live work: read-only Lighter account-state/native-limit capture and
+  calibration-label ingestion
+
 ## LTR-LIGHTER-VENUE-READINESS M5
 
 - Evidence id: `LTR-LIGHTER-VENUE-READINESS-M5`
@@ -167,7 +179,7 @@ python3 tools/check_telemetry_contract.py \
 Result:
 
 ```text
-Ran 71 tests in 0.934s
+Ran 71 tests
 OK
 OK: 4001 record(s) validated against schema v2
 ```

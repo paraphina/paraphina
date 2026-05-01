@@ -78,8 +78,13 @@ Every milestone follows this loop:
   v2 authorization values.
 - M7: Run a Phase 5.1 non-live evidence pack on a bounded real Phase 5 telemetry
   segment and validate schema plus manifest.
+  Status: `complete`; M6 evidence run satisfies this milestone with 4,001 v2
+  records validated against schema v2 and deterministic artifact hashes.
 - M8: Produce board decision: `PROMOTE_FOR_NEXT_NONLIVE_STEP`, `HOLD`, or
   `REJECT`.
+  Status: `complete`; decision is `PROMOTE_FOR_NEXT_NONLIVE_STEP` for the
+  non-live scaffold only, while EV admission, live/canary, capital, risk-limit,
+  and economic claims remain `HOLD`.
 
 ## Audit Cadence
 
