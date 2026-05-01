@@ -1,0 +1,23 @@
+{
+  "experiment_id": "LTR-EV-SHADOW-001",
+  "description": "Phase 5.1 Lighter-only non-live EV shadow/replay experiment.",
+  "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+  "run_mode": "SHADOW",
+  "venue_id": "lighter",
+  "instrument_id": "ETH-PERP",
+  "no_live_flag": true,
+  "capital_escalation_flag": false,
+  "risk_limit_override_flag": false,
+  "alpha": 0.05,
+  "default_decision": "HOLD",
+  "default_hold_reason": "missing_phase51_calibration",
+  "input_telemetry": null,
+  "output_root": "runs/phase51_lighter_only_ev_shadow",
+  "constraints": {
+    "live_orders_allowed": false,
+    "capital_change_allowed": false,
+    "risk_limit_relaxation_allowed": false,
+    "venue_scope": ["lighter"],
+    "maker_only_required": true
+  }
+}

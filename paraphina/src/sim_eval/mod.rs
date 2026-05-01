@@ -14,6 +14,7 @@
 
 pub mod ablation;
 pub mod env_override;
+pub mod ev;
 pub mod evidence_pack;
 pub mod evidence_pack_verify;
 pub mod output;
@@ -59,3 +60,9 @@ pub use evidence_pack_verify::{
 
 // Scoped environment variable overrides for inline scenarios
 pub use env_override::{parse_env_overrides, with_env_overrides};
+
+pub use ev::{
+    evaluate_candidate, select_discrete_size, BindingConstraint, CandidateLayer, CandidateSide,
+    EvComponents, EvConfidence, EvDecision, EvEvaluation, OrderCandidate, ReplayLabel,
+    ReplayLabelType, PHASE5_1_BASELINE_COMMIT, PHASE5_1_DEFAULT_ALPHA,
+};

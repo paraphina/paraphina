@@ -196,6 +196,19 @@ class TestLoadSchema(unittest.TestCase):
         self.assertIn("field_types", schema)
         self.assertIn("schema_version", schema["required_fields"])
         self.assertIn("run_index", schema["required_fields"])
+
+    def test_load_valid_telemetry_v2_schema(self):
+        """Should load the telemetry v2 schema file."""
+        script_dir = Path(__file__).parent.parent
+        schema_path = script_dir / "schemas" / "telemetry_schema_v2.json"
+
+        schema = load_schema(schema_path)
+
+        self.assertIsNotNone(schema)
+        self.assertIn("required_fields", schema)
+        self.assertIn("field_types", schema)
+        self.assertIn("schema_version", schema["required_fields"])
+        self.assertIn("event_type", schema["required_fields"])
     
     def test_load_missing_file_returns_none(self):
         """Should return None for missing file."""
@@ -590,6 +603,20 @@ class TestValidatorSubprocess(unittest.TestCase):
         }
         record.update(overrides)
         return record
+
+    def _make_valid_telemetry_v2_record(self, event_seq: int = 0, **overrides) -> dict:
+        """Create a valid telemetry v2 record."""
+        record = {
+            "schema_version": 2,
+            "event_type": "V2_RUN_CONTEXT",
+            "event_seq": event_seq,
+            "timestamp_local_ns": 1_700_000_000_000_000_000 + event_seq,
+            "run_id": "phase51_test",
+            "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+            "no_live_flag": True,
+        }
+        record.update(overrides)
+        return record
     
     def test_valid_telemetry_file_exit_0(self):
         """Valid telemetry file should exit with code 0."""
@@ -609,6 +636,61 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertIn("OK", result.stdout)
         finally:
             temp_path.unlink()
+
+    def test_valid_telemetry_v2_file_exit_0(self):
+        """Valid schema_version 2 telemetry file should exit with code 0."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telemetry_path = Path(tmpdir) / "telemetry.jsonl"
+            with open(telemetry_path, "w") as f:
+                f.write(json.dumps(self._make_valid_telemetry_v2_record(0)) + "\n")
+                f.write(json.dumps(self._make_valid_telemetry_v2_record(
+                    1,
+                    event_type="V2_EV_EVALUATED",
+                    candidate_id="cand-1",
+                    decision="HOLD",
+                    EV_hat=-0.1,
+                    EV_lcb_alpha=-0.2,
+                    alpha=0.05,
+                )) + "\n")
+
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(telemetry_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            self.assertIn("schema v2", result.stdout)
+
+    def test_mixed_telemetry_versions_fail(self):
+        """Mixed v1/v2 telemetry.jsonl files should fail."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telemetry_path = Path(tmpdir) / "telemetry.jsonl"
+            with open(telemetry_path, "w") as f:
+                f.write(json.dumps(self._make_valid_telemetry_record(0)) + "\n")
+                f.write(json.dumps(self._make_valid_telemetry_v2_record(1)) + "\n")
+
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(telemetry_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            self.assertIn("schema_version mismatch", result.stdout)
+
+    def test_unknown_telemetry_schema_version_fails(self):
+        """Unknown telemetry schema versions should fail without fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telemetry_path = Path(tmpdir) / "telemetry.jsonl"
+            with open(telemetry_path, "w") as f:
+                f.write(json.dumps(self._make_valid_telemetry_v2_record(0, schema_version=999)) + "\n")
+
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(telemetry_path)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            self.assertIn("Unsupported schema_version", result.stderr)
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

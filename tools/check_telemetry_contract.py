@@ -3,12 +3,12 @@
 Telemetry Contract Gate: Validates telemetry JSONL files against their schemas.
 
 This tool enforces telemetry schema contracts defined in:
-- docs/TELEMETRY_SCHEMA_V1.md (human-readable documentation)
-- schemas/telemetry_schema_v1.json (per-tick telemetry)
+- docs/TELEMETRY_SCHEMA_V1.md / docs/TELEMETRY_SCHEMA_V2.md
+- schemas/telemetry_schema_v1.json / telemetry_schema_v2.json
 - schemas/mc_runs_schema_v1.json (Monte Carlo per-run records)
 
 File-to-schema mapping:
-  telemetry.jsonl    → telemetry_schema_v1.json
+  telemetry.jsonl    → telemetry_schema_v1.json or telemetry_schema_v2.json by schema_version
   mc_runs.jsonl      → mc_runs_schema_v1.json
   metrics.jsonl      → (unmapped - fails loudly)
   trajectories.jsonl → (unmapped - fails loudly)
@@ -34,11 +34,27 @@ from typing import Any, NamedTuple
 # Maximum number of errors to display before truncating
 MAX_ERRORS_DISPLAY = 10
 
-# File-to-schema mapping: filename -> schema filename
-# Files not in this mapping will fail with a clear error
-FILE_SCHEMA_MAP: dict[str, str] = {
-    "telemetry.jsonl": "telemetry_schema_v1.json",
-    "mc_runs.jsonl": "mc_runs_schema_v1.json",
+# File-to-schema mapping: filename -> schema_version -> schema filename.
+# Files not in this mapping will fail with a clear error unless they are
+# unknown JSONL files, which retain the legacy telemetry-schema fallback.
+FILE_SCHEMA_MAP: dict[str, dict[int, str]] = {
+    "telemetry.jsonl": {
+        1: "telemetry_schema_v1.json",
+        2: "telemetry_schema_v2.json",
+    },
+    "mc_runs.jsonl": {
+        1: "mc_runs_schema_v1.json",
+    },
+}
+
+INDEX_FIELD_MAP: dict[str, dict[int, str | None]] = {
+    "telemetry.jsonl": {
+        1: "t",
+        2: "event_seq",
+    },
+    "mc_runs.jsonl": {
+        1: "run_index",
+    },
 }
 
 # Files that are recognized but have no schema yet
@@ -179,11 +195,6 @@ def validate_record(
     enums = schema.get("enums", {})
     expected_schema_version = schema.get("invariants", {}).get("schema_version_value", 1)
     
-    # Check required fields exist
-    for field in required_fields:
-        if field not in record:
-            errors.append(ValidationError(line_num, f"missing required field: {field}"))
-    
     # Check schema_version value
     if "schema_version" in record:
         if record["schema_version"] != expected_schema_version:
@@ -191,6 +202,11 @@ def validate_record(
                 line_num,
                 f"schema_version mismatch: expected {expected_schema_version}, got {record['schema_version']}"
             ))
+
+    # Check required fields exist
+    for field in required_fields:
+        if field not in record:
+            errors.append(ValidationError(line_num, f"missing required field: {field}"))
     
     # Check types for all present fields
     for field, value in record.items():
@@ -275,7 +291,31 @@ def validate_file(
     return errors
 
 
-def get_schema_for_file(filename: str, repo_root: Path) -> tuple[dict[str, Any] | None, str | None, int]:
+def detect_schema_version(file_path: Path, default_version: int | None = None) -> tuple[int | None, str | None]:
+    """Read the first JSONL record and return its schema_version."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as e:
+                    return None, f"invalid JSON while detecting schema_version: {e}"
+                if not isinstance(record, dict):
+                    return None, f"expected JSON object while detecting schema_version, got {type(record).__name__}"
+                version = record.get("schema_version", default_version)
+                if isinstance(version, bool) or not isinstance(version, int):
+                    return None, "schema_version must be an integer in the first record"
+                return version, None
+    except OSError as e:
+        return None, f"file read error while detecting schema_version: {e}"
+
+    return default_version, None
+
+
+def get_schema_for_file(file_path: Path, repo_root: Path) -> tuple[dict[str, Any] | None, str | None, int]:
     """
     Get the appropriate schema for a given filename.
     
@@ -283,23 +323,32 @@ def get_schema_for_file(filename: str, repo_root: Path) -> tuple[dict[str, Any] 
     - exit_code 0 means success
     - exit_code 2 means unmapped file (fail loudly)
     """
-    basename = Path(filename).name
+    basename = file_path.name
     
     if basename in FILE_SCHEMA_MAP:
-        schema_file = FILE_SCHEMA_MAP[basename]
+        version, version_error = detect_schema_version(file_path)
+        if version_error:
+            print(f"ERROR: {version_error}", file=sys.stderr)
+            return None, None, 1
+        if version is None:
+            print("ERROR: schema_version is required in the first record", file=sys.stderr)
+            return None, None, 1
+        versioned_map = FILE_SCHEMA_MAP[basename]
+        if version not in versioned_map:
+            versions = ", ".join(str(v) for v in sorted(versioned_map))
+            print(
+                f"ERROR: Unsupported schema_version {version} for '{basename}' "
+                f"(supported: {versions})",
+                file=sys.stderr,
+            )
+            return None, None, 1
+        schema_file = versioned_map[version]
         schema_path = repo_root / "schemas" / schema_file
         schema = load_schema(schema_path)
         if schema is None:
             return None, None, 2
-        
-        # Determine index field for monotonicity check
-        if basename == "telemetry.jsonl":
-            index_field = "t"
-        elif basename == "mc_runs.jsonl":
-            index_field = "run_index"
-        else:
-            index_field = None
-        
+
+        index_field = INDEX_FIELD_MAP.get(basename, {}).get(version)
         return schema, index_field, 0
     
     if basename in UNMAPPED_FILES:
@@ -312,11 +361,16 @@ def get_schema_for_file(filename: str, repo_root: Path) -> tuple[dict[str, Any] 
     
     # Unknown file - treat as potential telemetry, try with telemetry schema
     # This allows validating arbitrary .jsonl files against the default schema
-    schema_path = repo_root / "schemas" / "telemetry_schema_v1.json"
+    version, version_error = detect_schema_version(file_path, default_version=1)
+    if version_error:
+        print(f"ERROR: {version_error}", file=sys.stderr)
+        return None, None, 1
+    schema_file = "telemetry_schema_v2.json" if version == 2 else "telemetry_schema_v1.json"
+    schema_path = repo_root / "schemas" / schema_file
     schema = load_schema(schema_path)
     if schema is None:
         return None, None, 2
-    return schema, "t", 0
+    return schema, "event_seq" if version == 2 else "t", 0
 
 
 def validate_single_file(file_path: Path, repo_root: Path) -> int:
@@ -325,7 +379,7 @@ def validate_single_file(file_path: Path, repo_root: Path) -> int:
     
     Returns exit code: 0=OK, 1=contract violation, 2=error.
     """
-    schema, index_field, exit_code = get_schema_for_file(file_path.name, repo_root)
+    schema, index_field, exit_code = get_schema_for_file(file_path, repo_root)
     if exit_code != 0:
         return exit_code
     
@@ -413,7 +467,7 @@ def create_parser() -> argparse.ArgumentParser:
 Telemetry Contract Gate: Validates telemetry JSONL files against their schemas.
 
 Supports multiple file types with per-file schema mapping:
-  telemetry.jsonl    → schemas/telemetry_schema_v1.json (per-tick data)
+  telemetry.jsonl    → schema selected by first record's schema_version (v1 or v2)
   mc_runs.jsonl      → schemas/mc_runs_schema_v1.json (Monte Carlo runs)
 
 Unmapped files (metrics.jsonl, trajectories.jsonl) will fail with instructions

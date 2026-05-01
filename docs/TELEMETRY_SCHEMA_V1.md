@@ -1,6 +1,8 @@
 # Telemetry Schema v1
 
-This document defines the **Telemetry Contract** for Paraphina's JSONL output files. It is the authoritative reference for what telemetry consumers (analytics, Phase B world-model training, research tooling) can depend on.
+This document defines the **Telemetry Contract** for Paraphina's JSONL output files using `schema_version: 1`. It is the authoritative reference for what telemetry consumers (analytics, Phase B world-model training, research tooling) can depend on.
+
+Phase 5.1 non-live EV/replay/shadow artifacts use `schema_version: 2`; see `docs/TELEMETRY_SCHEMA_V2.md`. The validator selects the telemetry schema by the first record's `schema_version`, and mixed-version files are invalid.
 
 ## Purpose
 
@@ -240,7 +242,8 @@ Exit codes:
 The canonical machine-readable schemas are at:
 
 ```
-schemas/telemetry_schema_v1.json    # Per-tick telemetry
+schemas/telemetry_schema_v1.json    # Per-tick telemetry, schema_version: 1
+schemas/telemetry_schema_v2.json    # Phase 5.1 EV/replay/shadow telemetry, schema_version: 2
 schemas/mc_runs_schema_v1.json      # Monte Carlo runs
 ```
 
