@@ -1517,6 +1517,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             source_record_1 = {
                 "schema_version": 1,
                 "t": 7,
+                "kf_last_update_ms": 1700000000000,
+                "fair_value": 100.0,
                 "fills": [{
                     "venue_id": "lighter",
                     "venue_index": 3,
@@ -1535,6 +1537,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             source_record_2 = {
                 "schema_version": 1,
                 "t": 8,
+                "kf_last_update_ms": 1700000001000,
+                "fair_value": 101.0,
                 "fills": [{
                     "venue_id": "lighter",
                     "venue_index": 3,
@@ -1601,6 +1605,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "phase51c_observed_test",
                     "--timestamp-ns",
                     "1700000000000000000",
+                    "--markout-horizons-ms",
+                    "1000",
                 ],
                 capture_output=True,
                 text=True,
@@ -1609,9 +1615,10 @@ class TestValidatorSubprocess(unittest.TestCase):
             run_dir = output_root / "phase51c_observed_test"
             summary = json.loads((run_dir / "observed_label_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["fill_labels"], 2)
-            self.assertEqual(summary["markout_labels"], 1)
+            self.assertEqual(summary["markout_labels"], 2)
             self.assertEqual(summary["balance_reconciliation_labels"], 1)
             self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["gate_reason"], "observed_label_pack_requires_quote_join_holdout_and_board_review")
             self.assertEqual(summary["fill_label_status"], "OBSERVED")
             self.assertEqual(summary["markout_label_status"], "OBSERVED")
             self.assertEqual(summary["balance_reconciliation_status"], "OBSERVED")
@@ -1624,12 +1631,14 @@ class TestValidatorSubprocess(unittest.TestCase):
             ]
             self.assertEqual([label["label_type"] for label in labels], [
                 "OBSERVED_FILL_LABEL",
+                "OBSERVED_MARKOUT_LABEL",
                 "OBSERVED_FILL_LABEL",
                 "OBSERVED_MARKOUT_LABEL",
                 "BALANCE_RECONCILIATION_LABEL",
             ])
             self.assertEqual(labels[0]["maker_taker_attribution_status"], "UNKNOWN")
-            self.assertEqual(labels[1]["maker_taker_role"], "MAKER")
+            self.assertEqual(labels[1]["markout_horizon_ms"], 1000)
+            self.assertEqual(labels[2]["maker_taker_role"], "MAKER")
             self.assertTrue(all(label["approved_for_live"] is False for label in labels))
             self.assertTrue(all(label["admissible_for_model_training"] is False for label in labels))
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))

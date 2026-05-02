@@ -210,13 +210,14 @@ fdc37d39d4c7ec7f91440dd44d47ff8fb4d1eca5eb04c0307405ecb1b02a016f  evidence_pack/
 - Balance comparison:
   `/home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/balance_snapshot_comparison.json`
 - Gate status: `HOLD`
-- Gate reason: `observed_label_pack_missing_markout_coverage`
+- Gate reason: `observed_label_pack_missing_maker_taker_attribution`
 - Fill labels: `356`
-- Markout labels: `0`
+- Markout labels: `1424`
 - Balance reconciliation labels: `1`
-- Record count: `357`
+- Record count: `1781`
 - Fill label status: `OBSERVED`
-- Markout label status: `MISSING`
+- Markout label status: `OBSERVED`
+- Markout horizons: `100ms`, `500ms`, `1000ms`, `5000ms`
 - Balance reconciliation status: `OBSERVED`
 - Maker/taker role counts: `UNKNOWN=356`
 - `approved_for_model_training`: `false`
@@ -249,9 +250,9 @@ paradex: 12
 Artifact hashes:
 
 ```text
-01ffcf88295cf5553b47951d52aa52df0fceda15d40012760d26782006edf0b1  labels.jsonl
-5c6edfb912db0d1d5fd32ebf88d9133fa4e06898588678f18f2433fdbef85ca0  observed_label_summary.json
-6d92fedbce7419d6c394ca53ee37b49fcb44459acc67de172a8f1e98cbf1df7b  evidence_pack/artifact_index.json
+6e9a35bc43ef19eb1cb34c9cd78de8cc28217276e8e1a436ac3dca2640335ac5  labels.jsonl
+23e53b090394ffaade8b3a3f09f6014df545ea2d549fcde44b2c51ee5d7c2acd  observed_label_summary.json
+3f3dd64278c1276e12052d44784546e01fbb8d8080a2dcbb9515f4001bd90fa7  evidence_pack/artifact_index.json
 ```
 
 ## PHASE51C-LABEL-LAKE-20260502T004621Z

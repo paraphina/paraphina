@@ -120,6 +120,63 @@ def _hash_or_none(value: Any) -> str | None:
     return _stable_hash(value) if value not in (None, "") else None
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_time_ms(record: dict[str, Any]) -> int | None:
+    for key in ("timestamp_local_ms", "timestamp_ms", "exchange_timestamp_ms", "kf_last_update_ms"):
+        value = _safe_int(record.get(key))
+        if value is not None:
+            return value
+    treasury = record.get("treasury_guidance")
+    if isinstance(treasury, dict):
+        value = _safe_int(treasury.get("as_of_ms"))
+        if value is not None:
+            return value
+    return None
+
+
+def _reference_price(record: dict[str, Any], venue_index: Any) -> tuple[float | None, str]:
+    fair_value = _safe_float(record.get("fair_value"))
+    if fair_value is not None:
+        return fair_value, "fair_value"
+    venue_i = _safe_int(venue_index)
+    venue_mid = record.get("venue_mid_usd")
+    if venue_i is not None and isinstance(venue_mid, list) and 0 <= venue_i < len(venue_mid):
+        mid = _safe_float(venue_mid[venue_i])
+        if mid is not None:
+            return mid, "venue_mid_usd"
+    return None, "missing_reference_price"
+
+
+def _signed_markout_usd(side: Any, fill_price: Any, size: Any, future_price: float) -> float | None:
+    px = _safe_float(fill_price)
+    qty = _safe_float(size)
+    if px is None or qty is None:
+        return None
+    side_s = str(side or "").lower()
+    if side_s.startswith("buy") or side_s == "bid":
+        return (future_price - px) * abs(qty)
+    if side_s.startswith("sell") or side_s == "ask":
+        return (px - future_price) * abs(qty)
+    return None
+
+
 def _maker_taker_role(fill: dict[str, Any]) -> str:
     for key in ("maker_or_taker", "maker_taker", "liquidity", "role"):
         raw = fill.get(key)
@@ -141,13 +198,74 @@ def _extract_fill_labels(
     source_telemetry: Path,
     run_id: str,
     timestamp_ns: int,
+    markout_horizons_ms: list[int],
     labels_file,
 ) -> tuple[int, int, dict[str, int], dict[str, int]]:
     fill_count = 0
     markout_count = 0
+    label_seq = 0
     per_venue: dict[str, int] = {}
     role_counts: dict[str, int] = {}
+    pending_markouts: list[dict[str, Any]] = []
     for line_no, record in _iter_json_stream(source_telemetry):
+        record_time_ms = _record_time_ms(record)
+        if record_time_ms is not None and pending_markouts:
+            still_pending: list[dict[str, Any]] = []
+            for pending in pending_markouts:
+                remaining_horizons: list[int] = []
+                for horizon_ms in pending["remaining_horizons_ms"]:
+                    if record_time_ms < pending["fill_time_ms"] + horizon_ms:
+                        remaining_horizons.append(horizon_ms)
+                        continue
+                    future_price, price_source = _reference_price(record, pending["venue_index"])
+                    markout = (
+                        _signed_markout_usd(
+                            pending["side"],
+                            pending["price"],
+                            pending["size"],
+                            future_price,
+                        )
+                        if future_price is not None
+                        else None
+                    )
+                    if markout is None:
+                        remaining_horizons.append(horizon_ms)
+                        continue
+                    markout_count += 1
+                    label_seq += 1
+                    markout_label = _base_label(
+                        run_id=run_id,
+                        label_seq=label_seq,
+                        label_type="OBSERVED_MARKOUT_LABEL",
+                        timestamp_ns=timestamp_ns,
+                    )
+                    markout_label.update({
+                        "source": "phase5_telemetry_future_reference",
+                        "source_line": pending["source_line"],
+                        "source_t": pending["source_t"],
+                        "source_fill_index": pending["source_fill_index"],
+                        "future_source_line": line_no,
+                        "future_source_t": record.get("t"),
+                        "fill_id": pending["fill_id"],
+                        "venue_id": pending["venue_id"],
+                        "side": pending["side"],
+                        "price": pending["price"],
+                        "size": pending["size"],
+                        "fill_time_ms": pending["fill_time_ms"],
+                        "markout_horizon_ms": horizon_ms,
+                        "future_time_ms": record_time_ms,
+                        "future_reference_price": future_price,
+                        "future_reference_price_source": price_source,
+                        "markout_pnl": markout,
+                        "label_status": "OBSERVED_MARKOUT_FAIR_VALUE",
+                        "label_confidence": 1.0,
+                        "training_hold_reason": "requires_quote_join_holdout_and_model_calibration",
+                    })
+                    labels_file.write(json.dumps(markout_label, sort_keys=True, separators=(",", ":")) + "\n")
+                if remaining_horizons:
+                    pending["remaining_horizons_ms"] = remaining_horizons
+                    still_pending.append(pending)
+            pending_markouts = still_pending
         fills = record.get("fills") or []
         if not isinstance(fills, list) or not fills:
             continue
@@ -162,9 +280,22 @@ def _extract_fill_labels(
             role_counts[role] = role_counts.get(role, 0) + 1
             markout_value = fill.get("markout_pnl_short")
             markout_status = "OBSERVED" if markout_value is not None else "MISSING"
+            label_seq += 1
+            fill_id = _stable_hash([
+                line_no,
+                source_t,
+                fill_index,
+                fill.get("venue_id"),
+                fill.get("order_id"),
+                fill.get("client_order_id"),
+                fill.get("fill_time_ms"),
+                fill.get("side"),
+                fill.get("price"),
+                fill.get("size"),
+            ])
             label = _base_label(
                 run_id=run_id,
-                label_seq=fill_count + markout_count,
+                label_seq=label_seq,
                 label_type="OBSERVED_FILL_LABEL",
                 timestamp_ns=timestamp_ns,
             )
@@ -174,18 +305,7 @@ def _extract_fill_labels(
                 "source_t": source_t,
                 "source_fill_index": fill_index,
                 "source_record_sha256": _stable_hash(fill),
-                "fill_id": _stable_hash([
-                    line_no,
-                    source_t,
-                    fill_index,
-                    fill.get("venue_id"),
-                    fill.get("order_id"),
-                    fill.get("client_order_id"),
-                    fill.get("fill_time_ms"),
-                    fill.get("side"),
-                    fill.get("price"),
-                    fill.get("size"),
-                ]),
+                "fill_id": fill_id,
                 "venue_id": fill.get("venue_id"),
                 "venue_index": fill.get("venue_index"),
                 "side": fill.get("side"),
@@ -216,32 +336,47 @@ def _extract_fill_labels(
                 "training_hold_reason": "requires_markout_horizons_and_holdout_join",
             })
             labels_file.write(json.dumps(label, sort_keys=True, separators=(",", ":")) + "\n")
-            if markout_value is None:
-                continue
-            markout_count += 1
-            markout_label = _base_label(
-                run_id=run_id,
-                label_seq=fill_count + markout_count,
-                label_type="OBSERVED_MARKOUT_LABEL",
-                timestamp_ns=timestamp_ns,
-            )
-            markout_label.update({
-                "source": "phase5_telemetry_fills",
-                "source_line": line_no,
-                "source_t": source_t,
-                "source_fill_index": fill_index,
-                "fill_id": label["fill_id"],
-                "venue_id": fill.get("venue_id"),
-                "side": fill.get("side"),
-                "price": fill.get("price"),
-                "size": fill.get("size"),
-                "markout_horizon": "short_existing",
-                "markout_pnl": markout_value,
-                "label_status": "OBSERVED_MARKOUT_SHORT",
-                "label_confidence": 1.0,
-                "training_hold_reason": "requires_multi_horizon_markout_and_holdout_join",
-            })
-            labels_file.write(json.dumps(markout_label, sort_keys=True, separators=(",", ":")) + "\n")
+            if markout_value is not None:
+                markout_count += 1
+                label_seq += 1
+                markout_label = _base_label(
+                    run_id=run_id,
+                    label_seq=label_seq,
+                    label_type="OBSERVED_MARKOUT_LABEL",
+                    timestamp_ns=timestamp_ns,
+                )
+                markout_label.update({
+                    "source": "phase5_telemetry_fills",
+                    "source_line": line_no,
+                    "source_t": source_t,
+                    "source_fill_index": fill_index,
+                    "fill_id": label["fill_id"],
+                    "venue_id": fill.get("venue_id"),
+                    "side": fill.get("side"),
+                    "price": fill.get("price"),
+                    "size": fill.get("size"),
+                    "markout_horizon": "short_existing",
+                    "markout_pnl": markout_value,
+                    "label_status": "OBSERVED_MARKOUT_SHORT",
+                    "label_confidence": 1.0,
+                    "training_hold_reason": "requires_multi_horizon_markout_and_holdout_join",
+                })
+                labels_file.write(json.dumps(markout_label, sort_keys=True, separators=(",", ":")) + "\n")
+            fill_time_ms = _safe_int(fill.get("fill_time_ms"))
+            if fill_time_ms is not None and markout_horizons_ms:
+                pending_markouts.append({
+                    "fill_id": fill_id,
+                    "source_line": line_no,
+                    "source_t": source_t,
+                    "source_fill_index": fill_index,
+                    "venue_id": fill.get("venue_id"),
+                    "venue_index": fill.get("venue_index"),
+                    "side": fill.get("side"),
+                    "price": fill.get("price"),
+                    "size": fill.get("size"),
+                    "fill_time_ms": fill_time_ms,
+                    "remaining_horizons_ms": list(markout_horizons_ms),
+                })
     return fill_count, markout_count, per_venue, role_counts
 
 
@@ -295,11 +430,18 @@ def _balance_label(
     return label
 
 
-def _gate_reason(fill_labels: int, markout_labels: int, balance_labels: int) -> str:
+def _gate_reason(
+    fill_labels: int,
+    markout_labels: int,
+    balance_labels: int,
+    role_counts: dict[str, int],
+) -> str:
     if fill_labels == 0:
         return "observed_label_pack_missing_fills"
     if markout_labels == 0:
         return "observed_label_pack_missing_markout_coverage"
+    if role_counts.get("UNKNOWN", 0) == fill_labels:
+        return "observed_label_pack_missing_maker_taker_attribution"
     if balance_labels == 0:
         return "observed_label_pack_missing_balance_reconciliation"
     return "observed_label_pack_requires_quote_join_holdout_and_board_review"
@@ -314,6 +456,7 @@ def build_observed_labels(
     balance_pre: Path | None,
     balance_post: Path | None,
     balance_comparison: Path | None,
+    markout_horizons_ms: list[int],
 ) -> Path:
     if not source_telemetry.exists():
         raise ValueError(f"source telemetry not found: {source_telemetry}")
@@ -332,6 +475,7 @@ def build_observed_labels(
             source_telemetry=source_telemetry,
             run_id=run_id,
             timestamp_ns=timestamp_ns,
+            markout_horizons_ms=markout_horizons_ms,
             labels_file=labels_file,
         )
         balance_labels = 0
@@ -353,7 +497,7 @@ def build_observed_labels(
         "created_utc": created_utc,
         "baseline_commit": BASELINE_COMMIT,
         "gate_status": "HOLD",
-        "gate_reason": _gate_reason(fill_labels, markout_labels, balance_labels),
+        "gate_reason": _gate_reason(fill_labels, markout_labels, balance_labels, role_counts),
         "approved_for_model_training": False,
         "approved_for_live": False,
         "approved_for_canary": False,
@@ -364,6 +508,7 @@ def build_observed_labels(
         "balance_pre_snapshot": str(balance_pre) if balance_pre else None,
         "balance_post_snapshot": str(balance_post) if balance_post else None,
         "balance_comparison": str(balance_comparison) if balance_comparison else None,
+        "markout_horizons_ms": markout_horizons_ms,
         "fill_labels": fill_labels,
         "markout_labels": markout_labels,
         "balance_reconciliation_labels": balance_labels,
@@ -400,7 +545,21 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--timestamp-ns", type=int, default=None)
+    parser.add_argument(
+        "--markout-horizons-ms",
+        default="100,500,1000,5000",
+        help="Comma-separated fair-value markout horizons to derive from future telemetry records.",
+    )
     args = parser.parse_args()
+    try:
+        markout_horizons_ms = [
+            int(part)
+            for part in str(args.markout_horizons_ms).split(",")
+            if part.strip()
+        ]
+    except ValueError as exc:
+        print(f"phase51c_observed_labels: ERROR: invalid --markout-horizons-ms: {exc}", file=sys.stderr)
+        return 2
     try:
         out_dir = build_observed_labels(
             source_telemetry=args.source_telemetry,
@@ -410,6 +569,7 @@ def main() -> int:
             balance_pre=args.balance_pre,
             balance_post=args.balance_post,
             balance_comparison=args.balance_comparison,
+            markout_horizons_ms=markout_horizons_ms,
         )
     except Exception as exc:
         print(f"phase51c_observed_labels: ERROR: {exc}", file=sys.stderr)
