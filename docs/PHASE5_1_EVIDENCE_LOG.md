@@ -69,6 +69,132 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## LTR-EV-SHADOW-001 Phase 5 Tail 20k M6 Reference Replay
+
+- Run id: `LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_20k_m6`
+- Local run directory: `runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_20k_m6`
+- Source snapshot: `/tmp/phase51_inputs/phase5_tail_20000_20260501T214411Z.telemetry.jsonl`
+- Input artifact mode: `reference`
+- Input records scanned: `20000`
+- Input SHA256: `a05927b7e02d3e1a8987d9b385d09fe1e7908273e6a23d40585ae851cb6c48c9`
+- Candidates evaluated: `40000`
+- Replay labels emitted: `40000`
+- Gate status: `HOLD`
+- Calibration status: `SPARSE`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+- `admissible_for_financial_claim`: `false`
+- Replay timestamp: `1701007808057214863`
+- Replay timestamp UTC: `2023-11-26T14:10:08.057215+00:00`
+- Timestamp semantics: deterministic replay timestamp, not wall-clock artifact creation time.
+
+The source artifact was referenced rather than copied because root disk was at `100%`
+utilization and the source telemetry hash was already recorded in the manifest.
+This preserves evidence integrity without duplicating a large input file.
+
+Command:
+
+```bash
+python3 tools/phase51_ev_shadow.py \
+  --input-telemetry /tmp/phase51_inputs/phase5_tail_20000_20260501T214411Z.telemetry.jsonl \
+  --run-id LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_20k_m6 \
+  --output-root runs/phase51_lighter_only_ev_shadow \
+  --input-artifact-mode reference
+```
+
+Validation:
+
+```bash
+python3 tools/check_telemetry_contract.py \
+  runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_20k_m6/telemetry.jsonl
+```
+
+Result:
+
+```text
+OK: 80001 record(s) validated against schema v2
+```
+
+Artifact hashes:
+
+```text
+bcb62978eb22f5105dba92a420e336dc41cd9d28853a2683dcad3e1b3bcf7420  telemetry.jsonl
+558e1633b7557563d9f49f82363e1e83a081c6ab2c68ae186bfcdb439827b9c6  ev_shadow_summary.json
+0030db862079c8e05603b392e5730b23d06160162d468e3491d701064c31a9f5  evidence_pack/artifact_index.json
+```
+
+HOLD reason counts:
+
+```text
+missing_pfill_calibration: 40000
+missing_markout_calibration: 40000
+missing_hedge_success_calibration: 40000
+missing_queue_reset_calibration: 40000
+missing_churn_calibration: 40000
+missing_tail_risk_calibration: 40000
+sparse_calibration_bucket: 40000
+counterfactual_only_nonfinancial: 40000
+```
+
+## PHASE51C-LABEL-LAKE-20K
+
+- Run id: `PHASE51C-LABEL-LAKE-20K-20260502T004902Z`
+- Local run directory: `runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-20K-20260502T004902Z`
+- Source snapshot: `/tmp/phase51_inputs/phase5_tail_20000_20260501T214411Z.telemetry.jsonl`
+- EV shadow telemetry: `runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_20k_m6/telemetry.jsonl`
+- Phase 5.1b acceptance artifact: `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/phase51b_acceptance.json`
+- Gate status: `HOLD`
+- Gate reason: `label_lake_scaffold_missing_fill_markout_balance_coverage`
+- Record count: `66814`
+- Quote decision labels: `40000`
+- Order lifecycle labels: `26813`
+- Fill labels: `0`
+- Markout labels: `0`
+- Balance reconciliation labels: `0`
+- Balance reconciliation status: `MISSING`
+- Native limit pressure status: `UNKNOWN`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_label_lake.py \
+  --source-telemetry /tmp/phase51_inputs/phase5_tail_20000_20260501T214411Z.telemetry.jsonl \
+  --ev-shadow-telemetry runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_20k_m6/telemetry.jsonl \
+  --phase51b-acceptance runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/phase51b_acceptance.json \
+  --run-id PHASE51C-LABEL-LAKE-20K-20260502T004902Z
+```
+
+Order action counts:
+
+```text
+cancel: 10128
+place: 10130
+replace: 6555
+```
+
+Quote decision counts:
+
+```text
+HOLD: 40000
+```
+
+Artifact hashes:
+
+```text
+d1f168393a5e36e3413c82931db6096c202b763992c7351a7d9e828e521bb0d7  labels.jsonl
+94ce7b8e7f21c5f9610a12c96b7e99b78a19cb5a968fb339a1afced4d1869e48  label_lake_summary.json
+fdc37d39d4c7ec7f91440dd44d47ff8fb4d1eca5eb04c0307405ecb1b02a016f  evidence_pack/artifact_index.json
+```
+
 ## PHASE51C-LABEL-LAKE-20260502T004621Z
 
 - Run id: `PHASE51C-LABEL-LAKE-20260502T004621Z`
