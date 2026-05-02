@@ -47,6 +47,51 @@ current live-runtime code. Correct current-state claims in Part I or roadmap
 docs unless the explicit task is to revise the canonical appendix and update its
 integrity artifacts.
 
+### Active V2 target specification (Phase 5.1)
+
+The current V2 upgrade target lives in `docs/V2_SPECIFICATION.md`. It is the
+repo-owned Phase 5.1 specification for the fill-aware, hedge-aware,
+arbitrage-informed market-making evolution. It is a target and evidence
+contract, not a claim that V2 behavior is implemented, live-authorized, or
+production-ready.
+
+V2 changes the quote decision model from apparent-edge heuristics to
+probability-weighted expected value. Local edge and executable pair edge remain
+model features, but the rejected shortcuts `true_edge = max(local_edge,
+pair_edge)` and `Q_raw = true_edge / eta` must not be used as canonical quote
+admission or pair-edge-dominant sizing rules.
+
+The canonical V2 quote objective is:
+
+```text
+EV(order, Q, p, T) =
+  P_fill * [
+      P_hedge_success * E_locked_edge
+    + P_hedge_partial * E_partial_hedge_state
+    + P_hedge_fail * E_residual_inventory_state
+  ]
+  - E_adverse_selection
+  - E_queue_reset
+  - E_churn
+  - E_capital_funding
+  - E_tail_risk
+```
+
+Admission is permitted only when the post-rounding lower confidence bound is
+positive: `LCB_alpha(EV(order, Q, p, T)) > 0`. Sizing is a discrete constrained
+optimization over venue size grids, margin, hedgeability, inventory, pair
+budget, liquidation safety, rate-limit headroom, and non-live experiment caps.
+
+The active Phase 5.1 evidence boundary remains `HOLD` for live, canary, capital
+escalation, risk-limit relaxation, model training, and EV admission until the
+roadmap gates accept complete non-live evidence. Current blockers include
+filled-order horizon/timebase recovery, venue-native Lighter limit and
+maker/taker completeness, sparse calibration buckets, and observed-only
+selection-bias quarantine policy.
+
+Part II below remains the hash-locked v1 appendix. It is historical target/spec
+context, not the active V2 authority.
+
 ---
 
 ## Repo architecture at a glance

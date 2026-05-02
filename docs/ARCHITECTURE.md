@@ -127,6 +127,12 @@ gate. If the current implementation has moved beyond an old appendix status
 annotation, correct the current-state note before the canonical marker instead
 of casually editing the hash-locked appendix.
 
+`docs/V2_SPECIFICATION.md` is the active Phase 5.1/V2 target specification for
+fill-aware, hedge-aware, arbitrage-informed quoting. It is not implementation
+truth or live authorization. `ROADMAP.md` controls whether any V2 requirement is
+eligible for implementation, shadow evidence, model training, canary, or live
+promotion.
+
 Whitepaper completion means implementation parity for the audited whitepaper
 scope. It does not mean:
 
@@ -138,9 +144,10 @@ scope. It does not mean:
 For new work:
 
 1. Read `README.md`, `ROADMAP.md`, this file, and `docs/AGENT_START_HERE.md`.
-2. Locate code evidence with `rg` before making claims.
-3. Treat `docs/ROADMAP_B_READINESS_REPORT.md`, `docs/WP_PARITY_MATRIX.md`, and
+2. Read `docs/V2_SPECIFICATION.md` before Phase 5.1/V2 work.
+3. Locate code evidence with `rg` before making claims.
+4. Treat `docs/ROADMAP_B_READINESS_REPORT.md`, `docs/WP_PARITY_MATRIX.md`, and
    `docs/WHITEPAPER_COMPLETION_*` as historical/generated unless regenerated.
-4. Keep docs edits separate from runtime/code edits unless explicitly asked.
-5. Run `python3 tools/check_docs_integrity.py` after roadmap or whitepaper
+5. Keep docs edits separate from runtime/code edits unless explicitly asked.
+6. Run `python3 tools/check_docs_integrity.py` after roadmap or whitepaper
    changes.

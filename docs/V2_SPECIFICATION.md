@@ -1,0 +1,488 @@
+# Paraphina V2 Specification
+
+Status: active target specification for Phase 5.1 non-live research and
+implementation review.
+
+This document is the repo-owned V2 strategy specification. It supersedes the
+external proposal language wherever that proposal conflicts with the Phase 5.1
+board addenda. It does not authorize live orders, canary promotion, capital
+escalation, risk-limit relaxation, model training, EV admission, or financial
+claims.
+
+Primary source addenda:
+
+- `/home/ubuntu/paraphina/docs/Paraphina_V2_Whitepaper_Specification_Proposal`
+- `/home/ubuntu/paraphina/docs/PARAPHINA PHASE 5.1 V2 SPECIFICATION REVISION ADDENDA`
+
+Current repo evidence boundary:
+
+- Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
+- Current Phase 5.1 evidence boundary: Phase 5.1j observed-horizon recovery
+- Current V2 verdict: `HOLD` for model training, EV admission, canary, live
+  orders, capital escalation, risk-limit relaxation, and financial claims
+
+## 1. Scope And Non-Negotiables
+
+V2 is a fill-aware, hedge-aware, arbitrage-informed market-making upgrade. It
+keeps passive post-only market making as the default alpha capture mechanism
+and makes executable cross-venue economics a first-class input to quote
+admission, sizing, layering, and evidence.
+
+V2 is not:
+
+- a pure taker arbitrage bot;
+- a license to place live orders from Phase 5.1 evidence;
+- a capital escalation plan;
+- a risk-limit relaxation;
+- a multi-venue launch authorization;
+- proof that Phase 5 already demonstrated V2 profitability, improved fills,
+  lower directional exposure, successful fill-to-hedge, paired-inventory
+  safety, or all-five economic participation.
+
+Balance deltas across exchange accounts remain the live financial PnL
+authority. Telemetry PnL, model EV, fill-level PnL, replay PnL, and simulated
+PnL are diagnostic until reconciled to exchange balances with pre-registered
+tolerances.
+
+## 2. Rejected Formulations
+
+The following formulations are explicitly rejected as canonical V2 logic:
+
+```text
+true_edge = max(local_edge, pair_edge)
+Q_raw = true_edge / eta
+```
+
+`local_edge` and executable `pair_edge` may remain raw explanatory features.
+Neither may directly determine quote admission or quote size without fill
+probability, hedge success/failure, costs, confidence bounds, and failure-state
+EV.
+
+Positive apparent pair edge is not sufficient. A quote with positive apparent
+pair edge must still be rejected if fill probability is too low, hedge success
+is too uncertain, adverse selection dominates, rounded size is uneconomic, rate
+or order-management churn consumes the edge, residual inventory is unsafe, or
+required telemetry is missing.
+
+## 3. Order Candidate Contract
+
+Every evaluated quote must be represented as an `OrderCandidate` before
+admission. The candidate must be serializable, replayable, and reconstructable
+from raw market/inventory events, config hash, model version, and baseline
+commit.
+
+Required candidate fields:
+
+- `candidate_id`: deterministic ID derived from run, event sequence, venue,
+  side, layer, price, size, model version, and config hash.
+- `run_id`, `baseline_commit`, `config_hash`, `model_version`.
+- `instrument_id`, `entry_venue_id`, `side`, `layer`.
+- `passive_price`: final tick-snapped post-only price after passivity checks.
+- `candidate_size_Q`: final candidate size in base units and notional USD.
+- `intended_lifetime_ms`: planned rest time before cancel/replace evaluation.
+- `local_edge_feature`: fair-value-local maker edge after fees, ticks,
+  passivity, volatility buffer, and venue quote-cost buffer.
+- `pair_edge_feature`: executable pair-edge feature at candidate price and
+  size for eligible hedge venues.
+- `primary_hedge_venue_id`, `backup_hedge_venue_id`, or explicit
+  `NO_BACKUP_AVAILABLE`.
+- `quote_context`: fair value, book age, spread, depth, volatility, toxicity,
+  risk regime, inventory, margin, rate-limit state, and venue health.
+- `model_features_hash`: deterministic hash of the feature vector.
+
+Acceptance criterion: every admitted or rejected quote decision must be
+replayable from candidate records, raw events, baseline commit, config hash,
+and model version.
+
+## 4. Canonical EV Objective
+
+The canonical V2 objective for a candidate order is:
+
+```text
+EV(order, Q, p, T) =
+  P_fill(order, Q, p, T) * [
+      P_hedge_success(order, Q, p, T) * E_locked_edge(order, Q, p)
+    + P_hedge_partial(order, Q, p, T) * E_partial_hedge_state(order, Q, p)
+    + P_hedge_fail(order, Q, p, T) * E_residual_inventory_state(order, Q, p)
+  ]
+  - E_adverse_selection(order, Q, p, T)
+  - E_queue_reset(order, Q, p, T)
+  - E_churn(order, Q, p, T)
+  - E_capital_funding(order, Q, p, T)
+  - E_tail_risk(order, Q, p, T)
+```
+
+For pair-conditioned candidates:
+
+```text
+P_hedge_success + P_hedge_partial + P_hedge_fail = 1
+```
+
+For local-edge-driven candidates with no intended immediate hedge:
+
+```text
+P_hedge_success = 0
+P_hedge_partial = 0
+P_hedge_fail = 1
+```
+
+The residual inventory state must capture expected value after a passive maker
+fill without immediate hedge. It must be non-positive by default unless
+specific reproducible evidence supports a positive local inventory state.
+
+### Required EV Components
+
+`P_fill(order, Q, p, T)` estimates the probability that a passive order gets a
+fill or economically material partial fill during the intended lifetime.
+Calibration must condition on venue, side, layer, distance to touch, size
+relative to depth, queue age if available, cancel/replace history, spread,
+volatility, time of day, toxicity, venue health, rate state, recent fill
+intensity, post-only outcomes, and order lifetime.
+
+`P_hedge_success`, `P_hedge_partial`, and `P_hedge_fail` estimate hedge outcome
+probabilities conditional on passive fill. They must condition on entry/hedge
+venue pair, side, size bucket, hedge book age, usable depth, guard price,
+latency, rate headroom, margin, liquidation distance, connector health, error
+rate, recent hedge attempts, and edge decay half-life.
+
+`E_locked_edge` is the expected realized edge when passive fill and intended
+hedge both succeed, after maker/taker fees, slippage, latency decay, connector
+or settlement cost, and funding/carry over the expected holding window.
+
+`E_partial_hedge_state` is the expected value of a partial hedge, including
+executed hedge fraction distribution, residual delta, repair cost, liquidation
+and margin risk, basis exposure, and pair-budget impact.
+
+`E_residual_inventory_state` is the expected value when hedge fails, is skipped,
+is rejected, becomes uneconomic, or is blocked by risk. It must include markout
+while unpaired, periodic hedge or target-relative exit cost, forced risk
+reduction probability, extra capital/margin use, basis/fragmentation penalties,
+liquidation-distance penalty, and kill-switch contribution.
+
+`E_adverse_selection` is the expected toxic-fill cost measured from conditional
+markout after maker fill over pre-registered horizons: `100ms`, `500ms`, `1s`,
+`5s`, intended hedge completion horizon, and next fair-value update horizon.
+
+`E_queue_reset` is the expected opportunity cost of cancel/replace behavior that
+loses queue priority or causes post-only rejection/re-entry.
+
+`E_churn` is the operational and opportunity cost of order lifecycle actions:
+rate-limit use, connector load, message failure probability, and blocked future
+risk-reducing actions.
+
+`E_capital_funding` is expected cost or benefit from margin, funding, borrow,
+collateral, account fee profile, and opportunity cost of capital.
+
+`E_tail_risk` is a conservative penalty for low-frequency high-loss states:
+venue outage after fill, stale hedge book, volatility shock, partial hedge with
+widening spread, connector reject while unpaired, rate exhaustion preventing
+cancel/hedge, close-only mode, liquidation deterioration, and correlated basis
+collapse.
+
+## 5. Admission, Sizing, And Layering
+
+A candidate may be admitted only when all hard gates pass:
+
+- kill switch inactive;
+- risk regime permits new quote risk;
+- entry venue enabled;
+- entry book fresh and valid;
+- fair value available where required;
+- toxicity below hard-block threshold;
+- margin sufficient for entry fill and residual states;
+- liquidation-safe size positive;
+- order price valid under tick, passivity, and venue constraints;
+- rate-limit headroom sufficient for entry management and risk-reducing action;
+- telemetry and replay metadata complete.
+
+The canonical admission rule is:
+
+```text
+admit(order, Q, p, T) only if LCB_alpha(EV(order, Q, p, T)) > 0
+```
+
+The lower confidence bound must remain positive after final tick snapping,
+passivity checks, lot rounding, size-step rounding, and min-notional checks.
+
+Pair-conditioned candidates require additional hedgeability gates:
+
+- primary hedge venue valid;
+- backup venue recorded or explicitly unavailable;
+- hedge book fresh;
+- hedge depth supports `Q` under guard price;
+- hedge venue margin supports the hedge action;
+- hedge-confidence model available and fresh;
+- immediate hedge serialization enabled in non-live simulation or explicitly
+  disabled with no pair-conditioned admission.
+
+Sizing is a constrained discrete optimization:
+
+```text
+Q* = argmax_Q in F(order) LCB_alpha(EV(order, Q, p, T))
+```
+
+The feasible set `F(order)` is the venue size grid constrained by min lot, min
+notional, hedge depth, entry and hedge margin, pair budget, unpaired delta
+budget, liquidation-safe size, order limits, rate-limit proxy, and configured
+non-live experiment cap.
+
+The optimizer must evaluate size-dependent slippage, hedge-success probability,
+adverse selection, tail penalty, residual inventory cost, and binding
+constraints. A discrete grid search is acceptable for Phase 5.1 non-live work.
+
+V2 may evaluate multiple layers per venue-side:
+
+- `TOUCH`: small, strict-confidence candidates near top of book.
+- `WORKING`: less aggressive passive quotes with lower queue/churn pressure.
+- `INVENTORY_REDUCING`: candidates that reduce existing unpaired risk.
+- `BASELINE_COMPAT`: candidates used to compare against the clean baseline.
+
+If venue/order limits allow only one order per venue-side, select the candidate
+with the highest positive lower-bound EV after risk-priority rules.
+
+## 6. Pair Edge, Fair Value, And Local Edge
+
+Global fair value remains the anchor for risk, mark-to-market, local edge,
+basis, and inventory accounting. Pair-edge computation must not corrupt fair
+value construction.
+
+Executable pair edge is a feature generator, not the objective. It must be
+computed by a deterministic market-state module that consumes fresh books,
+fees, account profile, venue health, margin state, depth, latency estimates,
+and rate-limit state. Pair edge is invalid if any required input is stale,
+missing, disabled, toxic, margin-constrained, rate-constrained, or liquidation
+unsafe.
+
+Local-edge-driven quoting remains valid when no hedge venue has fresh depth,
+hedge confidence is below minimum, pair-edge evidence is unavailable, the quote
+reduces unpaired inventory, baseline-compatible MM is being evaluated, pair
+budget is exhausted, apparent pair edge is within uncertainty, or local-edge EV
+has superior confidence-bounded value.
+
+## 7. Inventory, Residual State, And Risk
+
+Inventory must be decomposed as:
+
+```text
+q_total_v = q_paired_v + q_unpaired_v
+```
+
+Paired inventory must carry a `pair_id`, long venue, short venue, instrument
+mapping, delta ratio, hedge venue where applicable, pair budget consumed, pair
+creation timestamp, validity state, and invalidation reason.
+
+Unpaired directional exposure must be separately observable and tighter than
+ordinary global delta. Paired basis inventory is not free risk; it consumes
+pair budget, margin budget, and basis risk budget.
+
+A pair is degraded or invalidated when either venue is stale, disabled, toxic,
+margin-constrained, near liquidation, connector-degraded, fee/account profile
+assumptions change, instrument mapping diverges, funding/basis moves outside
+model support, required telemetry is missing, or kill switch is active.
+
+For each fill on a pair-conditioned candidate, the system must create exactly
+one fast-hedge decision before periodic hedge or target-relative exit can act
+on that quantity. The mutually exclusive outcomes are `SEND`, `SKIP`, `DEFER`,
+and `BLOCKED`. Failed, skipped, blocked, or partial hedges immediately create
+auditable residual state.
+
+Each quantity of inventory must have exactly one active action owner:
+`FAST_HEDGE`, `TARGET_RELATIVE_EXIT`, `PERIODIC_HEDGE`,
+`RISK_REDUCE_ONLY`, or `NO_ACTION_INSIDE_BUDGET`.
+
+Hard risk limits always override pair preservation.
+
+## 8. Telemetry And Evidence
+
+V2 evidence must separate observed facts, model estimates, counterfactual
+decisions, counterfactual outcomes, simulated outcomes, paper/testnet outcomes,
+and balance-authoritative live economics.
+
+Required event families for V2 implementation review:
+
+- `V2_RUN_CONTEXT`
+- `V2_MARKET_SNAPSHOT`
+- `V2_PAIR_EDGE_SNAPSHOT`
+- `V2_EV_EVALUATED`
+- `V2_ORDER_INTENT`
+- `V2_ORDER_LIFECYCLE`
+- `V2_FILL_OBSERVED`
+- `V2_FAST_HEDGE_DECISION`
+- `V2_HEDGE_LIFECYCLE`
+- `V2_INVENTORY_SNAPSHOT`
+- `V2_BALANCE_SNAPSHOT`
+- `V2_REPLAY_LABEL`
+- `V2_GUARDRAIL_EVENT`
+
+Every event path must preserve non-live authorization fields, config hash,
+baseline commit, model version, schema version, and enough identifiers to
+replay without exposing secrets or raw private identifiers.
+
+Replay must:
+
+- verify the clean baseline commit or record the exact diff hash;
+- reproduce baseline decisions;
+- run V2 in decision-shadow mode on the same event stream;
+- emit EV and replay-label records for every candidate;
+- store manifest, artifact index, hashes, commands, configs, model versions,
+  dataset hashes, and seeds;
+- rerun byte-stable where determinism is expected;
+- block economic claims if attribution does not reconcile to balance facts.
+
+## 9. Calibration And Statistical Gates
+
+V2 model calibration requires out-of-sample or regime-separated holdout before
+promotion beyond non-live evidence.
+
+Primary metrics:
+
+- guardrail non-regression;
+- deterministic reproducibility;
+- EV calibration;
+- economic superiority only in authorized evidence lanes.
+
+Secondary metrics:
+
+- candidate count by venue/side/layer;
+- admission/rejection reason distribution;
+- P_fill estimate quality;
+- markout distribution;
+- hedge success estimate quality;
+- queue reset and churn cost quality;
+- capital/funding attribution;
+- paired vs unpaired inventory residence time.
+
+Provisional minimum sample rules:
+
+- at least `1000` quote candidate observations per venue/side/layer/regime
+  bucket;
+- at least `200` observed fills per fill-model bucket, or hierarchical pooling
+  with explicit uncertainty inflation;
+- at least `100` observed or paper/testnet hedge attempts per hedge-success
+  bucket before venue-pair-specific estimates;
+- sparse buckets force `HOLD` unless the board approves pooling.
+
+Confidence intervals must account for serial correlation; IID intervals are
+not acceptable for order-book time series unless justified.
+
+## 10. Systems Delta Contract
+
+The clean Phase 5 baseline is insufficient for V2 behavior until these
+components are implemented, tested, and evidenced:
+
+- pair-edge data model;
+- EV evaluation service or module;
+- hedge-confidence model;
+- layer-aware OMS;
+- order metadata propagation from candidate to fill and hedge;
+- immediate fill-to-hedge serialization state machine;
+- double-action prevention;
+- paired/unpaired inventory accounting;
+- pair invalidation and residual-state handling;
+- target-relative exit semantics;
+- pair-aware periodic hedge semantics;
+- V2 telemetry validation;
+- deterministic replay and unit-test invariants.
+
+Minimum invariant tests:
+
+- stale entry or hedge venue invalidates pair edge;
+- disabled or toxic venue invalidates pair edge;
+- positive pair-edge feature with negative lower-bound EV is rejected;
+- post-rounding negative EV is rejected;
+- size optimizer selects discrete EV argmax, not `true_edge / eta`;
+- one fast-hedge decision per pair-conditioned fill;
+- partial or rejected hedge creates residual state;
+- periodic hedge and target-relative exit cannot double-act on fast-hedge-owned
+  quantity;
+- paired inventory cannot also count as unpaired;
+- kill switch blocks new quote risk and overrides pair preservation;
+- missing metadata blocks economic claims;
+- no-live flag prevents order sending in non-live experiments.
+
+## 11. Venue Readiness And First Experiment
+
+V2 must not treat venue execution as homogeneous. Each venue needs evidence for
+account mode, fee profile, maker/taker economics, funding, post-only semantics,
+cancel/replace behavior, rate limits, active-order limits, lot/tick/min-notional
+constraints, telemetry visibility, connector readiness, and experiment
+blockers.
+
+The first executable V2 experiment remains venue-local and non-live:
+
+```text
+Experiment ID: LTR-EV-SHADOW-001
+Venue: Lighter only
+Mode: replay/shadow plus connector dry-run
+Authorization: no live orders, no capital changes, no risk-limit changes
+```
+
+Lighter-first does not mean other venues are strategically inferior. It means
+the first V2 evidence lane must prove one venue-local telemetry and lifecycle
+contract before generalizing.
+
+Aster remains blocked from first-experiment promotion unless taker-fee leakage
+is explicitly bounded and observable. Extended remains excluded from the first
+experiment due to bridge opacity and asynchronous acceptance. Paradex and
+Hyperliquid require profile/account/fee/queue evidence before promotion.
+
+## 12. Promotion Matrix
+
+`PROMOTE_FOR_NEXT_NONLIVE_STEP` only if:
+
+- baseline replay reproduces;
+- V2 decisions replay deterministically;
+- EV telemetry is complete;
+- hard gates are not bypassed;
+- no-live/no-capital/no-risk authorization fields remain safe;
+- source artifacts, commands, configs, hashes, and manifests are reproducible.
+
+`HOLD` if:
+
+- guardrails pass but calibration is sparse or inconclusive;
+- fill or hedge labels are insufficient;
+- venue/account/fee assumptions are unresolved;
+- balance reconciliation is unavailable for any economic claim;
+- telemetry required for EV components is missing.
+
+`REJECT` if:
+
+- objective cannot be computed from telemetry;
+- V2 bypasses hard gates;
+- residual state is unauditable;
+- model produces positive EV for known negative holdout outcomes;
+- replay cannot reproduce the baseline;
+- any non-live evidence path changes live execution.
+
+Canary and live deployment are outside this specification and require a later
+board decision, separate evidence, unchanged hard risk limits, operations
+runbook approval, balance-authoritative reconciliation, and rollback proof.
+
+## 13. Current Open Board Decisions
+
+These decisions remain open and must be resolved before model training or EV
+admission:
+
+- confidence standard for `LCB_alpha`, with `alpha = 0.05` one-sided as the
+  provisional default;
+- exact uncertainty inflation for sparse hierarchical pooling;
+- exact tighter unpaired directional exposure budget;
+- non-live pair-budget accounting limits;
+- Warning/Critical/Kill behavior for paired inventory invalidation;
+- whether immediate fill-to-hedge may advance beyond simulation/paper;
+- whether pure one-sided arbitrage remains research-only or moves to appendix;
+- whether the term `true_edge` is removed entirely or retained only as a
+  deprecated shorthand.
+
+## 14. Current Phase 5.1 Blockers
+
+As of Phase 5.1j, the V2 evidence path remains blocked by:
+
+- `461` filled-order rows still missing observed horizon/timebase evidence;
+- Lighter native-limit context still partial for `2288` labels;
+- maker/taker status incomplete for `287` fills;
+- sparse venue/side/layer/regime buckets;
+- observed-only selection bias from `1613` excluded quarantine/review groups.
+
+The next repo-owned V2 evidence move is a filled-order horizon/timebase recovery
+gate, plus read-only Lighter native-limit and maker/taker evidence enrichment.

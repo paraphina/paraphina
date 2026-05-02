@@ -73,6 +73,7 @@ structured closeout evidence.
 | `docs/AGENT_START_HERE.md` | Codex/human onboarding path and safety rules | Authoritative for workflow orientation |
 | `docs/WHITEPAPER.md` Part I | Algorithmic implementation narrative | Current where code-backed |
 | `docs/WHITEPAPER.md` Part II | Canonical target spec appendix | Hash-locked historical target/spec context |
+| `docs/V2_SPECIFICATION.md` | Phase 5.1/V2 fill-aware, hedge-aware, arbitrage-informed target specification | Active target spec; execution still gated by this roadmap |
 | `docs/ROADMAP_B.md` | Live venue rollout assumptions and gates | Supporting, not the roadmap |
 | `docs/ROADMAP_B_READINESS_REPORT.md` | Generated connector snapshot | Historical unless regenerated |
 | `docs/WP100_SIGNOFF.md` | WP100 audit signoff | Historical audit scope |
@@ -615,6 +616,19 @@ Hold/rollback condition:
 Do not change:
 
 - Live surface behavior from research-only work.
+
+#### Phase 5.1 / V2 Target Specification Gate
+
+| Field | Value |
+|---|---|
+| target | Canonicalize the V2 target specification and continue Phase 5.1 as a non-live evidence program for fill-aware, hedge-aware, arbitrage-informed quoting. |
+| current status | `specified_holding_nonlive`; `docs/V2_SPECIFICATION.md` is the active target spec, Phase 5.1j is the current evidence boundary, and no V2 live/canary/model-training/EV-admission promotion is authorized. |
+| next action | Close the highest-leverage non-live evidence gaps: filled-order horizon/timebase recovery, Lighter native-limit and maker/taker completeness, then rerun the 5.1h/5.1i/5.1j evidence chain before any calibrated EV shadow review. |
+| required evidence | Repo-owned V2 spec, Phase 5.1j recovered feature matrix, future filled-horizon evidence pack, Lighter native limit and maker/taker evidence, schema v2 validation, deterministic replay outputs, and docs integrity output. |
+| promotion condition | All current blockers are resolved enough for calibrated EV shadow/model-training review, no-live guards remain intact, accepted evidence separates observed facts from counterfactuals, and economic claims remain balance-authoritative only. |
+| hold/rollback condition | Any live/canary/capital/risk authorization from Phase 5.1 evidence, any return to `true_edge` or `Q_raw` as canonical admission/sizing, missing telemetry, unproven economic claims, spec drift, or docs integrity failure. |
+| lane | Phase 5.1 non-live V2 evidence / quant, systems, data, execution, and risk. |
+| source files | `docs/V2_SPECIFICATION.md`, `docs/WHITEPAPER.md`, `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`, `docs/PHASE5_1_BOARD_DECISION.md`, `docs/PHASE5_1_EVIDENCE_LOG.md`, `schemas/telemetry_schema_v2.json`, `tools/phase51j_observed_horizon_recovery.py`, `tools/phase51h_feature_matrix.py`, `tools/phase51b_lighter_account_limits.py`. |
 
 #### Phase 5.1b - Lighter Account/Native-Limit Evidence Gate
 

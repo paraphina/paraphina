@@ -19,9 +19,11 @@ Read these files in order:
 3. `docs/ARCHITECTURE.md` - current architecture, code surfaces, and status
    vocabulary.
 4. `docs/AGENT_START_HERE.md` - safe onboarding path for future Codex sessions.
-5. `docs/WHITEPAPER.md` - algorithmic whitepaper and hash-locked canonical
-   target specification.
-6. `docs/RUNBOOK.md` - operational controls and trade-mode procedures.
+5. `docs/WHITEPAPER.md` - algorithmic whitepaper, current implementation
+   narrative, and hash-locked canonical v1 appendix.
+6. `docs/V2_SPECIFICATION.md` - repo-owned Phase 5.1/V2 target specification
+   for the fill-aware, hedge-aware, arbitrage-informed upgrade.
+7. `docs/RUNBOOK.md` - operational controls and trade-mode procedures.
 
 When these disagree, executable code and structured Phase 5 state are stronger
 than prose. For live topology, read-only status comes from `phase5/status.md`
@@ -61,6 +63,8 @@ future gate.
 - `docs/AGENT_START_HERE.md` is the agent onboarding path.
 - `docs/WHITEPAPER.md` is the algorithm/spec reference. Its Part II appendix is
   hash-locked and may contain historical status annotations.
+- `docs/V2_SPECIFICATION.md` is the active V2 target spec. It is not live
+  authorization and must stay gated by Phase 5.1 evidence and `ROADMAP.md`.
 - `docs/ROADMAP_B.md` is a supporting live-venue rollout note, not a second
   roadmap.
 - `docs/ROADMAP_B_READINESS_REPORT.md`, `docs/WP_PARITY_MATRIX.md`, and

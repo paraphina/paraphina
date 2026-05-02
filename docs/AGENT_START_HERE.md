@@ -16,9 +16,12 @@ Read these in order:
    - current implementation map and status vocabulary.
 4. `docs/WHITEPAPER.md`
    - algorithmic narrative and canonical target-spec appendix.
-5. `docs/RUNBOOK.md`
+5. `docs/V2_SPECIFICATION.md`
+   - active Phase 5.1/V2 target spec for the fill-aware, hedge-aware,
+     arbitrage-informed upgrade.
+6. `docs/RUNBOOK.md`
    - operational trade-mode controls and live run procedures.
-6. `docs/AI_PLAYBOOK.md`
+7. `docs/AI_PLAYBOOK.md`
    - repo-specific AI change discipline.
 
 For live topology and Phase 5 status, read `phase5/status.md` and
@@ -34,7 +37,8 @@ When docs disagree, use this order:
 3. Current status board such as `phase5/status.md`.
 4. Authoritative docs: `ROADMAP.md` Execution Snapshot and target gates,
    `docs/ARCHITECTURE.md`,
-   `docs/WHITEPAPER.md` Part I.
+   `docs/WHITEPAPER.md` Part I,
+   `docs/V2_SPECIFICATION.md` for Phase 5.1/V2 target requirements.
 5. Supporting docs: `docs/RUNBOOK.md`, `docs/WORLD_CLASS_RUNTIME_GOALS.md`,
    `docs/PHASE5_AUTONOMOUS_TRANCHE_SYSTEM.md`.
 6. Historical/generated docs: Roadmap-B readiness reports, WP100 signoff,
@@ -48,6 +52,7 @@ Docs-only work may edit:
 - `ROADMAP.md`
 - `docs/ARCHITECTURE.md`
 - `docs/AGENT_START_HERE.md`
+- `docs/V2_SPECIFICATION.md`
 - current-state notes in `docs/WHITEPAPER.md` before the canonical-spec marker
 - scope banners in dated/generated docs
 - other documentation files when the change is clearly non-runtime
@@ -93,6 +98,10 @@ the docs integrity artifacts. If current code has moved beyond old appendix
 status annotations, add a current-state clarification before the canonical
 marker.
 
+The active V2 target spec is separate: use `docs/V2_SPECIFICATION.md` for
+Phase 5.1 requirements, and summarize/link it from Part I before the canonical
+marker. Do not insert V2 target text into the hash-locked appendix.
+
 ## Roadmap Rule
 
 There is one roadmap: `ROADMAP.md`.
@@ -113,8 +122,9 @@ out to dedicated docs.
 Paraphina is a deterministic market-making research and live-runtime system with
 feature-gated live connectors and a Phase 5 evidence workflow. The current docs
 architecture deliberately separates strategy (`ROADMAP.md`), implementation map
-(`docs/ARCHITECTURE.md`), algorithm/spec narrative (`docs/WHITEPAPER.md`), and
-operator procedures (`docs/RUNBOOK.md`). `ROADMAP.md` now also owns the
+(`docs/ARCHITECTURE.md`), algorithm/spec narrative (`docs/WHITEPAPER.md`),
+V2 target requirements (`docs/V2_SPECIFICATION.md`), and operator procedures
+(`docs/RUNBOOK.md`). `ROADMAP.md` now also owns the
 execution snapshot, target gates, and lane rules; `phase5/queue.yaml` remains
 the structured current queue and `phase5/status.md` is the generated human
 status board. Phase 5 is currently frozen as promoted/accepted-closeout on

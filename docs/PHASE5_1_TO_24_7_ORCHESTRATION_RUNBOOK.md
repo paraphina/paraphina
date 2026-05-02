@@ -13,6 +13,11 @@ This document preserves the autonomous orchestration workflow so another
 orchestrator can resume if the active chat is lost. It is an execution-control
 document, not live-trading authorization.
 
+V2 target-spec authority: `docs/V2_SPECIFICATION.md` defines the repo-owned
+Phase 5.1/V2 fill-aware, hedge-aware, arbitrage-informed target requirements.
+This runbook controls orchestration and evidence sequencing only; it does not
+promote V2 behavior beyond the gates in `ROADMAP.md`.
+
 ## Non-Negotiables
 
 - Do not place live orders from Phase 5.1b evidence.
