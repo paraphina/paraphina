@@ -576,6 +576,228 @@ trade history. The remaining 167 unknown-role fills are non-Lighter fills and
 do not imply a Lighter quote-candidate join failure.
 ```
 
+## Source-Aligned Terminal-Stale 025435 EV Shadow
+
+- Run id: `LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T025435Z`
+- Local run directory:
+  `runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T025435Z`
+- Source telemetry:
+  `/home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T025435Z/live_canary/telemetry_bounded.jsonl`
+- Input artifact mode: `reference`
+- Source telemetry SHA256:
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
+- Candidates evaluated: `57016`
+- Replay labels emitted: `57016`
+- Gate status: `HOLD`
+- Calibration status: `SPARSE`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51_ev_shadow.py \
+  --input-telemetry /home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T025435Z/live_canary/telemetry_bounded.jsonl \
+  --run-id LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T025435Z \
+  --output-root runs/phase51_lighter_only_ev_shadow \
+  --input-artifact-mode reference
+```
+
+Validation:
+
+```bash
+python3 tools/check_telemetry_contract.py \
+  runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T025435Z/telemetry.jsonl
+```
+
+Result:
+
+```text
+OK: 114033 record(s) validated against schema v2
+```
+
+Artifact hashes:
+
+```text
+50145959c159857992bf19c0ac2b4173b58bc828437a1f5b386fe6db9657b518  telemetry.jsonl
+5c95b25328fdc3e3974570193aad71c19ad3494ddf66f013b43014c82ca37731  ev_shadow_summary.json
+bcb2e8ae49bc4e2a754cd47c2b4187fae36d7dcec64c837d3d5fa6e80fe812b3  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-LABEL-LAKE-TERMINAL-STALE-025435
+
+- Run id: `PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z`
+- Local run directory:
+  `runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z`
+- Source telemetry SHA256:
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
+- EV shadow telemetry SHA256:
+  `50145959c159857992bf19c0ac2b4173b58bc828437a1f5b386fe6db9657b518`
+- Gate status: `HOLD`
+- Gate reason: `label_lake_scaffold_missing_fill_markout_balance_coverage`
+- Quote decision labels: `57016`
+- Order lifecycle labels: `24859`
+- Fill labels: `0`
+- Markout labels: `0`
+- Balance reconciliation labels: `0`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_label_lake.py \
+  --source-telemetry /home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T025435Z/live_canary/telemetry_bounded.jsonl \
+  --ev-shadow-telemetry runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T025435Z/telemetry.jsonl \
+  --phase51b-acceptance runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/phase51b_acceptance.json \
+  --run-id PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z
+```
+
+Artifact hashes:
+
+```text
+11ae96f58963a1b8513794714e48164d2179e5b1a79ffa4c49385b289c403e89  labels.jsonl
+697dfc919cd0654e29d8cd492c6b6c5fde12ecb3097d671cd61472370ed2dd52  label_lake_summary.json
+c64a834dfc7e28688e74007262f1fc7439f05d8976dc7d745c36bb0f7cdbaec5  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-025435
+
+- Run id: `PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T025435Z`
+- Local run directory:
+  `runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T025435Z`
+- Purpose: read-only native Lighter trade-history pagination for maker/taker
+  attribution.
+- Source mode: `readonly_lighter_api`
+- `from_timestamp_ms`: `1777438240934`
+- `stop_at_or_before_ms`: `1777431463614`
+- Pages fetched: `2`
+- Trade count: `200`
+- Timestamp range: `1777421078053` to `1777438206596`
+- Complete to requested stop: `true`
+- Role counts for account: `maker=136`, `taker=64`, `unknown=0`
+- Gate status: `HOLD`
+- Gate reason: `native_trade_backfill_readonly_attribution_input_only`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_lighter_trade_backfill.py \
+  --env-file /home/ubuntu/paraphina/deploy/env/all5_recover_20260314.env \
+  --allow-sdk-auth \
+  --lighter-sdk-path /tmp/lighter_sdk \
+  --run-id PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T025435Z \
+  --market-id 0 \
+  --market-type perp \
+  --pages 10 \
+  --limit 100 \
+  --from-timestamp-ms 1777438240934 \
+  --stop-at-or-before-ms 1777431463614 \
+  --sleep-s 1.6
+```
+
+Artifact hashes:
+
+```text
+8b99bd01978be9ed2afd68710cd1e46c632ff45444173f6244a3ca9a736e2fbb  source_snapshots/trades_backfill.sanitized.json
+8564016622e8e21e052f1e72ef5ab8a25a0a047682142113c9012949d1901dc9  lighter_trade_backfill_summary.json
+474cf4227fef8bd13652e1c3fe62c5bbdc5d0ed3237eb3e3ed1ff7237c889f41  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-025435
+
+- Run id: `PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T025435Z`
+- Local run directory:
+  `runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T025435Z`
+- Source telemetry SHA256:
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
+- Lighter trades JSON SHA256:
+  `8b99bd01978be9ed2afd68710cd1e46c632ff45444173f6244a3ca9a736e2fbb`
+- Gate status: `HOLD`
+- Gate reason: `observed_label_pack_partial_maker_taker_attribution`
+- Fill labels: `193`
+- Markout labels: `772`
+- Balance reconciliation labels: `1`
+- Maker/taker role counts: `MAKER=54`, `TAKER=26`, `UNKNOWN=113`
+- Per-venue role counts:
+  `lighter=54/26/37`, `aster=0/0/51`, `extended=0/0/19`,
+  `hyperliquid=0/0/3`, `paradex=0/0/3` as `MAKER/TAKER/UNKNOWN`.
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Artifact hashes:
+
+```text
+3aaeb363ceb4700ddaf8a1e4d30ee2315270f85c100881fd5e3da78528c8dafe  labels.jsonl
+507db3157ab54ce38c23d209359d135a13a9c1967b7008b8bf56363b04b188da  observed_label_summary.json
+f9ed9d6c1f9272078bd318c2e775306a6986ef23edd0a81799352503779a57ac  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-025435
+
+- Run id:
+  `PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T025435Z`
+- Local run directory:
+  `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T025435Z`
+- Source telemetry SHA256:
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
+- EV shadow telemetry SHA256:
+  `50145959c159857992bf19c0ac2b4173b58bc828437a1f5b386fe6db9657b518`
+- Gate status: `HOLD`
+- Gate reason: `deterministic_join_partial_maker_taker_attribution`
+- Quote decision labels: `57016`
+- Order lifecycle labels: `24859`
+- Fill labels: `193`
+- Order joins: `193`
+- Candidate joins: `117`
+- Complete quote/order/fill/markout joins: `117`
+- Markout joins: `193`
+- Balance reconciliation labels: `1`
+- Deterministic train split: `153`
+- Deterministic holdout split: `40`
+- Maker/taker role counts: `MAKER=54`, `TAKER=26`, `UNKNOWN=113`
+- Per-venue role counts:
+  `lighter=54/26/37`, `aster=0/0/51`, `extended=0/0/19`,
+  `hyperliquid=0/0/3`, `paradex=0/0/3` as `MAKER/TAKER/UNKNOWN`.
+- Join reason counts:
+  `complete_join=80`, `maker_taker_unknown=113`,
+  `missing_candidate_join=76`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_join_holdout.py \
+  --label-lake-run runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z \
+  --observed-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T025435Z \
+  --run-id PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T025435Z
+```
+
+Artifact hashes:
+
+```text
+a43995cd8f43db77b3dddb9b585145c73c4151b437422c7d384f7ea3fb743a35  joined_labels.jsonl
+055a3a0af7390821cd79a825e39b1feed6ee28b9a392477be3c46d860daf5117  join_holdout_summary.json
+e208f1976d5c809ba7d3d1929d7c2518bc15ccc98fcf47369d254af5f83172d8  evidence_pack/artifact_index.json
+```
+
 ## PHASE51C-LABEL-LAKE-20260502T004621Z
 
 - Run id: `PHASE51C-LABEL-LAKE-20260502T004621Z`

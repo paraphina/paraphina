@@ -127,6 +127,11 @@ Current repo-owned tooling:
   `64` maker and `32` taker labels. The remaining unknowns are `93` Lighter
   fills whose telemetry IDs were absent from native trade history, plus `167`
   non-Lighter fills outside this Lighter-only quote-candidate lane.
+- A second balance-backed terminal-stale 7200s artifact adds `117` Lighter
+  candidate joins and `80` native-role-attributed complete joins. Across the
+  two balance-backed terminal-stale lanes, current Lighter-only 5.1c evidence
+  has `306` Lighter candidate joins and `176` native-role-attributed complete
+  joins.
 - 5.1c remains `HOLD`. No model training, live, canary, capital escalation,
   risk-limit relaxation, or financial claim is authorized from the current
   pack.
