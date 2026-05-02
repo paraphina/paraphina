@@ -29,20 +29,23 @@ document, not live-trading authorization.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1h as the current evidence boundary. It proves the
-   observed-only P-fill set can be reconciled to queue/churn and markout source
-   context, while keeping inherited raw identifiers out of new outputs.
-3. The current Phase 5.1h feature audit pack remains `HOLD`: `4527` observed
-   terminal labels, `461` fills, `4066` terminal not-filled labels, all `4527`
-   joined to queue/churn, and all `4527` source-covered by markout readiness.
-4. The dominant blockers are feature quality, not tooling reachability:
-   `4389` inherited raw decision IDs are present in input artifacts but not
-   emitted by 5.1h, `4509` labels lack observed horizon timing, Lighter native
-   limit context is only partial for `2288` labels, and filled-order
-   maker/taker status is incomplete for `287` labels.
-5. Next repo-owned move is Phase 5.1i: redaction hardening/rebuild of upstream
-   P-fill artifacts plus feature-matrix admissibility review. Do not train
-   models from 5.1h.
+2. Treat Phase 5.1i as the current evidence boundary. It proves the P-fill
+   redaction chain can be rebuilt without raw `decision_id` emission and that a
+   repo-owned feature-matrix admissibility gate can fail closed.
+3. The current Phase 5.1i matrix pack remains `HOLD`: `4527` observed terminal
+   labels, `461` fills, `4066` terminal not-filled labels, all `4527` joined to
+   queue/churn, all `4527` source-covered by markout readiness, and raw
+   identifier redaction status `PASS`.
+4. The dominant blockers are feature quality and selection bias, not tooling
+   reachability: `4509` labels lack observed horizon timing, Lighter native
+   limit context is only partial for `2288` labels, filled-order maker/taker
+   status is incomplete for `287` labels, some venue/side buckets remain
+   sparse, and `1613` quarantined/review groups remain excluded from the
+   observed-only diagnostic pack.
+5. Next repo-owned move is another non-live evidence step: close the highest
+   leverage feature gaps, starting with deterministic observed-horizon recovery
+   and venue-native Lighter limit/maker-taker completeness. Do not train models
+   from 5.1i.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
@@ -424,12 +427,85 @@ Current 5.1h evidence:
   partial/unknown, `65` missing.
 - Inherited raw decision ID present in input: `4389`, not emitted by 5.1h.
 
+Superseding redacted 5.1i rebuild of the 5.1h feature audit:
+
+- Run:
+  `runs/phase51i_redacted_observed_pfill_feature_audit/PHASE51I-REDACTED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Gate remains `HOLD` with reason
+  `phase51h_missing_observed_horizon_features`.
+- Observed labels audited: `4527`.
+- Filled labels: `461`.
+- Terminal not-filled labels: `4066`.
+- Queue/churn joined all source keys: `4527`.
+- Markout source context available: `4527`.
+- Observed horizon available: `18`; missing: `4509`.
+- Lighter native limit status: `2288` partial, `0` fully observed.
+- Maker/taker status among filled orders: `174` observed, `222`
+  partial/unknown, `65` missing.
+- Excluded quarantine/review groups carried forward: `1613`.
+- Raw identifier input present: `0`.
+
 5.1h artifacts:
 
 ```text
 74a38fd69b1fea6254c2fc5ad748319ca8cda13e8a0c4a38c681bd462b180404  pfill_feature_audit_summary.json
 fad30084482bf284f0c8bc2c759edcee013ff45a170c039aaf2120290268c80e  pfill_feature_bucket_readiness.jsonl
 acc8830aff969df032f714bf8d5ee7709b7a17437034d85cc086ea39d0c3c87f  pfill_feature_coverage_labels.jsonl
+```
+
+5.1i redacted 5.1h artifacts:
+
+```text
+29e7703a8b85945a0725419fb11b3eaf75d67ffed1095daf353a7b0a97989eca  pfill_feature_audit_summary.json
+796f58c4198fa58e3bdd720af30bd20360e106e46e16e7b47cfd9fc2b21c2ed1  pfill_feature_bucket_readiness.jsonl
+5f14d0d695b9a87a5f0c3daacdf3454a9ca56f39b16f5ac6f18f1c9b2024399d  pfill_feature_coverage_labels.jsonl
+```
+
+### Gate 5.1i - Redacted P-Fill Feature-Matrix Admissibility
+
+Current repo-owned tooling:
+
+- `tools/phase51i_pfill_feature_matrix_admissibility.py` consumes a redacted
+  Phase 5.1h feature audit pack and emits a HOLD-only matrix admissibility
+  summary, bucket records, and blocker records.
+- The tool fails closed if the Phase 5.1h input is not redacted, if raw
+  identifier fields are present, if counts do not reconcile, if provenance is
+  not bound to the clean baseline commit, or if unsafe authorization flags are
+  true.
+- It does not train a model, submit orders, approve EV admission, approve live
+  or canary use, approve capital escalation, relax risk limits, or make
+  financial claims.
+
+Current 5.1i evidence:
+
+- Run:
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51I-PFILL-FEATURE-MATRIX-ADMISSIBILITY-REDACTED-TWO-LANE-20260502T000000Z`
+- Gate remains `HOLD` with reason
+  `phase51i_missing_observed_horizon_features`.
+- Redaction status: `PASS`; raw identifier input present: `0`.
+- Matrix labels: `4527`; filled: `461`; terminal not-filled: `4066`.
+- Train/holdout: `3625` / `902`.
+- Queue/churn joined all: `4527`; queue misses: `0`.
+- Markout source context available: `4527`.
+- Observed horizon available: `18`; missing: `4509`.
+- Lighter native-limit context: `2288` partial and `0` fully observed.
+- Filled-order maker/taker gaps: `222` partial/unknown and `65` missing.
+- Excluded quarantine/review groups: `1613` with reasons `1135`
+  duplicate-alias/no-terminal, `375` cancel-all scope, `95` replace-chain
+  review, and `8` right-censored/no-terminal.
+- Matrix blockers: `missing_observed_horizon_features`,
+  `lighter_native_limit_pressure_not_fully_observed`,
+  `maker_taker_not_fully_observed_for_filled_orders`,
+  `sparse_pfill_feature_buckets`, and
+  `observed_only_selection_bias_not_resolved`.
+
+5.1i artifacts:
+
+```text
+428753544c42c7bcaeeb95786cdfa5423b7a619164cbff2c7cf4805b9fbd2962  pfill_feature_matrix_admissibility_summary.json
+b9135cdc6e7cdf09ef39d33fdc1bb708ffd67231ef1dd8f4bb822bdb850946ae  pfill_feature_matrix_buckets.jsonl
+4d21e552ddc2efc93fa3fa1021de9a067cee0c0d4262b494ab6f8f696ecc847d  pfill_feature_matrix_blockers.jsonl
+8e8759afc3f61a6cd709e38c8e5ae7c14fba9c7fa0b455d3561f73b7300aa6ec  manifest.json
 ```
 
 ### Gate 5.2 - Calibrated EV Shadow
@@ -570,40 +646,18 @@ curl -fsS http://127.0.0.1:9898/health/detail
 
 ## Next Command Targets
 
-After this document and Phase 5.1b code are committed and pushed, produce the
-first real Phase 5.1b pack:
-
-```bash
-python3 tools/phase51b_lighter_account_limits.py \
-  --env-file /home/ubuntu/paraphina/deploy/env/all5_recover_20260314.env \
-  --fetch-readonly \
-  --include-trades \
-  --allow-sdk-auth \
-  --lighter-sdk-path /tmp/lighter_sdk \
-  --run-id PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-<utc>
-```
-
-If `LIGHTER_AUTH_TOKEN` is not present, either set a short-lived read-only auth
-token or use `--allow-sdk-auth` to derive one from existing Lighter API key env.
-If the SDK is not installed, provide an explicit `--lighter-sdk-path`; the
-collector does not auto-import SDK code from `/tmp`, and the supplied SDK path
-and `lighter/` package tree must be owned by root/current user, non-symlinked,
-and not group/world writable. The collector loads `--env-file` without shell
-execution. Do not print secrets. Do not use funded-main private keys. Do not use
-any sendTx path.
-
-Validate the pack:
-
-```bash
-python3 tools/check_telemetry_contract.py \
-  runs/phase51b_lighter_account_native_limits/<run_id>/telemetry.jsonl
-```
-
-Record the result in `docs/PHASE5_1_EVIDENCE_LOG.md`.
+After Phase 5.1i is committed and pushed, the next target is not another live
+run. Implement the next non-live evidence tool that attempts deterministic
+observed-horizon recovery from source lifecycle timing, then rerun the same
+redacted 5.1f -> 5.1g -> 5.1h -> 5.1i chain. The acceptance condition is a
+measurable reduction in `observed_horizon_missing_count` without introducing
+raw identifiers, live/canary/capital/risk authorization, or selection-bias
+shortcuts.
 
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
 production readiness.
 
-`PROMOTE` only for completing the Phase 5.1b non-live evidence workflow.
+`PROMOTE` only for the next Phase 5.1 non-live feature-completeness evidence
+step. No model training, EV admission, canary, or live trading is authorized.

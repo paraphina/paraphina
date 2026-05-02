@@ -231,3 +231,43 @@ non-live redaction and feature-matrix admissibility step:
 - Reconcile excluded quarantine categories only with deterministic
   venue-native evidence; otherwise keep them excluded from training.
 - Preserve all Phase 5.1 holds above.
+
+## Phase 5.1i Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live feature-completeness evidence
+step.
+
+Rationale:
+
+- Redaction hardening passed: the rebuilt Phase 5.1f -> 5.1g -> 5.1h chain
+  removes inherited raw `decision_id` fields from emitted labels and the
+  Phase 5.1i matrix input reports `raw_identifier_input_present_count=0`.
+- Evidence remains non-admissible for training/EV because the current matrix
+  still lacks observed horizon timing on `4509` of `4527` labels, has only
+  partial Lighter native-limit context for `2288` labels, has incomplete
+  maker/taker status on `287` fills, has sparse venue/side buckets, and
+  excludes `1613` quarantined/review groups from the observed-only diagnostic
+  pack.
+- No live, canary, capital, risk-limit, or strategy execution behavior changed.
+
+Current evidence boundary:
+
+```text
+Phase 5.1i - Redacted P-fill feature-matrix admissibility
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51I-PFILL-FEATURE-MATRIX-ADMISSIBILITY-REDACTED-TWO-LANE-20260502T000000Z
+gate_status: HOLD
+gate_reason: phase51i_missing_observed_horizon_features
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Implement a non-live observed-horizon recovery audit/tool, then rerun the
+redacted 5.1f -> 5.1g -> 5.1h -> 5.1i chain. The target is reducing
+observed_horizon_missing_count without weakening redaction, quarantine,
+selection-bias, venue-native, or safety holds.
+```

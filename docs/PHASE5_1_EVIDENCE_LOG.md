@@ -69,6 +69,89 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1i - Redacted P-Fill Feature-Matrix Admissibility
+
+- Run id: `PHASE51I-PFILL-FEATURE-MATRIX-ADMISSIBILITY-REDACTED-TWO-LANE-20260502T000000Z`
+- Local run directory:
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51I-PFILL-FEATURE-MATRIX-ADMISSIBILITY-REDACTED-TWO-LANE-20260502T000000Z`
+- Source redacted feature-audit run:
+  `runs/phase51i_redacted_observed_pfill_feature_audit/PHASE51I-REDACTED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Baseline commit: `18dd09512288a85e440d3977e32432c3aabc1190`
+- Gate status: `HOLD`
+- Gate reason: `phase51i_missing_observed_horizon_features`
+- Raw identifier redaction status: `PASS`
+- Raw identifier input present: `0`
+- Matrix labels: `4527`
+- Filled / terminal not-filled: `461` / `4066`
+- Train / holdout: `3625` / `902`
+- Queue/churn joined all source keys: `4527`
+- Markout source available: `4527`
+- Observed horizon available / missing: `18` / `4509`
+- Lighter native-limit observed / partial: `0` / `2288`
+- Filled-order maker/taker observed / partial-unknown / missing:
+  `174` / `222` / `65`
+- Excluded quarantine/review groups: `1613`
+- Safety flags: all live, canary, capital, risk-relaxation, EV-admission,
+  model-training, and financial-claim authorization fields are `false`.
+
+Commands:
+
+```bash
+python3 tools/phase51f_canonical_pfill_outcome_rebuild.py \
+  --lifecycle-truth-run runs/phase51e_lifecycle_truth_audit/PHASE51E-LIFECYCLE-TRUTH-AUDIT-TWO-LANE-20260502T000000Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z \
+  --output-root runs/phase51i_redacted_canonical_pfill_outcome \
+  --run-id PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+
+python3 tools/phase51g_pfill_quarantine_review.py \
+  --canonical-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --output-root runs/phase51i_redacted_pfill_quarantine_review \
+  --run-id PHASE51I-REDACTED-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+
+python3 tools/phase51h_observed_pfill_feature_audit.py \
+  --observed-pfill-run runs/phase51i_redacted_pfill_quarantine_review/PHASE51I-REDACTED-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z/observed_only_pfill_outcome \
+  --quarantine-review-run runs/phase51i_redacted_pfill_quarantine_review/PHASE51I-REDACTED-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z \
+  --canonical-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --queue-churn-run runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-NATIVE-CONTEXT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --queue-churn-run runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-NATIVE-CONTEXT-TERMINAL-STALE-7200S-20260429T025435Z \
+  --markout-readiness-run runs/phase51c_markout_calibration_readiness/PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z \
+  --output-root runs/phase51i_redacted_observed_pfill_feature_audit \
+  --run-id PHASE51I-REDACTED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+
+python3 tools/phase51i_pfill_feature_matrix_admissibility.py \
+  --feature-audit-run runs/phase51i_redacted_observed_pfill_feature_audit/PHASE51I-REDACTED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z \
+  --output-root runs/phase51i_pfill_feature_matrix_admissibility \
+  --run-id PHASE51I-PFILL-FEATURE-MATRIX-ADMISSIBILITY-REDACTED-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+```
+
+Artifact hashes:
+
+```text
+e1c191bb50128b4b42ed716007975bb4b5724a16a55d2cdb506c5faaaf268ae7  redacted canonical_pfill_order_labels.jsonl
+50fd363193ee24bbc6f4a62d4e3f25fdba7c47ee13ba8b0f6707a628bbda9fd9  redacted canonical_pfill_outcome_summary.json
+1ed04a832441456606f4a2e0074af1d11d703dacc9cffa439d01f20aa3b5b855  redacted observed_only_pfill_outcome/pfill_order_labels.jsonl
+29e7703a8b85945a0725419fb11b3eaf75d67ffed1095daf353a7b0a97989eca  redacted pfill_feature_audit_summary.json
+428753544c42c7bcaeeb95786cdfa5423b7a619164cbff2c7cf4805b9fbd2962  pfill_feature_matrix_admissibility_summary.json
+b9135cdc6e7cdf09ef39d33fdc1bb708ffd67231ef1dd8f4bb822bdb850946ae  pfill_feature_matrix_buckets.jsonl
+4d21e552ddc2efc93fa3fa1021de9a067cee0c0d4262b494ab6f8f696ecc847d  pfill_feature_matrix_blockers.jsonl
+8e8759afc3f61a6cd709e38c8e5ae7c14fba9c7fa0b455d3561f73b7300aa6ec  manifest.json
+```
+
+Matrix blockers:
+
+```text
+missing_observed_horizon_features
+lighter_native_limit_pressure_not_fully_observed
+maker_taker_not_fully_observed_for_filled_orders
+sparse_pfill_feature_buckets
+observed_only_selection_bias_not_resolved
+```
+
 ## Phase 5.1e Lifecycle/Native Truth Audit
 
 - Run id: `PHASE51E-LIFECYCLE-TRUTH-AUDIT-TWO-LANE-20260502T000000Z`

@@ -60,6 +60,15 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _redacted_decision_id_status(pfill_labels: list[dict[str, Any]]) -> tuple[bool, str | None]:
+    decision_ids = sorted({
+        str(label.get("decision_id"))
+        for label in pfill_labels
+        if label.get("decision_id") not in (None, "")
+    })
+    return bool(decision_ids), _stable_hash(["decision_id", decision_ids]) if decision_ids else None
+
+
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -265,7 +274,6 @@ def _representative(rows: list[dict[str, Any]], pfill_labels: list[dict[str, Any
         for key in (
             "price",
             "size",
-            "decision_id",
             "order_id_hash",
             "client_order_id_hash",
             "fill_count",
@@ -386,6 +394,7 @@ def build_canonical_pfill_outcomes(
         canonical_order_key = _stable_hash(["phase51f", source_sha, group_id])
         split = _holdout_split(canonical_order_key)
         group_source = _group_source_status(rows, pfill_labels)
+        decision_id_present, decision_id_hash = _redacted_decision_id_status(pfill_labels)
         if group_source["source_old_split_conflict"]:
             split_conflicts.append({
                 "canonical_order_key": canonical_order_key,
@@ -422,7 +431,8 @@ def build_canonical_pfill_outcomes(
             "side": rep.get("side"),
             "price": rep.get("price"),
             "size": rep.get("size"),
-            "decision_id": rep.get("decision_id"),
+            "decision_id_present": decision_id_present,
+            "decision_id_hash": decision_id_hash,
             "order_id_hash": rep.get("order_id_hash"),
             "client_order_id_hash": rep.get("client_order_id_hash"),
             "fill_count": max((int(label.get("fill_count") or 0) for label in pfill_labels), default=0),

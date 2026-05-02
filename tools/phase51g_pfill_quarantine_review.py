@@ -37,6 +37,15 @@ UNSAFE_TRUE_FLAGS = {
     "risk_limit_relaxation_allowed",
 }
 
+RAW_IDENTIFIER_FIELDS = {
+    "decision_id",
+    "order_id",
+    "client_order_id",
+    "venue_order_id",
+    "raw_order_id",
+    "raw_client_order_id",
+}
+
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -49,6 +58,20 @@ def _sha256_file(path: Path) -> str:
 def _stable_hash(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _redacted_compat_source(label: dict[str, Any]) -> dict[str, Any]:
+    result = dict(label)
+    decision_id = label.get("decision_id")
+    for field in RAW_IDENTIFIER_FIELDS:
+        result.pop(field, None)
+    if decision_id not in (None, ""):
+        result["decision_id_present"] = True
+        result["decision_id_hash"] = _stable_hash(["decision_id", str(decision_id)])
+    else:
+        result.setdefault("decision_id_present", False)
+        result.setdefault("decision_id_hash", None)
+    return result
 
 
 def _utc_stamp() -> str:
@@ -243,7 +266,7 @@ def _review_record(label: dict[str, Any], seq: int, run_id: str, timestamp_ns: i
 
 
 def _compat_label(label: dict[str, Any], seq: int, run_id: str, timestamp_ns: int) -> dict[str, Any]:
-    result = dict(label)
+    result = _redacted_compat_source(label)
     result.update({
         "label_seq": seq,
         "timestamp_local_ns": timestamp_ns + seq,

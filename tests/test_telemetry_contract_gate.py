@@ -662,6 +662,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1h observed P_fill feature audit gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51h_observed_pfill_feature_audit.py"
+
+    def _get_phase51i_pfill_feature_matrix_admissibility_path(self) -> Path:
+        """Get path to the Phase 5.1i P_fill feature-matrix admissibility gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51i_pfill_feature_matrix_admissibility.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -3255,6 +3260,10 @@ class TestValidatorSubprocess(unittest.TestCase):
             by_group = {label["canonical_group_id"]: label for label in labels}
             self.assertEqual(by_group["group-fill"]["outcome_status"], "OBSERVED_FILLED")
             self.assertEqual(by_group["group-fill"]["p_fill_outcome"], 1.0)
+            self.assertNotIn("decision_id", by_group["group-fill"])
+            self.assertTrue(by_group["group-fill"]["decision_id_present"])
+            self.assertIsNotNone(by_group["group-fill"]["decision_id_hash"])
+            self.assertNotIn("d-fill", json.dumps(labels))
             self.assertEqual(by_group["group-terminal"]["outcome_status"], "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL")
             self.assertEqual(by_group["group-terminal"]["p_fill_outcome"], 0.0)
             self.assertEqual(by_group["group-duplicate"]["outcome_status"], "CENSORED_OR_UNOBSERVED")
@@ -3360,6 +3369,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "order_holdout_split": "TRAIN",
                     "venue_id": "lighter",
                     "side": "Buy",
+                    "decision_id": "raw-phase51g-decision",
+                    "client_order_id": "raw-client-id-must-not-propagate",
                     "outcome_status": "OBSERVED_FILLED",
                     "p_fill_outcome": 1.0,
                     "source_label_count": 1,
@@ -3566,6 +3577,12 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "OBSERVED_FILLED",
                 "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
             })
+            self.assertTrue(compat_labels[0]["decision_id_present"])
+            self.assertIsNotNone(compat_labels[0]["decision_id_hash"])
+            self.assertNotIn("decision_id", {key for row in compat_labels for key in row})
+            self.assertNotIn("client_order_id", {key for row in compat_labels for key in row})
+            self.assertNotIn("raw-phase51g-decision", json.dumps(compat_labels))
+            self.assertNotIn("raw-client-id-must-not-propagate", json.dumps(compat_labels))
 
             readiness = subprocess.run(
                 [
@@ -3695,6 +3712,14 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "baseline_commit": baseline,
                 "gate_status": "HOLD",
                 "gate_reason": "phase51g_observed_only_binary_diagnostic_requires_board_review",
+                "excluded_quarantine_count": 4,
+                "excluded_quarantine_reason_counts": {
+                    "EXCLUDED_DUPLICATE_ALIAS_NO_TERMINAL": 1,
+                    "EXCLUDED_REPLACE_CHAIN_REVIEW": 1,
+                    "EXCLUDED_CANCEL_ALL_SCOPE_REVIEW": 1,
+                    "RIGHT_CENSORED_NO_TERMINAL": 1,
+                },
+                "observed_only_pack_warning": "diagnostic only; excluded censored groups are not negative outcomes",
                 "order_label_count": 2,
                 "filled_count": 1,
                 "not_filled_count": 1,
@@ -3832,6 +3857,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(summary["native_limit_partial_count"], 1)
             self.assertEqual(summary["markout_source_available_count"], 2)
             self.assertEqual(summary["raw_identifier_input_present_count"], 1)
+            self.assertEqual(summary["excluded_quarantine_count"], 4)
             self.assertFalse(summary["approved_for_model_training"])
             self.assertFalse(summary["admissible_for_ev_admission"])
 
@@ -3933,6 +3959,276 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(unsafe.returncode, 2)
             self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
+
+    def test_phase51i_pfill_feature_matrix_admissibility_holds_redacted_matrix(self):
+        """Feature-matrix admissibility should require redacted input and remain HOLD-only."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            feature_run = tmp_path / "phase51h"
+            output_root = tmp_path / "phase51i"
+            feature_run.mkdir()
+            baseline = "18dd09512288a85e440d3977e32432c3aabc1190"
+            summary = {
+                "schema_version": 1,
+                "run_id": "phase51h_redacted",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "phase51h_missing_observed_horizon_features",
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "no_live_flag": True,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "source_telemetry_sha256_list": ["source-sha-phase51i"],
+                "excluded_quarantine_count": 4,
+                "excluded_quarantine_reason_counts": {
+                    "EXCLUDED_DUPLICATE_ALIAS_NO_TERMINAL": 4,
+                },
+                "observed_only_pack_warning": "diagnostic only; excluded censored groups are not negative outcomes",
+                "bucket_count": 2,
+                "label_count": 2,
+                "filled_count": 1,
+                "not_filled_count": 1,
+                "train_count": 1,
+                "holdout_count": 1,
+                "observed_horizon_available_count": 1,
+                "observed_horizon_missing_count": 1,
+                "queue_churn_joined_all_count": 2,
+                "queue_churn_joined_partial_count": 0,
+                "queue_churn_missing_count": 0,
+                "queue_reset_proxy_present_count": 1,
+                "native_limit_observed_count": 0,
+                "native_limit_partial_count": 1,
+                "native_limit_unknown_count": 0,
+                "native_limit_not_applicable_count": 1,
+                "maker_taker_observed_count": 0,
+                "maker_taker_partial_or_unknown_count": 1,
+                "maker_taker_missing_count": 0,
+                "maker_taker_not_applicable_count": 1,
+                "markout_source_available_count": 2,
+                "markout_source_missing_count": 0,
+                "raw_identifier_input_present_count": 0,
+                "missing_feature_total": 3,
+            }
+            (feature_run / "pfill_feature_audit_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            labels = [
+                {
+                    "schema_version": 1,
+                    "label_type": "PHASE51H_PFILL_FEATURE_COVERAGE_LABEL",
+                    "label_seq": 1,
+                    "baseline_commit": baseline,
+                    "gate_status": "HOLD",
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "approved_for_capital_escalation": False,
+                    "admissible_for_financial_claim": False,
+                    "admissible_for_ev_admission": False,
+                    "no_live_flag": True,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                    "canonical_group_id": "group-filled",
+                    "venue_id": "lighter",
+                    "side": "BID",
+                    "p_fill_outcome": 1.0,
+                    "raw_identifier_input_present": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "PHASE51H_PFILL_FEATURE_COVERAGE_LABEL",
+                    "label_seq": 2,
+                    "baseline_commit": baseline,
+                    "gate_status": "HOLD",
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "approved_for_capital_escalation": False,
+                    "admissible_for_financial_claim": False,
+                    "admissible_for_ev_admission": False,
+                    "no_live_flag": True,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                    "canonical_group_id": "group-not-filled",
+                    "venue_id": "aster",
+                    "side": "ASK",
+                    "p_fill_outcome": 0.0,
+                    "raw_identifier_input_present": False,
+                },
+            ]
+            with (feature_run / "pfill_feature_coverage_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            buckets = [
+                {
+                    "schema_version": 1,
+                    "label_type": "PHASE51H_PFILL_FEATURE_BUCKET_READINESS",
+                    "bucket_seq": 1,
+                    "baseline_commit": baseline,
+                    "bucket_id": "GLOBAL",
+                    "bucket_dimensions": {"scope": "GLOBAL"},
+                    "gate_status": "HOLD",
+                    "gate_reasons": [
+                        "missing_observed_horizon_features",
+                        "lighter_native_limit_pressure_not_fully_observed",
+                        "maker_taker_not_fully_observed_for_filled_orders",
+                        "requires_feature_rich_pfill_model_and_board_review",
+                    ],
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "approved_for_capital_escalation": False,
+                    "admissible_for_financial_claim": False,
+                    "admissible_for_ev_admission": False,
+                    "no_live_flag": True,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                    "label_count": 2,
+                    "filled_count": 1,
+                    "not_filled_count": 1,
+                    "train_count": 1,
+                    "holdout_count": 1,
+                    "observed_horizon_available_count": 1,
+                    "observed_horizon_missing_count": 1,
+                    "queue_churn_joined_all_count": 2,
+                    "queue_churn_joined_partial_count": 0,
+                    "queue_churn_missing_count": 0,
+                    "queue_reset_proxy_present_count": 1,
+                    "native_limit_observed_count": 0,
+                    "native_limit_partial_count": 1,
+                    "native_limit_unknown_count": 0,
+                    "native_limit_not_applicable_count": 1,
+                    "maker_taker_observed_count": 0,
+                    "maker_taker_partial_or_unknown_count": 1,
+                    "maker_taker_missing_count": 0,
+                    "maker_taker_not_applicable_count": 1,
+                    "markout_source_available_count": 2,
+                    "markout_source_missing_count": 0,
+                    "raw_identifier_input_present_count": 0,
+                    "missing_feature_total": 3,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "PHASE51H_PFILL_FEATURE_BUCKET_READINESS",
+                    "bucket_seq": 2,
+                    "baseline_commit": baseline,
+                    "bucket_id": "VENUE:aster",
+                    "bucket_dimensions": {"venue_id": "aster"},
+                    "gate_status": "HOLD",
+                    "gate_reasons": [
+                        "sparse_pfill_feature_bucket",
+                        "requires_feature_rich_pfill_model_and_board_review",
+                    ],
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "approved_for_capital_escalation": False,
+                    "admissible_for_financial_claim": False,
+                    "admissible_for_ev_admission": False,
+                    "no_live_flag": True,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                    "label_count": 1,
+                    "filled_count": 0,
+                    "not_filled_count": 1,
+                    "train_count": 0,
+                    "holdout_count": 1,
+                    "observed_horizon_available_count": 1,
+                    "observed_horizon_missing_count": 0,
+                    "queue_churn_joined_all_count": 1,
+                    "queue_churn_joined_partial_count": 0,
+                    "queue_churn_missing_count": 0,
+                    "queue_reset_proxy_present_count": 0,
+                    "native_limit_observed_count": 0,
+                    "native_limit_partial_count": 0,
+                    "native_limit_unknown_count": 0,
+                    "native_limit_not_applicable_count": 1,
+                    "maker_taker_observed_count": 0,
+                    "maker_taker_partial_or_unknown_count": 0,
+                    "maker_taker_missing_count": 0,
+                    "maker_taker_not_applicable_count": 1,
+                    "markout_source_available_count": 1,
+                    "markout_source_missing_count": 0,
+                    "raw_identifier_input_present_count": 0,
+                    "missing_feature_total": 0,
+                },
+            ]
+            with (feature_run / "pfill_feature_bucket_readiness.jsonl").open("w", encoding="utf-8") as f:
+                for bucket in buckets:
+                    f.write(json.dumps(bucket) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51i_pfill_feature_matrix_admissibility_path()),
+                    "--feature-audit-run",
+                    str(feature_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51i_matrix_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51i_matrix_test"
+            matrix_summary = json.loads((run_dir / "pfill_feature_matrix_admissibility_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(matrix_summary["gate_status"], "HOLD")
+            self.assertEqual(matrix_summary["raw_identifier_redaction_status"], "PASS")
+            self.assertEqual(matrix_summary["label_count"], 2)
+            self.assertEqual(matrix_summary["observed_horizon_missing_count"], 1)
+            self.assertIn("missing_observed_horizon_features", matrix_summary["matrix_blocker_ids"])
+            self.assertIn("observed_only_selection_bias_not_resolved", matrix_summary["matrix_blocker_ids"])
+            self.assertEqual(matrix_summary["excluded_quarantine_count"], 4)
+            self.assertFalse(matrix_summary["approved_for_model_training"])
+            self.assertFalse(matrix_summary["admissible_for_ev_admission"])
+
+            blockers = [
+                json.loads(line)
+                for line in (run_dir / "pfill_feature_matrix_blockers.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(blockers[0]["blocker_id"], "raw_identifier_redaction_passed")
+            self.assertEqual(blockers[0]["gate_status"], "PASS")
+            self.assertTrue(all(blocker["approved_for_model_training"] is False for blocker in blockers))
+            self.assertNotIn("decision_id", json.dumps(blockers))
+
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
+            labels[0]["decision_id"] = "raw-id-blocks-input"
+            with (feature_run / "pfill_feature_coverage_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            raw_id = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51i_pfill_feature_matrix_admissibility_path()),
+                    "--feature-audit-run",
+                    str(feature_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51i_raw_id_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(raw_id.returncode, 2)
+            self.assertIn("raw identifier field", raw_id.stderr)
 
     def test_phase51c_markout_calibration_readiness_preserves_fill_splits_and_stats(self):
         """Markout readiness should inherit join splits and stay HOLD-only."""

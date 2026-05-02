@@ -720,6 +720,9 @@ def build_feature_audit(
             if label.get("source_telemetry_sha256")
         }),
         "input_pfill_gate_reason": pfill_summary.get("gate_reason"),
+        "excluded_quarantine_count": int(pfill_summary.get("excluded_quarantine_count") or 0),
+        "excluded_quarantine_reason_counts": pfill_summary.get("excluded_quarantine_reason_counts") or {},
+        "observed_only_pack_warning": pfill_summary.get("observed_only_pack_warning"),
         "bucket_count": len(bucket_records),
         **{
             key: global_bucket[key]
