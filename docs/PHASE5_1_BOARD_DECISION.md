@@ -54,10 +54,17 @@ now more specific:
   `pfill_calibration_sparse_buckets`: it removes censored labels from the
   diagnostic pack but does not satisfy feature-rich model, venue/side bucket,
   maker/taker, or board-review requirements.
+- Phase 5.1h audits the `4527` observed-only labels for feature readiness.
+  All labels reconcile to queue/churn and markout source context, but the gate
+  remains `HOLD`: `4389` inherited raw decision IDs are present in input
+  artifacts but not emitted, `4509` labels lack observed horizon timing,
+  Lighter native limits are only partial for `2288` labels, and filled-order
+  maker/taker status is incomplete for `287` labels.
 - 5.1 remains `HOLD` for model training, EV admission, live orders, canary,
   capital escalation, risk-limit relaxation, and financial claims until the
-  observed-only calibration policy, feature completeness, venue-native truth
-  gaps, and downstream calibration readiness are accepted.
+  upstream raw-ID hygiene, observed-only calibration policy, feature
+  completeness, venue-native truth gaps, and downstream calibration readiness
+  are accepted.
 
 ## Baseline
 
@@ -178,16 +185,18 @@ OK: 4001 record(s) validated against schema v2
 ## Current Evidence Boundary
 
 ```text
-Phase 5.1g - Canonical P-fill quarantine review and downstream rerun gate
+Phase 5.1h - Observed-only P-fill feature-readiness audit
 ```
 
 Completed non-live scope:
 
-- Reviewed the `1613` quarantined canonical P-fill groups from Phase 5.1f.
-- Kept duplicate-only, cancel-all-scope, replace-chain, and true no-terminal
-  cases out of the observed-only diagnostic P-fill pack.
-- Re-ran P-fill calibration readiness only on observed terminal outcomes where
-  the canonical contract was accepted.
+- Preserved the Phase 5.1g split: `4527` observed terminal labels and `1613`
+  excluded quarantine/review labels.
+- Joined the observed-only labels to queue/churn through the Phase 5.1f
+  source-to-canonical manifest.
+- Verified markout readiness source coverage for both source telemetry lanes.
+- Detected inherited raw decision IDs as presence-only redaction risk and did
+  not emit raw identifiers in Phase 5.1h outputs.
 - Emitted only `HOLD` records with `no_live_flag=true` and all live, canary,
   capital, risk-relaxation, EV-admission, model-training, and financial-claim
   authorization fields false.
@@ -196,22 +205,29 @@ Repo-owned artifacts:
 
 - Rebuild tool: `tools/phase51f_canonical_pfill_outcome_rebuild.py`
 - Quarantine review tool: `tools/phase51g_pfill_quarantine_review.py`
+- Feature audit tool: `tools/phase51h_observed_pfill_feature_audit.py`
 - Canonical pack:
   `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
 - Quarantine review pack:
   `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z`
 - Observed-only readiness rerun:
   `runs/phase51g_pfill_calibration_readiness_observed_only/PHASE51G-PFILL-CALIBRATION-READINESS-OBSERVED-ONLY-TWO-LANE-20260502T000000Z`
+- Feature audit pack:
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51H-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
 
 ## Next Move
 
-The next optimal move after Phase 5.1g is still not live trading. It is a
-non-live observed-only P-fill calibration review:
+The next optimal move after Phase 5.1h is still not live trading. It is a
+non-live redaction and feature-matrix admissibility step:
 
-- Build feature-rich P-fill diagnostics against the observed-only terminal
-  pack without using excluded quarantine rows as negatives.
-- Quantify venue/side/layer/regime sparsity, missing observed-horizon fields,
-  maker/taker role gaps, and model-feature availability.
+- Remove or hash inherited raw decision IDs in upstream Phase 5.1f/5.1g P-fill
+  artifacts and rebuild downstream 5.1g/5.1h packs.
+- Quantify whether observed horizon timing can be recovered deterministically
+  from source lifecycle events before any model-training proposal.
+- Preserve Lighter official-doc assumptions as evidence metadata: post-only
+  orders must rest as maker or cancel if crossing; account tier/fees/latency,
+  sendTx/rest limits, and active-order limits are account/profile-sensitive and
+  must come from official read endpoints or remain unknown.
 - Reconcile excluded quarantine categories only with deterministic
   venue-native evidence; otherwise keep them excluded from training.
 - Preserve all Phase 5.1 holds above.

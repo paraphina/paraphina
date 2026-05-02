@@ -29,24 +29,23 @@ document, not live-trading authorization.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1g as the current evidence boundary. It proves the canonical
-   P-fill quarantine can be split into observed terminal labels and excluded
-   review-only labels without converting censored lifecycle ambiguity into
-   false negative outcomes.
-3. The current Phase 5.1g quarantine review pack remains `HOLD`: `6140`
-   canonical P-fill groups, `4527` observed terminal outcomes, `461` fills,
-   `4066` terminal not-filled groups, and `1613` excluded quarantine/review
-   groups.
-4. The Phase 5.1g observed-only P-fill calibration-readiness rerun remains
-   `HOLD` with reason `pfill_calibration_sparse_buckets`: `4527` observed
-   outcomes, `461` fills, `4066` terminal not-filled groups, `0` censored
-   labels, and sparse venue/side bucket coverage.
-5. Next repo-owned move is feature-rich observed-only P-fill calibration
-   review plus venue-native reconciliation for excluded quarantine categories.
-   Do not train models from 5.1g.
-6. Proceed to calibrated EV shadow only after canonical outcomes, maker/taker
-   role gaps, holdout splits, feature completeness, venue-native truth gaps,
-   and quarantine exclusion policy are accepted.
+2. Treat Phase 5.1h as the current evidence boundary. It proves the
+   observed-only P-fill set can be reconciled to queue/churn and markout source
+   context, while keeping inherited raw identifiers out of new outputs.
+3. The current Phase 5.1h feature audit pack remains `HOLD`: `4527` observed
+   terminal labels, `461` fills, `4066` terminal not-filled labels, all `4527`
+   joined to queue/churn, and all `4527` source-covered by markout readiness.
+4. The dominant blockers are feature quality, not tooling reachability:
+   `4389` inherited raw decision IDs are present in input artifacts but not
+   emitted by 5.1h, `4509` labels lack observed horizon timing, Lighter native
+   limit context is only partial for `2288` labels, and filled-order
+   maker/taker status is incomplete for `287` labels.
+5. Next repo-owned move is Phase 5.1i: redaction hardening/rebuild of upstream
+   P-fill artifacts plus feature-matrix admissibility review. Do not train
+   models from 5.1h.
+6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
+   hygiene, maker/taker role gaps, holdout splits, feature completeness,
+   venue-native truth gaps, and quarantine exclusion policy are accepted.
 
 ## Board
 
@@ -382,6 +381,55 @@ Observed-only P-fill readiness rerun:
 19330c451fe84a476ef2a42584e49854bb8e9534540c10b11ed2d34a42eaecfd  pfill_calibration_buckets.jsonl
 219f35fee50f764a11aad97d5ce37b5c82d3f7b8d6d2675f77ef71b745cb7774  pfill_calibration_readiness_summary.json
 ffecbfa3254c0b940d37a14651f97a0ae711678689fa6bcaf4aebeb7e75d2d5d  pfill_order_split_manifest.jsonl
+```
+
+### Gate 5.1h - Observed P-Fill Feature Readiness Audit
+
+Current repo-owned tooling:
+
+- `tools/phase51h_observed_pfill_feature_audit.py` consumes the Phase 5.1g
+  observed-only P-fill pack, the Phase 5.1g quarantine reconciliation manifest,
+  the Phase 5.1f source-to-canonical manifest, queue/churn packs, and markout
+  readiness context.
+- The tool joins through source order keys, not canonical order keys. It uses
+  per-label source telemetry hashes and fails closed on missing queue/churn
+  rows, duplicate queue/churn rows, source-hash mismatch, count mismatch,
+  baseline mismatch, or unsafe authorization flags.
+- It detects inherited raw `decision_id` values as boolean presence only and
+  does not emit raw IDs in new Phase 5.1h artifacts.
+- Lighter assumptions remain official-doc bounded: post-only limit orders must
+  rest as maker or cancel if crossing
+  (`https://docs.lighter.xyz/trading/order-types-and-matching`); Standard and
+  Premium fee/latency differ
+  (`https://docs.lighter.xyz/trading/trading-fees`); REST, WebSocket,
+  `sendTx`/`sendTxBatch`, and active-order limits are account/profile
+  sensitive (`https://apidocs.lighter.xyz/docs/rate-limits`); account limits
+  must come from the official accountLimits read endpoint or remain unknown
+  (`https://apidocs.lighter.xyz/reference/accountlimits`).
+
+Current 5.1h evidence:
+
+- Run:
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51H-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Gate remains `HOLD` with reason
+  `phase51h_raw_identifier_present_in_input_not_emitted`.
+- Observed labels audited: `4527`.
+- Filled labels: `461`.
+- Terminal not-filled labels: `4066`.
+- Queue/churn joined all source keys: `4527`.
+- Markout source context available: `4527`.
+- Observed horizon available: `18`; missing: `4509`.
+- Lighter native limit status: `2288` partial, `0` fully observed.
+- Maker/taker status among filled orders: `174` observed, `222`
+  partial/unknown, `65` missing.
+- Inherited raw decision ID present in input: `4389`, not emitted by 5.1h.
+
+5.1h artifacts:
+
+```text
+74a38fd69b1fea6254c2fc5ad748319ca8cda13e8a0c4a38c681bd462b180404  pfill_feature_audit_summary.json
+fad30084482bf284f0c8bc2c759edcee013ff45a170c039aaf2120290268c80e  pfill_feature_bucket_readiness.jsonl
+acc8830aff969df032f714bf8d5ee7709b7a17437034d85cc086ea39d0c3c87f  pfill_feature_coverage_labels.jsonl
 ```
 
 ### Gate 5.2 - Calibrated EV Shadow

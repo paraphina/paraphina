@@ -657,6 +657,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1g P_fill quarantine review gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51g_pfill_quarantine_review.py"
+
+    def _get_phase51h_observed_pfill_feature_audit_path(self) -> Path:
+        """Get path to the Phase 5.1h observed P_fill feature audit gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51h_observed_pfill_feature_audit.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -3610,6 +3615,318 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(output_root),
                     "--run-id",
                     "phase51g_quarantine_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
+
+    def test_phase51h_observed_pfill_feature_audit_reconciles_features_without_raw_ids(self):
+        """Observed P_fill feature audit should join source features and redact raw IDs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            quarantine_run = tmp_path / "quarantine"
+            canonical_run = tmp_path / "canonical"
+            queue_run = tmp_path / "queue"
+            markout_run = tmp_path / "markout"
+            output_root = tmp_path / "phase51h"
+            for path in [observed_run, quarantine_run, canonical_run, queue_run, markout_run]:
+                path.mkdir()
+            source_sha = "source-sha-phase51h"
+            baseline = "18dd09512288a85e440d3977e32432c3aabc1190"
+            pfill_labels = [
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 1,
+                    "run_id": "phase51g_observed",
+                    "baseline_commit": baseline,
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "canonical-filled",
+                    "canonical_group_id": "group-filled",
+                    "source_order_keys": ["source-filled-a", "source-filled-b"],
+                    "source_label_count": 2,
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "fill_count": 1,
+                    "maker_taker_role_counts": {"MAKER": 1, "TAKER": 0, "UNKNOWN": 0},
+                    "observed_horizon_source_ticks": None,
+                    "terminal_event_count": 1,
+                    "terminal_action_first": "canonical_direct_terminal",
+                    "decision_id": "raw-decision-id-must-not-emit",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "admissible_for_ev_admission": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 2,
+                    "run_id": "phase51g_observed",
+                    "baseline_commit": baseline,
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "canonical-not-filled",
+                    "canonical_group_id": "group-not-filled",
+                    "source_order_keys": ["source-not-filled"],
+                    "source_label_count": 1,
+                    "order_holdout_split": "HOLDOUT",
+                    "venue_id": "aster",
+                    "side": "Sell",
+                    "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                    "p_fill_outcome": 0.0,
+                    "fill_count": 0,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 0},
+                    "observed_horizon_source_ticks": 3,
+                    "terminal_event_count": 1,
+                    "terminal_action_first": "cancel",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "admissible_for_ev_admission": False,
+                },
+            ]
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "phase51g_observed",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "phase51g_observed_only_binary_diagnostic_requires_board_review",
+                "order_label_count": 2,
+                "filled_count": 1,
+                "not_filled_count": 1,
+                "censored_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            with (observed_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in pfill_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            (quarantine_run / "quarantine_review_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "phase51g_quarantine",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "phase51g_quarantine_review_observed_only_diagnostic_pack",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            with (quarantine_run / "source_reconciliation_manifest.jsonl").open("w", encoding="utf-8") as f:
+                for group_id, order_key in [("group-filled", "canonical-filled"), ("group-not-filled", "canonical-not-filled")]:
+                    f.write(json.dumps({
+                        "canonical_group_id": group_id,
+                        "canonical_order_key": order_key,
+                        "source_telemetry_sha256": source_sha,
+                        "venue_id": "lighter" if group_id == "group-filled" else "aster",
+                        "review_status": "BINARY_OBSERVED_FILLED_DIAGNOSTIC",
+                        "included_in_observed_only_pack": True,
+                    }) + "\n")
+
+            with (canonical_run / "source_to_canonical_order_manifest.jsonl").open("w", encoding="utf-8") as f:
+                for source_key in ["source-filled-a", "source-filled-b"]:
+                    f.write(json.dumps({
+                        "canonical_group_id": "group-filled",
+                        "canonical_order_key": "canonical-filled",
+                        "source_order_key": source_key,
+                        "source_telemetry_sha256": source_sha,
+                    }) + "\n")
+                f.write(json.dumps({
+                    "canonical_group_id": "group-not-filled",
+                    "canonical_order_key": "canonical-not-filled",
+                    "source_order_key": "source-not-filled",
+                    "source_telemetry_sha256": source_sha,
+                }) + "\n")
+
+            (queue_run / "queue_churn_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "queue_run",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "queue_churn_native_limit_pressure_unknown",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            queue_labels = [
+                ("source-filled-a", "lighter", "PARTIAL_ACTIVE_ORDER_COUNT_OBSERVED_LIMIT_UNKNOWN", 1),
+                ("source-filled-b", "lighter", "PARTIAL_ACTIVE_ORDER_COUNT_OBSERVED_LIMIT_UNKNOWN", 0),
+                ("source-not-filled", "aster", "UNKNOWN_NON_LIGHTER_NO_NATIVE_LIMIT_INPUT", 0),
+            ]
+            with (queue_run / "queue_churn_labels.jsonl").open("w", encoding="utf-8") as f:
+                for seq, (order_key, venue, native_status, replace_count) in enumerate(queue_labels, start=1):
+                    f.write(json.dumps({
+                        "schema_version": 1,
+                        "label_type": "QUEUE_CHURN_LABEL",
+                        "label_seq": seq,
+                        "run_id": "queue_run",
+                        "baseline_commit": baseline,
+                        "source_telemetry_sha256": source_sha,
+                        "order_key": order_key,
+                        "venue_id": venue,
+                        "side": "BID",
+                        "lifecycle_join_status": "JOINED",
+                        "queue_reset_proxy_event_count": replace_count,
+                        "replace_event_count": replace_count,
+                        "cancel_event_count": 1,
+                        "cancel_all_event_count": 0,
+                        "churn_event_count": replace_count + 1,
+                        "native_limit_pressure_status": native_status,
+                        "approved_for_live": False,
+                        "approved_for_model_training": False,
+                        "admissible_for_ev_admission": False,
+                    }) + "\n")
+
+            (markout_run / "markout_calibration_readiness_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "markout_run",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "markout_readiness_sparse_buckets",
+                "source_telemetry_sha256_list": [source_sha],
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51h_observed_pfill_feature_audit_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--quarantine-review-run",
+                    str(quarantine_run),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--queue-churn-run",
+                    str(queue_run),
+                    "--markout-readiness-run",
+                    str(markout_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51h_feature_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--min-observed-per-bucket",
+                    "1",
+                    "--min-holdout-observed-per-bucket",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51h_feature_test"
+            summary = json.loads((run_dir / "pfill_feature_audit_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["label_count"], 2)
+            self.assertEqual(summary["queue_churn_joined_all_count"], 2)
+            self.assertEqual(summary["native_limit_partial_count"], 1)
+            self.assertEqual(summary["markout_source_available_count"], 2)
+            self.assertEqual(summary["raw_identifier_input_present_count"], 1)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["admissible_for_ev_admission"])
+
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "pfill_feature_coverage_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(labels), 2)
+            self.assertTrue(labels[0]["raw_identifier_input_present"])
+            self.assertNotIn("decision_id", labels[0])
+            self.assertNotIn("raw-decision-id-must-not-emit", json.dumps(labels))
+            self.assertEqual(labels[0]["queue_churn_join_status"], "JOINED_ALL_SOURCE_KEYS")
+            self.assertEqual(labels[0]["native_limit_pressure_status"], "PARTIAL")
+            self.assertEqual(labels[1]["maker_taker_feature_status"], "NO_FILL_NOT_APPLICABLE")
+
+            buckets = [
+                json.loads(line)
+                for line in (run_dir / "pfill_feature_bucket_readiness.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            global_bucket = next(row for row in buckets if row["bucket_id"] == "GLOBAL")
+            self.assertIn("raw_identifier_present_in_input_not_emitted", global_bucket["gate_reasons"])
+
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
+            with (queue_run / "queue_churn_labels.jsonl").open("w", encoding="utf-8") as f:
+                for seq, (order_key, venue, native_status, replace_count) in enumerate(queue_labels[:2], start=1):
+                    f.write(json.dumps({
+                        "schema_version": 1,
+                        "label_type": "QUEUE_CHURN_LABEL",
+                        "label_seq": seq,
+                        "run_id": "queue_run",
+                        "baseline_commit": baseline,
+                        "source_telemetry_sha256": source_sha,
+                        "order_key": order_key,
+                        "venue_id": venue,
+                        "side": "BID",
+                        "lifecycle_join_status": "JOINED",
+                        "queue_reset_proxy_event_count": replace_count,
+                        "replace_event_count": replace_count,
+                        "cancel_event_count": 1,
+                        "cancel_all_event_count": 0,
+                        "churn_event_count": replace_count + 1,
+                        "native_limit_pressure_status": native_status,
+                        "approved_for_live": False,
+                        "approved_for_model_training": False,
+                        "admissible_for_ev_admission": False,
+                    }) + "\n")
+            missing_queue = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51h_observed_pfill_feature_audit_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--quarantine-review-run",
+                    str(quarantine_run),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--queue-churn-run",
+                    str(queue_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51h_missing_queue_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(missing_queue.returncode, 2)
+            self.assertIn("missing queue/churn rows", missing_queue.stderr)
+
+            pfill_labels[0]["approved_for_live"] = True
+            with (observed_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in pfill_labels:
+                    f.write(json.dumps(label) + "\n")
+            unsafe = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51h_observed_pfill_feature_audit_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--quarantine-review-run",
+                    str(quarantine_run),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--queue-churn-run",
+                    str(queue_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51h_unsafe_test",
                 ],
                 capture_output=True,
                 text=True,

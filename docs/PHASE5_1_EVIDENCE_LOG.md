@@ -351,6 +351,77 @@ Artifact hashes:
 ffecbfa3254c0b940d37a14651f97a0ae711678689fa6bcaf4aebeb7e75d2d5d  pfill_order_split_manifest.jsonl
 ```
 
+## Phase 5.1h Observed-Only P-Fill Feature Audit
+
+- Run id:
+  `PHASE51H-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Local run directory:
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51H-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Tool: `tools/phase51h_observed_pfill_feature_audit.py`
+- Input observed P-fill run:
+  `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z/observed_only_pfill_outcome`
+- Input quarantine review run:
+  `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z`
+- Input canonical P-fill run:
+  `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
+- Input queue/churn run:
+  `runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-NATIVE-CONTEXT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Input queue/churn run:
+  `runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-NATIVE-CONTEXT-TERMINAL-STALE-7200S-20260429T025435Z`
+- Input markout readiness run:
+  `runs/phase51c_markout_calibration_readiness/PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z`
+- Gate status: `HOLD`
+- Gate reason: `phase51h_raw_identifier_present_in_input_not_emitted`
+- Observed labels audited: `4527`
+- Filled labels: `461`
+- Terminal not-filled labels: `4066`
+- Train labels: `3625`
+- Holdout labels: `902`
+- Queue/churn joined all source keys: `4527`
+- Queue/churn missing: `0`
+- Queue reset proxy present: `694`
+- Markout source context available: `4527`
+- Observed horizon available: `18`
+- Observed horizon missing: `4509`
+- Lighter native limit status partial: `2288`
+- Native limit not applicable for non-Lighter labels: `2239`
+- Filled-order maker/taker observed: `174`
+- Filled-order maker/taker partial/unknown: `222`
+- Filled-order maker/taker missing: `65`
+- Inherited raw decision ID present in input: `4389`; Phase 5.1h emits
+  boolean presence only and does not emit raw IDs.
+- Bucket records: `20`
+- Missing feature total across labels: `11473`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_ev_admission`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51h_observed_pfill_feature_audit.py \
+  --observed-pfill-run runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z/observed_only_pfill_outcome \
+  --quarantine-review-run runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z \
+  --canonical-pfill-run runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --queue-churn-run runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-NATIVE-CONTEXT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --queue-churn-run runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-NATIVE-CONTEXT-TERMINAL-STALE-7200S-20260429T025435Z \
+  --markout-readiness-run runs/phase51c_markout_calibration_readiness/PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z \
+  --output-root runs/phase51h_observed_pfill_feature_audit \
+  --run-id PHASE51H-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+```
+
+Artifact hashes:
+
+```text
+74a38fd69b1fea6254c2fc5ad748319ca8cda13e8a0c4a38c681bd462b180404  pfill_feature_audit_summary.json
+fad30084482bf284f0c8bc2c759edcee013ff45a170c039aaf2120290268c80e  pfill_feature_bucket_readiness.jsonl
+acc8830aff969df032f714bf8d5ee7709b7a17437034d85cc086ea39d0c3c87f  pfill_feature_coverage_labels.jsonl
+```
+
 ## Phase 5.1c Markout Calibration Readiness Two-Lane Pack
 
 - Run id: `PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z`
