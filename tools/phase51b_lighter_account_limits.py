@@ -275,6 +275,19 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
 def _as_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -282,12 +295,21 @@ def _as_text(value: Any) -> str | None:
 
 
 def _normalize_account_type(value: Any) -> str:
+    if value is None or str(value).strip() == "":
+        return "UNKNOWN"
     text = str(value or "").strip().upper()
     if "PREMIUM" in text:
         return "PREMIUM"
     if "STANDARD" in text or "RETAIL" in text:
         return "STANDARD"
+    if text.isdigit():
+        return f"ACCOUNT_TYPE_{text}"
     return "UNKNOWN"
+
+
+def _fee_percent_to_bps(value: Any) -> float | None:
+    fee_percent = _as_float(value)
+    return fee_percent * 100.0 if fee_percent is not None else None
 
 
 def _extract_items(payload: Any, keys: set[str]) -> list[dict[str, Any]]:
@@ -351,6 +373,32 @@ def _extract_market_metadata(payload: Any, market_symbol: str | None, market_id:
         if target_symbol and normalized_symbol == target_symbol:
             return book
     return books[0] if books else {}
+
+
+def _infer_lighter_trade_role(trade: dict[str, Any], account_index: int | None) -> str | None:
+    role = str(
+        trade.get("role")
+        or trade.get("maker_taker")
+        or trade.get("makerTaker")
+        or trade.get("liquidity")
+        or ""
+    ).lower()
+    if role == "maker" or role.startswith("maker"):
+        return "maker"
+    if role == "taker" or role.startswith("taker"):
+        return "taker"
+    if account_index is None:
+        return None
+    is_maker_ask = _as_bool(trade.get("is_maker_ask") if "is_maker_ask" in trade else trade.get("isMakerAsk"))
+    if is_maker_ask is None:
+        return None
+    ask_account_id = _as_int(trade.get("ask_account_id") or trade.get("askAccountId"))
+    bid_account_id = _as_int(trade.get("bid_account_id") or trade.get("bidAccountId"))
+    if account_index == ask_account_id:
+        return "maker" if is_maker_ask else "taker"
+    if account_index == bid_account_id:
+        return "taker" if is_maker_ask else "maker"
+    return None
 
 
 def _source_record(
@@ -617,14 +665,28 @@ def _account_profile_event(
             market.get("maker_fee_bps")
             if market.get("maker_fee_bps") is not None
             else market.get("makerFeeBps")
+        ) if market.get("maker_fee_bps") is not None or market.get("makerFeeBps") is not None else _fee_percent_to_bps(
+            market.get("maker_fee") or market.get("makerFee") or market.get("maker_fee_percent") or market.get("makerFeePercent")
         ),
         "taker_fee_bps": _as_float(
             market.get("taker_fee_bps")
             if market.get("taker_fee_bps") is not None
             else market.get("takerFeeBps")
+        ) if market.get("taker_fee_bps") is not None or market.get("takerFeeBps") is not None else _fee_percent_to_bps(
+            market.get("taker_fee") or market.get("takerFee") or market.get("taker_fee_percent") or market.get("takerFeePercent")
         ),
-        "price_decimals": _as_int(market.get("price_decimals") or market.get("priceDecimals")),
-        "size_decimals": _as_int(market.get("size_decimals") or market.get("sizeDecimals")),
+        "price_decimals": _as_int(
+            market.get("price_decimals")
+            or market.get("priceDecimals")
+            or market.get("supported_price_decimals")
+            or market.get("supportedPriceDecimals")
+        ),
+        "size_decimals": _as_int(
+            market.get("size_decimals")
+            or market.get("sizeDecimals")
+            or market.get("supported_size_decimals")
+            or market.get("supportedSizeDecimals")
+        ),
         "account_source_sha256": account_source["sha256"] if account_source else None,
         "order_books_source_sha256": order_books_source["sha256"] if order_books_source else None,
         "decision": "HOLD",
@@ -657,6 +719,11 @@ def _account_limits_event(
         "sendtx_per_minute_remaining": _as_int(_first_value(payload, {"sendtx_per_minute_remaining", "sendtxperminuteremaining", "send_tx_remaining", "sendtxremaining"})),
         "rest_requests_per_minute_limit": _as_int(_first_value(payload, {"rest_requests_per_minute_limit", "restrequestsperminutelimit", "standard_requests_per_minute", "standardrequestsperminute"})),
         "weighted_requests_per_minute_limit": _as_int(_first_value(payload, {"weighted_requests_per_minute_limit", "weightedrequestsperminutelimit", "premium_weighted_requests", "premiumweightedrequests"})),
+        "lighter_user_tier": _as_text(_first_value(payload, {"user_tier", "usertier"})),
+        "lighter_user_tier_name": _as_text(_first_value(payload, {"user_tier_name", "usertiername"})),
+        "current_maker_fee_tick": _as_int(_first_value(payload, {"current_maker_fee_tick", "currentmakerfeetick"})),
+        "current_taker_fee_tick": _as_int(_first_value(payload, {"current_taker_fee_tick", "currenttakerfeetick"})),
+        "effective_lit_stakes": _as_text(_first_value(payload, {"effective_lit_stakes", "effectivelitstakes"})),
         "pending_orders_per_account_limit": _as_int(_first_value(payload, {"pending_orders_per_account_limit", "pendingordersperaccountlimit", "pending_orders_per_account", "pendingordersperaccount"})),
         "pending_orders_per_market_limit": _as_int(_first_value(payload, {"pending_orders_per_market_limit", "pendingorderspermarketlimit", "pending_orders_per_market", "pendingorderspermarket"})),
         "active_orders_per_account_limit": _as_int(_first_value(payload, {"active_orders_per_account_limit", "activeordersperaccountlimit", "active_orders_per_account", "activeordersperaccount"})),
@@ -734,10 +801,10 @@ def _trades_event(
     taker_count = 0
     unknown_count = 0
     for trade in trades:
-        role = str(trade.get("role") or trade.get("maker_taker") or trade.get("makerTaker") or trade.get("liquidity") or "").lower()
-        if role == "maker" or role.startswith("maker"):
+        role = _infer_lighter_trade_role(trade, account_index)
+        if role == "maker":
             maker_count += 1
-        elif role == "taker" or role.startswith("taker"):
+        elif role == "taker":
             taker_count += 1
         else:
             unknown_count += 1

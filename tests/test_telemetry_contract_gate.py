@@ -1058,6 +1058,11 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "active_orders_per_account_limit": 1000,
                 "active_orders_per_market_limit": 100,
                 "volume_quota_remaining": 12.5,
+                "user_tier": "premium",
+                "user_tier_name": "premium",
+                "current_maker_fee_tick": 40,
+                "current_taker_fee_tick": 280,
+                "effective_lit_stakes": "0.00000000",
             }), encoding="utf-8")
             active_orders_path.write_text(json.dumps({
                 "active_orders": [
@@ -1070,16 +1075,16 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "order_books": [{
                     "market_id": 7,
                     "symbol": "ETH-USD",
-                    "maker_fee_bps": 0.0,
-                    "taker_fee_bps": 0.0,
-                    "price_decimals": 2,
-                    "size_decimals": 4,
+                    "maker_fee": "0.0040",
+                    "taker_fee": "0.0280",
+                    "supported_price_decimals": 2,
+                    "supported_size_decimals": 4,
                 }]
             }), encoding="utf-8")
             trades_path.write_text(json.dumps({
                 "trades": [
-                    {"trade_id": "t1", "role": "maker"},
-                    {"trade_id": "t2", "role": "taker"},
+                    {"trade_id": "t1", "ask_account_id": 123, "bid_account_id": 456, "is_maker_ask": True},
+                    {"trade_id": "t2", "ask_account_id": 123, "bid_account_id": 456, "is_maker_ask": False},
                     {"trade_id": "t3"},
                 ]
             }), encoding="utf-8")
@@ -1149,13 +1154,22 @@ class TestValidatorSubprocess(unittest.TestCase):
             profile = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACCOUNT_PROFILE")
             self.assertEqual(profile["lighter_account_type"], "STANDARD")
             self.assertEqual(profile["market_id"], 7)
-            self.assertEqual(profile["maker_fee_bps"], 0.0)
-            self.assertEqual(profile["taker_fee_bps"], 0.0)
+            self.assertEqual(profile["maker_fee_raw"], "0.0040")
+            self.assertEqual(profile["taker_fee_raw"], "0.0280")
+            self.assertAlmostEqual(profile["maker_fee_bps"], 0.4)
+            self.assertAlmostEqual(profile["taker_fee_bps"], 2.8)
+            self.assertEqual(profile["price_decimals"], 2)
+            self.assertEqual(profile["size_decimals"], 4)
 
             limits = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACCOUNT_LIMITS")
             self.assertEqual(limits["sendtx_per_minute_limit"], 60)
             self.assertEqual(limits["active_orders_per_account_limit"], 1000)
             self.assertEqual(limits["active_orders_per_market_limit"], 100)
+            self.assertEqual(limits["lighter_user_tier"], "premium")
+            self.assertEqual(limits["lighter_user_tier_name"], "premium")
+            self.assertEqual(limits["current_maker_fee_tick"], 40)
+            self.assertEqual(limits["current_taker_fee_tick"], 280)
+            self.assertEqual(limits["effective_lit_stakes"], "0.00000000")
 
             active_orders = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACTIVE_ORDERS")
             self.assertEqual(active_orders["active_orders_count_total"], 3)
