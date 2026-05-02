@@ -153,6 +153,16 @@ Current repo-owned tooling:
   `16` venue/side buckets including the global bucket. Gate remains `HOLD`
   because `72.14914118139925%` of labels are censored and feature-rich
   calibration requirements are not met.
+- `tools/phase51c_queue_churn_labels.py` emits HOLD-only order-level
+  queue/churn proxy labels by joining P_fill order labels back to lifecycle
+  events. It records replace/cancel churn, queue-reset proxy counts, terminal
+  horizons where available, and explicitly marks native-limit pressure as
+  `UNKNOWN_NO_NATIVE_LIMIT_PRESSURE_INPUT`.
+- Current queue/churn evidence across the same two lanes: `11935` labels,
+  `11935` lifecycle joins, `0` lifecycle misses, `4379` orders with churn,
+  `1777` orders with replace/queue-reset proxy events, `3997` orders with
+  cancel events, and `2906` orders with terminal horizons. Gate remains `HOLD`
+  because native-limit pressure is unknown for all `11935` labels.
 - 5.1c remains `HOLD`. No model training, live, canary, capital escalation,
   risk-limit relaxation, or financial claim is authorized from the current
   pack.

@@ -622,6 +622,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c P_fill calibration-readiness gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_pfill_calibration_readiness.py"
+
+    def _get_phase51c_queue_churn_path(self) -> Path:
+        """Get path to the Phase 5.1c queue/churn label gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_queue_churn_labels.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -2286,6 +2291,221 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(conflict.returncode, 2)
             self.assertIn("conflicting order_holdout_split", conflict.stderr)
+
+            labels = labels[:3]
+            labels[0]["approved_for_live"] = True
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            unsafe_label = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_calibration_readiness_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_readiness_unsafe_label_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe_label.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe_label.stderr)
+
+            labels[0]["approved_for_live"] = False
+            labels[0]["p_fill_outcome"] = 0.0
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            bad_outcome = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_calibration_readiness_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_readiness_bad_outcome_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(bad_outcome.returncode, 2)
+            self.assertIn("OBSERVED_FILLED P_fill labels must carry p_fill_outcome=1.0", bad_outcome.stderr)
+
+    def test_phase51c_queue_churn_labels_emit_hold_only_proxy_fields(self):
+        """Queue/churn labels should join lifecycle proxies and keep native pressure unknown."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            label_lake_run = tmp_path / "label_lake"
+            pfill_run = tmp_path / "pfill_outcome"
+            output_root = tmp_path / "queue_churn"
+            label_lake_run.mkdir()
+            pfill_run.mkdir()
+            source_sha = "source-sha-queue"
+            (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
+                "run_id": "label_lake_queue_test",
+                "source_telemetry_sha256": source_sha,
+                "order_lifecycle_labels": 3,
+            }), encoding="utf-8")
+            lifecycle = [
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 1,
+                    "action": "place",
+                    "source_t": 10,
+                    "source_line": 10,
+                    "source_order_index": 0,
+                    "order_id_hash": "order-1",
+                    "client_order_id_hash": "client-1",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 2,
+                    "action": "replace",
+                    "source_t": 11,
+                    "source_line": 11,
+                    "source_order_index": 0,
+                    "order_id_hash": "order-1",
+                    "client_order_id_hash": "client-1",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 3,
+                    "action": "cancel",
+                    "source_t": 12,
+                    "source_line": 12,
+                    "source_order_index": 0,
+                    "order_id_hash": "order-1",
+                    "client_order_id_hash": "client-1",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (label_lake_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in lifecycle:
+                    f.write(json.dumps(label) + "\n")
+            (pfill_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "pfill_queue_test",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            pfill_labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_queue_test",
+                    "order_key": "order-key-1",
+                    "order_holdout_split": "TRAIN",
+                    "order_label_seq": 1,
+                    "order_source_line": 10,
+                    "order_source_t": 10,
+                    "order_source_order_index": 0,
+                    "order_id_hash": "order-1",
+                    "client_order_id_hash": "client-1",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                    "p_fill_outcome": 0.0,
+                    "fill_count": 0,
+                    "filled_size_total": None,
+                    "terminal_action_first": "cancel",
+                    "terminal_event_count": 1,
+                    "observed_horizon_source_ticks": 2,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_queue_test",
+                    "order_key": "order-key-2",
+                    "order_holdout_split": "HOLDOUT",
+                    "order_label_seq": 99,
+                    "order_id_hash": "missing-order",
+                    "client_order_id_hash": "missing-client",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "fill_count": 0,
+                    "filled_size_total": None,
+                    "terminal_action_first": None,
+                    "terminal_event_count": 0,
+                    "observed_horizon_source_ticks": None,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in pfill_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_queue_churn_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_queue_churn_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_queue_churn_test"
+            summary = json.loads((run_dir / "queue_churn_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["gate_reason"], "queue_churn_native_limit_pressure_unknown")
+            self.assertEqual(summary["queue_churn_label_count"], 2)
+            self.assertEqual(summary["matched_lifecycle_count"], 1)
+            self.assertEqual(summary["unmatched_lifecycle_count"], 1)
+            self.assertEqual(summary["orders_with_churn_count"], 1)
+            self.assertEqual(summary["native_limit_pressure_unknown_count"], 2)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "queue_churn_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            joined = next(label for label in labels if label["order_key"] == "order-key-1")
+            self.assertEqual(joined["lifecycle_join_status"], "JOINED")
+            self.assertEqual(joined["replace_event_count"], 1)
+            self.assertEqual(joined["cancel_event_count"], 1)
+            self.assertEqual(joined["churn_event_count"], 2)
+            self.assertEqual(joined["queue_reset_proxy_event_count"], 1)
+            self.assertEqual(joined["observed_lifecycle_source_ticks"], 2)
+            self.assertEqual(joined["native_limit_pressure_status"], "UNKNOWN_NO_NATIVE_LIMIT_PRESSURE_INPUT")
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    file_info["sha256"],
+                    file_info["path"],
+                )
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

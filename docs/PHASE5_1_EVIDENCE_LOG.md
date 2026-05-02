@@ -990,6 +990,108 @@ ad236c4b40f08e1929edea2ce2d874ace6ebaba2f911664c6c2e85582a085b43  pfill_calibrat
 91b86a13311a5f5b9496d31cc3f99f805e6d4bcdcbf766061deff86f88c82ff5  evidence_pack/artifact_index.json
 ```
 
+## PHASE51C-QUEUE-CHURN-FROM-BACKFILL
+
+- Run id:
+  `PHASE51C-QUEUE-CHURN-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Local run directory:
+  `runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Purpose: emit HOLD-only order-level queue/churn proxy labels from the first
+  balance-backed terminal-stale lane.
+- Source telemetry SHA256:
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- Input label lake:
+  `runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z`
+- Input P_fill outcome run:
+  `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Gate status: `HOLD`
+- Gate reason: `queue_churn_native_limit_pressure_unknown`
+- Queue/churn labels: `6815`
+- Lifecycle joins: `6815`
+- Lifecycle misses: `0`
+- Filled orders: `310`
+- Terminal not-filled orders: `1929`
+- Censored orders: `4576`
+- Orders with churn: `3087`
+- Orders with replace/queue-reset proxy: `1337`
+- Orders with cancel: `2810`
+- Orders with terminal horizon: `1990`
+- Native-limit pressure unknown labels: `6815`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_queue_churn_labels.py \
+  --label-lake-run runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --run-id PHASE51C-QUEUE-CHURN-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z
+```
+
+Artifact hashes:
+
+```text
+1a5087e4e0ca190baac4f2d9a55e45ed2c7898f547f14848afd19fffdcc86c1a  queue_churn_labels.jsonl
+f2add8b846cd98e4e74b632ad5fe1508d0f2ff0e485fdcd8b530f465c1a2ee93  queue_churn_summary.json
+3cb1546072e4016ede5848de148181be9665776a12fe9f095fcbb87f24071384  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-QUEUE-CHURN-TERMINAL-STALE-025435
+
+- Run id:
+  `PHASE51C-QUEUE-CHURN-TERMINAL-STALE-7200S-20260429T025435Z`
+- Local run directory:
+  `runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-TERMINAL-STALE-7200S-20260429T025435Z`
+- Purpose: emit HOLD-only order-level queue/churn proxy labels from the second
+  balance-backed terminal-stale lane.
+- Source telemetry SHA256:
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
+- Input label lake:
+  `runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z`
+- Input P_fill outcome run:
+  `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z`
+- Gate status: `HOLD`
+- Gate reason: `queue_churn_native_limit_pressure_unknown`
+- Queue/churn labels: `5120`
+- Lifecycle joins: `5120`
+- Lifecycle misses: `0`
+- Filled orders: `179`
+- Terminal not-filled orders: `906`
+- Censored orders: `4035`
+- Orders with churn: `1292`
+- Orders with replace/queue-reset proxy: `440`
+- Orders with cancel: `1187`
+- Orders with terminal horizon: `916`
+- Native-limit pressure unknown labels: `5120`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_queue_churn_labels.py \
+  --label-lake-run runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z \
+  --run-id PHASE51C-QUEUE-CHURN-TERMINAL-STALE-7200S-20260429T025435Z
+```
+
+Artifact hashes:
+
+```text
+04805abcd01cc585f21a83fa81100d8fa36879924141065de633c26e5c1b24c1  queue_churn_labels.jsonl
+1b27e0eb8420df5a90e896d05567773100829c21716b6f9c0bbbce696702f737  queue_churn_summary.json
+4a0e8a3f654068a478f814d8872d5f2ca8ab4905c127e4e3ebd793861a925b4c  evidence_pack/artifact_index.json
+```
+
 ## PHASE51C-LABEL-LAKE-20260502T004621Z
 
 - Run id: `PHASE51C-LABEL-LAKE-20260502T004621Z`

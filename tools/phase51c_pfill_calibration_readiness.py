@@ -26,6 +26,17 @@ BASELINE_COMMIT = "18dd09512288a85e440d3977e32432c3aabc1190"
 DEFAULT_OUTPUT_ROOT = ROOT / "runs/phase51c_pfill_calibration_readiness"
 DEFAULT_BUCKET_FIELDS = ("venue_id", "side")
 WILSON_Z_95 = 1.959963984540054
+UNSAFE_TRUE_FLAGS = {
+    "approved_for_model_training",
+    "approved_for_live",
+    "approved_for_canary",
+    "approved_for_capital_escalation",
+    "admissible_for_financial_claim",
+    "admissible_for_ev_admission",
+    "live_orders_allowed",
+    "capital_change_allowed",
+    "risk_limit_relaxation_allowed",
+}
 
 
 def _sha256_file(path: Path) -> str:
@@ -167,6 +178,10 @@ def _increment_counts(counts: dict[str, int], label: dict[str, Any]) -> None:
         raise ValueError("censored P_fill labels must not carry numeric outcomes")
     if outcome_status != "CENSORED_OR_UNOBSERVED" and outcome is None:
         raise ValueError("observed P_fill labels must carry numeric outcomes")
+    if outcome_status == "OBSERVED_FILLED" and outcome != 1.0:
+        raise ValueError("OBSERVED_FILLED P_fill labels must carry p_fill_outcome=1.0")
+    if outcome_status == "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL" and outcome != 0.0:
+        raise ValueError("OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL labels must carry p_fill_outcome=0.0")
     split = str(label.get("order_holdout_split") or "UNKNOWN").upper()
     if split not in {"TRAIN", "HOLDOUT"}:
         raise ValueError(f"unexpected order_holdout_split: {split}")
@@ -266,14 +281,16 @@ def _base_bucket_record(
 
 def _load_outcome_run(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     summary = _load_json(path / "pfill_outcome_summary.json")
-    if summary.get("approved_for_live") is True:
-        raise ValueError(f"{path} is not an admissible non-live P_fill outcome input")
-    if summary.get("approved_for_model_training") is True:
-        raise ValueError(f"{path} already claims model-training approval")
+    for flag in UNSAFE_TRUE_FLAGS:
+        if summary.get(flag) is True:
+            raise ValueError(f"{path} has unsafe summary flag {flag}=true")
     labels: list[dict[str, Any]] = []
     for _, label in _iter_jsonl(path / "pfill_order_labels.jsonl"):
         if label.get("label_type") != "ORDER_PFILL_OUTCOME_LABEL":
             continue
+        for flag in UNSAFE_TRUE_FLAGS:
+            if label.get(flag) is True:
+                raise ValueError(f"{path} has unsafe label flag {flag}=true")
         labels.append(label)
     return summary, labels
 
@@ -317,7 +334,7 @@ def build_pfill_calibration_readiness(
 ) -> Path:
     if not pfill_outcome_runs:
         raise ValueError("at least one --pfill-outcome-run is required")
-    run_id = run_id or f"PHASE52-PFILL-CALIBRATION-READINESS-{_utc_stamp()}"
+    run_id = run_id or f"PHASE51C-PFILL-CALIBRATION-READINESS-{_utc_stamp()}"
     output_root = output_root or DEFAULT_OUTPUT_ROOT
     if not output_root.is_absolute():
         output_root = ROOT / output_root
