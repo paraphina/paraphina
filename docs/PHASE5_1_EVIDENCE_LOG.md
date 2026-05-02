@@ -134,6 +134,120 @@ This is descriptive observed-fill markout evidence only, not unconditional EV
 or balance-authoritative financial proof.
 ```
 
+## Phase 5.1d P-fill Censoring Audit Two-Lane Pack
+
+- Run id: `PHASE51D-PFILL-CENSORING-AUDIT-TWO-LANE-20260502T000000Z`
+- Local run directory: `runs/phase51c_pfill_censoring_audit/PHASE51D-PFILL-CENSORING-AUDIT-TWO-LANE-20260502T000000Z`
+- Tool: `tools/phase51c_pfill_censoring_audit.py`
+- Input P-fill outcome run: `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Input P-fill outcome run: `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z`
+- Source telemetry SHA256 list:
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`,
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- Gate status: `HOLD`
+- Gate reason: `pfill_censoring_audit_censored_orders_classified`
+- Order labels: `11935`
+- Observed outcomes: `3324`
+- Filled: `489`
+- Terminal not-filled: `2835`
+- Censored: `8611`
+- Censored rate: `0.7214914118139925`
+- Buckets: `141`
+- Reason counts: `OBSERVED_FILLED=489`,
+  `OBSERVED_NOT_FILLED_TO_TERMINAL=2835`,
+  `NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW=8611`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `approved_for_model_training`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_pfill_censoring_audit.py \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z \
+  --run-id PHASE51D-PFILL-CENSORING-AUDIT-TWO-LANE-20260502T000000Z
+```
+
+Artifact hashes:
+
+```text
+76674e04dbbea9759b62c4e32690a3a410a26f58eefe747a6e1d7588783eb6b6  evidence_pack/artifact_index.json
+f50459b5e60dc354f9101e2a345685aad59076a723dbe02093127f7258cabf69  pfill_censoring_audit_summary.json
+1ea8f1e32a1ab63d567550c2897f1bf76f841265055767c6c83b3cb5d88dfbe7  pfill_censoring_buckets.jsonl
+0b5e2abc4f0c9645006dd8d87a0d6fa6ba871db027239d5772a0bba64abb748a  pfill_censoring_labels.jsonl
+```
+
+Interpretation:
+
+```text
+The P-fill blocker is not explained by end-of-window truncation in this audit.
+All 8611 censored labels have sufficient source-window coverage but no matched
+fill or terminal lifecycle event. These remain censored and must not be treated
+as terminal not-filled observations.
+```
+
+## Phase 5.1d Lighter Attribution Gap Audit
+
+- Run id: `PHASE51D-LIGHTER-ATTRIBUTION-GAP-AUDIT-20260502T000000Z`
+- Local run directory: `runs/phase51c_lighter_attribution_gap_audit/PHASE51D-LIGHTER-ATTRIBUTION-GAP-AUDIT-20260502T000000Z`
+- Tool: `tools/phase51c_lighter_attribution_gap_audit.py`
+- Input observed run: `runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Input join/holdout run: `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Input Lighter trade backfill: `runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-COMBINED-TERMINAL-STALE-7200S-20260429T073231Z`
+- Input Phase 5.1b native evidence: `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z`
+- Source telemetry SHA256: `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- Gate status: `HOLD`
+- Gate reason: `lighter_attribution_gap_unknowns_unresolved`
+- Lighter fills: `189`
+- Native trade count: `300`
+- Observed role counts: `MAKER=64`, `TAKER=32`, `UNKNOWN=93`
+- Gap reason counts: `ATTRIBUTED_NATIVE_ROLE=96`, `NO_NATIVE_TRADE_MATCH=93`
+- Stale unknowns upgradable from native identity: `0`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `approved_for_model_training`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_lighter_attribution_gap_audit.py \
+  --observed-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --join-holdout-run runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --lighter-trade-backfill-run runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-COMBINED-TERMINAL-STALE-7200S-20260429T073231Z \
+  --phase51b-native-run runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z \
+  --run-id PHASE51D-LIGHTER-ATTRIBUTION-GAP-AUDIT-20260502T000000Z
+```
+
+Artifact hashes:
+
+```text
+e119855ff007e5961d10e4b4c04b9f4153199a6d976fc6705f4ec15947fef4ca  evidence_pack/artifact_index.json
+4523a0c82015e45b632d363095161572a4464e0a35b91ea60ddde5d200732446  lighter_attribution_gap_labels.jsonl
+6240c04f46bb332eb88ff1ecd5e21dbaee8d142955abd37842017eedf177be52  lighter_attribution_gap_summary.json
+```
+
+Interpretation:
+
+```text
+The current native backfill explains the 96 already-attributed Lighter fills.
+The remaining 93 UNKNOWN Lighter fills have no native trade match in the
+current 300-trade backfill and are not upgradable from existing native identity
+evidence. Do not infer maker/taker role from intent.
+```
+
 ## LTR-EV-SHADOW-001 Phase 5 Tail 20k M6 Reference Replay
 
 - Run id: `LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_20k_m6`

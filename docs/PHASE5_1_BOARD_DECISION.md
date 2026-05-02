@@ -23,6 +23,20 @@ Current live/canary decision: `HOLD`
 
 Current economic/profitability decision: `HOLD`
 
+## Current Superseding Status
+
+As of the Phase 5.1d evidence-quality triage, the board decision remains
+`PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are now sharper:
+
+- P-fill censoring is not merely a source-window boundary issue. The two-lane
+  censoring audit reconciles `11935` order labels and classifies all `8611`
+  censored labels as `NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW`.
+- Lighter native attribution is not upgradable from the current 300-trade
+  backfill. The gap audit finds `189` Lighter fills, `96` already attributed,
+  and `93` unknown fills with `NO_NATIVE_TRADE_MATCH`.
+- 5.1 remains `HOLD` for model training, EV admission, live orders, canary,
+  capital escalation, risk-limit relaxation, and financial claims.
+
 ## Baseline
 
 | Item | Value |

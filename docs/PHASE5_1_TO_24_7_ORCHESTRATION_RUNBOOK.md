@@ -184,6 +184,34 @@ Current repo-owned tooling:
   risk-limit relaxation, or financial claim is authorized from the current
   pack.
 
+### Gate 5.1d - Evidence Quality Triage
+
+Current repo-owned tooling:
+
+- `tools/phase51c_pfill_censoring_audit.py` consumes one or more P-fill
+  outcome packs, preserves existing `order_key` and `order_holdout_split`
+  assignments, validates source hashes and unsafe flags, and classifies
+  censored labels without converting them into observed negatives.
+- `tools/phase51c_lighter_attribution_gap_audit.py` compares observed Lighter
+  fills to sanitized native trade backfill and explains remaining unknown
+  maker/taker labels without inferring role from quote intent.
+
+Current 5.1d evidence:
+
+- P-fill censoring audit across the canonical two lanes: `11935` order labels,
+  `3324` observed outcomes, `489` filled, `2835` terminal not-filled, `8611`
+  censored, censor rate `0.7214914118139925`, and `141` buckets. All censored
+  labels classify as `NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW`, so the blocker
+  is not merely end-of-window truncation. Gate remains `HOLD`.
+- Lighter attribution gap audit on the canonical `FROM-BACKFILL-073231Z` lane:
+  `189` Lighter fills, `96` already native-attributed fills, and `93` unknown
+  fills classified as `NO_NATIVE_TRADE_MATCH` against the current 300-trade
+  backfill. No stale unknowns are upgradable from existing native identity
+  evidence. Gate remains `HOLD`.
+- 5.1d promotes only the next non-live evidence step. It does not authorize
+  model training, EV admission, live orders, canary, capital escalation,
+  risk-limit relaxation, or financial claims.
+
 ### Gate 5.2 - Calibrated EV Shadow
 
 Required evidence:

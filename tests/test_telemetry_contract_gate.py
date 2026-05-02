@@ -623,6 +623,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_pfill_calibration_readiness.py"
 
+    def _get_phase51c_pfill_censoring_audit_path(self) -> Path:
+        """Get path to the Phase 5.1c P_fill censoring audit gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_pfill_censoring_audit.py"
+
     def _get_phase51c_queue_churn_path(self) -> Path:
         """Get path to the Phase 5.1c queue/churn label gate."""
         script_dir = Path(__file__).parent.parent
@@ -632,6 +637,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c markout calibration-readiness gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_markout_calibration_readiness.py"
+
+    def _get_phase51c_lighter_attribution_gap_audit_path(self) -> Path:
+        """Get path to the Phase 5.1c Lighter attribution-gap audit gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_lighter_attribution_gap_audit.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -2341,6 +2351,231 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(bad_outcome.returncode, 2)
             self.assertIn("OBSERVED_FILLED P_fill labels must carry p_fill_outcome=1.0", bad_outcome.stderr)
 
+    def test_phase51c_pfill_censoring_audit_classifies_without_training_promotion(self):
+        """P_fill censoring audit should classify censored rows and stay HOLD-only."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            pfill_run = tmp_path / "pfill"
+            label_lake_run = tmp_path / "lake"
+            output_root = tmp_path / "audit"
+            pfill_run.mkdir()
+            label_lake_run.mkdir()
+            source_sha = "source-sha-censor"
+            (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
+                "run_id": "lake_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "source_telemetry_sha256": source_sha,
+                "record_count": 100,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "filled",
+                    "order_holdout_split": "TRAIN",
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "order_label_seq": 1,
+                    "order_source_line": 10,
+                    "order_source_t": 10,
+                    "order_id_hash": "order-filled",
+                    "client_order_id_hash": "client-filled",
+                    "fill_count": 1,
+                    "terminal_event_count": 0,
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "cancelled",
+                    "order_holdout_split": "HOLDOUT",
+                    "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                    "p_fill_outcome": 0.0,
+                    "order_label_seq": 2,
+                    "order_source_line": 20,
+                    "order_source_t": 20,
+                    "order_id_hash": "order-cancel",
+                    "client_order_id_hash": "client-cancel",
+                    "fill_count": 0,
+                    "terminal_event_count": 1,
+                    "terminal_action_first": "cancel",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "boundary",
+                    "order_holdout_split": "TRAIN",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "order_label_seq": 3,
+                    "order_source_line": 98,
+                    "order_source_t": 98,
+                    "order_id_hash": "order-boundary",
+                    "client_order_id_hash": "client-boundary",
+                    "fill_count": 0,
+                    "terminal_event_count": 0,
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "missing-terminal",
+                    "order_holdout_split": "TRAIN",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "order_label_seq": 4,
+                    "order_source_line": 30,
+                    "order_source_t": 30,
+                    "order_id_hash": "order-open",
+                    "client_order_id_hash": "client-open",
+                    "fill_count": 0,
+                    "terminal_event_count": 0,
+                    "venue_id": "paradex",
+                    "side": "Buy",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (pfill_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "pfill_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "pfill_outcome_contains_censored_orders",
+                "source_telemetry_sha256": source_sha,
+                "label_lake_run": str(label_lake_run),
+                "order_label_count": 4,
+                "filled_count": 1,
+                "not_filled_count": 1,
+                "censored_count": 2,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_censoring_audit_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_censor_audit_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--boundary-source-line-margin",
+                    "5",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_pfill_censor_audit_test"
+            summary = json.loads((run_dir / "pfill_censoring_audit_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["order_label_count"], 4)
+            self.assertEqual(summary["observed_count"], 2)
+            self.assertEqual(summary["censored_count"], 2)
+            self.assertEqual(summary["reason_counts"]["SOURCE_WINDOW_BOUNDARY"], 1)
+            self.assertEqual(summary["reason_counts"]["NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW"], 1)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            audit_labels = [
+                json.loads(line)
+                for line in (run_dir / "pfill_censoring_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(audit_labels), 4)
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
+            labels[0]["approved_for_live"] = True
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            unsafe = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_censoring_audit_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_censor_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
+
+            labels[0]["approved_for_live"] = False
+            labels.append({
+                **labels[0],
+                "order_holdout_split": "HOLDOUT",
+            })
+            with (pfill_run / "pfill_outcome_summary.json").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "gate_status": "HOLD",
+                    "gate_reason": "pfill_outcome_contains_censored_orders",
+                    "source_telemetry_sha256": source_sha,
+                    "label_lake_run": str(label_lake_run),
+                    "order_label_count": 5,
+                    "filled_count": 2,
+                    "not_filled_count": 1,
+                    "censored_count": 2,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }))
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            split_conflict = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_censoring_audit_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_censor_split_conflict_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(split_conflict.returncode, 2)
+            self.assertIn("conflicting order_holdout_split", split_conflict.stderr)
+
     def test_phase51c_markout_calibration_readiness_preserves_fill_splits_and_stats(self):
         """Markout readiness should inherit join splits and stay HOLD-only."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2551,6 +2786,210 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(missing_join.returncode, 2)
             self.assertIn("has no deterministic join label", missing_join.stderr)
+
+    def test_phase51c_lighter_attribution_gap_audit_explains_unknowns_hold_only(self):
+        """Lighter attribution gap audit should explain unknown roles without inference."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed"
+            join_run = tmp_path / "join"
+            backfill_run = tmp_path / "backfill"
+            phase51b_run = tmp_path / "phase51b"
+            output_root = tmp_path / "gap_audit"
+            observed_run.mkdir()
+            join_run.mkdir()
+            (backfill_run / "source_snapshots").mkdir(parents=True)
+            phase51b_run.mkdir()
+            source_sha = "source-sha-lighter-gap"
+            (observed_run / "observed_label_summary.json").write_text(json.dumps({
+                "run_id": "observed_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            fills = [
+                {
+                    "label_type": "OBSERVED_FILL_LABEL",
+                    "fill_id": "known-fill",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "fill_time_ms": 1000,
+                    "maker_taker_role": "MAKER",
+                    "order_id_hash": "known-order",
+                    "client_order_id_hash": "known-client",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "OBSERVED_FILL_LABEL",
+                    "fill_id": "unknown-fill",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "price": 101.0,
+                    "size": 0.02,
+                    "fill_time_ms": 2000,
+                    "maker_taker_role": "UNKNOWN",
+                    "order_id_hash": "missing-order",
+                    "client_order_id_hash": "missing-client",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (observed_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for fill in fills:
+                    f.write(json.dumps(fill) + "\n")
+            (join_run / "join_holdout_summary.json").write_text(json.dumps({
+                "run_id": "join_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            join_labels = [
+                {
+                    "label_type": "DETERMINISTIC_JOIN_LABEL",
+                    "fill_id": "known-fill",
+                    "candidate_join_status": "JOINED",
+                    "join_status": "COMPLETE_FOR_NONLIVE_REVIEW",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "DETERMINISTIC_JOIN_LABEL",
+                    "fill_id": "unknown-fill",
+                    "candidate_join_status": "JOINED",
+                    "join_status": "COMPLETE_FOR_NONLIVE_REVIEW",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (join_run / "joined_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in join_labels:
+                    f.write(json.dumps(label) + "\n")
+            trades_payload = {
+                "schema_version": 1,
+                "account_index": 7,
+                "trades": [
+                    {
+                        "trade_id": 1,
+                        "timestamp": 1000,
+                        "price": "100.0",
+                        "size": "0.01",
+                        "ask_account_id": 7,
+                        "bid_account_id": 8,
+                        "ask_id": "known-order",
+                        "ask_client_id": "known-client",
+                        "bid_id": "other-bid",
+                        "bid_client_id": "other-bid-client",
+                        "is_maker_ask": True,
+                    },
+                    {
+                        "trade_id": 2,
+                        "timestamp": 2000,
+                        "price": "101.0",
+                        "size": "0.02",
+                        "ask_account_id": 7,
+                        "bid_account_id": 8,
+                        "ask_id": "native-ask",
+                        "ask_client_id": "native-client",
+                        "bid_id": "other-bid-2",
+                        "bid_client_id": "other-bid-client-2",
+                        "is_maker_ask": False,
+                    },
+                ],
+            }
+            trades_path = backfill_run / "source_snapshots" / "trades_backfill.sanitized.json"
+            trades_path.write_text(json.dumps(trades_payload), encoding="utf-8")
+            (backfill_run / "lighter_trade_backfill_summary.json").write_text(json.dumps({
+                "run_id": "backfill_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "account_index": 7,
+                "trade_count": 2,
+                "trades_path": str(trades_path),
+                "trades_sha256": hashlib.sha256(trades_path.read_bytes()).hexdigest(),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (phase51b_run / "phase51b_acceptance.json").write_text(json.dumps({
+                "run_id": "phase51b_source",
+                "approved_for_calibration_label_ingestion": True,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_lighter_attribution_gap_audit_path()),
+                    "--observed-run",
+                    str(observed_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--lighter-trade-backfill-run",
+                    str(backfill_run),
+                    "--phase51b-native-run",
+                    str(phase51b_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_lighter_gap_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_lighter_gap_test"
+            summary = json.loads((run_dir / "lighter_attribution_gap_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["lighter_fill_count"], 2)
+            self.assertEqual(summary["observed_role_counts"], {"MAKER": 1, "UNKNOWN": 1})
+            self.assertEqual(summary["gap_reason_counts"]["ATTRIBUTED_NATIVE_ROLE"], 1)
+            self.assertEqual(summary["gap_reason_counts"]["ORDER_ID_MISMATCH"], 1)
+            self.assertFalse(summary["approved_for_live"])
+            self.assertFalse(summary["admissible_for_ev_admission"])
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "lighter_attribution_gap_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual({label["gap_reason"] for label in labels}, {"ATTRIBUTED_NATIVE_ROLE", "ORDER_ID_MISMATCH"})
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
+            fills[0]["approved_for_live"] = True
+            with (observed_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for fill in fills:
+                    f.write(json.dumps(fill) + "\n")
+            unsafe = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_lighter_attribution_gap_audit_path()),
+                    "--observed-run",
+                    str(observed_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--lighter-trade-backfill-run",
+                    str(backfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_lighter_gap_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
 
     def test_phase51c_queue_churn_labels_emit_hold_only_proxy_fields(self):
         """Queue/churn labels should join lifecycle proxies and keep native pressure unknown."""
