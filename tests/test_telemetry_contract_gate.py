@@ -612,6 +612,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c Lighter native trade backfill collector."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_lighter_trade_backfill.py"
+
+    def _get_phase51c_pfill_outcome_path(self) -> Path:
+        """Get path to the Phase 5.1c order-level P_fill outcome gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_pfill_outcome_labels.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -1935,6 +1940,202 @@ class TestValidatorSubprocess(unittest.TestCase):
                     file_info["sha256"],
                     file_info["path"],
                 )
+
+    def test_phase51c_pfill_outcome_labels_filled_cancelled_censored_without_promotion(self):
+        """P_fill outcome labels should distinguish filled, terminal unfilled, and censored orders."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            label_lake_run = tmp_path / "label_lake"
+            join_run = tmp_path / "join_holdout"
+            output_root = tmp_path / "pfill_runs"
+            label_lake_run.mkdir()
+            join_run.mkdir()
+            source_sha = "source-sha-pfill"
+            (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
+                "run_id": "label_lake_pfill_test",
+                "source_telemetry_sha256": source_sha,
+                "order_lifecycle_labels": 4,
+            }), encoding="utf-8")
+            order_labels = [
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 1,
+                    "source_line": 10,
+                    "source_t": 100,
+                    "source_order_index": 0,
+                    "venue_id": "lighter",
+                    "action": "place",
+                    "status": "sent",
+                    "decision_id": "d-fill",
+                    "order_id_hash": "order-fill",
+                    "client_order_id_hash": "client-fill",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 2,
+                    "source_line": 11,
+                    "source_t": 101,
+                    "source_order_index": 0,
+                    "venue_id": "lighter",
+                    "action": "place",
+                    "status": "sent",
+                    "decision_id": "d-cancel",
+                    "order_id_hash": "order-cancel",
+                    "client_order_id_hash": "client-cancel",
+                    "side": "Sell",
+                    "price": 101.0,
+                    "size": 0.02,
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 3,
+                    "source_line": 12,
+                    "source_t": 102,
+                    "source_order_index": 0,
+                    "venue_id": "lighter",
+                    "action": "cancel",
+                    "status": "cancelled",
+                    "decision_id": "d-cancel",
+                    "order_id_hash": "order-cancel",
+                    "client_order_id_hash": "client-cancel",
+                    "side": "Sell",
+                    "price": 101.0,
+                    "size": 0.02,
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 4,
+                    "source_line": 13,
+                    "source_t": 103,
+                    "source_order_index": 0,
+                    "venue_id": "lighter",
+                    "action": "place",
+                    "status": "sent",
+                    "decision_id": "d-censor",
+                    "order_id_hash": "order-censor",
+                    "client_order_id_hash": "client-censor",
+                    "side": "Buy",
+                    "price": 99.0,
+                    "size": 0.01,
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+            ]
+            with (label_lake_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in order_labels:
+                    f.write(json.dumps(label) + "\n")
+            (join_run / "join_holdout_summary.json").write_text(json.dumps({
+                "run_id": "join_pfill_test",
+                "source_telemetry_sha256": source_sha,
+                "fill_labels": 1,
+            }), encoding="utf-8")
+            with (join_run / "joined_labels.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "label_type": "DETERMINISTIC_JOIN_LABEL",
+                    "fill_id": "fill-1",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.004,
+                    "fill_time_ms": 1700000000001,
+                    "maker_taker_role": "MAKER",
+                    "order_join_status": "JOINED",
+                    "order_label_seq": 1,
+                    "order_source_line": 10,
+                    "order_source_t": 100,
+                    "order_source_order_index": 0,
+                    "order_id_hash": "order-fill",
+                    "client_order_id_hash": "client-fill",
+                    "order_decision_id": "d-fill",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_outcome_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_pfill_test"
+            summary = json.loads((run_dir / "pfill_outcome_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["order_label_count"], 3)
+            self.assertEqual(summary["filled_count"], 1)
+            self.assertEqual(summary["not_filled_count"], 1)
+            self.assertEqual(summary["censored_count"], 1)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "pfill_order_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            by_decision = {label["decision_id"]: label for label in labels}
+            self.assertEqual(by_decision["d-fill"]["p_fill_outcome"], 1.0)
+            self.assertEqual(by_decision["d-fill"]["outcome_status"], "OBSERVED_FILLED")
+            self.assertEqual(by_decision["d-fill"]["fill_count"], 1)
+            self.assertEqual(by_decision["d-fill"]["filled_size_total"], 0.004)
+            self.assertEqual(by_decision["d-cancel"]["p_fill_outcome"], 0.0)
+            self.assertEqual(by_decision["d-cancel"]["outcome_status"], "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL")
+            self.assertIsNone(by_decision["d-censor"]["p_fill_outcome"])
+            self.assertEqual(by_decision["d-censor"]["outcome_status"], "CENSORED_OR_UNOBSERVED")
+            self.assertTrue(all(label["approved_for_live"] is False for label in labels))
+            self.assertTrue(all(label["approved_for_model_training"] is False for label in labels))
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    file_info["sha256"],
+                    file_info["path"],
+                )
+
+            (join_run / "join_holdout_summary.json").write_text(json.dumps({
+                "run_id": "join_pfill_test",
+                "source_telemetry_sha256": "different-source-sha",
+                "fill_labels": 1,
+            }), encoding="utf-8")
+            mismatch = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_outcome_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_mismatch_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(mismatch.returncode, 2)
+            self.assertIn("source_telemetry_sha256", mismatch.stderr)
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

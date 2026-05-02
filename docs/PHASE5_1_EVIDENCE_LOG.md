@@ -576,6 +576,90 @@ trade history. The remaining 167 unknown-role fills are non-Lighter fills and
 do not imply a Lighter quote-candidate join failure.
 ```
 
+## PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-FROM-BACKFILL-M4
+
+- Run id:
+  `PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-M4-20260429T073231Z`
+- Local run directory:
+  `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-M4-20260429T073231Z`
+- Purpose: refresh the first terminal-stale join pack with order identity fields
+  required for order-level P_fill outcome labels.
+- Source telemetry SHA256:
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- Gate status: `HOLD`
+- Gate reason: `deterministic_join_partial_maker_taker_attribution`
+- Fill labels: `356`
+- Order joins: `356`
+- Candidate joins: `189`
+- Complete quote/order/fill/markout joins: `189`
+- Maker/taker role counts: `MAKER=64`, `TAKER=32`, `UNKNOWN=260`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_join_holdout.py \
+  --label-lake-run runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z \
+  --observed-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-FROM-BACKFILL-M2-20260429T073231Z \
+  --run-id PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-M4-20260429T073231Z
+```
+
+Artifact hashes:
+
+```text
+af3b274aff4881d810cf05547bf5514cd073a24ec02adbc157f752f61cbcc2c2  joined_labels.jsonl
+639d11cff87c555e3433b9c79bc854ae0278963302ee4070174fb351c786fa6e  join_holdout_summary.json
+204ddcd04660b3367efdf0266ca31ccfe49783cc54afc501141f36873bb2dc9e  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-PFILL-OUTCOME-FROM-BACKFILL
+
+- Run id:
+  `PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Local run directory:
+  `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Source telemetry SHA256:
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- Input label lake:
+  `runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z`
+- Input join holdout:
+  `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-M4-20260429T073231Z`
+- Gate status: `HOLD`
+- Gate reason: `pfill_outcome_contains_censored_orders`
+- Place-order outcome labels: `6815`
+- Filled orders: `310`
+- Terminal not-filled orders: `1929`
+- Censored/unobserved orders: `4576`
+- Deterministic train split: `5478`
+- Deterministic holdout split: `1337`
+- Observed positive fill rate on non-censored orders: `0.13845466726217062`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_pfill_outcome_labels.py \
+  --label-lake-run runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z \
+  --join-holdout-run runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-M4-20260429T073231Z \
+  --run-id PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z
+```
+
+Artifact hashes:
+
+```text
+8ca0b4d691a5f6a2096b958ab271ed9f56db0be57cc7dec98ce714d0952b0002  pfill_order_labels.jsonl
+68363ab1a28e2b59703c1b3a06062be2ed69819d45fe5cc1dc1b2c702f7b356b  pfill_outcome_summary.json
+e4f07e07ea4e990f15cf14d4561689800eecdf3fb5b4b3609090c4f86315a1f7  evidence_pack/artifact_index.json
+```
+
 ## Source-Aligned Terminal-Stale 025435 EV Shadow
 
 - Run id: `LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T025435Z`
@@ -749,9 +833,11 @@ f9ed9d6c1f9272078bd318c2e775306a6986ef23edd0a81799352503779a57ac  evidence_pack/
 ## PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-025435
 
 - Run id:
-  `PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T025435Z`
+  `PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-M2-20260429T025435Z`
 - Local run directory:
-  `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T025435Z`
+  `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-M2-20260429T025435Z`
+- Purpose: refresh the second terminal-stale join pack with order identity
+  fields required for order-level P_fill outcome labels.
 - Source telemetry SHA256:
   `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
 - EV shadow telemetry SHA256:
@@ -787,15 +873,59 @@ Command:
 python3 tools/phase51c_join_holdout.py \
   --label-lake-run runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z \
   --observed-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T025435Z \
-  --run-id PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T025435Z
+  --run-id PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-M2-20260429T025435Z
 ```
 
 Artifact hashes:
 
 ```text
-a43995cd8f43db77b3dddb9b585145c73c4151b437422c7d384f7ea3fb743a35  joined_labels.jsonl
-055a3a0af7390821cd79a825e39b1feed6ee28b9a392477be3c46d860daf5117  join_holdout_summary.json
-e208f1976d5c809ba7d3d1929d7c2518bc15ccc98fcf47369d254af5f83172d8  evidence_pack/artifact_index.json
+01b6f3243b267f46c194f2596f7211e66af836c49ab7c3bb3248602829b6e22d  joined_labels.jsonl
+5f405cec3671aefe40db04faa09aa36d6c75861566b5c320567c4921f5d8fe23  join_holdout_summary.json
+5c27ef102805cffae4f8e2bad5528e6c9198e24b6fbf630adc49787c338ffb16  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-025435
+
+- Run id:
+  `PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z`
+- Local run directory:
+  `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z`
+- Source telemetry SHA256:
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
+- Input label lake:
+  `runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z`
+- Input join holdout:
+  `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-M2-20260429T025435Z`
+- Gate status: `HOLD`
+- Gate reason: `pfill_outcome_sparse_observed_fills`
+- Place-order outcome labels: `5120`
+- Filled orders: `179`
+- Terminal not-filled orders: `906`
+- Censored/unobserved orders: `4035`
+- Deterministic train split: `4110`
+- Deterministic holdout split: `1010`
+- Observed positive fill rate on non-censored orders: `0.16497695852534563`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_pfill_outcome_labels.py \
+  --label-lake-run runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T025435Z \
+  --join-holdout-run runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-M2-20260429T025435Z \
+  --run-id PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z
+```
+
+Artifact hashes:
+
+```text
+e0ad36ed92f94f320a548fd48961ccde0c6c5efb07a1e6a5d4f72508504c4d4d  pfill_order_labels.jsonl
+97f6c94f0780010d382cc9e2b5691c165b0158207f20c7e2caaa2b2f49583fbf  pfill_outcome_summary.json
+34fcf5d99c1212421de97b2831a166a362a419213dc762edc7ebd0f9300f6792  evidence_pack/artifact_index.json
 ```
 
 ## PHASE51C-LABEL-LAKE-20260502T004621Z

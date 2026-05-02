@@ -132,6 +132,16 @@ Current repo-owned tooling:
   two balance-backed terminal-stale lanes, current Lighter-only 5.1c evidence
   has `306` Lighter candidate joins and `176` native-role-attributed complete
   joins.
+- `tools/phase51c_pfill_outcome_labels.py` builds order-level
+  `ORDER_PFILL_OUTCOME_LABEL` records from label-lake and join-holdout packs.
+  It uses order identity/source/hash keys rather than decision-id-first mapping,
+  emits independent order-level train/holdout splits, and labels place orders
+  as filled, terminal not-filled, or censored/unobserved.
+- Current P_fill outcome evidence across the two balance-backed lanes:
+  `11935` place-order labels, `489` filled, `2835` terminal not-filled, and
+  `8611` censored/unobserved. This is sufficient as a repo-owned outcome-label
+  scaffold but not sufficient for model training because censoring and sparse
+  observed fills remain unresolved.
 - 5.1c remains `HOLD`. No model training, live, canary, capital escalation,
   risk-limit relaxation, or financial claim is authorized from the current
   pack.
