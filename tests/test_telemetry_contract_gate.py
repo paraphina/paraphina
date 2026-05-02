@@ -592,6 +592,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1b evidence acceptance gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51b_accept_evidence.py"
+
+    def _get_phase51c_label_lake_path(self) -> Path:
+        """Get path to the Phase 5.1c label-lake scaffold."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_label_lake.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -1357,6 +1362,118 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertFalse(acceptance["approved_for_canary"])
             self.assertFalse(acceptance["approved_for_capital_escalation"])
             self.assertFalse(acceptance["secret_scan"]["sensitive_value_leak_found"])
+
+    def test_phase51c_label_lake_scaffold_holds_without_fill_markout_balance(self):
+        """Phase 5.1c label lake should preserve labels and keep model training blocked."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            source_path = tmp_path / "phase5_source.jsonl"
+            ev_path = tmp_path / "ev_shadow" / "telemetry.jsonl"
+            ev_path.parent.mkdir()
+            acceptance_path = tmp_path / "phase51b_acceptance.json"
+            output_root = tmp_path / "label_lake_runs"
+            source_record = {
+                "schema_version": 1,
+                "t": 42,
+                "orders": [{
+                    "action": "place",
+                    "status": "ack",
+                    "venue_id": "lighter",
+                    "decision_id": "d42_mm_v2_buy",
+                    "order_id": "order-1",
+                    "client_order_id": "client-1",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "post_only": True,
+                    "reduce_only": False,
+                }],
+            }
+            source_path.write_text(json.dumps(source_record) + "\n", encoding="utf-8")
+            ev_records = [
+                self._make_valid_telemetry_v2_record(1, run_id="ev_shadow_test"),
+                self._make_valid_telemetry_v2_record(
+                    2,
+                    run_id="ev_shadow_test",
+                    event_type="V2_EV_EVALUATED",
+                    venue_id="lighter",
+                    candidate_id="cand-1",
+                    source_line=1,
+                    source_t=42,
+                    source_record_sha256="abc",
+                    side="BID",
+                    layer="TOUCH",
+                    decision="HOLD",
+                    decision_reason_primary="missing_pfill_calibration",
+                    decision_reason_secondary_list=["counterfactual_only_nonfinancial"],
+                    calibration_bucket_id="lighter:BID:TOUCH",
+                    calibration_status="SPARSE",
+                    admissible_for_financial_claim=False,
+                ),
+            ]
+            with ev_path.open("w", encoding="utf-8") as f:
+                for record in ev_records:
+                    f.write(json.dumps(record) + "\n")
+            acceptance_path.write_text(json.dumps({
+                "status": "PROMOTE_TO_PHASE51C_CALIBRATION_INGESTION",
+                "approved_for_calibration_label_ingestion": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "approved_for_financial_claim": False,
+                "limitations": ["lighter_open_order_limit_headroom_unknown"],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_label_lake_path()),
+                    "--source-telemetry",
+                    str(source_path),
+                    "--ev-shadow-telemetry",
+                    str(ev_path),
+                    "--phase51b-acceptance",
+                    str(acceptance_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_label_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_label_test"
+            summary = json.loads((run_dir / "label_lake_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["quote_decision_labels"], 1)
+            self.assertEqual(summary["order_lifecycle_labels"], 1)
+            self.assertEqual(summary["fill_label_status"], "MISSING")
+            self.assertEqual(summary["markout_label_status"], "MISSING")
+            self.assertEqual(summary["balance_reconciliation_status"], "MISSING")
+            self.assertEqual(summary["native_limit_pressure_status"], "UNKNOWN")
+            self.assertFalse(summary["approved_for_model_training"])
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([label["label_type"] for label in labels], [
+                "QUOTE_DECISION_LABEL",
+                "ORDER_LIFECYCLE_LABEL",
+                "LABEL_COVERAGE_SUMMARY",
+            ])
+            self.assertTrue(all(label["approved_for_live"] is False for label in labels))
+            self.assertTrue(all(label["admissible_for_model_training"] is False for label in labels))
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    file_info["sha256"],
+                    file_info["path"],
+                )
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""
