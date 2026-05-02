@@ -1513,6 +1513,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             balance_pre = tmp_path / "balance_pre_snapshot.json"
             balance_post = tmp_path / "balance_post_snapshot.json"
             balance_comparison = tmp_path / "balance_snapshot_comparison.json"
+            lighter_trades = tmp_path / "lighter_trades.json"
             output_root = tmp_path / "observed_label_runs"
             source_record_1 = {
                 "schema_version": 1,
@@ -1528,7 +1529,7 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "fee_bps": 0.0,
                     "purpose": "Mm",
                     "decision_id": "d7_mm_v3_buy",
-                    "order_id": "order-1",
+                    "order_id": "123",
                     "client_order_id": "client-1",
                     "fill_time_ms": 1700000000000,
                     "markout_pnl_short": None,
@@ -1586,6 +1587,17 @@ class TestValidatorSubprocess(unittest.TestCase):
                     },
                 },
             }), encoding="utf-8")
+            lighter_trades.write_text(json.dumps({
+                "trades": [{
+                    "bid_id": 123,
+                    "bid_id_str": "123",
+                    "bid_client_id": 123,
+                    "bid_client_id_str": "123",
+                    "ask_id": 456,
+                    "ask_id_str": "456",
+                    "is_maker_ask": False,
+                }],
+            }), encoding="utf-8")
 
             result = subprocess.run(
                 [
@@ -1599,6 +1611,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(balance_post),
                     "--balance-comparison",
                     str(balance_comparison),
+                    "--lighter-trades-json",
+                    str(lighter_trades),
                     "--output-root",
                     str(output_root),
                     "--run-id",
@@ -1622,6 +1636,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(summary["fill_label_status"], "OBSERVED")
             self.assertEqual(summary["markout_label_status"], "OBSERVED")
             self.assertEqual(summary["balance_reconciliation_status"], "OBSERVED")
+            self.assertEqual(summary["maker_taker_role_counts"]["MAKER"], 2)
             self.assertFalse(summary["approved_for_model_training"])
             self.assertFalse(summary["approved_for_live"])
             labels = [
@@ -1636,7 +1651,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "OBSERVED_MARKOUT_LABEL",
                 "BALANCE_RECONCILIATION_LABEL",
             ])
-            self.assertEqual(labels[0]["maker_taker_attribution_status"], "UNKNOWN")
+            self.assertEqual(labels[0]["maker_taker_attribution_status"], "OBSERVED")
+            self.assertEqual(labels[0]["maker_taker_attribution_source"], "lighter_trades_json")
             self.assertEqual(labels[1]["markout_horizon_ms"], 1000)
             self.assertEqual(labels[2]["maker_taker_role"], "MAKER")
             self.assertTrue(all(label["approved_for_live"] is False for label in labels))

@@ -110,7 +110,9 @@ Current repo-owned tooling:
   labels from non-live EV shadow output.
 - `tools/phase51c_observed_labels.py` builds read-only observed fill and
   fair-value markout, and balance-reconciliation labels from existing artifacts
-  without copying large source telemetry.
+  without copying large source telemetry. It can optionally join Lighter native
+  trade snapshots by order/client IDs to upgrade maker/taker attribution from
+  `UNKNOWN` to `MAKER`/`TAKER`.
 - Observed fill and balance labels do not promote 5.1c by themselves. Missing
   native maker/taker role certainty, quote/fill joins, and deterministic
   holdout still force `HOLD`.

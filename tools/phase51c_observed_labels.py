@@ -177,20 +177,80 @@ def _signed_markout_usd(side: Any, fill_price: Any, size: Any, future_price: flo
     return None
 
 
-def _maker_taker_role(fill: dict[str, Any]) -> str:
+def _extract_items(payload: Any, keys: set[str]) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    lowered = {str(k).lower(): v for k, v in payload.items()}
+    for key in keys:
+        value = lowered.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _string_ids(*values: Any) -> list[str]:
+    ids: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            ids.append(text)
+    return ids
+
+
+def _load_lighter_trade_role_index(path: Path | None) -> tuple[dict[str, str], str | None]:
+    if path is None:
+        return {}, None
+    payload = _load_json(path)
+    trades = _extract_items(payload, {"trades", "trade_history", "tradehistory"})
+    index: dict[str, str] = {}
+    for trade in trades:
+        is_maker_ask = trade.get("is_maker_ask")
+        if is_maker_ask is None:
+            is_maker_ask = trade.get("isMakerAsk")
+        if not isinstance(is_maker_ask, bool):
+            continue
+        ask_role = "MAKER" if is_maker_ask else "TAKER"
+        bid_role = "TAKER" if is_maker_ask else "MAKER"
+        for order_id in _string_ids(
+            trade.get("ask_id"),
+            trade.get("ask_id_str"),
+            trade.get("ask_client_id"),
+            trade.get("ask_client_id_str"),
+        ):
+            index[order_id] = ask_role
+        for order_id in _string_ids(
+            trade.get("bid_id"),
+            trade.get("bid_id_str"),
+            trade.get("bid_client_id"),
+            trade.get("bid_client_id_str"),
+        ):
+            index[order_id] = bid_role
+    return index, _sha256_file(path)
+
+
+def _maker_taker_role(fill: dict[str, Any], lighter_trade_roles: dict[str, str]) -> tuple[str, str]:
     for key in ("maker_or_taker", "maker_taker", "liquidity", "role"):
         raw = fill.get(key)
         if isinstance(raw, str) and raw.strip():
             lowered = raw.strip().lower()
             if "maker" in lowered:
-                return "MAKER"
+                return "MAKER", "telemetry_fill_field"
             if "taker" in lowered:
-                return "TAKER"
+                return "TAKER", "telemetry_fill_field"
     if fill.get("is_maker") is True:
-        return "MAKER"
+        return "MAKER", "telemetry_fill_field"
     if fill.get("is_maker") is False:
-        return "TAKER"
-    return "UNKNOWN"
+        return "TAKER", "telemetry_fill_field"
+    if str(fill.get("venue_id") or "").lower() == "lighter":
+        for order_id in _string_ids(fill.get("order_id"), fill.get("client_order_id")):
+            role = lighter_trade_roles.get(order_id)
+            if role:
+                return role, "lighter_trades_json"
+    return "UNKNOWN", "unknown"
 
 
 def _extract_fill_labels(
@@ -199,6 +259,7 @@ def _extract_fill_labels(
     run_id: str,
     timestamp_ns: int,
     markout_horizons_ms: list[int],
+    lighter_trade_roles: dict[str, str],
     labels_file,
 ) -> tuple[int, int, dict[str, int], dict[str, int]]:
     fill_count = 0
@@ -275,7 +336,7 @@ def _extract_fill_labels(
                 continue
             fill_count += 1
             venue_id = str(fill.get("venue_id") or "unknown")
-            role = _maker_taker_role(fill)
+            role, role_source = _maker_taker_role(fill, lighter_trade_roles)
             per_venue[venue_id] = per_venue.get(venue_id, 0) + 1
             role_counts[role] = role_counts.get(role, 0) + 1
             markout_value = fill.get("markout_pnl_short")
@@ -325,6 +386,7 @@ def _extract_fill_labels(
                 "realised_pnl_usd": fill.get("realised_pnl_usd"),
                 "maker_taker_role": role,
                 "maker_taker_attribution_status": "OBSERVED" if role != "UNKNOWN" else "UNKNOWN",
+                "maker_taker_attribution_source": role_source,
                 "markout_pnl_short": markout_value,
                 "markout_status": markout_status,
                 "label_status": (
@@ -442,6 +504,8 @@ def _gate_reason(
         return "observed_label_pack_missing_markout_coverage"
     if role_counts.get("UNKNOWN", 0) == fill_labels:
         return "observed_label_pack_missing_maker_taker_attribution"
+    if role_counts.get("UNKNOWN", 0) > 0:
+        return "observed_label_pack_partial_maker_taker_attribution"
     if balance_labels == 0:
         return "observed_label_pack_missing_balance_reconciliation"
     return "observed_label_pack_requires_quote_join_holdout_and_board_review"
@@ -457,6 +521,7 @@ def build_observed_labels(
     balance_post: Path | None,
     balance_comparison: Path | None,
     markout_horizons_ms: list[int],
+    lighter_trades_json: Path | None,
 ) -> Path:
     if not source_telemetry.exists():
         raise ValueError(f"source telemetry not found: {source_telemetry}")
@@ -470,12 +535,14 @@ def build_observed_labels(
     created_utc = _timestamp_ns_to_utc(timestamp_ns)
 
     labels_path = out_dir / "labels.jsonl"
+    lighter_trade_roles, lighter_trades_sha256 = _load_lighter_trade_role_index(lighter_trades_json)
     with labels_path.open("w", encoding="utf-8") as labels_file:
         fill_labels, markout_labels, per_venue_fills, role_counts = _extract_fill_labels(
             source_telemetry=source_telemetry,
             run_id=run_id,
             timestamp_ns=timestamp_ns,
             markout_horizons_ms=markout_horizons_ms,
+            lighter_trade_roles=lighter_trade_roles,
             labels_file=labels_file,
         )
         balance_labels = 0
@@ -508,6 +575,9 @@ def build_observed_labels(
         "balance_pre_snapshot": str(balance_pre) if balance_pre else None,
         "balance_post_snapshot": str(balance_post) if balance_post else None,
         "balance_comparison": str(balance_comparison) if balance_comparison else None,
+        "lighter_trades_json": str(lighter_trades_json) if lighter_trades_json else None,
+        "lighter_trades_json_sha256": lighter_trades_sha256,
+        "lighter_trade_role_index_size": len(lighter_trade_roles),
         "markout_horizons_ms": markout_horizons_ms,
         "fill_labels": fill_labels,
         "markout_labels": markout_labels,
@@ -542,6 +612,7 @@ def main() -> int:
     parser.add_argument("--balance-pre", type=Path, default=None)
     parser.add_argument("--balance-post", type=Path, default=None)
     parser.add_argument("--balance-comparison", type=Path, default=None)
+    parser.add_argument("--lighter-trades-json", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--timestamp-ns", type=int, default=None)
@@ -570,6 +641,7 @@ def main() -> int:
             balance_post=args.balance_post,
             balance_comparison=args.balance_comparison,
             markout_horizons_ms=markout_horizons_ms,
+            lighter_trades_json=args.lighter_trades_json,
         )
     except Exception as exc:
         print(f"phase51c_observed_labels: ERROR: {exc}", file=sys.stderr)
