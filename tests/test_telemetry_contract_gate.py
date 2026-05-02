@@ -602,6 +602,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c observed-label extractor."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_observed_labels.py"
+
+    def _get_phase51c_join_holdout_path(self) -> Path:
+        """Get path to the Phase 5.1c deterministic join/holdout gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_join_holdout.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -845,7 +850,16 @@ class TestValidatorSubprocess(unittest.TestCase):
                     },
                 ],
             )
-            input_path.write_text(json.dumps(source_record) + "\n", encoding="utf-8")
+            suppressed_record = self._make_valid_telemetry_record(
+                tick=43,
+                fair_value=100.25,
+                config_version_id="test-config",
+                quote_levels=[],
+            )
+            input_path.write_text(
+                json.dumps(source_record) + json.dumps(suppressed_record) + "\n",
+                encoding="utf-8",
+            )
 
             result = subprocess.run(
                 [
@@ -1419,7 +1433,10 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "reduce_only": False,
                 }],
             }
-            source_path.write_text(json.dumps(source_record) + "\n", encoding="utf-8")
+            source_path.write_text(
+                json.dumps(source_record) + json.dumps({"schema_version": 1, "t": 43, "orders": []}) + "\n",
+                encoding="utf-8",
+            )
             ev_records = [
                 self._make_valid_telemetry_v2_record(1, run_id="ev_shadow_test"),
                 self._make_valid_telemetry_v2_record(
@@ -1665,6 +1682,173 @@ class TestValidatorSubprocess(unittest.TestCase):
                     file_info["sha256"],
                     file_info["path"],
                 )
+
+    def test_phase51c_join_holdout_joins_labels_without_training_promotion(self):
+        """Join/holdout pack should link observed fills to quote/order labels and remain HOLD."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            label_lake_run = tmp_path / "label_lake"
+            observed_run = tmp_path / "observed"
+            output_root = tmp_path / "join_runs"
+            label_lake_run.mkdir()
+            observed_run.mkdir()
+            source_sha = "source-sha-1"
+            (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
+                "run_id": "label_lake_test",
+                "source_telemetry_sha256": source_sha,
+                "ev_shadow_telemetry_sha256": "ev-sha-1",
+                "quote_decision_labels": 1,
+                "order_lifecycle_labels": 1,
+            }), encoding="utf-8")
+            label_lake_labels = [
+                {
+                    "label_type": "QUOTE_DECISION_LABEL",
+                    "source_line": 7,
+                    "source_t": 42,
+                    "venue_id": "lighter",
+                    "side": "BID",
+                    "candidate_id": "cand-1",
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "source_line": 7,
+                    "source_t": 42,
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "decision_id": "decision-1",
+                    "order_id_hash": "order-hash-1",
+                    "client_order_id_hash": "client-hash-1",
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+            ]
+            with (label_lake_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in label_lake_labels:
+                    f.write(json.dumps(label) + "\n")
+            (observed_run / "observed_label_summary.json").write_text(json.dumps({
+                "run_id": "observed_test",
+                "source_telemetry_sha256": source_sha,
+                "fill_labels": 1,
+                "markout_labels": 1,
+                "balance_reconciliation_labels": 1,
+                "maker_taker_role_counts": {"MAKER": 1, "TAKER": 0, "UNKNOWN": 0},
+            }), encoding="utf-8")
+            observed_labels = [
+                {
+                    "label_type": "OBSERVED_FILL_LABEL",
+                    "fill_id": "fill-5",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "fill_time_ms": 1700000000000,
+                    "decision_id": "decision-1",
+                    "order_id_hash": "order-hash-1",
+                    "client_order_id_hash": "client-hash-1",
+                    "maker_taker_role": "MAKER",
+                    "maker_taker_attribution_status": "OBSERVED",
+                    "maker_taker_attribution_source": "lighter_trades_json",
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+                {
+                    "label_type": "OBSERVED_MARKOUT_LABEL",
+                    "fill_id": "fill-5",
+                    "markout_horizon_ms": 1000,
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+                {
+                    "label_type": "BALANCE_RECONCILIATION_LABEL",
+                    "balance_reconciliation_status": "OBSERVED",
+                    "approved_for_live": False,
+                    "admissible_for_model_training": False,
+                },
+            ]
+            with (observed_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in observed_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_join_holdout_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--observed-run",
+                    str(observed_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_join_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_join_test"
+            summary = json.loads((run_dir / "join_holdout_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["gate_reason"], "deterministic_join_requires_board_review")
+            self.assertEqual(summary["fill_labels"], 1)
+            self.assertEqual(summary["order_join_count"], 1)
+            self.assertEqual(summary["candidate_join_count"], 1)
+            self.assertEqual(summary["complete_join_count"], 1)
+            self.assertEqual(summary["markout_join_count"], 1)
+            self.assertEqual(summary["balance_reconciliation_labels"], 1)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "joined_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(labels), 1)
+            self.assertEqual(labels[0]["candidate_id"], "cand-1")
+            self.assertEqual(labels[0]["join_status"], "COMPLETE_FOR_NONLIVE_REVIEW")
+            self.assertIn(labels[0]["holdout_split"], {"TRAIN", "HOLDOUT"})
+            self.assertFalse(labels[0]["approved_for_model_training"])
+            self.assertFalse(labels[0]["approved_for_live"])
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    file_info["sha256"],
+                    file_info["path"],
+                )
+
+            (observed_run / "observed_label_summary.json").write_text(json.dumps({
+                "run_id": "observed_test",
+                "source_telemetry_sha256": "different-source-sha",
+                "fill_labels": 1,
+                "markout_labels": 1,
+                "balance_reconciliation_labels": 1,
+            }), encoding="utf-8")
+            mismatch_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_join_holdout_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--observed-run",
+                    str(observed_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_join_mismatch_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(mismatch_result.returncode, 2)
+            self.assertIn("source_telemetry_sha256", mismatch_result.stderr)
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

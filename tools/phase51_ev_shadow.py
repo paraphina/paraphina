@@ -168,15 +168,26 @@ def _stable_hash(payload: dict[str, Any]) -> str:
 def _iter_input_records(path: Path) -> tuple[int, list[tuple[int, str, dict[str, Any]]]]:
     records: list[tuple[int, str, dict[str, Any]]] = []
     scanned = 0
+    decoder = json.JSONDecoder()
     with path.open("r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, start=1):
-            if not line.strip():
+            source = line.strip()
+            if not source:
                 continue
-            scanned += 1
-            record_hash = hashlib.sha256(line.rstrip("\n").encode("utf-8")).hexdigest()
-            obj = json.loads(line)
-            if isinstance(obj, dict):
+            pos = 0
+            while pos < len(source):
+                try:
+                    obj, end = decoder.raw_decode(source, pos)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid JSON at {path}:{line_num}:{pos + 1}: {exc}") from exc
+                if not isinstance(obj, dict):
+                    raise ValueError(f"expected JSON object at {path}:{line_num}")
+                scanned += 1
+                record_hash = hashlib.sha256(source[pos:end].encode("utf-8")).hexdigest()
                 records.append((line_num, record_hash, obj))
+                pos = end
+                while pos < len(source) and source[pos].isspace():
+                    pos += 1
     return scanned, records
 
 

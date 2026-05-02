@@ -113,9 +113,17 @@ Current repo-owned tooling:
   without copying large source telemetry. It can optionally join Lighter native
   trade snapshots by order/client IDs to upgrade maker/taker attribution from
   `UNKNOWN` to `MAKER`/`TAKER`.
-- Observed fill and balance labels do not promote 5.1c by themselves. Missing
-  native maker/taker role certainty, quote/fill joins, and deterministic
-  holdout still force `HOLD`.
+- `tools/phase51c_join_holdout.py` builds a source-aligned deterministic
+  quote/order/fill/markout/balance join pack and immutable train/holdout split.
+  It requires the label lake and observed-label pack to share the same
+  `source_telemetry_sha256`.
+- Current 5.1c evidence joins all `356` observed fills to orders, all `356`
+  fills to markouts, `189` fills to Lighter quote candidates, and creates a
+  deterministic `295` train / `61` holdout split.
+- 5.1c remains `HOLD` because native maker/taker role attribution is still
+  incomplete for `344/356` observed fills. No model training, live, canary,
+  capital escalation, risk-limit relaxation, or financial claim is authorized
+  from the current pack.
 
 ### Gate 5.2 - Calibrated EV Shadow
 

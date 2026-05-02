@@ -52,14 +52,24 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _iter_jsonl(path: Path):
+    decoder = json.JSONDecoder()
     with path.open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
-            if not line.strip():
+            source = line.strip()
+            if not source:
                 continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise ValueError(f"expected JSON object at {path}:{line_no}")
-            yield line_no, record
+            pos = 0
+            while pos < len(source):
+                try:
+                    record, end = decoder.raw_decode(source, pos)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid JSON at {path}:{line_no}:{pos + 1}: {exc}") from exc
+                if not isinstance(record, dict):
+                    raise ValueError(f"expected JSON object at {path}:{line_no}")
+                yield line_no, record
+                pos = end
+                while pos < len(source) and source[pos].isspace():
+                    pos += 1
 
 
 def _write_json(path: Path, data: Any) -> None:

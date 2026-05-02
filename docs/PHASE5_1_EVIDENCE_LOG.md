@@ -261,6 +261,166 @@ Artifact hashes:
 a9ae3b72f02dfea2d4c2795b2f38fa3ac8510cbc7528fd77dcb73a1e53dcdf5d  evidence_pack/artifact_index.json
 ```
 
+## Source-Aligned Terminal-Stale EV Shadow M7
+
+- Run id: `LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T073231Z_m7`
+- Local run directory:
+  `runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T073231Z_m7`
+- Source telemetry:
+  `/home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/telemetry_bounded.jsonl`
+- Input artifact mode: `reference`
+- Input records scanned: `27792`
+- Input SHA256:
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- Candidates evaluated: `55584`
+- Replay labels emitted: `55584`
+- Gate status: `HOLD`
+- Gate reason: `nonlive_shadow_requires_calibration_and_board_review`
+- Calibration status: `SPARSE`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+- `admissible_for_financial_claim`: `false`
+
+This replay uses the same source telemetry hash as the observed-label pack, so
+it is suitable for deterministic quote/order/fill/markout join evidence. The
+Phase 5.1 parsers were hardened to support concatenated JSON objects observed
+in this historical source artifact without mutating the raw artifact.
+
+Command:
+
+```bash
+python3 tools/phase51_ev_shadow.py \
+  --input-telemetry /home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/telemetry_bounded.jsonl \
+  --run-id LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T073231Z_m7 \
+  --output-root runs/phase51_lighter_only_ev_shadow \
+  --input-artifact-mode reference
+```
+
+Validation:
+
+```bash
+python3 tools/check_telemetry_contract.py \
+  runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T073231Z_m7/telemetry.jsonl
+```
+
+Result:
+
+```text
+OK: 111169 record(s) validated against schema v2
+```
+
+Artifact hashes:
+
+```text
+70d4d937b9804ce83f0307d3a3fb1853d58b56ee8bf467bfa35ebac7fec1d8c5  telemetry.jsonl
+13d6e4c4eea8ed033c26f0316bfe60aedf03a2c853f0903bd8d6e9724ccc5688  ev_shadow_summary.json
+1c8e17bb2675cf5c6ee7a8981b2b2624260fa2ce9805fd47e4a1e103047a6018  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S
+
+- Run id: `PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z`
+- Local run directory:
+  `runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z`
+- Source telemetry SHA256:
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- EV shadow telemetry SHA256:
+  `70d4d937b9804ce83f0307d3a3fb1853d58b56ee8bf467bfa35ebac7fec1d8c5`
+- Phase 5.1b acceptance artifact:
+  `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/phase51b_acceptance.json`
+- Gate status: `HOLD`
+- Gate reason: `label_lake_scaffold_missing_fill_markout_balance_coverage`
+- Record count: `77213`
+- Quote decision labels: `55584`
+- Order lifecycle labels: `21628`
+- Fill labels: `0`
+- Markout labels: `0`
+- Balance reconciliation labels: `0`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_label_lake.py \
+  --source-telemetry /home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/telemetry_bounded.jsonl \
+  --ev-shadow-telemetry runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_terminal_stale_7200s_20260429T073231Z_m7/telemetry.jsonl \
+  --phase51b-acceptance runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/phase51b_acceptance.json \
+  --run-id PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z
+```
+
+Artifact hashes:
+
+```text
+c6a83e0400aeda5e858b35e0b45c14715fa369f2d647ea2826529f94a0e54714  labels.jsonl
+a6e46679d8c88b9b41a6d6985346c036317d8d530e9aa7ec8c1712ce72e8f3cf  label_lake_summary.json
+df2e15bf5390d5b99b6c80ade9ee33dc4f8ae53cdcd2e50bfb39a8a98bc24256  evidence_pack/artifact_index.json
+```
+
+## PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S
+
+- Run id:
+  `PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T073231Z`
+- Local run directory:
+  `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T073231Z`
+- Source telemetry SHA256:
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- EV shadow telemetry SHA256:
+  `70d4d937b9804ce83f0307d3a3fb1853d58b56ee8bf467bfa35ebac7fec1d8c5`
+- Gate status: `HOLD`
+- Gate reason: `deterministic_join_partial_maker_taker_attribution`
+- Quote decision labels: `55584`
+- Order lifecycle labels: `21628`
+- Fill labels: `356`
+- Order joins: `356`
+- Candidate joins: `189`
+- Complete quote/order/fill/markout joins: `189`
+- Markout joins: `356`
+- Balance reconciliation labels: `1`
+- Deterministic train split: `295`
+- Deterministic holdout split: `61`
+- Maker/taker role counts: `MAKER=7`, `TAKER=5`, `UNKNOWN=344`
+- Join reason counts:
+  `complete_join=12`, `maker_taker_unknown=344`, `missing_candidate_join=167`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_join_holdout.py \
+  --label-lake-run runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-TERMINAL-STALE-7200S-20260429T073231Z \
+  --observed-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T073231Z \
+  --run-id PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T073231Z
+```
+
+Artifact hashes:
+
+```text
+8928f5871d844f418af5bcbf8cb0edb2f74faacffdb839712c68aa9e32af3322  joined_labels.jsonl
+9af2447ecbc088d5f4496f8cd5e8820ff58bcab117d2206701ed344805e0fffb  join_holdout_summary.json
+cbb3d95e9a6a778b8a0fbae9552d4fd86f5e96136a156806d206bb64b2246a64  evidence_pack/artifact_index.json
+```
+
+Current blocker:
+
+```text
+5.1c remains HOLD because native maker/taker role attribution is incomplete
+for 344/356 observed fills. No model training, live, canary, capital
+escalation, risk-limit relaxation, or financial claim is authorized from this
+pack.
+```
+
 ## PHASE51C-LABEL-LAKE-20260502T004621Z
 
 - Run id: `PHASE51C-LABEL-LAKE-20260502T004621Z`
