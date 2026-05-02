@@ -297,7 +297,7 @@ def _as_text(value: Any) -> str | None:
 def _normalize_account_type(value: Any) -> str:
     if value is None or str(value).strip() == "":
         return "UNKNOWN"
-    text = str(value or "").strip().upper()
+    text = str(value).strip().upper()
     if "PREMIUM" in text:
         return "PREMIUM"
     if "STANDARD" in text or "RETAIL" in text:
@@ -366,7 +366,7 @@ def _extract_market_metadata(payload: Any, market_symbol: str | None, market_id:
     target_symbol = (market_symbol or "").upper().replace("-PERP", "").replace("-USD", "")
     for book in books:
         symbol = str(book.get("symbol") or book.get("market") or "").upper()
-        book_market_id = _as_int(book.get("market_id") or book.get("marketId") or book.get("id"))
+        book_market_id = _as_int(_first_value(book, {"market_id", "marketid", "id"}))
         normalized_symbol = symbol.replace("-PERP", "").replace("-USD", "")
         if market_id is not None and book_market_id == market_id:
             return book
@@ -392,8 +392,8 @@ def _infer_lighter_trade_role(trade: dict[str, Any], account_index: int | None) 
     is_maker_ask = _as_bool(trade.get("is_maker_ask") if "is_maker_ask" in trade else trade.get("isMakerAsk"))
     if is_maker_ask is None:
         return None
-    ask_account_id = _as_int(trade.get("ask_account_id") or trade.get("askAccountId"))
-    bid_account_id = _as_int(trade.get("bid_account_id") or trade.get("bidAccountId"))
+    ask_account_id = _as_int(_first_value(trade, {"ask_account_id", "askaccountid"}))
+    bid_account_id = _as_int(_first_value(trade, {"bid_account_id", "bidaccountid"}))
     if account_index == ask_account_id:
         return "maker" if is_maker_ask else "taker"
     if account_index == bid_account_id:
@@ -645,9 +645,12 @@ def _account_profile_event(
 ) -> dict[str, Any]:
     account = _extract_account(account_source["payload"] if account_source else {})
     l1_address = _as_text(account.get("l1_address") or account.get("l1Address") or account.get("address"))
-    observed_account_index = _as_int(account.get("account_index") or account.get("accountIndex") or account.get("index")) or account_index
+    observed_account_index = _as_int(_first_value(account, {"account_index", "accountindex", "index"}))
+    if observed_account_index is None:
+        observed_account_index = account_index
     account_type = _normalize_account_type(_first_value(account, {"account_type", "accounttype", "account_tier", "accounttier", "tier"}))
     market = _extract_market_metadata(order_books_source["payload"] if order_books_source else {}, market_symbol, market_id)
+    observed_market_id = _as_int(_first_value(market, {"market_id", "marketid", "id"})) if market else None
     event = _base_event(event_type="V2_LIGHTER_ACCOUNT_PROFILE", event_seq=event_seq, run_id=run_id, timestamp_ns=timestamp_ns)
     event.update({
         "venue_id": "lighter",
@@ -656,7 +659,7 @@ def _account_profile_event(
         "account_l1_address_present": bool(l1_address),
         "lighter_account_type": account_type,
         "lighter_account_profile_status": "OBSERVED" if account_type != "UNKNOWN" else "UNKNOWN",
-        "market_id": _as_int(market.get("market_id") or market.get("marketId") or market.get("id")) or market_id,
+        "market_id": observed_market_id if observed_market_id is not None else market_id,
         "market_symbol": _as_text(market.get("symbol") or market.get("market") or market_symbol),
         "market_metadata_status": "OBSERVED" if market else "MISSING",
         "maker_fee_raw": _as_text(market.get("maker_fee") or market.get("makerFee") or market.get("maker_fee_percent") or market.get("makerFeePercent")),
@@ -754,7 +757,7 @@ def _active_orders_event(
     market_count = 0
     if market_id is not None:
         for order in orders:
-            if _as_int(order.get("market_id") or order.get("marketId")) == market_id:
+            if _as_int(_first_value(order, {"market_id", "marketid"})) == market_id:
                 market_count += 1
     else:
         market_count = len(orders)
@@ -913,6 +916,11 @@ def run(
         ))
     if not sources:
         raise ValueError("provide captured JSON files or --fetch-readonly")
+    if resolved_market_id is None and "order_books" in sources:
+        market = _extract_market_metadata(sources["order_books"]["payload"], resolved_market_symbol, None)
+        observed_market_id = _as_int(_first_value(market, {"market_id", "marketid", "id"})) if market else None
+        if observed_market_id is not None:
+            resolved_market_id = observed_market_id
 
     events: list[dict[str, Any]] = [{
         **_base_event(event_type="V2_RUN_CONTEXT", event_seq=1, run_id=run_id, timestamp_ns=timestamp_ns),

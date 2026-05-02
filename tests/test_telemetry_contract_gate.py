@@ -1066,14 +1066,14 @@ class TestValidatorSubprocess(unittest.TestCase):
             }), encoding="utf-8")
             active_orders_path.write_text(json.dumps({
                 "active_orders": [
-                    {"order_id": "1", "market_id": 7, "status": "OPEN"},
-                    {"order_id": "2", "market_id": 7, "status": "PENDING"},
+                    {"order_id": "1", "market_id": 0, "status": "OPEN"},
+                    {"order_id": "2", "market_id": 0, "status": "PENDING"},
                     {"order_id": "3", "market_id": 8, "status": "OPEN"},
                 ]
             }), encoding="utf-8")
             order_books_path.write_text(json.dumps({
                 "order_books": [{
-                    "market_id": 7,
+                    "market_id": 0,
                     "symbol": "ETH-USD",
                     "maker_fee": "0.0040",
                     "taker_fee": "0.0280",
@@ -1109,8 +1109,6 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(trades_path),
                     "--env-file",
                     str(env_path),
-                    "--market-id",
-                    "7",
                     "--market-symbol",
                     "ETH-USD",
                     "--timestamp-ns",
@@ -1153,7 +1151,7 @@ class TestValidatorSubprocess(unittest.TestCase):
 
             profile = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACCOUNT_PROFILE")
             self.assertEqual(profile["lighter_account_type"], "STANDARD")
-            self.assertEqual(profile["market_id"], 7)
+            self.assertEqual(profile["market_id"], 0)
             self.assertEqual(profile["maker_fee_raw"], "0.0040")
             self.assertEqual(profile["taker_fee_raw"], "0.0280")
             self.assertAlmostEqual(profile["maker_fee_bps"], 0.4)
