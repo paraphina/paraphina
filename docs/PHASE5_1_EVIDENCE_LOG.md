@@ -249,6 +249,108 @@ a3db6620d5b93b07387b6a053b3fddea23c898bb09a817a3fb40a186fea68410  pfill_calibrat
 e1645ec99c27156a8153c8e6f830b5d5335703b2bf0e74f6a51b4a4a51bb9ba7  evidence_pack/artifact_index.json
 ```
 
+## Phase 5.1g Canonical P-Fill Quarantine Review
+
+- Run id:
+  `PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z`
+- Local run directory:
+  `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z`
+- Tool: `tools/phase51g_pfill_quarantine_review.py`
+- Input canonical P-fill run:
+  `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
+- Gate status: `HOLD`
+- Gate reason: `phase51g_quarantine_review_observed_only_diagnostic_pack`
+- Canonical P-fill groups reviewed: `6140`
+- Observed terminal groups: `4527`
+- Filled groups: `461`
+- Terminal not-filled groups: `4066`
+- Excluded quarantine/review groups: `1613`
+- Train groups: `4911`
+- Holdout groups: `1229`
+- Exclusion reason counts:
+  `EXCLUDED_DUPLICATE_ALIAS_NO_TERMINAL=1135`,
+  `EXCLUDED_CANCEL_ALL_SCOPE_REVIEW=375`,
+  `EXCLUDED_REPLACE_CHAIN_REVIEW=95`,
+  `RIGHT_CENSORED_NO_TERMINAL=8`
+- Venue quarantine counts:
+  `lighter=844`, `hyperliquid=339`, `extended=236`, `aster=170`,
+  `paradex=24`
+- Old split conflicts preserved from source: `1673`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_ev_admission`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51g_pfill_quarantine_review.py \
+  --canonical-pfill-run runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --output-root runs/phase51g_pfill_quarantine_review \
+  --run-id PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+```
+
+Artifact hashes:
+
+```text
+de3cf674a26ae01a9189d86f15b52617a41e9889215552161a0050217602e8ec  binary_observed_pfill_order_labels.jsonl
+de3cf674a26ae01a9189d86f15b52617a41e9889215552161a0050217602e8ec  observed_only_pfill_outcome/pfill_order_labels.jsonl
+2121788d7b50ee593dc57a4a92daae668514bf45e52cda214dfa700a96e794fe  observed_only_pfill_outcome/pfill_outcome_summary.json
+be33fab71e636c9801e6c083f9b0aee432ba05cf2c59170ccd829aaf09564f8b  quarantine_review_labels.jsonl
+bf07596603805c5706e5bbb11c9aebb807d0b71ccb026893f826df177c878694  quarantine_review_summary.json
+4a27d7b5772e3d49a58debd269dd1a426b9fb6958a776fc5f6dd4cd6461a2067  source_reconciliation_manifest.jsonl
+```
+
+## Phase 5.1g Observed-Only P-Fill Readiness Rerun
+
+- Run id:
+  `PHASE51G-PFILL-CALIBRATION-READINESS-OBSERVED-ONLY-TWO-LANE-20260502T000000Z`
+- Local run directory:
+  `runs/phase51g_pfill_calibration_readiness_observed_only/PHASE51G-PFILL-CALIBRATION-READINESS-OBSERVED-ONLY-TWO-LANE-20260502T000000Z`
+- Tool: `tools/phase51c_pfill_calibration_readiness.py`
+- Input P-fill outcome run:
+  `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z/observed_only_pfill_outcome`
+- Gate status: `HOLD`
+- Gate reason: `pfill_calibration_sparse_buckets`
+- Order labels: `4527`
+- Observed outcomes: `4527`
+- Filled: `461`
+- Terminal not-filled: `4066`
+- Censored/quarantined: `0`
+- Train observed outcomes: `3625`
+- Holdout observed outcomes: `902`
+- Buckets: `12`
+- Minimum observed per bucket: `200`
+- Minimum holdout observed per bucket: `50`
+- Missing observed horizon count: `4509`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_ev_admission`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_pfill_calibration_readiness.py \
+  --pfill-outcome-run runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z/observed_only_pfill_outcome \
+  --output-root runs/phase51g_pfill_calibration_readiness_observed_only \
+  --run-id PHASE51G-PFILL-CALIBRATION-READINESS-OBSERVED-ONLY-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+```
+
+Artifact hashes:
+
+```text
+19330c451fe84a476ef2a42584e49854bb8e9534540c10b11ed2d34a42eaecfd  pfill_calibration_buckets.jsonl
+219f35fee50f764a11aad97d5ce37b5c82d3f7b8d6d2675f77ef71b745cb7774  pfill_calibration_readiness_summary.json
+ffecbfa3254c0b940d37a14651f97a0ae711678689fa6bcaf4aebeb7e75d2d5d  pfill_order_split_manifest.jsonl
+```
+
 ## Phase 5.1c Markout Calibration Readiness Two-Lane Pack
 
 - Run id: `PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z`

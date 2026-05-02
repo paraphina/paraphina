@@ -29,19 +29,24 @@ document, not live-trading authorization.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1f as the current evidence boundary. It proves the dominant
-   P-fill blocker was lifecycle canonicalization, but the rebuilt canonical
-   outcome pack still contains review-quarantined groups.
-3. The current P-fill calibration-readiness rerun from canonical labels remains
-   `HOLD`: `6140` canonical P-fill groups, `4527` observed outcomes, `461`
-   fills, `4066` terminal not-filled groups, and `1613` quarantined/censored
+2. Treat Phase 5.1g as the current evidence boundary. It proves the canonical
+   P-fill quarantine can be split into observed terminal labels and excluded
+   review-only labels without converting censored lifecycle ambiguity into
+   false negative outcomes.
+3. The current Phase 5.1g quarantine review pack remains `HOLD`: `6140`
+   canonical P-fill groups, `4527` observed terminal outcomes, `461` fills,
+   `4066` terminal not-filled groups, and `1613` excluded quarantine/review
    groups.
-4. Next repo-owned move is review policy for the remaining `1613`
-   quarantined groups plus downstream reruns only where the canonical contract
-   is accepted. Do not train models from 5.1f.
-5. Proceed to calibrated EV shadow only after canonical outcomes, maker/taker
-   role gaps, holdout splits, feature completeness, and quarantined review
-   policy are accepted.
+4. The Phase 5.1g observed-only P-fill calibration-readiness rerun remains
+   `HOLD` with reason `pfill_calibration_sparse_buckets`: `4527` observed
+   outcomes, `461` fills, `4066` terminal not-filled groups, `0` censored
+   labels, and sparse venue/side bucket coverage.
+5. Next repo-owned move is feature-rich observed-only P-fill calibration
+   review plus venue-native reconciliation for excluded quarantine categories.
+   Do not train models from 5.1g.
+6. Proceed to calibrated EV shadow only after canonical outcomes, maker/taker
+   role gaps, holdout splits, feature completeness, venue-native truth gaps,
+   and quarantine exclusion policy are accepted.
 
 ## Board
 
@@ -313,6 +318,71 @@ P-fill readiness rerun from canonical labels:
 - Censored rate: `0.26270358306188923`.
 - Holdout observed outcomes: `902`.
 - Gate remains `HOLD` with reason `pfill_calibration_contains_censored_orders`.
+
+### Gate 5.1g - Canonical P-Fill Quarantine Review
+
+Current repo-owned tooling:
+
+- `tools/phase51g_pfill_quarantine_review.py` consumes the Phase 5.1f
+  canonical P-fill outcome pack and emits a quarantine-review pack that
+  preserves all canonical groups while producing a separate observed-only
+  compatibility pack for diagnostic downstream calibration-readiness reruns.
+- The tool does not mutate Phase 5.1f artifacts, submit orders, train models,
+  approve EV admission, approve live/canary/capital/risk changes, or make
+  financial claims.
+
+Current 5.1g evidence:
+
+- Run:
+  `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z`
+- Canonical P-fill groups reviewed: `6140`.
+- Observed terminal groups: `4527`.
+- Filled groups: `461`.
+- Terminal not-filled groups: `4066`.
+- Excluded quarantine/review groups: `1613`.
+- Exclusion reasons: `1135` `EXCLUDED_DUPLICATE_ALIAS_NO_TERMINAL`, `375`
+  `EXCLUDED_CANCEL_ALL_SCOPE_REVIEW`, `95`
+  `EXCLUDED_REPLACE_CHAIN_REVIEW`, and `8`
+  `RIGHT_CENSORED_NO_TERMINAL`.
+- Venue quarantine counts: `lighter=844`, `hyperliquid=339`,
+  `extended=236`, `aster=170`, and `paradex=24`.
+- Gate remains `HOLD` with reason
+  `phase51g_quarantine_review_observed_only_diagnostic_pack`.
+
+5.1g quarantine artifacts:
+
+```text
+de3cf674a26ae01a9189d86f15b52617a41e9889215552161a0050217602e8ec  binary_observed_pfill_order_labels.jsonl
+de3cf674a26ae01a9189d86f15b52617a41e9889215552161a0050217602e8ec  observed_only_pfill_outcome/pfill_order_labels.jsonl
+2121788d7b50ee593dc57a4a92daae668514bf45e52cda214dfa700a96e794fe  observed_only_pfill_outcome/pfill_outcome_summary.json
+be33fab71e636c9801e6c083f9b0aee432ba05cf2c59170ccd829aaf09564f8b  quarantine_review_labels.jsonl
+bf07596603805c5706e5bbb11c9aebb807d0b71ccb026893f826df177c878694  quarantine_review_summary.json
+4a27d7b5772e3d49a58debd269dd1a426b9fb6958a776fc5f6dd4cd6461a2067  source_reconciliation_manifest.jsonl
+```
+
+Observed-only P-fill readiness rerun:
+
+- Run:
+  `runs/phase51g_pfill_calibration_readiness_observed_only/PHASE51G-PFILL-CALIBRATION-READINESS-OBSERVED-ONLY-TWO-LANE-20260502T000000Z`
+- Input observed-only pack:
+  `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z/observed_only_pfill_outcome`
+- Order labels: `4527`.
+- Observed outcomes: `4527`.
+- Filled: `461`.
+- Terminal not-filled: `4066`.
+- Censored/quarantined: `0`.
+- Train observed outcomes: `3625`.
+- Holdout observed outcomes: `902`.
+- Buckets: `12`, including global.
+- Gate remains `HOLD` with reason `pfill_calibration_sparse_buckets`.
+
+5.1g observed-only readiness artifacts:
+
+```text
+19330c451fe84a476ef2a42584e49854bb8e9534540c10b11ed2d34a42eaecfd  pfill_calibration_buckets.jsonl
+219f35fee50f764a11aad97d5ce37b5c82d3f7b8d6d2675f77ef71b745cb7774  pfill_calibration_readiness_summary.json
+ffecbfa3254c0b940d37a14651f97a0ae711678689fa6bcaf4aebeb7e75d2d5d  pfill_order_split_manifest.jsonl
+```
 
 ### Gate 5.2 - Calibrated EV Shadow
 

@@ -25,7 +25,7 @@ Current economic/profitability decision: `HOLD`
 
 ## Current Superseding Status
 
-As of the Phase 5.1f canonical P-fill outcome rebuild/review gate, the board
+As of the Phase 5.1g canonical P-fill quarantine review gate, the board
 decision remains `PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are
 now more specific:
 
@@ -46,10 +46,18 @@ now more specific:
   filled, `4066` terminal not-filled, and `1613` quarantined/censored review
   groups. The canonical readiness rerun remains `HOLD` because
   `1613 / 6140` labels remain censored or review-quarantined.
+- Phase 5.1g preserves all `6140` canonical groups, emits an observed-only
+  diagnostic pack with `4527` terminal labels (`461` filled, `4066`
+  terminal not-filled), and excludes `1613` quarantine/review groups from
+  binary P-fill calibration rather than treating them as not-filled outcomes.
+- The Phase 5.1g observed-only readiness rerun remains `HOLD` with reason
+  `pfill_calibration_sparse_buckets`: it removes censored labels from the
+  diagnostic pack but does not satisfy feature-rich model, venue/side bucket,
+  maker/taker, or board-review requirements.
 - 5.1 remains `HOLD` for model training, EV admission, live orders, canary,
   capital escalation, risk-limit relaxation, and financial claims until the
-  remaining quarantined review policy and downstream calibration readiness are
-  accepted.
+  observed-only calibration policy, feature completeness, venue-native truth
+  gaps, and downstream calibration readiness are accepted.
 
 ## Baseline
 
@@ -167,33 +175,43 @@ OK: 4001 record(s) validated against schema v2
 | Execution | PASS for Lighter non-live, HOLD beyond that | Lighter is acceptable as first non-live venue; account/native-limit evidence remains unresolved. |
 | Data/Evidence | PASS for counterfactual evidence, HOLD for economics | Replay labels are source-linked and nonfinancial; balance-authoritative PnL is not claimed. |
 
-## Next Move
-
-The next optimal move after Phase 5.1f is still not live trading. It is a
-non-live review of the remaining canonical P-fill quarantine boundary:
+## Current Evidence Boundary
 
 ```text
 Phase 5.1g - Canonical P-fill quarantine review and downstream rerun gate
 ```
 
-Scope:
+Completed non-live scope:
 
-- Review the `1613` quarantined canonical P-fill groups from Phase 5.1f.
-- Keep duplicate-only, cancel-all-scope, replace-chain, and true no-terminal
-  cases out of model training unless a deterministic, pre-registered review
-  policy accepts them.
-- Re-run queue/churn, markout, and Lighter attribution only where the canonical
-  group contract is accepted and source hashes reconcile.
-- Emit only `HOLD` records with `no_live_flag=true` and all live, canary,
+- Reviewed the `1613` quarantined canonical P-fill groups from Phase 5.1f.
+- Kept duplicate-only, cancel-all-scope, replace-chain, and true no-terminal
+  cases out of the observed-only diagnostic P-fill pack.
+- Re-ran P-fill calibration readiness only on observed terminal outcomes where
+  the canonical contract was accepted.
+- Emitted only `HOLD` records with `no_live_flag=true` and all live, canary,
   capital, risk-relaxation, EV-admission, model-training, and financial-claim
   authorization fields false.
 
 Repo-owned artifacts:
 
 - Rebuild tool: `tools/phase51f_canonical_pfill_outcome_rebuild.py`
+- Quarantine review tool: `tools/phase51g_pfill_quarantine_review.py`
 - Canonical pack:
   `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
-- Readiness rerun:
-  `runs/phase51f_pfill_calibration_readiness_from_canonical/PHASE51F-PFILL-CALIBRATION-READINESS-FROM-CANONICAL-TWO-LANE-20260502T000000Z`
+- Quarantine review pack:
+  `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z`
+- Observed-only readiness rerun:
+  `runs/phase51g_pfill_calibration_readiness_observed_only/PHASE51G-PFILL-CALIBRATION-READINESS-OBSERVED-ONLY-TWO-LANE-20260502T000000Z`
 
-This next work package must not relax the Phase 5.1 holds above.
+## Next Move
+
+The next optimal move after Phase 5.1g is still not live trading. It is a
+non-live observed-only P-fill calibration review:
+
+- Build feature-rich P-fill diagnostics against the observed-only terminal
+  pack without using excluded quarantine rows as negatives.
+- Quantify venue/side/layer/regime sparsity, missing observed-horizon fields,
+  maker/taker role gaps, and model-feature availability.
+- Reconcile excluded quarantine categories only with deterministic
+  venue-native evidence; otherwise keep them excluded from training.
+- Preserve all Phase 5.1 holds above.

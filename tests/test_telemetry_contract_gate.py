@@ -652,6 +652,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1f canonical P_fill outcome review gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51f_canonical_pfill_outcome_rebuild.py"
+
+    def _get_phase51g_pfill_quarantine_review_path(self) -> Path:
+        """Get path to the Phase 5.1g P_fill quarantine review gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51g_pfill_quarantine_review.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -3321,6 +3326,290 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(output_root),
                     "--run-id",
                     "phase51f_canonical_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
+
+    def test_phase51g_pfill_quarantine_review_emits_observed_only_diagnostic_pack(self):
+        """P_fill quarantine review should exclude review groups from numeric outcomes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            canonical_run = tmp_path / "phase51f"
+            output_root = tmp_path / "phase51g"
+            readiness_root = tmp_path / "readiness"
+            canonical_run.mkdir()
+            source_sha = "source-sha-phase51g"
+            labels = [
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 1,
+                    "run_id": "phase51f_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "canonical-filled",
+                    "canonical_group_id": "group-filled",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "source_label_count": 1,
+                    "source_canonical_status_counts": {"STAYS_FILLED": 1},
+                    "source_current_status_counts": {"OBSERVED_FILLED": 1},
+                    "source_old_split_conflict": False,
+                    "source_old_split_values": ["TRAIN"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "admissible_for_ev_admission": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 2,
+                    "run_id": "phase51f_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "canonical-not-filled",
+                    "canonical_group_id": "group-not-filled",
+                    "order_holdout_split": "HOLDOUT",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                    "p_fill_outcome": 0.0,
+                    "source_label_count": 1,
+                    "source_canonical_status_counts": {"STAYS_NOT_FILLED": 1},
+                    "source_current_status_counts": {"OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL": 1},
+                    "source_old_split_conflict": False,
+                    "source_old_split_values": ["HOLDOUT"],
+                    "terminal_action_first": "cancel",
+                    "observed_horizon_source_ticks": 2,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "admissible_for_ev_admission": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 3,
+                    "run_id": "phase51f_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "canonical-duplicate",
+                    "canonical_group_id": "group-duplicate",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "hyperliquid",
+                    "side": "Buy",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "source_label_count": 2,
+                    "source_canonical_status_counts": {"DUPLICATE_PLACE_ALIAS_COLLAPSE_REVIEW": 2},
+                    "source_current_status_counts": {"CENSORED_OR_UNOBSERVED": 2},
+                    "source_old_split_conflict": False,
+                    "source_old_split_values": ["TRAIN"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "admissible_for_ev_admission": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 4,
+                    "run_id": "phase51f_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "canonical-replace",
+                    "canonical_group_id": "group-replace",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "source_label_count": 3,
+                    "source_canonical_status_counts": {"CENSORED_TO_REPLACE_CHAIN_REVIEW": 3},
+                    "source_current_status_counts": {"CENSORED_OR_UNOBSERVED": 3},
+                    "source_old_split_conflict": True,
+                    "source_old_split_values": ["HOLDOUT", "TRAIN"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "admissible_for_ev_admission": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 5,
+                    "run_id": "phase51f_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "canonical-cancel-all",
+                    "canonical_group_id": "group-cancel-all",
+                    "order_holdout_split": "HOLDOUT",
+                    "venue_id": "aster",
+                    "side": "Buy",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "source_label_count": 1,
+                    "source_canonical_status_counts": {"CANCEL_ALL_SCOPE_REVIEW": 1},
+                    "source_current_status_counts": {"CENSORED_OR_UNOBSERVED": 1},
+                    "source_old_split_conflict": False,
+                    "source_old_split_values": ["HOLDOUT"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "admissible_for_ev_admission": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 6,
+                    "run_id": "phase51f_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "canonical-no-terminal",
+                    "canonical_group_id": "group-no-terminal",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "hyperliquid",
+                    "side": "Sell",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "source_label_count": 1,
+                    "source_canonical_status_counts": {"REMAINS_NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW": 1},
+                    "source_current_status_counts": {"CENSORED_OR_UNOBSERVED": 1},
+                    "source_old_split_conflict": False,
+                    "source_old_split_values": ["TRAIN"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "admissible_for_ev_admission": False,
+                },
+            ]
+            (canonical_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "phase51f_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "phase51f_canonical_pfill_contains_quarantined_review_groups",
+                "source_telemetry_sha256": source_sha,
+                "order_label_count": 6,
+                "filled_count": 1,
+                "not_filled_count": 1,
+                "censored_count": 4,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            with (canonical_run / "canonical_pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51g_pfill_quarantine_review_path()),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51g_quarantine_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51g_quarantine_test"
+            summary = json.loads((run_dir / "quarantine_review_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["order_label_count"], 6)
+            self.assertEqual(summary["observed_count"], 2)
+            self.assertEqual(summary["filled_count"], 1)
+            self.assertEqual(summary["not_filled_count"], 1)
+            self.assertEqual(summary["censored_count"], 4)
+            self.assertEqual(summary["exclusion_reason_counts"]["EXCLUDED_DUPLICATE_ALIAS_NO_TERMINAL"], 1)
+            self.assertEqual(summary["exclusion_reason_counts"]["EXCLUDED_REPLACE_CHAIN_REVIEW"], 1)
+            self.assertEqual(summary["exclusion_reason_counts"]["EXCLUDED_CANCEL_ALL_SCOPE_REVIEW"], 1)
+            self.assertEqual(summary["exclusion_reason_counts"]["RIGHT_CENSORED_NO_TERMINAL"], 1)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["admissible_for_ev_admission"])
+
+            review_labels = [
+                json.loads(line)
+                for line in (run_dir / "quarantine_review_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(review_labels), 6)
+            excluded = [row for row in review_labels if not row["included_in_observed_only_pack"]]
+            self.assertEqual(len(excluded), 4)
+            self.assertTrue(all(row["input_p_fill_outcome"] is None for row in excluded))
+            self.assertTrue(all(row["approved_for_model_training"] is False for row in review_labels))
+
+            compat_dir = run_dir / "observed_only_pfill_outcome"
+            compat_summary = json.loads((compat_dir / "pfill_outcome_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(compat_summary["order_label_count"], 2)
+            self.assertEqual(compat_summary["filled_count"], 1)
+            self.assertEqual(compat_summary["not_filled_count"], 1)
+            self.assertEqual(compat_summary["censored_count"], 0)
+            compat_labels = [
+                json.loads(line)
+                for line in (compat_dir / "pfill_order_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(compat_labels), 2)
+            self.assertEqual({row["outcome_status"] for row in compat_labels}, {
+                "OBSERVED_FILLED",
+                "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+            })
+
+            readiness = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_calibration_readiness_path()),
+                    "--pfill-outcome-run",
+                    str(compat_dir),
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51g_observed_readiness_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--min-observed-per-bucket",
+                    "1",
+                    "--min-holdout-observed-per-bucket",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(readiness.returncode, 0, f"stdout: {readiness.stdout}\nstderr: {readiness.stderr}")
+            readiness_summary = json.loads(
+                (readiness_root / "phase51g_observed_readiness_test" / "pfill_calibration_readiness_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(readiness_summary["order_label_count"], 2)
+            self.assertEqual(readiness_summary["censored_count"], 0)
+
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
+            labels[0]["approved_for_live"] = True
+            with (canonical_run / "canonical_pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            unsafe = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51g_pfill_quarantine_review_path()),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51g_quarantine_unsafe_test",
                 ],
                 capture_output=True,
                 text=True,
