@@ -17,7 +17,8 @@ Primary source addenda:
 Current repo evidence boundary:
 
 - Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
-- Current Phase 5.1 evidence boundary: Phase 5.1j observed-horizon recovery
+- Current Phase 5.1 evidence boundary: Phase 5.1k filled-horizon timebase
+  recovery and recovered feature-matrix admissibility
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
 
@@ -421,6 +422,13 @@ Lighter-first does not mean other venues are strategically inferior. It means
 the first V2 evidence lane must prove one venue-local telemetry and lifecycle
 contract before generalizing.
 
+V2 strategic scope remains all five current venues: Aster, Extended,
+Hyperliquid, Paradex, and Lighter. Phase 5.1k is a Lighter-first,
+venue-local non-live evidence lane selected to prove the telemetry,
+lifecycle, and evidence contract before generalizing. It does not narrow V2 to
+Lighter, does not authorize multi-venue launch, and does not prove non-Lighter
+venue contracts are ready.
+
 Aster remains blocked from first-experiment promotion unless taker-fee leakage
 is explicitly bounded and observable. Extended remains excluded from the first
 experiment due to bridge opacity and asynchronous acceptance. Paradex and
@@ -476,13 +484,17 @@ admission:
 
 ## 14. Current Phase 5.1 Blockers
 
-As of Phase 5.1j, the V2 evidence path remains blocked by:
+As of Phase 5.1k, the V2 evidence path remains blocked by:
 
-- `461` filled-order rows still missing observed horizon/timebase evidence;
+- `65` filled-order rows still missing source-tick horizon joins after 5.1k
+  recovered `396 / 461` filled-order source-tick horizons;
 - Lighter native-limit context still partial for `2288` labels;
 - maker/taker status incomplete for `287` fills;
 - sparse venue/side/layer/regime buckets;
 - observed-only selection bias from `1613` excluded quarantine/review groups.
 
-The next repo-owned V2 evidence move is a filled-order horizon/timebase recovery
-gate, plus read-only Lighter native-limit and maker/taker evidence enrichment.
+The next repo-owned V2 evidence move is to resolve or explicitly quarantine the
+remaining `65` missing filled-horizon joins, plus read-only Lighter native-limit
+and maker/taker evidence enrichment. No model training, EV admission, canary,
+live orders, capital escalation, risk-limit relaxation, or financial claim is
+authorized from Phase 5.1k.

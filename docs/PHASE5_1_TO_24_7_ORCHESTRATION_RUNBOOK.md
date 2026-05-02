@@ -20,10 +20,10 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 ## Non-Negotiables
 
-- Do not place live orders from Phase 5.1b evidence.
-- Do not start a canary from Phase 5.1b evidence.
-- Do not escalate capital from Phase 5.1b evidence.
-- Do not relax risk limits from Phase 5.1b evidence.
+- Do not place live orders from Phase 5.1 evidence.
+- Do not start a canary from Phase 5.1 evidence.
+- Do not escalate capital from Phase 5.1 evidence.
+- Do not relax risk limits from Phase 5.1 evidence.
 - Do not treat telemetry PnL as financial authority.
 - Do not treat `sendTx` acceptance as execution finality.
 - Do not infer maker/taker status from intent; require venue-native evidence.
@@ -34,24 +34,24 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1j as the current evidence boundary. It proves deterministic
-   terminal observed-horizon recovery can be applied without raw `decision_id`
+2. Treat Phase 5.1k as the current evidence boundary. It proves filled-order
+   source-tick horizon recovery can be applied without raw fill/order ID
    emission and that the recovered feature-matrix gate still fails closed.
-3. The current Phase 5.1j recovered matrix pack remains `HOLD`: `4527`
+3. The current Phase 5.1k recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
+   `4462` observed horizons available, `65` observed horizons still missing,
    all `4527` joined to queue/churn, all `4527` source-covered by markout
    readiness, and raw identifier redaction status `PASS`.
-4. The dominant blockers are feature quality and selection bias, not tooling
-   reachability: `461` filled-order labels still lack observed horizon timing,
-   Lighter native
-   limit context is only partial for `2288` labels, filled-order maker/taker
-   status is incomplete for `287` labels, some venue/side buckets remain
-   sparse, and `1613` quarantined/review groups remain excluded from the
-   observed-only diagnostic pack.
-5. Next repo-owned move is another non-live evidence step: close the highest
-   leverage feature gaps, starting with filled-order horizon/timebase recovery
-   and venue-native Lighter limit/maker-taker completeness. Do not train models
-   from 5.1j.
+4. The dominant blockers are feature quality and selection bias, not live
+   runtime reachability: `65` filled-order labels still lack deterministic
+   source-tick joins, Lighter native-limit context is only partial for `2288`
+   labels, filled-order maker/taker status is incomplete for `287` labels,
+   some venue/side buckets remain sparse, and `1613` quarantined/review groups
+   remain excluded from the observed-only diagnostic pack.
+5. Next repo-owned move is another non-live evidence step: resolve or
+   explicitly quarantine the remaining `65` filled-horizon join misses and
+   improve venue-native Lighter limit/maker-taker completeness. Do not train
+   models from 5.1k.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
@@ -562,6 +562,54 @@ Current 5.1j evidence:
 0c94a2b37c7f2e89835c1eb414555e5f521c53dc500658b1ae89c9e5aaec9194  recovered pfill_feature_matrix_blockers.jsonl
 ```
 
+### Gate 5.1k - Filled-Horizon Timebase Recovery
+
+Current repo-owned tooling:
+
+- `tools/phase51k_filled_horizon_timebase_recovery.py` consumes a redacted
+  Phase 5.1h feature audit pack, canonical P-fill outcomes, and Phase 5.1e
+  lifecycle truth. It emits HOLD-only recovery labels, bucket records, and a
+  summary.
+- The tool recovers filled-order horizons only in source-tick timebase when the
+  order source tick and fill source tick are both observable. Exchange
+  milliseconds are recorded separately if available and are never written into
+  `observed_horizon_source_ticks`.
+- The tool reads raw join/fill identifiers internally but does not emit raw
+  fill IDs, order IDs, client order IDs, venue order IDs, or decision IDs.
+
+Current 5.1k evidence:
+
+- Filled-horizon recovery run:
+  `runs/phase51k_filled_horizon_timebase_recovery/PHASE51K-FILLED-HORIZON-TIMEBASE-RECOVERY-TWO-LANE-20260502T000000Z`
+- Recovered 5.1h run:
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51K-RECOVERED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Recovered 5.1i run:
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51K-PFILL-FEATURE-MATRIX-ADMISSIBILITY-TWO-LANE-20260502T000000Z`
+- Gate remains `HOLD` with recovered matrix reason
+  `phase51i_filled_horizon_source_tick_still_missing`.
+- Redaction status: `PASS`; raw identifier input present: `0`.
+- Filled horizons recovered: `396 / 461`.
+- Recovered observed horizon available/missing: `4462` / `65`.
+- Remaining missing horizons are filled-order `MISSING_JOIN` rows.
+- Matrix blockers remain: `filled_horizon_source_tick_still_missing`,
+  `missing_observed_horizon_features`,
+  `lighter_native_limit_pressure_not_fully_observed`,
+  `maker_taker_not_fully_observed_for_filled_orders`,
+  `sparse_pfill_feature_buckets`, and
+  `observed_only_selection_bias_not_resolved`.
+
+5.1k artifacts:
+
+```text
+fb445f9b7c8dc7655f5796c6378c64be5df00349ec4ef93b8ca7ee35ae603ecc  filled_horizon_timebase_recovery_summary.json
+cfbb7c1dd86d731448b13b2f1a3f0a632705795c2b256bf69ffff7ddbb85ea06  filled_horizon_timebase_recovery_buckets.jsonl
+a1cfb1844604dd643decf68e9c654969a87bba7ef5d551f8143366193802fb51  filled_horizon_timebase_recovery_labels.jsonl
+dd79db7f37573a1e6886db36a4fc889704ea406696fbfdd4c122868eae79fb5b  recovered pfill_feature_audit_summary.json
+ea85005b6ce7e19f6db889486b5e91e5f8c207b2e2443f08415eef9e44944909  recovered pfill_feature_matrix_admissibility_summary.json
+62927129e74983467a75f47cca517d27869dacb899ce29626cec54195bf22dde  recovered pfill_feature_matrix_buckets.jsonl
+c6971841da4ca84291aa8a320214dde1d0a945ddf5a76a2b1ad1a04da792fa6f  recovered pfill_feature_matrix_blockers.jsonl
+```
+
 ### Gate 5.2 - Calibrated EV Shadow
 
 Required evidence:
@@ -686,28 +734,29 @@ The audit must answer:
 2. `git status --short`
 3. `git rev-parse HEAD`
 4. Read this document.
-5. Read `ROADMAP.md` Phase 5.1b gate.
-6. Read `docs/PHASE5_1_BOARD_DECISION.md` next-move section.
-7. Confirm runtime is still shadow before any evidence capture:
+5. Read `ROADMAP.md` Phase 5.1 / V2 target specification gate.
+6. Read `docs/V2_SPECIFICATION.md` current evidence boundary and blockers.
+7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1k board decision.
+8. Confirm runtime is still shadow before any evidence capture:
 
 ```bash
 systemctl show paraphina_live --property=ActiveState,SubState,NRestarts
 curl -fsS http://127.0.0.1:9898/health/detail
 ```
 
-8. Do not proceed to live/canary/capital work unless a later committed board
+9. Do not proceed to live/canary/capital work unless a later committed board
    decision explicitly supersedes this document.
 
 ## Next Command Targets
 
-After Phase 5.1j is committed and pushed, the next target is not another live
-run. Implement the next non-live evidence tool that resolves filled-order
-horizon/timebase coverage without using model assumptions, financial claims, or
-incompatible `fill_time_ms` substitutions. In parallel, continue read-only
-Lighter native-limit and maker/taker evidence enrichment. The acceptance
-condition is another measurable reduction in blocker counts without
-introducing raw identifiers, live/canary/capital/risk authorization, or
-selection-bias shortcuts.
+After Phase 5.1k is committed and pushed, the next target is not another live
+run. Audit the remaining `65` filled-order `MISSING_JOIN` rows and either
+recover deterministic source-tick joins or explicitly quarantine them from
+calibration. In parallel, continue read-only Lighter native-limit and
+maker/taker evidence enrichment. The acceptance condition is another measurable
+reduction or principled quarantine of blocker counts without introducing raw
+identifiers, live/canary/capital/risk authorization, or selection-bias
+shortcuts.
 
 ## Current Verdict
 

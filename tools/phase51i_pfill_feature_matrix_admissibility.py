@@ -54,6 +54,14 @@ HORIZON_RECOVERY_SUMMARY_KEYS = (
     "horizon_recovered_terminal_count",
     "horizon_recovery_preserved_existing_count",
     "horizon_recovery_fill_timebase_remaining_count",
+    "filled_horizon_recovery_run",
+    "filled_horizon_recovery_summary_sha256",
+    "filled_horizon_recovery_labels_sha256",
+    "filled_horizon_recovery_status_counts",
+    "filled_horizon_recovery_applied_count",
+    "filled_horizon_recovered_source_tick_count",
+    "filled_horizon_exchange_ms_only_count",
+    "filled_horizon_unrecovered_count",
 )
 
 HORIZON_RECOVERY_BUCKET_KEYS = (
@@ -61,6 +69,10 @@ HORIZON_RECOVERY_BUCKET_KEYS = (
     "horizon_recovered_terminal_count",
     "horizon_recovery_preserved_existing_count",
     "horizon_recovery_fill_timebase_remaining_count",
+    "filled_horizon_recovery_applied_count",
+    "filled_horizon_recovered_source_tick_count",
+    "filled_horizon_exchange_ms_only_count",
+    "filled_horizon_unrecovered_count",
 )
 
 
@@ -236,11 +248,25 @@ def _build_blockers(summary: dict[str, Any], buckets: list[dict[str, Any]], run_
             "no raw decision identifiers are present in the redacted Phase 5.1h input",
         ),
         (
+            "filled_horizon_source_tick_still_missing",
+            int(summary.get("filled_horizon_unrecovered_count") or 0),
+            "HOLD",
+            "HARD_BLOCK",
+            "filled-order source-tick horizons remain unrecovered after Phase 5.1k",
+        ),
+        (
             "missing_observed_horizon_features",
             int(summary.get("observed_horizon_missing_count") or 0),
             "HOLD",
             "HARD_BLOCK",
             "observed horizon timing is required before P_fill model calibration",
+        ),
+        (
+            "filled_horizon_exchange_ms_only_requires_board_review",
+            int(summary.get("filled_horizon_exchange_ms_only_count") or 0),
+            "HOLD",
+            "HARD_BLOCK",
+            "exchange-millisecond filled horizons cannot be used as source-tick horizons without board review",
         ),
         (
             "lighter_native_limit_pressure_not_fully_observed",
@@ -290,7 +316,9 @@ def _build_blockers(summary: dict[str, Any], buckets: list[dict[str, Any]], run_
 def _summary_gate_reason(blockers: list[dict[str, Any]]) -> str:
     blocker_ids = {str(blocker.get("blocker_id")) for blocker in blockers if blocker.get("gate_status") == "HOLD"}
     priority = [
+        "filled_horizon_source_tick_still_missing",
         "missing_observed_horizon_features",
+        "filled_horizon_exchange_ms_only_requires_board_review",
         "lighter_native_limit_pressure_not_fully_observed",
         "maker_taker_not_fully_observed_for_filled_orders",
         "sparse_pfill_feature_buckets",

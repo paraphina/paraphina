@@ -25,7 +25,7 @@ Current economic/profitability decision: `HOLD`
 
 ## Current Superseding Status
 
-As of the Phase 5.1j observed-horizon recovery gate, the board decision remains
+As of the Phase 5.1k filled-horizon timebase recovery gate, the board decision remains
 `PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are now more
 specific:
 
@@ -69,11 +69,16 @@ specific:
   from `18 / 4527` to `4066 / 4527`. It deliberately leaves `461`
   filled-order horizons unresolved rather than fabricating timing from
   incompatible fill-time fields.
+- Phase 5.1k recovers source-tick horizons for `396 / 461` filled-order rows,
+  increasing observed horizon coverage from `4066 / 4527` to `4462 / 4527`.
+  It leaves `65` filled-order rows as `MISSING_JOIN`, records
+  `exchange_ms_only_count=0`, and does not write exchange-millisecond timing
+  into source-tick horizon fields.
 - 5.1 remains `HOLD` for model training, EV admission, live orders, canary,
   capital escalation, risk-limit relaxation, and financial claims until the
-  remaining fill-horizon timebase, observed-only calibration policy,
-  feature completeness, venue-native truth gaps, and downstream calibration
-  readiness are accepted.
+  remaining filled-horizon joins, observed-only calibration policy, feature
+  completeness, venue-native truth gaps, and downstream calibration readiness
+  are accepted.
 
 ## Baseline
 
@@ -124,7 +129,7 @@ The following are blocked until a separate board decision:
 | Canary | No fill calibration, no account-state evidence, and no live-risk decision. |
 | Capital escalation | Outside Phase 5.1 scope. |
 | Risk-limit relaxation | Outside Phase 5.1 scope. |
-| Multi-venue launch | Phase 5.1 evidence is Lighter-first and venue-local. |
+| Multi-venue launch | V2 scope is all-five, but Phase 5.1k evidence authorizes only the Lighter-first non-live evidence lane. Non-Lighter venues require separate venue-readiness evidence and a later board decision before any multi-venue V2 launch. |
 | Profitability claim | No balance-authoritative live economic evidence. |
 
 ## Evidence Summary
@@ -194,51 +199,51 @@ OK: 4001 record(s) validated against schema v2
 ## Current Evidence Boundary
 
 ```text
-Phase 5.1h - Observed-only P-fill feature-readiness audit
+Phase 5.1k - Filled-horizon timebase recovery and recovered P-fill feature-matrix admissibility
 ```
 
 Completed non-live scope:
 
-- Preserved the Phase 5.1g split: `4527` observed terminal labels and `1613`
-  excluded quarantine/review labels.
-- Joined the observed-only labels to queue/churn through the Phase 5.1f
-  source-to-canonical manifest.
-- Verified markout readiness source coverage for both source telemetry lanes.
-- Detected inherited raw decision IDs as presence-only redaction risk and did
-  not emit raw identifiers in Phase 5.1h outputs.
-- Emitted only `HOLD` records with `no_live_flag=true` and all live, canary,
-  capital, risk-relaxation, EV-admission, model-training, and financial-claim
-  authorization fields false.
+- Added `tools/phase51k_filled_horizon_timebase_recovery.py`, a HOLD-only
+  offline evidence gate that recovers filled-order source-tick horizons only
+  when both order and fill source ticks are observable.
+- Recovered `396 / 461` previously unresolved filled-order source-tick
+  horizons and preserved the `4066` existing terminal/source-tick horizons.
+- Rebuilt Phase 5.1h and Phase 5.1i with the 5.1j terminal-horizon recovery
+  and 5.1k filled-horizon recovery packs.
+- Kept `raw_identifier_redaction_status=PASS`, emitted no raw fill/order
+  identifiers, and kept every live, canary, capital, risk-relaxation,
+  EV-admission, model-training, and financial-claim authorization field false.
 
 Repo-owned artifacts:
 
-- Rebuild tool: `tools/phase51f_canonical_pfill_outcome_rebuild.py`
-- Quarantine review tool: `tools/phase51g_pfill_quarantine_review.py`
-- Feature audit tool: `tools/phase51h_observed_pfill_feature_audit.py`
-- Canonical pack:
-  `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
-- Quarantine review pack:
-  `runs/phase51g_pfill_quarantine_review/PHASE51G-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z`
-- Observed-only readiness rerun:
-  `runs/phase51g_pfill_calibration_readiness_observed_only/PHASE51G-PFILL-CALIBRATION-READINESS-OBSERVED-ONLY-TWO-LANE-20260502T000000Z`
-- Feature audit pack:
-  `runs/phase51h_observed_pfill_feature_audit/PHASE51H-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Filled-horizon recovery tool:
+  `tools/phase51k_filled_horizon_timebase_recovery.py`
+- Recovered feature audit tool:
+  `tools/phase51h_observed_pfill_feature_audit.py`
+- Recovered matrix tool:
+  `tools/phase51i_pfill_feature_matrix_admissibility.py`
+- Filled-horizon recovery pack:
+  `runs/phase51k_filled_horizon_timebase_recovery/PHASE51K-FILLED-HORIZON-TIMEBASE-RECOVERY-TWO-LANE-20260502T000000Z`
+- Recovered feature audit pack:
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51K-RECOVERED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Recovered matrix pack:
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51K-PFILL-FEATURE-MATRIX-ADMISSIBILITY-TWO-LANE-20260502T000000Z`
 
 ## Next Move
 
-The next optimal move after Phase 5.1h is still not live trading. It is a
-non-live redaction and feature-matrix admissibility step:
+The next optimal move after Phase 5.1k is still not live trading. It is a
+non-live evidence-improvement step:
 
-- Remove or hash inherited raw decision IDs in upstream Phase 5.1f/5.1g P-fill
-  artifacts and rebuild downstream 5.1g/5.1h packs.
-- Quantify whether observed horizon timing can be recovered deterministically
-  from source lifecycle events before any model-training proposal.
+- Resolve or explicitly quarantine the remaining `65` filled-order
+  `MISSING_JOIN` rows without fabricating timebase data.
+- Improve read-only Lighter native-limit and maker/taker completeness.
 - Preserve Lighter official-doc assumptions as evidence metadata: post-only
   orders must rest as maker or cancel if crossing; account tier/fees/latency,
   sendTx/rest limits, and active-order limits are account/profile-sensitive and
   must come from official read endpoints or remain unknown.
-- Reconcile excluded quarantine categories only with deterministic
-  venue-native evidence; otherwise keep them excluded from training.
+- Reconcile excluded quarantine categories only with deterministic venue-native
+  evidence; otherwise keep them excluded from training.
 - Preserve all Phase 5.1 holds above.
 
 ## Phase 5.1i Board Decision
@@ -331,4 +336,55 @@ filled rows to source-tick or exchange-time lifecycle/fill evidence without
 using model assumptions or financial claims. In parallel, continue
 read-only Lighter native-limit and maker/taker evidence enrichment. Rerun the
 same recovered 5.1h -> 5.1i chain and keep all safety holds intact.
+```
+
+## Phase 5.1k Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live feature-completeness evidence
+step: resolve or quarantine the remaining filled-horizon join misses and
+improve Lighter native-limit/maker-taker evidence.
+
+Rationale:
+
+- Filled-horizon timebase recovery passed as a non-live evidence improvement.
+  It recovered `396 / 461` filled-order source-tick horizons and did not
+  substitute exchange milliseconds into source-tick fields.
+- The recovered 5.1h -> 5.1i chain now reports `4462 / 4527` observed horizons
+  available and `65` remaining missing horizons.
+- The matrix remains non-admissible with gate reason
+  `phase51i_filled_horizon_source_tick_still_missing`.
+- Other blockers remain: partial Lighter native-limit context for `2288`
+  labels, incomplete maker/taker status on `287` fills, sparse venue/side
+  buckets, and `1613` excluded quarantine/review groups.
+- No live, canary, capital, risk-limit, or strategy execution behavior changed.
+
+Current evidence boundary:
+
+```text
+Phase 5.1k - Filled-horizon timebase recovery
+runs/phase51k_filled_horizon_timebase_recovery/PHASE51K-FILLED-HORIZON-TIMEBASE-RECOVERY-TWO-LANE-20260502T000000Z
+gate_status: HOLD
+gate_reason: phase51k_filled_horizon_timebase_partial
+recovered_source_tick_count: 396
+still_missing_filled_horizon_count: 65
+raw_identifier_redaction_status: PASS
+
+Phase 5.1k - Recovered P-fill feature-matrix admissibility
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51K-PFILL-FEATURE-MATRIX-ADMISSIBILITY-TWO-LANE-20260502T000000Z
+gate_status: HOLD
+gate_reason: phase51i_filled_horizon_source_tick_still_missing
+observed_horizon_available_count: 4462
+observed_horizon_missing_count: 65
+```
+
+Next move:
+
+```text
+Audit the remaining 65 MISSING_JOIN filled-order rows to determine whether they
+can be deterministically joined through lifecycle/native evidence or must be
+quarantined from calibration. Continue Lighter native-limit and maker/taker
+evidence enrichment. Keep all non-live safety holds intact.
 ```
