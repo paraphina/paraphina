@@ -116,6 +116,18 @@ counterfactual_only_nonfinancial: 2000
 - `approved_for_capital_escalation`: `false`
 - Secret scan: `sensitive_env_values_checked=5`,
   `sensitive_value_leak_found=false`
+- Acceptance artifact:
+  `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/phase51b_acceptance.json`
+- Acceptance status: `PROMOTE_TO_PHASE51C_CALIBRATION_INGESTION`
+- Acceptance verdict: accepted only for beginning Gate 5.1c
+  calibration-label ingestion; live, canary, capital escalation,
+  risk-limit relaxation, and financial-authority use remain blocked.
+- Acceptance limitations:
+  `lighter_sendtx_limit_not_exposed_by_account_limits_payload`,
+  `lighter_rest_request_limit_not_exposed_by_account_limits_payload`,
+  `lighter_open_order_limit_headroom_unknown`.
+- Ingestion rule: native order-limit/headroom fields must be ingested as
+  explicit `UNKNOWN`/hold labels, not as usable numeric limit pressure.
 
 Command:
 
@@ -140,6 +152,20 @@ Result:
 
 ```text
 OK: 5 record(s) validated against schema v2
+```
+
+Acceptance:
+
+```bash
+python3 tools/phase51b_accept_evidence.py \
+  runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z \
+  --sensitive-env-file /home/ubuntu/paraphina/deploy/env/all5_recover_20260314.env
+```
+
+Result:
+
+```text
+phase51b_accept_evidence: status PROMOTE_TO_PHASE51C_CALIBRATION_INGESTION
 ```
 
 Extracted non-secret readiness facts:
@@ -182,6 +208,7 @@ feb1f074fac83cc9331dfbb8aa46d51d30318bd1bee1ba5f1fc2fa59c18cbbb2  telemetry.json
 fbbee0193abf774c2dc75c57fd6f4b36aa925465410b4d6d6d7f00b88607355c  gate_result.json
 6bca31f446a3504719a680213e634aab13df7c014a59f5b40d57a08af52853d2  evidence_pack/artifact_index.json
 951551534a89570a18ae3a2d02bce8be9d7e71521752c4402289803658c1ac93  command_log.json
+de68ee111a4dcf7eababb9ddc1d0886add484912916a82dabed63f72ab2b8c84  phase51b_acceptance.json
 96907e31dcbbfb4d171724d5a6becc56b31e7f7cb8d84a544735367c07a2c93e  source_snapshots/account.sanitized.json
 f564e0b56517e70dad5e7c19f5e3a005a1b9a1049201a41a55c0be5dcaa07d8f  source_snapshots/account_limits.sanitized.json
 38fc4fdf6355aeb29cbccc4716e1bd9612ba3c0c21f10506b19651700fdf8a64  source_snapshots/active_orders.sanitized.json

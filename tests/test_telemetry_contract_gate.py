@@ -587,6 +587,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1b Lighter account/native-limit collector."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51b_lighter_account_limits.py"
+
+    def _get_phase51b_acceptance_path(self) -> Path:
+        """Get path to the Phase 5.1b evidence acceptance gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51b_accept_evidence.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -1257,6 +1262,101 @@ class TestValidatorSubprocess(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2, f"case={name} stdout={result.stdout} stderr={result.stderr}")
                 self.assertIn(expected_error, result.stderr)
+
+    def test_phase51b_acceptance_promotes_only_calibration_ingestion(self):
+        """Phase 5.1b acceptance should promote only to 5.1c calibration ingestion."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            run_dir = tmp_path / "phase51b_accept"
+            run_dir.mkdir()
+            env_path = tmp_path / "lighter.env"
+            env_path.write_text("LIGHTER_AUTH_TOKEN='secret-token-value'\n", encoding="utf-8")
+            records = [
+                self._make_valid_telemetry_v2_record(1, run_id="phase51b_accept_test"),
+                self._make_valid_telemetry_v2_record(
+                    2,
+                    run_id="phase51b_accept_test",
+                    event_type="V2_LIGHTER_ACCOUNT_PROFILE",
+                    venue_id="lighter",
+                    account_index=123,
+                    lighter_account_type="ACCOUNT_TYPE_0",
+                    lighter_account_profile_status="OBSERVED",
+                    market_id=0,
+                    market_symbol="ETH",
+                    market_metadata_status="OBSERVED",
+                    decision="HOLD",
+                    admissible_for_financial_claim=False,
+                ),
+                self._make_valid_telemetry_v2_record(
+                    3,
+                    run_id="phase51b_accept_test",
+                    event_type="V2_LIGHTER_ACCOUNT_LIMITS",
+                    venue_id="lighter",
+                    account_index=123,
+                    account_limits_status="OBSERVED",
+                    account_limits_source_sha256="abc",
+                    account_limits_source_endpoint=None,
+                    account_limits_raw_keys=["user_tier_name"],
+                    lighter_user_tier_name="premium",
+                    rate_limit_headroom_status="OBSERVED",
+                    decision="HOLD",
+                    admissible_for_financial_claim=False,
+                ),
+                self._make_valid_telemetry_v2_record(
+                    4,
+                    run_id="phase51b_accept_test",
+                    event_type="V2_LIGHTER_ACTIVE_ORDERS",
+                    venue_id="lighter",
+                    account_index=123,
+                    market_id=0,
+                    active_orders_status="OBSERVED",
+                    active_orders_source_sha256="def",
+                    active_orders_source_endpoint=None,
+                    active_orders_count_total=0,
+                    active_orders_count_market=0,
+                    pending_orders_count_total=0,
+                    active_order_status_keys=[],
+                    active_order_sample_hash="empty",
+                    open_order_limit_status="UNKNOWN",
+                    decision="HOLD",
+                    admissible_for_financial_claim=False,
+                ),
+            ]
+            with (run_dir / "telemetry.jsonl").open("w", encoding="utf-8") as f:
+                for record in records:
+                    f.write(json.dumps(record) + "\n")
+            (run_dir / "gate_result.json").write_text(json.dumps({
+                "status": "HOLD",
+                "phase51b_capture_complete": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+            }), encoding="utf-8")
+            (run_dir / "manifest.json").write_text(json.dumps({
+                "schema_version": 1,
+                "metadata": {"run_id": "phase51b_accept_test"},
+                "files": [],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51b_acceptance_path()),
+                    str(run_dir),
+                    "--sensitive-env-file",
+                    str(env_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            acceptance = json.loads((run_dir / "phase51b_acceptance.json").read_text(encoding="utf-8"))
+            self.assertEqual(acceptance["status"], "PROMOTE_TO_PHASE51C_CALIBRATION_INGESTION")
+            self.assertTrue(acceptance["approved_for_calibration_label_ingestion"])
+            self.assertFalse(acceptance["approved_for_live"])
+            self.assertFalse(acceptance["approved_for_canary"])
+            self.assertFalse(acceptance["approved_for_capital_escalation"])
+            self.assertFalse(acceptance["secret_scan"]["sensitive_value_leak_found"])
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""
