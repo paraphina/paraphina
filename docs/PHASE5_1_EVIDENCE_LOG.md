@@ -151,6 +151,104 @@ fe099f177ae981c81a41a75a6c757d1960a2331221bdf439bab5cecbdc0903ff  lighter_native
 afcf0fbce4268b96f4ee7a2a848e8950671e570fa7bc74a44f87e065a1ce684c  evidence_pack/artifact_index.json
 ```
 
+## Phase 5.1f Canonical P-Fill Outcome Rebuild
+
+- Run id:
+  `PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
+- Local run directory:
+  `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
+- Tool: `tools/phase51f_canonical_pfill_outcome_rebuild.py`
+- Input lifecycle truth run:
+  `runs/phase51e_lifecycle_truth_audit/PHASE51E-LIFECYCLE-TRUTH-AUDIT-TWO-LANE-20260502T000000Z`
+- Input P-fill outcome run:
+  `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Input P-fill outcome run:
+  `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z`
+- Gate status: `HOLD`
+- Gate reason: `phase51f_canonical_pfill_contains_quarantined_review_groups`
+- Source P-fill rows accounted for: `11935`
+- Canonical P-fill groups emitted: `6140`
+- Lifecycle-graph canonical groups from 5.1e: `6999`
+- P-fill group diff vs lifecycle graph: `-859`
+- Filled groups: `461`
+- Terminal not-filled groups: `4066`
+- Quarantined/censored review groups: `1613`
+- Split conflicts in old per-order splits: `1673`
+- Positive observed fill rate: `0.10183344378175392`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_ev_admission`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51f_canonical_pfill_outcome_rebuild.py \
+  --lifecycle-truth-run runs/phase51e_lifecycle_truth_audit/PHASE51E-LIFECYCLE-TRUTH-AUDIT-TWO-LANE-20260502T000000Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z \
+  --output-root runs/phase51f_canonical_pfill_outcome \
+  --run-id PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+```
+
+Artifact hashes:
+
+```text
+5df9223e2c617569eb3d8d3c5359558517907856341472f1e225a1046cb49f23  canonical_pfill_order_labels.jsonl
+89e1835e6b3a090a99481d46b6287b5e22f7e5b466cff7b7b8eea8e75d1db187  canonical_pfill_outcome_summary.json
+cee129458060843872a363cd54a32018781771736bcdc8129f99bce7bd181ac2  source_to_canonical_order_manifest.jsonl
+3a73e53e3f0418b16ccaa712f4181c75a1c64d0870b36102be5a165ef2f4772a  split_conflict_manifest.jsonl
+69c3881505b812238d7132fda4f7ab09a21600bb42b3d6bdbaae5facf57a5a36  quarantined_review_labels.jsonl
+fe67edf1cd28fbce2291d193ce86e9a6c397fe99eadeae472b2127a5f331e137  evidence_pack/artifact_index.json
+```
+
+## Phase 5.1f P-Fill Readiness From Canonical Labels
+
+- Run id:
+  `PHASE51F-PFILL-CALIBRATION-READINESS-FROM-CANONICAL-TWO-LANE-20260502T000000Z`
+- Local run directory:
+  `runs/phase51f_pfill_calibration_readiness_from_canonical/PHASE51F-PFILL-CALIBRATION-READINESS-FROM-CANONICAL-TWO-LANE-20260502T000000Z`
+- Tool: `tools/phase51c_pfill_calibration_readiness.py`
+- Input P-fill outcome run:
+  `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
+- Gate status: `HOLD`
+- Gate reason: `pfill_calibration_contains_censored_orders`
+- Order labels: `6140`
+- Observed outcomes: `4527`
+- Filled: `461`
+- Terminal not-filled: `4066`
+- Censored/quarantined: `1613`
+- Censored rate: `0.26270358306188923`
+- Holdout observed outcomes: `902`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_ev_admission`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_pfill_calibration_readiness.py \
+  --pfill-outcome-run runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --output-root runs/phase51f_pfill_calibration_readiness_from_canonical \
+  --run-id PHASE51F-PFILL-CALIBRATION-READINESS-FROM-CANONICAL-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+```
+
+Artifact hashes:
+
+```text
+a3db6620d5b93b07387b6a053b3fddea23c898bb09a817a3fb40a186fea68410  pfill_calibration_readiness_summary.json
+4b724f5031fb9a817b2e84c1478c16a5de0de9596aa31a53b8eaeb05b13bf7ee  pfill_calibration_buckets.jsonl
+345f486d9c5a639e5883a911574decf39a3a45536c35137ddbe5685bf382e186  pfill_order_split_manifest.jsonl
+e1645ec99c27156a8153c8e6f830b5d5335703b2bf0e74f6a51b4a4a51bb9ba7  evidence_pack/artifact_index.json
+```
+
 ## Phase 5.1c Markout Calibration Readiness Two-Lane Pack
 
 - Run id: `PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z`

@@ -29,16 +29,19 @@ document, not live-trading authorization.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1e as the current evidence boundary. It proves the dominant
-   P-fill blocker is lifecycle canonicalization, not true source-window
-   truncation.
-3. Next repo-owned move is a separate canonical P-fill outcome rebuild/review
-   gate that collapses place intent/ack aliases and preserves review-only
-   statuses before any calibration-readiness rerun.
-4. Re-run P-fill readiness, queue/churn, markout, and Lighter attribution only
-   after the canonical outcome contract is explicitly reviewed.
+2. Treat Phase 5.1f as the current evidence boundary. It proves the dominant
+   P-fill blocker was lifecycle canonicalization, but the rebuilt canonical
+   outcome pack still contains review-quarantined groups.
+3. The current P-fill calibration-readiness rerun from canonical labels remains
+   `HOLD`: `6140` canonical P-fill groups, `4527` observed outcomes, `461`
+   fills, `4066` terminal not-filled groups, and `1613` quarantined/censored
+   groups.
+4. Next repo-owned move is review policy for the remaining `1613`
+   quarantined groups plus downstream reruns only where the canonical contract
+   is accepted. Do not train models from 5.1f.
 5. Proceed to calibrated EV shadow only after canonical outcomes, maker/taker
-   role gaps, holdout splits, and feature completeness are accepted.
+   role gaps, holdout splits, feature completeness, and quarantined review
+   policy are accepted.
 
 ## Board
 
@@ -257,6 +260,59 @@ fe099f177ae981c81a41a75a6c757d1960a2331221bdf439bab5cecbdc0903ff  lighter_native
 6db64ea422d445cc63d32505577dc71b0e72003b533374ae35a25c1dd70ced50  manifest.json
 afcf0fbce4268b96f4ee7a2a848e8950671e570fa7bc74a44f87e065a1ce684c  evidence_pack/artifact_index.json
 ```
+
+### Gate 5.1f - Canonical P-Fill Outcome Rebuild/Review
+
+Current repo-owned tooling:
+
+- `tools/phase51f_canonical_pfill_outcome_rebuild.py` consumes the Phase 5.1e
+  lifecycle truth audit and the source Phase 5.1c P-fill outcome packs. It
+  emits one `ORDER_PFILL_OUTCOME_LABEL` per canonical P-fill lifecycle group,
+  writes a source-to-canonical manifest, records split conflicts, quarantines
+  unresolved review groups, and keeps all live/canary/capital/risk/model
+  authorizations false.
+- The tool is additive. It does not mutate Phase 5.1c or Phase 5.1e artifacts,
+  submit orders, train models, approve EV admission, or make financial claims.
+
+Current 5.1f evidence:
+
+- Run:
+  `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
+- Source P-fill rows accounted for: `11935`.
+- Canonical P-fill groups emitted: `6140`.
+- Lifecycle-graph canonical groups from 5.1e: `6999`; the `-859` difference is
+  expected because 5.1f groups only canonical P-fill source rows.
+- Canonical review outcomes: `461` `CANONICAL_OBSERVED_FILLED`, `4066`
+  `CANONICAL_OBSERVED_NOT_FILLED`, and `1613`
+  `CANONICAL_REVIEW_QUARANTINED`.
+- Split conflicts from old per-order splits: `1673`; 5.1f assigns new
+  deterministic group-level splits.
+- Gate remains `HOLD` with reason
+  `phase51f_canonical_pfill_contains_quarantined_review_groups`.
+
+5.1f canonical artifacts:
+
+```text
+5df9223e2c617569eb3d8d3c5359558517907856341472f1e225a1046cb49f23  canonical_pfill_order_labels.jsonl
+89e1835e6b3a090a99481d46b6287b5e22f7e5b466cff7b7b8eea8e75d1db187  canonical_pfill_outcome_summary.json
+cee129458060843872a363cd54a32018781771736bcdc8129f99bce7bd181ac2  source_to_canonical_order_manifest.jsonl
+3a73e53e3f0418b16ccaa712f4181c75a1c64d0870b36102be5a165ef2f4772a  split_conflict_manifest.jsonl
+69c3881505b812238d7132fda4f7ab09a21600bb42b3d6bdbaae5facf57a5a36  quarantined_review_labels.jsonl
+fe67edf1cd28fbce2291d193ce86e9a6c397fe99eadeae472b2127a5f331e137  evidence_pack/artifact_index.json
+```
+
+P-fill readiness rerun from canonical labels:
+
+- Run:
+  `runs/phase51f_pfill_calibration_readiness_from_canonical/PHASE51F-PFILL-CALIBRATION-READINESS-FROM-CANONICAL-TWO-LANE-20260502T000000Z`
+- Order labels: `6140`.
+- Observed outcomes: `4527`.
+- Filled: `461`.
+- Not-filled: `4066`.
+- Censored/quarantined: `1613`.
+- Censored rate: `0.26270358306188923`.
+- Holdout observed outcomes: `902`.
+- Gate remains `HOLD` with reason `pfill_calibration_contains_censored_orders`.
 
 ### Gate 5.2 - Calibrated EV Shadow
 

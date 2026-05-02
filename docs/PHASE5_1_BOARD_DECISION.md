@@ -25,9 +25,9 @@ Current economic/profitability decision: `HOLD`
 
 ## Current Superseding Status
 
-As of the Phase 5.1e lifecycle/native-truth audit, the board decision remains
-`PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are now more
-specific:
+As of the Phase 5.1f canonical P-fill outcome rebuild/review gate, the board
+decision remains `PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are
+now more specific:
 
 - Phase 5.1d showed `8611 / 11935` P-fill labels were censored as
   `NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW`.
@@ -41,9 +41,15 @@ specific:
 - Lighter native attribution remains `HOLD`: raw captured telemetry IDs match
   native trades for `96 / 189` Lighter fills (`64` maker, `32` taker), while
   `93` remain `NATIVE_WINDOW_COVERED_NO_MATCH`.
+- Phase 5.1f rebuilds one P-fill label per canonical lifecycle group:
+  `11935` source rows collapse to `6140` canonical P-fill groups, with `461`
+  filled, `4066` terminal not-filled, and `1613` quarantined/censored review
+  groups. The canonical readiness rerun remains `HOLD` because
+  `1613 / 6140` labels remain censored or review-quarantined.
 - 5.1 remains `HOLD` for model training, EV admission, live orders, canary,
-  capital escalation, risk-limit relaxation, and financial claims until a
-  separate canonical P-fill outcome rebuild is reviewed.
+  capital escalation, risk-limit relaxation, and financial claims until the
+  remaining quarantined review policy and downstream calibration readiness are
+  accepted.
 
 ## Baseline
 
@@ -163,30 +169,31 @@ OK: 4001 record(s) validated against schema v2
 
 ## Next Move
 
-The next optimal move after this Phase 5.1 closeout is not live trading. It is
-the next non-live evidence step, now formalized as Phase 5.1b:
+The next optimal move after Phase 5.1f is still not live trading. It is a
+non-live review of the remaining canonical P-fill quarantine boundary:
 
 ```text
-Phase 5.1b - Lighter account/native-limit evidence gate
+Phase 5.1g - Canonical P-fill quarantine review and downstream rerun gate
 ```
 
 Scope:
 
-- Add read-only Lighter account-state and native-limit capture to v2 evidence.
-- Capture account/profile, account limits, active-order headroom, fee/market
-  metadata, and maker/taker trade-role samples where available.
-- Emit only schema v2 `HOLD` records with `no_live_flag=true` and all live,
-  canary, capital, and risk-relaxation authorization fields false.
-- Then begin calibration-label ingestion for P-fill, markout, queue/churn, and
-  maker/taker attribution only after the account/native-limit evidence pack is
-  present.
+- Review the `1613` quarantined canonical P-fill groups from Phase 5.1f.
+- Keep duplicate-only, cancel-all-scope, replace-chain, and true no-terminal
+  cases out of model training unless a deterministic, pre-registered review
+  policy accepts them.
+- Re-run queue/churn, markout, and Lighter attribution only where the canonical
+  group contract is accepted and source hashes reconcile.
+- Emit only `HOLD` records with `no_live_flag=true` and all live, canary,
+  capital, risk-relaxation, EV-admission, model-training, and financial-claim
+  authorization fields false.
 
 Repo-owned artifacts:
 
-- Gate spec: `configs/phase51b_lighter_account_native_limits.json`
-- Collector: `tools/phase51b_lighter_account_limits.py`
-- Schema events: `V2_LIGHTER_ACCOUNT_PROFILE`,
-  `V2_LIGHTER_ACCOUNT_LIMITS`, `V2_LIGHTER_ACTIVE_ORDERS`, and
-  `V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE`
+- Rebuild tool: `tools/phase51f_canonical_pfill_outcome_rebuild.py`
+- Canonical pack:
+  `runs/phase51f_canonical_pfill_outcome/PHASE51F-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
+- Readiness rerun:
+  `runs/phase51f_pfill_calibration_readiness_from_canonical/PHASE51F-PFILL-CALIBRATION-READINESS-FROM-CANONICAL-TWO-LANE-20260502T000000Z`
 
-This Phase 5.1b work package must not relax the Phase 5.1 holds above.
+This next work package must not relax the Phase 5.1 holds above.

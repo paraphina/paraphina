@@ -647,6 +647,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1e lifecycle/native-truth audit gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51e_lifecycle_truth_audit.py"
+
+    def _get_phase51f_canonical_pfill_outcome_path(self) -> Path:
+        """Get path to the Phase 5.1f canonical P_fill outcome review gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51f_canonical_pfill_outcome_rebuild.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -2972,6 +2977,350 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(output_root),
                     "--run-id",
                     "phase51e_lifecycle_truth_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
+
+    def test_phase51f_canonical_pfill_outcome_rebuild_collapses_groups_hold_only(self):
+        """Canonical P_fill rebuild should collapse lifecycle groups and keep review quarantines."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            lifecycle_run = tmp_path / "phase51e"
+            pfill_run = tmp_path / "pfill"
+            output_root = tmp_path / "phase51f"
+            readiness_root = tmp_path / "readiness"
+            lifecycle_run.mkdir()
+            pfill_run.mkdir()
+            source_sha = "source-sha-phase51f"
+
+            pfill_labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "raw-fill-observed",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "decision_id": "d-fill",
+                    "order_id_hash": "order-fill",
+                    "client_order_id_hash": "client-fill",
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "fill_count": 1,
+                    "filled_size_total": 0.01,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "raw-fill-alias",
+                    "order_holdout_split": "HOLDOUT",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "decision_id": "d-fill",
+                    "order_id_hash": "order-fill",
+                    "client_order_id_hash": "client-fill",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "fill_count": 0,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "raw-direct-terminal",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "raw-duplicate-only",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "raw-cancel-all",
+                    "order_holdout_split": "HOLDOUT",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (pfill_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "pfill_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "pfill_outcome_contains_censored_orders",
+                "source_telemetry_sha256": source_sha,
+                "order_label_count": 5,
+                "filled_count": 1,
+                "not_filled_count": 0,
+                "censored_count": 4,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in pfill_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            truth_rows = [
+                {
+                    "label_type": "PHASE51E_LIFECYCLE_TRUTH_AUDIT_LABEL",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "source_pfill_run_id": "pfill_source",
+                    "source_pfill_run_path": str(pfill_run),
+                    "order_key": "raw-fill-observed",
+                    "order_label_seq": 1,
+                    "canonical_group_id": "group-fill",
+                    "canonical_status": "STAYS_FILLED",
+                    "current_outcome_status": "OBSERVED_FILLED",
+                    "current_p_fill_outcome": 1.0,
+                    "canonical_direct_terminal_count": 0,
+                    "venue_id": "lighter",
+                    "side": "BID",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "PHASE51E_LIFECYCLE_TRUTH_AUDIT_LABEL",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "source_pfill_run_id": "pfill_source",
+                    "source_pfill_run_path": str(pfill_run),
+                    "order_key": "raw-fill-alias",
+                    "order_label_seq": 2,
+                    "canonical_group_id": "group-fill",
+                    "canonical_status": "CENSORED_TO_CANONICAL_FILLED_REVIEW",
+                    "current_outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "current_p_fill_outcome": None,
+                    "canonical_direct_terminal_count": 0,
+                    "venue_id": "lighter",
+                    "side": "BID",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "PHASE51E_LIFECYCLE_TRUTH_AUDIT_LABEL",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "source_pfill_run_id": "pfill_source",
+                    "source_pfill_run_path": str(pfill_run),
+                    "order_key": "raw-direct-terminal",
+                    "order_label_seq": 3,
+                    "canonical_group_id": "group-terminal",
+                    "canonical_status": "CENSORED_TO_CANONICAL_NOT_FILLED_REVIEW",
+                    "current_outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "current_p_fill_outcome": None,
+                    "canonical_direct_terminal_count": 1,
+                    "venue_id": "lighter",
+                    "side": "ASK",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "PHASE51E_LIFECYCLE_TRUTH_AUDIT_LABEL",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "source_pfill_run_id": "pfill_source",
+                    "source_pfill_run_path": str(pfill_run),
+                    "order_key": "raw-duplicate-only",
+                    "order_label_seq": 4,
+                    "canonical_group_id": "group-duplicate",
+                    "canonical_status": "DUPLICATE_PLACE_ALIAS_COLLAPSE_REVIEW",
+                    "current_outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "current_p_fill_outcome": None,
+                    "canonical_direct_terminal_count": 0,
+                    "venue_id": "lighter",
+                    "side": "BID",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "PHASE51E_LIFECYCLE_TRUTH_AUDIT_LABEL",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "source_pfill_run_id": "pfill_source",
+                    "source_pfill_run_path": str(pfill_run),
+                    "order_key": "raw-cancel-all",
+                    "order_label_seq": 5,
+                    "canonical_group_id": "group-cancel-all",
+                    "canonical_status": "CANCEL_ALL_SCOPE_REVIEW",
+                    "current_outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "current_p_fill_outcome": None,
+                    "canonical_direct_terminal_count": 0,
+                    "venue_id": "lighter",
+                    "side": "ASK",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (lifecycle_run / "lifecycle_truth_audit_summary.json").write_text(json.dumps({
+                "run_id": "phase51e_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "phase51e_canonical_lifecycle_reviewable_movements_found",
+                "source_telemetry_sha256_list": [source_sha],
+                "order_label_count": 5,
+                "canonical_group_count": 4,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (lifecycle_run / "order_lifecycle_truth_labels.jsonl").open("w", encoding="utf-8") as f:
+                for row in truth_rows:
+                    f.write(json.dumps(row) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51f_canonical_pfill_outcome_path()),
+                    "--lifecycle-truth-run",
+                    str(lifecycle_run),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51f_canonical_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51f_canonical_test"
+            summary = json.loads((run_dir / "pfill_outcome_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["source_label_count"], 5)
+            self.assertEqual(summary["canonical_group_count"], 4)
+            self.assertEqual(summary["order_label_count"], 4)
+            self.assertEqual(summary["filled_count"], 1)
+            self.assertEqual(summary["not_filled_count"], 1)
+            self.assertEqual(summary["censored_count"], 2)
+            self.assertEqual(summary["split_conflict_count"], 1)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "canonical_pfill_order_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(labels), 4)
+            by_group = {label["canonical_group_id"]: label for label in labels}
+            self.assertEqual(by_group["group-fill"]["outcome_status"], "OBSERVED_FILLED")
+            self.assertEqual(by_group["group-fill"]["p_fill_outcome"], 1.0)
+            self.assertEqual(by_group["group-terminal"]["outcome_status"], "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL")
+            self.assertEqual(by_group["group-terminal"]["p_fill_outcome"], 0.0)
+            self.assertEqual(by_group["group-duplicate"]["outcome_status"], "CENSORED_OR_UNOBSERVED")
+            self.assertIsNone(by_group["group-duplicate"]["p_fill_outcome"])
+            self.assertEqual(by_group["group-cancel-all"]["outcome_status"], "CENSORED_OR_UNOBSERVED")
+            self.assertTrue(all(label["approved_for_model_training"] is False for label in labels))
+
+            source_manifest = [
+                json.loads(line)
+                for line in (run_dir / "source_to_canonical_order_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(source_manifest), 5)
+            quarantined = [
+                json.loads(line)
+                for line in (run_dir / "quarantined_review_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(quarantined), 2)
+            split_conflicts = [
+                json.loads(line)
+                for line in (run_dir / "split_conflict_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(split_conflicts), 1)
+
+            readiness = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_calibration_readiness_path()),
+                    "--pfill-outcome-run",
+                    str(run_dir),
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51f_readiness_compat_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--min-observed-per-bucket",
+                    "1",
+                    "--min-holdout-observed-per-bucket",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(readiness.returncode, 0, f"stdout: {readiness.stdout}\nstderr: {readiness.stderr}")
+            readiness_summary = json.loads(
+                (readiness_root / "phase51f_readiness_compat_test" / "pfill_calibration_readiness_summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(readiness_summary["gate_status"], "HOLD")
+            self.assertEqual(readiness_summary["order_label_count"], 4)
+
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
+            truth_rows[0]["approved_for_live"] = True
+            with (lifecycle_run / "order_lifecycle_truth_labels.jsonl").open("w", encoding="utf-8") as f:
+                for row in truth_rows:
+                    f.write(json.dumps(row) + "\n")
+            unsafe = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51f_canonical_pfill_outcome_path()),
+                    "--lifecycle-truth-run",
+                    str(lifecycle_run),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51f_canonical_unsafe_test",
                 ],
                 capture_output=True,
                 text=True,
