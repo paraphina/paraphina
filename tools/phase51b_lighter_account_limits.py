@@ -442,6 +442,30 @@ def _import_lighter_sdk(sdk_path: Path | None) -> Any:
     raise RuntimeError("lighter-sdk is required for --allow-sdk-auth")
 
 
+async def _create_lighter_auth_token(
+    lighter: Any,
+    *,
+    base_url: str,
+    account_index: int,
+    api_key_index: int,
+    private_key: str,
+) -> str:
+    client = lighter.SignerClient(
+        url=base_url,
+        account_index=account_index,
+        api_private_keys={api_key_index: private_key},
+    )
+    try:
+        auth, err = client.create_auth_token_with_expiry(600)
+        if err is not None:
+            raise RuntimeError(f"lighter auth token generation failed: {err}")
+        return auth
+    finally:
+        api_client = getattr(client, "api_client", None)
+        if api_client is not None and hasattr(api_client, "close"):
+            await api_client.close()
+
+
 def _get_auth_token(env: dict[str, str], allow_sdk_auth: bool, sdk_path: Path | None) -> str:
     explicit = env.get("LIGHTER_AUTH_TOKEN", "").strip()
     if explicit:
@@ -458,18 +482,13 @@ def _get_auth_token(env: dict[str, str], allow_sdk_auth: bool, sdk_path: Path | 
     private_key = env["LIGHTER_API_PRIVATE_KEY_HEX"]
     if private_key.startswith("0x"):
         private_key = private_key[2:]
-    client = lighter.SignerClient(
-        url=base_url,
+    return asyncio.run(_create_lighter_auth_token(
+        lighter,
+        base_url=base_url,
         account_index=account_index,
-        api_private_keys={api_key_index: private_key},
-    )
-    auth, err = client.create_auth_token_with_expiry(600)
-    if err is not None:
-        raise RuntimeError(f"lighter auth token generation failed: {err}")
-    api_client = getattr(client, "api_client", None)
-    if api_client is not None and hasattr(api_client, "close"):
-        asyncio.run(api_client.close())
-    return auth
+        api_key_index=api_key_index,
+        private_key=private_key,
+    ))
 
 
 def _http_get_json(
