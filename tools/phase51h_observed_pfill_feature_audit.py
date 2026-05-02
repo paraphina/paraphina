@@ -36,6 +36,15 @@ UNSAFE_TRUE_FLAGS = {
     "risk_limit_relaxation_allowed",
 }
 
+RAW_IDENTIFIER_FIELDS = {
+    "decision_id",
+    "order_id",
+    "client_order_id",
+    "venue_order_id",
+    "raw_order_id",
+    "raw_client_order_id",
+}
+
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -115,6 +124,12 @@ def _check_unsafe(record: dict[str, Any], path: Path, *, label: str) -> None:
             raise ValueError(f"{path} has unsafe {label} flag {flag}=true")
 
 
+def _check_no_raw_identifiers(record: dict[str, Any], path: Path, *, label: str) -> None:
+    present = sorted(field for field in RAW_IDENTIFIER_FIELDS if field in record)
+    if present:
+        raise ValueError(f"{path} has raw identifier field(s) in {label}: {', '.join(present)}")
+
+
 def _load_hold_summary(path: Path, filename: str) -> dict[str, Any]:
     summary_path = path / filename
     summary = _load_json(summary_path)
@@ -124,6 +139,35 @@ def _load_hold_summary(path: Path, filename: str) -> dict[str, Any]:
         raise ValueError(f"{summary_path} must have gate_status=HOLD")
     _check_unsafe(summary, summary_path, label="summary")
     return summary
+
+
+def _load_horizon_recovery(
+    horizon_recovery_run: Path | None,
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]]]:
+    if horizon_recovery_run is None:
+        return None, {}
+    summary = _load_hold_summary(horizon_recovery_run, "observed_horizon_recovery_summary.json")
+    if summary.get("raw_identifier_redaction_status") != "PASS":
+        raise ValueError(f"{horizon_recovery_run} must have raw_identifier_redaction_status=PASS")
+    labels_path = horizon_recovery_run / "observed_horizon_recovery_labels.jsonl"
+    by_group: dict[str, dict[str, Any]] = {}
+    for _, label in _iter_jsonl(labels_path):
+        if label.get("label_type") != "PHASE51J_OBSERVED_HORIZON_RECOVERY_LABEL":
+            continue
+        _check_unsafe(label, labels_path, label="label")
+        _check_no_raw_identifiers(label, labels_path, label="label")
+        if label.get("raw_identifier_redaction_status") != "PASS":
+            raise ValueError(f"{labels_path} contains non-PASS raw identifier redaction status")
+        canonical_group_id = str(label.get("canonical_group_id") or "")
+        if not canonical_group_id:
+            raise ValueError(f"{labels_path} row missing canonical_group_id")
+        if canonical_group_id in by_group:
+            raise ValueError(f"{labels_path} duplicate canonical_group_id={canonical_group_id}")
+        by_group[canonical_group_id] = label
+    expected = int(summary.get("label_count") or 0)
+    if len(by_group) != expected:
+        raise ValueError(f"{labels_path} label count {len(by_group)} != summary label_count {expected}")
+    return summary, by_group
 
 
 def _safe_int(value: Any) -> int | None:
@@ -317,6 +361,7 @@ def _coverage_label(
     queue_labels: list[dict[str, Any]],
     quarantine_record: dict[str, Any] | None,
     markout_info: dict[str, Any] | None,
+    horizon_recovery_label: dict[str, Any] | None,
 ) -> dict[str, Any]:
     venue = str(pfill_label.get("venue_id") or "UNKNOWN")
     side = _canonical_side(pfill_label.get("side"))
@@ -334,7 +379,19 @@ def _coverage_label(
         queue_status = "JOINED_PARTIAL_SOURCE_KEYS"
     native_status = _native_status_class(venue, queue_labels)
     maker_taker_status = _maker_taker_status(pfill_label)
-    observed_horizon_available = pfill_label.get("observed_horizon_source_ticks") is not None
+    input_observed_horizon = pfill_label.get("observed_horizon_source_ticks")
+    observed_horizon_source_ticks = input_observed_horizon
+    horizon_recovery_status = None
+    horizon_recovery_applied = False
+    if horizon_recovery_label is not None:
+        horizon_recovery_status = horizon_recovery_label.get("recovery_status")
+        if horizon_recovery_label.get("source_telemetry_sha256") != pfill_label.get("source_telemetry_sha256"):
+            raise ValueError(f"horizon recovery source hash mismatch for canonical_group_id={pfill_label.get('canonical_group_id')}")
+        effective_horizon = horizon_recovery_label.get("effective_observed_horizon_source_ticks")
+        if input_observed_horizon is None and effective_horizon is not None:
+            observed_horizon_source_ticks = effective_horizon
+            horizon_recovery_applied = True
+    observed_horizon_available = observed_horizon_source_ticks is not None
     markout_available = markout_info is not None
     raw_decision_id_present = pfill_label.get("decision_id") not in (None, "")
     missing_features: list[str] = []
@@ -382,8 +439,12 @@ def _coverage_label(
         "fill_count": _safe_int(pfill_label.get("fill_count")) or 0,
         "terminal_action_first": pfill_label.get("terminal_action_first"),
         "terminal_event_count": _safe_int(pfill_label.get("terminal_event_count")) or 0,
+        "input_observed_horizon_source_ticks": input_observed_horizon,
         "observed_horizon_available": observed_horizon_available,
-        "observed_horizon_source_ticks": pfill_label.get("observed_horizon_source_ticks"),
+        "observed_horizon_source_ticks": observed_horizon_source_ticks,
+        "horizon_recovery_status": horizon_recovery_status,
+        "horizon_recovery_applied": horizon_recovery_applied,
+        "horizon_recovery_run_id": horizon_recovery_label.get("run_id") if horizon_recovery_label else None,
         "source_order_key_count": source_key_count,
         "source_queue_churn_label_count": len(queue_labels),
         "queue_churn_join_status": queue_status,
@@ -438,6 +499,10 @@ def _empty_bucket_counts() -> dict[str, int]:
         "markout_source_available_count": 0,
         "markout_source_missing_count": 0,
         "raw_identifier_input_present_count": 0,
+        "horizon_recovery_applied_count": 0,
+        "horizon_recovered_terminal_count": 0,
+        "horizon_recovery_preserved_existing_count": 0,
+        "horizon_recovery_fill_timebase_remaining_count": 0,
         "missing_feature_total": 0,
     }
 
@@ -490,6 +555,15 @@ def _add_to_bucket(counts: dict[str, int], label: dict[str, Any]) -> None:
         counts["markout_source_missing_count"] += 1
     if label.get("raw_identifier_input_present"):
         counts["raw_identifier_input_present_count"] += 1
+    recovery_status = label.get("horizon_recovery_status")
+    if label.get("horizon_recovery_applied"):
+        counts["horizon_recovery_applied_count"] += 1
+    if recovery_status == "RECOVERED_TERMINAL_SOURCE_TICKS":
+        counts["horizon_recovered_terminal_count"] += 1
+    elif recovery_status == "PRESERVED_EXISTING_OBSERVED_HORIZON":
+        counts["horizon_recovery_preserved_existing_count"] += 1
+    elif recovery_status == "FILL_HORIZON_REQUIRES_SEPARATE_TIMEBASE":
+        counts["horizon_recovery_fill_timebase_remaining_count"] += 1
     counts["missing_feature_total"] += int(label.get("missing_feature_count") or 0)
 
 
@@ -613,6 +687,7 @@ def build_feature_audit(
     canonical_pfill_run: Path,
     queue_churn_runs: list[Path],
     markout_readiness_runs: list[Path],
+    horizon_recovery_run: Path | None,
     output_root: Path | None,
     run_id: str | None,
     timestamp_ns: int | None,
@@ -633,12 +708,14 @@ def build_feature_audit(
     canonical_pfill_run = _resolve_path(canonical_pfill_run)
     queue_churn_runs = [_resolve_path(run) for run in queue_churn_runs]
     markout_readiness_runs = [_resolve_path(run) for run in markout_readiness_runs]
+    horizon_recovery_run = _resolve_path(horizon_recovery_run) if horizon_recovery_run is not None else None
 
     pfill_summary, pfill_labels = _load_pfill_labels(observed_pfill_run)
     canonical_index = _load_canonical_source_index(canonical_pfill_run)
     quarantine_index = _load_quarantine_reconciliation(quarantine_review_run)
     queue_by_order_key, queue_run_summaries = _load_queue_churn(queue_churn_runs)
     markout_by_source, markout_run_summaries = _load_markout_readiness(markout_readiness_runs)
+    horizon_recovery_summary, horizon_recovery_by_group = _load_horizon_recovery(horizon_recovery_run)
 
     feature_labels: list[dict[str, Any]] = []
     for seq, pfill_label in enumerate(pfill_labels, start=1):
@@ -669,6 +746,9 @@ def build_feature_audit(
             if str(queue_label.get("source_telemetry_sha256") or "") != source_sha:
                 raise ValueError(f"queue/churn source hash mismatch for canonical_group_id={canonical_group_id}")
         markout_info = markout_by_source.get(str(pfill_label.get("source_telemetry_sha256") or ""))
+        horizon_recovery_label = horizon_recovery_by_group.get(canonical_group_id)
+        if horizon_recovery_run is not None and horizon_recovery_label is None:
+            raise ValueError(f"canonical_group_id {canonical_group_id} missing from horizon recovery run")
         feature_labels.append(_coverage_label(
             seq=seq,
             run_id=run_id,
@@ -678,6 +758,7 @@ def build_feature_audit(
             queue_labels=queue_labels,
             quarantine_record=quarantine_record,
             markout_info=markout_info,
+            horizon_recovery_label=horizon_recovery_label,
         ))
 
     bucket_records = _build_bucket_records(
@@ -714,6 +795,18 @@ def build_feature_audit(
         "canonical_source_manifest_sha256": _sha256_file(canonical_pfill_run / "source_to_canonical_order_manifest.jsonl"),
         "queue_churn_runs": queue_run_summaries,
         "markout_readiness_runs": markout_run_summaries,
+        "horizon_recovery_run": str(horizon_recovery_run) if horizon_recovery_run else None,
+        "horizon_recovery_summary_sha256": (
+            _sha256_file(horizon_recovery_run / "observed_horizon_recovery_summary.json")
+            if horizon_recovery_run else None
+        ),
+        "horizon_recovery_labels_sha256": (
+            _sha256_file(horizon_recovery_run / "observed_horizon_recovery_labels.jsonl")
+            if horizon_recovery_run else None
+        ),
+        "horizon_recovery_status_counts": (
+            horizon_recovery_summary.get("recovery_status_counts") if horizon_recovery_summary else {}
+        ),
         "source_telemetry_sha256_list": sorted({
             str(label.get("source_telemetry_sha256") or "")
             for label in pfill_labels
@@ -749,6 +842,10 @@ def build_feature_audit(
                 "markout_source_available_count",
                 "markout_source_missing_count",
                 "raw_identifier_input_present_count",
+                "horizon_recovery_applied_count",
+                "horizon_recovered_terminal_count",
+                "horizon_recovery_preserved_existing_count",
+                "horizon_recovery_fill_timebase_remaining_count",
                 "missing_feature_total",
             )
         },
@@ -785,6 +882,7 @@ def main() -> int:
     parser.add_argument("--canonical-pfill-run", type=Path, required=True)
     parser.add_argument("--queue-churn-run", type=Path, action="append", default=[])
     parser.add_argument("--markout-readiness-run", type=Path, action="append", default=[])
+    parser.add_argument("--horizon-recovery-run", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--timestamp-ns", type=int, default=None)
@@ -798,6 +896,7 @@ def main() -> int:
             canonical_pfill_run=args.canonical_pfill_run,
             queue_churn_runs=args.queue_churn_run,
             markout_readiness_runs=args.markout_readiness_run,
+            horizon_recovery_run=args.horizon_recovery_run,
             output_root=args.output_root,
             run_id=args.run_id,
             timestamp_ns=args.timestamp_ns,

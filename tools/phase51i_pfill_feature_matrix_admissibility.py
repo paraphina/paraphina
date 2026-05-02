@@ -45,6 +45,24 @@ RAW_IDENTIFIER_FIELDS = {
     "raw_client_order_id",
 }
 
+HORIZON_RECOVERY_SUMMARY_KEYS = (
+    "horizon_recovery_run",
+    "horizon_recovery_summary_sha256",
+    "horizon_recovery_labels_sha256",
+    "horizon_recovery_status_counts",
+    "horizon_recovery_applied_count",
+    "horizon_recovered_terminal_count",
+    "horizon_recovery_preserved_existing_count",
+    "horizon_recovery_fill_timebase_remaining_count",
+)
+
+HORIZON_RECOVERY_BUCKET_KEYS = (
+    "horizon_recovery_applied_count",
+    "horizon_recovered_terminal_count",
+    "horizon_recovery_preserved_existing_count",
+    "horizon_recovery_fill_timebase_remaining_count",
+)
+
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -364,6 +382,11 @@ def build_matrix_admissibility(
                     "missing_feature_total",
                 )
             },
+            **{
+                key: bucket.get(key)
+                for key in HORIZON_RECOVERY_BUCKET_KEYS
+                if key in bucket
+            },
         })
 
     blocker_ids = [str(blocker["blocker_id"]) for blocker in blockers if blocker["gate_status"] == "HOLD"]
@@ -424,6 +447,11 @@ def build_matrix_admissibility(
                 "raw_identifier_input_present_count",
                 "missing_feature_total",
             )
+        },
+        **{
+            key: input_summary.get(key)
+            for key in HORIZON_RECOVERY_SUMMARY_KEYS
+            if key in input_summary
         },
         "input_summary_hash": _stable_hash(input_summary),
     }

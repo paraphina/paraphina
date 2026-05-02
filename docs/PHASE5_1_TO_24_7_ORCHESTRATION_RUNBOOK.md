@@ -29,23 +29,24 @@ document, not live-trading authorization.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1i as the current evidence boundary. It proves the P-fill
-   redaction chain can be rebuilt without raw `decision_id` emission and that a
-   repo-owned feature-matrix admissibility gate can fail closed.
-3. The current Phase 5.1i matrix pack remains `HOLD`: `4527` observed terminal
-   labels, `461` fills, `4066` terminal not-filled labels, all `4527` joined to
-   queue/churn, all `4527` source-covered by markout readiness, and raw
-   identifier redaction status `PASS`.
+2. Treat Phase 5.1j as the current evidence boundary. It proves deterministic
+   terminal observed-horizon recovery can be applied without raw `decision_id`
+   emission and that the recovered feature-matrix gate still fails closed.
+3. The current Phase 5.1j recovered matrix pack remains `HOLD`: `4527`
+   observed terminal labels, `461` fills, `4066` terminal not-filled labels,
+   all `4527` joined to queue/churn, all `4527` source-covered by markout
+   readiness, and raw identifier redaction status `PASS`.
 4. The dominant blockers are feature quality and selection bias, not tooling
-   reachability: `4509` labels lack observed horizon timing, Lighter native
+   reachability: `461` filled-order labels still lack observed horizon timing,
+   Lighter native
    limit context is only partial for `2288` labels, filled-order maker/taker
    status is incomplete for `287` labels, some venue/side buckets remain
    sparse, and `1613` quarantined/review groups remain excluded from the
    observed-only diagnostic pack.
 5. Next repo-owned move is another non-live evidence step: close the highest
-   leverage feature gaps, starting with deterministic observed-horizon recovery
+   leverage feature gaps, starting with filled-order horizon/timebase recovery
    and venue-native Lighter limit/maker-taker completeness. Do not train models
-   from 5.1i.
+   from 5.1j.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
@@ -508,6 +509,54 @@ b9135cdc6e7cdf09ef39d33fdc1bb708ffd67231ef1dd8f4bb822bdb850946ae  pfill_feature_
 8e8759afc3f61a6cd709e38c8e5ae7c14fba9c7fa0b455d3561f73b7300aa6ec  manifest.json
 ```
 
+### Gate 5.1j - Observed-Horizon Recovery
+
+Current repo-owned tooling:
+
+- `tools/phase51j_observed_horizon_recovery.py` consumes a redacted Phase 5.1h
+  feature audit pack, the canonical P-fill manifest, and Phase 5.1e lifecycle
+  truth. It emits HOLD-only recovery labels, bucket records, and a summary.
+- The tool reads lifecycle alias fields internally but does not emit raw order
+  or decision identifiers.
+- Recovery is limited to deterministic terminal source-tick horizons. Filled
+  rows remain unresolved until a separate fill-time/source-time recovery audit
+  exists.
+
+Current 5.1j evidence:
+
+- Recovery run:
+  `runs/phase51j_observed_horizon_recovery/PHASE51J-OBSERVED-HORIZON-RECOVERY-TWO-LANE-20260502T000000Z`
+- Recovered 5.1h run:
+  `runs/phase51j_recovered_observed_pfill_feature_audit/PHASE51J-RECOVERED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Recovered 5.1i run:
+  `runs/phase51j_pfill_feature_matrix_admissibility/PHASE51J-PFILL-FEATURE-MATRIX-ADMISSIBILITY-RECOVERED-TWO-LANE-20260502T000000Z`
+- Gate remains `HOLD` with recovered matrix reason
+  `phase51i_missing_observed_horizon_features`.
+- Redaction status: `PASS`; raw identifier input present: `0`.
+- Matrix labels: `4527`; filled: `461`; terminal not-filled: `4066`.
+- Input observed horizon available/missing: `18` / `4509`.
+- Recovered deterministic terminal horizons: `4048`.
+- Recovered observed horizon available/missing: `4066` / `461`.
+- Remaining missing horizons are filled-order rows requiring a separate
+  timebase treatment.
+- Matrix blockers remain: `missing_observed_horizon_features`,
+  `lighter_native_limit_pressure_not_fully_observed`,
+  `maker_taker_not_fully_observed_for_filled_orders`,
+  `sparse_pfill_feature_buckets`, and
+  `observed_only_selection_bias_not_resolved`.
+
+5.1j artifacts:
+
+```text
+2ab20ec4d916e9f61b758ab5fc54d6cc70cb23c75975db56a5b2d4d69f2922bf  observed_horizon_recovery_summary.json
+9ba357b41753dbc7cc9f7592497abf81dc5a6474b2b15963fa78627fe6413a2e  observed_horizon_recovery_buckets.jsonl
+767da905e574d5c58d73ee96a89da88295e75d1d102bc011b861e172a07f9cec  observed_horizon_recovery_labels.jsonl
+904e3d97eccbc33adee9a9c97043254881e79cda1fc71b12bcb4aa884387497f  recovered pfill_feature_audit_summary.json
+2dcce34fa99e3257a8ee06d43a6a3dbc2da23b12723c51ea33f3eed7fc182309  recovered pfill_feature_matrix_admissibility_summary.json
+775abf60df16e12913995a3834bdc69abac0ce5951e1b4acf5a7ef01d9804377  recovered pfill_feature_matrix_buckets.jsonl
+0c94a2b37c7f2e89835c1eb414555e5f521c53dc500658b1ae89c9e5aaec9194  recovered pfill_feature_matrix_blockers.jsonl
+```
+
 ### Gate 5.2 - Calibrated EV Shadow
 
 Required evidence:
@@ -646,13 +695,14 @@ curl -fsS http://127.0.0.1:9898/health/detail
 
 ## Next Command Targets
 
-After Phase 5.1i is committed and pushed, the next target is not another live
-run. Implement the next non-live evidence tool that attempts deterministic
-observed-horizon recovery from source lifecycle timing, then rerun the same
-redacted 5.1f -> 5.1g -> 5.1h -> 5.1i chain. The acceptance condition is a
-measurable reduction in `observed_horizon_missing_count` without introducing
-raw identifiers, live/canary/capital/risk authorization, or selection-bias
-shortcuts.
+After Phase 5.1j is committed and pushed, the next target is not another live
+run. Implement the next non-live evidence tool that resolves filled-order
+horizon/timebase coverage without using model assumptions, financial claims, or
+incompatible `fill_time_ms` substitutions. In parallel, continue read-only
+Lighter native-limit and maker/taker evidence enrichment. The acceptance
+condition is another measurable reduction in blocker counts without
+introducing raw identifiers, live/canary/capital/risk authorization, or
+selection-bias shortcuts.
 
 ## Current Verdict
 

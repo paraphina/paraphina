@@ -667,6 +667,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1i P_fill feature-matrix admissibility gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51i_pfill_feature_matrix_admissibility.py"
+
+    def _get_phase51j_observed_horizon_recovery_path(self) -> Path:
+        """Get path to the Phase 5.1j observed-horizon recovery gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51j_observed_horizon_recovery.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -3648,8 +3653,9 @@ class TestValidatorSubprocess(unittest.TestCase):
             canonical_run = tmp_path / "canonical"
             queue_run = tmp_path / "queue"
             markout_run = tmp_path / "markout"
+            horizon_recovery_run = tmp_path / "horizon_recovery"
             output_root = tmp_path / "phase51h"
-            for path in [observed_run, quarantine_run, canonical_run, queue_run, markout_run]:
+            for path in [observed_run, quarantine_run, canonical_run, queue_run, markout_run, horizon_recovery_run]:
                 path.mkdir()
             source_sha = "source-sha-phase51h"
             baseline = "18dd09512288a85e440d3977e32432c3aabc1190"
@@ -3698,7 +3704,7 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "p_fill_outcome": 0.0,
                     "fill_count": 0,
                     "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 0},
-                    "observed_horizon_source_ticks": 3,
+                    "observed_horizon_source_ticks": None,
                     "terminal_event_count": 1,
                     "terminal_action_first": "cancel",
                     "approved_for_live": False,
@@ -3820,6 +3826,61 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "admissible_for_ev_admission": False,
             }), encoding="utf-8")
 
+            (horizon_recovery_run / "observed_horizon_recovery_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "phase51j_recovery",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "phase51j_observed_horizon_recovery_partial_horizon_missing",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "no_live_flag": True,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "raw_identifier_redaction_status": "PASS",
+                "label_count": 2,
+                "recovery_status_counts": {
+                    "FILL_HORIZON_REQUIRES_SEPARATE_TIMEBASE": 1,
+                    "RECOVERED_TERMINAL_SOURCE_TICKS": 1,
+                },
+            }), encoding="utf-8")
+            with (horizon_recovery_run / "observed_horizon_recovery_labels.jsonl").open("w", encoding="utf-8") as f:
+                for seq, (group_id, order_key, venue, side, status, effective) in enumerate([
+                    ("group-filled", "canonical-filled", "lighter", "BID", "FILL_HORIZON_REQUIRES_SEPARATE_TIMEBASE", None),
+                    ("group-not-filled", "canonical-not-filled", "aster", "ASK", "RECOVERED_TERMINAL_SOURCE_TICKS", 3),
+                ], start=1):
+                    f.write(json.dumps({
+                        "schema_version": 1,
+                        "label_type": "PHASE51J_OBSERVED_HORIZON_RECOVERY_LABEL",
+                        "label_seq": seq,
+                        "run_id": "phase51j_recovery",
+                        "baseline_commit": baseline,
+                        "gate_status": "HOLD",
+                        "approved_for_live": False,
+                        "approved_for_model_training": False,
+                        "approved_for_canary": False,
+                        "approved_for_capital_escalation": False,
+                        "admissible_for_financial_claim": False,
+                        "admissible_for_ev_admission": False,
+                        "no_live_flag": True,
+                        "live_orders_allowed": False,
+                        "capital_change_allowed": False,
+                        "risk_limit_relaxation_allowed": False,
+                        "raw_identifier_redaction_status": "PASS",
+                        "canonical_group_id": group_id,
+                        "canonical_order_key": order_key,
+                        "source_telemetry_sha256": source_sha,
+                        "venue_id": venue,
+                        "side": side,
+                        "recovery_status": status,
+                        "effective_observed_horizon_source_ticks": effective,
+                    }) + "\n")
+
             result = subprocess.run(
                 [
                     sys.executable,
@@ -3834,6 +3895,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(queue_run),
                     "--markout-readiness-run",
                     str(markout_run),
+                    "--horizon-recovery-run",
+                    str(horizon_recovery_run),
                     "--output-root",
                     str(output_root),
                     "--run-id",
@@ -3857,6 +3920,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(summary["native_limit_partial_count"], 1)
             self.assertEqual(summary["markout_source_available_count"], 2)
             self.assertEqual(summary["raw_identifier_input_present_count"], 1)
+            self.assertEqual(summary["horizon_recovery_applied_count"], 1)
+            self.assertEqual(summary["horizon_recovered_terminal_count"], 1)
             self.assertEqual(summary["excluded_quarantine_count"], 4)
             self.assertFalse(summary["approved_for_model_training"])
             self.assertFalse(summary["admissible_for_ev_admission"])
@@ -3873,6 +3938,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(labels[0]["queue_churn_join_status"], "JOINED_ALL_SOURCE_KEYS")
             self.assertEqual(labels[0]["native_limit_pressure_status"], "PARTIAL")
             self.assertEqual(labels[1]["maker_taker_feature_status"], "NO_FILL_NOT_APPLICABLE")
+            self.assertTrue(labels[1]["horizon_recovery_applied"])
+            self.assertEqual(labels[1]["observed_horizon_source_ticks"], 3)
 
             buckets = [
                 json.loads(line)
@@ -3960,6 +4027,293 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(unsafe.returncode, 2)
             self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
 
+    def test_phase51j_observed_horizon_recovery_recovers_terminal_horizons_hold_only(self):
+        """Observed-horizon recovery should recover terminal source ticks without emitting raw IDs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            feature_run = tmp_path / "phase51h"
+            canonical_run = tmp_path / "canonical"
+            lifecycle_run = tmp_path / "lifecycle_truth"
+            label_lake_run = tmp_path / "label_lake"
+            output_root = tmp_path / "phase51j"
+            for path in [feature_run, canonical_run, lifecycle_run, label_lake_run]:
+                path.mkdir()
+            source_sha = "source-sha-phase51j"
+            baseline = "18dd09512288a85e440d3977e32432c3aabc1190"
+            group_terminal = f"{source_sha}:order_label_seq:101"
+            group_existing = f"{source_sha}:order_label_seq:201"
+            group_fill = f"{source_sha}:order_label_seq:301"
+
+            feature_summary = {
+                "schema_version": 1,
+                "run_id": "phase51h_redacted",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "phase51h_missing_observed_horizon_features",
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "no_live_flag": True,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "source_telemetry_sha256_list": [source_sha],
+                "raw_identifier_input_present_count": 0,
+                "label_count": 3,
+                "observed_horizon_available_count": 1,
+                "observed_horizon_missing_count": 2,
+            }
+            (feature_run / "pfill_feature_audit_summary.json").write_text(json.dumps(feature_summary), encoding="utf-8")
+            feature_labels = [
+                {
+                    "schema_version": 1,
+                    "label_type": "PHASE51H_PFILL_FEATURE_COVERAGE_LABEL",
+                    "label_seq": 1,
+                    "run_id": "phase51h_redacted",
+                    "baseline_commit": baseline,
+                    "gate_status": "HOLD",
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "approved_for_capital_escalation": False,
+                    "admissible_for_financial_claim": False,
+                    "admissible_for_ev_admission": False,
+                    "no_live_flag": True,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                    "canonical_group_id": group_terminal,
+                    "canonical_order_key": "canonical-terminal",
+                    "source_telemetry_sha256": source_sha,
+                    "venue_id": "lighter",
+                    "side": "BID",
+                    "order_holdout_split": "TRAIN",
+                    "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                    "p_fill_outcome": 0.0,
+                    "observed_horizon_source_ticks": None,
+                    "raw_identifier_input_present": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "PHASE51H_PFILL_FEATURE_COVERAGE_LABEL",
+                    "label_seq": 2,
+                    "run_id": "phase51h_redacted",
+                    "baseline_commit": baseline,
+                    "gate_status": "HOLD",
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "approved_for_capital_escalation": False,
+                    "admissible_for_financial_claim": False,
+                    "admissible_for_ev_admission": False,
+                    "no_live_flag": True,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                    "canonical_group_id": group_existing,
+                    "canonical_order_key": "canonical-existing",
+                    "source_telemetry_sha256": source_sha,
+                    "venue_id": "aster",
+                    "side": "ASK",
+                    "order_holdout_split": "HOLDOUT",
+                    "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                    "p_fill_outcome": 0.0,
+                    "observed_horizon_source_ticks": 2,
+                    "raw_identifier_input_present": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "PHASE51H_PFILL_FEATURE_COVERAGE_LABEL",
+                    "label_seq": 3,
+                    "run_id": "phase51h_redacted",
+                    "baseline_commit": baseline,
+                    "gate_status": "HOLD",
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "approved_for_capital_escalation": False,
+                    "admissible_for_financial_claim": False,
+                    "admissible_for_ev_admission": False,
+                    "no_live_flag": True,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                    "canonical_group_id": group_fill,
+                    "canonical_order_key": "canonical-fill",
+                    "source_telemetry_sha256": source_sha,
+                    "venue_id": "lighter",
+                    "side": "BID",
+                    "order_holdout_split": "TRAIN",
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "observed_horizon_source_ticks": None,
+                    "raw_identifier_input_present": False,
+                },
+            ]
+            with (feature_run / "pfill_feature_coverage_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in feature_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            (canonical_run / "canonical_pfill_outcome_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "canonical",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            with (canonical_run / "source_to_canonical_order_manifest.jsonl").open("w", encoding="utf-8") as f:
+                for group_id, order_key in [
+                    (group_terminal, "source-terminal"),
+                    (group_existing, "source-existing"),
+                    (group_fill, "source-fill"),
+                ]:
+                    f.write(json.dumps({
+                        "canonical_group_id": group_id,
+                        "canonical_order_key": f"canonical-{order_key}",
+                        "source_order_key": order_key,
+                        "source_telemetry_sha256": source_sha,
+                    }) + "\n")
+
+            (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "label_lake",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            lifecycle_labels = [
+                (101, "place", "intent", 10, "raw-decision-terminal"),
+                (102, "cancel", "ack", 13, "raw-decision-terminal"),
+                (201, "place", "intent", 20, "raw-decision-existing"),
+                (202, "cancel", "ack", 22, "raw-decision-existing"),
+                (301, "place", "intent", 30, "raw-decision-fill"),
+            ]
+            with (label_lake_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for seq, action, status, source_t, decision_id in lifecycle_labels:
+                    f.write(json.dumps({
+                        "schema_version": 1,
+                        "label_type": "ORDER_LIFECYCLE_LABEL",
+                        "label_seq": seq,
+                        "run_id": "label_lake",
+                        "baseline_commit": baseline,
+                        "source_telemetry_sha256": source_sha,
+                        "venue_id": "lighter",
+                        "action": action,
+                        "status": status,
+                        "source_t": source_t,
+                        "decision_id": decision_id,
+                        "client_order_id_hash": hashlib.sha256(decision_id.encode("utf-8")).hexdigest(),
+                        "approved_for_model_training": False,
+                        "approved_for_live": False,
+                        "approved_for_canary": False,
+                        "admissible_for_ev_admission": False,
+                    }) + "\n")
+            labels_sha = hashlib.sha256((label_lake_run / "labels.jsonl").read_bytes()).hexdigest()
+
+            (lifecycle_run / "lifecycle_truth_audit_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "lifecycle_truth",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "phase51e_test",
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "admissible_for_ev_admission": False,
+                "source_inputs": [
+                    {
+                        "source_telemetry_sha256": source_sha,
+                        "label_lake_run": str(label_lake_run),
+                        "label_lake_labels_sha256": labels_sha,
+                    }
+                ],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51j_observed_horizon_recovery_path()),
+                    "--feature-audit-run",
+                    str(feature_run),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--lifecycle-truth-run",
+                    str(lifecycle_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51j_recovery_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51j_recovery_test"
+            summary = json.loads((run_dir / "observed_horizon_recovery_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["raw_identifier_redaction_status"], "PASS")
+            self.assertEqual(summary["label_count"], 3)
+            self.assertEqual(summary["input_observed_horizon_missing_count"], 2)
+            self.assertEqual(summary["recovered_terminal_horizon_count"], 1)
+            self.assertEqual(summary["effective_observed_horizon_missing_count"], 1)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["admissible_for_ev_admission"])
+
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "observed_horizon_recovery_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            by_group = {label["canonical_group_id"]: label for label in labels}
+            self.assertEqual(by_group[group_terminal]["recovery_status"], "RECOVERED_TERMINAL_SOURCE_TICKS")
+            self.assertEqual(by_group[group_terminal]["effective_observed_horizon_source_ticks"], 3)
+            self.assertEqual(by_group[group_existing]["recovery_status"], "PRESERVED_EXISTING_OBSERVED_HORIZON")
+            self.assertEqual(by_group[group_fill]["recovery_status"], "FILL_HORIZON_REQUIRES_SEPARATE_TIMEBASE")
+            self.assertNotIn("decision_id", json.dumps(labels))
+            self.assertNotIn("raw-decision-terminal", json.dumps(labels))
+
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
+            feature_labels[0]["decision_id"] = "raw-id-blocks-input"
+            with (feature_run / "pfill_feature_coverage_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in feature_labels:
+                    f.write(json.dumps(label) + "\n")
+            raw_id = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51j_observed_horizon_recovery_path()),
+                    "--feature-audit-run",
+                    str(feature_run),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--lifecycle-truth-run",
+                    str(lifecycle_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51j_raw_id_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(raw_id.returncode, 2)
+            self.assertIn("raw identifier field", raw_id.stderr)
+
     def test_phase51i_pfill_feature_matrix_admissibility_holds_redacted_matrix(self):
         """Feature-matrix admissibility should require redacted input and remain HOLD-only."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4013,6 +4367,15 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "markout_source_available_count": 2,
                 "markout_source_missing_count": 0,
                 "raw_identifier_input_present_count": 0,
+                "horizon_recovery_run": "/tmp/phase51j_recovery",
+                "horizon_recovery_status_counts": {
+                    "RECOVERED_TERMINAL_SOURCE_TICKS": 1,
+                    "FILL_HORIZON_REQUIRES_SEPARATE_TIMEBASE": 1,
+                },
+                "horizon_recovery_applied_count": 1,
+                "horizon_recovered_terminal_count": 1,
+                "horizon_recovery_preserved_existing_count": 0,
+                "horizon_recovery_fill_timebase_remaining_count": 1,
                 "missing_feature_total": 3,
             }
             (feature_run / "pfill_feature_audit_summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -4112,6 +4475,10 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "markout_source_available_count": 2,
                     "markout_source_missing_count": 0,
                     "raw_identifier_input_present_count": 0,
+                    "horizon_recovery_applied_count": 1,
+                    "horizon_recovered_terminal_count": 1,
+                    "horizon_recovery_preserved_existing_count": 0,
+                    "horizon_recovery_fill_timebase_remaining_count": 1,
                     "missing_feature_total": 3,
                 },
                 {
@@ -4158,6 +4525,10 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "markout_source_available_count": 1,
                     "markout_source_missing_count": 0,
                     "raw_identifier_input_present_count": 0,
+                    "horizon_recovery_applied_count": 1,
+                    "horizon_recovered_terminal_count": 1,
+                    "horizon_recovery_preserved_existing_count": 0,
+                    "horizon_recovery_fill_timebase_remaining_count": 0,
                     "missing_feature_total": 0,
                 },
             ]
@@ -4188,6 +4559,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(matrix_summary["raw_identifier_redaction_status"], "PASS")
             self.assertEqual(matrix_summary["label_count"], 2)
             self.assertEqual(matrix_summary["observed_horizon_missing_count"], 1)
+            self.assertEqual(matrix_summary["horizon_recovery_applied_count"], 1)
+            self.assertEqual(matrix_summary["horizon_recovered_terminal_count"], 1)
             self.assertIn("missing_observed_horizon_features", matrix_summary["matrix_blocker_ids"])
             self.assertIn("observed_only_selection_bias_not_resolved", matrix_summary["matrix_blocker_ids"])
             self.assertEqual(matrix_summary["excluded_quarantine_count"], 4)

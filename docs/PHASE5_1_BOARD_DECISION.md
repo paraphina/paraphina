@@ -25,9 +25,9 @@ Current economic/profitability decision: `HOLD`
 
 ## Current Superseding Status
 
-As of the Phase 5.1g canonical P-fill quarantine review gate, the board
-decision remains `PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are
-now more specific:
+As of the Phase 5.1j observed-horizon recovery gate, the board decision remains
+`PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are now more
+specific:
 
 - Phase 5.1d showed `8611 / 11935` P-fill labels were censored as
   `NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW`.
@@ -60,11 +60,20 @@ now more specific:
   artifacts but not emitted, `4509` labels lack observed horizon timing,
   Lighter native limits are only partial for `2288` labels, and filled-order
   maker/taker status is incomplete for `287` labels.
+- Phase 5.1i rebuilds the same feature-matrix path from redacted inputs:
+  `raw_identifier_input_present_count=0` and
+  `raw_identifier_redaction_status=PASS`, but the matrix remains `HOLD`
+  because `4509` observed horizons are still missing.
+- Phase 5.1j recovers deterministic terminal source-tick horizons for `4048`
+  canonical terminal-not-filled labels, increasing observed horizon coverage
+  from `18 / 4527` to `4066 / 4527`. It deliberately leaves `461`
+  filled-order horizons unresolved rather than fabricating timing from
+  incompatible fill-time fields.
 - 5.1 remains `HOLD` for model training, EV admission, live orders, canary,
   capital escalation, risk-limit relaxation, and financial claims until the
-  upstream raw-ID hygiene, observed-only calibration policy, feature
-  completeness, venue-native truth gaps, and downstream calibration readiness
-  are accepted.
+  remaining fill-horizon timebase, observed-only calibration policy,
+  feature completeness, venue-native truth gaps, and downstream calibration
+  readiness are accepted.
 
 ## Baseline
 
@@ -270,4 +279,56 @@ Implement a non-live observed-horizon recovery audit/tool, then rerun the
 redacted 5.1f -> 5.1g -> 5.1h -> 5.1i chain. The target is reducing
 observed_horizon_missing_count without weakening redaction, quarantine,
 selection-bias, venue-native, or safety holds.
+```
+
+## Phase 5.1j Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live feature-completeness evidence
+step: fill-horizon/source-time recovery plus venue-native and maker/taker
+evidence improvement.
+
+Rationale:
+
+- Observed-horizon recovery passed as a non-live evidence improvement. It
+  recovered deterministic terminal source-tick horizons for `4048` canonical
+  terminal-not-filled labels and preserved `18` existing horizons.
+- The matrix still remains non-admissible because the remaining `461` missing
+  horizons are filled-order rows that need a separate fill-time/source-time
+  treatment; they were not fabricated from `fill_time_ms`.
+- The redacted recovered 5.1h -> 5.1i chain keeps
+  `raw_identifier_input_present_count=0` and
+  `raw_identifier_redaction_status=PASS`.
+- Other blockers remain: partial Lighter native-limit context for `2288`
+  labels, incomplete maker/taker status on `287` fills, sparse venue/side
+  buckets, and `1613` excluded quarantine/review groups.
+- No live, canary, capital, risk-limit, or strategy execution behavior changed.
+
+Current evidence boundary:
+
+```text
+Phase 5.1j - Observed-horizon recovery
+runs/phase51j_observed_horizon_recovery/PHASE51J-OBSERVED-HORIZON-RECOVERY-TWO-LANE-20260502T000000Z
+gate_status: HOLD
+gate_reason: phase51j_observed_horizon_recovery_partial_horizon_missing
+raw_identifier_redaction_status: PASS
+
+Phase 5.1j - Recovered P-fill feature-matrix admissibility
+runs/phase51j_pfill_feature_matrix_admissibility/PHASE51J-PFILL-FEATURE-MATRIX-ADMISSIBILITY-RECOVERED-TWO-LANE-20260502T000000Z
+gate_status: HOLD
+gate_reason: phase51i_missing_observed_horizon_features
+observed_horizon_available_count: 4066
+observed_horizon_missing_count: 461
+```
+
+Next move:
+
+```text
+Implement a non-live filled-order horizon/timebase recovery audit that maps
+filled rows to source-tick or exchange-time lifecycle/fill evidence without
+using model assumptions or financial claims. In parallel, continue
+read-only Lighter native-limit and maker/taker evidence enrichment. Rerun the
+same recovered 5.1h -> 5.1i chain and keep all safety holds intact.
 ```
