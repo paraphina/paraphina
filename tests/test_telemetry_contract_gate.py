@@ -955,12 +955,37 @@ class TestValidatorSubprocess(unittest.TestCase):
                 self.assertEqual(metadata["baseline_commit"], ev["baseline_commit"])
                 self.assertTrue(metadata["no_live_flag"])
                 self.assertEqual(metadata["input_sha256"], hashlib.sha256(input_path.read_bytes()).hexdigest())
+                self.assertEqual(metadata["input_artifact_mode"], "copy")
                 self.assertFalse(metadata["approved_for_live"])
                 self.assertFalse(metadata["approved_for_canary"])
                 self.assertFalse(metadata["approved_for_capital_escalation"])
                 self.assertFalse(metadata["live_orders_allowed"])
                 self.assertFalse(metadata["capital_change_allowed"])
                 self.assertFalse(metadata["risk_limit_relaxation_allowed"])
+
+            ref_run_id = f"{run_id}_reference"
+            reference = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51_shadow_path()),
+                    "--input-telemetry",
+                    str(input_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    ref_run_id,
+                    "--input-artifact-mode",
+                    "reference",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(reference.returncode, 0, f"stdout: {reference.stdout}\nstderr: {reference.stderr}")
+            ref_dir = output_root / ref_run_id
+            self.assertFalse((ref_dir / "input_telemetry.source.jsonl").exists())
+            ref_manifest = json.loads((ref_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(ref_manifest["metadata"]["input_artifact_mode"], "reference")
+            self.assertEqual(ref_manifest["metadata"]["input_sha256"], hashlib.sha256(input_path.read_bytes()).hexdigest())
 
             telemetry_hash = hashlib.sha256(telemetry_path.read_bytes()).hexdigest()
             manifest_hash = hashlib.sha256((run_dir / "manifest.json").read_bytes()).hexdigest()

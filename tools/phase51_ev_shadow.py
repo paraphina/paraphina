@@ -453,6 +453,7 @@ def run(
     input_telemetry: Path | None,
     run_id: str | None,
     replay_timestamp_ns: int | None = None,
+    input_artifact_mode: str = "copy",
 ) -> Path:
     spec = _load_json(spec_path)
     _validate_spec(spec)
@@ -465,6 +466,8 @@ def run(
     )
     if input_path and not input_path.is_absolute():
         input_path = ROOT / input_path
+    if input_artifact_mode not in {"copy", "reference"}:
+        raise ValueError("input_artifact_mode must be copy or reference")
     input_sha256 = _sha256(input_path) if input_path else None
     timestamp_ns = replay_timestamp_ns or _derive_replay_timestamp_ns(spec, run_id, input_sha256)
     replay_created_utc = _timestamp_ns_to_utc(timestamp_ns)
@@ -474,6 +477,7 @@ def run(
     resolved_spec["spec_path"] = str(spec_path)
     resolved_spec["input_telemetry"] = str(input_path) if input_path else spec.get("input_telemetry")
     resolved_spec["input_sha256"] = input_sha256
+    resolved_spec["input_artifact_mode"] = input_artifact_mode
     resolved_spec["output_dir"] = str(out_dir)
     resolved_spec["replay_timestamp_ns"] = timestamp_ns
     resolved_spec["replay_created_utc"] = replay_created_utc
@@ -579,6 +583,9 @@ def run(
         "created_utc_semantics": "deterministic_replay_timestamp_not_wall_clock",
         "python_version": sys.version.split()[0],
         "replay_timestamp_ns": timestamp_ns,
+        "input_telemetry": str(input_path) if input_path else None,
+        "input_sha256": input_sha256,
+        "input_artifact_mode": input_artifact_mode,
     }
 
     artifact_paths = [
@@ -593,7 +600,7 @@ def run(
     _write_json(artifact_paths[2], summary)
     _write_json(artifact_paths[3], gate)
     _write_json(artifact_paths[4], command_log)
-    if input_path:
+    if input_path and input_artifact_mode == "copy":
         copied = out_dir / "input_telemetry.source.jsonl"
         shutil.copyfile(input_path, copied)
         artifact_paths.append(copied)
@@ -612,6 +619,8 @@ def run(
         "capital_change_allowed": False,
         "risk_limit_relaxation_allowed": False,
         "input_sha256": input_sha256,
+        "input_telemetry": str(input_path) if input_path else None,
+        "input_artifact_mode": input_artifact_mode,
         "replay_timestamp_ns": timestamp_ns,
         "replay_created_utc": replay_created_utc,
     }
@@ -638,6 +647,12 @@ def main() -> int:
         default=None,
         help="Optional deterministic base timestamp for replay events.",
     )
+    parser.add_argument(
+        "--input-artifact-mode",
+        choices=("copy", "reference"),
+        default="copy",
+        help="Use 'reference' for large immutable inputs: record path and SHA without copying the source JSONL.",
+    )
     args = parser.parse_args()
 
     try:
@@ -647,6 +662,7 @@ def main() -> int:
             args.input_telemetry,
             args.run_id,
             replay_timestamp_ns=args.replay_timestamp_ns,
+            input_artifact_mode=args.input_artifact_mode,
         )
     except Exception as exc:
         print(f"phase51_ev_shadow: ERROR: {exc}", file=sys.stderr)
