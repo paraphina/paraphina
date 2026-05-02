@@ -617,6 +617,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c order-level P_fill outcome gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_pfill_outcome_labels.py"
+
+    def _get_phase51c_pfill_calibration_readiness_path(self) -> Path:
+        """Get path to the Phase 5.1c P_fill calibration-readiness gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_pfill_calibration_readiness.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -2136,6 +2141,151 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(mismatch.returncode, 2)
             self.assertIn("source_telemetry_sha256", mismatch.stderr)
+
+    def test_phase51c_pfill_calibration_readiness_preserves_splits_and_censoring(self):
+        """P_fill readiness should summarize immutable splits without approving training."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            pfill_run = tmp_path / "pfill_outcome"
+            output_root = tmp_path / "pfill_readiness"
+            pfill_run.mkdir()
+            labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "order_key": "order-1",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "terminal_action_first": None,
+                    "observed_horizon_source_ticks": 5,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "order_key": "order-2",
+                    "order_holdout_split": "HOLDOUT",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                    "p_fill_outcome": 0.0,
+                    "terminal_action_first": "cancel",
+                    "observed_horizon_source_ticks": 2,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "order_key": "order-3",
+                    "order_holdout_split": "TRAIN",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "terminal_action_first": None,
+                    "observed_horizon_source_ticks": None,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (pfill_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "pfill_source",
+                "gate_status": "HOLD",
+                "gate_reason": "pfill_outcome_contains_censored_orders",
+                "source_telemetry_sha256": "source-sha-readiness",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_calibration_readiness_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_readiness_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--min-observed-per-bucket",
+                    "2",
+                    "--min-holdout-observed-per-bucket",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_pfill_readiness_test"
+            summary = json.loads((run_dir / "pfill_calibration_readiness_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["gate_reason"], "pfill_calibration_contains_censored_orders")
+            self.assertEqual(summary["order_label_count"], 3)
+            self.assertEqual(summary["observed_count"], 2)
+            self.assertEqual(summary["filled_count"], 1)
+            self.assertEqual(summary["not_filled_count"], 1)
+            self.assertEqual(summary["censored_count"], 1)
+            self.assertEqual(summary["missing_observed_horizon_count"], 1)
+            self.assertEqual(summary["terminal_action_counts"]["cancel"], 1)
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            buckets = [
+                json.loads(line)
+                for line in (run_dir / "pfill_calibration_buckets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            global_bucket = next(bucket for bucket in buckets if bucket["bucket_id"] == "GLOBAL")
+            self.assertEqual(global_bucket["observed_fill_rate"], 0.5)
+            self.assertIsNotNone(global_bucket["observed_fill_rate_ci_low_95"])
+            split_manifest = [
+                json.loads(line)
+                for line in (run_dir / "pfill_order_split_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(split_manifest), 3)
+            self.assertEqual({row["order_key"] for row in split_manifest}, {"order-1", "order-2", "order-3"})
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    file_info["sha256"],
+                    file_info["path"],
+                )
+
+            labels.append({
+                **labels[0],
+                "order_holdout_split": "HOLDOUT",
+            })
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            conflict = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_pfill_calibration_readiness_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_pfill_readiness_conflict_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(conflict.returncode, 2)
+            self.assertIn("conflicting order_holdout_split", conflict.stderr)
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

@@ -928,6 +928,68 @@ e0ad36ed92f94f320a548fd48961ccde0c6c5efb07a1e6a5d4f72508504c4d4d  pfill_order_la
 34fcf5d99c1212421de97b2831a166a362a419213dc762edc7ebd0f9300f6792  evidence_pack/artifact_index.json
 ```
 
+## PHASE51C-PFILL-CALIBRATION-READINESS-TWO-LANE
+
+- Run id:
+  `PHASE51C-PFILL-CALIBRATION-READINESS-TWO-LANE-20260502`
+- Local run directory:
+  `runs/phase51c_pfill_calibration_readiness/PHASE51C-PFILL-CALIBRATION-READINESS-TWO-LANE-20260502`
+- Purpose: aggregate the two balance-backed P_fill outcome lanes into a
+  HOLD-only calibration-readiness pack that preserves immutable order
+  train/holdout splits, audits censoring, and computes Wilson 95% fill-rate
+  intervals without training a model.
+- Source telemetry SHA256 inputs:
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`,
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
+- Input P_fill outcome runs:
+  `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`,
+  `runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z`
+- Gate status: `HOLD`
+- Gate reason: `pfill_calibration_contains_censored_orders`
+- Bucket fields: `venue_id`, `side`
+- Bucket count: `16`
+- Order labels: `11935`
+- Observed non-censored outcomes: `3324`
+- Filled orders: `489`
+- Terminal not-filled orders: `2835`
+- Censored/unobserved orders: `8611`
+- Censored rate: `0.7214914118139925`
+- Train observed outcomes: `2655`
+- Train filled outcomes: `382`
+- Train censored labels: `6933`
+- Holdout observed outcomes: `669`
+- Holdout filled outcomes: `107`
+- Holdout censored labels: `1678`
+- Global observed fill rate: `0.14711191335740073`
+- Global observed fill-rate Wilson 95% CI:
+  `[0.13547763363313772, 0.15956089839135207]`
+- Missing observed horizon fields: `9029`
+- Terminal action counts: `NONE=9029`, `cancel=2551`, `replace=355`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_pfill_calibration_readiness.py \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z \
+  --run-id PHASE51C-PFILL-CALIBRATION-READINESS-TWO-LANE-20260502
+```
+
+Artifact hashes:
+
+```text
+678cda5831e0a007dfa8947d7a3d285845e5897cead9729de16103f97c60df97  pfill_calibration_buckets.jsonl
+5383610e1387a59882d6cdb494be30624dcf19a5cacc0f3c5e5fd6b95642c5ab  pfill_order_split_manifest.jsonl
+ad236c4b40f08e1929edea2ce2d874ace6ebaba2f911664c6c2e85582a085b43  pfill_calibration_readiness_summary.json
+91b86a13311a5f5b9496d31cc3f99f805e6d4bcdcbf766061deff86f88c82ff5  evidence_pack/artifact_index.json
+```
+
 ## PHASE51C-LABEL-LAKE-20260502T004621Z
 
 - Run id: `PHASE51C-LABEL-LAKE-20260502T004621Z`

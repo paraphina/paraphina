@@ -142,6 +142,17 @@ Current repo-owned tooling:
   `8611` censored/unobserved. This is sufficient as a repo-owned outcome-label
   scaffold but not sufficient for model training because censoring and sparse
   observed fills remain unresolved.
+- `tools/phase51c_pfill_calibration_readiness.py` consumes one or more
+  P_fill outcome packs and emits HOLD-only calibration-readiness records. It
+  preserves existing `order_holdout_split` assignments, writes an order split
+  manifest, computes Wilson 95% fill-rate intervals on observed non-censored
+  labels, and refuses training/live/canary/economic authorization.
+- Current P_fill calibration-readiness evidence across the same two lanes:
+  `11935` order labels, `3324` observed outcomes, `489` filled, `2835`
+  terminal not-filled, `8611` censored, `669` holdout observed outcomes, and
+  `16` venue/side buckets including the global bucket. Gate remains `HOLD`
+  because `72.14914118139925%` of labels are censored and feature-rich
+  calibration requirements are not met.
 - 5.1c remains `HOLD`. No model training, live, canary, capital escalation,
   risk-limit relaxation, or financial claim is authorized from the current
   pack.
