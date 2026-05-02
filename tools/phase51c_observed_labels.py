@@ -261,12 +261,13 @@ def _extract_fill_labels(
     markout_horizons_ms: list[int],
     lighter_trade_roles: dict[str, str],
     labels_file,
-) -> tuple[int, int, dict[str, int], dict[str, int]]:
+) -> tuple[int, int, dict[str, int], dict[str, int], dict[str, dict[str, int]]]:
     fill_count = 0
     markout_count = 0
     label_seq = 0
     per_venue: dict[str, int] = {}
     role_counts: dict[str, int] = {}
+    role_counts_by_venue: dict[str, dict[str, int]] = {}
     pending_markouts: list[dict[str, Any]] = []
     for line_no, record in _iter_json_stream(source_telemetry):
         record_time_ms = _record_time_ms(record)
@@ -339,6 +340,11 @@ def _extract_fill_labels(
             role, role_source = _maker_taker_role(fill, lighter_trade_roles)
             per_venue[venue_id] = per_venue.get(venue_id, 0) + 1
             role_counts[role] = role_counts.get(role, 0) + 1
+            venue_role_counts = role_counts_by_venue.setdefault(
+                venue_id,
+                {"MAKER": 0, "TAKER": 0, "UNKNOWN": 0},
+            )
+            venue_role_counts[role] = venue_role_counts.get(role, 0) + 1
             markout_value = fill.get("markout_pnl_short")
             markout_status = "OBSERVED" if markout_value is not None else "MISSING"
             label_seq += 1
@@ -439,7 +445,7 @@ def _extract_fill_labels(
                     "fill_time_ms": fill_time_ms,
                     "remaining_horizons_ms": list(markout_horizons_ms),
                 })
-    return fill_count, markout_count, per_venue, role_counts
+    return fill_count, markout_count, per_venue, role_counts, role_counts_by_venue
 
 
 def _balance_label(
@@ -537,7 +543,7 @@ def build_observed_labels(
     labels_path = out_dir / "labels.jsonl"
     lighter_trade_roles, lighter_trades_sha256 = _load_lighter_trade_role_index(lighter_trades_json)
     with labels_path.open("w", encoding="utf-8") as labels_file:
-        fill_labels, markout_labels, per_venue_fills, role_counts = _extract_fill_labels(
+        fill_labels, markout_labels, per_venue_fills, role_counts, role_counts_by_venue = _extract_fill_labels(
             source_telemetry=source_telemetry,
             run_id=run_id,
             timestamp_ns=timestamp_ns,
@@ -587,6 +593,7 @@ def build_observed_labels(
         "balance_reconciliation_status": "OBSERVED" if balance_labels else "MISSING",
         "per_venue_fill_counts": per_venue_fills,
         "maker_taker_role_counts": role_counts,
+        "maker_taker_role_counts_by_venue": role_counts_by_venue,
         "record_count": fill_labels + markout_labels + balance_labels,
     }
     _write_json(summary_path, summary)

@@ -347,6 +347,7 @@ def build_join_holdout(
         "markout_labels": observed_summary.get("markout_labels", 0),
         "balance_reconciliation_labels": balance_labels,
         "maker_taker_role_counts": observed_summary.get("maker_taker_role_counts", {}),
+        "maker_taker_role_counts_by_venue": observed_summary.get("maker_taker_role_counts_by_venue", {}),
         "reason_counts": reason_counts,
         **counts,
     }

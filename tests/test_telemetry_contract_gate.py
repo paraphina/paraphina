@@ -607,6 +607,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c deterministic join/holdout gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_join_holdout.py"
+
+    def _get_phase51c_lighter_trade_backfill_path(self) -> Path:
+        """Get path to the Phase 5.1c Lighter native trade backfill collector."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_lighter_trade_backfill.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -1654,6 +1659,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(summary["markout_label_status"], "OBSERVED")
             self.assertEqual(summary["balance_reconciliation_status"], "OBSERVED")
             self.assertEqual(summary["maker_taker_role_counts"]["MAKER"], 2)
+            self.assertEqual(summary["maker_taker_role_counts_by_venue"]["lighter"]["MAKER"], 2)
             self.assertFalse(summary["approved_for_model_training"])
             self.assertFalse(summary["approved_for_live"])
             labels = [
@@ -1849,6 +1855,86 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(mismatch_result.returncode, 2)
             self.assertIn("source_telemetry_sha256", mismatch_result.stderr)
+
+    def test_phase51c_lighter_trade_backfill_ingests_offline_pages_without_promotion(self):
+        """Trade backfill should paginate/normalize native role evidence without promotion."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            page_path = tmp_path / "trades_page.json"
+            output_root = tmp_path / "trade_backfill_runs"
+            page_path.write_text(json.dumps({
+                "next_cursor": "cursor-1",
+                "trades": [
+                    {
+                        "ask_account_id": 123,
+                        "ask_id": 11,
+                        "ask_id_str": "11",
+                        "ask_client_id": 111,
+                        "ask_client_id_str": "111",
+                        "bid_account_id": 456,
+                        "bid_id": 22,
+                        "bid_id_str": "22",
+                        "bid_client_id": 222,
+                        "bid_client_id_str": "222",
+                        "is_maker_ask": True,
+                        "timestamp": 1777448154939,
+                    },
+                    {
+                        "ask_account_id": 456,
+                        "ask_id": 33,
+                        "ask_id_str": "33",
+                        "bid_account_id": 123,
+                        "bid_id": 44,
+                        "bid_id_str": "44",
+                        "is_maker_ask": False,
+                        "timestamp": 1777448164939,
+                    },
+                ],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_lighter_trade_backfill_path()),
+                    "--page-json",
+                    str(page_path),
+                    "--account-index",
+                    "123",
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_trade_backfill_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--stop-at-or-before-ms",
+                    "1777448154939",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_trade_backfill_test"
+            summary = json.loads((run_dir / "lighter_trade_backfill_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["gate_reason"], "native_trade_backfill_readonly_attribution_input_only")
+            self.assertEqual(summary["source_mode"], "offline_page_json")
+            self.assertEqual(summary["trade_count"], 2)
+            self.assertEqual(summary["timestamp_min_ms"], 1777448154939)
+            self.assertEqual(summary["timestamp_max_ms"], 1777448164939)
+            self.assertTrue(summary["complete_to_requested_stop"])
+            self.assertEqual(summary["role_counts_for_account"], {"maker": 2, "taker": 0, "unknown": 0})
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            trades = json.loads((run_dir / "source_snapshots" / "trades_backfill.sanitized.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(trades["trades"]), 2)
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    file_info["sha256"],
+                    file_info["path"],
+                )
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

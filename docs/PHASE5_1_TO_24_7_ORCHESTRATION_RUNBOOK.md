@@ -120,10 +120,16 @@ Current repo-owned tooling:
 - Current 5.1c evidence joins all `356` observed fills to orders, all `356`
   fills to markouts, `189` fills to Lighter quote candidates, and creates a
   deterministic `295` train / `61` holdout split.
-- 5.1c remains `HOLD` because native maker/taker role attribution is still
-  incomplete for `344/356` observed fills. No model training, live, canary,
-  capital escalation, risk-limit relaxation, or financial claim is authorized
-  from the current pack.
+- `tools/phase51c_lighter_trade_backfill.py` collects paginated read-only
+  Lighter native trades for run-window-aligned maker/taker attribution. It uses
+  only the official `trades` read endpoint and remains HOLD-only evidence.
+- Current run-window Lighter backfill improved native-role attribution to
+  `64` maker and `32` taker labels. The remaining unknowns are `93` Lighter
+  fills whose telemetry IDs were absent from native trade history, plus `167`
+  non-Lighter fills outside this Lighter-only quote-candidate lane.
+- 5.1c remains `HOLD`. No model training, live, canary, capital escalation,
+  risk-limit relaxation, or financial claim is authorized from the current
+  pack.
 
 ### Gate 5.2 - Calibrated EV Shadow
 
