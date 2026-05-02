@@ -104,6 +104,17 @@ Promote condition:
 - Sparse buckets are marked `HOLD` or pooled with explicit uncertainty
   inflation.
 
+Current repo-owned tooling:
+
+- `tools/phase51c_label_lake.py` builds quote-decision and order-lifecycle
+  labels from non-live EV shadow output.
+- `tools/phase51c_observed_labels.py` builds read-only observed fill and
+  balance-reconciliation labels from existing artifacts without copying large
+  source telemetry.
+- Observed fill and balance labels do not promote 5.1c by themselves. Missing
+  multi-horizon markout, maker/taker role certainty, quote/fill joins, and
+  deterministic holdout still force `HOLD`.
+
 ### Gate 5.2 - Calibrated EV Shadow
 
 Required evidence:

@@ -597,6 +597,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c label-lake scaffold."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_label_lake.py"
+
+    def _get_phase51c_observed_labels_path(self) -> Path:
+        """Get path to the Phase 5.1c observed-label extractor."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_observed_labels.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -1489,6 +1494,142 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "ORDER_LIFECYCLE_LABEL",
                 "LABEL_COVERAGE_SUMMARY",
             ])
+            self.assertTrue(all(label["approved_for_live"] is False for label in labels))
+            self.assertTrue(all(label["admissible_for_model_training"] is False for label in labels))
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    file_info["sha256"],
+                    file_info["path"],
+                )
+
+    def test_phase51c_observed_labels_extracts_fills_and_balance_without_promotion(self):
+        """Observed labels should capture fills/balances while keeping training blocked."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            source_path = tmp_path / "phase5_source.jsonl"
+            balance_pre = tmp_path / "balance_pre_snapshot.json"
+            balance_post = tmp_path / "balance_post_snapshot.json"
+            balance_comparison = tmp_path / "balance_snapshot_comparison.json"
+            output_root = tmp_path / "observed_label_runs"
+            source_record_1 = {
+                "schema_version": 1,
+                "t": 7,
+                "fills": [{
+                    "venue_id": "lighter",
+                    "venue_index": 3,
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "fee_bps": 0.0,
+                    "purpose": "Mm",
+                    "decision_id": "d7_mm_v3_buy",
+                    "order_id": "order-1",
+                    "client_order_id": "client-1",
+                    "fill_time_ms": 1700000000000,
+                    "markout_pnl_short": None,
+                }],
+            }
+            source_record_2 = {
+                "schema_version": 1,
+                "t": 8,
+                "fills": [{
+                    "venue_id": "lighter",
+                    "venue_index": 3,
+                    "side": "Sell",
+                    "price": 101.0,
+                    "size": 0.02,
+                    "fee_bps": 0.0,
+                    "purpose": "Mm",
+                    "decision_id": "d8_mm_v3_sell",
+                    "order_id": "order-2",
+                    "client_order_id": "client-2",
+                    "fill_time_ms": 1700000000250,
+                    "markout_pnl_short": 0.001,
+                    "maker_or_taker": "maker",
+                }],
+            }
+            source_path.write_text(
+                json.dumps(source_record_1) + json.dumps(source_record_2) + "\n",
+                encoding="utf-8",
+            )
+            balance_pre.write_text(json.dumps({
+                "schema_version": 1,
+                "total_balance_usd": "100.00000000",
+                "venues": ["lighter"],
+            }), encoding="utf-8")
+            balance_post.write_text(json.dumps({
+                "schema_version": 1,
+                "total_balance_usd": "100.00100000",
+                "venues": ["lighter"],
+            }), encoding="utf-8")
+            balance_comparison.write_text(json.dumps({
+                "schema_version": 1,
+                "generated_at_utc": "2026-05-02T00:00:00Z",
+                "venues": ["lighter"],
+                "total": {
+                    "pre_usd": "100.00000000",
+                    "post_usd": "100.00100000",
+                    "delta_usd": "0.00100000",
+                },
+                "per_venue": {
+                    "lighter": {
+                        "pre_balance_usd": "100.00000000",
+                        "post_balance_usd": "100.00100000",
+                        "delta_usd": "0.00100000",
+                    },
+                },
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_observed_labels_path()),
+                    "--source-telemetry",
+                    str(source_path),
+                    "--balance-pre",
+                    str(balance_pre),
+                    "--balance-post",
+                    str(balance_post),
+                    "--balance-comparison",
+                    str(balance_comparison),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_observed_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_observed_test"
+            summary = json.loads((run_dir / "observed_label_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["fill_labels"], 2)
+            self.assertEqual(summary["markout_labels"], 1)
+            self.assertEqual(summary["balance_reconciliation_labels"], 1)
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["fill_label_status"], "OBSERVED")
+            self.assertEqual(summary["markout_label_status"], "OBSERVED")
+            self.assertEqual(summary["balance_reconciliation_status"], "OBSERVED")
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([label["label_type"] for label in labels], [
+                "OBSERVED_FILL_LABEL",
+                "OBSERVED_FILL_LABEL",
+                "OBSERVED_MARKOUT_LABEL",
+                "BALANCE_RECONCILIATION_LABEL",
+            ])
+            self.assertEqual(labels[0]["maker_taker_attribution_status"], "UNKNOWN")
+            self.assertEqual(labels[1]["maker_taker_role"], "MAKER")
             self.assertTrue(all(label["approved_for_live"] is False for label in labels))
             self.assertTrue(all(label["admissible_for_model_training"] is False for label in labels))
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))

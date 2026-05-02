@@ -195,6 +195,65 @@ d1f168393a5e36e3413c82931db6096c202b763992c7351a7d9e828e521bb0d7  labels.jsonl
 fdc37d39d4c7ec7f91440dd44d47ff8fb4d1eca5eb04c0307405ecb1b02a016f  evidence_pack/artifact_index.json
 ```
 
+## PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S
+
+- Run id: `PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T073231Z`
+- Local run directory: `runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T073231Z`
+- Source telemetry:
+  `/home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/telemetry_bounded.jsonl`
+- Source telemetry SHA256:
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- Balance pre snapshot:
+  `/home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/balance_pre_snapshot.json`
+- Balance post snapshot:
+  `/home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/balance_post_snapshot.json`
+- Balance comparison:
+  `/home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/balance_snapshot_comparison.json`
+- Gate status: `HOLD`
+- Gate reason: `observed_label_pack_missing_markout_coverage`
+- Fill labels: `356`
+- Markout labels: `0`
+- Balance reconciliation labels: `1`
+- Record count: `357`
+- Fill label status: `OBSERVED`
+- Markout label status: `MISSING`
+- Balance reconciliation status: `OBSERVED`
+- Maker/taker role counts: `UNKNOWN=356`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_observed_labels.py \
+  --source-telemetry /home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/telemetry_bounded.jsonl \
+  --balance-pre /home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/balance_pre_snapshot.json \
+  --balance-post /home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/balance_post_snapshot.json \
+  --balance-comparison /home/ubuntu/promotion_runs/phase5_reopened_terminal_stale_order_residual_requal_7200s_20260429T073231Z/live_canary/balance_snapshot_comparison.json \
+  --run-id PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T073231Z
+```
+
+Per-venue fill counts:
+
+```text
+aster: 141
+extended: 10
+hyperliquid: 4
+lighter: 189
+paradex: 12
+```
+
+Artifact hashes:
+
+```text
+01ffcf88295cf5553b47951d52aa52df0fceda15d40012760d26782006edf0b1  labels.jsonl
+5c6edfb912db0d1d5fd32ebf88d9133fa4e06898588678f18f2433fdbef85ca0  observed_label_summary.json
+6d92fedbce7419d6c394ca53ee37b49fcb44459acc67de172a8f1e98cbf1df7b  evidence_pack/artifact_index.json
+```
+
 ## PHASE51C-LABEL-LAKE-20260502T004621Z
 
 - Run id: `PHASE51C-LABEL-LAKE-20260502T004621Z`
