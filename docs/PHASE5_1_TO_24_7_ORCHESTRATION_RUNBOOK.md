@@ -156,13 +156,15 @@ Current repo-owned tooling:
 - `tools/phase51c_queue_churn_labels.py` emits HOLD-only order-level
   queue/churn proxy labels by joining P_fill order labels back to lifecycle
   events. It records replace/cancel churn, queue-reset proxy counts, terminal
-  horizons where available, and explicitly marks native-limit pressure as
-  `UNKNOWN_NO_NATIVE_LIMIT_PRESSURE_INPUT`.
+  horizons where available, and can join accepted Phase 5.1b Lighter native
+  context while keeping all live/canary/economic approvals false.
 - Current queue/churn evidence across the same two lanes: `11935` labels,
   `11935` lifecycle joins, `0` lifecycle misses, `4379` orders with churn,
   `1777` orders with replace/queue-reset proxy events, `3997` orders with
-  cancel events, and `2906` orders with terminal horizons. Gate remains `HOLD`
-  because native-limit pressure is unknown for all `11935` labels.
+  cancel events, and `2906` orders with terminal horizons. The accepted
+  Phase 5.1b Lighter native pack upgrades `6148` Lighter rows to
+  `PARTIAL_ACTIVE_ORDER_COUNT_OBSERVED_LIMIT_UNKNOWN`; `5787` non-Lighter rows
+  remain venue-native-limit unknown. Gate remains `HOLD`.
 - 5.1c remains `HOLD`. No model training, live, canary, capital escalation,
   risk-limit relaxation, or financial claim is authorized from the current
   pack.

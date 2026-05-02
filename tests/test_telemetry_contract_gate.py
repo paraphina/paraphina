@@ -2342,9 +2342,11 @@ class TestValidatorSubprocess(unittest.TestCase):
             tmp_path = Path(tmpdir)
             label_lake_run = tmp_path / "label_lake"
             pfill_run = tmp_path / "pfill_outcome"
+            native_run = tmp_path / "phase51b_native"
             output_root = tmp_path / "queue_churn"
             label_lake_run.mkdir()
             pfill_run.mkdir()
+            native_run.mkdir()
             source_sha = "source-sha-queue"
             (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
                 "run_id": "label_lake_queue_test",
@@ -2454,6 +2456,35 @@ class TestValidatorSubprocess(unittest.TestCase):
             with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
                 for label in pfill_labels:
                     f.write(json.dumps(label) + "\n")
+            (native_run / "phase51b_acceptance.json").write_text(json.dumps({
+                "run_id": "phase51b_native_test",
+                "approved_for_calibration_label_ingestion": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "approved_for_financial_claim": False,
+                "limitations": ["lighter_open_order_limit_headroom_unknown"],
+            }), encoding="utf-8")
+            with (native_run / "telemetry.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACCOUNT_LIMITS",
+                    "run_id": "phase51b_native_test",
+                    "venue_id": "lighter",
+                    "sendtx_per_minute_remaining": None,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACTIVE_ORDERS",
+                    "run_id": "phase51b_native_test",
+                    "venue_id": "lighter",
+                    "active_orders_count_total": 0,
+                    "active_orders_count_market": 0,
+                    "active_order_headroom_account": None,
+                    "active_order_headroom_market": None,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
 
             result = subprocess.run(
                 [
@@ -2469,6 +2500,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "phase51c_queue_churn_test",
                     "--timestamp-ns",
                     "1700000000000000000",
+                    "--lighter-native-limits-run",
+                    str(native_run),
                 ],
                 capture_output=True,
                 text=True,
@@ -2477,12 +2510,13 @@ class TestValidatorSubprocess(unittest.TestCase):
             run_dir = output_root / "phase51c_queue_churn_test"
             summary = json.loads((run_dir / "queue_churn_summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["gate_status"], "HOLD")
-            self.assertEqual(summary["gate_reason"], "queue_churn_native_limit_pressure_unknown")
+            self.assertEqual(summary["gate_reason"], "queue_churn_partial_lifecycle_join")
             self.assertEqual(summary["queue_churn_label_count"], 2)
             self.assertEqual(summary["matched_lifecycle_count"], 1)
             self.assertEqual(summary["unmatched_lifecycle_count"], 1)
             self.assertEqual(summary["orders_with_churn_count"], 1)
-            self.assertEqual(summary["native_limit_pressure_unknown_count"], 2)
+            self.assertEqual(summary["native_limit_pressure_unknown_count"], 0)
+            self.assertEqual(summary["native_limit_pressure_partial_count"], 2)
             self.assertFalse(summary["approved_for_model_training"])
             self.assertFalse(summary["approved_for_live"])
             labels = [
@@ -2497,7 +2531,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(joined["churn_event_count"], 2)
             self.assertEqual(joined["queue_reset_proxy_event_count"], 1)
             self.assertEqual(joined["observed_lifecycle_source_ticks"], 2)
-            self.assertEqual(joined["native_limit_pressure_status"], "UNKNOWN_NO_NATIVE_LIMIT_PRESSURE_INPUT")
+            self.assertEqual(joined["native_limit_pressure_status"], "PARTIAL_ACTIVE_ORDER_COUNT_OBSERVED_LIMIT_UNKNOWN")
+            self.assertEqual(joined["native_active_orders_count_total"], 0)
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
             for file_info in manifest["files"]:
                 artifact = run_dir / file_info["path"]
@@ -2506,6 +2541,29 @@ class TestValidatorSubprocess(unittest.TestCase):
                     file_info["sha256"],
                     file_info["path"],
                 )
+
+            pfill_labels[0]["approved_for_live"] = True
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in pfill_labels:
+                    f.write(json.dumps(label) + "\n")
+            unsafe = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_queue_churn_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_queue_churn_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

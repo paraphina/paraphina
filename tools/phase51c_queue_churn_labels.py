@@ -25,6 +25,17 @@ BASELINE_COMMIT = "18dd09512288a85e440d3977e32432c3aabc1190"
 DEFAULT_OUTPUT_ROOT = ROOT / "runs/phase51c_queue_churn"
 TERMINAL_ACTIONS = {"cancel", "replace", "cancel_all", "expire", "expired", "reject", "rejected"}
 CHURN_ACTIONS = {"cancel", "replace", "cancel_all"}
+UNSAFE_TRUE_FLAGS = {
+    "approved_for_model_training",
+    "approved_for_live",
+    "approved_for_canary",
+    "approved_for_capital_escalation",
+    "admissible_for_financial_claim",
+    "admissible_for_ev_admission",
+    "live_orders_allowed",
+    "capital_change_allowed",
+    "risk_limit_relaxation_allowed",
+}
 
 
 def _sha256_file(path: Path) -> str:
@@ -158,13 +169,17 @@ def _load_lifecycle_events(label_lake_run: Path) -> tuple[dict[str, Any], dict[t
 
 def _load_pfill_labels(pfill_outcome_run: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     summary = _load_json(pfill_outcome_run / "pfill_outcome_summary.json")
-    if summary.get("approved_for_live") is True:
-        raise ValueError(f"{pfill_outcome_run} is not an admissible non-live P_fill outcome input")
-    labels = [
-        label
-        for _, label in _iter_jsonl(pfill_outcome_run / "pfill_order_labels.jsonl")
-        if label.get("label_type") == "ORDER_PFILL_OUTCOME_LABEL"
-    ]
+    for flag in UNSAFE_TRUE_FLAGS:
+        if summary.get(flag) is True:
+            raise ValueError(f"{pfill_outcome_run} has unsafe summary flag {flag}=true")
+    labels: list[dict[str, Any]] = []
+    for _, label in _iter_jsonl(pfill_outcome_run / "pfill_order_labels.jsonl"):
+        if label.get("label_type") != "ORDER_PFILL_OUTCOME_LABEL":
+            continue
+        for flag in UNSAFE_TRUE_FLAGS:
+            if label.get(flag) is True:
+                raise ValueError(f"{pfill_outcome_run} has unsafe label flag {flag}=true")
+        labels.append(label)
     return summary, labels
 
 
@@ -245,13 +260,97 @@ def _base_label(run_id: str, seq: int, timestamp_ns: int) -> dict[str, Any]:
     }
 
 
+def _load_phase51b_lighter_context(run_dir: Path | None) -> dict[str, Any] | None:
+    if run_dir is None:
+        return None
+    acceptance_path = run_dir / "phase51b_acceptance.json"
+    telemetry_path = run_dir / "telemetry.jsonl"
+    if not acceptance_path.exists():
+        raise ValueError("Phase 5.1b native-limit run is missing phase51b_acceptance.json")
+    acceptance = _load_json(acceptance_path)
+    if acceptance.get("approved_for_calibration_label_ingestion") is not True:
+        raise ValueError("Phase 5.1b native-limit run is not approved for calibration-label ingestion")
+    for flag in ("approved_for_live", "approved_for_canary", "approved_for_capital_escalation", "approved_for_financial_claim"):
+        if acceptance.get(flag) is True:
+            raise ValueError(f"Phase 5.1b native-limit run has unsafe acceptance flag {flag}=true")
+    limits: dict[str, Any] = {}
+    active_orders: dict[str, Any] = {}
+    for _, event in _iter_jsonl(telemetry_path):
+        if event.get("approved_for_live") is True or event.get("approved_for_canary") is True:
+            raise ValueError("Phase 5.1b telemetry contains unsafe approval flags")
+        if event.get("event_type") == "V2_LIGHTER_ACCOUNT_LIMITS":
+            limits = event
+        elif event.get("event_type") == "V2_LIGHTER_ACTIVE_ORDERS":
+            active_orders = event
+    return {
+        "run_dir": str(run_dir),
+        "acceptance_sha256": _sha256_file(acceptance_path),
+        "telemetry_sha256": _sha256_file(telemetry_path),
+        "run_id": acceptance.get("run_id"),
+        "limitations": acceptance.get("limitations", []),
+        "limits": limits,
+        "active_orders": active_orders,
+    }
+
+
+def _native_limit_pressure(
+    venue_id: Any,
+    phase51b_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if phase51b_context is None:
+        return {
+            "native_limit_pressure_status": "UNKNOWN_NO_NATIVE_LIMIT_PRESSURE_INPUT",
+            "native_limit_pressure_hold_reason": "requires_phase51b_native_limit_pressure_join",
+            "native_limit_context_run": None,
+            "native_active_orders_count_total": None,
+            "native_active_orders_count_market": None,
+            "native_active_order_headroom_account": None,
+            "native_active_order_headroom_market": None,
+            "native_sendtx_per_minute_remaining": None,
+        }
+    if str(venue_id or "").lower() != "lighter":
+        return {
+            "native_limit_pressure_status": "UNKNOWN_NON_LIGHTER_NO_NATIVE_LIMIT_INPUT",
+            "native_limit_pressure_hold_reason": "requires_venue_specific_native_limit_context",
+            "native_limit_context_run": phase51b_context["run_id"],
+            "native_active_orders_count_total": None,
+            "native_active_orders_count_market": None,
+            "native_active_order_headroom_account": None,
+            "native_active_order_headroom_market": None,
+            "native_sendtx_per_minute_remaining": None,
+        }
+    limits = phase51b_context.get("limits", {})
+    active_orders = phase51b_context.get("active_orders", {})
+    headroom_account = active_orders.get("active_order_headroom_account")
+    headroom_market = active_orders.get("active_order_headroom_market")
+    sendtx_remaining = limits.get("sendtx_per_minute_remaining")
+    if any(value is not None for value in (headroom_account, headroom_market, sendtx_remaining)):
+        status = "OBSERVED_NATIVE_LIMIT_HEADROOM"
+        hold_reason = "requires_queue_reset_calibration_and_board_review"
+    else:
+        status = "PARTIAL_ACTIVE_ORDER_COUNT_OBSERVED_LIMIT_UNKNOWN"
+        hold_reason = "native_limit_capacity_not_exposed_by_phase51b_payload"
+    return {
+        "native_limit_pressure_status": status,
+        "native_limit_pressure_hold_reason": hold_reason,
+        "native_limit_context_run": phase51b_context["run_id"],
+        "native_active_orders_count_total": active_orders.get("active_orders_count_total"),
+        "native_active_orders_count_market": active_orders.get("active_orders_count_market"),
+        "native_active_order_headroom_account": headroom_account,
+        "native_active_order_headroom_market": headroom_market,
+        "native_sendtx_per_minute_remaining": sendtx_remaining,
+    }
+
+
 def _summary_gate_reason(counts: dict[str, int]) -> str:
     if counts["queue_churn_label_count"] == 0:
         return "queue_churn_missing_labels"
-    if counts["native_limit_pressure_unknown_count"] > 0:
-        return "queue_churn_native_limit_pressure_unknown"
     if counts["unmatched_lifecycle_count"] > 0:
         return "queue_churn_partial_lifecycle_join"
+    if counts["native_limit_pressure_unknown_count"] > 0:
+        return "queue_churn_native_limit_pressure_unknown"
+    if counts["native_limit_pressure_partial_count"] > 0:
+        return "queue_churn_native_limit_pressure_partial"
     return "queue_churn_requires_board_review"
 
 
@@ -262,6 +361,7 @@ def build_queue_churn_labels(
     output_root: Path | None,
     run_id: str | None,
     timestamp_ns: int | None,
+    lighter_native_limits_run: Path | None,
 ) -> Path:
     run_id = run_id or f"PHASE51C-QUEUE-CHURN-{_utc_stamp()}"
     output_root = output_root or DEFAULT_OUTPUT_ROOT
@@ -274,6 +374,7 @@ def build_queue_churn_labels(
 
     lake_summary, lifecycle_index, lifecycle_count = _load_lifecycle_events(label_lake_run)
     pfill_summary, pfill_labels = _load_pfill_labels(pfill_outcome_run)
+    phase51b_context = _load_phase51b_lighter_context(lighter_native_limits_run)
     if lake_summary.get("source_telemetry_sha256") != pfill_summary.get("source_telemetry_sha256"):
         raise ValueError("label lake and P_fill outcome run must share source_telemetry_sha256")
 
@@ -290,6 +391,8 @@ def build_queue_churn_labels(
         "orders_with_churn_count": 0,
         "orders_with_terminal_horizon_count": 0,
         "native_limit_pressure_unknown_count": 0,
+        "native_limit_pressure_partial_count": 0,
+        "native_limit_pressure_observed_count": 0,
     }
     for seq, pfill_label in enumerate(pfill_labels, start=1):
         events, matched_by = _match_events(pfill_label, lifecycle_index)
@@ -314,7 +417,14 @@ def build_queue_churn_labels(
             counts["orders_with_churn_count"] += 1
         if summary["terminal_horizon_source_ticks_from_pfill"] is not None:
             counts["orders_with_terminal_horizon_count"] += 1
-        counts["native_limit_pressure_unknown_count"] += 1
+        native_pressure = _native_limit_pressure(pfill_label.get("venue_id"), phase51b_context)
+        native_status = native_pressure["native_limit_pressure_status"]
+        if str(native_status).startswith("UNKNOWN"):
+            counts["native_limit_pressure_unknown_count"] += 1
+        elif str(native_status).startswith("PARTIAL"):
+            counts["native_limit_pressure_partial_count"] += 1
+        else:
+            counts["native_limit_pressure_observed_count"] += 1
         record = _base_label(run_id, seq, timestamp_ns)
         record.update({
             "source": "phase51c_label_lake_and_pfill_outcome",
@@ -336,10 +446,9 @@ def build_queue_churn_labels(
             "filled_size_total": pfill_label.get("filled_size_total"),
             "lifecycle_join_status": "JOINED" if events else "MISSING",
             "lifecycle_join_key_types": sorted(set(matched_by)),
-            "native_limit_pressure_status": "UNKNOWN_NO_NATIVE_LIMIT_PRESSURE_INPUT",
-            "native_limit_pressure_hold_reason": "requires_phase51b_native_limit_pressure_join",
             "queue_churn_hold_reason": "requires_queue_reset_and_native_limit_pressure_calibration",
             **summary,
+            **native_pressure,
         })
         records.append(record)
 
@@ -361,6 +470,16 @@ def build_queue_churn_labels(
         "admissible_for_ev_admission": False,
         "label_lake_run": str(label_lake_run),
         "pfill_outcome_run": str(pfill_outcome_run),
+        "lighter_native_limits_run": str(lighter_native_limits_run) if lighter_native_limits_run else None,
+        "lighter_native_limits_acceptance_sha256": (
+            phase51b_context.get("acceptance_sha256") if phase51b_context else None
+        ),
+        "lighter_native_limits_telemetry_sha256": (
+            phase51b_context.get("telemetry_sha256") if phase51b_context else None
+        ),
+        "lighter_native_limits_limitations": (
+            phase51b_context.get("limitations") if phase51b_context else []
+        ),
         "source_telemetry_sha256": lake_summary.get("source_telemetry_sha256"),
         "label_lake_summary_sha256": _sha256_file(label_lake_run / "label_lake_summary.json"),
         "pfill_outcome_summary_sha256": _sha256_file(pfill_outcome_run / "pfill_outcome_summary.json"),
@@ -391,6 +510,7 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--timestamp-ns", type=int, default=None)
+    parser.add_argument("--lighter-native-limits-run", type=Path, default=None)
     args = parser.parse_args()
     try:
         out_dir = build_queue_churn_labels(
@@ -399,6 +519,7 @@ def main() -> int:
             output_root=args.output_root,
             run_id=args.run_id,
             timestamp_ns=args.timestamp_ns,
+            lighter_native_limits_run=args.lighter_native_limits_run,
         )
     except Exception as exc:
         print(f"phase51c_queue_churn_labels: ERROR: {exc}", file=sys.stderr)
