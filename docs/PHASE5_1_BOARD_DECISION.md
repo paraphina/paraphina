@@ -58,7 +58,7 @@ now more specific:
 | Phase 5 closeout baseline | `18dd09512288a85e440d3977e32432c3aabc1190` |
 | M5 Lighter readiness commit | `705f79c6c647dbb03c8e2a993c6e23b870b4af6c` |
 | M6 safety invariant commit | `02f63e30e6d1c877ab11c43d591bbda3f5c28974` |
-| Branch | `mm-pnl-harness-clean` |
+| Branch | `main` |
 | Evidence run | `LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_m6` |
 
 ## Accepted

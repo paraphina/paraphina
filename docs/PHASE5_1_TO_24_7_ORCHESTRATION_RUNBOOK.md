@@ -5,7 +5,7 @@ Date: 2026-05-01
 Status: `HOLD` for live/canary/capital. `PROMOTE` only for continuing the
 Phase 5.1 non-live evidence workflow.
 
-Branch: `mm-pnl-harness-clean`
+Branch: `main`
 
 Pre-Phase-5.1b commit: `f047e4ee0adbf2ab8a2e6914c9a3872a8a4e8abb`
 
