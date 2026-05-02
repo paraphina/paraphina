@@ -17,6 +17,8 @@ import asyncio
 import hashlib
 import json
 import os
+import shlex
+import stat
 import sys
 import time
 import urllib.parse
@@ -65,6 +67,29 @@ def _load_json(path: Path) -> dict[str, Any] | list[Any]:
     if not isinstance(data, (dict, list)):
         raise ValueError(f"expected object or array JSON in {path}")
     return data
+
+
+def _load_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            key = key.strip()
+            if not key or not key.replace("_", "").isalnum():
+                continue
+            try:
+                parsed = shlex.split(raw_value, comments=False, posix=True)
+            except ValueError:
+                parsed = [raw_value.strip().strip("'\"")]
+            values[key] = parsed[0] if parsed else ""
+    return values
 
 
 def _write_json(path: Path, data: Any) -> None:
@@ -368,7 +393,56 @@ def _resolve_base_url(env: dict[str, str], explicit: str | None = None) -> str:
     return DEFAULT_TESTNET_BASE_URL if network == "testnet" else DEFAULT_BASE_URL
 
 
-def _get_auth_token(env: dict[str, str], allow_sdk_auth: bool) -> str:
+def _check_safe_sdk_entry(label: str, path: Path, *, require_dir: bool | None = None) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"{label} must not be a symlink: {path}")
+    if require_dir is True and not path.is_dir():
+        raise RuntimeError(f"{label} is not a directory: {path}")
+    if require_dir is False and not path.is_file():
+        raise RuntimeError(f"{label} is not a file: {path}")
+    info = path.stat()
+    if info.st_uid not in (0, os.getuid()):
+        raise RuntimeError(f"{label} must be owned by root or current user: {path}")
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError(f"{label} must not be group/world writable: {path}")
+
+
+def _resolve_safe_lighter_sdk_path(sdk_path: Path) -> Path:
+    expanded = sdk_path.expanduser()
+    if expanded.is_symlink():
+        raise RuntimeError(f"lighter-sdk path must not be a symlink: {expanded}")
+    sdk_root = expanded.resolve(strict=True)
+    package_dir = sdk_root / "lighter"
+    for label, path in (("lighter-sdk path", sdk_root), ("lighter package path", package_dir)):
+        if path.is_symlink():
+            raise RuntimeError(f"{label} must not be a symlink: {path}")
+        _check_safe_sdk_entry(label, path, require_dir=True)
+    for current_root, dirnames, filenames in os.walk(package_dir):
+        current = Path(current_root)
+        _check_safe_sdk_entry("lighter package directory", current, require_dir=True)
+        for dirname in dirnames:
+            _check_safe_sdk_entry("lighter package directory", current / dirname, require_dir=True)
+        for filename in filenames:
+            _check_safe_sdk_entry("lighter package file", current / filename, require_dir=False)
+    return sdk_root
+
+
+def _import_lighter_sdk(sdk_path: Path | None) -> Any:
+    try:
+        import lighter  # type: ignore
+
+        return lighter
+    except ImportError:
+        if sdk_path is not None:
+            sdk_root = _resolve_safe_lighter_sdk_path(sdk_path)
+            sys.path.insert(0, str(sdk_root))
+            import lighter  # type: ignore
+
+            return lighter
+    raise RuntimeError("lighter-sdk is required for --allow-sdk-auth")
+
+
+def _get_auth_token(env: dict[str, str], allow_sdk_auth: bool, sdk_path: Path | None) -> str:
     explicit = env.get("LIGHTER_AUTH_TOKEN", "").strip()
     if explicit:
         return explicit
@@ -377,10 +451,7 @@ def _get_auth_token(env: dict[str, str], allow_sdk_auth: bool) -> str:
             "missing LIGHTER_AUTH_TOKEN; set it or pass --allow-sdk-auth to derive "
             "a short-lived read-only auth token from existing Lighter API key env"
         )
-    try:
-        import lighter  # type: ignore
-    except ImportError as exc:  # pragma: no cover - runtime only
-        raise RuntimeError("lighter-sdk is required for --allow-sdk-auth") from exc
+    lighter = _import_lighter_sdk(sdk_path)
     base_url = _resolve_base_url(env)
     account_index = int(env["LIGHTER_ACCOUNT_INDEX"])
     api_key_index = int(env["LIGHTER_API_KEY_INDEX"])
@@ -432,9 +503,10 @@ def _fetch_readonly_sources(
     market_id: int | None,
     include_trades: bool,
     allow_sdk_auth: bool,
+    sdk_path: Path | None,
     timeout_s: float,
 ) -> dict[str, dict[str, Any]]:
-    auth_token = _get_auth_token(env, allow_sdk_auth=allow_sdk_auth)
+    auth_token = _get_auth_token(env, allow_sdk_auth=allow_sdk_auth, sdk_path=sdk_path)
     fetched: dict[str, dict[str, Any]] = {}
     endpoint = READONLY_ENDPOINTS["account"]
     fetched["account"] = _source_record(
@@ -691,9 +763,11 @@ def run(
     active_orders_json: Path | None,
     order_books_json: Path | None,
     trades_json: Path | None,
+    env_file: Path | None,
     fetch_readonly: bool,
     include_trades: bool,
     allow_sdk_auth: bool,
+    lighter_sdk_path: Path | None,
     base_url: str | None,
     account_index: int | None,
     market_id: int | None,
@@ -706,6 +780,8 @@ def run(
         raise ValueError(f"expected object JSON in {spec_path}")
     _validate_spec(spec)
     env = dict(os.environ)
+    if env_file is not None:
+        env.update(_load_env_file(env_file))
     run_id = run_id or f"{spec.get('experiment_id', 'PHASE51B-LIGHTER-NATIVE-LIMITS')}_{_utc_stamp()}"
     output_root = output_root or Path(spec.get("output_root", DEFAULT_OUTPUT_ROOT))
     if not output_root.is_absolute():
@@ -746,6 +822,7 @@ def run(
             market_id=resolved_market_id,
             include_trades=include_trades,
             allow_sdk_auth=allow_sdk_auth,
+            sdk_path=lighter_sdk_path,
             timeout_s=timeout_s,
         ))
     if not sources:
@@ -862,6 +939,8 @@ def run(
         "fetch_readonly": fetch_readonly,
         "include_trades": include_trades,
         "allow_sdk_auth": allow_sdk_auth,
+        "env_file": str(env_file) if env_file else None,
+        "lighter_sdk_path": str(lighter_sdk_path) if lighter_sdk_path else None,
     })
     command_log = {
         "argv": [arg if "PRIVATE" not in arg.upper() and "TOKEN" not in arg.upper() else "<redacted>" for arg in sys.argv],
@@ -909,9 +988,21 @@ def main() -> int:
     parser.add_argument("--active-orders-json", type=Path, default=None)
     parser.add_argument("--order-books-json", type=Path, default=None)
     parser.add_argument("--trades-json", type=Path, default=None)
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Optional KEY=VALUE env file loaded without shell execution.",
+    )
     parser.add_argument("--fetch-readonly", action="store_true")
     parser.add_argument("--include-trades", action="store_true")
     parser.add_argument("--allow-sdk-auth", action="store_true")
+    parser.add_argument(
+        "--lighter-sdk-path",
+        type=Path,
+        default=None,
+        help="Optional explicit local lighter-sdk source path used only when the package is not installed.",
+    )
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--account-index", type=int, default=None)
     parser.add_argument("--market-id", type=int, default=None)
@@ -929,9 +1020,11 @@ def main() -> int:
             active_orders_json=args.active_orders_json,
             order_books_json=args.order_books_json,
             trades_json=args.trades_json,
+            env_file=args.env_file,
             fetch_readonly=args.fetch_readonly,
             include_trades=args.include_trades,
             allow_sdk_auth=args.allow_sdk_auth,
+            lighter_sdk_path=args.lighter_sdk_path,
             base_url=args.base_url,
             account_index=args.account_index,
             market_id=args.market_id,

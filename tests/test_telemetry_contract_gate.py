@@ -1034,6 +1034,12 @@ class TestValidatorSubprocess(unittest.TestCase):
             active_orders_path = tmp_path / "active_orders.json"
             order_books_path = tmp_path / "order_books.json"
             trades_path = tmp_path / "trades.json"
+            env_path = tmp_path / "lighter.env"
+            env_path.write_text(
+                "LIGHTER_ACCOUNT_INDEX='123'\n"
+                "LIGHTER_AUTH_TOKEN='should-not-appear-in-artifacts'\n",
+                encoding="utf-8",
+            )
             account_path.write_text(json.dumps({
                 "accounts": [{
                     "account_index": 123,
@@ -1096,8 +1102,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(order_books_path),
                     "--trades-json",
                     str(trades_path),
-                    "--account-index",
-                    "123",
+                    "--env-file",
+                    str(env_path),
                     "--market-id",
                     "7",
                     "--market-symbol",
@@ -1183,6 +1189,11 @@ class TestValidatorSubprocess(unittest.TestCase):
                 gate["calibration_label_ingestion_hold_reason"],
                 "requires_external_schema_validation_and_secret_audit",
             )
+            for artifact in run_dir.rglob("*"):
+                if artifact.is_file():
+                    content = artifact.read_text(encoding="utf-8", errors="ignore")
+                    self.assertNotIn("should-not-appear-in-artifacts", content, str(artifact))
+                    self.assertNotIn("should-redact", content, str(artifact))
             self.assertFalse(gate["approved_for_live"])
 
     def test_phase51b_lighter_account_limits_rejects_live_or_sendtx_specs(self):

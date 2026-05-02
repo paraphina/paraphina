@@ -247,15 +247,22 @@ first real Phase 5.1b pack:
 
 ```bash
 python3 tools/phase51b_lighter_account_limits.py \
+  --env-file /home/ubuntu/paraphina/deploy/env/all5_recover_20260314.env \
   --fetch-readonly \
   --include-trades \
+  --allow-sdk-auth \
+  --lighter-sdk-path /tmp/lighter_sdk \
   --run-id PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-<utc>
 ```
 
 If `LIGHTER_AUTH_TOKEN` is not present, either set a short-lived read-only auth
 token or use `--allow-sdk-auth` to derive one from existing Lighter API key env.
-Do not print secrets. Do not use funded-main private keys. Do not use any
-sendTx path.
+If the SDK is not installed, provide an explicit `--lighter-sdk-path`; the
+collector does not auto-import SDK code from `/tmp`, and the supplied SDK path
+and `lighter/` package tree must be owned by root/current user, non-symlinked,
+and not group/world writable. The collector loads `--env-file` without shell
+execution. Do not print secrets. Do not use funded-main private keys. Do not use
+any sendTx path.
 
 Validate the pack:
 
