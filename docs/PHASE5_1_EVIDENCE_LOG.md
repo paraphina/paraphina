@@ -69,6 +69,76 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## PHASE51C-LABEL-LAKE-20260502T004621Z
+
+- Run id: `PHASE51C-LABEL-LAKE-20260502T004621Z`
+- Local run directory:
+  `runs/phase51c_label_lake/PHASE51C-LABEL-LAKE-20260502T004621Z`
+- Created UTC: `2026-05-02T00:46:33.634536+00:00`
+- Tool commit: `5857163`
+- Gate status: `HOLD`
+- Gate reason: `label_lake_scaffold_missing_fill_markout_balance_coverage`
+- Source telemetry:
+  `/tmp/phase51_inputs/phase5_tail_1000_20260501T214411Z.telemetry.jsonl`
+- Source telemetry SHA256:
+  `c2b50d00912b22f877e6e79be0ae16e2342d5ea3eaad22b7be3049f059312b64`
+- EV shadow telemetry:
+  `runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_m6/telemetry.jsonl`
+- EV shadow telemetry SHA256:
+  `6ddbf774f6fb05f11508866d604d6ac7da89a54ef22e83a9bca6c32eb59090dc`
+- Phase 5.1b acceptance artifact:
+  `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/phase51b_acceptance.json`
+- Phase 5.1b acceptance SHA256:
+  `de68ee111a4dcf7eababb9ddc1d0886add484912916a82dabed63f72ab2b8c84`
+- Record count: `3319`
+- Quote-decision labels: `2000`
+- Order-lifecycle labels: `1318`
+- Fill labels: `0`
+- Markout labels: `0`
+- Balance-reconciliation labels: `0`
+- Native limit pressure status: `UNKNOWN`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_label_lake.py \
+  --source-telemetry /tmp/phase51_inputs/phase5_tail_1000_20260501T214411Z.telemetry.jsonl \
+  --ev-shadow-telemetry runs/phase51_lighter_only_ev_shadow/LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_m6/telemetry.jsonl \
+  --phase51b-acceptance runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/phase51b_acceptance.json \
+  --run-id PHASE51C-LABEL-LAKE-20260502T004621Z
+```
+
+Result:
+
+```text
+phase51c_label_lake: status HOLD (label scaffold only)
+manifest_hashes_valid=true
+```
+
+Label summary:
+
+```text
+quote_decision_counts: HOLD=2000
+order_action_counts: cancel=505, place=501, replace=312
+fill_label_status: MISSING
+markout_label_status: MISSING
+balance_reconciliation_status: MISSING
+native_limit_pressure_status: UNKNOWN
+```
+
+Artifact hashes:
+
+```text
+35db92cb71234a88c02e98593cea24f0d6b0555c4a9b9ab618a9c530d4d5164f  labels.jsonl
+1372b298a6ce8e09b24c454714eda0df1655a22147f602362047e8682856c30e  label_lake_summary.json
+f463e1f62d8302849013579cf14854e7ded6a8669c73e9ad7e3ac4edd98068f3  evidence_pack/artifact_index.json
+```
+
 ## Phase 5.1 Board Decision M8
 
 - Decision document: `docs/PHASE5_1_BOARD_DECISION.md`
