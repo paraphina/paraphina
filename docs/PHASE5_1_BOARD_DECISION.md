@@ -25,17 +25,25 @@ Current economic/profitability decision: `HOLD`
 
 ## Current Superseding Status
 
-As of the Phase 5.1d evidence-quality triage, the board decision remains
-`PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are now sharper:
+As of the Phase 5.1e lifecycle/native-truth audit, the board decision remains
+`PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are now more
+specific:
 
-- P-fill censoring is not merely a source-window boundary issue. The two-lane
-  censoring audit reconciles `11935` order labels and classifies all `8611`
-  censored labels as `NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW`.
-- Lighter native attribution is not upgradable from the current 300-trade
-  backfill. The gap audit finds `189` Lighter fills, `96` already attributed,
-  and `93` unknown fills with `NO_NATIVE_TRADE_MATCH`.
+- Phase 5.1d showed `8611 / 11935` P-fill labels were censored as
+  `NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW`.
+- Phase 5.1e shows that censoring is primarily a lifecycle
+  canonicalization issue, not a true absence of terminal evidence. After
+  grouping place intent/ack aliases and order/client-id aliases, the `8611`
+  censored labels decompose into `464` canonical filled review rows, `5206`
+  canonical not-filled review rows, `288` replace-chain review rows, `2270`
+  duplicate place-alias review rows, `375` cancel-all scope review rows, and
+  only `8` rows that remain `REMAINS_NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW`.
+- Lighter native attribution remains `HOLD`: raw captured telemetry IDs match
+  native trades for `96 / 189` Lighter fills (`64` maker, `32` taker), while
+  `93` remain `NATIVE_WINDOW_COVERED_NO_MATCH`.
 - 5.1 remains `HOLD` for model training, EV admission, live orders, canary,
-  capital escalation, risk-limit relaxation, and financial claims.
+  capital escalation, risk-limit relaxation, and financial claims until a
+  separate canonical P-fill outcome rebuild is reviewed.
 
 ## Baseline
 

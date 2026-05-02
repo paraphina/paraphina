@@ -642,6 +642,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c Lighter attribution-gap audit gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_lighter_attribution_gap_audit.py"
+
+    def _get_phase51e_lifecycle_truth_audit_path(self) -> Path:
+        """Get path to the Phase 5.1e lifecycle/native-truth audit gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51e_lifecycle_truth_audit.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -2575,6 +2580,404 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(split_conflict.returncode, 2)
             self.assertIn("conflicting order_holdout_split", split_conflict.stderr)
+
+    def test_phase51e_lifecycle_truth_audit_canonicalizes_aliases_hold_only(self):
+        """Lifecycle truth audit should explain censored aliases without relabeling/training."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            label_lake_run = tmp_path / "label_lake"
+            join_run = tmp_path / "join"
+            pfill_run = tmp_path / "pfill"
+            lighter_gap_run = tmp_path / "lighter_gap"
+            observed_run = tmp_path / "observed"
+            backfill_run = tmp_path / "backfill"
+            output_root = tmp_path / "phase51e"
+            label_lake_run.mkdir()
+            join_run.mkdir()
+            pfill_run.mkdir()
+            lighter_gap_run.mkdir()
+            observed_run.mkdir()
+            (backfill_run / "source_snapshots").mkdir(parents=True)
+            source_sha = "source-sha-phase51e"
+
+            (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
+                "run_id": "lake_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            lifecycle_labels = [
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 10,
+                    "venue_id": "lighter",
+                    "action": "place",
+                    "status": "intent",
+                    "decision_id": "d1",
+                    "client_order_id_hash": "client-1",
+                    "source_line": 10,
+                    "source_t": 10,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 11,
+                    "venue_id": "lighter",
+                    "action": "place",
+                    "status": "ack",
+                    "decision_id": "d1",
+                    "order_id_hash": "client-1",
+                    "client_order_id_hash": "client-1",
+                    "source_line": 11,
+                    "source_t": 11,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 12,
+                    "venue_id": "lighter",
+                    "action": "cancel",
+                    "status": "ack",
+                    "decision_id": "d1",
+                    "order_id_hash": "client-1",
+                    "source_line": 12,
+                    "source_t": 12,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 20,
+                    "venue_id": "lighter",
+                    "action": "place",
+                    "status": "intent",
+                    "decision_id": "d2",
+                    "client_order_id_hash": "client-2",
+                    "source_line": 20,
+                    "source_t": 20,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 21,
+                    "venue_id": "lighter",
+                    "action": "place",
+                    "status": "ack",
+                    "decision_id": "d2",
+                    "order_id_hash": "client-2",
+                    "client_order_id_hash": "client-2",
+                    "source_line": 21,
+                    "source_t": 21,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 30,
+                    "venue_id": "lighter",
+                    "action": "place",
+                    "status": "intent",
+                    "decision_id": "d3",
+                    "client_order_id_hash": "client-3",
+                    "source_line": 30,
+                    "source_t": 30,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 31,
+                    "venue_id": "lighter",
+                    "action": "cancel_all",
+                    "status": "intent",
+                    "source_line": 31,
+                    "source_t": 31,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (label_lake_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in lifecycle_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            (join_run / "join_holdout_summary.json").write_text(json.dumps({
+                "run_id": "join_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (join_run / "joined_labels.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "label_type": "DETERMINISTIC_JOIN_LABEL",
+                    "venue_id": "lighter",
+                    "fill_id": "fill-client-2",
+                    "order_id_hash": "client-2",
+                    "client_order_id_hash": "client-2",
+                    "maker_taker_role": "UNKNOWN",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n")
+
+            pfill_labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "order-client-1-intent",
+                    "order_label_seq": 10,
+                    "order_source_line": 10,
+                    "order_source_t": 10,
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "client_order_id_hash": "client-1",
+                    "fill_count": 0,
+                    "terminal_event_count": 0,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "order-client-2-intent",
+                    "order_label_seq": 20,
+                    "order_source_line": 20,
+                    "order_source_t": 20,
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "client_order_id_hash": "client-2",
+                    "fill_count": 0,
+                    "terminal_event_count": 0,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_source",
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "order-client-3-intent",
+                    "order_label_seq": 30,
+                    "order_source_line": 30,
+                    "order_source_t": 30,
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "outcome_status": "CENSORED_OR_UNOBSERVED",
+                    "p_fill_outcome": None,
+                    "client_order_id_hash": "client-3",
+                    "fill_count": 0,
+                    "terminal_event_count": 0,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (pfill_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "pfill_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "pfill_outcome_contains_censored_orders",
+                "source_telemetry_sha256": source_sha,
+                "label_lake_run": str(label_lake_run),
+                "join_holdout_run": str(join_run),
+                "order_label_count": 3,
+                "filled_count": 0,
+                "not_filled_count": 0,
+                "censored_count": 3,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in pfill_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            raw_telemetry = tmp_path / "source.telemetry.jsonl"
+            raw_fill = {
+                "venue_id": "lighter",
+                "side": "Sell",
+                "price": 100.0,
+                "size": 0.01,
+                "fill_time_ms": 1000,
+                "order_id": "raw-order",
+                "client_order_id": "raw-client",
+                "decision_id": "raw-decision",
+            }
+            raw_telemetry.write_text(json.dumps({"t": 1, "fills": [raw_fill]}) + "\n", encoding="utf-8")
+            (observed_run / "observed_label_summary.json").write_text(json.dumps({
+                "run_id": "observed_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "source_telemetry_sha256": source_sha,
+                "source_telemetry": str(raw_telemetry),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "labels.jsonl").write_text("", encoding="utf-8")
+            trades_payload = {
+                "account_index": 7,
+                "trades": [
+                    {
+                        "trade_id": 99,
+                        "trade_id_str": "99",
+                        "timestamp": 1000,
+                        "transaction_time": 1000,
+                        "price": "100.0",
+                        "size": "0.01",
+                        "ask_account_id": 7,
+                        "bid_account_id": 8,
+                        "ask_id": "raw-order",
+                        "ask_client_id": "raw-client",
+                        "bid_id": "other-order",
+                        "bid_client_id": "other-client",
+                        "is_maker_ask": True,
+                    },
+                ],
+            }
+            trades_path = backfill_run / "source_snapshots" / "trades_backfill.sanitized.json"
+            trades_path.write_text(json.dumps(trades_payload), encoding="utf-8")
+            (backfill_run / "lighter_trade_backfill_summary.json").write_text(json.dumps({
+                "run_id": "backfill_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "trades_path": str(trades_path),
+                "trades_sha256": hashlib.sha256(trades_path.read_bytes()).hexdigest(),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (lighter_gap_run / "lighter_attribution_gap_summary.json").write_text(json.dumps({
+                "run_id": "gap_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "source_telemetry_sha256": source_sha,
+                "observed_run": str(observed_run),
+                "lighter_trade_backfill_run": str(backfill_run),
+                "lighter_fill_count": 1,
+                "observed_role_counts": {"UNKNOWN": 1},
+                "gap_reason_counts": {"NO_NATIVE_TRADE_MATCH": 1},
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (lighter_gap_run / "lighter_attribution_gap_labels.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "label_type": "LIGHTER_ATTRIBUTION_GAP_AUDIT_LABEL",
+                    "fill_id": "unknown-lighter-fill",
+                    "fill_time_ms": 1000,
+                    "side": "BID",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "observed_maker_taker_role": "UNKNOWN",
+                    "native_role_if_determinable": None,
+                    "gap_reason": "NO_NATIVE_TRADE_MATCH",
+                    "gap_reason_detail": "no native trade matches identity or time/price/size",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51e_lifecycle_truth_audit_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--lighter-attribution-gap-run",
+                    str(lighter_gap_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51e_lifecycle_truth_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51e_lifecycle_truth_test"
+            summary = json.loads((run_dir / "lifecycle_truth_audit_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["order_label_count"], 3)
+            self.assertEqual(summary["current_censored_count"], 3)
+            self.assertEqual(summary["canonical_status_counts"]["CENSORED_TO_CANONICAL_NOT_FILLED_REVIEW"], 1)
+            self.assertEqual(summary["canonical_status_counts"]["CENSORED_TO_CANONICAL_FILLED_REVIEW"], 1)
+            self.assertEqual(summary["canonical_status_counts"]["CANCEL_ALL_SCOPE_REVIEW"], 1)
+            self.assertEqual(summary["lighter_native_gap_reason_counts"], {"NO_NATIVE_TRADE_MATCH": 1})
+            self.assertEqual(summary["lighter_raw_native_truth_label_count"], 1)
+            self.assertEqual(summary["lighter_raw_native_match_status_counts"], {"MATCHED_NATIVE_ID": 1})
+            self.assertEqual(summary["lighter_raw_native_role_counts"], {"MAKER": 1})
+            self.assertFalse(summary["approved_for_live"])
+            self.assertFalse(summary["admissible_for_ev_admission"])
+            labels = [
+                json.loads(line)
+                for line in (run_dir / "order_lifecycle_truth_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual({label["canonical_status"] for label in labels}, {
+                "CENSORED_TO_CANONICAL_NOT_FILLED_REVIEW",
+                "CENSORED_TO_CANONICAL_FILLED_REVIEW",
+                "CANCEL_ALL_SCOPE_REVIEW",
+            })
+            native_gap_labels = [
+                json.loads(line)
+                for line in (run_dir / "lighter_native_identity_gap_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(native_gap_labels), 1)
+            self.assertEqual(native_gap_labels[0]["gap_reason"], "NO_NATIVE_TRADE_MATCH")
+            raw_native_labels = [
+                json.loads(line)
+                for line in (run_dir / "lighter_raw_native_truth_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(raw_native_labels), 1)
+            self.assertEqual(raw_native_labels[0]["native_trade_match_status"], "MATCHED_NATIVE_ID")
+            self.assertEqual(raw_native_labels[0]["native_role"], "MAKER")
+            self.assertIn("decision_id_hash", raw_native_labels[0])
+            self.assertNotIn("decision_id", raw_native_labels[0])
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
+            pfill_labels[0]["approved_for_live"] = True
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in pfill_labels:
+                    f.write(json.dumps(label) + "\n")
+            unsafe = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51e_lifecycle_truth_audit_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51e_lifecycle_truth_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
 
     def test_phase51c_markout_calibration_readiness_preserves_fill_splits_and_stats(self):
         """Markout readiness should inherit join splits and stay HOLD-only."""

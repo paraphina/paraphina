@@ -27,15 +27,18 @@ document, not live-trading authorization.
 
 ## Current Critical Path
 
-1. Freeze and push the Phase 5.1b repo state.
-2. Produce the first real read-only Lighter account/native-limit evidence pack.
-3. Validate the evidence pack against telemetry schema v2.
-4. Accept or hold Phase 5.1b based on whether the pack contains account profile,
-   account limits, active-order headroom, fee/market metadata, and optional
-   maker/taker trade-role samples.
-5. Only after accepted Phase 5.1b evidence, begin calibration-label ingestion
-   for P-fill, markout, queue/churn, maker/taker attribution, residual/tail
-   costs, and balance reconciliation.
+1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
+   escalation, risk-limit relaxation, model training, or EV admission.
+2. Treat Phase 5.1e as the current evidence boundary. It proves the dominant
+   P-fill blocker is lifecycle canonicalization, not true source-window
+   truncation.
+3. Next repo-owned move is a separate canonical P-fill outcome rebuild/review
+   gate that collapses place intent/ack aliases and preserves review-only
+   statuses before any calibration-readiness rerun.
+4. Re-run P-fill readiness, queue/churn, markout, and Lighter attribution only
+   after the canonical outcome contract is explicitly reviewed.
+5. Proceed to calibrated EV shadow only after canonical outcomes, maker/taker
+   role gaps, holdout splits, and feature completeness are accepted.
 
 ## Board
 
@@ -211,6 +214,49 @@ Current 5.1d evidence:
 - 5.1d promotes only the next non-live evidence step. It does not authorize
   model training, EV admission, live orders, canary, capital escalation,
   risk-limit relaxation, or financial claims.
+
+### Gate 5.1e - Lifecycle/Native Truth Audit
+
+Current repo-owned tooling:
+
+- `tools/phase51e_lifecycle_truth_audit.py` consumes one or more P-fill
+  outcome packs, their source label-lake and join-holdout packs, and the
+  Lighter attribution gap audit. It canonicalizes order lifecycle identity
+  across place intent/ack aliases, order/client hashes, decision IDs, fill
+  joins, replace chains, and cancel-all scope without rewriting P-fill labels.
+- The same tool re-reads raw captured Lighter telemetry IDs from the observed
+  label source and compares them to sanitized native Lighter trades. It emits
+  raw-native match status without printing raw IDs or secrets.
+
+Current 5.1e evidence:
+
+- Run:
+  `runs/phase51e_lifecycle_truth_audit/PHASE51E-LIFECYCLE-TRUTH-AUDIT-TWO-LANE-20260502T000000Z`
+- P-fill rows audited: `11935`.
+- Current P-fill state entering 5.1e: `489` filled, `2835` terminal
+  not-filled, `8611` censored.
+- Canonical lifecycle status counts: `489` `STAYS_FILLED`, `2835`
+  `STAYS_NOT_FILLED`, `464` `CENSORED_TO_CANONICAL_FILLED_REVIEW`, `5206`
+  `CENSORED_TO_CANONICAL_NOT_FILLED_REVIEW`, `288`
+  `CENSORED_TO_REPLACE_CHAIN_REVIEW`, `2270`
+  `DUPLICATE_PLACE_ALIAS_COLLAPSE_REVIEW`, `375` `CANCEL_ALL_SCOPE_REVIEW`,
+  and `8` `REMAINS_NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW`.
+- Raw Lighter native truth: `189` raw Lighter fills audited, `96`
+  `MATCHED_NATIVE_ID`, `93` `NATIVE_WINDOW_COVERED_NO_MATCH`; native roles are
+  `64` maker, `32` taker, `93` unknown.
+- Gate remains `HOLD`. The evidence supports a canonical P-fill outcome
+  rebuild/review gate, not model training or EV admission.
+
+5.1e artifacts:
+
+```text
+861fd63459957d1b6508c19ccdda020c4a2b4b40a60465457d7ad89d131a8f66  lifecycle_truth_audit_summary.json
+82fad77b173825ccca0650368a9d68426c5e6d80c08ef5d05d0203ffbea189ce  order_lifecycle_truth_labels.jsonl
+fe099f177ae981c81a41a75a6c757d1960a2331221bdf439bab5cecbdc0903ff  lighter_native_identity_gap_labels.jsonl
+3892c024a8e6d60d766eece7d0c7effb9125801c9c18a2bac1b599735c487d11  lighter_raw_native_truth_labels.jsonl
+6db64ea422d445cc63d32505577dc71b0e72003b533374ae35a25c1dd70ced50  manifest.json
+afcf0fbce4268b96f4ee7a2a848e8950671e570fa7bc74a44f87e065a1ce684c  evidence_pack/artifact_index.json
+```
 
 ### Gate 5.2 - Calibrated EV Shadow
 

@@ -69,6 +69,88 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1e Lifecycle/Native Truth Audit
+
+- Run id: `PHASE51E-LIFECYCLE-TRUTH-AUDIT-TWO-LANE-20260502T000000Z`
+- Local run directory: `runs/phase51e_lifecycle_truth_audit/PHASE51E-LIFECYCLE-TRUTH-AUDIT-TWO-LANE-20260502T000000Z`
+- Gate status: `HOLD`
+- Gate reason: `phase51e_canonical_lifecycle_reviewable_movements_found`
+- Source telemetry SHA256 list:
+  - `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`
+  - `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- P-fill rows audited: `11935`
+- Current state entering audit: `489` filled, `2835` terminal not-filled,
+  `8611` censored.
+- Canonical lifecycle groups: `6999`
+- Lifecycle events inspected: `46487`
+- `approved_for_model_training`: `false`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_ev_admission`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Canonical lifecycle status counts:
+
+```text
+STAYS_FILLED: 489
+STAYS_NOT_FILLED: 2835
+CENSORED_TO_CANONICAL_FILLED_REVIEW: 464
+CENSORED_TO_CANONICAL_NOT_FILLED_REVIEW: 5206
+CENSORED_TO_REPLACE_CHAIN_REVIEW: 288
+DUPLICATE_PLACE_ALIAS_COLLAPSE_REVIEW: 2270
+CANCEL_ALL_SCOPE_REVIEW: 375
+REMAINS_NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW: 8
+```
+
+Lighter native truth:
+
+```text
+lighter_native_gap_label_count: 189
+ATTRIBUTED_NATIVE_ROLE: 96
+NO_NATIVE_TRADE_MATCH: 93
+lighter_raw_native_truth_label_count: 189
+MATCHED_NATIVE_ID: 96
+NATIVE_WINDOW_COVERED_NO_MATCH: 93
+raw_native_roles: MAKER=64, TAKER=32, UNKNOWN=93
+```
+
+Interpretation:
+
+```text
+Phase 5.1d's 8611 censored P-fill labels are not primarily true
+no-terminal/no-fill observations. Phase 5.1e shows that only 8 remain true
+NO_TERMINAL_EVENT_WITH_SUFFICIENT_WINDOW after lifecycle canonicalization.
+The dominant issue is label canonicalization around place intent/ack aliases,
+order/client-id aliases, replace chains, and cancel-all scope.
+
+The next non-live move is a separate canonical P-fill outcome rebuild/review
+gate. Phase 5.1e does not authorize model training, EV admission, live orders,
+canary, capital escalation, risk-limit relaxation, or financial claims.
+```
+
+Command:
+
+```bash
+python3 tools/phase51e_lifecycle_truth_audit.py \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --pfill-outcome-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z \
+  --lighter-attribution-gap-run runs/phase51c_lighter_attribution_gap_audit/PHASE51D-LIGHTER-ATTRIBUTION-GAP-AUDIT-20260502T000000Z \
+  --run-id PHASE51E-LIFECYCLE-TRUTH-AUDIT-TWO-LANE-20260502T000000Z \
+  --timestamp-ns 1777680000000000000
+```
+
+Artifact hashes:
+
+```text
+861fd63459957d1b6508c19ccdda020c4a2b4b40a60465457d7ad89d131a8f66  lifecycle_truth_audit_summary.json
+82fad77b173825ccca0650368a9d68426c5e6d80c08ef5d05d0203ffbea189ce  order_lifecycle_truth_labels.jsonl
+fe099f177ae981c81a41a75a6c757d1960a2331221bdf439bab5cecbdc0903ff  lighter_native_identity_gap_labels.jsonl
+3892c024a8e6d60d766eece7d0c7effb9125801c9c18a2bac1b599735c487d11  lighter_raw_native_truth_labels.jsonl
+6db64ea422d445cc63d32505577dc71b0e72003b533374ae35a25c1dd70ced50  manifest.json
+afcf0fbce4268b96f4ee7a2a848e8950671e570fa7bc74a44f87e065a1ce684c  evidence_pack/artifact_index.json
+```
+
 ## Phase 5.1c Markout Calibration Readiness Two-Lane Pack
 
 - Run id: `PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z`
