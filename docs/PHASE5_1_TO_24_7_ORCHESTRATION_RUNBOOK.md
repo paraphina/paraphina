@@ -165,6 +165,21 @@ Current repo-owned tooling:
   Phase 5.1b Lighter native pack upgrades `6148` Lighter rows to
   `PARTIAL_ACTIVE_ORDER_COUNT_OBSERVED_LIMIT_UNKNOWN`; `5787` non-Lighter rows
   remain venue-native-limit unknown. Gate remains `HOLD`.
+- `tools/phase51c_markout_calibration_readiness.py` consumes one or more
+  observed-label and deterministic-join/holdout run pairs, validates matching
+  `source_telemetry_sha256` and clean-baseline commit provenance, preserves the
+  join-provided fill `TRAIN`/`HOLDOUT` split, and emits HOLD-only
+  adverse-selection/markout readiness buckets. It refuses training, live,
+  canary, capital, risk-relaxation, EV-admission, and financial authority.
+- Current markout readiness evidence across the canonical `025435Z` and
+  `FROM-BACKFILL-073231Z` lanes: `549` fills, `2196` markout rows, four
+  horizons (`100`, `500`, `1000`, `5000` ms), `448` train fills, `101` holdout
+  fills, `141` buckets including split-specific buckets, `780` adverse markout
+  rows, and mean signed markout PnL `-0.040162968947815805`. Gate remains
+  `HOLD` with reason `markout_readiness_sparse_buckets`; unresolved blockers
+  include `373` fills with unknown maker/taker role, `243` fills with missing
+  candidate joins, fair-value-only future reference prices, and sparse
+  venue/side/horizon/split holdout coverage.
 - 5.1c remains `HOLD`. No model training, live, canary, capital escalation,
   risk-limit relaxation, or financial claim is authorized from the current
   pack.

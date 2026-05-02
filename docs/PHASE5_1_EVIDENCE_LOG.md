@@ -69,6 +69,71 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1c Markout Calibration Readiness Two-Lane Pack
+
+- Run id: `PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z`
+- Local run directory: `runs/phase51c_markout_calibration_readiness/PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z`
+- Tool: `tools/phase51c_markout_calibration_readiness.py`
+- Input observed run: `runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T025435Z`
+- Input join/holdout run: `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T025435Z`
+- Input observed run: `runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Input join/holdout run: `runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
+- Source telemetry SHA256 list:
+  `c1b0184628f04cf9e7db2671a8cbcc2d97473e5e5777625cd4855362bf543b89`,
+  `f89b92af3ff52bf953cdcc8f7736051a8833de776cb4612a3717e1d049f6ecd4`
+- Gate status: `HOLD`
+- Gate reason: `markout_readiness_sparse_buckets`
+- Markout rows: `2196`
+- Unique fills: `549`
+- Train fills: `448`
+- Holdout fills: `101`
+- Markout horizons ms: `100`, `500`, `1000`, `5000`
+- Buckets: `141`
+- Adverse rows: `780`
+- Adverse rate: `0.3551912568306011`
+- Mean signed markout PnL: `-0.040162968947815805`
+- Maker/taker counts by fill: `MAKER=118`, `TAKER=58`, `UNKNOWN=373`
+- Candidate join counts by fill: `JOINED=306`, `MISSING=243`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51c_markout_calibration_readiness.py \
+  --observed-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T025435Z \
+  --join-holdout-run runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-20260429T025435Z \
+  --observed-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --join-holdout-run runs/phase51c_join_holdout/PHASE51C-DETERMINISTIC-JOIN-HOLDOUT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --run-id PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z
+```
+
+Artifact hashes:
+
+```text
+21e8c977a2beb0019aba2b3e6dd2a5037a05450566911c68eb82dc95ad416fd1  evidence_pack/artifact_index.json
+daf4ee36e77d2da2cdca0d678737a19ace72dbc7251a83d03e96260cb194f6cf  markout_calibration_buckets.jsonl
+618eff73f99f91562143bd1eb8fb1ce50147c752f2c457371aa1f783e6d00022  markout_calibration_readiness_summary.json
+1e995930404db07b097c113545aede55314bdb6cdd78ea0009810e46c416ab92  markout_fill_split_manifest.jsonl
+```
+
+Blockers:
+
+```text
+Sparse venue/side/horizon/split buckets remain below calibration thresholds.
+373/549 fills still have UNKNOWN maker/taker role.
+243/549 fills still have missing candidate joins.
+Future reference prices are fair-value labels, not independent tape.
+This is descriptive observed-fill markout evidence only, not unconditional EV
+or balance-authoritative financial proof.
+```
+
 ## LTR-EV-SHADOW-001 Phase 5 Tail 20k M6 Reference Replay
 
 - Run id: `LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_20k_m6`

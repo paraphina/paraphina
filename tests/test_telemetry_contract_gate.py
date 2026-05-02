@@ -627,6 +627,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1c queue/churn label gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51c_queue_churn_labels.py"
+
+    def _get_phase51c_markout_calibration_readiness_path(self) -> Path:
+        """Get path to the Phase 5.1c markout calibration-readiness gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51c_markout_calibration_readiness.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -2335,6 +2340,217 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(bad_outcome.returncode, 2)
             self.assertIn("OBSERVED_FILLED P_fill labels must carry p_fill_outcome=1.0", bad_outcome.stderr)
+
+    def test_phase51c_markout_calibration_readiness_preserves_fill_splits_and_stats(self):
+        """Markout readiness should inherit join splits and stay HOLD-only."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed"
+            join_run = tmp_path / "join"
+            output_root = tmp_path / "markout_readiness"
+            observed_run.mkdir()
+            join_run.mkdir()
+            source_sha = "source-sha-markout"
+            (observed_run / "observed_label_summary.json").write_text(json.dumps({
+                "run_id": "observed_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "observed_label_pack_partial_maker_taker_attribution",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (join_run / "join_holdout_summary.json").write_text(json.dumps({
+                "run_id": "join_source",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "deterministic_join_partial_maker_taker_attribution",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            joined_labels = [
+                {
+                    "label_type": "DETERMINISTIC_JOIN_LABEL",
+                    "fill_id": "fill-train",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "maker_taker_role": "MAKER",
+                    "order_join_status": "JOINED",
+                    "candidate_join_status": "JOINED",
+                    "join_status": "COMPLETE_FOR_NONLIVE_REVIEW",
+                    "holdout_split": "TRAIN",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "DETERMINISTIC_JOIN_LABEL",
+                    "fill_id": "fill-holdout",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "maker_taker_role": "UNKNOWN",
+                    "order_join_status": "JOINED",
+                    "candidate_join_status": "MISSING",
+                    "join_status": "PARTIAL",
+                    "holdout_split": "HOLDOUT",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (join_run / "joined_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in joined_labels:
+                    f.write(json.dumps(label) + "\n")
+            observed_labels = [
+                {
+                    "label_type": "OBSERVED_MARKOUT_LABEL",
+                    "fill_id": "fill-train",
+                    "fill_time_ms": 1000,
+                    "markout_horizon_ms": 100,
+                    "markout_pnl": 1.5,
+                    "future_reference_price_source": "fair_value",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "OBSERVED_MARKOUT_LABEL",
+                    "fill_id": "fill-train",
+                    "fill_time_ms": 1000,
+                    "markout_horizon_ms": 500,
+                    "markout_pnl": -0.5,
+                    "future_reference_price_source": "fair_value",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "OBSERVED_MARKOUT_LABEL",
+                    "fill_id": "fill-holdout",
+                    "fill_time_ms": 2000,
+                    "markout_horizon_ms": 100,
+                    "markout_pnl": -2.0,
+                    "future_reference_price_source": "fair_value",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (observed_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in observed_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_markout_calibration_readiness_path()),
+                    "--observed-run",
+                    str(observed_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_markout_readiness_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--min-fills-per-bucket",
+                    "2",
+                    "--min-holdout-fills-per-bucket",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51c_markout_readiness_test"
+            summary = json.loads((run_dir / "markout_calibration_readiness_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["gate_reason"], "markout_readiness_sparse_buckets")
+            self.assertEqual(summary["markout_row_count"], 3)
+            self.assertEqual(summary["unique_fill_count"], 2)
+            self.assertEqual(summary["train_fill_count"], 1)
+            self.assertEqual(summary["holdout_fill_count"], 1)
+            self.assertEqual(summary["adverse_count"], 2)
+            self.assertEqual(summary["maker_taker_role_counts_by_fill"], {"MAKER": 1, "UNKNOWN": 1})
+            self.assertFalse(summary["approved_for_model_training"])
+            self.assertFalse(summary["approved_for_live"])
+            buckets = [
+                json.loads(line)
+                for line in (run_dir / "markout_calibration_buckets.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            global_bucket = next(bucket for bucket in buckets if bucket["bucket_id"] == "GLOBAL")
+            self.assertEqual(global_bucket["mean_markout_pnl"], -1.0 / 3.0)
+            self.assertEqual(global_bucket["adverse_rate"], 2 / 3)
+            self.assertIn("maker_taker_unknown_present", global_bucket["gate_reasons"])
+            split_manifest = [
+                json.loads(line)
+                for line in (run_dir / "markout_fill_split_manifest.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual({row["fill_id"] for row in split_manifest}, {"fill-train", "fill-holdout"})
+            self.assertEqual(
+                {row["fill_id"]: row["holdout_split"] for row in split_manifest},
+                {"fill-train": "TRAIN", "fill-holdout": "HOLDOUT"},
+            )
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(
+                    hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    file_info["sha256"],
+                    file_info["path"],
+                )
+
+            observed_labels[0]["approved_for_live"] = True
+            with (observed_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in observed_labels:
+                    f.write(json.dumps(label) + "\n")
+            unsafe = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_markout_calibration_readiness_path()),
+                    "--observed-run",
+                    str(observed_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_markout_readiness_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
+
+            observed_labels[0]["approved_for_live"] = False
+            observed_labels[0]["fill_id"] = "missing-fill"
+            with (observed_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in observed_labels:
+                    f.write(json.dumps(label) + "\n")
+            missing_join = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_markout_calibration_readiness_path()),
+                    "--observed-run",
+                    str(observed_run),
+                    "--join-holdout-run",
+                    str(join_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_markout_readiness_missing_join_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(missing_join.returncode, 2)
+            self.assertIn("has no deterministic join label", missing_join.stderr)
 
     def test_phase51c_queue_churn_labels_emit_hold_only_proxy_fields(self):
         """Queue/churn labels should join lifecycle proxies and keep native pressure unknown."""
