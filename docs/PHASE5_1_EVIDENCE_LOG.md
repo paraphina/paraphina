@@ -94,8 +94,101 @@ counterfactual_only_nonfinancial: 2000
   `V2_LIGHTER_ACTIVE_ORDERS`, optional
   `V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE`, sanitized source snapshots, manifest,
   artifact index, and schema v2 validation output.
-- Current limitation: no real account/native-limit evidence pack is accepted in
-  this log yet.
+- Current limitation: real account/native-limit capture is accepted for
+  non-live evidence review only; calibration-label ingestion remains blocked
+  until external schema validation and secret audit pass.
+
+### Read-Only Capture 2026-05-02
+
+- Run id: `PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z`
+- Local run directory:
+  `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z`
+- Created UTC: `2026-05-02T00:25:50.978342+00:00`
+- Collector commit: `319089d`
+- Gate status: `HOLD`
+- `phase51b_capture_complete`: `true`
+- `approved_for_nonlive_evidence_review`: `true`
+- `approved_for_calibration_label_ingestion`: `false`
+- Calibration hold reason:
+  `requires_external_schema_validation_and_secret_audit`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- Secret scan: `sensitive_env_values_checked=5`,
+  `sensitive_value_leak_found=false`
+
+Command:
+
+```bash
+python3 tools/phase51b_lighter_account_limits.py \
+  --env-file /home/ubuntu/paraphina/deploy/env/all5_recover_20260314.env \
+  --fetch-readonly \
+  --include-trades \
+  --allow-sdk-auth \
+  --lighter-sdk-path /tmp/lighter_sdk \
+  --run-id PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z
+```
+
+Validation:
+
+```bash
+python3 tools/check_telemetry_contract.py \
+  runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/telemetry.jsonl
+```
+
+Result:
+
+```text
+OK: 5 record(s) validated against schema v2
+```
+
+Extracted non-secret readiness facts:
+
+```text
+event_types:
+  V2_RUN_CONTEXT
+  V2_LIGHTER_ACCOUNT_PROFILE
+  V2_LIGHTER_ACCOUNT_LIMITS
+  V2_LIGHTER_ACTIVE_ORDERS
+  V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE
+lighter_account_type: ACCOUNT_TYPE_0
+lighter_account_profile_status: OBSERVED
+market_id: 0
+market_symbol: ETH
+market_metadata_status: OBSERVED
+maker_fee_bps: 0.0
+taker_fee_bps: 0.0
+price_decimals: 2
+size_decimals: 4
+lighter_user_tier: premium
+lighter_user_tier_name: premium
+current_maker_fee_tick: 40
+current_taker_fee_tick: 280
+active_orders_count_total: 0
+active_orders_count_market: 0
+open_order_limit_status: UNKNOWN
+trade_sample_count: 100
+maker_trade_count: 56
+taker_trade_count: 44
+unknown_role_trade_count: 0
+maker_taker_attribution_status: OBSERVED
+```
+
+Artifact hashes:
+
+```text
+feb1f074fac83cc9331dfbb8aa46d51d30318bd1bee1ba5f1fc2fa59c18cbbb2  telemetry.jsonl
+8095d5a35c2e21bd25deb8377210d41344d839573b4247a8f130367ee2f99ad5  lighter_account_native_limits_summary.json
+fbbee0193abf774c2dc75c57fd6f4b36aa925465410b4d6d6d7f00b88607355c  gate_result.json
+6bca31f446a3504719a680213e634aab13df7c014a59f5b40d57a08af52853d2  evidence_pack/artifact_index.json
+951551534a89570a18ae3a2d02bce8be9d7e71521752c4402289803658c1ac93  command_log.json
+96907e31dcbbfb4d171724d5a6becc56b31e7f7cb8d84a544735367c07a2c93e  source_snapshots/account.sanitized.json
+f564e0b56517e70dad5e7c19f5e3a005a1b9a1049201a41a55c0be5dcaa07d8f  source_snapshots/account_limits.sanitized.json
+38fc4fdf6355aeb29cbccc4716e1bd9612ba3c0c21f10506b19651700fdf8a64  source_snapshots/active_orders.sanitized.json
+e2b930d2f0cfc0e1bacdcaaca6ac907746cd743cbfd934689b0022779bb83df7  source_snapshots/order_books.sanitized.json
+249c441525520716a4c139dbb03d386e825d7102d7ea96d480fb511c737c1d0c  source_snapshots/trades.sanitized.json
+06537f4610394509a790bd18c5ee0185ef09c4888394e7a3f87c42658f14312b  spec_resolved.json
+```
 
 ## LTR-LIGHTER-VENUE-READINESS M5
 
