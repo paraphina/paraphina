@@ -34,10 +34,12 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1q as the active forward-evidence gate and Phase 5.1p as the
-   last completed historical evidence boundary. Phase 5.1q is repo-owned,
-   non-live, and designed to consume sanitized all-five venue-native role rows
-   plus Lighter event-time native-limit pressure rows without raw ID leakage.
+2. Treat Phase 5.1r as the active forward native source-acquisition layer,
+   Phase 5.1q as the downstream forward-evidence gate, and Phase 5.1p as the
+   last completed historical evidence boundary. Phase 5.1r is repo-owned,
+   non-live, and designed to ingest local read-only native snapshots while
+   emitting sanitized all-five venue-native role rows plus Lighter event-time
+   native-limit pressure rows without raw ID leakage.
 3. The current Phase 5.1p recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
    `4527` observed horizons available, `0` observed horizons still missing,
@@ -50,14 +52,16 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    venue/side buckets remain sparse, and `1613` quarantined/review groups remain
    excluded from the observed-only diagnostic pack.
 5. Next repo-owned move is another non-live evidence step: capture or locate
-   real sanitized Phase 5.1q source rows, run Phase 5.1q, feed its
-   `native_role_evidence.jsonl` into Phase 5.1n, then rerun the recovered
-   5.1h/5.1i matrix. Do not train models from 5.1q.
+   real read-only native snapshots, run Phase 5.1r, feed its sanitized outputs
+   into Phase 5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into
+   Phase 5.1n, then rerun the recovered 5.1h/5.1i matrix. Do not train models
+   from Phase 5.1r or Phase 5.1q.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
-7. Use `docs/PHASE5_1Q_FORWARD_NATIVE_EVIDENCE.md` as the standing contract
-   for the current forward native-evidence gate, and
+7. Use `docs/PHASE5_1R_FORWARD_NATIVE_SOURCE_ACQUISITION.md` as the standing
+   contract for source acquisition, `docs/PHASE5_1Q_FORWARD_NATIVE_EVIDENCE.md`
+   for downstream forward native evidence, and
    `docs/PHASE5_1P_LIGHTER_NATIVE_ROLE_EVIDENCE.md` for the exhausted
    quarantined Lighter historical join.
 
@@ -629,13 +633,22 @@ Current repo-owned tooling:
 - The tool never emits raw fill IDs, order IDs, client order IDs, venue order
   IDs, or decision IDs. Raw upstream identifiers are not used as output fields.
 
-Current 5.1q / 5.1p evidence:
+Current 5.1r / 5.1q / 5.1p evidence:
 
+- Forward native source-acquisition baseline run:
+  `runs/phase51r_forward_native_source_acquisition/PHASE51R-FORWARD-NATIVE-SOURCE-ACQUISITION-BASELINE-NO-SOURCES-20260503T000000Z`
 - Forward native evidence baseline run:
-  `runs/phase51q_forward_native_evidence/PHASE51Q-FORWARD-NATIVE-EVIDENCE-BASELINE-NO-SOURCES-20260503T000000Z`
-- Phase 5.1q maker/taker recovery rerun:
-  `runs/phase51n_maker_taker_attribution_recovery/PHASE51Q-MAKER-TAKER-ATTRIBUTION-RECOVERY-BASELINE-NO-SOURCES-20260503T000000Z`
-- Phase 5.1q baseline result: `0` recovered forward role records, `287`
+  `runs/phase51q_forward_native_evidence/PHASE51R-FORWARD-NATIVE-EVIDENCE-BASELINE-NO-SOURCES-20260503T000000Z`
+- Phase 5.1r maker/taker recovery rerun:
+  `runs/phase51n_maker_taker_attribution_recovery/PHASE51R-MAKER-TAKER-ATTRIBUTION-RECOVERY-BASELINE-NO-SOURCES-20260503T000000Z`
+- Phase 5.1r recovered 5.1h run:
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51R-OBSERVED-PFILL-FEATURE-AUDIT-BASELINE-NO-SOURCES-20260503T000000Z`
+- Phase 5.1r recovered 5.1i run:
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51R-PFILL-FEATURE-MATRIX-ADMISSIBILITY-BASELINE-NO-SOURCES-20260503T000000Z`
+- Phase 5.1r baseline result: `0` source files, `0` source rows, `0 / 287`
+  native-role targets recovered, `0 / 3132` Lighter native-limit targets
+  recovered, and raw identifier redaction `PASS`.
+- Phase 5.1q downstream result: `0` recovered forward role records, `287`
   filled rows still missing forward native role source, `3132` Lighter rows
   still missing native-limit pressure source, and raw identifier redaction
   `PASS`.
@@ -819,7 +832,7 @@ The audit must answer:
 4. Read this document.
 5. Read `ROADMAP.md` Phase 5.1 / V2 target specification gate.
 6. Read `docs/V2_SPECIFICATION.md` current evidence boundary and blockers.
-7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1n board decision.
+7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1r board decision.
 8. Confirm runtime is still shadow before any evidence capture:
 
 ```bash
@@ -832,12 +845,13 @@ curl -fsS http://127.0.0.1:9898/health/detail
 
 ## Next Command Targets
 
-After Phase 5.1q is committed and pushed, the next target is not another live
-run. The Phase 5.1q baseline no-source run proves the gate is runnable and keeps
-the expected HOLD: `0` recovered forward role records, `287` filled rows still
+After Phase 5.1r is committed and pushed, the next target is not another live
+run. The Phase 5.1r baseline no-source run proves the acquisition layer is
+runnable and keeps the expected HOLD: `0 / 287` native-role targets recovered,
+`0 / 3132` Lighter native-limit targets recovered, `287` filled rows still
 missing native role evidence, and Lighter native-limit pressure still missing
-real event-time sendTx/REST pressure rows. Capture real sanitized forward
-native source rows across all five venues, rerun Phase 5.1q -> 5.1n -> 5.1h ->
+real event-time sendTx/REST pressure rows. Capture real read-only native
+snapshots across all five venues, rerun Phase 5.1r -> 5.1q -> 5.1n -> 5.1h ->
 5.1i, and require measurable blocker reduction without raw identifiers,
 live/canary/capital/risk authorization, model-training shortcuts, or
 selection-bias shortcuts.

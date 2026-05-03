@@ -484,7 +484,7 @@ admission:
 
 ## 14. Current Phase 5.1 Blockers
 
-As of Phase 5.1q, the V2 evidence path remains blocked by:
+As of Phase 5.1r, the V2 evidence path remains blocked by:
 
 - Lighter native-limit context still partial for `2288` labels because
   historical active-order snapshots do not include full sendTx/REST pressure;
@@ -533,7 +533,15 @@ gate, and rejects raw order/client/fill/trade identifiers. This is the active
 repo-owned path for future exact canonical maker/taker completeness and
 sendTx/REST native-limit pressure evidence.
 
-The next evidence move is to run Phase 5.1q against real forward-captured
-source rows and then rerun Phase 5.1n/5.1h/5.1i. No model training, EV
-admission, canary, live orders, capital escalation, risk-limit relaxation, or
-financial claim is authorized from Phase 5.1q.
+Phase 5.1r adds the source-acquisition layer in front of Phase 5.1q. It may
+ingest local quarantined raw venue-native snapshots, but it emits only redacted
+canonical-group/count/hash evidence: `native_role_source.jsonl`,
+`native_limit_source.jsonl`, and source-acquisition labels. Its baseline
+no-source run is redaction-safe and clears no blockers: `0 / 287` native-role
+targets recovered and `0 / 3132` Lighter native-limit targets recovered.
+
+The next evidence move is to run Phase 5.1r against real read-only native
+snapshots, feed the sanitized outputs into Phase 5.1q, and rerun
+Phase 5.1n/5.1h/5.1i. No model training, EV admission, canary, live orders,
+capital escalation, risk-limit relaxation, or financial claim is authorized
+from Phase 5.1r or Phase 5.1q.

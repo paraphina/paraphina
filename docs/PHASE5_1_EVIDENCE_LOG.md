@@ -445,6 +445,87 @@ evidence move is to capture explicit venue-native maker/taker role fields for
 all five venues and Lighter event-time active-order, sendTx, and REST/weighted
 request pressure, then rerun Phase 5.1q -> 5.1n -> 5.1h -> 5.1i.
 
+## Phase 5.1r - Forward Native Source Acquisition Baseline
+
+Date: 2026-05-03
+
+Purpose: add a redaction-safe acquisition layer that can ingest local,
+read-only venue-native snapshots and emit the sanitized Phase 5.1q source rows
+without leaking raw venue identifiers or creating any live/training authority.
+
+Evidence packs:
+
+```text
+runs/phase51r_forward_native_source_acquisition/PHASE51R-FORWARD-NATIVE-SOURCE-ACQUISITION-BASELINE-NO-SOURCES-20260503T000000Z
+runs/phase51q_forward_native_evidence/PHASE51R-FORWARD-NATIVE-EVIDENCE-BASELINE-NO-SOURCES-20260503T000000Z
+runs/phase51n_maker_taker_attribution_recovery/PHASE51R-MAKER-TAKER-ATTRIBUTION-RECOVERY-BASELINE-NO-SOURCES-20260503T000000Z
+runs/phase51h_observed_pfill_feature_audit/PHASE51R-OBSERVED-PFILL-FEATURE-AUDIT-BASELINE-NO-SOURCES-20260503T000000Z
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51R-PFILL-FEATURE-MATRIX-ADMISSIBILITY-BASELINE-NO-SOURCES-20260503T000000Z
+```
+
+Phase 5.1r result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51r_forward_native_source_acquisition_incomplete
+observed_pfill_label_count: 6140
+source_file_count: 0
+source_row_count: 0
+native_role_target_count: 287
+native_role_source_record_count: 0
+native_role_target_recovered_count: 0
+lighter_native_limit_target_count: 3132
+native_limit_source_record_count: 0
+native_limit_complete_source_record_count: 0
+lighter_native_limit_target_recovered_count: 0
+raw_identifier_redaction_status: PASS
+```
+
+Downstream Phase 5.1q result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51q_forward_native_evidence_incomplete
+native_role_evidence_record_count: 0
+recovered_forward_native_role_count: 0
+native_role_capture_status_counts:
+- OBSERVED_PRESERVED: 174
+- MISSING_FORWARD_NATIVE_ROLE_SOURCE: 287
+- NO_FILL_NOT_APPLICABLE: 5679
+native_limit_pressure_status_counts:
+- MISSING_NATIVE_LIMIT_PRESSURE_SOURCE: 3132
+- NOT_APPLICABLE_NON_LIGHTER: 3008
+raw_identifier_redaction_status: PASS
+```
+
+Downstream Phase 5.1n result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51n_maker_taker_attribution_incomplete
+filled_count: 461
+maker_taker_observed_or_recovered_count: 174
+maker_taker_partial_or_missing_count: 287
+native_role_inputs: 0 records from Phase 5.1q
+raw_identifier_redaction_status: PASS
+```
+
+Recovered matrix result:
+
+```text
+5.1h gate_reason: phase51h_lighter_native_limit_pressure_not_fully_observed
+5.1i gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+5.1i matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+```
+
+Interpretation: Phase 5.1r is now repo-owned and runnable. The no-source
+baseline intentionally clears no blocker; it proves the adapter preserves the
+HOLD boundary until real read-only native snapshots are supplied.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:

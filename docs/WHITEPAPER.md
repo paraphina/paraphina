@@ -84,15 +84,17 @@ budget, liquidation safety, rate-limit headroom, and non-live experiment caps.
 
 The active Phase 5.1 evidence boundary remains `HOLD` for live, canary, capital
 escalation, risk-limit relaxation, model training, and EV admission until the
-roadmap gates accept complete non-live evidence. Phase 5.1q is the active
-forward native-evidence gate; Phase 5.1p remains the last completed historical
-evidence boundary. Phase 5.1p recovered all previously missing filled-order
-source-tick horizons, aligned historical Lighter active-order snapshots without
-treating them as full sendTx/REST pressure, and exhausted the quarantined
-historical Lighter native trade join attempt with `0 / 125` exact canonical
-recoveries. Phase 5.1q adds the all-five forward path for explicit
-venue-native maker/taker role evidence and Lighter event-time sendTx/REST
-native-limit pressure, but its baseline no-source run clears no blockers.
+roadmap gates accept complete non-live evidence. Phase 5.1r is the active
+forward native source-acquisition layer feeding the Phase 5.1q forward
+native-evidence gate; Phase 5.1p remains the last completed historical evidence
+boundary. Phase 5.1p recovered all previously missing filled-order source-tick
+horizons, aligned historical Lighter active-order snapshots without treating
+them as full sendTx/REST pressure, and exhausted the quarantined historical
+Lighter native trade join attempt with `0 / 125` exact canonical recoveries.
+Phase 5.1q adds the all-five forward path for explicit venue-native maker/taker
+role evidence and Lighter event-time sendTx/REST native-limit pressure. Phase
+5.1r adds the redaction-safe local source adapter, but its baseline no-source
+run clears no blockers.
 Blockers remain: native-limit pressure is still partial, venue-native
 maker/taker evidence is incomplete for `287` filled rows, calibration buckets
 are sparse, and observed-only selection-bias quarantine policy remains

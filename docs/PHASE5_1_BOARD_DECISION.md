@@ -803,3 +803,82 @@ sources and Lighter event-time native-limit pressure. Run Phase 5.1q, rerun
 Phase 5.1n/5.1h/5.1i, and preserve HOLD unless the blockers clear through
 observed venue-native evidence.
 ```
+
+## Phase 5.1r Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live evidence action: run
+`tools/phase51r_forward_native_source_acquisition.py` on read-only local
+venue-native snapshots, feed its sanitized `native_role_source.jsonl` and
+`native_limit_source.jsonl` into Phase 5.1q, then rerun
+Phase 5.1n/5.1h/5.1i.
+
+Rationale:
+
+- Phase 5.1r is the source-acquisition adapter required before Phase 5.1q when
+  raw local snapshots contain venue identifiers that cannot enter 5.1q.
+- The gate accepts all-five venue-native role fields only: Lighter
+  `is_maker_ask` with account side, Hyperliquid `crossed`, Paradex
+  `liquidity`, Aster `ORDER_TRADE_UPDATE.o.m`, and Extended `isTaker`.
+- Raw order/client/fill/trade identifiers may exist only in quarantined local
+  inputs. Outputs are canonical-group/count/hash based and redaction-checked.
+- The baseline no-source run correctly clears no blockers and therefore
+  preserves the existing HOLD boundary.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1r - Forward native source acquisition
+tool: tools/phase51r_forward_native_source_acquisition.py
+spec: docs/PHASE5_1R_FORWARD_NATIVE_SOURCE_ACQUISITION.md
+status: HOLD
+authorized outputs:
+- native_role_source.jsonl
+- native_limit_source.jsonl
+- source_acquisition_labels.jsonl
+- phase51r_forward_native_source_acquisition_summary.json
+prohibited:
+- live orders
+- canary
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+```
+
+Baseline no-source evidence:
+
+```text
+runs/phase51r_forward_native_source_acquisition/PHASE51R-FORWARD-NATIVE-SOURCE-ACQUISITION-BASELINE-NO-SOURCES-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51r_forward_native_source_acquisition_incomplete
+native_role_target_count: 287
+native_role_source_record_count: 0
+native_role_target_recovered_count: 0
+lighter_native_limit_target_count: 3132
+native_limit_source_record_count: 0
+native_limit_complete_source_record_count: 0
+lighter_native_limit_target_recovered_count: 0
+raw_identifier_redaction_status: PASS
+```
+
+Downstream rerun evidence:
+
+```text
+runs/phase51q_forward_native_evidence/PHASE51R-FORWARD-NATIVE-EVIDENCE-BASELINE-NO-SOURCES-20260503T000000Z
+runs/phase51n_maker_taker_attribution_recovery/PHASE51R-MAKER-TAKER-ATTRIBUTION-RECOVERY-BASELINE-NO-SOURCES-20260503T000000Z
+runs/phase51h_observed_pfill_feature_audit/PHASE51R-OBSERVED-PFILL-FEATURE-AUDIT-BASELINE-NO-SOURCES-20260503T000000Z
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51R-PFILL-FEATURE-MATRIX-ADMISSIBILITY-BASELINE-NO-SOURCES-20260503T000000Z
+```
+
+Next move:
+
+```text
+Supply real read-only native snapshots to Phase 5.1r, require redacted outputs,
+then rerun Phase 5.1q -> 5.1n -> 5.1h -> 5.1i. Preserve HOLD unless observed
+venue-native evidence materially reduces the native-role/native-limit blockers
+without introducing raw IDs or unsafe authorization flags.
+```

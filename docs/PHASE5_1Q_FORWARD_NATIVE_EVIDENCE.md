@@ -46,6 +46,16 @@ Missing any of those fields produces `PARTIAL_NATIVE_LIMIT_PRESSURE_SOURCE` or
 
 ## Tool
 
+Phase 5.1q expects sanitized source rows. When local source snapshots contain
+raw venue identifiers, first run Phase 5.1r:
+
+```bash
+python3 tools/phase51r_forward_native_source_acquisition.py \
+  --observed-pfill-run runs/<pfill_run> \
+  --source-root <local_native_snapshot_dir> \
+  --run-id <phase51r_run_id>
+```
+
 Command:
 
 ```bash
@@ -120,3 +130,14 @@ native_limit_pressure_status_counts:
 
 The baseline proves the gate is runnable against real canonical P_fill evidence
 and preserves HOLD when no forward native source rows exist.
+
+Phase 5.1r source-acquisition baseline:
+
+```text
+runs/phase51r_forward_native_source_acquisition/PHASE51R-FORWARD-NATIVE-SOURCE-ACQUISITION-BASELINE-NO-SOURCES-20260503T000000Z
+native_role_target_count: 287
+native_role_target_recovered_count: 0
+lighter_native_limit_target_count: 3132
+lighter_native_limit_target_recovered_count: 0
+raw_identifier_redaction_status: PASS
+```
