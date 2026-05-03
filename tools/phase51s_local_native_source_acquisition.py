@@ -90,6 +90,12 @@ SOURCE_LIST_KEYS = {
     "tradeHistory",
     "trades",
 }
+SOURCE_LINK_HASH_FIELDS = {
+    "phase51s_source_record_sha256",
+    "source_record_sha256",
+    "redacted_source_record_sha256",
+}
+SOURCE_LINK_ALLOWED_FIELDS = SOURCE_LINK_HASH_FIELDS | {"canonical_group_id", "order_key"} | UNSAFE_TRUE_FLAGS
 
 
 def _sha256_file(path: Path) -> str:
@@ -191,6 +197,13 @@ def _check_output_safe(record: dict[str, Any], path: Path) -> None:
         raise ValueError(f"{path} output leaked raw identifier fields: {sorted(raw_fields)}")
 
 
+def _check_no_nested_raw_identifier_fields(record: Any, path: Path, *, label: str) -> None:
+    for obj in _iter_dicts(record):
+        raw_fields = NESTED_RAW_IDENTIFIER_FIELDS & set(obj)
+        if raw_fields:
+            raise ValueError(f"{path} {label} leaked raw identifier fields: {sorted(raw_fields)}")
+
+
 def _artifact_infos(root_dir: Path, artifact_paths: list[Path]) -> list[dict[str, Any]]:
     return [
         {
@@ -243,22 +256,22 @@ def _check_no_symlink(path: Path) -> None:
             raise ValueError(f"symlink source path is prohibited: {candidate}")
 
 
-def _source_path(entry: dict[str, Any], manifest_path: Path, index: int) -> Path:
+def _source_path(entry: dict[str, Any], manifest_path: Path, index: int, *, entry_kind: str = "source") -> Path:
     raw = entry.get("path")
     if not isinstance(raw, str) or not raw.strip():
-        raise ValueError(f"{manifest_path}: source[{index}] missing local path")
+        raise ValueError(f"{manifest_path}: {entry_kind}[{index}] missing local path")
     if _path_text_is_unsafe(raw):
-        raise ValueError(f"{manifest_path}: network source paths are prohibited")
+        raise ValueError(f"{manifest_path}: network {entry_kind} paths are prohibited")
     path = _resolve_path(Path(raw))
     if _is_env_path(path):
-        raise ValueError(f"{manifest_path}: env files are prohibited as native source input")
+        raise ValueError(f"{manifest_path}: env files are prohibited as native {entry_kind} input")
     _check_no_symlink(path)
     if not path.exists():
-        raise ValueError(f"{manifest_path}: source path does not exist: {path}")
+        raise ValueError(f"{manifest_path}: {entry_kind} path does not exist: {path}")
     if not path.is_file():
-        raise ValueError(f"{manifest_path}: source path must be a file: {path}")
+        raise ValueError(f"{manifest_path}: {entry_kind} path must be a file: {path}")
     if path.suffix not in {".json", ".jsonl"}:
-        raise ValueError(f"{manifest_path}: source path must be .json or .jsonl: {path}")
+        raise ValueError(f"{manifest_path}: {entry_kind} path must be .json or .jsonl: {path}")
     return path
 
 
@@ -359,6 +372,79 @@ def _redact_source_row(row: dict[str, Any], venue_id: str | None) -> tuple[dict[
     return redacted, len(stripped)
 
 
+def _source_link_hashes(row: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in sorted(SOURCE_LINK_HASH_FIELDS):
+        value = row.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _require_source_link_string(row: dict[str, Any], path: Path, line_no: int, key: str) -> None:
+    value = row.get(key)
+    if value is None or value == "":
+        return
+    if not isinstance(value, str):
+        raise ValueError(f"{path}:{line_no} source link field {key} must be a string")
+
+
+def _check_source_link_safe(row: dict[str, Any], path: Path, line_no: int) -> None:
+    _check_unsafe_flags(row, path, label="source link")
+    _check_no_secret_fields(row, path, label="source link")
+    _check_no_nested_raw_identifier_fields(row, path, label="source link")
+    unexpected = sorted(set(row) - SOURCE_LINK_ALLOWED_FIELDS)
+    if unexpected:
+        raise ValueError(f"{path}:{line_no} source link has unsupported fields: {unexpected}")
+    for key in sorted(SOURCE_LINK_HASH_FIELDS | {"canonical_group_id", "order_key"}):
+        _require_source_link_string(row, path, line_no, key)
+    if not _source_link_hashes(row):
+        raise ValueError(f"{path}:{line_no} source link missing source hash")
+    if not (row.get("canonical_group_id") or row.get("order_key")):
+        raise ValueError(f"{path}:{line_no} source link missing canonical_group_id or order_key")
+
+
+def _iter_source_link_records(path: Path):
+    if path.suffix == ".jsonl":
+        for line_no, row in _iter_jsonl(path):
+            _check_source_link_safe(row, path, line_no)
+            yield line_no, row
+        return
+    payload = _load_json(path)
+    _check_unsafe_flags(payload, path, label="source link payload")
+    _check_no_secret_fields(payload, path, label="source link payload")
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("source_links"), list):
+        rows = payload["source_links"]
+    elif isinstance(payload, dict):
+        rows = [payload]
+    else:
+        raise ValueError(f"expected JSON object at {path}:1")
+    for line_no, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise ValueError(f"expected JSON object at {path}:{line_no}")
+        _check_source_link_safe(row, path, line_no)
+        yield line_no, row
+
+
+def _stage_source_link_row(row: dict[str, Any]) -> dict[str, Any]:
+    staged = {
+        key: row[key]
+        for key in sorted(SOURCE_LINK_ALLOWED_FIELDS)
+        if key in row
+    }
+    for flag in UNSAFE_TRUE_FLAGS:
+        staged.setdefault(flag, False)
+    _check_source_link_safe(staged, Path("phase51s_source_link_sidecar"), 0)
+    return staged
+
+
 def _has_join_key(row: dict[str, Any]) -> bool:
     return bool(row.get("canonical_group_id") or row.get("order_key"))
 
@@ -410,18 +496,29 @@ def build_local_native_source_acquisition(
     sources = manifest_payload.get("sources")
     if not isinstance(sources, list):
         raise ValueError(f"{manifest} must contain a sources list")
+    source_links = manifest_payload.get("source_links", [])
+    if source_links is None:
+        source_links = []
+    if not isinstance(source_links, list):
+        raise ValueError(f"{manifest} source_links must be a list when present")
 
     out_dir = output_root / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     staged_records: list[dict[str, Any]] = []
+    staged_source_links: list[dict[str, Any]] = []
     labels: list[dict[str, Any]] = []
+    source_link_labels: list[dict[str, Any]] = []
     source_artifacts: list[dict[str, Any]] = []
+    source_link_artifacts: list[dict[str, Any]] = []
     seq = 0
+    source_link_seq = 0
     source_row_count = 0
+    source_link_row_count = 0
     join_key_row_count = 0
     stripped_raw_identifier_field_count = 0
     complete_lighter_limit_row_count = 0
+    source_link_hashes_seen: dict[str, dict[str, Any]] = {}
 
     for index, source in enumerate(sources):
         if not isinstance(source, dict):
@@ -481,17 +578,72 @@ def build_local_native_source_acquisition(
             }
         )
 
+    for index, source_link in enumerate(source_links):
+        if not isinstance(source_link, dict):
+            raise ValueError(f"{manifest}: source_links[{index}] must be an object")
+        _check_unsafe_flags(source_link, manifest, label=f"source_links[{index}]")
+        _check_no_secret_fields(source_link, manifest, label=f"source_links[{index}]")
+        path = _source_path(source_link, manifest, index, entry_kind="source_links")
+        row_count = 0
+        hash_count = 0
+        for line_no, row in _iter_source_link_records(path):
+            source_link_row_count += 1
+            row_count += 1
+            staged = _stage_source_link_row(row)
+            row_hashes = _source_link_hashes(staged)
+            for source_hash in row_hashes:
+                existing = source_link_hashes_seen.get(source_hash)
+                if existing is not None:
+                    raise ValueError(f"{path}:{line_no} duplicate source link hash {source_hash}")
+                source_link_hashes_seen[source_hash] = {
+                    "canonical_group_id": staged.get("canonical_group_id") or "",
+                    "order_key": staged.get("order_key") or "",
+                }
+            hash_count += len(row_hashes)
+            staged_source_links.append(staged)
+
+            label = _base_record(run_id, source_link_seq, timestamp_ns, "PHASE51S_SOURCE_LINK_LABEL")
+            source_link_seq += 1
+            label.update(
+                {
+                    "source_link_index": index,
+                    "source_path_hash": _stable_hash(str(path)),
+                    "source_line": line_no,
+                    "source_link_sha256": _stable_hash(staged),
+                    "source_link_hash_count": len(row_hashes),
+                    "canonical_group_present": bool(staged.get("canonical_group_id")),
+                    "order_key_present": bool(staged.get("order_key")),
+                    "local_source_link_stage_status": "STAGED_LOCAL_SOURCE_LINK_ROW",
+                }
+            )
+            source_link_labels.append(label)
+        source_link_artifacts.append(
+            {
+                "path_hash": _stable_hash(str(path)),
+                "sha256": _sha256_file(path),
+                "row_count": row_count,
+                "staged_count": row_count,
+                "source_link_hash_count": hash_count,
+            }
+        )
+
     source_path = out_dir / "local_native_source.jsonl"
+    source_link_path = out_dir / "local_source_link_sidecar.jsonl"
     labels_path = out_dir / "local_source_labels.jsonl"
+    source_link_labels_path = out_dir / "local_source_link_labels.jsonl"
     summary_path = out_dir / "phase51s_local_native_source_acquisition_summary.json"
     manifest_path = out_dir / "phase51s_manifest.json"
 
     _write_jsonl(source_path, staged_records)
+    _write_jsonl(source_link_path, staged_source_links)
     _write_jsonl(labels_path, labels)
+    _write_jsonl(source_link_labels_path, source_link_labels)
 
     gate_reason = (
         "phase51s_local_native_source_acquisition_complete_nonlive_hold"
         if staged_records
+        else "phase51s_local_native_source_acquisition_incomplete_source_links_only"
+        if staged_source_links
         else "phase51s_local_native_source_acquisition_incomplete"
     )
     summary = {
@@ -516,19 +668,26 @@ def build_local_native_source_acquisition(
         "source_file_count": len(sources),
         "source_row_count": source_row_count,
         "staged_source_row_count": len(staged_records),
+        "source_link_file_count": len(source_links),
+        "source_link_row_count": source_link_row_count,
+        "staged_source_link_row_count": len(staged_source_links),
+        "source_link_hash_count": len(source_link_hashes_seen),
         "join_key_source_row_count": join_key_row_count,
         "source_row_without_join_key_count": len(staged_records) - join_key_row_count,
         "complete_lighter_native_limit_source_row_count": complete_lighter_limit_row_count,
         "raw_identifier_fields_stripped_count": stripped_raw_identifier_field_count,
         "local_source_stage_status_counts": _status_counts(labels, "local_source_stage_status"),
+        "local_source_link_stage_status_counts": _status_counts(source_link_labels, "local_source_link_stage_status"),
         "source_artifacts": source_artifacts,
+        "source_link_artifacts": source_link_artifacts,
         "downstream_tool": "tools/phase51r_forward_native_source_acquisition.py",
         "downstream_argument": "--source-json local_native_source.jsonl",
+        "downstream_source_link_argument": "--source-link-jsonl local_source_link_sidecar.jsonl",
         "clears_phase51_blockers": False,
     }
     _write_json(summary_path, summary)
 
-    artifacts = [source_path, labels_path, summary_path]
+    artifacts = [source_path, source_link_path, labels_path, source_link_labels_path, summary_path]
     manifest_out = {
         "run_id": run_id,
         "generated_at_utc": _timestamp_ns_to_utc(timestamp_ns),

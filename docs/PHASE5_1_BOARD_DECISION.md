@@ -949,6 +949,9 @@ Rationale:
   unsafe true authorization flags.
 - It strips raw order/client/fill/trade identifiers and emits only redacted
   local source rows plus label/summary/manifest artifacts.
+- It stages optional redacted source-link sidecars from the manifest
+  `source_links` list so redacted source hashes can be linked to observed
+  canonical groups/order keys before Phase 5.1r.
 - It is not a blocker-clearing gate by itself. Blocker reduction requires
   downstream exact canonical joins and complete venue-native evidence.
 
@@ -962,6 +965,7 @@ example manifest: configs/phase51s_local_native_source_manifest.example.json
 status: HOLD
 authorized output:
 - local_native_source.jsonl for Phase 5.1r --source-json
+- local_source_link_sidecar.jsonl for Phase 5.1r --source-link-jsonl
 prohibited:
 - live orders
 - canary
@@ -987,6 +991,19 @@ raw_identifier_redaction_status: PASS
 clears_phase51_blockers: false
 ```
 
+Current source-link staging support:
+
+```text
+manifest input: optional source_links list
+accepted sidecar row: source-record hash plus canonical_group_id or order_key
+rejected sidecar row: unsupported fields, raw venue IDs, duplicate hashes,
+  unsafe true authorization flags, secret-shaped fields, non-string hash/join
+  fields, or missing join fields
+output: local_source_link_sidecar.jsonl
+status: HOLD, non-live join evidence only
+sidecar-only run: incomplete_source_links_only
+```
+
 Downstream Phase 5.1r evidence from that staged source:
 
 ```text
@@ -1005,7 +1022,9 @@ Next move:
 Use Phase 5.1s as the mandatory local preflight for future native source
 snapshots. Capture forward all-five venue-native role rows with canonical
 group/order-key linkage and capture complete Lighter event-time active-order,
-sendTx, and REST/weighted-request pressure rows. Rerun Phase 5.1s -> 5.1r ->
-5.1q -> 5.1n -> 5.1h -> 5.1i, preserving HOLD unless observed evidence clears
-the blockers without raw IDs or unsafe authorization flags.
+sendTx, and REST/weighted-request pressure rows. If direct group/order keys
+cannot be embedded in redacted source rows, provide a redacted manifest
+`source_links` sidecar that maps source hashes to observed labels. Rerun Phase
+5.1s -> 5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i, preserving HOLD unless observed
+evidence clears the blockers without raw IDs or unsafe authorization flags.
 ```

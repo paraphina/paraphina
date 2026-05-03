@@ -22,5 +22,11 @@
       "venue_id": "hyperliquid",
       "path": "runs/<phase51_local_readonly_source>/source_snapshots/hyperliquid_fills.sanitized.jsonl"
     }
+  ],
+  "source_links": [
+    {
+      "source_link_id": "forward_source_hash_to_canonical_group",
+      "path": "runs/<phase51_local_readonly_source>/source_snapshots/source_links.sanitized.jsonl"
+    }
   ]
 }

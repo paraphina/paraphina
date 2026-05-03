@@ -52,6 +52,9 @@ for `.json` and `.jsonl` files. `--source-link-jsonl` may also be repeated.
 Phase 5.1r accepts an optional source-link sidecar when a redacted staged source
 row does not itself carry `canonical_group_id` or `order_key`, but can be linked
 by a deterministic source hash. The sidecar is non-live evidence plumbing only.
+Forward local captures should stage source-link sidecars through the Phase 5.1s
+manifest `source_links` list, which emits `local_source_link_sidecar.jsonl` for
+this Phase 5.1r `--source-link-jsonl` input.
 
 Allowed sidecar fields:
 

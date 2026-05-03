@@ -638,6 +638,52 @@ resume safety, but no live or economic blocker is cleared until real forward
 source snapshots and source-link rows produce observed venue-native role and
 Lighter native-limit evidence.
 
+## Phase 5.1s - Source-Link Sidecar Staging
+
+Date: 2026-05-03
+
+Purpose: make Phase 5.1s the mandatory local preflight for both redacted native
+source rows and redacted source-link sidecars before Phase 5.1r consumes them.
+This keeps forward captures manifest-bound, local-only, raw-ID checked, and
+resume-safe.
+
+Repo-owned gate:
+
+```text
+tool: tools/phase51s_local_native_source_acquisition.py
+manifest input: optional source_links list
+output: local_source_link_sidecar.jsonl
+status: HOLD
+```
+
+Validation evidence:
+
+```text
+python3 -m py_compile tools/phase51s_local_native_source_acquisition.py tests/test_telemetry_contract_gate.py
+python3 -m unittest tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51s_local_source_link_sidecar_feeds_phase51r_deterministically tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51s_source_link_sidecar_rejects_unsafe_rows
+python3 -m unittest tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51s_local_source_acquisition_feeds_phase51r_without_raw_ids tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51s_local_source_acquisition_rejects_secrets_and_network_sources tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51s_local_source_acquisition_does_not_false_clear_partial_sources tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51r_source_link_sidecar_recovers_joinable_staged_rows tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51r_source_link_sidecar_rejects_ambiguous_or_raw_links
+```
+
+Expected staging behavior:
+
+```text
+accepted: source hash -> observed canonical_group_id/order_key
+rejected: network paths, .env files, symlinks
+rejected: secret-shaped fields
+rejected: raw order/client/fill/trade identifiers
+rejected: duplicate source hashes
+rejected: non-string source-hash or join fields
+rejected: unsupported sidecar fields
+rejected: unsafe true authorization flags
+sidecar-only run: incomplete_source_links_only
+not allowed: maker/taker inference, Lighter limit-pressure inference, EV/PnL claims
+```
+
+Interpretation: Phase 5.1s now stages both source rows and optional source-link
+sidecars, but it still clears no blocker by itself. Blocker reduction remains
+downstream-only through Phase 5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i with real
+forward venue-native evidence.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:
