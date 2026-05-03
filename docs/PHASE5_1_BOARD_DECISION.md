@@ -594,3 +594,78 @@ retention allows it, and add forward-looking event-time native-limit telemetry
 for sendTx/REST pressure. Rerun 5.1h/5.1i after any recovery; keep sparse
 bucket and observed-only selection-bias holds until separately solved.
 ```
+
+## Phase 5.1o Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live evidence-completeness step:
+quarantined raw-ID Lighter native trade join where safe, plus forward native
+maker/taker capture for Aster, Extended, Paradex, and Hyperliquid and
+event-time native-limit capture for sendTx/REST pressure.
+
+Rationale:
+
+- Phase 5.1o added a repo-owned native-role source inventory. It emits
+  `native_role_evidence.jsonl` only for exact canonical venue-native role
+  evidence and rejects inferred sources.
+- The current inventory found `461` filled rows, `174` already-observed
+  maker/taker rows, `0` exact canonical recoveries, `125` Lighter
+  `SOURCE_AVAILABLE_NO_CANONICAL_JOIN` rows, and `162`
+  `MISSING_VENUE_NATIVE_ROLE_SOURCE` rows.
+- Venue split for the unresolved rows is Lighter `125` source-available but
+  unjoined rows, plus Aster `113`, Extended `28`, Paradex `15`, and
+  Hyperliquid `6` rows with no retained native role source in current artifacts.
+- Lighter has historical native trade source material that may be recoverable
+  through a quarantined raw-ID join. Aster, Extended, Paradex, and Hyperliquid
+  lack retained event-time native role fields in current artifacts, so their
+  evidence path is forward capture unless separate native fill/trade archives
+  are supplied.
+- The recovered 5.1h -> 5.1i chain remains `HOLD` with the same four blockers:
+  native-limit pressure incomplete, maker/taker incomplete, sparse buckets, and
+  observed-only selection bias.
+
+Current evidence boundary:
+
+```text
+Phase 5.1o - Native role source inventory
+runs/phase51o_native_role_source_inventory/PHASE51O-NATIVE-ROLE-SOURCE-INVENTORY-ALL-VENUE-20260503T120000Z
+gate_status: HOLD
+gate_reason: phase51o_native_role_sources_incomplete
+filled_count: 461
+input_observed_preserved_count: 174
+recovered_native_role_count: 0
+source_available_no_canonical_join_count: 125
+missing_native_role_source_count: 162
+raw_identifier_redaction_status: PASS
+
+Phase 5.1o - Maker/taker attribution recovery rerun
+runs/phase51n_maker_taker_attribution_recovery/PHASE51O-MAKER-TAKER-ATTRIBUTION-RECOVERY-ALL-VENUE-20260503T120000Z
+gate_status: HOLD
+maker_taker_observed_or_recovered_count: 174
+maker_taker_partial_or_missing_count: 287
+raw_identifier_redaction_status: PASS
+
+Phase 5.1o - Recovered P-fill feature-matrix admissibility
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51O-PFILL-FEATURE-MATRIX-ADMISSIBILITY-NATIVE-ROLE-RECOVERY-20260503T120000Z
+gate_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+maker_taker_observed_count: 174
+maker_taker_partial_or_unknown_count: 222
+maker_taker_missing_count: 65
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Do not start live/canary/model-training/EV-admission work. Implement the
+smallest quarantined Lighter-only native trade join that can emit exact
+canonical role evidence without raw ID leakage, and add forward venue-native
+role collectors/fields for Aster ORDER_TRADE_UPDATE.m, Extended isTaker,
+Paradex liquidity, and Hyperliquid crossed. Preserve sparse-bucket and
+observed-only selection-bias holds until separately solved.
+```

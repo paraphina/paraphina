@@ -692,6 +692,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1n maker/taker attribution recovery gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51n_maker_taker_attribution_recovery.py"
+
+    def _get_phase51o_native_role_source_inventory_path(self) -> Path:
+        """Get path to the Phase 5.1o native role source inventory gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51o_native_role_source_inventory.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -6312,6 +6317,250 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(by_group["group-1"]["maker_taker_attribution_source"], "HYPERLIQUID_CROSSED")
             self.assertEqual(by_group["group-2"]["maker_taker_recovery_status"], "OBSERVED_PRESERVED")
             self.assertEqual(by_group["group-3"]["maker_taker_recovery_status"], "NO_FILL_NOT_APPLICABLE")
+
+    def test_phase51o_native_role_inventory_feeds_recovery_without_inference(self):
+        """5.1o should emit only exact canonical venue-native role evidence for 5.1n recovery."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            source_root = tmp_path / "source_root"
+            inventory_root = tmp_path / "native_role_inventory"
+            recovery_root = tmp_path / "maker_taker_recovery"
+            native_roles = tmp_path / "native_roles.jsonl"
+            observed_run.mkdir()
+            source_root.mkdir()
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51o_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 4,
+                "censored_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (source_root / "trades_backfill.sanitized.json").write_text(json.dumps({
+                "schema_version": 1,
+                "source_mode": "synthetic_test_metadata_only",
+                "trade_count": 0,
+                "trades": [],
+            }), encoding="utf-8")
+            labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-observed",
+                    "order_key": "order-observed",
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "hyperliquid",
+                    "side": "Buy",
+                    "fill_count": 1,
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "maker_taker_role_counts": {"MAKER": 1, "TAKER": 0, "UNKNOWN": 0},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-recovered",
+                    "order_key": "order-recovered",
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "aster",
+                    "side": "Sell",
+                    "fill_count": 1,
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-source-available",
+                    "order_key": "order-source-available",
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "fill_count": 1,
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-missing",
+                    "order_key": "order-missing",
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "extended",
+                    "side": "Buy",
+                    "fill_count": 1,
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (observed_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            native_roles.write_text(json.dumps({
+                "canonical_group_id": "group-recovered",
+                "maker_taker_role_counts": {"MAKER": 0, "TAKER": 1, "UNKNOWN": 0},
+                "maker_taker_attribution_source": "ASTER_ORDER_TRADE_UPDATE_M",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            inventory_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51o_native_role_source_inventory_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--source-root",
+                    str(source_root),
+                    "--native-role-jsonl",
+                    str(native_roles),
+                    "--output-root",
+                    str(inventory_root),
+                    "--run-id",
+                    "phase51o_inventory_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                inventory_result.returncode,
+                0,
+                f"stdout: {inventory_result.stdout}\nstderr: {inventory_result.stderr}",
+            )
+            inventory_dir = inventory_root / "phase51o_inventory_test"
+            inventory_summary = json.loads(
+                (inventory_dir / "native_role_source_inventory_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(inventory_summary["input_observed_preserved_count"], 1)
+            self.assertEqual(inventory_summary["recovered_native_role_count"], 1)
+            self.assertEqual(inventory_summary["missing_native_role_source_count"], 1)
+            self.assertEqual(inventory_summary["source_available_no_canonical_join_count"], 1)
+            self.assertEqual(inventory_summary["native_role_evidence_record_count"], 1)
+            self.assertEqual(inventory_summary["raw_identifier_redaction_status"], "PASS")
+            self.assertEqual(inventory_summary["source_artifact_venues"], ["lighter"])
+            evidence_rows = [
+                json.loads(line)
+                for line in (inventory_dir / "native_role_evidence.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(evidence_rows), 1)
+            self.assertEqual(evidence_rows[0]["canonical_group_id"], "group-recovered")
+            self.assertEqual(evidence_rows[0]["maker_taker_attribution_source"], "ASTER_ORDER_TRADE_UPDATE_M")
+            self.assertFalse(evidence_rows[0]["approved_for_live"])
+            self.assertFalse(evidence_rows[0]["approved_for_model_training"])
+
+            recovery_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51n_maker_taker_attribution_recovery_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--native-role-jsonl",
+                    str(inventory_dir / "native_role_evidence.jsonl"),
+                    "--output-root",
+                    str(recovery_root),
+                    "--run-id",
+                    "phase51o_recovery_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                recovery_result.returncode,
+                0,
+                f"stdout: {recovery_result.stdout}\nstderr: {recovery_result.stderr}",
+            )
+            recovery_summary = json.loads(
+                (recovery_root / "phase51o_recovery_test" / "maker_taker_attribution_recovery_summary.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(recovery_summary["maker_taker_observed_or_recovered_count"], 2)
+            self.assertEqual(recovery_summary["maker_taker_partial_or_missing_count"], 2)
+            self.assertEqual(
+                recovery_summary["maker_taker_recovery_status_counts"]["RECOVERED_VENUE_NATIVE_ROLE"],
+                1,
+            )
+            self.assertEqual(
+                recovery_summary["maker_taker_recovery_status_counts"]["OBSERVED_PRESERVED"],
+                1,
+            )
+            self.assertEqual(
+                recovery_summary["maker_taker_recovery_status_counts"]["MISSING_VENUE_NATIVE_ROLE_SOURCE"],
+                2,
+            )
+
+    def test_phase51o_native_role_inventory_rejects_non_native_source(self):
+        """5.1o should reject role evidence from non-native or inferred sources."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            source_root = tmp_path / "source_root"
+            output_root = tmp_path / "native_role_inventory"
+            native_roles = tmp_path / "native_roles.jsonl"
+            observed_run.mkdir()
+            source_root.mkdir()
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51o_reject_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(json.dumps({
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "canonical_group_id": "group-unsafe",
+                "order_key": "order-unsafe",
+                "source_telemetry_sha256": "source-sha",
+                "venue_id": "lighter",
+                "side": "Buy",
+                "fill_count": 1,
+                "outcome_status": "OBSERVED_FILLED",
+                "p_fill_outcome": 1.0,
+                "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            native_roles.write_text(json.dumps({
+                "canonical_group_id": "group-unsafe",
+                "maker_taker_role_counts": {"MAKER": 1, "TAKER": 0, "UNKNOWN": 0},
+                "maker_taker_attribution_source": "POST_ONLY_INTENT_INFERENCE",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51o_native_role_source_inventory_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--source-root",
+                    str(source_root),
+                    "--native-role-jsonl",
+                    str(native_roles),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51o_inventory_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unsupported native role source", result.stderr)
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""

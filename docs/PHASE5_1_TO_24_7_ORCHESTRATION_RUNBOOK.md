@@ -34,12 +34,14 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1n as the current evidence boundary. It proves the remaining
+2. Treat Phase 5.1o as the current evidence boundary. It proves the remaining
    filled-order source-tick horizon gap can be closed with source keys and
-   hashed observed-fill fallback without raw fill/order ID emission, and that
+   hashed observed-fill fallback without raw fill/order ID emission, that
    historical Lighter active-order snapshots can be aligned to label event time
-   without falsely treating them as full sendTx/REST native-limit pressure.
-3. The current Phase 5.1n recovered matrix pack remains `HOLD`: `4527`
+   without falsely treating them as full sendTx/REST native-limit pressure, and
+   that existing maker/taker source artifacts are not exact canonical joins for
+   any of the remaining `287` filled rows.
+3. The current Phase 5.1o recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
    `4527` observed horizons available, `0` observed horizons still missing,
    all `4527` joined to queue/churn, all `4527` source-covered by markout
@@ -50,10 +52,11 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    filled-order maker/taker status is incomplete for `287` labels, some
    venue/side buckets remain sparse, and `1613` quarantined/review groups remain
    excluded from the observed-only diagnostic pack.
-5. Next repo-owned move is another non-live evidence step: improve venue-native
-   event-time native-limit pressure and maker/taker completeness across all
-   filled venues while preserving sparse-bucket and selection-bias holds. Do not
-   train models from 5.1n.
+5. Next repo-owned move is another non-live evidence step: implement a
+   quarantined Lighter-only native trade join if it can emit exact canonical
+   role evidence without raw ID leakage, and add forward venue-native role plus
+   event-time native-limit pressure capture across all venues. Do not train
+   models from 5.1o.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
@@ -626,7 +629,7 @@ Current repo-owned tooling:
 - The tool never emits raw fill IDs, order IDs, client order IDs, venue order
   IDs, or decision IDs. Raw upstream identifiers are not used as output fields.
 
-Current 5.1n evidence:
+Current 5.1o evidence:
 
 - Filled-horizon source-key recovery run:
   `runs/phase51l_filled_horizon_source_key_recovery/PHASE51L-FILLED-HORIZON-SOURCE-KEY-RECOVERY-TWO-LANE-20260502T000000Z`
@@ -634,11 +637,13 @@ Current 5.1n evidence:
   `runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-TIME-ALIGNMENT-TERMINAL-STALE-7200S-20260429T025435Z`
   `runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-TIME-ALIGNMENT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z`
 - Maker/taker recovery run:
-  `runs/phase51n_maker_taker_attribution_recovery/PHASE51N-MAKER-TAKER-ATTRIBUTION-RECOVERY-OBSERVED-ONLY-TWO-LANE-20260503T000000Z`
+  `runs/phase51n_maker_taker_attribution_recovery/PHASE51O-MAKER-TAKER-ATTRIBUTION-RECOVERY-ALL-VENUE-20260503T120000Z`
+- Native role source inventory run:
+  `runs/phase51o_native_role_source_inventory/PHASE51O-NATIVE-ROLE-SOURCE-INVENTORY-ALL-VENUE-20260503T120000Z`
 - Recovered 5.1h run:
-  `runs/phase51h_observed_pfill_feature_audit/PHASE51N-OBSERVED-PFILL-FEATURE-AUDIT-EVENT-TIME-NATIVE-LIMIT-TWO-LANE-20260503T000000Z`
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51O-OBSERVED-PFILL-FEATURE-AUDIT-NATIVE-ROLE-RECOVERY-20260503T120000Z`
 - Recovered 5.1i run:
-  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51N-PFILL-FEATURE-MATRIX-ADMISSIBILITY-EVENT-TIME-NATIVE-LIMIT-TWO-LANE-20260503T000000Z`
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51O-PFILL-FEATURE-MATRIX-ADMISSIBILITY-NATIVE-ROLE-RECOVERY-20260503T120000Z`
 - 5.1l recovery gate remains `HOLD` with reason
   `phase51l_filled_horizon_source_key_complete_nonlive_hold`.
 - Recovered matrix remains `HOLD` with reason
@@ -652,8 +657,11 @@ Current 5.1n evidence:
   025435 lane and `3700 / 3954` rows in the 073231 lane, but full native-limit
   pressure remains partial because sendTx/REST pressure was not historically
   observed.
-- Maker/taker role recovery: `174` filled rows already complete, `287` filled
-  rows missing venue-native role source.
+- Maker/taker role recovery: `174` filled rows already complete, `125` Lighter
+  filled rows have source material available but no exact canonical native-role
+  join, and `162` Aster/Extended/Paradex/Hyperliquid rows have no retained
+  native-role source in current artifacts. Venue split is Lighter `125`, Aster
+  `113`, Extended `28`, Paradex `15`, and Hyperliquid `6`.
 - Matrix blockers remain: `lighter_native_limit_pressure_not_fully_observed`,
   `maker_taker_not_fully_observed_for_filled_orders`,
   `sparse_pfill_feature_buckets`, and
@@ -812,11 +820,14 @@ curl -fsS http://127.0.0.1:9898/health/detail
 
 ## Next Command Targets
 
-After Phase 5.1n is committed and pushed, the next target is not another live
+After Phase 5.1o is committed and pushed, the next target is not another live
 run. Event-time active-order alignment is recorded for many historical Lighter
 rows, but native-limit pressure remains partial because sendTx/REST pressure
-was not captured historically. Continue venue-native maker/taker evidence
-completion across all filled venues and forward-looking native-limit pressure
+was not captured historically. Maker/taker source artifacts are available only
+for the remaining Lighter filled rows as unjoined source material; the other
+venues require forward capture or separate native archives. Continue with a
+quarantined Lighter native-trade join where safe, add forward venue-native role
+capture for the other venues, and add forward-looking native-limit pressure
 instrumentation, then rerun the recovered 5.1h/5.1i matrix. The acceptance
 condition is another measurable reduction of blocker counts without introducing
 raw identifiers, live/canary/capital/risk authorization, model-training

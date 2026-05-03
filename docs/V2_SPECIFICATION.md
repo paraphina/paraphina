@@ -484,11 +484,12 @@ admission:
 
 ## 14. Current Phase 5.1 Blockers
 
-As of Phase 5.1n, the V2 evidence path remains blocked by:
+As of Phase 5.1o, the V2 evidence path remains blocked by:
 
 - Lighter native-limit context still partial for `2288` labels because
   historical active-order snapshots do not include full sendTx/REST pressure;
-- maker/taker status incomplete for `287` fills;
+- maker/taker status incomplete for `287` fills because existing source
+  artifacts do not provide exact canonical venue-native role joins;
 - sparse venue/side/layer/regime buckets;
 - observed-only selection bias from `1613` excluded quarantine/review groups.
 
@@ -510,8 +511,15 @@ Phase 5.1n added historical Lighter account snapshot alignment. It aligned
 historically. Phase 5.1n also added all-venue maker/taker recovery and
 classified the remaining `287` filled rows as missing venue-native role source.
 
-The next repo-owned V2 evidence move is venue-native maker/taker completeness
-across all filled venues plus forward-looking event-time native-limit pressure
-instrumentation. No model training, EV admission, canary, live orders, capital
-escalation, risk-limit relaxation, or financial claim is authorized from Phase
-5.1n.
+Phase 5.1o added a venue-native role source inventory. It found `174` filled
+rows remain input-observed, `0` roles were recovered by exact canonical
+evidence, `125` Lighter filled rows have source material available but no exact
+canonical join, and `162` filled rows across Aster, Extended, Hyperliquid, and
+Paradex have no retained native-role source in current artifacts. The rerun
+matrix therefore remains `HOLD` with the same four blockers.
+
+The next repo-owned V2 evidence move is exact canonical venue-native
+maker/taker completeness across all filled venues plus forward-looking
+event-time native-limit pressure instrumentation. No model training, EV
+admission, canary, live orders, capital escalation, risk-limit relaxation, or
+financial claim is authorized from Phase 5.1o.

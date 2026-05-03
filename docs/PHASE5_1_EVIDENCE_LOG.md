@@ -223,6 +223,89 @@ The all-venue maker/taker gate confirms that the remaining `287` filled rows
 need venue-native fill/trade role evidence; quote intent, post-only behavior,
 strategy purpose, and fee expectations remain inadmissible as role inference.
 
+## Phase 5.1o - Native Role Source Inventory and Recovered Matrix Rerun
+
+Date: 2026-05-03
+
+Purpose: inventory existing all-venue venue-native maker/taker source material,
+emit only exact canonical native-role evidence for 5.1n recovery, and rerun
+5.1h/5.1i without inferring roles from intent, post-only behavior, strategy
+purpose, price position, or fee schedule.
+
+Evidence packs:
+
+```text
+runs/phase51o_native_role_source_inventory/PHASE51O-NATIVE-ROLE-SOURCE-INVENTORY-ALL-VENUE-20260503T120000Z
+runs/phase51n_maker_taker_attribution_recovery/PHASE51O-MAKER-TAKER-ATTRIBUTION-RECOVERY-ALL-VENUE-20260503T120000Z
+runs/phase51h_observed_pfill_feature_audit/PHASE51O-OBSERVED-PFILL-FEATURE-AUDIT-NATIVE-ROLE-RECOVERY-20260503T120000Z
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51O-PFILL-FEATURE-MATRIX-ADMISSIBILITY-NATIVE-ROLE-RECOVERY-20260503T120000Z
+```
+
+Native-role source inventory result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51o_native_role_sources_incomplete
+label_count: 4527
+filled_count: 461
+input_observed_preserved_count: 174
+recovered_native_role_count: 0
+native_role_evidence_record_count: 0
+missing_native_role_source_count: 162
+source_available_no_canonical_join_count: 125
+raw_identifier_redaction_status: PASS
+
+source_available_no_canonical_join by venue:
+- lighter: 125
+
+missing_native_role_source by venue:
+- aster: 113
+- extended: 28
+- hyperliquid: 6
+- paradex: 15
+```
+
+Recovered matrix result:
+
+```text
+matrix_admissibility_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+matrix_blocker_count: 4
+matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+
+label_count: 4527
+filled_count: 461
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+maker_taker_observed_count: 174
+maker_taker_partial_or_unknown_count: 222
+maker_taker_missing_count: 65
+raw_identifier_redaction_status: PASS
+```
+
+Artifact hashes:
+
+```text
+2e785de0b686b1d1f7858a923ec9fb88fd33c9ceb5cfe17c966c4c926726ecb4  native_role_source_inventory_summary.json
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  native_role_evidence.jsonl
+9c513f5565687d407d693660eeeee72c9171d80241f04f68a6be8b47d3393dce  maker_taker_attribution_recovery_summary.json
+be19e44b7c14304d4ac5696de97534a54fdad23e18b87adadbff67fc98f5a54c  pfill_feature_audit_summary.json
+5f488d288b6019d0c9a83d2e8122e1835c2f7d5e019eb962ee55bb8bb4744cdf  pfill_feature_matrix_admissibility_summary.json
+```
+
+Interpretation: Phase 5.1o proves that current retained artifacts are
+insufficient for exact canonical maker/taker role recovery. Lighter has `125`
+filled rows with source material available but not canonically joined to the
+observed P_fill labels; Aster, Extended, Hyperliquid, and Paradex have `162`
+filled rows with no retained venue-native role source in current artifacts. The
+correct next move is forward canonical capture plus a narrowly scoped Lighter
+backfill where raw identifier handling can remain quarantined; the matrix must
+not be cleared by inference.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:
