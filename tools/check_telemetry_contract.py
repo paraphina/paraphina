@@ -170,6 +170,11 @@ def check_type(value: Any, expected_type: str | list[str], field_name: str) -> s
             if not isinstance(elem, str):
                 return f"field '{field_name}[{i}]' expected string, got {type(elem).__name__}"
         return None
+
+    elif expected_type == "object":
+        if isinstance(value, dict):
+            return None
+        return f"field '{field_name}' expected object, got {type(value).__name__}"
     
     else:
         # Unknown type in schema - treat as internal error

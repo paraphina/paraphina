@@ -17,8 +17,8 @@ Primary source addenda:
 Current repo evidence boundary:
 
 - Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
-- Current Phase 5.1 evidence boundary: Phase 5.1l filled-horizon source-key
-  recovery and recovered feature-matrix admissibility
+- Current Phase 5.1 evidence boundary: Phase 5.1q forward native-evidence gate
+  active; Phase 5.1p is the last completed historical evidence boundary
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
 
@@ -484,7 +484,7 @@ admission:
 
 ## 14. Current Phase 5.1 Blockers
 
-As of Phase 5.1p, the V2 evidence path remains blocked by:
+As of Phase 5.1q, the V2 evidence path remains blocked by:
 
 - Lighter native-limit context still partial for `2288` labels because
   historical active-order snapshots do not include full sendTx/REST pressure;
@@ -526,8 +526,14 @@ identifiers internally, emitted no raw order/client/trade identifiers, indexed
 rows. The rerun matrix remains `HOLD` with `174` maker/taker-observed filled
 rows and `287` filled rows still lacking complete venue-native role evidence.
 
-The next repo-owned V2 evidence move is exact canonical venue-native
-maker/taker completeness across all filled venues through forward capture plus
-event-time native-limit pressure instrumentation. No model training, EV
+Phase 5.1q adds the forward native-evidence capture gate. It consumes sanitized
+all-five venue-native role source rows and Lighter event-time native-limit
+pressure rows, emits `native_role_evidence.jsonl` for the Phase 5.1n recovery
+gate, and rejects raw order/client/fill/trade identifiers. This is the active
+repo-owned path for future exact canonical maker/taker completeness and
+sendTx/REST native-limit pressure evidence.
+
+The next evidence move is to run Phase 5.1q against real forward-captured
+source rows and then rerun Phase 5.1n/5.1h/5.1i. No model training, EV
 admission, canary, live orders, capital escalation, risk-limit relaxation, or
-financial claim is authorized from Phase 5.1p.
+financial claim is authorized from Phase 5.1q.

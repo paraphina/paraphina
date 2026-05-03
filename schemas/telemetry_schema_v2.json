@@ -147,7 +147,19 @@
     "maker_trade_count",
     "taker_trade_count",
     "unknown_role_trade_count",
-    "maker_taker_attribution_status"
+    "maker_taker_attribution_status",
+    "canonical_group_id",
+    "native_role_source",
+    "native_liquidity_role",
+    "native_role_capture_status",
+    "maker_taker_role_counts",
+    "native_limit_pressure_status",
+    "native_limit_pressure_hold_reason",
+    "native_limit_event_time_status",
+    "native_limit_staleness_ms",
+    "native_limit_source_sha256",
+    "rest_requests_per_minute_remaining",
+    "weighted_requests_per_minute_remaining"
   ],
   "field_types": {
     "schema_version": "integer",
@@ -290,7 +302,19 @@
     "maker_trade_count": "integer",
     "taker_trade_count": "integer",
     "unknown_role_trade_count": "integer",
-    "maker_taker_attribution_status": "string"
+    "maker_taker_attribution_status": "string",
+    "canonical_group_id": "string",
+    "native_role_source": "string",
+    "native_liquidity_role": "string",
+    "native_role_capture_status": "string",
+    "maker_taker_role_counts": "object",
+    "native_limit_pressure_status": "string",
+    "native_limit_pressure_hold_reason": "string",
+    "native_limit_event_time_status": "string",
+    "native_limit_staleness_ms": ["number", "null"],
+    "native_limit_source_sha256": ["string", "null"],
+    "rest_requests_per_minute_remaining": ["integer", "null"],
+    "weighted_requests_per_minute_remaining": ["integer", "null"]
   },
   "enums": {
     "event_type": [
@@ -311,7 +335,9 @@
       "V2_LIGHTER_ACCOUNT_LIMITS",
       "V2_LIGHTER_OFFICIAL_LIMITS_DOC",
       "V2_LIGHTER_ACTIVE_ORDERS",
-      "V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE"
+      "V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE",
+      "V2_VENUE_NATIVE_ROLE_SAMPLE",
+      "V2_VENUE_NATIVE_LIMIT_PRESSURE"
     ],
     "decision": ["ADMIT", "REJECT", "HOLD"],
     "label_type": [

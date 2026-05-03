@@ -393,6 +393,58 @@ rows. The next maker/taker evidence path is therefore forward capture of native
 role fields/IDs at order/fill time across all five venues, not inference from
 post-only intent or historical fee/account assumptions.
 
+## Phase 5.1q - Forward Native Evidence Gate Baseline
+
+Date: 2026-05-03
+
+Purpose: formalize the forward native-evidence gate and run it against the
+latest real canonical P_fill artifact with no forward native source rows
+provided. This establishes the replayable HOLD boundary and proves the gate
+does not infer maker/taker role or native-limit pressure.
+
+Evidence packs:
+
+```text
+runs/phase51q_forward_native_evidence/PHASE51Q-FORWARD-NATIVE-EVIDENCE-BASELINE-NO-SOURCES-20260503T000000Z
+runs/phase51n_maker_taker_attribution_recovery/PHASE51Q-MAKER-TAKER-ATTRIBUTION-RECOVERY-BASELINE-NO-SOURCES-20260503T000000Z
+```
+
+Phase 5.1q result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51q_forward_native_evidence_incomplete
+observed_pfill_label_count: 6140
+native_role_evidence_record_count: 0
+recovered_forward_native_role_count: 0
+native_role_capture_status_counts:
+- OBSERVED_PRESERVED: 174
+- MISSING_FORWARD_NATIVE_ROLE_SOURCE: 287
+- NO_FILL_NOT_APPLICABLE: 5679
+native_limit_pressure_status_counts:
+- MISSING_NATIVE_LIMIT_PRESSURE_SOURCE: 3132
+- NOT_APPLICABLE_NON_LIGHTER: 3008
+raw_identifier_redaction_status: PASS
+```
+
+Maker/taker recovery rerun from Phase 5.1q output:
+
+```text
+gate_status: HOLD
+gate_reason: phase51n_maker_taker_attribution_incomplete
+filled_count: 461
+maker_taker_observed_or_recovered_count: 174
+maker_taker_partial_or_missing_count: 287
+native_role_inputs: 0 records from Phase 5.1q
+raw_identifier_redaction_status: PASS
+```
+
+Interpretation: Phase 5.1q is now repo-owned and runnable, but no blockers are
+cleared until real forward-captured native source rows are provided. The next
+evidence move is to capture explicit venue-native maker/taker role fields for
+all five venues and Lighter event-time active-order, sendTx, and REST/weighted
+request pressure, then rerun Phase 5.1q -> 5.1n -> 5.1h -> 5.1i.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:

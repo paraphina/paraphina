@@ -736,3 +736,70 @@ forward venue-native role and event-time native-limit pressure capture across
 all five venues, preserving the no-live, no-capital, no-risk-relaxation
 boundary until the matrix blockers clear through observed evidence.
 ```
+
+## Phase 5.1q Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live evidence action: run
+`tools/phase51q_forward_native_evidence_capture.py` on real forward-captured,
+sanitized venue-native source rows, feed its `native_role_evidence.jsonl` into
+Phase 5.1n maker/taker recovery, and rerun the Phase 5.1h/5.1i matrix.
+
+Rationale:
+
+- Phase 5.1q is the repo-owned forward path after historical Lighter native
+  trade recovery exhausted exact-hash joins.
+- The gate supports all-five venue maker/taker role evidence from explicit
+  native fields: Lighter trades, Hyperliquid `crossed`, Paradex `liquidity`,
+  Aster `ORDER_TRADE_UPDATE.m`, and Extended `isTaker`.
+- The current native-limit pressure blocker is Lighter-specific, so non-Lighter
+  rows are not applicable for that blocker while Lighter requires event-time
+  active-order, sendTx, and REST/weighted-request headroom.
+- Raw order/client/fill/trade identifiers are rejected from source rows and
+  outputs. Evidence remains canonical-group/count/hash based.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1q - Forward native evidence capture
+tool: tools/phase51q_forward_native_evidence_capture.py
+spec: docs/PHASE5_1Q_FORWARD_NATIVE_EVIDENCE.md
+status: HOLD
+authorized outputs:
+- native_role_evidence.jsonl
+- forward_native_role_capture_labels.jsonl
+- native_limit_pressure_labels.jsonl
+- phase51q_forward_native_evidence_summary.json
+prohibited:
+- live orders
+- canary
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+```
+
+Baseline no-source evidence:
+
+```text
+runs/phase51q_forward_native_evidence/PHASE51Q-FORWARD-NATIVE-EVIDENCE-BASELINE-NO-SOURCES-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51q_forward_native_evidence_incomplete
+native_role_evidence_record_count: 0
+recovered_forward_native_role_count: 0
+native_role_missing_source_count: 287
+native_limit_missing_source_count: 3132
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Capture or locate real sanitized forward native source rows for all five role
+sources and Lighter event-time native-limit pressure. Run Phase 5.1q, rerun
+Phase 5.1n/5.1h/5.1i, and preserve HOLD unless the blockers clear through
+observed venue-native evidence.
+```
