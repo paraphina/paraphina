@@ -306,6 +306,93 @@ correct next move is forward canonical capture plus a narrowly scoped Lighter
 backfill where raw identifier handling can remain quarantined; the matrix must
 not be cleared by inference.
 
+## Phase 5.1p - Lighter Native Role Canonical Join Attempt
+
+Date: 2026-05-03
+
+Purpose: run the narrow quarantined Lighter-only native trade join authorized by
+Phase 5.1o. The tool may read raw Lighter side IDs inside the local process,
+but board-facing outputs contain only hashes, canonical group IDs, counts, and
+source classifications.
+
+Evidence packs:
+
+```text
+runs/phase51p_lighter_native_role_canonical_join/PHASE51P-LIGHTER-NATIVE-ROLE-CANONICAL-JOIN-ALL-BACKFILLS-20260503T140000Z
+runs/phase51n_maker_taker_attribution_recovery/PHASE51P-MAKER-TAKER-ATTRIBUTION-RECOVERY-LIGHTER-NATIVE-20260503T140000Z
+runs/phase51h_observed_pfill_feature_audit/PHASE51P-OBSERVED-PFILL-FEATURE-AUDIT-LIGHTER-NATIVE-20260503T140000Z
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51P-PFILL-FEATURE-MATRIX-ADMISSIBILITY-LIGHTER-NATIVE-20260503T140000Z
+```
+
+Lighter canonical join result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51p_lighter_native_role_join_incomplete
+label_count: 4527
+filled_count: 461
+lighter_source_available_target_count: 125
+recovered_lighter_native_role_count: 0
+unrecovered_lighter_native_role_count: 125
+native_role_evidence_record_count: 0
+raw_identifier_redaction_status: PASS
+
+lighter_native_role_join_status_counts:
+- NATIVE_ID_HASH_NO_MATCH: 125
+- NOT_TARGETED: 4402
+```
+
+Native Lighter trade backfill coverage used by the join:
+
+```text
+unique native trades indexed with role: 531
+native side identity hash index entries: 2124
+native role counts across unique indexed rows:
+- MAKER: 345
+- TAKER: 186
+- UNKNOWN: 0
+```
+
+Recovered matrix result:
+
+```text
+matrix_admissibility_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+matrix_blocker_count: 4
+matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+
+label_count: 4527
+filled_count: 461
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+maker_taker_observed_count: 174
+maker_taker_partial_or_unknown_count: 222
+maker_taker_missing_count: 65
+raw_identifier_redaction_status: PASS
+```
+
+Artifact hashes:
+
+```text
+17c4a3405967a4c6cf9c9005e9448f0a09acdc0e50a7bdea57ae187a6f8dede9  lighter_native_role_canonical_join_summary.json
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  lighter_native_role_evidence.jsonl
+14ea7d5b58ed4b860ed208645a7057780f7fb4832ca616b3905af33c78860718  maker_taker_attribution_recovery_summary.json
+a0fe91ccf13d2fd4101b4cc3df581b4e90ce339dd6215bd8f6d0c37d0b494ea5  pfill_feature_audit_summary.json
+a65bab824b031b148af527b0765293e0611ab7247a564b4a7f48b76d77703710  pfill_feature_matrix_admissibility_summary.json
+```
+
+Interpretation: Phase 5.1p closes the safe historical Lighter backfill attempt
+without clearing the maker/taker blocker. The retained Lighter native trades do
+carry explicit maker/taker truth, but their native side IDs do not exactly match
+the canonical source order/client hashes for the `125` source-available filled
+rows. The next maker/taker evidence path is therefore forward capture of native
+role fields/IDs at order/fill time across all five venues, not inference from
+post-only intent or historical fee/account assumptions.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:

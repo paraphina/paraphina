@@ -484,7 +484,7 @@ admission:
 
 ## 14. Current Phase 5.1 Blockers
 
-As of Phase 5.1o, the V2 evidence path remains blocked by:
+As of Phase 5.1p, the V2 evidence path remains blocked by:
 
 - Lighter native-limit context still partial for `2288` labels because
   historical active-order snapshots do not include full sendTx/REST pressure;
@@ -518,8 +518,16 @@ canonical join, and `162` filled rows across Aster, Extended, Hyperliquid, and
 Paradex have no retained native-role source in current artifacts. The rerun
 matrix therefore remains `HOLD` with the same four blockers.
 
+Phase 5.1p added a quarantined Lighter native-role canonical join attempt over
+all retained Lighter native trade backfills. It hashed native side order/client
+identifiers internally, emitted no raw order/client/trade identifiers, indexed
+`531` unique native Lighter trades with explicit maker/taker roles, and found
+`0 / 125` exact canonical matches against the source-available Lighter filled
+rows. The rerun matrix remains `HOLD` with `174` maker/taker-observed filled
+rows and `287` filled rows still lacking complete venue-native role evidence.
+
 The next repo-owned V2 evidence move is exact canonical venue-native
-maker/taker completeness across all filled venues plus forward-looking
+maker/taker completeness across all filled venues through forward capture plus
 event-time native-limit pressure instrumentation. No model training, EV
 admission, canary, live orders, capital escalation, risk-limit relaxation, or
-financial claim is authorized from Phase 5.1o.
+financial claim is authorized from Phase 5.1p.

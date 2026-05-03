@@ -669,3 +669,70 @@ role collectors/fields for Aster ORDER_TRADE_UPDATE.m, Extended isTaker,
 Paradex liquidity, and Hyperliquid crossed. Preserve sparse-bucket and
 observed-only selection-bias holds until separately solved.
 ```
+
+## Phase 5.1p Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live forward-capture evidence step:
+capture venue-native maker/taker role fields and event-time native-limit
+pressure at order/fill time across all five venues, then rerun the 5.1h/5.1i
+matrix.
+
+Rationale:
+
+- Phase 5.1p implemented the quarantined Lighter-only native trade join
+  authorized by Phase 5.1o. Raw Lighter side IDs are read only inside the local
+  process and board-facing artifacts contain hashes and counts only.
+- The all-backfill run indexed `531` unique native Lighter trades with complete
+  native role truth (`345` maker, `186` taker, `0` unknown), but recovered
+  `0 / 125` source-available canonical Lighter filled rows.
+- The downstream maker/taker recovery therefore remains unchanged: `174`
+  observed/recovered rows and `287` filled rows still partial or missing native
+  role evidence.
+- The recovered 5.1h -> 5.1i matrix remains `HOLD` with the same four blockers:
+  native-limit pressure incomplete, maker/taker incomplete, sparse buckets, and
+  observed-only selection bias.
+
+Current evidence boundary:
+
+```text
+Phase 5.1p - Lighter native role canonical join
+runs/phase51p_lighter_native_role_canonical_join/PHASE51P-LIGHTER-NATIVE-ROLE-CANONICAL-JOIN-ALL-BACKFILLS-20260503T140000Z
+gate_status: HOLD
+gate_reason: phase51p_lighter_native_role_join_incomplete
+lighter_source_available_target_count: 125
+recovered_lighter_native_role_count: 0
+unrecovered_lighter_native_role_count: 125
+native_role_evidence_record_count: 0
+raw_identifier_redaction_status: PASS
+
+Phase 5.1p - Maker/taker attribution recovery rerun
+runs/phase51n_maker_taker_attribution_recovery/PHASE51P-MAKER-TAKER-ATTRIBUTION-RECOVERY-LIGHTER-NATIVE-20260503T140000Z
+gate_status: HOLD
+maker_taker_observed_or_recovered_count: 174
+maker_taker_partial_or_missing_count: 287
+raw_identifier_redaction_status: PASS
+
+Phase 5.1p - Recovered P-fill feature-matrix admissibility
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51P-PFILL-FEATURE-MATRIX-ADMISSIBILITY-LIGHTER-NATIVE-20260503T140000Z
+gate_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+maker_taker_observed_count: 174
+maker_taker_partial_or_unknown_count: 222
+maker_taker_missing_count: 65
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Do not start live/canary/model-training/EV-admission work. Historical Lighter
+native trade backfill recovery is exhausted under exact-hash rules. Add
+forward venue-native role and event-time native-limit pressure capture across
+all five venues, preserving the no-live, no-capital, no-risk-relaxation
+boundary until the matrix blockers clear through observed evidence.
+```

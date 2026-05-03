@@ -697,6 +697,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1o native role source inventory gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51o_native_role_source_inventory.py"
+
+    def _get_phase51p_lighter_native_role_canonical_join_path(self) -> Path:
+        """Get path to the Phase 5.1p Lighter native role canonical join gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51p_lighter_native_role_canonical_join.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -6500,6 +6505,267 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(
                 recovery_summary["maker_taker_recovery_status_counts"]["MISSING_VENUE_NATIVE_ROLE_SOURCE"],
                 2,
+            )
+
+    def test_phase51p_lighter_native_role_join_feeds_recovery_without_raw_ids(self):
+        """5.1p should recover Lighter roles from hashed native IDs without emitting raw IDs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            inventory_run = tmp_path / "native_role_inventory"
+            canonical_run = tmp_path / "canonical_pfill"
+            source_run = tmp_path / "source_pfill"
+            trade_run = tmp_path / "lighter_trade_backfill"
+            join_root = tmp_path / "lighter_native_join"
+            recovery_root = tmp_path / "maker_taker_recovery"
+            for path in (inventory_run, canonical_run, source_run, trade_run):
+                path.mkdir(parents=True)
+
+            def phase51_hash(value):
+                encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+                return hashlib.sha256(encoded).hexdigest()
+
+            source_labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "order_key": "source-order-recovered",
+                    "canonical_group_id": "source-group-recovered",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "fill_count": 1,
+                    "client_order_id_hash": phase51_hash("client-recovered"),
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "order_key": "source-order-missing",
+                    "canonical_group_id": "source-group-missing",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "fill_count": 1,
+                    "client_order_id_hash": phase51_hash("client-missing"),
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (source_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "source_phase51p_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": len(source_labels),
+                "source_telemetry_sha256": "source-sha",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (source_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in source_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            canonical_labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-recovered",
+                    "order_key": "canonical-order-recovered",
+                    "source_order_keys": ["source-order-recovered"],
+                    "source_pfill_run_paths": [str(source_run)],
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "fill_count": 1,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-missing",
+                    "order_key": "canonical-order-missing",
+                    "source_order_keys": ["source-order-missing"],
+                    "source_pfill_run_paths": [str(source_run)],
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "lighter",
+                    "side": "Sell",
+                    "fill_count": 1,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (canonical_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "canonical_phase51p_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "observed_label_pack_partial_maker_taker_attribution",
+                "order_label_count": len(canonical_labels),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (canonical_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in canonical_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            inventory_labels = [
+                {
+                    "label_type": "PHASE51O_NATIVE_ROLE_SOURCE_INVENTORY_LABEL",
+                    "canonical_group_id": "group-recovered",
+                    "native_role_source_status": "SOURCE_AVAILABLE_NO_CANONICAL_JOIN",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "PHASE51O_NATIVE_ROLE_SOURCE_INVENTORY_LABEL",
+                    "canonical_group_id": "group-missing",
+                    "native_role_source_status": "SOURCE_AVAILABLE_NO_CANONICAL_JOIN",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (inventory_run / "native_role_source_inventory_summary.json").write_text(json.dumps({
+                "run_id": "inventory_phase51p_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "gate_reason": "phase51o_native_role_source_inventory_incomplete",
+                "label_count": len(inventory_labels),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (inventory_run / "native_role_source_inventory_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in inventory_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            source_snapshots = trade_run / "source_snapshots"
+            source_snapshots.mkdir()
+            trades_path = source_snapshots / "trades_backfill.sanitized.json"
+            trades_path.write_text(json.dumps({
+                "schema_version": 1,
+                "account_index": 123,
+                "trades": [
+                    {
+                        "trade_id": "trade-raw-redacted-by-tool",
+                        "market_id": 1,
+                        "timestamp": 1700000000000,
+                        "price": "100.0",
+                        "size": "0.1",
+                        "is_maker_ask": False,
+                        "ask_account_id": 456,
+                        "bid_account_id": 123,
+                        "ask_client_id": "other-client",
+                        "bid_client_id": "client-recovered",
+                    }
+                ],
+            }), encoding="utf-8")
+            (trade_run / "lighter_trade_backfill_summary.json").write_text(json.dumps({
+                "run_id": "trade_phase51p_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "trades_path": str(trades_path),
+                "account_index": 123,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+
+            join_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51p_lighter_native_role_canonical_join_path()),
+                    "--native-role-inventory-run",
+                    str(inventory_run),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--source-pfill-run",
+                    str(source_run),
+                    "--lighter-trade-backfill-run",
+                    str(trade_run),
+                    "--output-root",
+                    str(join_root),
+                    "--run-id",
+                    "phase51p_join_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(join_result.returncode, 0, f"stdout: {join_result.stdout}\nstderr: {join_result.stderr}")
+            join_dir = join_root / "phase51p_join_test"
+            join_summary = json.loads(
+                (join_dir / "lighter_native_role_canonical_join_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(join_summary["gate_status"], "HOLD")
+            self.assertEqual(join_summary["gate_reason"], "phase51p_lighter_native_role_join_incomplete")
+            self.assertEqual(join_summary["lighter_source_available_target_count"], 2)
+            self.assertEqual(join_summary["recovered_lighter_native_role_count"], 1)
+            self.assertEqual(join_summary["unrecovered_lighter_native_role_count"], 1)
+            self.assertEqual(join_summary["native_role_evidence_record_count"], 1)
+            self.assertEqual(join_summary["raw_identifier_redaction_status"], "PASS")
+            self.assertEqual(
+                join_summary["lighter_native_role_join_status_counts"]["RECOVERED_LIGHTER_NATIVE_ROLE"],
+                1,
+            )
+            self.assertEqual(
+                join_summary["lighter_native_role_join_status_counts"]["NATIVE_ID_HASH_NO_MATCH"],
+                1,
+            )
+
+            evidence_rows = [
+                json.loads(line)
+                for line in (join_dir / "lighter_native_role_evidence.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(evidence_rows), 1)
+            self.assertEqual(evidence_rows[0]["canonical_group_id"], "group-recovered")
+            self.assertEqual(evidence_rows[0]["maker_taker_role_counts"], {"MAKER": 1, "TAKER": 0, "UNKNOWN": 0})
+            self.assertEqual(evidence_rows[0]["maker_taker_attribution_source"], "LIGHTER_TRADES_JSON")
+            self.assertFalse(evidence_rows[0]["approved_for_live"])
+            raw_fields = {
+                "order_id",
+                "client_order_id",
+                "ask_id",
+                "bid_id",
+                "ask_client_id",
+                "bid_client_id",
+                "trade_id",
+            }
+            self.assertFalse(raw_fields & set(evidence_rows[0]))
+
+            recovery_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51n_maker_taker_attribution_recovery_path()),
+                    "--observed-pfill-run",
+                    str(canonical_run),
+                    "--native-role-jsonl",
+                    str(join_dir / "lighter_native_role_evidence.jsonl"),
+                    "--output-root",
+                    str(recovery_root),
+                    "--run-id",
+                    "phase51p_recovery_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                recovery_result.returncode,
+                0,
+                f"stdout: {recovery_result.stdout}\nstderr: {recovery_result.stderr}",
+            )
+            recovery_summary = json.loads(
+                (recovery_root / "phase51p_recovery_test" / "maker_taker_attribution_recovery_summary.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(recovery_summary["maker_taker_observed_or_recovered_count"], 1)
+            self.assertEqual(recovery_summary["maker_taker_partial_or_missing_count"], 1)
+            self.assertEqual(
+                recovery_summary["maker_taker_recovery_status_counts"]["RECOVERED_VENUE_NATIVE_ROLE"],
+                1,
+            )
+            self.assertEqual(
+                recovery_summary["maker_taker_recovery_status_counts"]["MISSING_VENUE_NATIVE_ROLE_SOURCE"],
+                1,
             )
 
     def test_phase51o_native_role_inventory_rejects_non_native_source(self):
