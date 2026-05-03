@@ -40,11 +40,47 @@ python3 tools/phase51r_forward_native_source_acquisition.py \
   --observed-pfill-run runs/<canonical_pfill_run> \
   --source-root <local_native_snapshot_dir> \
   --source-json <local_native_snapshot.jsonl> \
+  --source-link-jsonl <optional_source_link_sidecar.jsonl> \
   --run-id <run_id>
 ```
 
 `--source-root` and `--source-json` may be repeated. Source roots are scanned
-for `.json` and `.jsonl` files.
+for `.json` and `.jsonl` files. `--source-link-jsonl` may also be repeated.
+
+## Source-Link Sidecars
+
+Phase 5.1r accepts an optional source-link sidecar when a redacted staged source
+row does not itself carry `canonical_group_id` or `order_key`, but can be linked
+by a deterministic source hash. The sidecar is non-live evidence plumbing only.
+
+Allowed sidecar fields:
+
+- `phase51s_source_record_sha256`, `source_record_sha256`, or
+  `redacted_source_record_sha256`
+- `canonical_group_id` or `order_key`
+- safety authorization flags, all false
+
+Validation rules:
+
+- the referenced `canonical_group_id` or `order_key` must already exist in the
+  observed P-fill labels;
+- if both `canonical_group_id` and `order_key` are present, they must resolve to
+  the same observed canonical group;
+- each source hash may appear only once across all sidecars;
+- sidecars are rejected if they contain raw order/client/fill/trade identifiers
+  or unsafe true authorization flags;
+- sidecars never infer maker/taker role or Lighter native-limit fields.
+
+Phase 5.1r records `canonical_group_link_source` on each acquisition label as
+one of `SOURCE_ROW_CANONICAL_GROUP`, `SOURCE_ROW_ORDER_KEY`,
+`SOURCE_LINK_SIDECAR`, or `NO_CANONICAL_LINK`. Summary output also records
+`source_link_record_count`, `source_link_applied_count`,
+`source_link_hash_count`, `canonical_group_link_source_counts`, and
+`source_link_artifacts`.
+
+The sidecar clears no blocker by itself. Blocker reduction still requires
+explicit venue-native maker/taker fields and complete Lighter event-time
+active-order, sendTx, and REST/weighted-request pressure rows.
 
 Outputs:
 

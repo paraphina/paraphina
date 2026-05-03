@@ -18,8 +18,9 @@ Current repo evidence boundary:
 
 - Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
 - Current Phase 5.1 evidence boundary: Phase 5.1s local native source-staging
-  gate active in front of Phase 5.1r and Phase 5.1q; Phase 5.1p is the last
-  completed historical evidence boundary
+  gate active in front of Phase 5.1r and Phase 5.1q; Phase 5.1r includes a
+  validated source-link sidecar path for redacted source-hash joins; Phase 5.1p
+  is the last completed historical evidence boundary
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
 
@@ -540,6 +541,11 @@ canonical-group/count/hash evidence: `native_role_source.jsonl`,
 `native_limit_source.jsonl`, and source-acquisition labels. Its baseline
 no-source run is redaction-safe and clears no blockers: `0 / 287` native-role
 targets recovered and `0 / 3132` Lighter native-limit targets recovered.
+Phase 5.1r also accepts optional validated source-link sidecars that map
+redacted source-record hashes to observed `canonical_group_id` or `order_key`
+when the staged source row cannot carry direct join fields. The sidecar is join
+evidence only; it does not infer maker/taker role, Lighter native-limit
+pressure, EV, PnL, or economic performance.
 
 Phase 5.1s adds the local manifest-driven source-staging layer in front of
 Phase 5.1r. It rejects network paths, `.env` files, symlinks, secret-shaped
@@ -551,8 +557,9 @@ kept `0 / 287` native-role targets recovered and `0 / 3132` Lighter
 native-limit targets recovered.
 
 The next evidence move is to capture forward native snapshots with canonical
-group or order-key linkage, stage them through Phase 5.1s, run Phase 5.1r,
-feed the sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i.
-No model training, EV admission, canary, live orders, capital escalation,
-risk-limit relaxation, or financial claim is authorized from Phase 5.1s,
-Phase 5.1r, or Phase 5.1q.
+group/order-key linkage, or a validated source-link sidecar that binds redacted
+source hashes to those observed labels. Stage snapshots through Phase 5.1s, run
+Phase 5.1r, feed the sanitized outputs into Phase 5.1q, and rerun Phase
+5.1n/5.1h/5.1i. No model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, or financial claim is authorized from Phase
+5.1s, Phase 5.1r, or Phase 5.1q.

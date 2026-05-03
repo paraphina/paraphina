@@ -38,6 +38,15 @@ python3 tools/phase51r_forward_native_source_acquisition.py \
   --run-id <phase51r_run_id>
 ```
 
+If a forward capture produces a separate redacted mapping from
+`phase51s_source_record_sha256`, `source_record_sha256`, or
+`redacted_source_record_sha256` to observed `canonical_group_id` / `order_key`,
+pass that mapping to Phase 5.1r with repeated `--source-link-jsonl` arguments.
+Phase 5.1r validates the sidecar against observed P-fill labels and rejects raw
+IDs, duplicate hashes, ambiguous mappings, or unsafe flags. The sidecar is only
+join evidence; it does not infer maker/taker role or Lighter native-limit
+pressure.
+
 ## Safety Contract
 
 Phase 5.1s rejects:
@@ -53,7 +62,8 @@ Phase 5.1s strips raw venue identifier fields before output, including
 order/client/fill/trade IDs and common venue-native ID aliases. It preserves
 only non-secret fields needed by Phase 5.1r, such as `canonical_group_id`,
 `order_key`, venue, native maker/taker role fields, and native limit-pressure
-fields.
+fields. Phase 5.1r may also join by the redacted source-record hash when a
+validated source-link sidecar is supplied.
 
 ## Boundary
 

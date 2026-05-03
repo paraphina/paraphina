@@ -877,10 +877,59 @@ runs/phase51i_pfill_feature_matrix_admissibility/PHASE51R-PFILL-FEATURE-MATRIX-A
 Next move:
 
 ```text
-Supply real read-only native snapshots to Phase 5.1r, require redacted outputs,
-then rerun Phase 5.1q -> 5.1n -> 5.1h -> 5.1i. Preserve HOLD unless observed
-venue-native evidence materially reduces the native-role/native-limit blockers
-without introducing raw IDs or unsafe authorization flags.
+Supply real read-only native snapshots to Phase 5.1r, optionally include
+validated source-link sidecars when redacted source hashes rather than direct
+group/order keys carry the join, require redacted outputs, then rerun Phase
+5.1q -> 5.1n -> 5.1h -> 5.1i. Preserve HOLD unless observed venue-native
+evidence materially reduces the native-role/native-limit blockers without
+introducing raw IDs or unsafe authorization flags.
+```
+
+## Phase 5.1r Source-Link Sidecar Board Decision
+
+Decision: `PROMOTE` only for non-live validated source-hash linkage inside
+Phase 5.1r.
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Rationale:
+
+- Existing 5.1s local snapshots can be redaction-safe but unjoined when the
+  source rows do not carry direct `canonical_group_id` or `order_key`.
+- A source-link sidecar lets future forward captures bind redacted source hashes
+  to already observed P-fill labels without preserving raw venue identifiers in
+  Phase 5.1r output.
+- The sidecar is validated against observed `canonical_group_id` / `order_key`,
+  rejects duplicates, rejects conflicts, rejects raw identifier fields, and
+  rejects unsafe true authorization flags.
+- It does not infer maker/taker roles, Lighter native-limit pressure, fill
+  outcomes, EV, PnL, or economic performance.
+
+Current repo-owned change:
+
+```text
+tool: tools/phase51r_forward_native_source_acquisition.py
+new input: repeated --source-link-jsonl
+new label field: canonical_group_link_source
+new summary fields:
+- source_link_record_count
+- source_link_applied_count
+- source_link_hash_count
+- canonical_group_link_source_counts
+- source_link_artifacts
+test coverage:
+- source-link sidecar recovers joinable staged rows
+- ambiguous or raw source-link sidecars are rejected
+```
+
+Next move:
+
+```text
+Capture forward source snapshots and, when direct group/order keys cannot be
+embedded in redacted source rows, capture a redacted source-link sidecar that
+maps source hashes to observed canonical groups/order keys. Then run Phase 5.1r
+with --source-link-jsonl and feed only sanitized 5.1r outputs into Phase 5.1q.
 ```
 
 ## Phase 5.1s Board Decision

@@ -40,6 +40,9 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    evidence boundary. Phase 5.1s is repo-owned, non-live, and designed to
    require an explicit local manifest, reject unsafe source surfaces, strip raw
    identifiers, and emit a redacted `local_native_source.jsonl` for Phase 5.1r.
+   Phase 5.1r may additionally consume a validated `--source-link-jsonl`
+   sidecar when future forward captures provide redacted source-hash-to-group
+   mappings instead of direct group/order fields.
 3. The current Phase 5.1p recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
    `4527` observed horizons available, `0` observed horizons still missing,
@@ -53,8 +56,9 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    excluded from the observed-only diagnostic pack.
 5. Next repo-owned move is another non-live evidence step: capture or locate
    forward read-only native snapshots with canonical group/order-key linkage,
-   stage them through Phase 5.1s, run Phase 5.1r, feed its sanitized outputs
-   into Phase 5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into
+   or a redacted source-link sidecar that validates those joins by source hash.
+   Stage snapshots through Phase 5.1s, run Phase 5.1r, feed its sanitized
+   outputs into Phase 5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into
    Phase 5.1n, then rerun the recovered 5.1h/5.1i matrix. Do not train models
    from Phase 5.1s, Phase 5.1r, or Phase 5.1q.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
@@ -855,11 +859,14 @@ before Phase 5.1r. Its first run over existing Lighter local sources staged
 and correctly cleared no blocker. The downstream Phase 5.1r rerun classified
 all `405` staged rows as `UNJOINED_NO_CANONICAL_GROUP`, leaving `0 / 287`
 native-role targets recovered and `0 / 3132` Lighter native-limit targets
-recovered. Capture forward native snapshots across all five venues with
-canonical group/order-key linkage, rerun Phase 5.1s -> 5.1r -> 5.1q -> 5.1n
--> 5.1h -> 5.1i, and require measurable blocker reduction without raw
-identifiers, live/canary/capital/risk authorization, model-training shortcuts,
-or selection-bias shortcuts.
+recovered. Phase 5.1r now accepts repeated `--source-link-jsonl` sidecars that
+map redacted source hashes to observed canonical groups/order keys, with
+duplicate/conflict/raw-ID rejection. Capture forward native snapshots across
+all five venues with canonical group/order-key linkage or validated source-link
+sidecars, rerun Phase 5.1s -> 5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i, and
+require measurable blocker reduction without raw identifiers,
+live/canary/capital/risk authorization, model-training shortcuts, or
+selection-bias shortcuts.
 
 ## Current Verdict
 

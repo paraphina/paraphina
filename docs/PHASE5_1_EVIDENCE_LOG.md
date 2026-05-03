@@ -597,6 +597,47 @@ capturing forward native source rows with canonical group or order-key linkage
 at decision/fill time, plus complete Lighter event-time active-order, sendTx,
 and REST/weighted-request pressure context.
 
+## Phase 5.1r - Source-Link Sidecar Gate
+
+Date: 2026-05-03
+
+Purpose: add a validated non-live source-link sidecar path so Phase 5.1r can
+join future redacted source rows by deterministic source hash when direct
+`canonical_group_id` or `order_key` fields are not present in the staged source
+row.
+
+Repo-owned gate:
+
+```text
+tool: tools/phase51r_forward_native_source_acquisition.py
+input: repeated --source-link-jsonl
+status: HOLD
+```
+
+Validation evidence:
+
+```text
+python3 -m py_compile tools/phase51r_forward_native_source_acquisition.py tests/test_telemetry_contract_gate.py
+python3 -m unittest tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51r_source_link_sidecar_recovers_joinable_staged_rows tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51r_source_link_sidecar_rejects_ambiguous_or_raw_links
+python3 -m unittest tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51s_local_source_acquisition_feeds_phase51r_without_raw_ids tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51s_local_source_acquisition_does_not_false_clear_partial_sources tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51r_source_acquisition_feeds_phase51q_without_raw_ids tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51r_source_acquisition_does_not_false_clear_partial_or_inferred_sources tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51q_forward_native_evidence_feeds_all_five_venues_without_raw_ids
+```
+
+Expected sidecar behavior:
+
+```text
+accepted: source hash -> observed canonical_group_id/order_key
+rejected: duplicate source hashes
+rejected: conflicting group/order mappings
+rejected: raw order/client/fill/trade identifiers
+rejected: unsafe true authorization flags
+not allowed: maker/taker inference, Lighter limit-pressure inference, EV/PnL claims
+```
+
+Interpretation: the sidecar gate improves source-acquisition plumbing and
+resume safety, but no live or economic blocker is cleared until real forward
+source snapshots and source-link rows produce observed venue-native role and
+Lighter native-limit evidence.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:

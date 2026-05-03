@@ -50,7 +50,41 @@ RAW_IDENTIFIER_FIELDS = {
     "oid",
     "cloid",
     "tid",
+    "orderId",
+    "clientOrderId",
+    "tradeId",
+    "fillId",
+    "order_id_str",
+    "client_id",
+    "clientId",
 }
+NESTED_RAW_IDENTIFIER_FIELDS = RAW_IDENTIFIER_FIELDS | {"i"}
+SECRET_FIELD_FRAGMENTS = {
+    "api_key",
+    "apikey",
+    "private_key",
+    "privatekey",
+    "secret_key",
+    "secretkey",
+    "access_key",
+    "accesskey",
+    "auth_token",
+    "authtoken",
+    "authorization",
+    "bearer",
+    "jwt",
+    "mnemonic",
+    "passphrase",
+    "password",
+    "session_token",
+    "signing_key",
+}
+SOURCE_LINK_HASH_FIELDS = {
+    "phase51s_source_record_sha256",
+    "source_record_sha256",
+    "redacted_source_record_sha256",
+}
+SOURCE_LINK_ALLOWED_FIELDS = SOURCE_LINK_HASH_FIELDS | {"canonical_group_id", "order_key"} | UNSAFE_TRUE_FLAGS
 ROLE_VALUES = {"MAKER", "TAKER"}
 SOURCE_BY_VENUE = {
     "hyperliquid": "HYPERLIQUID_CROSSED",
@@ -171,11 +205,42 @@ def _check_unsafe_flags(record: dict[str, Any], path: Path, *, label: str) -> No
                 raise ValueError(f"{path} has unsafe {label} flag {flag}=true")
 
 
+def _field_looks_secret(key: str) -> bool:
+    normalized = key.replace("-", "_").lower()
+    if "nonsecret" in normalized:
+        return False
+    return any(fragment in normalized for fragment in SECRET_FIELD_FRAGMENTS)
+
+
+def _check_no_secret_fields(record: Any, path: Path, *, label: str) -> None:
+    for obj in _iter_dicts(record):
+        for key in obj:
+            if _field_looks_secret(str(key)):
+                raise ValueError(f"{path} has secret-shaped {label} field {key!r}")
+
+
+def _check_no_nested_raw_identifier_fields(record: Any, path: Path, *, label: str) -> None:
+    for obj in _iter_dicts(record):
+        raw_fields = NESTED_RAW_IDENTIFIER_FIELDS & set(obj)
+        if raw_fields:
+            raise ValueError(f"{path} {label} leaked raw identifier fields: {sorted(raw_fields)}")
+
+
 def _check_output_safe(record: dict[str, Any], path: Path) -> None:
     _check_unsafe_flags(record, path, label="output")
+    _check_no_secret_fields(record, path, label="output")
     raw_fields = RAW_IDENTIFIER_FIELDS & set(record)
     if raw_fields:
         raise ValueError(f"{path} output leaked raw identifier fields: {sorted(raw_fields)}")
+
+
+def _check_source_link_safe(row: dict[str, Any], path: Path, line_no: int) -> None:
+    _check_unsafe_flags(row, path, label="source link")
+    _check_no_secret_fields(row, path, label="source link")
+    _check_no_nested_raw_identifier_fields(row, path, label="source link")
+    unexpected = sorted(set(row) - SOURCE_LINK_ALLOWED_FIELDS)
+    if unexpected:
+        raise ValueError(f"{path}:{line_no} source link has unsupported fields: {unexpected}")
 
 
 def _artifact_infos(root_dir: Path, artifact_paths: list[Path]) -> list[dict[str, Any]]:
@@ -344,14 +409,111 @@ def _venue_id(row: dict[str, Any], observed_label: dict[str, Any] | None = None)
     return str(raw).lower()
 
 
-def _canonical_group(row: dict[str, Any], by_group: dict[str, dict[str, Any]], by_order_key: dict[str, dict[str, Any]]) -> str | None:
+def _source_link_hashes(row: dict[str, Any]) -> list[str]:
+    hashes = []
+    for key in ("phase51s_source_record_sha256", "source_record_sha256", "redacted_source_record_sha256"):
+        value = str(row.get(key) or "")
+        if value:
+            hashes.append(value)
+    hashes.append(_stable_hash(row))
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in hashes:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _resolve_link_group(
+    row: dict[str, Any],
+    by_group: dict[str, dict[str, Any]],
+    by_order_key: dict[str, dict[str, Any]],
+    path: Path,
+    line_no: int,
+) -> str:
+    group = str(row.get("canonical_group_id") or "")
+    order_key = str(row.get("order_key") or "")
+    resolved_from_order = ""
+    if order_key:
+        if order_key not in by_order_key:
+            raise ValueError(f"{path}:{line_no} source link order_key does not match observed P-fill labels")
+        resolved_from_order = str(by_order_key[order_key].get("canonical_group_id") or "")
+    if group:
+        if group not in by_group:
+            raise ValueError(f"{path}:{line_no} source link canonical_group_id does not match observed P-fill labels")
+        if resolved_from_order and resolved_from_order != group:
+            raise ValueError(f"{path}:{line_no} source link canonical_group_id conflicts with order_key")
+        return group
+    if resolved_from_order:
+        return resolved_from_order
+    raise ValueError(f"{path}:{line_no} source link missing canonical_group_id or order_key")
+
+
+def _load_source_links(
+    paths: list[Path],
+    by_group: dict[str, dict[str, Any]],
+    by_order_key: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], int]:
+    links: dict[str, dict[str, Any]] = {}
+    infos: list[dict[str, Any]] = []
+    total_count = 0
+    for raw_path in paths:
+        path = _resolve_path(raw_path)
+        count = 0
+        for line_no, row in _iter_jsonl(path):
+            _check_source_link_safe(row, path, line_no)
+            group = _resolve_link_group(row, by_group, by_order_key, path, line_no)
+            source_hashes = [
+                str(row.get(key) or "")
+                for key in SOURCE_LINK_HASH_FIELDS
+                if row.get(key)
+            ]
+            if not source_hashes:
+                raise ValueError(f"{path}:{line_no} source link missing source hash")
+            for source_hash in sorted(set(source_hashes)):
+                existing = links.get(source_hash)
+                if existing is not None:
+                    raise ValueError(f"{path}:{line_no} duplicate source link hash {source_hash}")
+                links[source_hash] = {
+                    "canonical_group_id": group,
+                    "order_key": row.get("order_key") or by_group[group].get("order_key"),
+                    "source_link_sha256": _stable_hash(row),
+                }
+            count += 1
+            total_count += 1
+        infos.append({"path": str(path), "sha256": _sha256_file(path), "record_count": count})
+    return links, infos, total_count
+
+
+def _canonical_group_with_source(
+    row: dict[str, Any],
+    by_group: dict[str, dict[str, Any]],
+    by_order_key: dict[str, dict[str, Any]],
+    source_links: dict[str, dict[str, Any]],
+) -> tuple[str | None, str]:
     group = str(row.get("canonical_group_id") or "")
     if group in by_group:
-        return group
+        return group, "SOURCE_ROW_CANONICAL_GROUP"
     order_key = str(row.get("order_key") or "")
     if order_key in by_order_key:
-        return str(by_order_key[order_key].get("canonical_group_id") or "")
-    return None
+        return str(by_order_key[order_key].get("canonical_group_id") or ""), "SOURCE_ROW_ORDER_KEY"
+    linked_groups = {
+        str(source_links[source_hash].get("canonical_group_id") or "")
+        for source_hash in _source_link_hashes(row)
+        if source_hash in source_links
+    }
+    if len(linked_groups) > 1:
+        raise ValueError("source row has ambiguous source-link sidecar groups")
+    if linked_groups:
+        return linked_groups.pop(), "SOURCE_LINK_SIDECAR"
+    return None, "NO_CANONICAL_LINK"
+
+
+def _canonical_group(row: dict[str, Any], by_group: dict[str, dict[str, Any]], by_order_key: dict[str, dict[str, Any]]) -> str | None:
+    group, _ = _canonical_group_with_source(row, by_group, by_order_key, {})
+    return group
 
 
 def _native_role_for_lighter_account(row: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -477,6 +639,7 @@ def build_forward_native_source_acquisition(
     observed_pfill_run: Path,
     source_roots: list[Path],
     source_json: list[Path],
+    source_link_jsonl: list[Path],
     output_root: Path,
     run_id: str,
     timestamp_ns: int,
@@ -497,6 +660,11 @@ def build_forward_native_source_acquisition(
     lighter_limit_target_groups = {
         group for group, label in by_group.items() if str(label.get("venue_id") or "").lower() == "lighter"
     }
+    source_links, source_link_infos, source_link_record_count = _load_source_links(
+        source_link_jsonl,
+        by_group,
+        by_order_key,
+    )
 
     source_files = _source_paths(source_roots, source_json)
     native_roles_by_group: dict[str, dict[str, Any]] = {}
@@ -506,6 +674,7 @@ def build_forward_native_source_acquisition(
     source_artifacts: list[dict[str, Any]] = []
     seq = 0
     source_rows_seen = 0
+    source_link_applied_count = 0
 
     for path in source_files:
         path = _resolve_path(path)
@@ -515,7 +684,9 @@ def build_forward_native_source_acquisition(
         for line_no, row in _iter_source_records(path):
             row_count += 1
             source_rows_seen += 1
-            group = _canonical_group(row, by_group, by_order_key)
+            group, link_source = _canonical_group_with_source(row, by_group, by_order_key, source_links)
+            if link_source == "SOURCE_LINK_SIDECAR":
+                source_link_applied_count += 1
             observed_label = by_group.get(group or "")
             venue = _venue_id(row, observed_label)
             role, role_source, role_error = _detect_native_role(row, venue)
@@ -561,6 +732,7 @@ def build_forward_native_source_acquisition(
                     "source_path_hash": _stable_hash(str(path)),
                     "source_line": line_no,
                     "source_record_sha256": _stable_hash(row),
+                    "canonical_group_link_source": link_source,
                     "native_source_acquisition_status": status,
                     "native_source_acquisition_hold_reason": hold_reason,
                     "maker_taker_attribution_source": role_source or "NONE",
@@ -627,6 +799,9 @@ def build_forward_native_source_acquisition(
         "observed_pfill_label_count": len(labels),
         "source_file_count": len(source_files),
         "source_row_count": source_rows_seen,
+        "source_link_record_count": source_link_record_count,
+        "source_link_hash_count": len(source_links),
+        "source_link_applied_count": source_link_applied_count,
         "native_role_target_count": len(role_target_groups),
         "native_role_source_record_count": len(native_role_records),
         "native_role_target_recovered_count": role_recovered_targets,
@@ -635,7 +810,9 @@ def build_forward_native_source_acquisition(
         "native_limit_complete_source_record_count": len(complete_limit_groups),
         "lighter_native_limit_target_recovered_count": limit_recovered_targets,
         "native_source_acquisition_status_counts": _status_counts(labels_out, "native_source_acquisition_status"),
+        "canonical_group_link_source_counts": _status_counts(labels_out, "canonical_group_link_source"),
         "source_artifacts": source_artifacts,
+        "source_link_artifacts": source_link_infos,
         "observed_pfill_gate_status": observed_summary.get("gate_status"),
         "observed_pfill_gate_reason": observed_summary.get("gate_reason"),
     }
@@ -658,6 +835,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--observed-pfill-run", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, action="append", default=[])
     parser.add_argument("--source-json", type=Path, action="append", default=[])
+    parser.add_argument("--source-link-jsonl", type=Path, action="append", default=[])
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--run-id", default=f"phase51r_{_utc_stamp()}")
     parser.add_argument("--timestamp-ns", type=int, default=None)
@@ -672,6 +850,7 @@ def main() -> int:
             observed_pfill_run=args.observed_pfill_run,
             source_roots=args.source_root,
             source_json=args.source_json,
+            source_link_jsonl=args.source_link_jsonl,
             output_root=args.output_root,
             run_id=args.run_id,
             timestamp_ns=timestamp_ns,
