@@ -34,12 +34,12 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1r as the active forward native source-acquisition layer,
-   Phase 5.1q as the downstream forward-evidence gate, and Phase 5.1p as the
-   last completed historical evidence boundary. Phase 5.1r is repo-owned,
-   non-live, and designed to ingest local read-only native snapshots while
-   emitting sanitized all-five venue-native role rows plus Lighter event-time
-   native-limit pressure rows without raw ID leakage.
+2. Treat Phase 5.1s as the active local native source-staging gate, Phase 5.1r
+   as the forward native source-acquisition layer, Phase 5.1q as the downstream
+   forward-evidence gate, and Phase 5.1p as the last completed historical
+   evidence boundary. Phase 5.1s is repo-owned, non-live, and designed to
+   require an explicit local manifest, reject unsafe source surfaces, strip raw
+   identifiers, and emit a redacted `local_native_source.jsonl` for Phase 5.1r.
 3. The current Phase 5.1p recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
    `4527` observed horizons available, `0` observed horizons still missing,
@@ -52,14 +52,17 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    venue/side buckets remain sparse, and `1613` quarantined/review groups remain
    excluded from the observed-only diagnostic pack.
 5. Next repo-owned move is another non-live evidence step: capture or locate
-   real read-only native snapshots, run Phase 5.1r, feed its sanitized outputs
+   forward read-only native snapshots with canonical group/order-key linkage,
+   stage them through Phase 5.1s, run Phase 5.1r, feed its sanitized outputs
    into Phase 5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into
    Phase 5.1n, then rerun the recovered 5.1h/5.1i matrix. Do not train models
-   from Phase 5.1r or Phase 5.1q.
+   from Phase 5.1s, Phase 5.1r, or Phase 5.1q.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
-7. Use `docs/PHASE5_1R_FORWARD_NATIVE_SOURCE_ACQUISITION.md` as the standing
+7. Use `docs/PHASE5_1S_LOCAL_NATIVE_SOURCE_ACQUISITION.md` as the standing
+   contract for local source staging,
+   `docs/PHASE5_1R_FORWARD_NATIVE_SOURCE_ACQUISITION.md` as the standing
    contract for source acquisition, `docs/PHASE5_1Q_FORWARD_NATIVE_EVIDENCE.md`
    for downstream forward native evidence, and
    `docs/PHASE5_1P_LIGHTER_NATIVE_ROLE_EVIDENCE.md` for the exhausted
@@ -832,7 +835,7 @@ The audit must answer:
 4. Read this document.
 5. Read `ROADMAP.md` Phase 5.1 / V2 target specification gate.
 6. Read `docs/V2_SPECIFICATION.md` current evidence boundary and blockers.
-7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1r board decision.
+7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1s board decision.
 8. Confirm runtime is still shadow before any evidence capture:
 
 ```bash
@@ -845,16 +848,18 @@ curl -fsS http://127.0.0.1:9898/health/detail
 
 ## Next Command Targets
 
-After Phase 5.1r is committed and pushed, the next target is not another live
-run. The Phase 5.1r baseline no-source run proves the acquisition layer is
-runnable and keeps the expected HOLD: `0 / 287` native-role targets recovered,
-`0 / 3132` Lighter native-limit targets recovered, `287` filled rows still
-missing native role evidence, and Lighter native-limit pressure still missing
-real event-time sendTx/REST pressure rows. Capture real read-only native
-snapshots across all five venues, rerun Phase 5.1r -> 5.1q -> 5.1n -> 5.1h ->
-5.1i, and require measurable blocker reduction without raw identifiers,
-live/canary/capital/risk authorization, model-training shortcuts, or
-selection-bias shortcuts.
+After Phase 5.1s is committed and pushed, the next target is not another live
+run. Phase 5.1s is the mandatory local preflight for read-only native snapshots
+before Phase 5.1r. Its first run over existing Lighter local sources staged
+`405` rows, stripped `3500` raw identifier fields, found `0` join-key rows,
+and correctly cleared no blocker. The downstream Phase 5.1r rerun classified
+all `405` staged rows as `UNJOINED_NO_CANONICAL_GROUP`, leaving `0 / 287`
+native-role targets recovered and `0 / 3132` Lighter native-limit targets
+recovered. Capture forward native snapshots across all five venues with
+canonical group/order-key linkage, rerun Phase 5.1s -> 5.1r -> 5.1q -> 5.1n
+-> 5.1h -> 5.1i, and require measurable blocker reduction without raw
+identifiers, live/canary/capital/risk authorization, model-training shortcuts,
+or selection-bias shortcuts.
 
 ## Current Verdict
 

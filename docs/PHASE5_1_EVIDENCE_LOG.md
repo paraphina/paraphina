@@ -526,6 +526,77 @@ Interpretation: Phase 5.1r is now repo-owned and runnable. The no-source
 baseline intentionally clears no blocker; it proves the adapter preserves the
 HOLD boundary until real read-only native snapshots are supplied.
 
+## Phase 5.1s - Local Native Source Acquisition
+
+Date: 2026-05-03
+
+Purpose: add a manifest-driven local source staging gate in front of Phase 5.1r
+so read-only native snapshots are acquired through an auditable, redaction-safe
+path instead of ad hoc source-root scans.
+
+Repo-owned gate:
+
+```text
+tool: tools/phase51s_local_native_source_acquisition.py
+spec: docs/PHASE5_1S_LOCAL_NATIVE_SOURCE_ACQUISITION.md
+example manifest: configs/phase51s_local_native_source_manifest.example.json
+status: HOLD
+```
+
+First local-source staging evidence:
+
+```text
+runs/phase51s_local_native_source_acquisition/PHASE51S-LOCAL-NATIVE-SOURCE-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+```
+
+Result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51s_local_native_source_acquisition_complete_nonlive_hold
+source_file_count: 7
+source_row_count: 405
+staged_source_row_count: 405
+join_key_source_row_count: 0
+source_row_without_join_key_count: 405
+complete_lighter_native_limit_source_row_count: 0
+raw_identifier_fields_stripped_count: 3500
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Downstream Phase 5.1r rerun from the Phase 5.1s staged source:
+
+```text
+runs/phase51r_forward_native_source_acquisition/PHASE51S-TO-R-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+```
+
+Downstream result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51r_forward_native_source_acquisition_incomplete
+source_row_count: 405
+native_source_acquisition_status_counts:
+- UNJOINED_NO_CANONICAL_GROUP: 405
+native_role_target_count: 287
+native_role_source_record_count: 0
+native_role_target_recovered_count: 0
+lighter_native_limit_target_count: 3132
+native_limit_source_record_count: 0
+native_limit_complete_source_record_count: 0
+lighter_native_limit_target_recovered_count: 0
+raw_identifier_redaction_status: PASS
+```
+
+Interpretation: Phase 5.1s successfully stages existing local Lighter source
+snapshots and strips raw identifiers, but those historical snapshots do not
+contain canonical join keys or complete event-time limit-pressure rows.
+Therefore no Phase 5.1 blocker is cleared. The next evidence move remains
+capturing forward native source rows with canonical group or order-key linkage
+at decision/fill time, plus complete Lighter event-time active-order, sendTx,
+and REST/weighted-request pressure context.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:

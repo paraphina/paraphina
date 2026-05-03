@@ -1,0 +1,26 @@
+{
+  "manifest_version": 1,
+  "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+  "no_live_flag": true,
+  "approved_for_live": false,
+  "approved_for_canary": false,
+  "approved_for_model_training": false,
+  "approved_for_capital_escalation": false,
+  "admissible_for_financial_claim": false,
+  "admissible_for_ev_admission": false,
+  "live_orders_allowed": false,
+  "capital_change_allowed": false,
+  "risk_limit_relaxation_allowed": false,
+  "sources": [
+    {
+      "source_id": "lighter_trades_snapshot",
+      "venue_id": "lighter",
+      "path": "runs/<phase51_local_readonly_source>/source_snapshots/trades.sanitized.json"
+    },
+    {
+      "source_id": "hyperliquid_fills_snapshot",
+      "venue_id": "hyperliquid",
+      "path": "runs/<phase51_local_readonly_source>/source_snapshots/hyperliquid_fills.sanitized.jsonl"
+    }
+  ]
+}

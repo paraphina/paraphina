@@ -882,3 +882,81 @@ then rerun Phase 5.1q -> 5.1n -> 5.1h -> 5.1i. Preserve HOLD unless observed
 venue-native evidence materially reduces the native-role/native-limit blockers
 without introducing raw IDs or unsafe authorization flags.
 ```
+
+## Phase 5.1s Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for local non-live source staging through
+`tools/phase51s_local_native_source_acquisition.py`, followed by the existing
+Phase 5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i evidence chain.
+
+Rationale:
+
+- Phase 5.1s reduces operational risk by requiring an explicit local manifest
+  before any native snapshot is passed to Phase 5.1r.
+- It rejects network paths, `.env` files, symlinks, secret-shaped fields, and
+  unsafe true authorization flags.
+- It strips raw order/client/fill/trade identifiers and emits only redacted
+  local source rows plus label/summary/manifest artifacts.
+- It is not a blocker-clearing gate by itself. Blocker reduction requires
+  downstream exact canonical joins and complete venue-native evidence.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1s - Local native source acquisition
+tool: tools/phase51s_local_native_source_acquisition.py
+spec: docs/PHASE5_1S_LOCAL_NATIVE_SOURCE_ACQUISITION.md
+example manifest: configs/phase51s_local_native_source_manifest.example.json
+status: HOLD
+authorized output:
+- local_native_source.jsonl for Phase 5.1r --source-json
+prohibited:
+- live orders
+- canary
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+```
+
+First local-source evidence:
+
+```text
+runs/phase51s_local_native_source_acquisition/PHASE51S-LOCAL-NATIVE-SOURCE-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51s_local_native_source_acquisition_complete_nonlive_hold
+source_row_count: 405
+join_key_source_row_count: 0
+source_row_without_join_key_count: 405
+complete_lighter_native_limit_source_row_count: 0
+raw_identifier_fields_stripped_count: 3500
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Downstream Phase 5.1r evidence from that staged source:
+
+```text
+runs/phase51r_forward_native_source_acquisition/PHASE51S-TO-R-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51r_forward_native_source_acquisition_incomplete
+native_source_acquisition_status_counts:
+- UNJOINED_NO_CANONICAL_GROUP: 405
+native_role_target_recovered_count: 0 / 287
+lighter_native_limit_target_recovered_count: 0 / 3132
+```
+
+Next move:
+
+```text
+Use Phase 5.1s as the mandatory local preflight for future native source
+snapshots. Capture forward all-five venue-native role rows with canonical
+group/order-key linkage and capture complete Lighter event-time active-order,
+sendTx, and REST/weighted-request pressure rows. Rerun Phase 5.1s -> 5.1r ->
+5.1q -> 5.1n -> 5.1h -> 5.1i, preserving HOLD unless observed evidence clears
+the blockers without raw IDs or unsafe authorization flags.
+```

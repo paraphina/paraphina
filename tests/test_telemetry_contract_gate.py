@@ -720,6 +720,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51r_forward_native_source_acquisition.py"
 
+    def _get_phase51s_local_native_source_acquisition_path(self) -> Path:
+        """Get path to the Phase 5.1s local native source-acquisition gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51s_local_native_source_acquisition.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -7012,6 +7017,516 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("raw native role source identifier fields", result.stderr)
+
+    def test_phase51s_local_source_acquisition_feeds_phase51r_without_raw_ids(self):
+        """5.1s should stage explicit local sources for 5.1r without leaking raw IDs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            source_path = tmp_path / "native_source.jsonl"
+            manifest_path = tmp_path / "manifest.json"
+            staging_root = tmp_path / "local_source_acquisition"
+            acquisition_root = tmp_path / "source_acquisition"
+            capture_root = tmp_path / "forward_native_capture"
+            observed_run.mkdir()
+
+            observed_labels = [
+                ("group-hl", "order-hl", "hyperliquid", "Buy"),
+                ("group-lighter", "order-lighter", "lighter", "Sell"),
+            ]
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51s_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": len(observed_labels),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (observed_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for group, order_key, venue_id, side in observed_labels:
+                    f.write(json.dumps({
+                        "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                        "canonical_group_id": group,
+                        "order_key": order_key,
+                        "source_telemetry_sha256": f"source-{group}",
+                        "venue_id": venue_id,
+                        "side": side,
+                        "fill_count": 1,
+                        "outcome_status": "OBSERVED_FILLED",
+                        "p_fill_outcome": 1.0,
+                        "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                        "approved_for_live": False,
+                        "approved_for_model_training": False,
+                    }) + "\n")
+
+            source_rows = [
+                {
+                    "canonical_group_id": "group-hl",
+                    "venue_id": "hyperliquid",
+                    "crossed": False,
+                    "oid": "raw-hl-order",
+                    "cloid": "raw-hl-client-order",
+                    "tid": "raw-hl-trade",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "group-lighter",
+                    "venue_id": "lighter",
+                    "account_index": 123,
+                    "is_maker_ask": True,
+                    "ask_account_id": 123,
+                    "bid_account_id": 456,
+                    "trade_id": "raw-lighter-trade-id",
+                    "bid_client_id": "raw-lighter-client-id",
+                    "active_order_headroom_account": 100,
+                    "active_order_headroom_market": 8,
+                    "sendtx_per_minute_limit": 1000,
+                    "sendtx_per_minute_remaining": 990,
+                    "rest_requests_per_minute_limit": 1200,
+                    "rest_requests_per_minute_remaining": 1180,
+                    "native_limit_event_time_status": "EVENT_TIME_ALIGNED",
+                    "native_limit_staleness_ms": 5.0,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with source_path.open("w", encoding="utf-8") as f:
+                for row in source_rows:
+                    f.write(json.dumps(row) + "\n")
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "sources": [{"source_id": "test_source", "venue_id": "lighter", "path": str(source_path)}],
+            }), encoding="utf-8")
+
+            staging_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51s_local_native_source_acquisition_path()),
+                    "--manifest",
+                    str(manifest_path),
+                    "--output-root",
+                    str(staging_root),
+                    "--run-id",
+                    "phase51s_local_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                staging_result.returncode,
+                0,
+                f"stdout: {staging_result.stdout}\nstderr: {staging_result.stderr}",
+            )
+            staging_dir = staging_root / "phase51s_local_test"
+            staging_summary = json.loads(
+                (staging_dir / "phase51s_local_native_source_acquisition_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(staging_summary["gate_status"], "HOLD")
+            self.assertEqual(staging_summary["gate_reason"], "phase51s_local_native_source_acquisition_complete_nonlive_hold")
+            self.assertEqual(staging_summary["source_row_count"], 2)
+            self.assertEqual(staging_summary["staged_source_row_count"], 2)
+            self.assertEqual(staging_summary["join_key_source_row_count"], 2)
+            self.assertEqual(staging_summary["complete_lighter_native_limit_source_row_count"], 1)
+            self.assertEqual(staging_summary["raw_identifier_redaction_status"], "PASS")
+            self.assertFalse(staging_summary["clears_phase51_blockers"])
+            self.assertNotIn("path", staging_summary["source_artifacts"][0])
+            self.assertIn("path_hash", staging_summary["source_artifacts"][0])
+
+            raw_fields = {
+                "order_id",
+                "client_order_id",
+                "venue_order_id",
+                "raw_order_id",
+                "raw_client_order_id",
+                "ask_id",
+                "bid_id",
+                "ask_client_id",
+                "bid_client_id",
+                "trade_id",
+                "fill_id",
+                "id",
+                "oid",
+                "cloid",
+                "tid",
+            }
+            for line in (staging_dir / "local_native_source.jsonl").read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                self.assertFalse(raw_fields & set(row))
+                self.assertFalse(row["approved_for_live"])
+                self.assertFalse(row["approved_for_model_training"])
+
+            acquisition_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51r_forward_native_source_acquisition_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--source-json",
+                    str(staging_dir / "local_native_source.jsonl"),
+                    "--output-root",
+                    str(acquisition_root),
+                    "--run-id",
+                    "phase51s_to_phase51r_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                acquisition_result.returncode,
+                0,
+                f"stdout: {acquisition_result.stdout}\nstderr: {acquisition_result.stderr}",
+            )
+            acquisition_summary = json.loads(
+                (
+                    acquisition_root
+                    / "phase51s_to_phase51r_test"
+                    / "phase51r_forward_native_source_acquisition_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(acquisition_summary["native_role_target_recovered_count"], 2)
+            self.assertEqual(acquisition_summary["lighter_native_limit_target_recovered_count"], 1)
+
+            capture_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51q_forward_native_evidence_capture_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--native-role-jsonl",
+                    str(acquisition_root / "phase51s_to_phase51r_test" / "native_role_source.jsonl"),
+                    "--native-limit-jsonl",
+                    str(acquisition_root / "phase51s_to_phase51r_test" / "native_limit_source.jsonl"),
+                    "--output-root",
+                    str(capture_root),
+                    "--run-id",
+                    "phase51s_to_phase51q_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                capture_result.returncode,
+                0,
+                f"stdout: {capture_result.stdout}\nstderr: {capture_result.stderr}",
+            )
+            capture_summary = json.loads(
+                (
+                    capture_root
+                    / "phase51s_to_phase51q_test"
+                    / "phase51q_forward_native_evidence_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(capture_summary["recovered_forward_native_role_count"], 2)
+            self.assertEqual(capture_summary["native_limit_pressure_status_counts"]["OBSERVED_NATIVE_LIMIT_PRESSURE"], 1)
+
+    def test_phase51s_local_source_acquisition_rejects_secrets_and_network_sources(self):
+        """5.1s should reject unsafe local-source acquisition surfaces."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            source_path = tmp_path / "native_source.jsonl"
+            manifest_path = tmp_path / "manifest.json"
+            output_root = tmp_path / "local_source_acquisition"
+
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "approved_for_live": False,
+                "sources": [{"source_id": "network", "path": "https://example.invalid/native.json"}],
+            }), encoding="utf-8")
+            network_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51s_local_native_source_acquisition_path()),
+                    "--manifest",
+                    str(manifest_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51s_network_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(network_result.returncode, 2)
+            self.assertIn("network source paths are prohibited", network_result.stderr)
+
+            source_path.write_text(json.dumps({
+                "canonical_group_id": "group-secret",
+                "venue_id": "hyperliquid",
+                "crossed": False,
+                "api_key": "should-never-be-present",
+                "approved_for_live": False,
+            }) + "\n", encoding="utf-8")
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "approved_for_live": False,
+                "sources": [{"source_id": "secret", "path": str(source_path)}],
+            }), encoding="utf-8")
+            secret_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51s_local_native_source_acquisition_path()),
+                    "--manifest",
+                    str(manifest_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51s_secret_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(secret_result.returncode, 2)
+            self.assertIn("secret-shaped source row field", secret_result.stderr)
+
+            env_source = tmp_path / "native.env"
+            env_source.write_text("{}", encoding="utf-8")
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "approved_for_live": False,
+                "sources": [{"source_id": "env", "path": str(env_source)}],
+            }), encoding="utf-8")
+            env_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51s_local_native_source_acquisition_path()),
+                    "--manifest",
+                    str(manifest_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51s_env_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(env_result.returncode, 2)
+            self.assertIn("env files are prohibited", env_result.stderr)
+
+            target_path = tmp_path / "target.jsonl"
+            link_path = tmp_path / "linked.jsonl"
+            target_path.write_text(json.dumps({
+                "canonical_group_id": "group-link",
+                "venue_id": "hyperliquid",
+                "crossed": False,
+            }) + "\n", encoding="utf-8")
+            link_path.symlink_to(target_path)
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "approved_for_live": False,
+                "sources": [{"source_id": "link", "path": str(link_path)}],
+            }), encoding="utf-8")
+            symlink_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51s_local_native_source_acquisition_path()),
+                    "--manifest",
+                    str(manifest_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51s_symlink_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(symlink_result.returncode, 2)
+            self.assertIn("symlink source path is prohibited", symlink_result.stderr)
+
+    def test_phase51s_local_source_acquisition_does_not_false_clear_partial_sources(self):
+        """5.1s should not convert staged local rows into blocker-clearing evidence."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            source_path = tmp_path / "native_source.jsonl"
+            manifest_path = tmp_path / "manifest.json"
+            staging_root = tmp_path / "local_source_acquisition"
+            acquisition_root = tmp_path / "source_acquisition"
+            capture_root = tmp_path / "forward_native_capture"
+            observed_run.mkdir()
+
+            observed_labels = [
+                ("group-lighter-partial", "order-lighter-partial", "lighter", "Buy", 1),
+                ("group-hl-unjoined", "order-hl-unjoined", "hyperliquid", "Sell", 1),
+                ("group-generic", "order-generic", "extended", "Buy", 1),
+            ]
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51s_no_false_clear_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": len(observed_labels),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (observed_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for group, order_key, venue_id, side, fill_count in observed_labels:
+                    f.write(json.dumps({
+                        "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                        "canonical_group_id": group,
+                        "order_key": order_key,
+                        "source_telemetry_sha256": f"source-{group}",
+                        "venue_id": venue_id,
+                        "side": side,
+                        "fill_count": fill_count,
+                        "outcome_status": "OBSERVED_FILLED",
+                        "p_fill_outcome": 1.0,
+                        "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                        "approved_for_live": False,
+                        "approved_for_model_training": False,
+                    }) + "\n")
+
+            source_rows = [
+                {
+                    "canonical_group_id": "group-lighter-partial",
+                    "venue_id": "lighter",
+                    "account_index": 123,
+                    "is_maker_ask": True,
+                    "ask_account_id": 123,
+                    "bid_account_id": 456,
+                    "active_order_headroom_account": 10,
+                    "active_order_headroom_market": 3,
+                    "native_limit_event_time_status": "EVENT_TIME_ALIGNED",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "venue_id": "hyperliquid",
+                    "crossed": False,
+                    "tid": "raw-unjoined-hl-trade",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "group-generic",
+                    "venue_id": "extended",
+                    "native_role": "MAKER",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with source_path.open("w", encoding="utf-8") as f:
+                for row in source_rows:
+                    f.write(json.dumps(row) + "\n")
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "sources": [{"source_id": "partial", "path": str(source_path)}],
+            }), encoding="utf-8")
+
+            staging_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51s_local_native_source_acquisition_path()),
+                    "--manifest",
+                    str(manifest_path),
+                    "--output-root",
+                    str(staging_root),
+                    "--run-id",
+                    "phase51s_no_false_clear_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                staging_result.returncode,
+                0,
+                f"stdout: {staging_result.stdout}\nstderr: {staging_result.stderr}",
+            )
+            staging_dir = staging_root / "phase51s_no_false_clear_test"
+            staging_summary = json.loads(
+                (staging_dir / "phase51s_local_native_source_acquisition_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(staging_summary["source_row_count"], 3)
+            self.assertEqual(staging_summary["join_key_source_row_count"], 2)
+            self.assertEqual(staging_summary["source_row_without_join_key_count"], 1)
+            self.assertEqual(staging_summary["complete_lighter_native_limit_source_row_count"], 0)
+            self.assertFalse(staging_summary["clears_phase51_blockers"])
+
+            acquisition_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51r_forward_native_source_acquisition_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--source-json",
+                    str(staging_dir / "local_native_source.jsonl"),
+                    "--output-root",
+                    str(acquisition_root),
+                    "--run-id",
+                    "phase51s_no_false_clear_to_phase51r_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                acquisition_result.returncode,
+                0,
+                f"stdout: {acquisition_result.stdout}\nstderr: {acquisition_result.stderr}",
+            )
+            acquisition_summary = json.loads(
+                (
+                    acquisition_root
+                    / "phase51s_no_false_clear_to_phase51r_test"
+                    / "phase51r_forward_native_source_acquisition_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(acquisition_summary["gate_reason"], "phase51r_forward_native_source_acquisition_incomplete")
+            self.assertEqual(acquisition_summary["source_row_count"], 3)
+            self.assertEqual(acquisition_summary["native_role_target_count"], 3)
+            self.assertEqual(acquisition_summary["native_role_target_recovered_count"], 1)
+            self.assertEqual(acquisition_summary["native_limit_source_record_count"], 1)
+            self.assertEqual(acquisition_summary["native_limit_complete_source_record_count"], 0)
+            self.assertEqual(acquisition_summary["lighter_native_limit_target_recovered_count"], 0)
+
+            capture_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51q_forward_native_evidence_capture_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--native-role-jsonl",
+                    str(acquisition_root / "phase51s_no_false_clear_to_phase51r_test" / "native_role_source.jsonl"),
+                    "--native-limit-jsonl",
+                    str(acquisition_root / "phase51s_no_false_clear_to_phase51r_test" / "native_limit_source.jsonl"),
+                    "--output-root",
+                    str(capture_root),
+                    "--run-id",
+                    "phase51s_no_false_clear_to_phase51q_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                capture_result.returncode,
+                0,
+                f"stdout: {capture_result.stdout}\nstderr: {capture_result.stderr}",
+            )
+            capture_summary = json.loads(
+                (
+                    capture_root
+                    / "phase51s_no_false_clear_to_phase51q_test"
+                    / "phase51q_forward_native_evidence_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(capture_summary["recovered_forward_native_role_count"], 1)
+            self.assertEqual(capture_summary["native_role_capture_status_counts"]["MISSING_FORWARD_NATIVE_ROLE_SOURCE"], 2)
+            self.assertEqual(capture_summary["native_limit_pressure_status_counts"]["PARTIAL_NATIVE_LIMIT_PRESSURE_SOURCE"], 1)
 
     def test_phase51r_source_acquisition_feeds_phase51q_without_raw_ids(self):
         """5.1r should normalize venue-native snapshots into redacted 5.1q inputs."""
