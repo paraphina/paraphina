@@ -484,11 +484,10 @@ admission:
 
 ## 14. Current Phase 5.1 Blockers
 
-As of Phase 5.1m, the V2 evidence path remains blocked by:
+As of Phase 5.1n, the V2 evidence path remains blocked by:
 
-- Lighter native-limit context still partial for `2288` labels because the
-  accepted official-cap/current-active-order snapshot is not label-event-time
-  aligned;
+- Lighter native-limit context still partial for `2288` labels because
+  historical active-order snapshots do not include full sendTx/REST pressure;
 - maker/taker status incomplete for `287` fills;
 - sparse venue/side/layer/regime buckets;
 - observed-only selection bias from `1613` excluded quarantine/review groups.
@@ -504,8 +503,15 @@ The recovered matrix correctly remains at `0 / 2288` native-limit rows observed
 and `2288 / 2288` partial, while preserving `0` missing horizons, `0`
 unrecovered filled-horizon source-key rows, and raw-identifier redaction `PASS`.
 
-The next repo-owned V2 evidence move is event-time native-limit pressure plus
-venue-native maker/taker completeness across all filled venues, followed by
-another recovered 5.1h/5.1i matrix run. No model training, EV admission,
-canary, live orders, capital escalation, risk-limit relaxation, or financial
-claim is authorized from Phase 5.1m.
+Phase 5.1n added historical Lighter account snapshot alignment. It aligned
+`1728 / 2194` Lighter rows in the 025435 lane and `3700 / 3954` rows in the
+073231 lane to event-time active-order snapshots, but it kept
+`native_limit_observed_count = 0` because sendTx/REST pressure was not captured
+historically. Phase 5.1n also added all-venue maker/taker recovery and
+classified the remaining `287` filled rows as missing venue-native role source.
+
+The next repo-owned V2 evidence move is venue-native maker/taker completeness
+across all filled venues plus forward-looking event-time native-limit pressure
+instrumentation. No model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, or financial claim is authorized from Phase
+5.1n.

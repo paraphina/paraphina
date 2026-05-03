@@ -293,10 +293,98 @@ def _load_phase51b_lighter_context(run_dir: Path | None) -> dict[str, Any] | Non
     }
 
 
+def _load_phase51n_lighter_alignment(
+    run_dir: Path | None,
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]]]:
+    if run_dir is None:
+        return None, {}
+    summary_path = run_dir / "lighter_native_limit_time_alignment_summary.json"
+    labels_path = run_dir / "lighter_native_limit_time_alignment_labels.jsonl"
+    summary = _load_json(summary_path)
+    if summary.get("baseline_commit") != BASELINE_COMMIT:
+        raise ValueError(f"{summary_path} baseline_commit mismatch")
+    if summary.get("gate_status") != "HOLD":
+        raise ValueError(f"{summary_path} must have gate_status=HOLD")
+    for flag in UNSAFE_TRUE_FLAGS:
+        if summary.get(flag) is True:
+            raise ValueError(f"{summary_path} has unsafe summary flag {flag}=true")
+    by_order_key: dict[str, dict[str, Any]] = {}
+    for _, label in _iter_jsonl(labels_path):
+        if label.get("label_type") != "PHASE51N_LIGHTER_NATIVE_LIMIT_TIME_ALIGNMENT_LABEL":
+            continue
+        for flag in UNSAFE_TRUE_FLAGS:
+            if label.get(flag) is True:
+                raise ValueError(f"{labels_path} has unsafe label flag {flag}=true")
+        order_key = str(label.get("order_key") or "")
+        if not order_key:
+            continue
+        if order_key in by_order_key:
+            raise ValueError(f"{labels_path} duplicate order_key={order_key}")
+        by_order_key[order_key] = label
+    expected = int(summary.get("label_count") or 0)
+    if len(by_order_key) > expected:
+        raise ValueError(f"{labels_path} indexed label count exceeds summary label_count")
+    return summary, by_order_key
+
+
 def _native_limit_pressure(
     venue_id: Any,
     phase51b_context: dict[str, Any] | None,
+    phase51n_alignment: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    if phase51n_alignment is not None and str(venue_id or "").lower() == "lighter":
+        alignment_status = str(
+            phase51n_alignment.get("native_limit_time_alignment_status") or "UNKNOWN"
+        )
+        all_dimensions = phase51n_alignment.get("native_limit_all_pressure_dimensions_observed") is True
+        if alignment_status == "EVENT_TIME_ALIGNED" and all_dimensions:
+            status = "OBSERVED_NATIVE_LIMIT_HEADROOM"
+            hold_reason = "requires_queue_reset_calibration_and_board_review"
+        elif alignment_status == "EVENT_TIME_ALIGNED":
+            status = "PARTIAL_NATIVE_HEADROOM_EVENT_TIME_ALIGNED_LIMITS_INCOMPLETE"
+            hold_reason = str(
+                phase51n_alignment.get("native_limit_alignment_hold_reason")
+                or "event_time_aligned_but_sendtx_or_rest_remaining_unobserved"
+            )
+        elif alignment_status.startswith("MISSING") or alignment_status == "STALE_LIGHTER_ACCOUNT_SNAPSHOT":
+            status = f"PARTIAL_{alignment_status}"
+            hold_reason = str(
+                phase51n_alignment.get("native_limit_alignment_hold_reason")
+                or "event_time_native_limit_alignment_incomplete"
+            )
+        else:
+            status = "PARTIAL_NATIVE_HEADROOM_NOT_EVENT_TIME_ALIGNED"
+            hold_reason = str(
+                phase51n_alignment.get("native_limit_alignment_hold_reason")
+                or "native_limit_headroom_not_event_time_aligned"
+            )
+        return {
+            "native_limit_pressure_status": status,
+            "native_limit_pressure_hold_reason": hold_reason,
+            "native_limit_context_run": phase51n_alignment.get("run_id"),
+            "native_active_orders_count_total": phase51n_alignment.get("native_active_orders_count_total"),
+            "native_active_orders_count_market": phase51n_alignment.get("native_active_orders_count_market"),
+            "native_pending_orders_count_total": phase51n_alignment.get("native_pending_orders_count_total"),
+            "native_active_order_headroom_account": phase51n_alignment.get(
+                "native_active_order_headroom_account"
+            ),
+            "native_active_order_headroom_market": phase51n_alignment.get(
+                "native_active_order_headroom_market"
+            ),
+            "native_sendtx_per_minute_remaining": phase51n_alignment.get(
+                "native_sendtx_per_minute_remaining"
+            ),
+            "native_rest_request_remaining": phase51n_alignment.get("native_rest_request_remaining"),
+            "native_active_order_limit_source": phase51n_alignment.get("native_active_order_limit_source"),
+            "native_active_order_limit_conflicts": phase51n_alignment.get(
+                "native_active_order_limit_conflicts"
+            )
+            or [],
+            "native_limit_time_alignment_status": alignment_status,
+            "native_limit_alignment_source": "phase51n_lighter_native_limit_time_alignment",
+            "native_limit_snapshot_age_ms_abs": phase51n_alignment.get("snapshot_age_ms_abs"),
+            "native_limit_all_pressure_dimensions_observed": all_dimensions,
+        }
     if phase51b_context is None:
         return {
             "native_limit_pressure_status": "UNKNOWN_NO_NATIVE_LIMIT_PRESSURE_INPUT",
@@ -310,6 +398,9 @@ def _native_limit_pressure(
             "native_active_order_limit_source": None,
             "native_active_order_limit_conflicts": [],
             "native_limit_time_alignment_status": None,
+            "native_limit_alignment_source": None,
+            "native_limit_snapshot_age_ms_abs": None,
+            "native_limit_all_pressure_dimensions_observed": False,
         }
     if str(venue_id or "").lower() != "lighter":
         return {
@@ -324,6 +415,9 @@ def _native_limit_pressure(
             "native_active_order_limit_source": None,
             "native_active_order_limit_conflicts": [],
             "native_limit_time_alignment_status": None,
+            "native_limit_alignment_source": None,
+            "native_limit_snapshot_age_ms_abs": None,
+            "native_limit_all_pressure_dimensions_observed": False,
         }
     limits = phase51b_context.get("limits", {})
     active_orders = phase51b_context.get("active_orders", {})
@@ -353,6 +447,9 @@ def _native_limit_pressure(
         "native_active_order_limit_source": active_orders.get("active_order_limit_source"),
         "native_active_order_limit_conflicts": active_orders.get("active_order_limit_conflicts") or [],
         "native_limit_time_alignment_status": time_alignment,
+        "native_limit_alignment_source": "phase51b_lighter_native_limits_context",
+        "native_limit_snapshot_age_ms_abs": None,
+        "native_limit_all_pressure_dimensions_observed": status == "OBSERVED_NATIVE_LIMIT_HEADROOM",
     }
 
 
@@ -376,6 +473,7 @@ def build_queue_churn_labels(
     run_id: str | None,
     timestamp_ns: int | None,
     lighter_native_limits_run: Path | None,
+    lighter_native_limit_alignment_run: Path | None,
 ) -> Path:
     run_id = run_id or f"PHASE51C-QUEUE-CHURN-{_utc_stamp()}"
     output_root = output_root or DEFAULT_OUTPUT_ROOT
@@ -389,6 +487,9 @@ def build_queue_churn_labels(
     lake_summary, lifecycle_index, lifecycle_count = _load_lifecycle_events(label_lake_run)
     pfill_summary, pfill_labels = _load_pfill_labels(pfill_outcome_run)
     phase51b_context = _load_phase51b_lighter_context(lighter_native_limits_run)
+    phase51n_summary, phase51n_by_order_key = _load_phase51n_lighter_alignment(
+        lighter_native_limit_alignment_run
+    )
     if lake_summary.get("source_telemetry_sha256") != pfill_summary.get("source_telemetry_sha256"):
         raise ValueError("label lake and P_fill outcome run must share source_telemetry_sha256")
 
@@ -431,7 +532,12 @@ def build_queue_churn_labels(
             counts["orders_with_churn_count"] += 1
         if summary["terminal_horizon_source_ticks_from_pfill"] is not None:
             counts["orders_with_terminal_horizon_count"] += 1
-        native_pressure = _native_limit_pressure(pfill_label.get("venue_id"), phase51b_context)
+        phase51n_alignment = phase51n_by_order_key.get(str(pfill_label.get("order_key") or ""))
+        native_pressure = _native_limit_pressure(
+            pfill_label.get("venue_id"),
+            phase51b_context,
+            phase51n_alignment,
+        )
         native_status = native_pressure["native_limit_pressure_status"]
         if str(native_status).startswith("UNKNOWN"):
             counts["native_limit_pressure_unknown_count"] += 1
@@ -494,6 +600,21 @@ def build_queue_churn_labels(
         "lighter_native_limits_limitations": (
             phase51b_context.get("limitations") if phase51b_context else []
         ),
+        "lighter_native_limit_alignment_run": (
+            str(lighter_native_limit_alignment_run) if lighter_native_limit_alignment_run else None
+        ),
+        "lighter_native_limit_alignment_summary_sha256": (
+            _sha256_file(lighter_native_limit_alignment_run / "lighter_native_limit_time_alignment_summary.json")
+            if lighter_native_limit_alignment_run else None
+        ),
+        "lighter_native_limit_alignment_labels_sha256": (
+            _sha256_file(lighter_native_limit_alignment_run / "lighter_native_limit_time_alignment_labels.jsonl")
+            if lighter_native_limit_alignment_run else None
+        ),
+        "lighter_native_limit_alignment_status_counts": (
+            phase51n_summary.get("native_limit_time_alignment_status_counts")
+            if phase51n_summary else {}
+        ),
         "source_telemetry_sha256": lake_summary.get("source_telemetry_sha256"),
         "label_lake_summary_sha256": _sha256_file(label_lake_run / "label_lake_summary.json"),
         "pfill_outcome_summary_sha256": _sha256_file(pfill_outcome_run / "pfill_outcome_summary.json"),
@@ -525,6 +646,7 @@ def main() -> int:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--timestamp-ns", type=int, default=None)
     parser.add_argument("--lighter-native-limits-run", type=Path, default=None)
+    parser.add_argument("--lighter-native-limit-alignment-run", type=Path, default=None)
     args = parser.parse_args()
     try:
         out_dir = build_queue_churn_labels(
@@ -534,6 +656,7 @@ def main() -> int:
             run_id=args.run_id,
             timestamp_ns=args.timestamp_ns,
             lighter_native_limits_run=args.lighter_native_limits_run,
+            lighter_native_limit_alignment_run=args.lighter_native_limit_alignment_run,
         )
     except Exception as exc:
         print(f"phase51c_queue_churn_labels: ERROR: {exc}", file=sys.stderr)

@@ -236,6 +236,38 @@ def _load_filled_horizon_source_key_recovery(
     return summary, by_group
 
 
+def _load_maker_taker_recovery(
+    maker_taker_recovery_run: Path | None,
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]]]:
+    if maker_taker_recovery_run is None:
+        return None, {}
+    summary = _load_hold_summary(
+        maker_taker_recovery_run,
+        "maker_taker_attribution_recovery_summary.json",
+    )
+    if summary.get("raw_identifier_redaction_status") != "PASS":
+        raise ValueError(f"{maker_taker_recovery_run} must have raw_identifier_redaction_status=PASS")
+    labels_path = maker_taker_recovery_run / "maker_taker_attribution_recovery_labels.jsonl"
+    by_group: dict[str, dict[str, Any]] = {}
+    for _, label in _iter_jsonl(labels_path):
+        if label.get("label_type") != "PHASE51N_MAKER_TAKER_ATTRIBUTION_RECOVERY_LABEL":
+            continue
+        _check_unsafe(label, labels_path, label="label")
+        _check_no_raw_identifiers(label, labels_path, label="label")
+        if label.get("raw_identifier_redaction_status") != "PASS":
+            raise ValueError(f"{labels_path} contains non-PASS raw identifier redaction status")
+        canonical_group_id = str(label.get("canonical_group_id") or "")
+        if not canonical_group_id:
+            raise ValueError(f"{labels_path} row missing canonical_group_id")
+        if canonical_group_id in by_group:
+            raise ValueError(f"{labels_path} duplicate canonical_group_id={canonical_group_id}")
+        by_group[canonical_group_id] = label
+    expected = int(summary.get("label_count") or 0)
+    if len(by_group) != expected:
+        raise ValueError(f"{labels_path} label count {len(by_group)} != summary label_count {expected}")
+    return summary, by_group
+
+
 def _safe_int(value: Any) -> int | None:
     if value is None:
         return None
@@ -403,11 +435,11 @@ def _native_status_class(venue: str, queue_labels: list[dict[str, Any]]) -> str:
     return "UNKNOWN"
 
 
-def _maker_taker_status(label: dict[str, Any]) -> str:
+def _maker_taker_status(label: dict[str, Any], counts: dict[str, Any] | None = None) -> str:
     fill_count = _safe_int(label.get("fill_count")) or 0
     if fill_count <= 0:
         return "NO_FILL_NOT_APPLICABLE"
-    counts = label.get("maker_taker_role_counts") or {}
+    counts = counts or label.get("maker_taker_role_counts") or {}
     known = int(counts.get("MAKER") or 0) + int(counts.get("TAKER") or 0)
     unknown = int(counts.get("UNKNOWN") or 0)
     if known >= fill_count and unknown == 0:
@@ -430,6 +462,7 @@ def _coverage_label(
     horizon_recovery_label: dict[str, Any] | None,
     filled_horizon_recovery_label: dict[str, Any] | None,
     filled_horizon_source_key_recovery_label: dict[str, Any] | None,
+    maker_taker_recovery_label: dict[str, Any] | None,
 ) -> dict[str, Any]:
     venue = str(pfill_label.get("venue_id") or "UNKNOWN")
     side = _canonical_side(pfill_label.get("side"))
@@ -446,7 +479,26 @@ def _coverage_label(
     else:
         queue_status = "JOINED_PARTIAL_SOURCE_KEYS"
     native_status = _native_status_class(venue, queue_labels)
-    maker_taker_status = _maker_taker_status(pfill_label)
+    maker_taker_counts = pfill_label.get("maker_taker_role_counts") or {}
+    maker_taker_recovery_status = None
+    maker_taker_recovery_source = None
+    maker_taker_recovery_applied = False
+    if maker_taker_recovery_label is not None:
+        maker_taker_recovery_status = maker_taker_recovery_label.get("maker_taker_recovery_status")
+        maker_taker_recovery_source = maker_taker_recovery_label.get("maker_taker_attribution_source")
+        if maker_taker_recovery_label.get("source_telemetry_sha256") != pfill_label.get("source_telemetry_sha256"):
+            raise ValueError(
+                f"maker/taker recovery source hash mismatch for canonical_group_id="
+                f"{pfill_label.get('canonical_group_id')}"
+            )
+        effective_counts = maker_taker_recovery_label.get("effective_maker_taker_role_counts")
+        if isinstance(effective_counts, dict):
+            maker_taker_counts = effective_counts
+            maker_taker_recovery_applied = maker_taker_recovery_status in {
+                "RECOVERED_VENUE_NATIVE_ROLE",
+                "PARTIAL_VENUE_NATIVE_ROLE",
+            }
+    maker_taker_status = _maker_taker_status(pfill_label, maker_taker_counts)
     input_observed_horizon = pfill_label.get("observed_horizon_source_ticks")
     observed_horizon_source_ticks = input_observed_horizon
     horizon_recovery_status = None
@@ -580,7 +632,10 @@ def _coverage_label(
         "native_limit_pressure_status": native_status,
         "native_limit_pressure_status_counts": _count_map(queue_labels, "native_limit_pressure_status"),
         "maker_taker_feature_status": maker_taker_status,
-        "maker_taker_role_counts": pfill_label.get("maker_taker_role_counts") or {},
+        "maker_taker_role_counts": maker_taker_counts,
+        "maker_taker_recovery_status": maker_taker_recovery_status,
+        "maker_taker_recovery_source": maker_taker_recovery_source,
+        "maker_taker_recovery_applied": maker_taker_recovery_applied,
         "markout_readiness_source_available": markout_available,
         "markout_readiness_gate_reason": markout_info.get("gate_reason") if markout_info else None,
         "quarantine_review_status": quarantine_record.get("review_status") if quarantine_record else None,
@@ -854,6 +909,7 @@ def build_feature_audit(
     horizon_recovery_run: Path | None,
     filled_horizon_recovery_run: Path | None,
     filled_horizon_source_key_recovery_run: Path | None,
+    maker_taker_recovery_run: Path | None,
     output_root: Path | None,
     run_id: str | None,
     timestamp_ns: int | None,
@@ -882,6 +938,9 @@ def build_feature_audit(
         _resolve_path(filled_horizon_source_key_recovery_run)
         if filled_horizon_source_key_recovery_run is not None else None
     )
+    maker_taker_recovery_run = (
+        _resolve_path(maker_taker_recovery_run) if maker_taker_recovery_run is not None else None
+    )
 
     pfill_summary, pfill_labels = _load_pfill_labels(observed_pfill_run)
     canonical_index = _load_canonical_source_index(canonical_pfill_run)
@@ -896,6 +955,9 @@ def build_feature_audit(
         filled_horizon_source_key_recovery_summary,
         filled_horizon_source_key_recovery_by_group,
     ) = _load_filled_horizon_source_key_recovery(filled_horizon_source_key_recovery_run)
+    maker_taker_recovery_summary, maker_taker_recovery_by_group = _load_maker_taker_recovery(
+        maker_taker_recovery_run
+    )
 
     feature_labels: list[dict[str, Any]] = []
     for seq, pfill_label in enumerate(pfill_labels, start=1):
@@ -937,6 +999,9 @@ def build_feature_audit(
             raise ValueError(
                 f"canonical_group_id {canonical_group_id} missing from filled horizon source-key recovery run"
             )
+        maker_taker_recovery_label = maker_taker_recovery_by_group.get(canonical_group_id)
+        if maker_taker_recovery_run is not None and maker_taker_recovery_label is None:
+            raise ValueError(f"canonical_group_id {canonical_group_id} missing from maker/taker recovery run")
         feature_labels.append(_coverage_label(
             seq=seq,
             run_id=run_id,
@@ -949,6 +1014,7 @@ def build_feature_audit(
             horizon_recovery_label=horizon_recovery_label,
             filled_horizon_recovery_label=filled_horizon_recovery_label,
             filled_horizon_source_key_recovery_label=filled_horizon_source_key_recovery_label,
+            maker_taker_recovery_label=maker_taker_recovery_label,
         ))
 
     bucket_records = _build_bucket_records(
@@ -1029,6 +1095,23 @@ def build_feature_audit(
             filled_horizon_source_key_recovery_summary.get("recovery_status_counts")
             if filled_horizon_source_key_recovery_summary else {}
         ),
+        "maker_taker_recovery_run": str(maker_taker_recovery_run) if maker_taker_recovery_run else None,
+        "maker_taker_recovery_summary_sha256": (
+            _sha256_file(maker_taker_recovery_run / "maker_taker_attribution_recovery_summary.json")
+            if maker_taker_recovery_run else None
+        ),
+        "maker_taker_recovery_labels_sha256": (
+            _sha256_file(maker_taker_recovery_run / "maker_taker_attribution_recovery_labels.jsonl")
+            if maker_taker_recovery_run else None
+        ),
+        "maker_taker_recovery_status_counts": (
+            maker_taker_recovery_summary.get("maker_taker_recovery_status_counts")
+            if maker_taker_recovery_summary else {}
+        ),
+        "maker_taker_recovery_source_counts": (
+            maker_taker_recovery_summary.get("maker_taker_attribution_source_counts")
+            if maker_taker_recovery_summary else {}
+        ),
         "source_telemetry_sha256_list": sorted({
             str(label.get("source_telemetry_sha256") or "")
             for label in pfill_labels
@@ -1039,6 +1122,9 @@ def build_feature_audit(
         "excluded_quarantine_reason_counts": pfill_summary.get("excluded_quarantine_reason_counts") or {},
         "observed_only_pack_warning": pfill_summary.get("observed_only_pack_warning"),
         "bucket_count": len(bucket_records),
+        "raw_identifier_redaction_status": (
+            "PASS" if global_bucket["raw_identifier_input_present_count"] == 0 else "FAIL"
+        ),
         **{
             key: global_bucket[key]
             for key in (
@@ -1116,6 +1202,7 @@ def main() -> int:
     parser.add_argument("--horizon-recovery-run", type=Path, default=None)
     parser.add_argument("--filled-horizon-recovery-run", type=Path, default=None)
     parser.add_argument("--filled-horizon-source-key-recovery-run", type=Path, default=None)
+    parser.add_argument("--maker-taker-recovery-run", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--timestamp-ns", type=int, default=None)
@@ -1132,6 +1219,7 @@ def main() -> int:
             horizon_recovery_run=args.horizon_recovery_run,
             filled_horizon_recovery_run=args.filled_horizon_recovery_run,
             filled_horizon_source_key_recovery_run=args.filled_horizon_source_key_recovery_run,
+            maker_taker_recovery_run=args.maker_taker_recovery_run,
             output_root=args.output_root,
             run_id=args.run_id,
             timestamp_ns=args.timestamp_ns,

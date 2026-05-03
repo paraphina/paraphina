@@ -525,3 +525,72 @@ not infer role from quote intent, post-only flags, or strategy purpose. Rerun
 5.1h/5.1i after any evidence recovery and preserve sparse-bucket and
 observed-only selection-bias holds.
 ```
+
+## Phase 5.1n Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live evidence-completeness step:
+venue-native maker/taker recovery where native trade/fill role sources exist,
+plus future event-time native-limit instrumentation that includes sendTx/REST
+pressure instead of active-order snapshots alone.
+
+Rationale:
+
+- Phase 5.1n added repo-owned event-time alignment for Lighter account snapshot
+  logs. This upgrades the forensic record from current/doc-only capacity
+  context to historical active-order context where snapshots align to label
+  event time.
+- The 025435 lane aligned `1728 / 2194` Lighter rows to event-time active-order
+  snapshots and marked `466` as stale. The 073231 lane aligned `3700 / 3954`
+  Lighter rows and marked `254` as stale.
+- The gate deliberately keeps `native_limit_observed_count: 0` because sendTx
+  and REST pressure were not historically observed. Active-order snapshots
+  alone do not clear the full native-limit-pressure feature requirement.
+- Phase 5.1n also added an all-venue maker/taker recovery gate. It preserved
+  `174` already-observed filled rows and classified the remaining `287` filled
+  rows as `MISSING_VENUE_NATIVE_ROLE_SOURCE`; no role was inferred from
+  post-only flags, order intent, strategy purpose, or fee schedule.
+- The recovered 5.1h -> 5.1i chain remains `HOLD` with the same four blockers:
+  native-limit pressure incomplete, maker/taker incomplete, sparse buckets, and
+  observed-only selection bias.
+
+Current evidence boundary:
+
+```text
+Phase 5.1n - Event-time Lighter native-limit alignment
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-TIME-ALIGNMENT-TERMINAL-STALE-7200S-20260429T025435Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-TIME-ALIGNMENT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z
+gate_status: HOLD
+native_limit_all_pressure_dimensions_observed_count: 0
+raw_identifier_redaction_status: PASS
+
+Phase 5.1n - Maker/taker attribution recovery
+runs/phase51n_maker_taker_attribution_recovery/PHASE51N-MAKER-TAKER-ATTRIBUTION-RECOVERY-OBSERVED-ONLY-TWO-LANE-20260503T000000Z
+gate_status: HOLD
+maker_taker_observed_or_recovered_count: 174
+maker_taker_partial_or_missing_count: 287
+raw_identifier_redaction_status: PASS
+
+Phase 5.1n - Recovered P-fill feature-matrix admissibility
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51N-PFILL-FEATURE-MATRIX-ADMISSIBILITY-EVENT-TIME-NATIVE-LIMIT-TWO-LANE-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+maker_taker_observed_count: 174
+maker_taker_partial_or_unknown_count: 222
+maker_taker_missing_count: 65
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Do not start live/canary/model-training/EV-admission work. Continue with
+venue-native maker/taker role capture/backfill for all five venues where source
+retention allows it, and add forward-looking event-time native-limit telemetry
+for sendTx/REST pressure. Rerun 5.1h/5.1i after any recovery; keep sparse
+bucket and observed-only selection-bias holds until separately solved.
+```

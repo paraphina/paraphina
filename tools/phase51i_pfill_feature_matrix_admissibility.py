@@ -89,6 +89,14 @@ HORIZON_RECOVERY_BUCKET_KEYS = (
     "filled_horizon_source_key_unrecovered_count",
 )
 
+PHASE51N_SUMMARY_KEYS = (
+    "maker_taker_recovery_run",
+    "maker_taker_recovery_summary_sha256",
+    "maker_taker_recovery_labels_sha256",
+    "maker_taker_recovery_status_counts",
+    "maker_taker_recovery_source_counts",
+)
+
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -501,6 +509,11 @@ def build_matrix_admissibility(
         **{
             key: input_summary.get(key)
             for key in HORIZON_RECOVERY_SUMMARY_KEYS
+            if key in input_summary
+        },
+        **{
+            key: input_summary.get(key)
+            for key in PHASE51N_SUMMARY_KEYS
             if key in input_summary
         },
         "input_summary_hash": _stable_hash(input_summary),

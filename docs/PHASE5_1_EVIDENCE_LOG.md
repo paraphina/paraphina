@@ -144,6 +144,85 @@ to label historical Phase 5 rows as event-time native-limit pressure observed.
 The next non-live gate is event-time native-limit pressure and venue-native
 maker/taker completion across all filled venues.
 
+## Phase 5.1n - Event-Time Native-Limit and Maker/Taker Evidence Gate
+
+Date: 2026-05-03
+
+Purpose: align Lighter historical account snapshot logs to Phase 5 label event
+times, add a repo-owned all-venue maker/taker attribution recovery gate, and
+rerun 5.1h/5.1i without inferring native-limit pressure or maker/taker role.
+
+Evidence packs:
+
+```text
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-TIME-ALIGNMENT-TERMINAL-STALE-7200S-20260429T025435Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-TIME-ALIGNMENT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z
+runs/phase51n_maker_taker_attribution_recovery/PHASE51N-MAKER-TAKER-ATTRIBUTION-RECOVERY-OBSERVED-ONLY-TWO-LANE-20260503T000000Z
+runs/phase51c_queue_churn/PHASE51N-QUEUE-CHURN-EVENT-TIME-NATIVE-LIMIT-TERMINAL-STALE-7200S-20260429T025435Z
+runs/phase51c_queue_churn/PHASE51N-QUEUE-CHURN-EVENT-TIME-NATIVE-LIMIT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z
+runs/phase51h_observed_pfill_feature_audit/PHASE51N-OBSERVED-PFILL-FEATURE-AUDIT-EVENT-TIME-NATIVE-LIMIT-TWO-LANE-20260503T000000Z
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51N-PFILL-FEATURE-MATRIX-ADMISSIBILITY-EVENT-TIME-NATIVE-LIMIT-TWO-LANE-20260503T000000Z
+```
+
+Result:
+
+```text
+matrix_admissibility_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+matrix_blocker_count: 4
+matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+
+label_count: 4527
+filled_count: 461
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+native_limit_unknown_count: 0
+maker_taker_observed_count: 174
+maker_taker_partial_or_unknown_count: 222
+maker_taker_missing_count: 65
+raw_identifier_redaction_status: PASS
+```
+
+Phase 5.1n native-limit detail:
+
+```text
+025435 lane:
+- lighter labels: 2194
+- event-time aligned active-order snapshots: 1728
+- stale Lighter snapshots: 466
+- all pressure dimensions observed: 0
+
+073231 lane:
+- lighter labels: 3954
+- event-time aligned active-order snapshots: 3700
+- stale Lighter snapshots: 254
+- all pressure dimensions observed: 0
+
+Known limitation:
+- lighter_sendtx_remaining_not_observed
+- lighter_rest_request_remaining_not_observed
+```
+
+Phase 5.1n maker/taker detail:
+
+```text
+filled rows: 461
+input role counts already complete: 174
+missing venue-native role source: 287
+native role evidence supplied for recovery: 0
+```
+
+Interpretation: Phase 5.1n improves the forensic boundary but does not clear
+the matrix. Historical Lighter active-order pressure is now partially
+event-time aligned, but sendTx/REST pressure was not captured historically.
+The all-venue maker/taker gate confirms that the remaining `287` filled rows
+need venue-native fill/trade role evidence; quote intent, post-only behavior,
+strategy purpose, and fee expectations remain inadmissible as role inference.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:

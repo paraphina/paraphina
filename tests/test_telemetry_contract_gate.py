@@ -682,6 +682,16 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1l filled-horizon source-key recovery gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51l_filled_horizon_source_key_recovery.py"
+
+    def _get_phase51n_lighter_native_limit_time_alignment_path(self) -> Path:
+        """Get path to the Phase 5.1n Lighter native-limit time-alignment gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51n_lighter_native_limit_time_alignment.py"
+
+    def _get_phase51n_maker_taker_attribution_recovery_path(self) -> Path:
+        """Get path to the Phase 5.1n maker/taker attribution recovery gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51n_maker_taker_attribution_recovery.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -6022,6 +6032,286 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(unsafe.returncode, 2)
             self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
+
+    def test_phase51n_lighter_native_limit_alignment_feeds_queue_churn_without_false_clearance(self):
+        """Event-time Lighter snapshots should not clear sendTx/REST-native pressure by inference."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            source_path = tmp_path / "telemetry.jsonl"
+            snapshot_log = tmp_path / "paraphina_live.err.segment"
+            pfill_run = tmp_path / "pfill_outcome"
+            label_lake_run = tmp_path / "label_lake"
+            native_run = tmp_path / "phase51b_native"
+            alignment_root = tmp_path / "phase51n_alignment"
+            queue_root = tmp_path / "queue_churn"
+            pfill_run.mkdir()
+            label_lake_run.mkdir()
+            native_run.mkdir()
+            source_path.write_text(
+                json.dumps({"schema_version": 1, "t": 10, "kf_last_update_ms": 1700000000000}) + "\n",
+                encoding="utf-8",
+            )
+            source_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            snapshot_log.write_text(
+                "INFO: Lighter account snapshot seq=1700000000000 ts=1700000000100 "
+                "positions=flat collateral_usd=1 available_usd=1 total_order_count=4 pending_order_count=0\n",
+                encoding="utf-8",
+            )
+            (native_run / "phase51b_acceptance.json").write_text(json.dumps({
+                "run_id": "phase51b_native_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "approved_for_calibration_label_ingestion": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "approved_for_financial_claim": False,
+                "limitations": ["lighter_sendtx_remaining_not_observed"],
+            }), encoding="utf-8")
+            with (native_run / "telemetry.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACCOUNT_LIMITS",
+                    "run_id": "phase51b_native_test",
+                    "venue_id": "lighter",
+                    "sendtx_per_minute_remaining": None,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACTIVE_ORDERS",
+                    "run_id": "phase51b_native_test",
+                    "venue_id": "lighter",
+                    "active_orders_count_total": 0,
+                    "active_order_headroom_account": 1500,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+            (pfill_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "pfill_phase51n_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            pfill_label = {
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "run_id": "pfill_phase51n_test",
+                "order_key": "order-key-lighter",
+                "order_holdout_split": "TRAIN",
+                "order_label_seq": 1,
+                "order_source_line": 1,
+                "order_source_t": 10,
+                "order_source_order_index": 0,
+                "order_id_hash": "order-hash",
+                "client_order_id_hash": "client-hash",
+                "venue_id": "lighter",
+                "side": "Buy",
+                "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                "p_fill_outcome": 0.0,
+                "fill_count": 0,
+                "filled_size_total": None,
+                "terminal_action_first": "cancel",
+                "terminal_event_count": 1,
+                "observed_horizon_source_ticks": 2,
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps(pfill_label) + "\n")
+
+            alignment_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51n_lighter_native_limit_time_alignment_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--source-telemetry",
+                    str(source_path),
+                    "--lighter-snapshot-log",
+                    str(snapshot_log),
+                    "--phase51b-native-run",
+                    str(native_run),
+                    "--output-root",
+                    str(alignment_root),
+                    "--run-id",
+                    "phase51n_alignment_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(alignment_result.returncode, 0, f"stdout: {alignment_result.stdout}\nstderr: {alignment_result.stderr}")
+            alignment_dir = alignment_root / "phase51n_alignment_test"
+            alignment_summary = json.loads(
+                (alignment_dir / "lighter_native_limit_time_alignment_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(alignment_summary["native_limit_event_time_aligned_count"], 1)
+            self.assertEqual(alignment_summary["native_limit_all_pressure_dimensions_observed_count"], 0)
+            alignment_label = json.loads(
+                (alignment_dir / "lighter_native_limit_time_alignment_labels.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(alignment_label["native_limit_time_alignment_status"], "EVENT_TIME_ALIGNED")
+            self.assertEqual(alignment_label["native_active_order_headroom_account"], 1496)
+            self.assertFalse(alignment_label["native_limit_all_pressure_dimensions_observed"])
+
+            (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
+                "run_id": "label_lake_phase51n_test",
+                "source_telemetry_sha256": source_sha,
+                "order_lifecycle_labels": 1,
+            }), encoding="utf-8")
+            with (label_lake_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "label_type": "ORDER_LIFECYCLE_LABEL",
+                    "label_seq": 1,
+                    "action": "cancel",
+                    "source_t": 12,
+                    "source_line": 12,
+                    "source_order_index": 0,
+                    "order_id_hash": "order-hash",
+                    "client_order_id_hash": "client-hash",
+                    "venue_id": "lighter",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n")
+            queue_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_queue_churn_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(queue_root),
+                    "--run-id",
+                    "phase51n_queue_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--lighter-native-limits-run",
+                    str(native_run),
+                    "--lighter-native-limit-alignment-run",
+                    str(alignment_dir),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(queue_result.returncode, 0, f"stdout: {queue_result.stdout}\nstderr: {queue_result.stderr}")
+            queue_dir = queue_root / "phase51n_queue_test"
+            queue_summary = json.loads((queue_dir / "queue_churn_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(queue_summary["native_limit_pressure_partial_count"], 1)
+            self.assertEqual(queue_summary["native_limit_pressure_observed_count"], 0)
+            queue_label = json.loads((queue_dir / "queue_churn_labels.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(
+                queue_label["native_limit_pressure_status"],
+                "PARTIAL_NATIVE_HEADROOM_EVENT_TIME_ALIGNED_LIMITS_INCOMPLETE",
+            )
+            self.assertEqual(queue_label["native_limit_alignment_source"], "phase51n_lighter_native_limit_time_alignment")
+
+    def test_phase51n_maker_taker_recovery_uses_only_venue_native_evidence(self):
+        """Maker/taker recovery should recover only from explicit venue-native role evidence."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            output_root = tmp_path / "maker_taker_recovery"
+            native_roles = tmp_path / "native_roles.jsonl"
+            observed_run.mkdir()
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51n_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 3,
+                "censored_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-1",
+                    "order_key": "order-1",
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "hyperliquid",
+                    "side": "Buy",
+                    "fill_count": 1,
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-2",
+                    "order_key": "order-2",
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "aster",
+                    "side": "Sell",
+                    "fill_count": 1,
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "maker_taker_role_counts": {"MAKER": 1, "TAKER": 0, "UNKNOWN": 0},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "group-3",
+                    "order_key": "order-3",
+                    "source_telemetry_sha256": "source-sha",
+                    "venue_id": "paradex",
+                    "side": "Buy",
+                    "fill_count": 0,
+                    "outcome_status": "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL",
+                    "p_fill_outcome": 0.0,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 0},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with (observed_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+            native_roles.write_text(json.dumps({
+                "canonical_group_id": "group-1",
+                "maker_taker_role_counts": {"MAKER": 0, "TAKER": 1, "UNKNOWN": 0},
+                "maker_taker_attribution_source": "HYPERLIQUID_CROSSED",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51n_maker_taker_attribution_recovery_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--native-role-jsonl",
+                    str(native_roles),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51n_maker_taker_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51n_maker_taker_test"
+            summary = json.loads((run_dir / "maker_taker_attribution_recovery_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["maker_taker_observed_or_recovered_count"], 2)
+            self.assertEqual(summary["maker_taker_partial_or_missing_count"], 0)
+            recovery_labels = [
+                json.loads(line)
+                for line in (run_dir / "maker_taker_attribution_recovery_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            by_group = {label["canonical_group_id"]: label for label in recovery_labels}
+            self.assertEqual(by_group["group-1"]["maker_taker_recovery_status"], "RECOVERED_VENUE_NATIVE_ROLE")
+            self.assertEqual(by_group["group-1"]["maker_taker_attribution_source"], "HYPERLIQUID_CROSSED")
+            self.assertEqual(by_group["group-2"]["maker_taker_recovery_status"], "OBSERVED_PRESERVED")
+            self.assertEqual(by_group["group-3"]["maker_taker_recovery_status"], "NO_FILL_NOT_APPLICABLE")
     
     def test_invalid_file_exit_1(self):
         """File with contract violation should exit with code 1."""
