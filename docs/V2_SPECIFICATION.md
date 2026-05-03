@@ -17,7 +17,7 @@ Primary source addenda:
 Current repo evidence boundary:
 
 - Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
-- Current Phase 5.1 evidence boundary: Phase 5.1k filled-horizon timebase
+- Current Phase 5.1 evidence boundary: Phase 5.1l filled-horizon source-key
   recovery and recovered feature-matrix admissibility
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
@@ -423,7 +423,7 @@ the first V2 evidence lane must prove one venue-local telemetry and lifecycle
 contract before generalizing.
 
 V2 strategic scope remains all five current venues: Aster, Extended,
-Hyperliquid, Paradex, and Lighter. Phase 5.1k is a Lighter-first,
+Hyperliquid, Paradex, and Lighter. Phase 5.1 remains a Lighter-first,
 venue-local non-live evidence lane selected to prove the telemetry,
 lifecycle, and evidence contract before generalizing. It does not narrow V2 to
 Lighter, does not authorize multi-venue launch, and does not prove non-Lighter
@@ -484,17 +484,20 @@ admission:
 
 ## 14. Current Phase 5.1 Blockers
 
-As of Phase 5.1k, the V2 evidence path remains blocked by:
+As of Phase 5.1l, the V2 evidence path remains blocked by:
 
-- `65` filled-order rows still missing source-tick horizon joins after 5.1k
-  recovered `396 / 461` filled-order source-tick horizons;
 - Lighter native-limit context still partial for `2288` labels;
 - maker/taker status incomplete for `287` fills;
 - sparse venue/side/layer/regime buckets;
 - observed-only selection bias from `1613` excluded quarantine/review groups.
 
-The next repo-owned V2 evidence move is to resolve or explicitly quarantine the
-remaining `65` missing filled-horizon joins, plus read-only Lighter native-limit
-and maker/taker evidence enrichment. No model training, EV admission, canary,
-live orders, capital escalation, risk-limit relaxation, or financial claim is
-authorized from Phase 5.1k.
+Phase 5.1l resolved the previous filled-horizon blocker by recovering the
+remaining `65 / 65` source-tick horizons: `43` via source P-fill horizon
+evidence and `22` via hashed observed-fill fallback. The recovered matrix now
+reports `4527 / 4527` observed horizons available and `0` missing horizons.
+
+The next repo-owned V2 evidence move is read-only Lighter native-limit and
+maker/taker evidence enrichment, followed by another recovered 5.1h/5.1i
+matrix run. No model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, or financial claim is authorized from
+Phase 5.1l.

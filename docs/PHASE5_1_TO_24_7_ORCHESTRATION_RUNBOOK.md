@@ -34,24 +34,23 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1k as the current evidence boundary. It proves filled-order
-   source-tick horizon recovery can be applied without raw fill/order ID
-   emission and that the recovered feature-matrix gate still fails closed.
-3. The current Phase 5.1k recovered matrix pack remains `HOLD`: `4527`
+2. Treat Phase 5.1l as the current evidence boundary. It proves the remaining
+   filled-order source-tick horizon gap can be closed with source keys and
+   hashed observed-fill fallback without raw fill/order ID emission, and that
+   the recovered feature-matrix gate still fails closed.
+3. The current Phase 5.1l recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
-   `4462` observed horizons available, `65` observed horizons still missing,
+   `4527` observed horizons available, `0` observed horizons still missing,
    all `4527` joined to queue/churn, all `4527` source-covered by markout
    readiness, and raw identifier redaction status `PASS`.
 4. The dominant blockers are feature quality and selection bias, not live
-   runtime reachability: `65` filled-order labels still lack deterministic
-   source-tick joins, Lighter native-limit context is only partial for `2288`
+   runtime reachability: Lighter native-limit context is only partial for `2288`
    labels, filled-order maker/taker status is incomplete for `287` labels,
    some venue/side buckets remain sparse, and `1613` quarantined/review groups
    remain excluded from the observed-only diagnostic pack.
-5. Next repo-owned move is another non-live evidence step: resolve or
-   explicitly quarantine the remaining `65` filled-horizon join misses and
-   improve venue-native Lighter limit/maker-taker completeness. Do not train
-   models from 5.1k.
+5. Next repo-owned move is another non-live evidence step: improve venue-native
+   Lighter limit/maker-taker completeness while preserving sparse-bucket and
+   selection-bias holds. Do not train models from 5.1l.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
@@ -610,6 +609,56 @@ ea85005b6ce7e19f6db889486b5e91e5f8c207b2e2443f08415eef9e44944909  recovered pfil
 c6971841da4ca84291aa8a320214dde1d0a945ddf5a76a2b1ad1a04da792fa6f  recovered pfill_feature_matrix_blockers.jsonl
 ```
 
+### Gate 5.1l - Filled-Horizon Source-Key Recovery
+
+Current repo-owned tooling:
+
+- `tools/phase51l_filled_horizon_source_key_recovery.py` consumes the 5.1k
+  filled-horizon recovery pack, canonical P-fill labels, source P-fill labels,
+  and observed fill-label packs. It emits HOLD-only recovery labels, bucket
+  records, and a summary.
+- The tool targets the remaining filled-order `MISSING_JOIN` rows after 5.1k.
+  It first reconstructs canonical source-tick horizons from source P-fill
+  `observed_horizon_source_ticks`; if unavailable, it falls back to hashed
+  order/client identifiers against observed fill labels.
+- The tool never emits raw fill IDs, order IDs, client order IDs, venue order
+  IDs, or decision IDs. Raw upstream identifiers are not used as output fields.
+
+Current 5.1l evidence:
+
+- Filled-horizon source-key recovery run:
+  `runs/phase51l_filled_horizon_source_key_recovery/PHASE51L-FILLED-HORIZON-SOURCE-KEY-RECOVERY-TWO-LANE-20260502T000000Z`
+- Recovered 5.1h run:
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51L-RECOVERED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Recovered 5.1i run:
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51L-PFILL-FEATURE-MATRIX-ADMISSIBILITY-TWO-LANE-20260502T000000Z`
+- 5.1l recovery gate remains `HOLD` with reason
+  `phase51l_filled_horizon_source_key_complete_nonlive_hold`.
+- Recovered matrix remains `HOLD` with reason
+  `phase51i_lighter_native_limit_pressure_not_fully_observed`.
+- Redaction status: `PASS`; raw identifier input present: `0`.
+- Remaining filled-horizon missing joins recovered: `65 / 65`.
+- Recovery path split: `43` source P-fill horizon, `22` observed-fill hash.
+- Recovered observed horizon available/missing: `4527` / `0`.
+- Matrix blockers remain: `lighter_native_limit_pressure_not_fully_observed`,
+  `maker_taker_not_fully_observed_for_filled_orders`,
+  `sparse_pfill_feature_buckets`, and
+  `observed_only_selection_bias_not_resolved`.
+
+5.1l artifacts:
+
+```text
+d355a58043cb285454a2005725274f6c34ea9fdb19d1a906220b34f41b862790  filled_horizon_source_key_recovery_summary.json
+ea0eb037d67a8ce2e36667e3e835331c48a778f0bd200af9826ae2dd2a0106b7  filled_horizon_source_key_recovery_buckets.jsonl
+c2befefc86a808bee7674ccd021b5a608d4529dd7489cd3b3878e47899385607  filled_horizon_source_key_recovery_labels.jsonl
+e68990f39d1c0d08a4601d2a344ed782b43ae492b24c04dabad76e82a3a014e2  recovered pfill_feature_audit_summary.json
+ffb3574e7effe35e1550f1273f3e99cb636b1928393e5d579901e9b43bebc8a2  recovered pfill_feature_bucket_readiness.jsonl
+a95e0d7e9e8f6c815821c790f72fe3b56fd6384bbd888bad695b71cfc7a1f993  recovered pfill_feature_coverage_labels.jsonl
+4b087d1e44d4af778d5be7fb21c0dbdbbf9cb1f63c9f97b0d4168aa1241794b4  recovered pfill_feature_matrix_admissibility_summary.json
+95ca05d6e4f160c9564847c1da427fc761298b2099429e5a445dc4ed0bd7091c  recovered pfill_feature_matrix_buckets.jsonl
+f9a7feeacffbe66498f03086e3036e73b146cbfc9f62038e638df50825dc97df  recovered pfill_feature_matrix_blockers.jsonl
+```
+
 ### Gate 5.2 - Calibrated EV Shadow
 
 Required evidence:
@@ -736,7 +785,7 @@ The audit must answer:
 4. Read this document.
 5. Read `ROADMAP.md` Phase 5.1 / V2 target specification gate.
 6. Read `docs/V2_SPECIFICATION.md` current evidence boundary and blockers.
-7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1k board decision.
+7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1l board decision.
 8. Confirm runtime is still shadow before any evidence capture:
 
 ```bash
@@ -749,14 +798,12 @@ curl -fsS http://127.0.0.1:9898/health/detail
 
 ## Next Command Targets
 
-After Phase 5.1k is committed and pushed, the next target is not another live
-run. Audit the remaining `65` filled-order `MISSING_JOIN` rows and either
-recover deterministic source-tick joins or explicitly quarantine them from
-calibration. In parallel, continue read-only Lighter native-limit and
-maker/taker evidence enrichment. The acceptance condition is another measurable
-reduction or principled quarantine of blocker counts without introducing raw
-identifiers, live/canary/capital/risk authorization, or selection-bias
-shortcuts.
+After Phase 5.1l is committed and pushed, the next target is not another live
+run. Continue read-only Lighter native-limit and maker/taker evidence
+enrichment, then rerun the recovered 5.1h/5.1i matrix. The acceptance condition
+is another measurable reduction of blocker counts without introducing raw
+identifiers, live/canary/capital/risk authorization, model-training shortcuts,
+or selection-bias shortcuts.
 
 ## Current Verdict
 

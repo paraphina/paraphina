@@ -677,6 +677,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the Phase 5.1k filled-horizon timebase recovery gate."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51k_filled_horizon_timebase_recovery.py"
+
+    def _get_phase51l_filled_horizon_source_key_recovery_path(self) -> Path:
+        """Get path to the Phase 5.1l filled-horizon source-key recovery gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51l_filled_horizon_source_key_recovery.py"
     
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
@@ -4627,6 +4632,272 @@ class TestValidatorSubprocess(unittest.TestCase):
                 artifact = run_dir / file_info["path"]
                 self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
 
+    def test_phase51l_filled_horizon_source_key_recovery_recovers_source_and_hash_paths_hold_only(self):
+        """Source-key recovery should recover 5.1k MISSING_JOIN rows without raw identifiers."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            phase51k_run = tmp_path / "phase51k"
+            canonical_run = tmp_path / "canonical"
+            source_pfill_run = tmp_path / "source_pfill"
+            observed_run = tmp_path / "observed_labels"
+            output_root = tmp_path / "phase51l"
+            for path in [phase51k_run, canonical_run, source_pfill_run, observed_run]:
+                path.mkdir()
+            source_sha = "source-sha-phase51l"
+            baseline = "18dd09512288a85e440d3977e32432c3aabc1190"
+            group_source = f"{source_sha}:order_label_seq:101"
+            group_hash = f"{source_sha}:order_label_seq:201"
+            group_existing = f"{source_sha}:order_label_seq:301"
+            group_not_filled = f"{source_sha}:order_label_seq:401"
+
+            (phase51k_run / "filled_horizon_timebase_recovery_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "phase51k_recovery",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "phase51k_filled_horizon_timebase_partial",
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "no_live_flag": True,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "raw_identifier_redaction_status": "PASS",
+                "label_count": 4,
+            }), encoding="utf-8")
+            phase51k_rows = [
+                (1, group_source, "canonical-source", "OBSERVED_FILLED", 1.0, "MISSING_JOIN", None, 10, "aster"),
+                (2, group_hash, "canonical-hash", "OBSERVED_FILLED", 1.0, "MISSING_JOIN", None, 20, "paradex"),
+                (3, group_existing, "canonical-existing", "OBSERVED_FILLED", 1.0, "PRESERVED_EXISTING_SOURCE_TICKS", 2, 30, "extended"),
+                (4, group_not_filled, "canonical-not-filled", "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL", 0.0, "PRESERVED_EXISTING_SOURCE_TICKS", 3, 40, "aster"),
+            ]
+            with (phase51k_run / "filled_horizon_timebase_recovery_labels.jsonl").open("w", encoding="utf-8") as f:
+                for seq, group_id, order_key, outcome, pfill, status, effective, order_source_t, venue in phase51k_rows:
+                    f.write(json.dumps({
+                        "schema_version": 1,
+                        "label_type": "PHASE51K_FILLED_HORIZON_TIMEBASE_RECOVERY_LABEL",
+                        "label_seq": seq,
+                        "run_id": "phase51k_recovery",
+                        "baseline_commit": baseline,
+                        "gate_status": "HOLD",
+                        "approved_for_model_training": False,
+                        "approved_for_live": False,
+                        "approved_for_canary": False,
+                        "approved_for_capital_escalation": False,
+                        "admissible_for_financial_claim": False,
+                        "admissible_for_ev_admission": False,
+                        "no_live_flag": True,
+                        "live_orders_allowed": False,
+                        "capital_change_allowed": False,
+                        "risk_limit_relaxation_allowed": False,
+                        "raw_identifier_redaction_status": "PASS",
+                        "canonical_group_id": group_id,
+                        "canonical_order_key": order_key,
+                        "source_telemetry_sha256": source_sha,
+                        "venue_id": venue,
+                        "side": "BID",
+                        "order_holdout_split": "TRAIN",
+                        "outcome_status": outcome,
+                        "p_fill_outcome": pfill,
+                        "fill_count": 1 if pfill == 1.0 else 0,
+                        "order_source_t": order_source_t,
+                        "recovery_status": status,
+                        "recovery_timebase": "SOURCE_TICKS" if effective is not None else "NONE",
+                        "effective_observed_horizon_source_ticks": effective,
+                    }) + "\n")
+
+            (canonical_run / "canonical_pfill_outcome_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "canonical",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "order_label_count": 4,
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            canonical_rows = [
+                (101, group_source, "canonical-source", 10, ["source-key-a"], None, None, "aster"),
+                (201, group_hash, "canonical-hash", 20, ["source-key-b"], None, None, "paradex"),
+                (301, group_existing, "canonical-existing", 30, ["source-key-c"], None, None, "extended"),
+                (401, group_not_filled, "canonical-not-filled", 40, ["source-key-d"], None, None, "aster"),
+            ]
+            with (canonical_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for seq, group_id, order_key, order_source_t, source_keys, order_hash, client_hash, venue in canonical_rows:
+                    f.write(json.dumps({
+                        "schema_version": 1,
+                        "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                        "label_seq": seq,
+                        "run_id": "canonical",
+                        "baseline_commit": baseline,
+                        "canonical_group_id": group_id,
+                        "order_key": order_key,
+                        "source_telemetry_sha256": source_sha,
+                        "venue_id": venue,
+                        "order_source_t": order_source_t,
+                        "source_order_keys": source_keys,
+                        "order_id_hash": order_hash,
+                        "client_order_id_hash": client_hash,
+                        "approved_for_model_training": False,
+                        "approved_for_live": False,
+                        "approved_for_canary": False,
+                        "admissible_for_ev_admission": False,
+                    }) + "\n")
+
+            (source_pfill_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "source_pfill",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "pfill_outcome_sparse_observed_fills",
+                "source_telemetry_sha256": source_sha,
+                "order_label_count": 2,
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            raw_decision_id = "raw-decision-id-must-not-emit-phase51l"
+            source_labels = [
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 1,
+                    "run_id": "source_pfill",
+                    "baseline_commit": baseline,
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "source-key-a",
+                    "venue_id": "aster",
+                    "side": "Buy",
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "fill_count": 1,
+                    "order_source_t": 12,
+                    "observed_horizon_source_ticks": 3,
+                    "decision_id": raw_decision_id,
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "admissible_for_ev_admission": False,
+                },
+                {
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": 2,
+                    "run_id": "source_pfill",
+                    "baseline_commit": baseline,
+                    "source_telemetry_sha256": source_sha,
+                    "order_key": "source-key-b",
+                    "venue_id": "paradex",
+                    "side": "Buy",
+                    "outcome_status": "OBSERVED_FILLED",
+                    "p_fill_outcome": 1.0,
+                    "fill_count": 1,
+                    "order_source_t": 21,
+                    "observed_horizon_source_ticks": None,
+                    "order_id_hash": "hash-order-b",
+                    "client_order_id_hash": "hash-client-b",
+                    "decision_id": "raw-decision-id-must-not-emit-hash",
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "admissible_for_ev_admission": False,
+                },
+            ]
+            with (source_pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in source_labels:
+                    f.write(json.dumps(label) + "\n")
+
+            (observed_run / "observed_label_summary.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_id": "observed_labels",
+                "baseline_commit": baseline,
+                "gate_status": "HOLD",
+                "gate_reason": "observed_label_pack_partial_maker_taker_attribution",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_model_training": False,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "admissible_for_ev_admission": False,
+            }), encoding="utf-8")
+            raw_fill_id = "raw-fill-id-must-not-emit-phase51l"
+            with (observed_run / "labels.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "schema_version": 1,
+                    "label_type": "OBSERVED_FILL_LABEL",
+                    "label_seq": 1,
+                    "run_id": "observed_labels",
+                    "baseline_commit": baseline,
+                    "venue_id": "paradex",
+                    "order_id_hash": "hash-order-b",
+                    "client_order_id_hash": "hash-client-b",
+                    "fill_id": raw_fill_id,
+                    "decision_id": "raw-observed-decision-must-not-emit",
+                    "source_t": 26,
+                    "approved_for_model_training": False,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "admissible_for_ev_admission": False,
+                }) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51l_filled_horizon_source_key_recovery_path()),
+                    "--phase51k-recovery-run",
+                    str(phase51k_run),
+                    "--canonical-pfill-run",
+                    str(canonical_run),
+                    "--source-pfill-run",
+                    str(source_pfill_run),
+                    "--observed-label-run",
+                    str(observed_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51l_recovery_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51l_recovery_test"
+            summary = json.loads((run_dir / "filled_horizon_source_key_recovery_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["raw_identifier_redaction_status"], "PASS")
+            self.assertEqual(summary["target_missing_join_count"], 2)
+            self.assertEqual(summary["source_pfill_horizon_recovered_count"], 1)
+            self.assertEqual(summary["observed_fill_hash_recovered_count"], 1)
+            self.assertEqual(summary["recovered_source_tick_count"], 2)
+            self.assertEqual(summary["still_missing_filled_horizon_count"], 0)
+            self.assertEqual(summary["gate_reason"], "phase51l_filled_horizon_source_key_complete_nonlive_hold")
+
+            output_text = (run_dir / "filled_horizon_source_key_recovery_labels.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn(raw_decision_id, output_text)
+            self.assertNotIn(raw_fill_id, output_text)
+            self.assertNotIn("decision_id", output_text)
+            self.assertNotIn("fill_id", output_text)
+            labels = [json.loads(line) for line in output_text.splitlines() if line.strip()]
+            by_group = {label["canonical_group_id"]: label for label in labels}
+            self.assertEqual(by_group[group_source]["recovery_status"], "RECOVERED_FROM_SOURCE_PFILL_HORIZON")
+            self.assertEqual(by_group[group_source]["effective_observed_horizon_source_ticks"], 5)
+            self.assertEqual(by_group[group_hash]["recovery_status"], "RECOVERED_FROM_OBSERVED_FILL_HASH")
+            self.assertEqual(by_group[group_hash]["effective_observed_horizon_source_ticks"], 6)
+            self.assertEqual(by_group[group_existing]["recovery_status"], "PRESERVED_EXISTING_SOURCE_TICKS")
+            self.assertEqual(by_group[group_not_filled]["recovery_status"], "PRESERVED_EXISTING_SOURCE_TICKS")
+
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            for file_info in manifest["files"]:
+                artifact = run_dir / file_info["path"]
+                self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), file_info["sha256"])
+
     def test_phase51i_pfill_feature_matrix_admissibility_holds_redacted_matrix(self):
         """Feature-matrix admissibility should require redacted input and remain HOLD-only."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4698,6 +4969,16 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "filled_horizon_recovered_source_tick_count": 0,
                 "filled_horizon_exchange_ms_only_count": 0,
                 "filled_horizon_unrecovered_count": 1,
+                "filled_horizon_source_key_recovery_run": "/tmp/phase51l_recovery",
+                "filled_horizon_source_key_recovery_status_counts": {
+                    "NO_OBSERVED_FILL_HASH_MATCH": 1,
+                    "PRESERVED_EXISTING_SOURCE_TICKS": 1,
+                },
+                "filled_horizon_source_key_recovery_applied_count": 0,
+                "filled_horizon_source_key_recovered_source_tick_count": 0,
+                "filled_horizon_source_key_pfill_horizon_recovered_count": 0,
+                "filled_horizon_source_key_observed_hash_recovered_count": 0,
+                "filled_horizon_source_key_unrecovered_count": 1,
                 "missing_feature_total": 3,
             }
             (feature_run / "pfill_feature_audit_summary.json").write_text(json.dumps(summary), encoding="utf-8")
@@ -4761,6 +5042,7 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "gate_status": "HOLD",
                     "gate_reasons": [
                         "missing_observed_horizon_features",
+                        "filled_horizon_source_key_still_missing",
                         "filled_horizon_source_tick_still_missing",
                         "lighter_native_limit_pressure_not_fully_observed",
                         "maker_taker_not_fully_observed_for_filled_orders",
@@ -4806,6 +5088,11 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "filled_horizon_recovered_source_tick_count": 0,
                     "filled_horizon_exchange_ms_only_count": 0,
                     "filled_horizon_unrecovered_count": 1,
+                    "filled_horizon_source_key_recovery_applied_count": 0,
+                    "filled_horizon_source_key_recovered_source_tick_count": 0,
+                    "filled_horizon_source_key_pfill_horizon_recovered_count": 0,
+                    "filled_horizon_source_key_observed_hash_recovered_count": 0,
+                    "filled_horizon_source_key_unrecovered_count": 1,
                     "missing_feature_total": 3,
                 },
                 {
@@ -4860,6 +5147,11 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "filled_horizon_recovered_source_tick_count": 0,
                     "filled_horizon_exchange_ms_only_count": 0,
                     "filled_horizon_unrecovered_count": 0,
+                    "filled_horizon_source_key_recovery_applied_count": 0,
+                    "filled_horizon_source_key_recovered_source_tick_count": 0,
+                    "filled_horizon_source_key_pfill_horizon_recovered_count": 0,
+                    "filled_horizon_source_key_observed_hash_recovered_count": 0,
+                    "filled_horizon_source_key_unrecovered_count": 0,
                     "missing_feature_total": 0,
                 },
             ]
@@ -4890,10 +5182,12 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(matrix_summary["raw_identifier_redaction_status"], "PASS")
             self.assertEqual(matrix_summary["label_count"], 2)
             self.assertEqual(matrix_summary["observed_horizon_missing_count"], 1)
-            self.assertEqual(matrix_summary["gate_reason"], "phase51i_filled_horizon_source_tick_still_missing")
+            self.assertEqual(matrix_summary["gate_reason"], "phase51i_filled_horizon_source_key_still_missing")
             self.assertEqual(matrix_summary["horizon_recovery_applied_count"], 1)
             self.assertEqual(matrix_summary["horizon_recovered_terminal_count"], 1)
             self.assertEqual(matrix_summary["filled_horizon_unrecovered_count"], 1)
+            self.assertEqual(matrix_summary["filled_horizon_source_key_unrecovered_count"], 1)
+            self.assertIn("filled_horizon_source_key_still_missing", matrix_summary["matrix_blocker_ids"])
             self.assertIn("filled_horizon_source_tick_still_missing", matrix_summary["matrix_blocker_ids"])
             self.assertIn("missing_observed_horizon_features", matrix_summary["matrix_blocker_ids"])
             self.assertIn("observed_only_selection_bias_not_resolved", matrix_summary["matrix_blocker_ids"])

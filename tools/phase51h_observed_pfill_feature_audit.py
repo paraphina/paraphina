@@ -202,6 +202,40 @@ def _load_filled_horizon_recovery(
     return summary, by_group
 
 
+def _load_filled_horizon_source_key_recovery(
+    filled_horizon_source_key_recovery_run: Path | None,
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]]]:
+    if filled_horizon_source_key_recovery_run is None:
+        return None, {}
+    summary = _load_hold_summary(
+        filled_horizon_source_key_recovery_run,
+        "filled_horizon_source_key_recovery_summary.json",
+    )
+    if summary.get("raw_identifier_redaction_status") != "PASS":
+        raise ValueError(
+            f"{filled_horizon_source_key_recovery_run} must have raw_identifier_redaction_status=PASS"
+        )
+    labels_path = filled_horizon_source_key_recovery_run / "filled_horizon_source_key_recovery_labels.jsonl"
+    by_group: dict[str, dict[str, Any]] = {}
+    for _, label in _iter_jsonl(labels_path):
+        if label.get("label_type") != "PHASE51L_FILLED_HORIZON_SOURCE_KEY_RECOVERY_LABEL":
+            continue
+        _check_unsafe(label, labels_path, label="label")
+        _check_no_raw_identifiers(label, labels_path, label="label")
+        if label.get("raw_identifier_redaction_status") != "PASS":
+            raise ValueError(f"{labels_path} contains non-PASS raw identifier redaction status")
+        canonical_group_id = str(label.get("canonical_group_id") or "")
+        if not canonical_group_id:
+            raise ValueError(f"{labels_path} row missing canonical_group_id")
+        if canonical_group_id in by_group:
+            raise ValueError(f"{labels_path} duplicate canonical_group_id={canonical_group_id}")
+        by_group[canonical_group_id] = label
+    expected = int(summary.get("label_count") or 0)
+    if len(by_group) != expected:
+        raise ValueError(f"{labels_path} label count {len(by_group)} != summary label_count {expected}")
+    return summary, by_group
+
+
 def _safe_int(value: Any) -> int | None:
     if value is None:
         return None
@@ -395,6 +429,7 @@ def _coverage_label(
     markout_info: dict[str, Any] | None,
     horizon_recovery_label: dict[str, Any] | None,
     filled_horizon_recovery_label: dict[str, Any] | None,
+    filled_horizon_source_key_recovery_label: dict[str, Any] | None,
 ) -> dict[str, Any]:
     venue = str(pfill_label.get("venue_id") or "UNKNOWN")
     side = _canonical_side(pfill_label.get("side"))
@@ -444,6 +479,23 @@ def _coverage_label(
         if observed_horizon_source_ticks is None and effective_filled_horizon is not None:
             observed_horizon_source_ticks = effective_filled_horizon
             filled_horizon_recovery_applied = True
+    filled_horizon_source_key_recovery_status = None
+    filled_horizon_source_key_recovery_method = None
+    filled_horizon_source_key_recovery_applied = False
+    if filled_horizon_source_key_recovery_label is not None:
+        filled_horizon_source_key_recovery_status = filled_horizon_source_key_recovery_label.get("recovery_status")
+        filled_horizon_source_key_recovery_method = filled_horizon_source_key_recovery_label.get("recovery_method")
+        if filled_horizon_source_key_recovery_label.get("source_telemetry_sha256") != pfill_label.get("source_telemetry_sha256"):
+            raise ValueError(
+                f"filled horizon source-key recovery source hash mismatch for canonical_group_id="
+                f"{pfill_label.get('canonical_group_id')}"
+            )
+        effective_source_key_horizon = filled_horizon_source_key_recovery_label.get(
+            "effective_observed_horizon_source_ticks"
+        )
+        if observed_horizon_source_ticks is None and effective_source_key_horizon is not None:
+            observed_horizon_source_ticks = effective_source_key_horizon
+            filled_horizon_source_key_recovery_applied = True
     observed_horizon_available = observed_horizon_source_ticks is not None
     markout_available = markout_info is not None
     raw_decision_id_present = pfill_label.get("decision_id") not in (None, "")
@@ -509,6 +561,13 @@ def _coverage_label(
         "filled_horizon_exchange_ms_not_used_as_source_ticks": (
             filled_horizon_exchange_ms_available and not filled_horizon_recovery_applied
         ),
+        "filled_horizon_source_key_recovery_status": filled_horizon_source_key_recovery_status,
+        "filled_horizon_source_key_recovery_method": filled_horizon_source_key_recovery_method,
+        "filled_horizon_source_key_recovery_applied": filled_horizon_source_key_recovery_applied,
+        "filled_horizon_source_key_recovery_run_id": (
+            filled_horizon_source_key_recovery_label.get("run_id")
+            if filled_horizon_source_key_recovery_label else None
+        ),
         "source_order_key_count": source_key_count,
         "source_queue_churn_label_count": len(queue_labels),
         "queue_churn_join_status": queue_status,
@@ -571,6 +630,11 @@ def _empty_bucket_counts() -> dict[str, int]:
         "filled_horizon_recovered_source_tick_count": 0,
         "filled_horizon_exchange_ms_only_count": 0,
         "filled_horizon_unrecovered_count": 0,
+        "filled_horizon_source_key_recovery_applied_count": 0,
+        "filled_horizon_source_key_recovered_source_tick_count": 0,
+        "filled_horizon_source_key_pfill_horizon_recovered_count": 0,
+        "filled_horizon_source_key_observed_hash_recovered_count": 0,
+        "filled_horizon_source_key_unrecovered_count": 0,
         "missing_feature_total": 0,
     }
 
@@ -639,12 +703,24 @@ def _add_to_bucket(counts: dict[str, int], label: dict[str, Any]) -> None:
         counts["filled_horizon_recovered_source_tick_count"] += 1
     elif filled_horizon_status == "RECOVERED_EXCHANGE_MS":
         counts["filled_horizon_exchange_ms_only_count"] += 1
+    source_key_status = label.get("filled_horizon_source_key_recovery_status")
+    source_key_method = label.get("filled_horizon_source_key_recovery_method")
+    if label.get("filled_horizon_source_key_recovery_applied"):
+        counts["filled_horizon_source_key_recovery_applied_count"] += 1
+    if source_key_status in {"RECOVERED_FROM_SOURCE_PFILL_HORIZON", "RECOVERED_FROM_OBSERVED_FILL_HASH"}:
+        counts["filled_horizon_source_key_recovered_source_tick_count"] += 1
+    if source_key_status == "RECOVERED_FROM_SOURCE_PFILL_HORIZON" or source_key_method == "SOURCE_PFILL_HORIZON":
+        counts["filled_horizon_source_key_pfill_horizon_recovered_count"] += 1
+    elif source_key_status == "RECOVERED_FROM_OBSERVED_FILL_HASH" or source_key_method == "OBSERVED_FILL_HASH":
+        counts["filled_horizon_source_key_observed_hash_recovered_count"] += 1
     if (
         label.get("outcome_status") == "OBSERVED_FILLED"
         and label.get("observed_horizon_available") is False
         and filled_horizon_status not in {"PRESERVED_EXISTING_SOURCE_TICKS", "RECOVERED_SOURCE_TICKS"}
     ):
         counts["filled_horizon_unrecovered_count"] += 1
+        if source_key_status is not None:
+            counts["filled_horizon_source_key_unrecovered_count"] += 1
     counts["missing_feature_total"] += int(label.get("missing_feature_count") or 0)
 
 
@@ -676,6 +752,8 @@ def _bucket_gate_reasons(
         reasons.append("missing_observed_horizon_features")
     if counts["filled_horizon_unrecovered_count"] > 0:
         reasons.append("filled_horizon_source_tick_still_missing")
+    if counts["filled_horizon_source_key_unrecovered_count"] > 0:
+        reasons.append("filled_horizon_source_key_still_missing")
     if counts["filled_horizon_exchange_ms_only_count"] > 0:
         reasons.append("filled_horizon_exchange_ms_only_requires_board_review")
     if counts["queue_churn_missing_count"] > 0 or counts["queue_churn_joined_partial_count"] > 0:
@@ -752,6 +830,7 @@ def _summary_gate_reason(bucket_records: list[dict[str, Any]]) -> str:
     }
     priority = [
         "raw_identifier_present_in_input_not_emitted",
+        "filled_horizon_source_key_still_missing",
         "missing_observed_horizon_features",
         "queue_churn_join_incomplete",
         "lighter_native_limit_pressure_not_fully_observed",
@@ -774,6 +853,7 @@ def build_feature_audit(
     markout_readiness_runs: list[Path],
     horizon_recovery_run: Path | None,
     filled_horizon_recovery_run: Path | None,
+    filled_horizon_source_key_recovery_run: Path | None,
     output_root: Path | None,
     run_id: str | None,
     timestamp_ns: int | None,
@@ -798,6 +878,10 @@ def build_feature_audit(
     filled_horizon_recovery_run = (
         _resolve_path(filled_horizon_recovery_run) if filled_horizon_recovery_run is not None else None
     )
+    filled_horizon_source_key_recovery_run = (
+        _resolve_path(filled_horizon_source_key_recovery_run)
+        if filled_horizon_source_key_recovery_run is not None else None
+    )
 
     pfill_summary, pfill_labels = _load_pfill_labels(observed_pfill_run)
     canonical_index = _load_canonical_source_index(canonical_pfill_run)
@@ -808,6 +892,10 @@ def build_feature_audit(
     filled_horizon_recovery_summary, filled_horizon_recovery_by_group = _load_filled_horizon_recovery(
         filled_horizon_recovery_run
     )
+    (
+        filled_horizon_source_key_recovery_summary,
+        filled_horizon_source_key_recovery_by_group,
+    ) = _load_filled_horizon_source_key_recovery(filled_horizon_source_key_recovery_run)
 
     feature_labels: list[dict[str, Any]] = []
     for seq, pfill_label in enumerate(pfill_labels, start=1):
@@ -844,6 +932,11 @@ def build_feature_audit(
         filled_horizon_recovery_label = filled_horizon_recovery_by_group.get(canonical_group_id)
         if filled_horizon_recovery_run is not None and filled_horizon_recovery_label is None:
             raise ValueError(f"canonical_group_id {canonical_group_id} missing from filled horizon recovery run")
+        filled_horizon_source_key_recovery_label = filled_horizon_source_key_recovery_by_group.get(canonical_group_id)
+        if filled_horizon_source_key_recovery_run is not None and filled_horizon_source_key_recovery_label is None:
+            raise ValueError(
+                f"canonical_group_id {canonical_group_id} missing from filled horizon source-key recovery run"
+            )
         feature_labels.append(_coverage_label(
             seq=seq,
             run_id=run_id,
@@ -855,6 +948,7 @@ def build_feature_audit(
             markout_info=markout_info,
             horizon_recovery_label=horizon_recovery_label,
             filled_horizon_recovery_label=filled_horizon_recovery_label,
+            filled_horizon_source_key_recovery_label=filled_horizon_source_key_recovery_label,
         ))
 
     bucket_records = _build_bucket_records(
@@ -916,6 +1010,25 @@ def build_feature_audit(
             filled_horizon_recovery_summary.get("recovery_status_counts")
             if filled_horizon_recovery_summary else {}
         ),
+        "filled_horizon_source_key_recovery_run": (
+            str(filled_horizon_source_key_recovery_run) if filled_horizon_source_key_recovery_run else None
+        ),
+        "filled_horizon_source_key_recovery_summary_sha256": (
+            _sha256_file(
+                filled_horizon_source_key_recovery_run / "filled_horizon_source_key_recovery_summary.json"
+            )
+            if filled_horizon_source_key_recovery_run else None
+        ),
+        "filled_horizon_source_key_recovery_labels_sha256": (
+            _sha256_file(
+                filled_horizon_source_key_recovery_run / "filled_horizon_source_key_recovery_labels.jsonl"
+            )
+            if filled_horizon_source_key_recovery_run else None
+        ),
+        "filled_horizon_source_key_recovery_status_counts": (
+            filled_horizon_source_key_recovery_summary.get("recovery_status_counts")
+            if filled_horizon_source_key_recovery_summary else {}
+        ),
         "source_telemetry_sha256_list": sorted({
             str(label.get("source_telemetry_sha256") or "")
             for label in pfill_labels
@@ -959,6 +1072,11 @@ def build_feature_audit(
                 "filled_horizon_recovered_source_tick_count",
                 "filled_horizon_exchange_ms_only_count",
                 "filled_horizon_unrecovered_count",
+                "filled_horizon_source_key_recovery_applied_count",
+                "filled_horizon_source_key_recovered_source_tick_count",
+                "filled_horizon_source_key_pfill_horizon_recovered_count",
+                "filled_horizon_source_key_observed_hash_recovered_count",
+                "filled_horizon_source_key_unrecovered_count",
                 "missing_feature_total",
             )
         },
@@ -997,6 +1115,7 @@ def main() -> int:
     parser.add_argument("--markout-readiness-run", type=Path, action="append", default=[])
     parser.add_argument("--horizon-recovery-run", type=Path, default=None)
     parser.add_argument("--filled-horizon-recovery-run", type=Path, default=None)
+    parser.add_argument("--filled-horizon-source-key-recovery-run", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--timestamp-ns", type=int, default=None)
@@ -1012,6 +1131,7 @@ def main() -> int:
             markout_readiness_runs=args.markout_readiness_run,
             horizon_recovery_run=args.horizon_recovery_run,
             filled_horizon_recovery_run=args.filled_horizon_recovery_run,
+            filled_horizon_source_key_recovery_run=args.filled_horizon_source_key_recovery_run,
             output_root=args.output_root,
             run_id=args.run_id,
             timestamp_ns=args.timestamp_ns,

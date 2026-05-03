@@ -622,13 +622,13 @@ Do not change:
 | Field | Value |
 |---|---|
 | target | Canonicalize the V2 target specification and continue Phase 5.1 as a non-live evidence program for fill-aware, hedge-aware, arbitrage-informed quoting. |
-| current status | `specified_holding_nonlive`; `docs/V2_SPECIFICATION.md` is the active target spec, Phase 5.1k is the current evidence boundary, and no V2 live/canary/model-training/EV-admission promotion is authorized. |
-| next action | Close the highest-leverage non-live evidence gaps: resolve or quarantine the remaining `65` filled-horizon source-tick join misses, improve Lighter native-limit and maker/taker completeness, then rerun the recovered 5.1h/5.1i evidence chain before any calibrated EV shadow review. |
-| required evidence | Repo-owned V2 spec, Phase 5.1k recovered feature matrix, filled-horizon timebase evidence pack, Lighter native limit and maker/taker evidence, schema v2 validation, deterministic replay outputs, and docs integrity output. |
+| current status | `specified_holding_nonlive`; `docs/V2_SPECIFICATION.md` is the active target spec, Phase 5.1l is the current evidence boundary, the filled-horizon source-tick blocker is cleared, and no V2 live/canary/model-training/EV-admission promotion is authorized. |
+| next action | Close the highest-leverage remaining non-live evidence gaps: improve Lighter native-limit and maker/taker completeness, maintain sparse-bucket/selection-bias holds, then rerun the recovered 5.1h/5.1i evidence chain before any calibrated EV shadow review. |
+| required evidence | Repo-owned V2 spec, Phase 5.1l recovered feature matrix, filled-horizon source-key recovery evidence pack, Lighter native limit and maker/taker evidence, schema v2 validation, deterministic replay outputs, and docs integrity output. |
 | promotion condition | All current blockers are resolved enough for calibrated EV shadow/model-training review, no-live guards remain intact, accepted evidence separates observed facts from counterfactuals, and economic claims remain balance-authoritative only. |
 | hold/rollback condition | Any live/canary/capital/risk authorization from Phase 5.1 evidence, any return to `true_edge` or `Q_raw` as canonical admission/sizing, missing telemetry, unproven economic claims, spec drift, or docs integrity failure. |
 | lane | Phase 5.1 non-live V2 evidence / quant, systems, data, execution, and risk. |
-| source files | `docs/V2_SPECIFICATION.md`, `docs/WHITEPAPER.md`, `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`, `docs/PHASE5_1_BOARD_DECISION.md`, `docs/PHASE5_1_EVIDENCE_LOG.md`, `schemas/telemetry_schema_v2.json`, `tools/phase51j_observed_horizon_recovery.py`, `tools/phase51k_filled_horizon_timebase_recovery.py`, `tools/phase51h_observed_pfill_feature_audit.py`, `tools/phase51i_pfill_feature_matrix_admissibility.py`, `tools/phase51b_lighter_account_limits.py`. |
+| source files | `docs/V2_SPECIFICATION.md`, `docs/WHITEPAPER.md`, `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`, `docs/PHASE5_1_BOARD_DECISION.md`, `docs/PHASE5_1_EVIDENCE_LOG.md`, `schemas/telemetry_schema_v2.json`, `tools/phase51j_observed_horizon_recovery.py`, `tools/phase51k_filled_horizon_timebase_recovery.py`, `tools/phase51l_filled_horizon_source_key_recovery.py`, `tools/phase51h_observed_pfill_feature_audit.py`, `tools/phase51i_pfill_feature_matrix_admissibility.py`, `tools/phase51b_lighter_account_limits.py`. |
 
 #### Phase 5.1b - Lighter Account/Native-Limit Evidence Gate
 

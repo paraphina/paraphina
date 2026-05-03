@@ -233,6 +233,89 @@ sparse_pfill_feature_buckets
 observed_only_selection_bias_not_resolved
 ```
 
+## Phase 5.1l - Filled-Horizon Source-Key Recovery and Recovered Matrix
+
+- Recovery run id:
+  `PHASE51L-FILLED-HORIZON-SOURCE-KEY-RECOVERY-TWO-LANE-20260502T000000Z`
+- Recovery run directory:
+  `runs/phase51l_filled_horizon_source_key_recovery/PHASE51L-FILLED-HORIZON-SOURCE-KEY-RECOVERY-TWO-LANE-20260502T000000Z`
+- Recovered 5.1h run:
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51L-RECOVERED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+- Recovered 5.1i run:
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51L-PFILL-FEATURE-MATRIX-ADMISSIBILITY-TWO-LANE-20260502T000000Z`
+- Baseline commit: `18dd09512288a85e440d3977e32432c3aabc1190`
+- Gate status: `HOLD`
+- Recovery gate reason:
+  `phase51l_filled_horizon_source_key_complete_nonlive_hold`
+- Matrix gate reason:
+  `phase51i_lighter_native_limit_pressure_not_fully_observed`
+- Raw identifier redaction status: `PASS`
+- Matrix labels: `4527`
+- Phase 5.1k target missing joins: `65`
+- Filled horizons recovered in 5.1l: `65`
+- Source P-fill horizon recoveries: `43`
+- Observed-fill hash fallback recoveries: `22`
+- Filled horizons still missing after 5.1l: `0`
+- Recovered observed horizon available / missing: `4527` / `0`
+- Lighter native-limit observed / partial remains: `0` / `2288`
+- Filled-order maker/taker observed / partial-unknown / missing remains:
+  `174` / `222` / `65`
+- Excluded quarantine/review groups remain: `1613`
+- Safety flags: all live, canary, capital, risk-relaxation, EV-admission,
+  model-training, and financial-claim authorization fields are `false`.
+
+Commands:
+
+```bash
+python3 tools/phase51l_filled_horizon_source_key_recovery.py \
+  --phase51k-recovery-run runs/phase51k_filled_horizon_timebase_recovery/PHASE51K-FILLED-HORIZON-TIMEBASE-RECOVERY-TWO-LANE-20260502T000000Z \
+  --canonical-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --source-pfill-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-20260429T025435Z \
+  --source-pfill-run runs/phase51c_pfill_outcome/PHASE51C-PFILL-OUTCOME-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --observed-label-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-20260429T025435Z \
+  --observed-label-run runs/phase51c_observed_labels/PHASE51C-OBSERVED-LABELS-TERMINAL-STALE-7200S-FROM-BACKFILL-M2-20260429T073231Z \
+  --run-id PHASE51L-FILLED-HORIZON-SOURCE-KEY-RECOVERY-TWO-LANE-20260502T000000Z
+
+python3 tools/phase51h_observed_pfill_feature_audit.py \
+  --observed-pfill-run runs/phase51i_redacted_pfill_quarantine_review/PHASE51I-REDACTED-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z/observed_only_pfill_outcome \
+  --quarantine-review-run runs/phase51i_redacted_pfill_quarantine_review/PHASE51I-REDACTED-PFILL-QUARANTINE-REVIEW-TWO-LANE-20260502T000000Z \
+  --canonical-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --queue-churn-run runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-NATIVE-CONTEXT-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z \
+  --queue-churn-run runs/phase51c_queue_churn/PHASE51C-QUEUE-CHURN-NATIVE-CONTEXT-TERMINAL-STALE-7200S-20260429T025435Z \
+  --markout-readiness-run runs/phase51c_markout_calibration_readiness/PHASE51C-MARKOUT-CALIBRATION-READINESS-TWO-LANE-20260502T000000Z \
+  --horizon-recovery-run runs/phase51j_observed_horizon_recovery/PHASE51J-OBSERVED-HORIZON-RECOVERY-TWO-LANE-20260502T000000Z \
+  --filled-horizon-recovery-run runs/phase51k_filled_horizon_timebase_recovery/PHASE51K-FILLED-HORIZON-TIMEBASE-RECOVERY-TWO-LANE-20260502T000000Z \
+  --filled-horizon-source-key-recovery-run runs/phase51l_filled_horizon_source_key_recovery/PHASE51L-FILLED-HORIZON-SOURCE-KEY-RECOVERY-TWO-LANE-20260502T000000Z \
+  --run-id PHASE51L-RECOVERED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z
+
+python3 tools/phase51i_pfill_feature_matrix_admissibility.py \
+  --feature-audit-run runs/phase51h_observed_pfill_feature_audit/PHASE51L-RECOVERED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z \
+  --run-id PHASE51L-PFILL-FEATURE-MATRIX-ADMISSIBILITY-TWO-LANE-20260502T000000Z
+```
+
+Artifact hashes:
+
+```text
+d355a58043cb285454a2005725274f6c34ea9fdb19d1a906220b34f41b862790  filled_horizon_source_key_recovery_summary.json
+ea0eb037d67a8ce2e36667e3e835331c48a778f0bd200af9826ae2dd2a0106b7  filled_horizon_source_key_recovery_buckets.jsonl
+c2befefc86a808bee7674ccd021b5a608d4529dd7489cd3b3878e47899385607  filled_horizon_source_key_recovery_labels.jsonl
+e68990f39d1c0d08a4601d2a344ed782b43ae492b24c04dabad76e82a3a014e2  recovered pfill_feature_audit_summary.json
+ffb3574e7effe35e1550f1273f3e99cb636b1928393e5d579901e9b43bebc8a2  recovered pfill_feature_bucket_readiness.jsonl
+a95e0d7e9e8f6c815821c790f72fe3b56fd6384bbd888bad695b71cfc7a1f993  recovered pfill_feature_coverage_labels.jsonl
+4b087d1e44d4af778d5be7fb21c0dbdbbf9cb1f63c9f97b0d4168aa1241794b4  recovered pfill_feature_matrix_admissibility_summary.json
+95ca05d6e4f160c9564847c1da427fc761298b2099429e5a445dc4ed0bd7091c  recovered pfill_feature_matrix_buckets.jsonl
+f9a7feeacffbe66498f03086e3036e73b146cbfc9f62038e638df50825dc97df  recovered pfill_feature_matrix_blockers.jsonl
+```
+
+Recovered matrix blockers:
+
+```text
+lighter_native_limit_pressure_not_fully_observed
+maker_taker_not_fully_observed_for_filled_orders
+sparse_pfill_feature_buckets
+observed_only_selection_bias_not_resolved
+```
+
 ## Phase 5.1i - Redacted P-Fill Feature-Matrix Admissibility
 
 - Run id: `PHASE51I-PFILL-FEATURE-MATRIX-ADMISSIBILITY-REDACTED-TWO-LANE-20260502T000000Z`

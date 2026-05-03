@@ -25,7 +25,7 @@ Current economic/profitability decision: `HOLD`
 
 ## Current Superseding Status
 
-As of the Phase 5.1k filled-horizon timebase recovery gate, the board decision remains
+As of the Phase 5.1l filled-horizon source-key recovery gate, the board decision remains
 `PROMOTE_FOR_NEXT_NONLIVE_STEP` only. The current blockers are now more
 specific:
 
@@ -74,11 +74,15 @@ specific:
   It leaves `65` filled-order rows as `MISSING_JOIN`, records
   `exchange_ms_only_count=0`, and does not write exchange-millisecond timing
   into source-tick horizon fields.
+- Phase 5.1l recovers the remaining `65 / 65` filled-order source-tick
+  horizons with source-key/hash evidence, increasing observed horizon coverage
+  from `4462 / 4527` to `4527 / 4527`. The matrix still remains `HOLD`,
+  now on Lighter native-limit completeness, maker/taker completeness, sparse
+  buckets, and observed-only selection bias.
 - 5.1 remains `HOLD` for model training, EV admission, live orders, canary,
-  capital escalation, risk-limit relaxation, and financial claims until the
-  remaining filled-horizon joins, observed-only calibration policy, feature
-  completeness, venue-native truth gaps, and downstream calibration readiness
-  are accepted.
+  capital escalation, risk-limit relaxation, and financial claims until
+  observed-only calibration policy, feature completeness, venue-native truth
+  gaps, and downstream calibration readiness are accepted.
 
 ## Baseline
 
@@ -129,7 +133,7 @@ The following are blocked until a separate board decision:
 | Canary | No fill calibration, no account-state evidence, and no live-risk decision. |
 | Capital escalation | Outside Phase 5.1 scope. |
 | Risk-limit relaxation | Outside Phase 5.1 scope. |
-| Multi-venue launch | V2 scope is all-five, but Phase 5.1k evidence authorizes only the Lighter-first non-live evidence lane. Non-Lighter venues require separate venue-readiness evidence and a later board decision before any multi-venue V2 launch. |
+| Multi-venue launch | V2 scope is all-five, but current Phase 5.1 evidence authorizes only the Lighter-first non-live evidence lane. Non-Lighter venues require separate venue-readiness evidence and a later board decision before any multi-venue V2 launch. |
 | Profitability claim | No balance-authoritative live economic evidence. |
 
 ## Evidence Summary
@@ -387,4 +391,66 @@ Audit the remaining 65 MISSING_JOIN filled-order rows to determine whether they
 can be deterministically joined through lifecycle/native evidence or must be
 quarantined from calibration. Continue Lighter native-limit and maker/taker
 evidence enrichment. Keep all non-live safety holds intact.
+```
+
+## Phase 5.1l Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live feature-completeness evidence
+step: improve Lighter native-limit and maker/taker evidence while preserving
+sparse-bucket and observed-only selection-bias holds.
+
+Rationale:
+
+- Phase 5.1l added a source-key/hash fallback recovery gate for the remaining
+  Phase 5.1k `MISSING_JOIN` filled-order rows. It emits only redacted source
+  keys, hashes, counts, and source-tick horizons; it does not emit raw fill IDs,
+  order IDs, client order IDs, venue order IDs, or decision IDs.
+- The gate recovered the remaining `65 / 65` filled-order source-tick horizons:
+  `43` via source P-fill horizon evidence and `22` via hashed observed-fill
+  fallback.
+- The recovered 5.1h -> 5.1i chain now reports `4527 / 4527` observed horizons
+  available and `0` missing horizons.
+- The matrix remains non-admissible with gate reason
+  `phase51i_lighter_native_limit_pressure_not_fully_observed`.
+- Remaining blockers are partial Lighter native-limit context for `2288`
+  labels, incomplete maker/taker status on `287` fills, sparse venue/side
+  buckets, and `1613` excluded quarantine/review groups.
+- No live, canary, capital, risk-limit, or strategy execution behavior changed.
+
+Current evidence boundary:
+
+```text
+Phase 5.1l - Filled-horizon source-key recovery
+runs/phase51l_filled_horizon_source_key_recovery/PHASE51L-FILLED-HORIZON-SOURCE-KEY-RECOVERY-TWO-LANE-20260502T000000Z
+gate_status: HOLD
+gate_reason: phase51l_filled_horizon_source_key_complete_nonlive_hold
+target_missing_join_count: 65
+source_pfill_horizon_recovered_count: 43
+observed_fill_hash_recovered_count: 22
+still_missing_filled_horizon_count: 0
+raw_identifier_redaction_status: PASS
+
+Phase 5.1l - Recovered P-fill feature-matrix admissibility
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51L-PFILL-FEATURE-MATRIX-ADMISSIBILITY-TWO-LANE-20260502T000000Z
+gate_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+observed_horizon_available_count: 4527
+observed_horizon_missing_count: 0
+matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+```
+
+Next move:
+
+```text
+Do not start live/canary/model-training/EV-admission work. Improve read-only
+Lighter native-limit and maker/taker evidence completeness, rerun 5.1h/5.1i,
+and preserve sparse-bucket and observed-only selection-bias holds until there
+is a board-approved calibration protocol.
 ```
