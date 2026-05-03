@@ -34,16 +34,16 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1s as the active local native source-staging gate, Phase 5.1r
-   as the forward native source-acquisition layer, Phase 5.1q as the downstream
-   forward-evidence gate, and Phase 5.1p as the last completed historical
-   evidence boundary. Phase 5.1s is repo-owned, non-live, and designed to
-   require an explicit local manifest, reject unsafe source surfaces, strip raw
-   identifiers, emit a redacted `local_native_source.jsonl` for Phase 5.1r, and
-   stage optional manifest `source_links` as `local_source_link_sidecar.jsonl`.
-   Phase 5.1r may additionally consume that staged `--source-link-jsonl`
-   sidecar when future forward captures provide redacted source-hash-to-group
-   mappings instead of direct group/order fields.
+2. Treat Phase 5.1u as the active forward capture target-manifest gate,
+   Phase 5.1s as the local native source-staging gate, Phase 5.1t as the
+   optional source-link sidecar builder, Phase 5.1r as the forward native
+   source-acquisition layer, and Phase 5.1q as the downstream forward-evidence
+   gate. Phase 5.1u is repo-owned, non-live, and emits the exact target list
+   for fresh all-five native role capture plus Lighter event-time native-limit
+   pressure. Phase 5.1s requires an explicit local manifest, rejects unsafe
+   source surfaces, strips raw identifiers, emits a redacted
+   `local_native_source.jsonl` for Phase 5.1r, and stages optional manifest
+   `source_links` as `local_source_link_sidecar.jsonl`.
 3. The current Phase 5.1p recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
    `4527` observed horizons available, `0` observed horizons still missing,
@@ -55,14 +55,15 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    filled-order maker/taker status is incomplete for `287` labels, some
    venue/side buckets remain sparse, and `1613` quarantined/review groups remain
    excluded from the observed-only diagnostic pack.
-5. Next repo-owned move is another non-live evidence step: capture or locate
-   forward read-only native snapshots with canonical group/order-key linkage,
-   or a redacted Phase 5.1s `source_links` sidecar that validates those joins
-   by source hash.
-   Stage snapshots through Phase 5.1s, run Phase 5.1r, feed its sanitized
-   outputs into Phase 5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into
-   Phase 5.1n, then rerun the recovered 5.1h/5.1i matrix. Do not train models
-   from Phase 5.1s, Phase 5.1r, or Phase 5.1q.
+5. Next repo-owned move is another non-live evidence step: execute a fresh
+   read-only forward source-capture pilot against the Phase 5.1u target
+   manifest. Capture or locate native snapshots with canonical group/order-key
+   linkage, or a redacted Phase 5.1t/5.1s `source_links` sidecar that validates
+   those joins by source hash. Stage snapshots through Phase 5.1s, run Phase
+   5.1r, feed its sanitized outputs into Phase 5.1q, feed Phase 5.1q
+   `native_role_evidence.jsonl` into Phase 5.1n, then rerun the recovered
+   5.1h/5.1i matrix. Do not train models from Phase 5.1u, Phase 5.1s, Phase
+   5.1r, or Phase 5.1q.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
@@ -854,23 +855,30 @@ curl -fsS http://127.0.0.1:9898/health/detail
 
 ## Next Command Targets
 
-After Phase 5.1s is committed and pushed, the next target is not another live
-run. Phase 5.1s is the mandatory local preflight for read-only native snapshots
-before Phase 5.1r. Its first run over existing Lighter local sources staged
-`405` rows, stripped `3500` raw identifier fields, found `0` join-key rows,
-and correctly cleared no blocker. The downstream Phase 5.1r rerun classified
-all `405` staged rows as `UNJOINED_NO_CANONICAL_GROUP`, leaving `0 / 287`
-native-role targets recovered and `0 / 3132` Lighter native-limit targets
-recovered. Phase 5.1s now stages optional manifest `source_links` as
-`local_source_link_sidecar.jsonl`, and Phase 5.1r accepts that sidecar through
-`--source-link-jsonl` to map redacted source hashes to observed canonical
-groups/order keys with duplicate/conflict/raw-ID rejection. Capture forward
-native snapshots across all five venues with canonical group/order-key linkage
-or validated Phase 5.1s source-link sidecars, rerun Phase 5.1s -> 5.1r ->
-5.1q -> 5.1n -> 5.1h -> 5.1i, and
-require measurable blocker reduction without raw identifiers,
-live/canary/capital/risk authorization, model-training shortcuts, or
-selection-bias shortcuts.
+After Phase 5.1u, the next target is not another live run. Phase 5.1u emits the
+exact target manifest for fresh forward capture:
+
+```text
+runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z
+native_role_capture_target_count: 287
+native_role_capture_target_counts_by_venue:
+- aster: 113
+- extended: 28
+- hyperliquid: 6
+- lighter: 125
+- paradex: 15
+lighter_native_limit_capture_target_count: 3132
+clears_phase51_blockers: false
+```
+
+Execute a read-only forward source-capture pilot against that target manifest.
+Capture all-five venue-native maker/taker fields and complete Lighter
+event-time active-order/sendTx/REST-or-weighted-request pressure. Use direct
+canonical group/order-key linkage where possible; otherwise use Phase 5.1t to
+build 5.1s-compatible source-link sidecars. Then rerun Phase 5.1s -> 5.1r ->
+5.1q -> 5.1n -> 5.1h -> 5.1i, and require measurable blocker reduction
+without raw identifiers, live/canary/capital/risk authorization,
+model-training shortcuts, or selection-bias shortcuts.
 
 After Phase 5.1t, source-link generation is repo-owned and should be used
 before Phase 5.1s whenever a local forward source snapshot contains raw

@@ -69,6 +69,68 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1u Forward Capture Target Manifest
+
+Run id: `PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z`
+
+Local run directory:
+`runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z`
+
+Input:
+`runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z`
+
+Result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51u_forward_capture_targets_emitted_nonlive_hold
+observed_pfill_label_count: 6140
+native_role_capture_target_count: 287
+native_role_capture_target_counts_by_venue:
+- aster: 113
+- extended: 28
+- hyperliquid: 6
+- lighter: 125
+- paradex: 15
+lighter_native_limit_capture_target_count: 3132
+clears_phase51_blockers: false
+raw_identifier_redaction_status: PASS
+```
+
+Command:
+
+```bash
+python3 tools/phase51u_forward_capture_target_manifest.py \
+  --observed-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --run-id PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --timestamp-ns 1777766400000000000
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51u_forward_capture_target_manifest.py tools/phase51r_forward_native_source_acquisition.py tests/test_telemetry_contract_gate.py
+python3 -m unittest tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51u_forward_capture_target_manifest_emits_exact_targets tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51u_forward_capture_target_manifest_rejects_unsafe_labels tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51r_source_acquisition_aggregates_multi_fill_native_roles
+```
+
+Result:
+
+```text
+Ran 3 tests
+OK
+```
+
+Verdict:
+
+```text
+HOLD for live, canary, model training, EV admission, capital escalation,
+risk-limit relaxation, financial claims, and 24/7 readiness.
+
+PROMOTE only for a fresh read-only forward source-capture pilot against the
+Phase 5.1u target manifest, followed by Phase 5.1s -> 5.1r -> 5.1q -> 5.1n ->
+5.1h -> 5.1i.
+```
+
 ## Phase 5.1t - Source-Link Sidecar Builder
 
 - Run id:

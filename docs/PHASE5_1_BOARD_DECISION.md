@@ -1118,3 +1118,74 @@ works but do not clear missing all-five venue-native roles or complete Lighter
 native-limit pressure. Capture new forward read-only native source rows with
 canonical linkage, then rerun 5.1t/5.1s/5.1r/5.1q/5.1n/5.1h/5.1i.
 ```
+
+## Phase 5.1u Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for HOLD-only forward capture target manifest
+generation through `tools/phase51u_forward_capture_target_manifest.py`.
+
+Rationale:
+
+- Existing source plumbing is redaction-safe, but current retained artifacts
+  are exhausted and still recover `0 / 287` missing native-role targets and
+  `0 / 3132` Lighter native-limit targets.
+- Phase 5.1u makes the fresh capture pilot exact and auditable by emitting the
+  required canonical groups, order keys, venue-specific native fields, and
+  Lighter event-time limit-pressure fields.
+- Phase 5.1u does not capture venue truth, does not infer maker/taker role or
+  native-limit pressure, and does not clear blockers by itself.
+- Phase 5.1r now aggregates distinct source-record hashes for the same
+  canonical group so valid multi-fill native source bundles are not falsely
+  classified as partial.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1u - Forward capture target manifest
+tool: tools/phase51u_forward_capture_target_manifest.py
+spec: docs/PHASE5_1U_FORWARD_CAPTURE_TARGET_MANIFEST.md
+status: HOLD
+authorized output:
+- native_role_capture_targets.jsonl
+- lighter_native_limit_capture_targets.jsonl
+- capture_bundle_manifest_template.json
+prohibited:
+- live orders
+- canary
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+- source truth inference
+```
+
+Baseline target-manifest evidence:
+
+```text
+runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z
+gate_status: HOLD
+native_role_capture_target_count: 287
+native_role_capture_target_counts_by_venue:
+- aster: 113
+- extended: 28
+- hyperliquid: 6
+- lighter: 125
+- paradex: 15
+lighter_native_limit_capture_target_count: 3132
+clears_phase51_blockers: false
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Execute a fresh read-only forward source-capture pilot against the Phase 5.1u
+target manifest, using direct canonical group/order-key linkage or 5.1t/5.1s
+source-link sidecars. Then rerun 5.1s -> 5.1r -> 5.1q -> 5.1n -> 5.1h ->
+5.1i and require measurable blocker reduction before any calibration/model
+training review.
+```

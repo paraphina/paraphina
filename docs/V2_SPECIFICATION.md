@@ -17,11 +17,11 @@ Primary source addenda:
 Current repo evidence boundary:
 
 - Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
-- Current Phase 5.1 evidence boundary: Phase 5.1s local native source-staging
-  gate active in front of Phase 5.1r and Phase 5.1q; Phase 5.1s stages
-  optional source-link sidecars and Phase 5.1r validates them for redacted
-  source-hash joins; Phase 5.1p is the last completed historical evidence
-  boundary
+- Current Phase 5.1 evidence boundary: Phase 5.1u forward capture target
+  manifest is the active non-live preflight in front of fresh all-five native
+  source capture; Phase 5.1s stages local source bundles, Phase 5.1t builds
+  optional source-link sidecars, and Phase 5.1r validates redacted
+  source-hash joins before Phase 5.1q
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
 
@@ -573,10 +573,20 @@ redaction-safe, but existing local artifacts still lack the exact all-five
 venue-native role and complete Lighter native-limit evidence required for
 calibrated EV review.
 
-The next evidence move is to capture forward native snapshots with canonical
+Phase 5.1u adds a HOLD-only forward capture target manifest in front of the
+fresh source-capture pilot. It consumes the canonical P-fill labels and emits
+the exact missing target set: `287` all-five venue-native role targets
+(`aster=113`, `extended=28`, `hyperliquid=6`, `lighter=125`, `paradex=15`) and
+`3132` Lighter event-time native-limit pressure targets. It also emits a local
+capture bundle manifest template for Phase 5.1s. Phase 5.1u does not capture
+source truth, does not clear blockers by itself, and does not infer maker/taker
+role, native-limit pressure, EV, PnL, or economic performance.
+
+The next evidence move is to use Phase 5.1u as the target list for a fresh
+read-only forward source-capture pilot. Capture native snapshots with canonical
 group/order-key linkage, or a validated source-link sidecar that binds redacted
-source hashes to those observed labels. Stage snapshots and any source-link
-sidecars through Phase 5.1s, run Phase 5.1r, feed the sanitized outputs into
-Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No model training, EV admission,
-canary, live orders, capital escalation, risk-limit relaxation, or financial
-claim is authorized from Phase 5.1s, Phase 5.1r, or Phase 5.1q.
+source hashes to observed labels. Stage snapshots and sidecars through Phase
+5.1s, run Phase 5.1r, feed the sanitized outputs into Phase 5.1q, and rerun
+Phase 5.1n/5.1h/5.1i. No model training, EV admission, canary, live orders,
+capital escalation, risk-limit relaxation, or financial claim is authorized
+from Phase 5.1s, Phase 5.1r, Phase 5.1q, Phase 5.1t, or Phase 5.1u.

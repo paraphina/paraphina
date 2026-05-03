@@ -305,6 +305,13 @@ def _existing_role_counts(value: Any) -> dict[str, int]:
     return counts
 
 
+def _merge_role_counts(existing: dict[str, int], additional: dict[str, int]) -> dict[str, int]:
+    return {
+        key: int(existing.get(key) or 0) + int(additional.get(key) or 0)
+        for key in ("MAKER", "TAKER", "UNKNOWN")
+    }
+
+
 def _status_counts(records: list[dict[str, Any]], field: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for record in records:
@@ -717,6 +724,17 @@ def build_forward_native_source_acquisition(
                     if group not in native_roles_by_group:
                         role_record["source_record_count"] = 1
                         native_roles_by_group[group] = role_record
+                    else:
+                        existing = native_roles_by_group[group]
+                        if existing.get("venue_id") != venue:
+                            raise ValueError("same canonical group mapped to conflicting venue native role sources")
+                        if existing.get("maker_taker_attribution_source") != role_source:
+                            raise ValueError("same canonical group mapped to conflicting native role source types")
+                        existing["maker_taker_role_counts"] = _merge_role_counts(
+                            _existing_role_counts(existing.get("maker_taker_role_counts")),
+                            _role_counts(role),
+                        )
+                        existing["source_record_count"] = int(existing.get("source_record_count") or 1) + 1
                     role_count += 1
 
             if group and venue == "lighter" and _has_limit_fields(row):

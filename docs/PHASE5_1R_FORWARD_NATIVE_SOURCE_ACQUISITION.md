@@ -88,6 +88,18 @@ The sidecar clears no blocker by itself. Blocker reduction still requires
 explicit venue-native maker/taker fields and complete Lighter event-time
 active-order, sendTx, and REST/weighted-request pressure rows.
 
+## Multi-Fill Role Aggregation
+
+Forward source bundles may contain more than one venue-native fill/trade row
+for the same canonical group. Phase 5.1r aggregates distinct source-record
+hashes for the same canonical group when the venue and native role source type
+are consistent. This lets a group with `fill_count > 1` become complete only
+when the aggregated MAKER/TAKER count covers the observed fill count.
+
+Aggregation does not infer missing roles. Duplicate source-record hashes are
+deduplicated, conflicting venue/source types are rejected, and Phase 5.1q still
+requires complete aggregated role counts before recovering a group.
+
 Outputs:
 
 - `phase51r_forward_native_source_acquisition_summary.json`

@@ -730,6 +730,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51t_source_link_sidecar_builder.py"
 
+    def _get_phase51u_forward_capture_target_manifest_path(self) -> Path:
+        """Get path to the Phase 5.1u forward capture target-manifest gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51u_forward_capture_target_manifest.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -7733,6 +7738,175 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("secret-shaped source row field", result.stderr)
 
+    def test_phase51u_forward_capture_target_manifest_emits_exact_targets(self):
+        """5.1u should emit redacted all-five role targets and Lighter limit targets."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            output_root = tmp_path / "forward_capture_targets"
+            observed_run.mkdir()
+            labels = [
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "lighter-filled",
+                    "order_key": "lighter-order",
+                    "source_telemetry_sha256": "source-lighter",
+                    "venue_id": "lighter",
+                    "side": "BID",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "fill_count": 2,
+                    "order_source_t": 10,
+                    "order_source_line": 20,
+                    "source_order_keys": ["source-lighter-a", "source-lighter-b"],
+                    "maker_taker_role_counts": {"MAKER": 1, "TAKER": 0, "UNKNOWN": 0},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "hyperliquid-filled",
+                    "order_key": "hyper-order",
+                    "source_telemetry_sha256": "source-hyper",
+                    "venue_id": "hyperliquid",
+                    "side": "ASK",
+                    "price": 101.0,
+                    "size": 0.02,
+                    "fill_count": 1,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 0},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "paradex-complete",
+                    "order_key": "paradex-order",
+                    "source_telemetry_sha256": "source-paradex",
+                    "venue_id": "paradex",
+                    "side": "BID",
+                    "price": 102.0,
+                    "size": 0.03,
+                    "fill_count": 1,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 1, "UNKNOWN": 0},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "canonical_group_id": "lighter-not-filled",
+                    "order_key": "lighter-empty-order",
+                    "source_telemetry_sha256": "source-lighter-empty",
+                    "venue_id": "lighter",
+                    "side": "ASK",
+                    "price": 103.0,
+                    "size": 0.04,
+                    "fill_count": 0,
+                    "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 0},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51u_target_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": len(labels),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (observed_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                for label in labels:
+                    f.write(json.dumps(label) + "\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51u_forward_capture_target_manifest_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51u_target_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            run_dir = output_root / "phase51u_target_test"
+            summary = json.loads(
+                (run_dir / "phase51u_forward_capture_target_manifest_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["native_role_capture_target_count"], 2)
+            self.assertEqual(summary["lighter_native_limit_capture_target_count"], 2)
+            self.assertEqual(summary["native_role_capture_target_counts_by_venue"]["hyperliquid"], 1)
+            self.assertEqual(summary["native_role_capture_target_counts_by_venue"]["lighter"], 1)
+            self.assertEqual(summary["native_role_required_source_counts"]["HYPERLIQUID_CROSSED"], 1)
+            self.assertEqual(summary["native_role_required_source_counts"]["LIGHTER_TRADES_JSON"], 1)
+            self.assertFalse(summary["clears_phase51_blockers"])
+            role_targets = [
+                json.loads(line)
+                for line in (run_dir / "native_role_capture_targets.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            lighter_target = next(target for target in role_targets if target["venue_id"] == "lighter")
+            self.assertEqual(lighter_target["missing_native_role_count"], 1)
+            self.assertEqual(lighter_target["required_native_role_source"], "LIGHTER_TRADES_JSON")
+            self.assertFalse(lighter_target["role_inference_allowed"])
+            output_text = (run_dir / "native_role_capture_targets.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("client_order_id", output_text)
+            self.assertNotIn("trade_id", output_text)
+            template = json.loads((run_dir / "capture_bundle_manifest_template.json").read_text(encoding="utf-8"))
+            self.assertEqual(template["native_role_capture_target_count"], 2)
+            self.assertEqual(template["lighter_native_limit_capture_target_count"], 2)
+            self.assertFalse(template["live_orders_allowed"])
+
+    def test_phase51u_forward_capture_target_manifest_rejects_unsafe_labels(self):
+        """5.1u should reject P_fill labels that attempt to authorize live use."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            observed_run.mkdir()
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51u_unsafe_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(json.dumps({
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "canonical_group_id": "unsafe-group",
+                "venue_id": "extended",
+                "fill_count": 1,
+                "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 0},
+                "approved_for_live": True,
+            }) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51u_forward_capture_target_manifest_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--output-root",
+                    str(tmp_path / "forward_capture_targets"),
+                    "--run-id",
+                    "phase51u_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unsafe label flag approved_for_live=true", result.stderr)
+
     def test_phase51s_source_link_sidecar_rejects_unsafe_rows(self):
         """5.1s source-link sidecars should be local, redacted, and unambiguous."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -8407,6 +8581,130 @@ class TestValidatorSubprocess(unittest.TestCase):
                     self.assertEqual(result.returncode, 2)
                     self.assertIn(expected_error, result.stderr)
 
+    def test_phase51r_source_acquisition_aggregates_multi_fill_native_roles(self):
+        """5.1r should aggregate distinct native fill/trade rows for one group."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            source_path = tmp_path / "native_source.jsonl"
+            acquisition_root = tmp_path / "source_acquisition"
+            capture_root = tmp_path / "forward_native_capture"
+            observed_run.mkdir()
+
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51r_aggregate_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(json.dumps({
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "canonical_group_id": "group-multi-fill",
+                "order_key": "order-multi-fill",
+                "source_telemetry_sha256": "source-multi-fill",
+                "venue_id": "hyperliquid",
+                "side": "BID",
+                "fill_count": 2,
+                "outcome_status": "OBSERVED_FILLED",
+                "p_fill_outcome": 1.0,
+                "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 2},
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            source_rows = [
+                {
+                    "canonical_group_id": "group-multi-fill",
+                    "venue_id": "hyperliquid",
+                    "crossed": False,
+                    "sequence_hash": "native-fill-a",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "group-multi-fill",
+                    "venue_id": "hyperliquid",
+                    "crossed": True,
+                    "sequence_hash": "native-fill-b",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            with source_path.open("w", encoding="utf-8") as f:
+                for row in source_rows:
+                    f.write(json.dumps(row) + "\n")
+
+            acquisition_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51r_forward_native_source_acquisition_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--source-json",
+                    str(source_path),
+                    "--output-root",
+                    str(acquisition_root),
+                    "--run-id",
+                    "phase51r_aggregate_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                acquisition_result.returncode,
+                0,
+                f"stdout: {acquisition_result.stdout}\nstderr: {acquisition_result.stderr}",
+            )
+            acquisition_dir = acquisition_root / "phase51r_aggregate_test"
+            acquisition_summary = json.loads(
+                (acquisition_dir / "phase51r_forward_native_source_acquisition_summary.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(acquisition_summary["native_role_source_record_count"], 1)
+            self.assertEqual(acquisition_summary["native_role_target_recovered_count"], 1)
+            role_row = json.loads((acquisition_dir / "native_role_source.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(role_row["source_record_count"], 2)
+            self.assertEqual(role_row["maker_taker_role_counts"]["MAKER"], 1)
+            self.assertEqual(role_row["maker_taker_role_counts"]["TAKER"], 1)
+
+            capture_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51q_forward_native_evidence_capture_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--native-role-jsonl",
+                    str(acquisition_dir / "native_role_source.jsonl"),
+                    "--native-limit-jsonl",
+                    str(acquisition_dir / "native_limit_source.jsonl"),
+                    "--output-root",
+                    str(capture_root),
+                    "--run-id",
+                    "phase51r_aggregate_to_phase51q_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                capture_result.returncode,
+                0,
+                f"stdout: {capture_result.stdout}\nstderr: {capture_result.stderr}",
+            )
+            capture_summary = json.loads(
+                (
+                    capture_root
+                    / "phase51r_aggregate_to_phase51q_test"
+                    / "phase51q_forward_native_evidence_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(capture_summary["recovered_forward_native_role_count"], 1)
+            self.assertEqual(capture_summary["native_role_capture_status_counts"]["RECOVERED_FORWARD_NATIVE_ROLE"], 1)
+
     def test_phase51r_source_acquisition_feeds_phase51q_without_raw_ids(self):
         """5.1r should normalize venue-native snapshots into redacted 5.1q inputs."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -8827,7 +9125,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(acquisition_summary["gate_reason"], "phase51r_forward_native_source_acquisition_incomplete")
             self.assertEqual(acquisition_summary["native_role_target_count"], 4)
             self.assertEqual(acquisition_summary["native_role_source_record_count"], 2)
-            self.assertEqual(acquisition_summary["native_role_target_recovered_count"], 1)
+            self.assertEqual(acquisition_summary["native_role_target_recovered_count"], 2)
             self.assertEqual(acquisition_summary["native_limit_source_record_count"], 1)
             self.assertEqual(acquisition_summary["native_limit_complete_source_record_count"], 0)
             self.assertEqual(acquisition_summary["lighter_native_limit_target_recovered_count"], 0)
@@ -8866,9 +9164,9 @@ class TestValidatorSubprocess(unittest.TestCase):
                     / "phase51q_forward_native_evidence_summary.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(capture_summary["recovered_forward_native_role_count"], 1)
+            self.assertEqual(capture_summary["recovered_forward_native_role_count"], 2)
             self.assertEqual(capture_summary["native_role_capture_status_counts"]["MISSING_FORWARD_NATIVE_ROLE_SOURCE"], 2)
-            self.assertEqual(capture_summary["native_role_capture_status_counts"]["PARTIAL_FORWARD_NATIVE_ROLE_SOURCE"], 1)
+            self.assertEqual(capture_summary["native_role_capture_status_counts"].get("PARTIAL_FORWARD_NATIVE_ROLE_SOURCE", 0), 0)
             self.assertEqual(capture_summary["native_limit_pressure_status_counts"]["PARTIAL_NATIVE_LIMIT_PRESSURE_SOURCE"], 1)
 
     def test_phase51o_native_role_inventory_rejects_non_native_source(self):
