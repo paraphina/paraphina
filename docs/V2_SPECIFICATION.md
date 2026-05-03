@@ -559,6 +559,20 @@ stripped `3500` raw identifier fields, but found `0` join-key rows; the
 downstream Phase 5.1r rerun therefore kept `0 / 287` native-role targets
 recovered and `0 / 3132` Lighter native-limit targets recovered.
 
+Phase 5.1t adds a HOLD-only source-link sidecar builder in front of Phase 5.1s.
+It reads quarantined local source snapshots, matches only by existing redacted
+order/client identifier hashes in observed P-fill labels, and emits a Phase
+5.1s-compatible `source_links.sanitized.jsonl` sidecar. It does not infer
+maker/taker role, native-limit pressure, EV, PnL, or economic performance. The
+first 5.1t run over existing local Lighter snapshots processed `1522` source
+rows, emitted `363` redacted source-link rows, and let Phase 5.1r apply `909`
+source-link joins. Those joins were not sufficient to clear the blocker:
+5.1q/5.1n still recovered `0 / 287` missing native-role targets and `0 / 3132`
+Lighter native-limit targets. This proves the source-link path is runnable and
+redaction-safe, but existing local artifacts still lack the exact all-five
+venue-native role and complete Lighter native-limit evidence required for
+calibrated EV review.
+
 The next evidence move is to capture forward native snapshots with canonical
 group/order-key linkage, or a validated source-link sidecar that binds redacted
 source hashes to those observed labels. Stage snapshots and any source-link

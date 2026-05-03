@@ -179,6 +179,8 @@ def _field_looks_secret(key: str) -> bool:
     normalized = key.replace("-", "_").lower()
     if "nonsecret" in normalized:
         return False
+    if "authorization" in normalized and normalized.startswith(("no_", "not_")):
+        return False
     return any(fragment in normalized for fragment in SECRET_FIELD_FRAGMENTS)
 
 

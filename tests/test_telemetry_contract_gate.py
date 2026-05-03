@@ -725,6 +725,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51s_local_native_source_acquisition.py"
 
+    def _get_phase51t_source_link_sidecar_builder_path(self) -> Path:
+        """Get path to the Phase 5.1t source-link sidecar builder."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51t_source_link_sidecar_builder.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -7517,6 +7522,216 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(sidecar_only_summary["staged_source_row_count"], 0)
             self.assertEqual(sidecar_only_summary["staged_source_link_row_count"], 1)
             self.assertFalse(sidecar_only_summary["clears_phase51_blockers"])
+
+    def test_phase51t_builder_emits_phase51s_compatible_source_link_sidecar(self):
+        """5.1t should build only redacted sidecars from existing order/client hashes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            source_path = tmp_path / "native_source.jsonl"
+            builder_root = tmp_path / "source_link_builder"
+            staging_root = tmp_path / "local_source_acquisition"
+            acquisition_root = tmp_path / "source_acquisition"
+            manifest_path = tmp_path / "manifest.json"
+            observed_run.mkdir()
+
+            def stable_hash(value):
+                encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+                return hashlib.sha256(encoded).hexdigest()
+
+            client_order_id = "client-order-1"
+            source_row = {
+                "venue_id": "lighter",
+                "ask_client_id": client_order_id,
+                "is_maker_ask": True,
+                "ask_account_id": 123,
+                "bid_account_id": 456,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }
+            expanded_source_row = {"account_index": 123, **source_row}
+            source_path.write_text(json.dumps({
+                "account_index": 123,
+                "not_ev_admission_authorization": True,
+                "trades": [source_row],
+            }), encoding="utf-8")
+
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51t_source_link_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(json.dumps({
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "canonical_group_id": "group-from-identity-hash",
+                "order_key": "order-from-identity-hash",
+                "source_telemetry_sha256": "source-phase51t",
+                "venue_id": "lighter",
+                "side": "Sell",
+                "fill_count": 1,
+                "outcome_status": "OBSERVED_FILLED",
+                "p_fill_outcome": 1.0,
+                "client_order_id_hash": stable_hash(client_order_id),
+                "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            builder_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51t_source_link_sidecar_builder_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--source-json",
+                    str(source_path),
+                    "--output-root",
+                    str(builder_root),
+                    "--run-id",
+                    "phase51t_source_link_builder_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                builder_result.returncode,
+                0,
+                f"stdout: {builder_result.stdout}\nstderr: {builder_result.stderr}",
+            )
+            builder_dir = builder_root / "phase51t_source_link_builder_test"
+            builder_summary = json.loads(
+                (builder_dir / "phase51t_source_link_sidecar_builder_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(builder_summary["gate_status"], "HOLD")
+            self.assertEqual(builder_summary["source_link_record_count"], 1)
+            self.assertEqual(builder_summary["source_link_status_counts"]["SOURCE_LINK_EMITTED"], 1)
+            self.assertFalse(builder_summary["clears_phase51_blockers"])
+            sidecar_row = json.loads(
+                (builder_dir / "source_links.sanitized.jsonl").read_text(encoding="utf-8").strip()
+            )
+            self.assertEqual(sidecar_row["phase51s_source_record_sha256"], stable_hash(expanded_source_row))
+            self.assertEqual(sidecar_row["canonical_group_id"], "group-from-identity-hash")
+            self.assertEqual(sidecar_row["order_key"], "order-from-identity-hash")
+            self.assertNotIn("client_order_id", sidecar_row)
+
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "sources": [{"source_id": "native", "path": str(source_path)}],
+                "source_links": [{"source_link_id": "phase51t_link", "path": str(builder_dir / "source_links.sanitized.jsonl")}],
+            }), encoding="utf-8")
+            staging_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51s_local_native_source_acquisition_path()),
+                    "--manifest",
+                    str(manifest_path),
+                    "--output-root",
+                    str(staging_root),
+                    "--run-id",
+                    "phase51t_to_phase51s_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                staging_result.returncode,
+                0,
+                f"stdout: {staging_result.stdout}\nstderr: {staging_result.stderr}",
+            )
+            staging_dir = staging_root / "phase51t_to_phase51s_test"
+            staged_source = json.loads(
+                (staging_dir / "local_native_source.jsonl").read_text(encoding="utf-8").strip()
+            )
+            self.assertEqual(staged_source["phase51s_source_record_sha256"], stable_hash(expanded_source_row))
+            self.assertNotIn("ask_client_id", staged_source)
+
+            acquisition_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51r_forward_native_source_acquisition_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--source-json",
+                    str(staging_dir / "local_native_source.jsonl"),
+                    "--source-link-jsonl",
+                    str(staging_dir / "local_source_link_sidecar.jsonl"),
+                    "--output-root",
+                    str(acquisition_root),
+                    "--run-id",
+                    "phase51t_to_phase51r_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                acquisition_result.returncode,
+                0,
+                f"stdout: {acquisition_result.stdout}\nstderr: {acquisition_result.stderr}",
+            )
+            acquisition_summary = json.loads(
+                (
+                    acquisition_root
+                    / "phase51t_to_phase51r_test"
+                    / "phase51r_forward_native_source_acquisition_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(acquisition_summary["source_link_applied_count"], 1)
+            self.assertEqual(acquisition_summary["native_role_target_recovered_count"], 1)
+            self.assertEqual(acquisition_summary["raw_identifier_redaction_status"], "PASS")
+
+    def test_phase51t_builder_rejects_secret_shaped_source_fields(self):
+        """5.1t should not stage source-link evidence from secret-bearing inputs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            source_path = tmp_path / "native_source.jsonl"
+            observed_run.mkdir()
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51t_secret_reject_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text("", encoding="utf-8")
+            source_path.write_text(json.dumps({
+                "venue_id": "hyperliquid",
+                "client_order_id": "client-order-1",
+                "private_key": "not-allowed",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51t_source_link_sidecar_builder_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--source-json",
+                    str(source_path),
+                    "--output-root",
+                    str(tmp_path / "source_link_builder"),
+                    "--run-id",
+                    "phase51t_secret_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("secret-shaped source row field", result.stderr)
 
     def test_phase51s_source_link_sidecar_rejects_unsafe_rows(self):
         """5.1s source-link sidecars should be local, redacted, and unambiguous."""

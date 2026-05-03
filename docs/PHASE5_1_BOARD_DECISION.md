@@ -1028,3 +1028,93 @@ cannot be embedded in redacted source rows, provide a redacted manifest
 5.1s -> 5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i, preserving HOLD unless observed
 evidence clears the blockers without raw IDs or unsafe authorization flags.
 ```
+
+## Phase 5.1t Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for HOLD-only source-link sidecar generation through
+`tools/phase51t_source_link_sidecar_builder.py`, followed by Phase 5.1s ->
+5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i.
+
+Rationale:
+
+- Existing local source snapshots may contain raw order/client identifiers that
+  cannot be emitted downstream.
+- Phase 5.1t uses those identifiers only inside a quarantined local process to
+  match existing redacted `order_id_hash` / `client_order_id_hash` values from
+  observed P-fill labels.
+- Phase 5.1t emits only source-record hashes plus `canonical_group_id` /
+  `order_key` joins for Phase 5.1s `source_links` staging.
+- It does not infer maker/taker role, Lighter native-limit pressure, EV,
+  PnL, or financial performance.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1t - Source-link sidecar builder
+tool: tools/phase51t_source_link_sidecar_builder.py
+spec: docs/PHASE5_1T_SOURCE_LINK_SIDECAR_BUILDER.md
+status: HOLD
+authorized output:
+- source_links.sanitized.jsonl for Phase 5.1s manifest source_links
+prohibited:
+- live orders
+- canary
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+```
+
+Existing-source evidence:
+
+```text
+runs/phase51t_source_link_sidecar_builder/PHASE51T-SOURCE-LINK-SIDECAR-BUILDER-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+gate_status: HOLD
+source_row_count: 1522
+source_link_record_count: 363
+source_link_status_counts:
+- SOURCE_LINK_EMITTED: 363
+- DUPLICATE_SOURCE_HASH_ALREADY_EMITTED: 546
+- NO_OBSERVED_IDENTITY_MATCH: 570
+- NO_ORDER_IDENTITY_HASH: 17
+- AMBIGUOUS_OBSERVED_IDENTITY_MATCH: 26
+clears_phase51_blockers: false
+```
+
+Downstream evidence:
+
+```text
+runs/phase51s_local_native_source_acquisition/PHASE51T-TO-S-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+staged_source_row_count: 1522
+staged_source_link_row_count: 363
+
+runs/phase51r_forward_native_source_acquisition/PHASE51T-TO-R-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+source_link_applied_count: 909
+native_role_source_record_count: 296
+native_role_target_recovered_count: 0 / 287
+lighter_native_limit_target_recovered_count: 0 / 3132
+
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51T-PFILL-FEATURE-MATRIX-ADMISSIBILITY-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+```
+
+Next move:
+
+```text
+Use Phase 5.1t for future forward captures where direct canonical group/order
+keys cannot be embedded in redacted source rows. Existing local Lighter
+artifacts are now exhausted for blocker reduction: they prove sidecar plumbing
+works but do not clear missing all-five venue-native roles or complete Lighter
+native-limit pressure. Capture new forward read-only native source rows with
+canonical linkage, then rerun 5.1t/5.1s/5.1r/5.1q/5.1n/5.1h/5.1i.
+```

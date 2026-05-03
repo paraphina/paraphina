@@ -872,6 +872,19 @@ require measurable blocker reduction without raw identifiers,
 live/canary/capital/risk authorization, model-training shortcuts, or
 selection-bias shortcuts.
 
+After Phase 5.1t, source-link generation is repo-owned and should be used
+before Phase 5.1s whenever a local forward source snapshot contains raw
+order/client identifiers that cannot be emitted. The first 5.1t run over
+existing local Lighter snapshots emitted `363` redacted source-link rows from
+`1522` source rows. The downstream chain staged those sidecars, Phase 5.1r
+applied `909` source-link joins and emitted `296` native-role source records,
+but Phase 5.1q/5.1n/5.1h/5.1i still recovered `0 / 287` missing native-role
+targets and `0 / 3132` Lighter native-limit targets. Existing local Lighter
+artifacts are therefore exhausted for blocker reduction. The next command
+target is fresh forward read-only native source capture with canonical linkage
+or 5.1t-compatible sidecars across all five venues, plus complete Lighter
+event-time active-order/sendTx/REST-or-weighted-request pressure.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7

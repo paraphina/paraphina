@@ -53,6 +53,11 @@ observed P-fill labels and rejects raw IDs, duplicate hashes, ambiguous
 mappings, or unsafe flags. The sidecar is only join evidence; it does not infer
 maker/taker role or Lighter native-limit pressure.
 
+Phase 5.1t (`tools/phase51t_source_link_sidecar_builder.py`) is the repo-owned
+HOLD-only helper for building these sidecars from quarantined local snapshots.
+It matches only by existing redacted order/client identifier hashes and emits
+`source_links.sanitized.jsonl` for this manifest `source_links` input.
+
 ## Safety Contract
 
 Phase 5.1s rejects:

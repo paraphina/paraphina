@@ -69,6 +69,137 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1t - Source-Link Sidecar Builder
+
+- Run id:
+  `PHASE51T-SOURCE-LINK-SIDECAR-BUILDER-EXISTING-LIGHTER-SOURCES-20260503T000000Z`
+- Local run directory:
+  `runs/phase51t_source_link_sidecar_builder/PHASE51T-SOURCE-LINK-SIDECAR-BUILDER-EXISTING-LIGHTER-SOURCES-20260503T000000Z`
+- Scope: existing local Lighter read-only source snapshots and trade backfills.
+- Gate status: `HOLD`
+- Gate reason: `phase51t_source_link_sidecar_builder_complete_nonlive_hold`
+- Source files scanned: `31`
+- Source rows scanned: `1522`
+- Redacted source-link rows emitted: `363`
+- Ambiguous identity-hash target count: `48`
+- `clears_phase51_blockers`: `false`
+- Safety flags: all live, canary, capital, risk-relaxation, EV-admission,
+  model-training, and financial-claim authorization fields are `false`.
+
+Source-link status counts:
+
+```text
+SOURCE_LINK_EMITTED: 363
+DUPLICATE_SOURCE_HASH_ALREADY_EMITTED: 546
+NO_OBSERVED_IDENTITY_MATCH: 570
+NO_ORDER_IDENTITY_HASH: 17
+AMBIGUOUS_OBSERVED_IDENTITY_MATCH: 26
+```
+
+Downstream rerun chain:
+
+```text
+5.1s run:
+runs/phase51s_local_native_source_acquisition/PHASE51T-TO-S-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+staged_source_row_count: 1522
+staged_source_link_row_count: 363
+
+5.1r run:
+runs/phase51r_forward_native_source_acquisition/PHASE51T-TO-R-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+source_link_applied_count: 909
+native_role_source_record_count: 296
+native_role_target_recovered_count: 0 / 287
+lighter_native_limit_target_recovered_count: 0 / 3132
+
+5.1q run:
+runs/phase51q_forward_native_evidence/PHASE51T-FORWARD-NATIVE-EVIDENCE-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+recovered_forward_native_role_count: 0
+
+5.1n run:
+runs/phase51n_maker_taker_attribution_recovery/PHASE51T-MAKER-TAKER-ATTRIBUTION-RECOVERY-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+maker_taker_observed_or_recovered_count: 174
+maker_taker_partial_or_missing_count: 287
+
+5.1h run:
+runs/phase51h_observed_pfill_feature_audit/PHASE51T-OBSERVED-PFILL-FEATURE-AUDIT-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+maker_taker_observed_count: 174
+maker_taker_partial_or_unknown_count: 222
+maker_taker_missing_count: 65
+
+5.1i run:
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51T-PFILL-FEATURE-MATRIX-ADMISSIBILITY-EXISTING-LIGHTER-SOURCES-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+matrix_blocker_count: 4
+matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+```
+
+Commands:
+
+```bash
+python3 tools/phase51t_source_link_sidecar_builder.py \
+  --observed-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --source-root runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T001126Z/source_snapshots \
+  --source-root runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002006Z/source_snapshots \
+  --source-root runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS-20260502T002535Z/source_snapshots \
+  --source-root runs/phase51b_lighter_account_native_limits/PHASE51M-LIGHTER-OFFICIAL-LIMIT-ENRICHMENT-20260503T000000Z/source_snapshots \
+  --source-root runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-COMBINED-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots \
+  --source-root runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-FROM-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots \
+  --source-root runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-OFFLINE-EXISTING-20260502T1135Z/source_snapshots \
+  --source-root runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T025435Z/source_snapshots \
+  --source-root runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots \
+  --output-root runs/phase51t_source_link_sidecar_builder \
+  --run-id PHASE51T-SOURCE-LINK-SIDECAR-BUILDER-EXISTING-LIGHTER-SOURCES-20260503T000000Z \
+  --timestamp-ns 1777852800000000000
+
+python3 tools/phase51s_local_native_source_acquisition.py \
+  --manifest runs/phase51t_source_link_sidecar_builder/PHASE51T-SOURCE-LINK-SIDECAR-BUILDER-EXISTING-LIGHTER-SOURCES-20260503T000000Z/phase51s_existing_lighter_sources_manifest.json \
+  --output-root runs/phase51s_local_native_source_acquisition \
+  --run-id PHASE51T-TO-S-EXISTING-LIGHTER-SOURCES-20260503T000000Z \
+  --timestamp-ns 1777852800000000000
+
+python3 tools/phase51r_forward_native_source_acquisition.py \
+  --observed-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --source-json runs/phase51s_local_native_source_acquisition/PHASE51T-TO-S-EXISTING-LIGHTER-SOURCES-20260503T000000Z/local_native_source.jsonl \
+  --source-link-jsonl runs/phase51s_local_native_source_acquisition/PHASE51T-TO-S-EXISTING-LIGHTER-SOURCES-20260503T000000Z/local_source_link_sidecar.jsonl \
+  --output-root runs/phase51r_forward_native_source_acquisition \
+  --run-id PHASE51T-TO-R-EXISTING-LIGHTER-SOURCES-20260503T000000Z \
+  --timestamp-ns 1777852800000000000
+
+python3 tools/phase51q_forward_native_evidence_capture.py \
+  --observed-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --native-role-jsonl runs/phase51r_forward_native_source_acquisition/PHASE51T-TO-R-EXISTING-LIGHTER-SOURCES-20260503T000000Z/native_role_source.jsonl \
+  --native-limit-jsonl runs/phase51r_forward_native_source_acquisition/PHASE51T-TO-R-EXISTING-LIGHTER-SOURCES-20260503T000000Z/native_limit_source.jsonl \
+  --output-root runs/phase51q_forward_native_evidence \
+  --run-id PHASE51T-FORWARD-NATIVE-EVIDENCE-EXISTING-LIGHTER-SOURCES-20260503T000000Z \
+  --timestamp-ns 1777852800000000000
+```
+
+Artifact hashes:
+
+```text
+c7046d5a763eddd06faded62bb9f461ea9918f619492b84da20e4ca85047bec8  phase51t_source_link_sidecar_builder_summary.json
+018f2fa0671de3496853788c037438336eaed9288d09b25fcf16d1a7802e7125  source_links.sanitized.jsonl
+83da939f05757b19ab81658d08632a1af37ff994f05ca98c7bbc52bea16584ec  phase51s_local_native_source_acquisition_summary.json
+5cd5f04896bd74d3afb05ea75928a3d35ecd797cac30016b29aa63bd5d720e7f  phase51r_forward_native_source_acquisition_summary.json
+6521fa74d37903981c322dd60f28345dfe732314bed8dd762e9e5305d18a54f2  phase51q_forward_native_evidence_summary.json
+56de16b4384a2753e022658e84c1510c59f994ddd911599691b9155918260bdc  maker_taker_attribution_recovery_summary.json
+c73f3ff5fc428578541cd4369b26e6b8db923ca2ef32eb958fabf13288902c65  pfill_feature_audit_summary.json
+a445a340aed5b695216dabcadd8cedd0dccec7842ec6d896e0c7886064cbedbd  pfill_feature_matrix_admissibility_summary.json
+```
+
+Interpretation: Phase 5.1t is a useful and safe source-link plumbing gate, but
+existing local artifacts do not clear the current blockers. The next evidence
+move remains fresh forward read-only native source capture with canonical
+linkage or 5.1t-compatible sidecars across all five venues, plus complete
+Lighter event-time active-order/sendTx/REST-or-weighted-request pressure.
+
 ## Phase 5.1m - Lighter Official-Doc Native-Limit Enrichment
 
 Date: 2026-05-03

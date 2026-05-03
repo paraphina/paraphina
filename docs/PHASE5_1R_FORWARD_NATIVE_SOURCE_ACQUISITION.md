@@ -55,6 +55,9 @@ by a deterministic source hash. The sidecar is non-live evidence plumbing only.
 Forward local captures should stage source-link sidecars through the Phase 5.1s
 manifest `source_links` list, which emits `local_source_link_sidecar.jsonl` for
 this Phase 5.1r `--source-link-jsonl` input.
+Phase 5.1t (`tools/phase51t_source_link_sidecar_builder.py`) is the repo-owned
+helper for producing those sidecars from quarantined local source snapshots
+when only redacted order/client identifier hashes can establish the join.
 
 Allowed sidecar fields:
 
