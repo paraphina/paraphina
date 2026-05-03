@@ -34,16 +34,19 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1u as the active forward capture target-manifest gate,
-   Phase 5.1s as the local native source-staging gate, Phase 5.1t as the
-   optional source-link sidecar builder, Phase 5.1r as the forward native
-   source-acquisition layer, and Phase 5.1q as the downstream forward-evidence
-   gate. Phase 5.1u is repo-owned, non-live, and emits the exact target list
-   for fresh all-five native role capture plus Lighter event-time native-limit
-   pressure. Phase 5.1s requires an explicit local manifest, rejects unsafe
-   source surfaces, strips raw identifiers, emits a redacted
-   `local_native_source.jsonl` for Phase 5.1r, and stages optional manifest
-   `source_links` as `local_source_link_sidecar.jsonl`.
+2. Treat Phase 5.1u as the active forward capture target-manifest gate, Phase
+   5.1v as the offline capture bundle-readiness gate, Phase 5.1s as the local
+   native source-staging gate, Phase 5.1t as the optional source-link sidecar
+   builder, Phase 5.1r as the forward native source-acquisition layer, and
+   Phase 5.1q as the downstream forward-evidence gate. Phase 5.1u is
+   repo-owned, non-live, and emits the exact target list for fresh all-five
+   native role capture plus Lighter event-time native-limit pressure. Phase
+   5.1v consumes a local candidate capture bundle manifest, rejects unsafe
+   source surfaces, and emits a generated Phase 5.1s manifest only when all
+   targets are structurally ready. Phase 5.1s requires an explicit local
+   manifest, rejects unsafe source surfaces, strips raw identifiers, emits a
+   redacted `local_native_source.jsonl` for Phase 5.1r, and stages optional
+   manifest `source_links` as `local_source_link_sidecar.jsonl`.
 3. The current Phase 5.1p recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
    `4527` observed horizons available, `0` observed horizons still missing,
@@ -55,19 +58,22 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    filled-order maker/taker status is incomplete for `287` labels, some
    venue/side buckets remain sparse, and `1613` quarantined/review groups remain
    excluded from the observed-only diagnostic pack.
-5. Next repo-owned move is another non-live evidence step: execute a fresh
-   read-only forward source-capture pilot against the Phase 5.1u target
-   manifest. Capture or locate native snapshots with canonical group/order-key
-   linkage, or a redacted Phase 5.1t/5.1s `source_links` sidecar that validates
-   those joins by source hash. Stage snapshots through Phase 5.1s, run Phase
-   5.1r, feed its sanitized outputs into Phase 5.1q, feed Phase 5.1q
-   `native_role_evidence.jsonl` into Phase 5.1n, then rerun the recovered
-   5.1h/5.1i matrix. Do not train models from Phase 5.1u, Phase 5.1s, Phase
-   5.1r, or Phase 5.1q.
+5. Next repo-owned move is another non-live evidence step: acquire or produce
+   a sanitized local read-only all-five forward capture bundle, then run Phase
+   5.1v against the Phase 5.1u target manifest. Capture or locate native
+   snapshots with canonical group/order-key linkage, or a redacted Phase
+   5.1t/5.1s `source_links` sidecar that validates those joins by source hash.
+   If 5.1v emits `generated_phase51s_manifest_ready=true`, stage the generated
+   manifest through Phase 5.1s, run Phase 5.1r, feed its sanitized outputs into
+   Phase 5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into Phase 5.1n,
+   then rerun the recovered 5.1h/5.1i matrix. Do not train models from Phase
+   5.1u, Phase 5.1v, Phase 5.1s, Phase 5.1r, or Phase 5.1q.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
-7. Use `docs/PHASE5_1S_LOCAL_NATIVE_SOURCE_ACQUISITION.md` as the standing
+7. Use `docs/PHASE5_1V_FORWARD_CAPTURE_BUNDLE_READINESS.md` as the standing
+   contract for capture bundle readiness,
+   `docs/PHASE5_1S_LOCAL_NATIVE_SOURCE_ACQUISITION.md` as the standing
    contract for local source staging,
    `docs/PHASE5_1R_FORWARD_NATIVE_SOURCE_ACQUISITION.md` as the standing
    contract for source acquisition, `docs/PHASE5_1Q_FORWARD_NATIVE_EVIDENCE.md`
@@ -842,7 +848,7 @@ The audit must answer:
 4. Read this document.
 5. Read `ROADMAP.md` Phase 5.1 / V2 target specification gate.
 6. Read `docs/V2_SPECIFICATION.md` current evidence boundary and blockers.
-7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1s board decision.
+7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1v board decision.
 8. Confirm runtime is still shadow before any evidence capture:
 
 ```bash
@@ -873,12 +879,41 @@ clears_phase51_blockers: false
 
 Execute a read-only forward source-capture pilot against that target manifest.
 Capture all-five venue-native maker/taker fields and complete Lighter
-event-time active-order/sendTx/REST-or-weighted-request pressure. Use direct
-canonical group/order-key linkage where possible; otherwise use Phase 5.1t to
-build 5.1s-compatible source-link sidecars. Then rerun Phase 5.1s -> 5.1r ->
-5.1q -> 5.1n -> 5.1h -> 5.1i, and require measurable blocker reduction
-without raw identifiers, live/canary/capital/risk authorization,
-model-training shortcuts, or selection-bias shortcuts.
+event-time active-order/sendTx/REST-or-weighted-request pressure into a
+sanitized local bundle. Use direct canonical group/order-key linkage where
+possible; otherwise use Phase 5.1t to build 5.1s-compatible source-link
+sidecars. First run Phase 5.1v:
+
+```bash
+python3 tools/phase51v_forward_capture_bundle_readiness.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --candidate-manifest <local_capture_bundle_manifest.json> \
+  --run-id <phase51v_run_id>
+```
+
+Only if `generated_phase51s_manifest_ready=true`, run Phase 5.1s using:
+
+```bash
+runs/phase51v_forward_capture_bundle_readiness/<phase51v_run_id>/phase51s_manifest.generated.json
+```
+
+Then rerun Phase 5.1s -> 5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i, and require
+measurable blocker reduction without raw identifiers,
+live/canary/capital/risk authorization, model-training shortcuts, or
+selection-bias shortcuts.
+
+The baseline Phase 5.1v run against the Phase 5.1u placeholder template is:
+
+```text
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-FORWARD-CAPTURE-BUNDLE-READINESS-TEMPLATE-20260503T000000Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 0 / 287
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+source_file_status_counts:
+- PLACEHOLDER_PATH: 6
+generated_phase51s_manifest_ready: false
+clears_phase51_blockers: false
+```
 
 After Phase 5.1t, source-link generation is repo-owned and should be used
 before Phase 5.1s whenever a local forward source snapshot contains raw
@@ -889,9 +924,10 @@ applied `909` source-link joins and emitted `296` native-role source records,
 but Phase 5.1q/5.1n/5.1h/5.1i still recovered `0 / 287` missing native-role
 targets and `0 / 3132` Lighter native-limit targets. Existing local Lighter
 artifacts are therefore exhausted for blocker reduction. The next command
-target is fresh forward read-only native source capture with canonical linkage
-or 5.1t-compatible sidecars across all five venues, plus complete Lighter
-event-time active-order/sendTx/REST-or-weighted-request pressure.
+target is a sanitized local forward read-only native source capture bundle
+with canonical linkage or 5.1t-compatible sidecars across all five venues,
+plus complete Lighter event-time active-order/sendTx/REST-or-weighted-request
+pressure, validated by Phase 5.1v before Phase 5.1s.
 
 ## Current Verdict
 

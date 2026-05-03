@@ -735,6 +735,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51u_forward_capture_target_manifest.py"
 
+    def _get_phase51v_forward_capture_bundle_readiness_path(self) -> Path:
+        """Get path to the Phase 5.1v forward capture bundle-readiness gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51v_forward_capture_bundle_readiness.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -7906,6 +7911,333 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("unsafe label flag approved_for_live=true", result.stderr)
+
+    def test_phase51v_forward_capture_bundle_readiness_accepts_local_bundle(self):
+        """5.1v should verify local source rows and emit a Phase 5.1s-ready manifest."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            output_root = tmp_path / "phase51v_readiness"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 2,
+                "lighter_native_limit_capture_target_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            role_targets = [
+                {
+                    "canonical_group_id": "hyper-group",
+                    "order_key": "hyper-order",
+                    "venue_id": "hyperliquid",
+                    "required_native_role_source": "HYPERLIQUID_CROSSED",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "lighter-group",
+                    "order_key": "lighter-order",
+                    "venue_id": "lighter",
+                    "required_native_role_source": "LIGHTER_TRADES_JSON",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            limit_targets = [
+                {
+                    "canonical_group_id": "lighter-group",
+                    "order_key": "lighter-order",
+                    "venue_id": "lighter",
+                    "required_native_limit_source": "LIGHTER_LIMITS_AT_DECISION_TIME",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }
+            ]
+            (target_run / "native_role_capture_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in role_targets),
+                encoding="utf-8",
+            )
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in limit_targets),
+                encoding="utf-8",
+            )
+            source_path = tmp_path / "local_native_source.jsonl"
+            source_rows = [
+                {
+                    "venue_id": "hyperliquid",
+                    "order_key": "hyper-order",
+                    "crossed": False,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "venue_id": "lighter",
+                    "canonical_group_id": "lighter-group",
+                    "account_index": 7,
+                    "is_maker_ask": True,
+                    "ask_account_id": 8,
+                    "bid_account_id": 9,
+                    "active_order_headroom_account": 100,
+                    "active_order_headroom_market": 20,
+                    "sendtx_per_minute_limit": 120,
+                    "sendtx_per_minute_remaining": 119,
+                    "weighted_requests_per_minute_limit": 300,
+                    "weighted_requests_per_minute_remaining": 299,
+                    "native_limit_event_time_status": "EVENT_TIME_ALIGNED",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            source_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in source_rows),
+                encoding="utf-8",
+            )
+            candidate_manifest = tmp_path / "capture_bundle_manifest.json"
+            candidate_manifest.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [
+                    {
+                        "source_id": "local_all5_sample",
+                        "venue_id": "mixed",
+                        "path": str(source_path),
+                    }
+                ],
+                "source_links": [],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(candidate_manifest),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51v_ready_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            run_dir = output_root / "phase51v_ready_test"
+            summary = json.loads(
+                (run_dir / "phase51v_forward_capture_bundle_readiness_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["gate_reason"], "phase51v_forward_capture_bundle_ready_for_phase51s_nonlive_hold")
+            self.assertEqual(summary["native_role_capture_target_ready_count"], 2)
+            self.assertEqual(summary["native_role_capture_target_missing_count"], 0)
+            self.assertEqual(summary["lighter_native_limit_capture_target_ready_count"], 1)
+            self.assertEqual(summary["lighter_native_limit_capture_target_missing_count"], 0)
+            self.assertEqual(summary["source_file_status_counts"], {"LOCAL_FILE_READY": 1})
+            self.assertTrue(summary["generated_phase51s_manifest_ready"])
+            self.assertEqual(summary["generated_phase51s_source_count"], 1)
+            self.assertFalse(summary["clears_phase51_blockers"])
+            generated_manifest = json.loads(
+                (run_dir / "phase51s_manifest.generated.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(generated_manifest["sources"][0]["path"], str(source_path))
+            self.assertFalse(generated_manifest["live_orders_allowed"])
+            labels_text = (run_dir / "capture_bundle_readiness_labels.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("client_order_id", labels_text)
+            self.assertNotIn("trade_id", labels_text)
+
+    def test_phase51v_forward_capture_bundle_readiness_holds_template_placeholders(self):
+        """5.1v should keep placeholder capture manifests in HOLD with no ready targets."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            output_root = tmp_path / "phase51v_readiness"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "hyper-group",
+                "order_key": "hyper-order",
+                "venue_id": "hyperliquid",
+                "required_native_role_source": "HYPERLIQUID_CROSSED",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "lighter-group",
+                "order_key": "lighter-order",
+                "venue_id": "lighter",
+                "required_native_limit_source": "LIGHTER_LIMITS_AT_DECISION_TIME",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            candidate_manifest = tmp_path / "capture_bundle_manifest_template.json"
+            candidate_manifest.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [
+                    {
+                        "source_id": "hyperliquid_private_fills",
+                        "venue_id": "hyperliquid",
+                        "path": "<local_sanitized_hyperliquid_private_fills.jsonl>",
+                    }
+                ],
+                "source_links": [
+                    {
+                        "source_link_id": "optional_links",
+                        "path": "<optional_phase51t_source_link_sidecar.jsonl>",
+                    }
+                ],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(candidate_manifest),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51v_template_hold_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            summary = json.loads(
+                (
+                    output_root
+                    / "phase51v_template_hold_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_reason"], "phase51v_forward_capture_bundle_incomplete_nonlive_hold")
+            self.assertEqual(summary["native_role_capture_target_ready_count"], 0)
+            self.assertEqual(summary["lighter_native_limit_capture_target_ready_count"], 0)
+            self.assertEqual(summary["source_file_status_counts"], {"PLACEHOLDER_PATH": 1})
+            self.assertEqual(summary["source_link_file_status_counts"], {"PLACEHOLDER_PATH": 1})
+            self.assertFalse(summary["generated_phase51s_manifest_ready"])
+            self.assertEqual(summary["generated_phase51s_source_count"], 0)
+
+    def test_phase51v_forward_capture_bundle_readiness_rejects_unsafe_manifest(self):
+        """5.1v should reject network paths and secret-shaped manifest fields."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 0,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+            secret_manifest = tmp_path / "secret_manifest.json"
+            secret_manifest.write_text(json.dumps({
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "api_key": "redacted",
+                "approved_for_live": False,
+            }), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(secret_manifest),
+                    "--output-root",
+                    str(tmp_path / "phase51v_readiness"),
+                    "--run-id",
+                    "phase51v_unsafe_secret_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("secret-shaped candidate manifest field", result.stderr)
+
+            network_manifest = tmp_path / "network_manifest.json"
+            network_manifest.write_text(json.dumps({
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "sources": [
+                    {
+                        "source_id": "network_source",
+                        "venue_id": "hyperliquid",
+                        "path": "https://example.com/private_fills.jsonl",
+                    }
+                ],
+            }), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(network_manifest),
+                    "--output-root",
+                    str(tmp_path / "phase51v_readiness"),
+                    "--run-id",
+                    "phase51v_unsafe_network_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("network source[0] paths are prohibited", result.stderr)
 
     def test_phase51s_source_link_sidecar_rejects_unsafe_rows(self):
         """5.1s source-link sidecars should be local, redacted, and unambiguous."""

@@ -17,11 +17,12 @@ Primary source addenda:
 Current repo evidence boundary:
 
 - Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
-- Current Phase 5.1 evidence boundary: Phase 5.1u forward capture target
-  manifest is the active non-live preflight in front of fresh all-five native
-  source capture; Phase 5.1s stages local source bundles, Phase 5.1t builds
-  optional source-link sidecars, and Phase 5.1r validates redacted
-  source-hash joins before Phase 5.1q
+- Current Phase 5.1 evidence boundary: Phase 5.1u emits the active forward
+  capture target manifest, and Phase 5.1v is the active offline readiness gate
+  that verifies a sanitized local capture bundle before Phase 5.1s; Phase 5.1s
+  stages local source bundles, Phase 5.1t builds optional source-link
+  sidecars, and Phase 5.1r validates redacted source-hash joins before Phase
+  5.1q
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
 
@@ -582,11 +583,25 @@ capture bundle manifest template for Phase 5.1s. Phase 5.1u does not capture
 source truth, does not clear blockers by itself, and does not infer maker/taker
 role, native-limit pressure, EV, PnL, or economic performance.
 
-The next evidence move is to use Phase 5.1u as the target list for a fresh
-read-only forward source-capture pilot. Capture native snapshots with canonical
-group/order-key linkage, or a validated source-link sidecar that binds redacted
-source hashes to observed labels. Stage snapshots and sidecars through Phase
-5.1s, run Phase 5.1r, feed the sanitized outputs into Phase 5.1q, and rerun
-Phase 5.1n/5.1h/5.1i. No model training, EV admission, canary, live orders,
-capital escalation, risk-limit relaxation, or financial claim is authorized
-from Phase 5.1s, Phase 5.1r, Phase 5.1q, Phase 5.1t, or Phase 5.1u.
+Phase 5.1v adds a HOLD-only forward capture bundle-readiness gate in front of
+Phase 5.1s. It consumes the Phase 5.1u target run and a local candidate
+capture-bundle manifest, rejects unsafe source surfaces, checks whether local
+redacted source rows cover the required all-five native role targets and
+Lighter native-limit targets, and emits a Phase 5.1s-ready generated manifest
+only when all targets are structurally ready. Its baseline run against the
+Phase 5.1u placeholder template intentionally remains `HOLD`: `0 / 287`
+native-role targets ready, `0 / 3132` Lighter native-limit targets ready, and
+`PLACEHOLDER_PATH` source status. Phase 5.1v does not capture source truth,
+does not clear blockers by itself, and does not infer maker/taker role,
+native-limit pressure, EV, PnL, or economic performance.
+
+The next evidence move is to acquire or produce a sanitized local read-only
+all-five forward source-capture bundle, run it through Phase 5.1v, and only if
+5.1v emits `generated_phase51s_manifest_ready=true`, stage the generated
+manifest through Phase 5.1s. The bundle must contain native snapshots with
+canonical group/order-key linkage, or validated source-link sidecars that bind
+redacted source hashes to observed labels. After Phase 5.1s, run Phase 5.1r,
+feed the sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No
+model training, EV admission, canary, live orders, capital escalation,
+risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
+5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, or Phase 5.1v.

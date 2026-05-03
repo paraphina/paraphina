@@ -1189,3 +1189,82 @@ source-link sidecars. Then rerun 5.1s -> 5.1r -> 5.1q -> 5.1n -> 5.1h ->
 5.1i and require measurable blocker reduction before any calibration/model
 training review.
 ```
+
+## Phase 5.1v Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for offline forward capture bundle-readiness
+validation through `tools/phase51v_forward_capture_bundle_readiness.py`.
+
+Rationale:
+
+- The Phase 5.1u target manifest is exact, but the repo still needs a safe
+  handoff between externally captured sanitized private/read-only source files
+  and Phase 5.1s.
+- Phase 5.1v verifies local bundle readiness without network calls, venue API
+  calls, secret reads, live orders, source-truth inference, EV admission, or
+  model training.
+- The gate rejects unsafe source surfaces and emits a generated Phase 5.1s
+  manifest only when all targets are structurally covered by local redacted
+  source rows or staged source-link sidecars.
+- The baseline run against the Phase 5.1u placeholder template correctly
+  remains `HOLD` and clears no blocker.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1v - Forward capture bundle readiness
+tool: tools/phase51v_forward_capture_bundle_readiness.py
+spec: docs/PHASE5_1V_FORWARD_CAPTURE_BUNDLE_READINESS.md
+status: HOLD
+authorized output:
+- capture_bundle_readiness_labels.jsonl
+- missing_native_role_capture_targets.jsonl
+- missing_lighter_native_limit_capture_targets.jsonl
+- phase51s_manifest.generated.json
+- phase51v_forward_capture_bundle_readiness_summary.json
+- phase51v_manifest.json
+prohibited:
+- live orders
+- canary
+- network source paths
+- secret-shaped fields
+- .env source files
+- symlink source files
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+- source truth inference
+```
+
+Baseline bundle-readiness evidence:
+
+```text
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-FORWARD-CAPTURE-BUNDLE-READINESS-TEMPLATE-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51v_forward_capture_bundle_incomplete_nonlive_hold
+native_role_capture_target_ready_count: 0 / 287
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+source_file_status_counts:
+- PLACEHOLDER_PATH: 6
+source_link_file_status_counts:
+- PLACEHOLDER_PATH: 1
+generated_phase51s_manifest_ready: false
+downstream_chain_ready: false
+clears_phase51_blockers: false
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Acquire or produce a sanitized local read-only all-five forward capture bundle,
+run Phase 5.1v against the Phase 5.1u target manifest, and only if 5.1v emits
+generated_phase51s_manifest_ready=true run 5.1s -> 5.1r -> 5.1q -> 5.1n ->
+5.1h -> 5.1i. Require measurable blocker reduction before any
+calibration/model-training review.
+```
