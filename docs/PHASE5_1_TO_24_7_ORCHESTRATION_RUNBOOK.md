@@ -34,23 +34,27 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
-2. Treat Phase 5.1l as the current evidence boundary. It proves the remaining
+2. Treat Phase 5.1m as the current evidence boundary. It proves the remaining
    filled-order source-tick horizon gap can be closed with source keys and
    hashed observed-fill fallback without raw fill/order ID emission, and that
-   the recovered feature-matrix gate still fails closed.
-3. The current Phase 5.1l recovered matrix pack remains `HOLD`: `4527`
+   Lighter active-order capacity can be documented with official caps plus
+   observed current active-order counts without falsely treating the snapshot as
+   label-event-time native pressure.
+3. The current Phase 5.1m recovered matrix pack remains `HOLD`: `4527`
    observed terminal labels, `461` fills, `4066` terminal not-filled labels,
    `4527` observed horizons available, `0` observed horizons still missing,
    all `4527` joined to queue/churn, all `4527` source-covered by markout
    readiness, and raw identifier redaction status `PASS`.
 4. The dominant blockers are feature quality and selection bias, not live
-   runtime reachability: Lighter native-limit context is only partial for `2288`
-   labels, filled-order maker/taker status is incomplete for `287` labels,
-   some venue/side buckets remain sparse, and `1613` quarantined/review groups
-   remain excluded from the observed-only diagnostic pack.
+   runtime reachability: Lighter native-limit context remains partial for
+   `2288` labels because it is not event-time aligned, filled-order maker/taker
+   status is incomplete for `287` labels, some venue/side buckets remain sparse,
+   and `1613` quarantined/review groups remain excluded from the observed-only
+   diagnostic pack.
 5. Next repo-owned move is another non-live evidence step: improve venue-native
-   Lighter limit/maker-taker completeness while preserving sparse-bucket and
-   selection-bias holds. Do not train models from 5.1l.
+   event-time native-limit pressure and maker/taker completeness across all
+   filled venues while preserving sparse-bucket and selection-bias holds. Do not
+   train models from 5.1m.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
@@ -486,20 +490,19 @@ Current 5.1i evidence:
 - Run:
   `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51I-PFILL-FEATURE-MATRIX-ADMISSIBILITY-REDACTED-TWO-LANE-20260502T000000Z`
 - Gate remains `HOLD` with reason
-  `phase51i_missing_observed_horizon_features`.
+  `phase51i_lighter_native_limit_pressure_not_fully_observed`.
 - Redaction status: `PASS`; raw identifier input present: `0`.
 - Matrix labels: `4527`; filled: `461`; terminal not-filled: `4066`.
 - Train/holdout: `3625` / `902`.
 - Queue/churn joined all: `4527`; queue misses: `0`.
 - Markout source context available: `4527`.
-- Observed horizon available: `18`; missing: `4509`.
-- Lighter native-limit context: `2288` partial and `0` fully observed.
+- Observed horizon available: `4527`; missing: `0`.
+- Lighter native-limit context: `0` observed, `2288` partial, and `0` unknown.
 - Filled-order maker/taker gaps: `222` partial/unknown and `65` missing.
 - Excluded quarantine/review groups: `1613` with reasons `1135`
   duplicate-alias/no-terminal, `375` cancel-all scope, `95` replace-chain
   review, and `8` right-censored/no-terminal.
-- Matrix blockers: `missing_observed_horizon_features`,
-  `lighter_native_limit_pressure_not_fully_observed`,
+- Matrix blockers: `lighter_native_limit_pressure_not_fully_observed`,
   `maker_taker_not_fully_observed_for_filled_orders`,
   `sparse_pfill_feature_buckets`, and
   `observed_only_selection_bias_not_resolved`.
@@ -624,14 +627,16 @@ Current repo-owned tooling:
 - The tool never emits raw fill IDs, order IDs, client order IDs, venue order
   IDs, or decision IDs. Raw upstream identifiers are not used as output fields.
 
-Current 5.1l evidence:
+Current 5.1m evidence:
 
 - Filled-horizon source-key recovery run:
   `runs/phase51l_filled_horizon_source_key_recovery/PHASE51L-FILLED-HORIZON-SOURCE-KEY-RECOVERY-TWO-LANE-20260502T000000Z`
+- Lighter official-doc native-limit enrichment run:
+  `runs/phase51b_lighter_account_native_limits/PHASE51M-LIGHTER-OFFICIAL-LIMIT-ENRICHMENT-20260503T000000Z`
 - Recovered 5.1h run:
-  `runs/phase51h_observed_pfill_feature_audit/PHASE51L-RECOVERED-OBSERVED-PFILL-FEATURE-AUDIT-TWO-LANE-20260502T000000Z`
+  `runs/phase51h_observed_pfill_feature_audit/PHASE51M-OBSERVED-PFILL-FEATURE-AUDIT-NATIVE-DOC-CAP-TWO-LANE-20260503T000000Z`
 - Recovered 5.1i run:
-  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51L-PFILL-FEATURE-MATRIX-ADMISSIBILITY-TWO-LANE-20260502T000000Z`
+  `runs/phase51i_pfill_feature_matrix_admissibility/PHASE51M-PFILL-FEATURE-MATRIX-ADMISSIBILITY-NATIVE-DOC-CAP-TWO-LANE-20260503T000000Z`
 - 5.1l recovery gate remains `HOLD` with reason
   `phase51l_filled_horizon_source_key_complete_nonlive_hold`.
 - Recovered matrix remains `HOLD` with reason
@@ -640,6 +645,7 @@ Current 5.1l evidence:
 - Remaining filled-horizon missing joins recovered: `65 / 65`.
 - Recovery path split: `43` source P-fill horizon, `22` observed-fill hash.
 - Recovered observed horizon available/missing: `4527` / `0`.
+- Recovered Lighter native-limit observed/partial/unknown: `0` / `2288` / `0`.
 - Matrix blockers remain: `lighter_native_limit_pressure_not_fully_observed`,
   `maker_taker_not_fully_observed_for_filled_orders`,
   `sparse_pfill_feature_buckets`, and
@@ -785,7 +791,7 @@ The audit must answer:
 4. Read this document.
 5. Read `ROADMAP.md` Phase 5.1 / V2 target specification gate.
 6. Read `docs/V2_SPECIFICATION.md` current evidence boundary and blockers.
-7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1l board decision.
+7. Read `docs/PHASE5_1_BOARD_DECISION.md` Phase 5.1m board decision.
 8. Confirm runtime is still shadow before any evidence capture:
 
 ```bash
@@ -798,17 +804,20 @@ curl -fsS http://127.0.0.1:9898/health/detail
 
 ## Next Command Targets
 
-After Phase 5.1l is committed and pushed, the next target is not another live
-run. Continue read-only Lighter native-limit and maker/taker evidence
-enrichment, then rerun the recovered 5.1h/5.1i matrix. The acceptance condition
-is another measurable reduction of blocker counts without introducing raw
-identifiers, live/canary/capital/risk authorization, model-training shortcuts,
-or selection-bias shortcuts.
+After Phase 5.1m is committed and pushed, the next target is not another live
+run. Lighter official-cap/current-active-order evidence is recorded, but the
+native-limit pressure blocker remains because it is not label-event-time
+aligned. Continue event-time native-limit pressure and venue-native maker/taker
+evidence completion across all filled venues, then rerun the recovered 5.1h/5.1i
+matrix. The acceptance condition is another measurable reduction of blocker
+counts without introducing raw identifiers, live/canary/capital/risk
+authorization, model-training shortcuts, or selection-bias shortcuts.
 
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
 production readiness.
 
-`PROMOTE` only for the next Phase 5.1 non-live feature-completeness evidence
-step. No model training, EV admission, canary, or live trading is authorized.
+`PROMOTE` only for the next Phase 5.1 non-live native-limit/maker-taker
+feature-completeness evidence step. No model training, EV admission, canary, or
+live trading is authorized.

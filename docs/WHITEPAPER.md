@@ -84,11 +84,13 @@ budget, liquidation safety, rate-limit headroom, and non-live experiment caps.
 
 The active Phase 5.1 evidence boundary remains `HOLD` for live, canary, capital
 escalation, risk-limit relaxation, model training, and EV admission until the
-roadmap gates accept complete non-live evidence. The current Phase 5.1l
-boundary recovered all previously missing filled-order source-tick horizons,
-but blockers remain: venue-native Lighter limit and maker/taker evidence is
-incomplete, calibration buckets are sparse, and observed-only selection-bias
-quarantine policy remains unresolved.
+roadmap gates accept complete non-live evidence. The current Phase 5.1m
+boundary recovered all previously missing filled-order source-tick horizons and
+documents Lighter active-order capacity from official caps plus observed
+current active-order counts, but blockers remain: native-limit pressure is not
+label-event-time aligned, venue-native maker/taker evidence is incomplete,
+calibration buckets are sparse, and observed-only selection-bias quarantine
+policy remains unresolved.
 
 Part II below remains the hash-locked v1 appendix. It is historical target/spec
 context, not the active V2 authority.

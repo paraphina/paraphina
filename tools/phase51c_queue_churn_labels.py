@@ -307,6 +307,9 @@ def _native_limit_pressure(
             "native_active_order_headroom_account": None,
             "native_active_order_headroom_market": None,
             "native_sendtx_per_minute_remaining": None,
+            "native_active_order_limit_source": None,
+            "native_active_order_limit_conflicts": [],
+            "native_limit_time_alignment_status": None,
         }
     if str(venue_id or "").lower() != "lighter":
         return {
@@ -318,15 +321,23 @@ def _native_limit_pressure(
             "native_active_order_headroom_account": None,
             "native_active_order_headroom_market": None,
             "native_sendtx_per_minute_remaining": None,
+            "native_active_order_limit_source": None,
+            "native_active_order_limit_conflicts": [],
+            "native_limit_time_alignment_status": None,
         }
     limits = phase51b_context.get("limits", {})
     active_orders = phase51b_context.get("active_orders", {})
     headroom_account = active_orders.get("active_order_headroom_account")
     headroom_market = active_orders.get("active_order_headroom_market")
     sendtx_remaining = limits.get("sendtx_per_minute_remaining")
+    time_alignment = active_orders.get("native_limit_time_alignment_status")
     if any(value is not None for value in (headroom_account, headroom_market, sendtx_remaining)):
-        status = "OBSERVED_NATIVE_LIMIT_HEADROOM"
-        hold_reason = "requires_queue_reset_calibration_and_board_review"
+        if time_alignment == "EVENT_TIME_ALIGNED":
+            status = "OBSERVED_NATIVE_LIMIT_HEADROOM"
+            hold_reason = "requires_queue_reset_calibration_and_board_review"
+        else:
+            status = "PARTIAL_NATIVE_HEADROOM_NOT_EVENT_TIME_ALIGNED"
+            hold_reason = "native_limit_headroom_not_event_time_aligned"
     else:
         status = "PARTIAL_ACTIVE_ORDER_COUNT_OBSERVED_LIMIT_UNKNOWN"
         hold_reason = "native_limit_capacity_not_exposed_by_phase51b_payload"
@@ -339,6 +350,9 @@ def _native_limit_pressure(
         "native_active_order_headroom_account": headroom_account,
         "native_active_order_headroom_market": headroom_market,
         "native_sendtx_per_minute_remaining": sendtx_remaining,
+        "native_active_order_limit_source": active_orders.get("active_order_limit_source"),
+        "native_active_order_limit_conflicts": active_orders.get("active_order_limit_conflicts") or [],
+        "native_limit_time_alignment_status": time_alignment,
     }
 
 

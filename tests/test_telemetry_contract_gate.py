@@ -1184,8 +1184,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             }), encoding="utf-8")
             limits_path.write_text(json.dumps({
                 "sendtx_per_minute_limit": 60,
-                "active_orders_per_account_limit": 1000,
-                "active_orders_per_market_limit": 100,
+                "active_orders_per_account_limit": 1500,
+                "active_orders_per_market_limit": 1000,
                 "volume_quota_remaining": 12.5,
                 "user_tier": "premium",
                 "user_tier_name": "premium",
@@ -1266,6 +1266,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             event_types = {record["event_type"] for record in records}
             self.assertIn("V2_LIGHTER_ACCOUNT_PROFILE", event_types)
             self.assertIn("V2_LIGHTER_ACCOUNT_LIMITS", event_types)
+            self.assertIn("V2_LIGHTER_OFFICIAL_LIMITS_DOC", event_types)
             self.assertIn("V2_LIGHTER_ACTIVE_ORDERS", event_types)
             self.assertIn("V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE", event_types)
             self.assertTrue(all(r["no_live_flag"] is True for r in records))
@@ -1290,20 +1291,28 @@ class TestValidatorSubprocess(unittest.TestCase):
 
             limits = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACCOUNT_LIMITS")
             self.assertEqual(limits["sendtx_per_minute_limit"], 60)
-            self.assertEqual(limits["active_orders_per_account_limit"], 1000)
-            self.assertEqual(limits["active_orders_per_market_limit"], 100)
+            self.assertEqual(limits["active_orders_per_account_limit"], 1500)
+            self.assertEqual(limits["active_orders_per_market_limit"], 1000)
             self.assertEqual(limits["lighter_user_tier"], "premium")
             self.assertEqual(limits["lighter_user_tier_name"], "premium")
             self.assertEqual(limits["current_maker_fee_tick"], 40)
             self.assertEqual(limits["current_taker_fee_tick"], 280)
             self.assertEqual(limits["effective_lit_stakes"], "0.00000000")
 
+            official_limits = next(r for r in records if r["event_type"] == "V2_LIGHTER_OFFICIAL_LIMITS_DOC")
+            self.assertEqual(official_limits["official_active_orders_per_account_limit"], 1500)
+            self.assertEqual(official_limits["official_active_orders_per_market_limit"], 1000)
+            self.assertTrue(official_limits["official_doc_cap_not_event_time_usage"])
+
             active_orders = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACTIVE_ORDERS")
             self.assertEqual(active_orders["active_orders_count_total"], 3)
             self.assertEqual(active_orders["active_orders_count_market"], 2)
             self.assertEqual(active_orders["pending_orders_count_total"], 1)
-            self.assertEqual(active_orders["active_order_headroom_account"], 997)
-            self.assertEqual(active_orders["active_order_headroom_market"], 98)
+            self.assertEqual(active_orders["active_order_limit_source"], "API_ACCOUNT_LIMITS")
+            self.assertEqual(active_orders["open_order_limit_status"], "OBSERVED_API_ACCOUNT_LIMIT")
+            self.assertEqual(active_orders["native_limit_time_alignment_status"], "CURRENT_SNAPSHOT_NOT_LABEL_EVENT_TIME")
+            self.assertEqual(active_orders["active_order_headroom_account"], 1497)
+            self.assertEqual(active_orders["active_order_headroom_market"], 998)
 
             trades = next(r for r in records if r["event_type"] == "V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE")
             self.assertEqual(trades["trade_sample_count"], 3)
@@ -5843,6 +5852,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(joined["observed_lifecycle_source_ticks"], 2)
             self.assertEqual(joined["native_limit_pressure_status"], "PARTIAL_ACTIVE_ORDER_COUNT_OBSERVED_LIMIT_UNKNOWN")
             self.assertEqual(joined["native_active_orders_count_total"], 0)
+            self.assertIsNone(joined["native_active_order_limit_source"])
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
             for file_info in manifest["files"]:
                 artifact = run_dir / file_info["path"]
@@ -5851,6 +5861,144 @@ class TestValidatorSubprocess(unittest.TestCase):
                     file_info["sha256"],
                     file_info["path"],
                 )
+
+            native_doc_run = tmp_path / "native_doc_run"
+            native_doc_run.mkdir()
+            (native_doc_run / "phase51b_acceptance.json").write_text(json.dumps({
+                "run_id": "phase51m_native_doc_test",
+                "approved_for_calibration_label_ingestion": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "approved_for_financial_claim": False,
+                "limitations": ["lighter_sendtx_remaining_not_observed"],
+            }), encoding="utf-8")
+            with (native_doc_run / "telemetry.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACCOUNT_LIMITS",
+                    "run_id": "phase51m_native_doc_test",
+                    "venue_id": "lighter",
+                    "sendtx_per_minute_remaining": None,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACTIVE_ORDERS",
+                    "run_id": "phase51m_native_doc_test",
+                    "venue_id": "lighter",
+                    "active_orders_count_total": 2,
+                    "active_orders_count_market": 1,
+                    "active_order_headroom_account": 1498,
+                    "active_order_headroom_market": 999,
+                    "active_order_limit_source": "OFFICIAL_DOC_CAP",
+                    "active_order_limit_conflicts": [],
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+            observed_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_queue_churn_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_queue_churn_doc_cap_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--lighter-native-limits-run",
+                    str(native_doc_run),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(observed_result.returncode, 0, f"stdout: {observed_result.stdout}\nstderr: {observed_result.stderr}")
+            observed_run_dir = output_root / "phase51c_queue_churn_doc_cap_test"
+            observed_summary = json.loads((observed_run_dir / "queue_churn_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(observed_summary["native_limit_pressure_unknown_count"], 0)
+            self.assertEqual(observed_summary["native_limit_pressure_partial_count"], 2)
+            observed_labels = [
+                json.loads(line)
+                for line in (observed_run_dir / "queue_churn_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            observed_joined = next(label for label in observed_labels if label["order_key"] == "order-key-1")
+            self.assertEqual(observed_joined["native_limit_pressure_status"], "PARTIAL_NATIVE_HEADROOM_NOT_EVENT_TIME_ALIGNED")
+            self.assertEqual(observed_joined["native_active_order_headroom_account"], 1498)
+            self.assertEqual(observed_joined["native_active_order_limit_source"], "OFFICIAL_DOC_CAP")
+            self.assertEqual(observed_joined["native_active_order_limit_conflicts"], [])
+            self.assertIsNone(observed_joined["native_limit_time_alignment_status"])
+
+            native_aligned_run = tmp_path / "native_aligned_run"
+            native_aligned_run.mkdir()
+            (native_aligned_run / "phase51b_acceptance.json").write_text(json.dumps({
+                "run_id": "phase51m_native_aligned_test",
+                "approved_for_calibration_label_ingestion": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "approved_for_financial_claim": False,
+                "limitations": ["lighter_sendtx_remaining_not_observed"],
+            }), encoding="utf-8")
+            with (native_aligned_run / "telemetry.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACCOUNT_LIMITS",
+                    "run_id": "phase51m_native_aligned_test",
+                    "venue_id": "lighter",
+                    "sendtx_per_minute_remaining": None,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACTIVE_ORDERS",
+                    "run_id": "phase51m_native_aligned_test",
+                    "venue_id": "lighter",
+                    "active_orders_count_total": 2,
+                    "active_orders_count_market": 1,
+                    "active_order_headroom_account": 1498,
+                    "active_order_headroom_market": 999,
+                    "active_order_limit_source": "OFFICIAL_DOC_CAP",
+                    "active_order_limit_conflicts": [],
+                    "native_limit_time_alignment_status": "EVENT_TIME_ALIGNED",
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+            aligned_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_queue_churn_path()),
+                    "--label-lake-run",
+                    str(label_lake_run),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_queue_churn_aligned_cap_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--lighter-native-limits-run",
+                    str(native_aligned_run),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(aligned_result.returncode, 0, f"stdout: {aligned_result.stdout}\nstderr: {aligned_result.stderr}")
+            aligned_run_dir = output_root / "phase51c_queue_churn_aligned_cap_test"
+            aligned_summary = json.loads((aligned_run_dir / "queue_churn_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(aligned_summary["native_limit_pressure_unknown_count"], 0)
+            self.assertEqual(aligned_summary["native_limit_pressure_partial_count"], 0)
+            aligned_labels = [
+                json.loads(line)
+                for line in (aligned_run_dir / "queue_churn_labels.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            aligned_joined = next(label for label in aligned_labels if label["order_key"] == "order-key-1")
+            self.assertEqual(aligned_joined["native_limit_pressure_status"], "OBSERVED_NATIVE_LIMIT_HEADROOM")
+            self.assertEqual(aligned_joined["native_limit_time_alignment_status"], "EVENT_TIME_ALIGNED")
 
             pfill_labels[0]["approved_for_live"] = True
             with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:

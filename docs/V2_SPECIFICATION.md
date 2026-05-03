@@ -484,9 +484,11 @@ admission:
 
 ## 14. Current Phase 5.1 Blockers
 
-As of Phase 5.1l, the V2 evidence path remains blocked by:
+As of Phase 5.1m, the V2 evidence path remains blocked by:
 
-- Lighter native-limit context still partial for `2288` labels;
+- Lighter native-limit context still partial for `2288` labels because the
+  accepted official-cap/current-active-order snapshot is not label-event-time
+  aligned;
 - maker/taker status incomplete for `287` fills;
 - sparse venue/side/layer/regime buckets;
 - observed-only selection bias from `1613` excluded quarantine/review groups.
@@ -496,8 +498,14 @@ remaining `65 / 65` source-tick horizons: `43` via source P-fill horizon
 evidence and `22` via hashed observed-fill fallback. The recovered matrix now
 reports `4527 / 4527` observed horizons available and `0` missing horizons.
 
-The next repo-owned V2 evidence move is read-only Lighter native-limit and
-maker/taker evidence enrichment, followed by another recovered 5.1h/5.1i
-matrix run. No model training, EV admission, canary, live orders, capital
-escalation, risk-limit relaxation, or financial claim is authorized from
-Phase 5.1l.
+Phase 5.1m added official Lighter active-order cap evidence and records current
+active-order headroom without treating it as historical event-time pressure.
+The recovered matrix correctly remains at `0 / 2288` native-limit rows observed
+and `2288 / 2288` partial, while preserving `0` missing horizons, `0`
+unrecovered filled-horizon source-key rows, and raw-identifier redaction `PASS`.
+
+The next repo-owned V2 evidence move is event-time native-limit pressure plus
+venue-native maker/taker completeness across all filled venues, followed by
+another recovered 5.1h/5.1i matrix run. No model training, EV admission,
+canary, live orders, capital escalation, risk-limit relaxation, or financial
+claim is authorized from Phase 5.1m.

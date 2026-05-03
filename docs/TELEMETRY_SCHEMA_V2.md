@@ -56,6 +56,7 @@ revision addenda:
 - `V2_GUARDRAIL_EVENT`
 - `V2_LIGHTER_ACCOUNT_PROFILE`
 - `V2_LIGHTER_ACCOUNT_LIMITS`
+- `V2_LIGHTER_OFFICIAL_LIMITS_DOC`
 - `V2_LIGHTER_ACTIVE_ORDERS`
 - `V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE`
 
@@ -84,8 +85,14 @@ Phase 5.1b adds read-only Lighter account/native-limit event families:
   as sendTx, REST/weighted request, pending-order, active-order, and volume
   quota fields where the endpoint exposes them. It also records observed Lighter
   user-tier and fee-tick fields when the account limits payload exposes them.
+- `V2_LIGHTER_OFFICIAL_LIMITS_DOC` records the official-doc limit-cap snapshot
+  used by Phase 5.1m. These caps can support current active-order capacity
+  context only when paired with observed active-order counts; they must not be
+  treated as label-event-time native-limit pressure, sendTx remaining pressure,
+  or REST remaining pressure unless explicit event-time alignment is present.
 - `V2_LIGHTER_ACTIVE_ORDERS` records active/pending order counts and native
-  headroom against observed active-order limits.
+  headroom against observed account-limit fields or official-doc active-order
+  caps, with conflicts preserved as HOLD evidence instead of inferred headroom.
 - `V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE` records read-only maker/taker trade-role
   sample counts for attribution calibration, including Lighter trade-shape
   inference from account side plus `is_maker_ask` when explicit role labels are

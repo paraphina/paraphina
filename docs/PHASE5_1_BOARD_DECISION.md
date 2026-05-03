@@ -454,3 +454,74 @@ Lighter native-limit and maker/taker evidence completeness, rerun 5.1h/5.1i,
 and preserve sparse-bucket and observed-only selection-bias holds until there
 is a board-approved calibration protocol.
 ```
+
+## Phase 5.1m Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for the next non-live feature-completeness evidence
+step: event-time native-limit pressure and venue-native maker/taker completion
+across all filled venues while preserving sparse-bucket and observed-only
+selection-bias holds.
+
+Rationale:
+
+- Phase 5.1m added an official Lighter limit-cap snapshot and wired it into the
+  read-only account/native-limit evidence path. Official active-order caps are
+  used only with observed active-order counts; they are not treated as event-time
+  sendTx or REST remaining pressure.
+- The Phase 5.1m Lighter evidence pack was accepted only for calibration-label
+  ingestion. It keeps live/canary/capital/financial authority blocked and keeps
+  sendTx/REST remaining pressure explicitly unobserved.
+- The recovered 5.1h -> 5.1i chain keeps the Lighter native-limit rows partial:
+  `0 / 2288` observed, `2288 / 2288` partial, and `0` unknown. This is
+  intentional because the evidence is a current snapshot, not label-event-time
+  native pressure.
+- The matrix remains non-admissible with gate reason
+  `phase51i_lighter_native_limit_pressure_not_fully_observed`.
+- Remaining blockers are Lighter native-limit event-time alignment for `2288`
+  labels, incomplete maker/taker status on `287` fills, sparse venue/side
+  buckets, and `1613` excluded quarantine/review groups.
+- No live, canary, capital, risk-limit, or strategy execution behavior changed.
+
+Current evidence boundary:
+
+```text
+Phase 5.1m - Lighter official-doc native-limit enrichment
+runs/phase51b_lighter_account_native_limits/PHASE51M-LIGHTER-OFFICIAL-LIMIT-ENRICHMENT-20260503T000000Z
+status: PROMOTE_TO_PHASE51C_CALIBRATION_INGESTION
+approved_for_live: false
+approved_for_canary: false
+approved_for_capital_escalation: false
+limitations:
+- lighter_sendtx_remaining_not_observed
+- lighter_rest_request_limit_not_exposed_by_account_limits_payload
+
+Phase 5.1m - Recovered P-fill feature-matrix admissibility
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51M-PFILL-FEATURE-MATRIX-ADMISSIBILITY-NATIVE-DOC-CAP-TWO-LANE-20260503T000000Z
+gate_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+native_limit_unknown_count: 0
+observed_horizon_missing_count: 0
+filled_horizon_source_key_unrecovered_count: 0
+raw_identifier_redaction_status: PASS
+matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+```
+
+Next move:
+
+```text
+Do not start live/canary/model-training/EV-admission work. Build the next
+non-live gate for event-time native-limit pressure and maker/taker completion
+across all filled venues. Use only venue-native fill/trade/limit evidence; do
+not infer role from quote intent, post-only flags, or strategy purpose. Rerun
+5.1h/5.1i after any evidence recovery and preserve sparse-bucket and
+observed-only selection-bias holds.
+```

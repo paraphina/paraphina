@@ -431,6 +431,21 @@ def _load_source_file(name: str, path: Path | None) -> dict[str, Any] | None:
     )
 
 
+def _selected_official_limits(official_limits_source: dict[str, Any] | None) -> dict[str, Any]:
+    if official_limits_source is None:
+        return {}
+    payload = official_limits_source["payload"]
+    if not isinstance(payload, dict):
+        return {}
+    selected = payload.get("selected_limits")
+    return selected if isinstance(selected, dict) else payload
+
+
+def _official_limit_int(official_limits_source: dict[str, Any] | None, keys: set[str]) -> int | None:
+    limits = _selected_official_limits(official_limits_source)
+    return _as_int(_first_value(limits, keys))
+
+
 def _resolve_base_url(env: dict[str, str], explicit: str | None = None) -> str:
     if explicit:
         return explicit.rstrip("/")
@@ -741,6 +756,40 @@ def _account_limits_event(
     return event
 
 
+def _official_limits_event(
+    *,
+    event_seq: int,
+    run_id: str,
+    timestamp_ns: int,
+    official_limits_source: dict[str, Any],
+) -> dict[str, Any]:
+    payload = official_limits_source["payload"]
+    raw_keys = sorted(payload.keys()) if isinstance(payload, dict) else []
+    selected = _selected_official_limits(official_limits_source)
+    event = _base_event(event_type="V2_LIGHTER_OFFICIAL_LIMITS_DOC", event_seq=event_seq, run_id=run_id, timestamp_ns=timestamp_ns)
+    event.update({
+        "venue_id": "lighter",
+        "official_limits_status": "OBSERVED",
+        "official_limits_source_sha256": official_limits_source["sha256"],
+        "official_limits_source_path": official_limits_source["source_path"],
+        "official_limits_raw_keys": raw_keys,
+        "official_limits_accessed_utc": _as_text(payload.get("accessed_utc")) if isinstance(payload, dict) else None,
+        "official_active_orders_per_account_limit": _as_int(_first_value(selected, {"active_orders_per_account_limit", "activeordersperaccountlimit", "active_orders_per_account", "activeordersperaccount"})),
+        "official_active_orders_per_market_limit": _as_int(_first_value(selected, {"active_orders_per_market_limit", "activeorderspermarketlimit", "active_orders_per_market", "activeorderspermarket"})),
+        "official_pending_orders_per_account_limit": _as_int(_first_value(selected, {"pending_orders_per_account_limit", "pendingordersperaccountlimit", "pending_orders_per_account", "pendingordersperaccount"})),
+        "official_pending_orders_per_market_limit": _as_int(_first_value(selected, {"pending_orders_per_market_limit", "pendingorderspermarketlimit", "pending_orders_per_market", "pendingorderspermarket"})),
+        "official_standard_rest_requests_per_minute_limit": _as_int(_first_value(selected, {"standard_rest_requests_per_minute_limit", "standardrestrequestsperminutelimit", "standard_requests_per_minute", "standardrequestsperminute"})),
+        "official_premium_weighted_requests_per_minute_limit": _as_int(_first_value(selected, {"premium_weighted_requests_per_minute_limit", "premiumweightedrequestsperminutelimit", "premium_weighted_requests", "premiumweightedrequests"})),
+        "official_standard_sendtx_per_minute_limit": _as_int(_first_value(selected, {"standard_sendtx_per_minute_limit", "standardsendtxperminutelimit", "standard_sendtx_per_minute", "standardsendtxperminute"})),
+        "official_doc_cap_not_event_time_usage": True,
+        "decision": "HOLD",
+        "decision_reason_primary": "phase51m_official_lighter_limit_doc_snapshot",
+        "decision_reason_secondary_list": ["nonlive_readonly_evidence_only", "doc_caps_are_not_remaining_pressure", "not_live_authorization"],
+        "admissible_for_financial_claim": False,
+    })
+    return event
+
+
 def _active_orders_event(
     *,
     event_seq: int,
@@ -748,6 +797,7 @@ def _active_orders_event(
     timestamp_ns: int,
     active_orders_source: dict[str, Any],
     limits_source: dict[str, Any] | None,
+    official_limits_source: dict[str, Any] | None,
     account_index: int | None,
     market_id: int | None,
 ) -> dict[str, Any]:
@@ -762,8 +812,46 @@ def _active_orders_event(
     else:
         market_count = len(orders)
     limits_payload = limits_source["payload"] if limits_source else {}
-    per_account_limit = _as_int(_first_value(limits_payload, {"active_orders_per_account_limit", "activeordersperaccountlimit", "active_orders_per_account", "activeordersperaccount"}))
-    per_market_limit = _as_int(_first_value(limits_payload, {"active_orders_per_market_limit", "activeorderspermarketlimit", "active_orders_per_market", "activeorderspermarket"}))
+    api_per_account_limit = _as_int(_first_value(limits_payload, {"active_orders_per_account_limit", "activeordersperaccountlimit", "active_orders_per_account", "activeordersperaccount"}))
+    api_per_market_limit = _as_int(_first_value(limits_payload, {"active_orders_per_market_limit", "activeorderspermarketlimit", "active_orders_per_market", "activeorderspermarket"}))
+    official_per_account_limit = _official_limit_int(
+        official_limits_source,
+        {"active_orders_per_account_limit", "activeordersperaccountlimit", "active_orders_per_account", "activeordersperaccount"},
+    )
+    official_per_market_limit = _official_limit_int(
+        official_limits_source,
+        {"active_orders_per_market_limit", "activeorderspermarketlimit", "active_orders_per_market", "activeorderspermarket"},
+    )
+    conflicts: list[str] = []
+    if api_per_account_limit is not None and official_per_account_limit is not None and api_per_account_limit != official_per_account_limit:
+        conflicts.append("active_orders_per_account_limit")
+    if api_per_market_limit is not None and official_per_market_limit is not None and api_per_market_limit != official_per_market_limit:
+        conflicts.append("active_orders_per_market_limit")
+    if conflicts:
+        per_account_limit = None
+        per_market_limit = None
+        limit_source = "CONFLICT_API_OFFICIAL_DOC_CAP"
+    else:
+        per_account_limit = api_per_account_limit if api_per_account_limit is not None else official_per_account_limit
+        per_market_limit = api_per_market_limit if api_per_market_limit is not None else official_per_market_limit
+        if api_per_account_limit is not None or api_per_market_limit is not None:
+            limit_source = "API_ACCOUNT_LIMITS"
+        elif official_per_account_limit is not None or official_per_market_limit is not None:
+            limit_source = "OFFICIAL_DOC_CAP"
+        else:
+            limit_source = None
+    if conflicts:
+        open_order_limit_status = "CONFLICT_API_OFFICIAL_DOC_CAP"
+    elif limit_source == "API_ACCOUNT_LIMITS":
+        open_order_limit_status = "OBSERVED_API_ACCOUNT_LIMIT"
+    elif limit_source == "OFFICIAL_DOC_CAP":
+        open_order_limit_status = "OBSERVED_OFFICIAL_DOC_CAP_WITH_ACTIVE_COUNT"
+    else:
+        open_order_limit_status = "UNKNOWN"
+    time_alignment = _as_text(_first_value(
+        active_orders_source["payload"],
+        {"native_limit_time_alignment_status", "nativelimittimealignmentstatus", "event_time_alignment_status", "eventtimealignmentstatus"},
+    )) or "CURRENT_SNAPSHOT_NOT_LABEL_EVENT_TIME"
     event = _base_event(event_type="V2_LIGHTER_ACTIVE_ORDERS", event_seq=event_seq, run_id=run_id, timestamp_ns=timestamp_ns)
     event.update({
         "venue_id": "lighter",
@@ -777,11 +865,18 @@ def _active_orders_event(
         "pending_orders_count_total": pending_count,
         "active_order_status_keys": sorted(status_counts.keys()),
         "active_order_sample_hash": _stable_hash(orders[:20]),
+        "api_active_orders_per_account_limit": api_per_account_limit,
+        "api_active_orders_per_market_limit": api_per_market_limit,
+        "official_active_orders_per_account_limit": official_per_account_limit,
+        "official_active_orders_per_market_limit": official_per_market_limit,
+        "active_order_limit_source": limit_source,
+        "active_order_limit_conflicts": conflicts,
+        "native_limit_time_alignment_status": time_alignment,
         "active_orders_per_account_limit": per_account_limit,
         "active_orders_per_market_limit": per_market_limit,
         "active_order_headroom_account": per_account_limit - len(orders) if per_account_limit is not None else None,
         "active_order_headroom_market": per_market_limit - market_count if per_market_limit is not None else None,
-        "open_order_limit_status": "OBSERVED" if per_account_limit is not None or per_market_limit is not None else "UNKNOWN",
+        "open_order_limit_status": open_order_limit_status,
         "decision": "HOLD",
         "decision_reason_primary": "phase51b_readonly_active_orders_capture",
         "decision_reason_secondary_list": ["nonlive_readonly_evidence_only", "active_orders_not_execution_authority", "not_live_authorization"],
@@ -850,6 +945,7 @@ def run(
     account_json: Path | None,
     account_limits_json: Path | None,
     active_orders_json: Path | None,
+    official_limits_json: Path | None,
     order_books_json: Path | None,
     trades_json: Path | None,
     env_file: Path | None,
@@ -868,6 +964,10 @@ def run(
     if not isinstance(spec, dict):
         raise ValueError(f"expected object JSON in {spec_path}")
     _validate_spec(spec)
+    if official_limits_json is None and spec.get("official_limits_json"):
+        official_limits_json = Path(str(spec["official_limits_json"]))
+        if not official_limits_json.is_absolute():
+            official_limits_json = ROOT / official_limits_json
     env = dict(os.environ)
     if env_file is not None:
         env.update(_load_env_file(env_file))
@@ -896,6 +996,7 @@ def run(
             "account": _load_source_file("account", account_json),
             "account_limits": _load_source_file("account_limits", account_limits_json),
             "active_orders": _load_source_file("active_orders", active_orders_json),
+            "official_limits": _load_source_file("official_limits", official_limits_json),
             "order_books": _load_source_file("order_books", order_books_json),
             "trades": _load_source_file("trades", trades_json),
         }.items()
@@ -956,6 +1057,13 @@ def run(
             "decision_reason_primary": "missing_lighter_account_limits_source",
             "admissible_for_financial_claim": False,
         })
+    if "official_limits" in sources:
+        events.append(_official_limits_event(
+            event_seq=len(events) + 1,
+            run_id=run_id,
+            timestamp_ns=timestamp_ns,
+            official_limits_source=sources["official_limits"],
+        ))
     if "active_orders" in sources:
         events.append(_active_orders_event(
             event_seq=len(events) + 1,
@@ -963,6 +1071,7 @@ def run(
             timestamp_ns=timestamp_ns,
             active_orders_source=sources["active_orders"],
             limits_source=sources.get("account_limits"),
+            official_limits_source=sources.get("official_limits"),
             account_index=resolved_account_index,
             market_id=resolved_market_id,
         ))
@@ -1034,6 +1143,7 @@ def run(
         "include_trades": include_trades,
         "allow_sdk_auth": allow_sdk_auth,
         "env_file": str(env_file) if env_file else None,
+        "official_limits_json": str(official_limits_json) if official_limits_json else None,
         "lighter_sdk_path": str(lighter_sdk_path) if lighter_sdk_path else None,
     })
     command_log = {
@@ -1080,6 +1190,7 @@ def main() -> int:
     parser.add_argument("--account-json", type=Path, default=None)
     parser.add_argument("--account-limits-json", type=Path, default=None)
     parser.add_argument("--active-orders-json", type=Path, default=None)
+    parser.add_argument("--official-limits-json", type=Path, default=None)
     parser.add_argument("--order-books-json", type=Path, default=None)
     parser.add_argument("--trades-json", type=Path, default=None)
     parser.add_argument(
@@ -1112,6 +1223,7 @@ def main() -> int:
             account_json=args.account_json,
             account_limits_json=args.account_limits_json,
             active_orders_json=args.active_orders_json,
+            official_limits_json=args.official_limits_json,
             order_books_json=args.order_books_json,
             trades_json=args.trades_json,
             env_file=args.env_file,

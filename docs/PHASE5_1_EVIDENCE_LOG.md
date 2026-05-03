@@ -69,6 +69,81 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1m - Lighter Official-Doc Native-Limit Enrichment
+
+Date: 2026-05-03
+
+Purpose: add official Lighter active-order cap evidence and verify whether it
+can clear the Lighter native-limit feature-completeness blocker without using
+live orders, canary authority, model training, EV admission, or financial
+claims.
+
+Evidence packs:
+
+```text
+runs/phase51b_lighter_account_native_limits/PHASE51M-LIGHTER-OFFICIAL-LIMIT-ENRICHMENT-20260503T000000Z
+runs/phase51c_queue_churn/PHASE51M-QUEUE-CHURN-NATIVE-DOC-CAP-TERMINAL-STALE-7200S-20260429T025435Z
+runs/phase51c_queue_churn/PHASE51M-QUEUE-CHURN-NATIVE-DOC-CAP-TERMINAL-STALE-7200S-FROM-BACKFILL-20260429T073231Z
+runs/phase51h_observed_pfill_feature_audit/PHASE51M-OBSERVED-PFILL-FEATURE-AUDIT-NATIVE-DOC-CAP-TWO-LANE-20260503T000000Z
+runs/phase51i_pfill_feature_matrix_admissibility/PHASE51M-PFILL-FEATURE-MATRIX-ADMISSIBILITY-NATIVE-DOC-CAP-TWO-LANE-20260503T000000Z
+```
+
+Official Lighter sources used:
+
+```text
+https://apidocs.lighter.xyz/docs/rate-limits
+https://apidocs.lighter.xyz/docs/account-types
+https://apidocs.lighter.xyz/reference/accountlimits
+https://apidocs.lighter.xyz/reference/accountactiveorders
+https://apidocs.lighter.xyz/reference/trades
+```
+
+Result:
+
+```text
+matrix_admissibility_status: HOLD
+gate_reason: phase51i_lighter_native_limit_pressure_not_fully_observed
+matrix_blocker_count: 4
+matrix_blocker_ids:
+- lighter_native_limit_pressure_not_fully_observed
+- maker_taker_not_fully_observed_for_filled_orders
+- sparse_pfill_feature_buckets
+- observed_only_selection_bias_not_resolved
+
+label_count: 4527
+filled_count: 461
+native_limit_observed_count: 0
+native_limit_partial_count: 2288
+native_limit_unknown_count: 0
+maker_taker_observed_count: 174
+maker_taker_partial_or_unknown_count: 222
+maker_taker_missing_count: 65
+observed_horizon_missing_count: 0
+filled_horizon_source_key_unrecovered_count: 0
+raw_identifier_redaction_status: PASS
+missing_feature_total: 2575
+```
+
+Safety boundary:
+
+```text
+approved_for_live: false
+approved_for_canary: false
+approved_for_capital_escalation: false
+approved_for_financial_claim: false
+admissible_for_ev_admission: false
+official_doc_cap_not_event_time_usage: true
+limitations:
+- lighter_sendtx_remaining_not_observed
+- lighter_rest_request_limit_not_exposed_by_account_limits_payload
+```
+
+Interpretation: official Lighter active-order caps plus observed current
+active-order counts are useful capacity evidence, but they are not sufficient
+to label historical Phase 5 rows as event-time native-limit pressure observed.
+The next non-live gate is event-time native-limit pressure and venue-native
+maker/taker completion across all filled venues.
+
 ## Phase 5.1j - Observed-Horizon Recovery and Recovered Matrix
 
 - Recovery run id:

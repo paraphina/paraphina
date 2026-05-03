@@ -140,7 +140,7 @@ Allowed next work:
 | Next item | Description |
 |---|---|
 | M6 risk/system invariants | Add no-live enforcement, metadata propagation, residual-state placeholders, and double-action prevention precondition tests. |
-| Phase 5.1b Lighter account-state telemetry | Use `tools/phase51b_lighter_account_limits.py` with `configs/phase51b_lighter_account_native_limits.json` to capture account type, account limits, active-order counts/headroom, fee/market metadata, and maker/taker trade-role samples into V2 readiness events. This is read-only and remains `HOLD` for live/canary/economics. |
+| Phase 5.1b/5.1m Lighter account-state telemetry | Use `tools/phase51b_lighter_account_limits.py` with `configs/phase51b_lighter_account_native_limits.json` to capture account type, account limits, active-order counts/headroom, official-doc active-order caps, fee/market metadata, and maker/taker trade-role samples into V2 readiness events. Official caps may support current active-order capacity context only with observed active-order counts; they do not prove label-event-time native-limit pressure, sendTx remaining pressure, or REST remaining pressure. This is read-only and remains `HOLD` for live/canary/economics. |
 | Lighter fill/markout calibration | Keep blocked until enough non-live/paper/testnet/observed labels exist for P-fill, maker/taker attribution, adverse selection, queue reset, churn, and tail-risk terms. |
 
 Rejected next work:

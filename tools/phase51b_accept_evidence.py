@@ -150,14 +150,19 @@ def _all_safety_flags_hold(records: list[dict[str, Any]], gate: dict[str, Any]) 
 def _limitations(records: list[dict[str, Any]]) -> list[str]:
     by_type = {record.get("event_type"): record for record in records}
     limits = by_type.get("V2_LIGHTER_ACCOUNT_LIMITS", {})
+    official = by_type.get("V2_LIGHTER_OFFICIAL_LIMITS_DOC", {})
     active = by_type.get("V2_LIGHTER_ACTIVE_ORDERS", {})
     limitations: list[str] = []
-    if limits.get("sendtx_per_minute_limit") is None:
+    if limits.get("sendtx_per_minute_limit") is None and official.get("official_standard_sendtx_per_minute_limit") is None:
         limitations.append("lighter_sendtx_limit_not_exposed_by_account_limits_payload")
+    elif limits.get("sendtx_per_minute_remaining") is None:
+        limitations.append("lighter_sendtx_remaining_not_observed")
     if limits.get("rest_requests_per_minute_limit") is None:
         limitations.append("lighter_rest_request_limit_not_exposed_by_account_limits_payload")
     if active.get("open_order_limit_status") == "UNKNOWN":
         limitations.append("lighter_open_order_limit_headroom_unknown")
+    if active.get("open_order_limit_status") == "CONFLICT_API_OFFICIAL_DOC_CAP":
+        limitations.append("lighter_open_order_limit_api_official_doc_conflict")
     return limitations
 
 

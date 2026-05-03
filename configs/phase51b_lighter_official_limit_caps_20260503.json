@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "source_type": "official_lighter_docs_snapshot",
+  "accessed_utc": "2026-05-03T00:00:00Z",
+  "sources": [
+    {
+      "url": "https://apidocs.lighter.xyz/docs/rate-limits",
+      "facts_used": [
+        "REST API endpoint limits are tier-specific.",
+        "sendTx and sendTxBatch have separate Premium-account limits.",
+        "Active orders are capped per account and per market.",
+        "Pending orders are capped per account and per market."
+      ]
+    },
+    {
+      "url": "https://apidocs.lighter.xyz/docs/account-types",
+      "facts_used": [
+        "Standard and Premium accounts have different fee, latency, and sendTx/sendTxBatch assumptions.",
+        "Sub-accounts share the same tier as the main L1 address."
+      ]
+    },
+    {
+      "url": "https://apidocs.lighter.xyz/reference/accountlimits",
+      "facts_used": [
+        "accountLimits is the read-only account limits endpoint used for account-specific payload inspection."
+      ]
+    },
+    {
+      "url": "https://apidocs.lighter.xyz/reference/accountactiveorders",
+      "facts_used": [
+        "accountActiveOrders is the read-only active-order endpoint used for observed active-order counts."
+      ]
+    },
+    {
+      "url": "https://apidocs.lighter.xyz/reference/trades",
+      "facts_used": [
+        "trades is the read-only account trade endpoint and supports maker/taker role filtering."
+      ]
+    }
+  ],
+  "selected_limits": {
+    "builder_weighted_requests_per_minute_limit": 240000,
+    "premium_weighted_requests_per_minute_limit": 24000,
+    "standard_rest_requests_per_minute_limit": 60,
+    "endpoint_weight_sendtx_sendtxbatch_nextnonce": 6,
+    "endpoint_weight_trades_recenttrades": 600,
+    "websocket_connections_per_ip_limit": 100,
+    "websocket_subscriptions_per_connection_limit": 500,
+    "websocket_unique_accounts_per_connection_limit": 500,
+    "websocket_max_connections_per_minute_limit": 80,
+    "websocket_client_messages_per_minute_limit": 200,
+    "websocket_max_inflight_messages": 50,
+    "pending_orders_per_account_limit": 500,
+    "pending_orders_per_market_limit": 16,
+    "active_orders_per_account_limit": 1500,
+    "active_orders_per_market_limit": 1000,
+    "standard_sendtx_per_minute_limit": 60,
+    "premium_sendtx_per_minute_by_staked_lit": {
+      "0": 4000,
+      "1000": 5000,
+      "3000": 6000,
+      "10000": 7000,
+      "30000": 8000,
+      "100000": 12000,
+      "300000": 24000,
+      "500000": 40000
+    },
+    "default_transaction_type_limit_per_minute": 40
+  },
+  "evidence_boundary": {
+    "doc_caps_are_not_event_time_usage": true,
+    "do_not_infer_sendtx_remaining": true,
+    "do_not_infer_rest_remaining": true,
+    "derive_active_order_headroom_only_from_observed_active_order_count_plus_cap": true,
+    "not_live_authorization": true,
+    "not_model_training_authorization": true,
+    "not_ev_admission_authorization": true,
+    "not_financial_claim": true
+  }
+}

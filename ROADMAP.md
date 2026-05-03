@@ -622,9 +622,9 @@ Do not change:
 | Field | Value |
 |---|---|
 | target | Canonicalize the V2 target specification and continue Phase 5.1 as a non-live evidence program for fill-aware, hedge-aware, arbitrage-informed quoting. |
-| current status | `specified_holding_nonlive`; `docs/V2_SPECIFICATION.md` is the active target spec, Phase 5.1l is the current evidence boundary, the filled-horizon source-tick blocker is cleared, and no V2 live/canary/model-training/EV-admission promotion is authorized. |
-| next action | Close the highest-leverage remaining non-live evidence gaps: improve Lighter native-limit and maker/taker completeness, maintain sparse-bucket/selection-bias holds, then rerun the recovered 5.1h/5.1i evidence chain before any calibrated EV shadow review. |
-| required evidence | Repo-owned V2 spec, Phase 5.1l recovered feature matrix, filled-horizon source-key recovery evidence pack, Lighter native limit and maker/taker evidence, schema v2 validation, deterministic replay outputs, and docs integrity output. |
+| current status | `specified_holding_nonlive`; `docs/V2_SPECIFICATION.md` is the active target spec, Phase 5.1m is the current evidence boundary, the filled-horizon source-tick blocker is cleared, Lighter native-limit capacity is documented but not event-time aligned, and no V2 live/canary/model-training/EV-admission promotion is authorized. |
+| next action | Close the highest-leverage remaining non-live evidence gaps: event-time native-limit pressure and venue-native maker/taker completeness across all filled venues, maintain sparse-bucket/selection-bias holds, then rerun the recovered 5.1h/5.1i evidence chain before any calibrated EV shadow review. |
+| required evidence | Repo-owned V2 spec, Phase 5.1m recovered feature matrix, filled-horizon source-key recovery evidence pack, Lighter official-doc/native-limit evidence, venue-native maker/taker evidence, schema v2 validation, deterministic replay outputs, and docs integrity output. |
 | promotion condition | All current blockers are resolved enough for calibrated EV shadow/model-training review, no-live guards remain intact, accepted evidence separates observed facts from counterfactuals, and economic claims remain balance-authoritative only. |
 | hold/rollback condition | Any live/canary/capital/risk authorization from Phase 5.1 evidence, any return to `true_edge` or `Q_raw` as canonical admission/sizing, missing telemetry, unproven economic claims, spec drift, or docs integrity failure. |
 | lane | Phase 5.1 non-live V2 evidence / quant, systems, data, execution, and risk. |
@@ -635,10 +635,10 @@ Do not change:
 | Field | Value |
 |---|---|
 | target | Capture Lighter account/profile, native limits, active-order headroom, fee/market metadata, and maker/taker attribution samples as schema v2 non-live evidence. |
-| current status | `implemented_for_readonly_capture`; no real account/native-limit evidence pack has been accepted yet. |
+| current status | `accepted_for_calibration_label_ingestion`; Phase 5.1m accepted a read-only Lighter official-doc/native-limit evidence pack, but the recovered 5.1h/5.1i matrix correctly keeps native-limit pressure partial because the snapshot is not label-event-time aligned. |
 | next action | Run `tools/phase51b_lighter_account_limits.py` against authenticated read-only Lighter sources or captured endpoint JSON, then validate `telemetry.jsonl` with `tools/check_telemetry_contract.py`. |
 | required evidence | `V2_LIGHTER_ACCOUNT_PROFILE`, `V2_LIGHTER_ACCOUNT_LIMITS`, `V2_LIGHTER_ACTIVE_ORDERS`, optional `V2_LIGHTER_TRADE_ATTRIBUTION_SAMPLE`, sanitized source snapshots, manifest, artifact index, and schema validation output. |
-| promotion condition | `phase51b_capture_complete=true`, schema v2 passes, account/native-limit fields are present enough to begin P-fill, markout, queue/churn, and maker/taker calibration-label ingestion. |
+| promotion condition | `phase51b_capture_complete=true`, schema v2 passes, account/native-limit fields are present enough to begin P-fill, markout, queue/churn, and maker/taker calibration-label ingestion; official-doc caps may derive current active-order capacity context only when paired with observed active-order counts and must not be treated as label-event-time native-limit pressure or event-time sendTx/REST remaining pressure. |
 | hold/rollback condition | Missing account limits, missing active orders, unsafe spec flags, missing no-live guards, any sendTx/live-order path, unredacted secrets, or any attempt to use this evidence as live/canary/economic authority. |
 | lane | Phase 5.1 non-live evidence / execution microstructure. |
 | source files | `configs/phase51b_lighter_account_native_limits.json`, `tools/phase51b_lighter_account_limits.py`, `schemas/telemetry_schema_v2.json`, `docs/TELEMETRY_SCHEMA_V2.md`, `docs/PHASE5_1_BOARD_DECISION.md`, `docs/PHASE5_1_LIGHTER_VENUE_READINESS.md`, `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`. |

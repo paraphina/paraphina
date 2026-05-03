@@ -12,6 +12,7 @@
   "default_decision": "HOLD",
   "default_hold_reason": "nonlive_lighter_native_limit_capture_only",
   "output_root": "runs/phase51b_lighter_account_native_limits",
+  "official_limits_json": "configs/phase51b_lighter_official_limit_caps_20260503.json",
   "constraints": {
     "live_orders_allowed": false,
     "capital_change_allowed": false,
