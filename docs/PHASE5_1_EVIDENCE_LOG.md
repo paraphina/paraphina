@@ -379,6 +379,105 @@ model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claims are authorized.
 ```
 
+## Phase 5.1z Diagnostic Capture Retry
+
+- Evidence date: `2026-05-04`
+- Tool: `tools/phase51z_readonly_native_role_capture.py`
+- Run id: `PHASE51Z-DIAGNOSTIC-READONLY-NATIVE-ROLE-CAPTURE-20260504T220117Z`
+- Gate status: `HOLD`
+- Purpose: add and exercise redaction-safe capture diagnostics to distinguish
+  native-field absence from no-target-match source coverage.
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51z_readonly_native_role_capture.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z/source_snapshots/trades_backfill.sanitized.json \
+  --env-file /etc/paraphina/current.env \
+  --fetch-readonly \
+  --venue aster --venue extended --venue paradex --venue lighter \
+  --allow-paradex-jwt-cmd \
+  --limit 1000 \
+  --max-pages 50 \
+  --timeout-s 30 \
+  --window-pad-ms 86400000 \
+  --run-id PHASE51Z-DIAGNOSTIC-READONLY-NATIVE-ROLE-CAPTURE-20260504T220117Z
+```
+
+Sanitized output:
+
+```text
+run: runs/phase51z_readonly_native_role_capture/PHASE51Z-DIAGNOSTIC-READONLY-NATIVE-ROLE-CAPTURE-20260504T220117Z
+gate_status: HOLD
+fetch_status: aster=824 rows, extended=1601 rows, paradex=163 rows, lighter=SKIPPED
+sanitized_source_row_count: 67
+sanitized_source_row_counts_by_venue: aster=39, extended=21, paradex=7
+capture_status_counts: NO_TARGET_MATCH=2819, SANITIZED_SOURCE_ROW_EMITTED=67, TARGET_MATCHED_BY_REDACTED_ID_HASH=2
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Redaction-safe diagnostics:
+
+```text
+aster: target_ready=39/113, source_rows=824, native_field_ready=824, matched_rows=40, duplicates=1, no_target_match=784
+extended: target_ready=21/28, source_rows=1601, native_field_ready=1601, matched_rows=22, duplicates=1, no_target_match=1579
+lighter: target_ready=0/125, source_rows=300, native_field_ready=300, matched_rows=0, duplicates=0, no_target_match=300
+paradex: target_ready=7/15, source_rows=163, native_field_ready=163, matched_rows=7, duplicates=0, no_target_match=156
+```
+
+Target windows used by the diagnostic run:
+
+```text
+aster: 2026-04-28T02:57:43.614000+00:00 -> 2026-04-30T09:09:41.283000+00:00
+extended: 2026-04-28T04:34:10.971000+00:00 -> 2026-04-30T09:21:21.844000+00:00
+lighter: 2026-04-28T02:59:52.534000+00:00 -> 2026-04-30T09:20:54.193000+00:00
+paradex: 2026-04-28T03:08:22.527000+00:00 -> 2026-04-30T08:45:30.189000+00:00
+```
+
+Secret-pattern scan:
+
+```bash
+rg -c --pcre2 "0x[0-9a-fA-F]{64}|(?i)bearer\s+[A-Za-z0-9._-]{20,}|(?i)api[_-]?secret\s*[=:]|(?i)private[_-]?key\s*[=:]|(?i)authorization\s*[=:]|(?i)jwt\s*[=:]" \
+  runs/phase51z_readonly_native_role_capture/PHASE51Z-DIAGNOSTIC-READONLY-NATIVE-ROLE-CAPTURE-20260504T220117Z \
+  runs/phase51v_forward_capture_bundle_readiness/PHASE51V-COMBINED-PHASE51Z-DIAGNOSTIC-HYPERLIQUID-HOLD-20260504T220117Z
+```
+
+Result:
+
+```text
+exit code: 1
+matches: none
+```
+
+Combined Phase 5.1v result:
+
+```text
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-COMBINED-PHASE51Z-DIAGNOSTIC-HYPERLIQUID-HOLD-20260504T220117Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 73 / 287
+native_role_capture_target_missing_count: 214 / 287
+missing native-role targets by venue: aster=74, extended=7, lighter=125, paradex=8
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+downstream_chain_ready: false
+```
+
+Interpretation:
+
+```text
+The diagnostic retry did not increase native-role readiness beyond 73 / 287.
+It proves the current blocker is target linkage/source coverage rather than
+missing role fields in the fetched rows. Lighter remains the binding blocker
+because it has 125 unmatched native-role targets and all 3132 missing
+event-time native-limit pressure targets.
+```
+
 ## Phase 5.1x Hyperliquid Native-Role Adapter
 
 - Run id: `PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z`

@@ -9386,6 +9386,23 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(summary["sanitized_source_row_count"], 4)
             self.assertEqual(summary["raw_identifier_redaction_status"], "PASS")
             self.assertFalse(summary["live_orders_allowed"])
+            diagnostics = summary["capture_diagnostics_by_venue"]
+            self.assertEqual(diagnostics["aster"]["target_count"], 1)
+            self.assertEqual(diagnostics["aster"]["target_ready_count"], 1)
+            self.assertEqual(diagnostics["aster"]["target_missing_count"], 0)
+            self.assertEqual(diagnostics["aster"]["source_row_count"], 1)
+            self.assertEqual(diagnostics["aster"]["native_field_ready_count"], 1)
+            self.assertEqual(diagnostics["aster"]["target_matched_row_count"], 1)
+            self.assertEqual(diagnostics["aster"]["duplicate_matched_row_count"], 0)
+            self.assertEqual(diagnostics["aster"]["no_target_match_count"], 0)
+            self.assertEqual(diagnostics["aster"]["rows_with_redacted_hash_candidates"], 1)
+            self.assertEqual(
+                diagnostics["aster"]["capture_status_counts"],
+                {"SANITIZED_SOURCE_ROW_EMITTED": 1},
+            )
+            self.assertEqual(diagnostics["extended"]["target_ready_count"], 1)
+            self.assertEqual(diagnostics["lighter"]["target_ready_count"], 1)
+            self.assertEqual(diagnostics["paradex"]["target_ready_count"], 1)
             output_text = (
                 (capture_dir / "source_snapshots" / "phase51z_forward_native_role_rows.jsonl").read_text(encoding="utf-8")
                 + (capture_dir / "phase51z_readonly_native_role_capture_labels.jsonl").read_text(encoding="utf-8")
@@ -9480,6 +9497,134 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("network source paths are prohibited", result.stderr)
+
+    def test_phase51z_readonly_native_role_capture_reports_no_target_match_diagnostics(self):
+        """5.1z diagnostics should show source coverage without leaking unmatched IDs."""
+        def stable_hash(value):
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            target_run = tmp_path / "phase51u_targets"
+            capture_root = tmp_path / "phase51z_capture"
+            observed_run.mkdir()
+            target_run.mkdir()
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51z_diagnostics_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(json.dumps({
+                "schema_version": 1,
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "label_seq": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "canonical_group_id": "aster-target-group",
+                "order_key": "aster-target-order",
+                "venue_id": "aster",
+                "client_order_id_hash": stable_hash("target-client-id"),
+                "order_id_hash": None,
+                "fill_count": 1,
+                "first_fill_time_ms": 1700000000000,
+                "last_fill_time_ms": 1700000000000,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_phase51z_diagnostics_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "observed_pfill_run": str(observed_run),
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "aster-target-group",
+                "order_key": "aster-target-order",
+                "venue_id": "aster",
+                "required_native_role_source": "ASTER_ORDER_TRADE_UPDATE_M",
+                "required_native_role_fields": ["o.m"],
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            source_path = tmp_path / "raw_unmatched_aster_rows.jsonl"
+            source_path.write_text(
+                "".join(
+                    json.dumps(row) + "\n"
+                    for row in [
+                        {
+                            "venue_id": "aster",
+                            "clientOrderId": "unmatched-client-1",
+                            "maker": True,
+                            "qty": "0.01",
+                        },
+                        {
+                            "venue_id": "aster",
+                            "clientOrderId": "unmatched-client-2",
+                            "maker": False,
+                            "qty": "0.02",
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51z_readonly_native_role_capture_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    str(source_path),
+                    "--output-root",
+                    str(capture_root),
+                    "--run-id",
+                    "phase51z_diagnostics_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            capture_dir = capture_root / "phase51z_diagnostics_test"
+            summary = json.loads(
+                (capture_dir / "phase51z_readonly_native_role_capture_summary.json").read_text(encoding="utf-8")
+            )
+            diagnostics = summary["capture_diagnostics_by_venue"]["aster"]
+            self.assertEqual(summary["sanitized_source_row_count"], 0)
+            self.assertEqual(diagnostics["target_count"], 1)
+            self.assertEqual(diagnostics["target_ready_count"], 0)
+            self.assertEqual(diagnostics["target_missing_count"], 1)
+            self.assertEqual(diagnostics["source_row_count"], 2)
+            self.assertEqual(diagnostics["native_field_ready_count"], 2)
+            self.assertEqual(diagnostics["target_matched_row_count"], 0)
+            self.assertEqual(diagnostics["duplicate_matched_row_count"], 0)
+            self.assertEqual(diagnostics["no_target_match_count"], 2)
+            self.assertEqual(diagnostics["rows_with_redacted_hash_candidates"], 2)
+            self.assertEqual(diagnostics["target_match_status_counts"], {"NO_TARGET_MATCH": 2})
+            output_text = (
+                (capture_dir / "phase51z_readonly_native_role_capture_summary.json").read_text(encoding="utf-8")
+                + (capture_dir / "phase51z_readonly_native_role_capture_labels.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("unmatched-client-1", output_text)
+            self.assertNotIn("unmatched-client-2", output_text)
 
     def test_phase51w_forward_capture_request_pack_emits_operator_pack(self):
         """5.1w should emit an operator-facing request pack from 5.1u targets."""

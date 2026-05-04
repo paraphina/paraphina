@@ -668,12 +668,17 @@ redacted hashes, emits only sanitized target-linked rows for Phase 5.1y/5.1v,
 records credential presence as booleans only, rejects network paths for local
 source inputs, rejects `.env` source files, rejects unsafe true flags and
 secret-shaped fields, and does not persist raw order IDs, raw client IDs, raw
-trade IDs, tokens, signatures, or private keys. Its current read-only evidence
-run recovered `67 / 287` all-five native-role target groups (`aster=39`,
+trade IDs, tokens, signatures, or private keys. It now emits redaction-safe
+per-venue diagnostics: target count, source row count, native-field-ready
+count, matched row count, duplicate matched row count, no-target-match count,
+hash-candidate coverage, and target time windows. Its current read-only
+evidence recovered `67 / 287` all-five native-role target groups (`aster=39`,
 `extended=21`, `paradex=7`) and the combined Phase 5.1v run with existing
-Hyperliquid source recognizes `73 / 287` native-role targets ready. This is
-blocker reduction, not promotion: `214 / 287` native-role targets remain
-missing and Lighter event-time native-limit pressure remains `0 / 3132`.
+Hyperliquid source recognizes `73 / 287` native-role targets ready. The
+diagnostic retry showed that target linkage, not native-field parsing, is the
+main source blocker for retained rows. This is blocker reduction, not
+promotion: `214 / 287` native-role targets remain missing and Lighter
+event-time native-limit pressure remains `0 / 3132`.
 
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change

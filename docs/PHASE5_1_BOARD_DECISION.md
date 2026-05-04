@@ -1545,6 +1545,9 @@ Rationale:
   sanitized target-linked native fields, artifact hashes, and source counts.
   Raw venue order IDs, client IDs, trade IDs, private keys, tokens, signatures,
   and authorization headers are not persisted.
+- Phase 5.1z now emits redaction-safe per-venue diagnostics so the board can
+  separate missing native fields from no-target-match source coverage without
+  exposing raw identifiers.
 - Lighter network capture remains delegated to the existing Phase 5.1b/5.1c
   read-only collectors. Phase 5.1z can consume already-local Lighter source
   rows, but the retained Lighter backfills did not match the current target
@@ -1562,6 +1565,12 @@ authorized output:
 - phase51z_candidate_manifest.json
 - phase51z_readonly_native_role_capture_summary.json
 - manifest.json
+diagnostic fields:
+- target_count / target_ready_count / target_missing_count
+- source_row_count / native_field_ready_count
+- target_matched_row_count / duplicate_matched_row_count
+- no_target_match_count / rows_with_redacted_hash_candidates
+- target_time_windows_by_venue
 prohibited:
 - live orders
 - canary
@@ -1610,16 +1619,36 @@ runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-RETAINED-BACKFILLS-H
 gate_status: HOLD
 sanitized_source_row_count: 0
 capture_status_counts: NO_TARGET_MATCH=1400
+
+runs/phase51z_readonly_native_role_capture/PHASE51Z-DIAGNOSTIC-READONLY-NATIVE-ROLE-CAPTURE-20260504T220117Z
+gate_status: HOLD
+fetch_status: aster=824 rows, extended=1601 rows, paradex=163 rows, lighter=SKIPPED
+sanitized_source_row_count: 67
+sanitized_source_row_counts_by_venue: aster=39, extended=21, paradex=7
+capture_diagnostics:
+- aster: target_ready=39/113, native_field_ready=824, no_target_match=784
+- extended: target_ready=21/28, native_field_ready=1601, no_target_match=1579
+- lighter: target_ready=0/125, native_field_ready=300, no_target_match=300
+- paradex: target_ready=7/15, native_field_ready=163, no_target_match=156
+
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-COMBINED-PHASE51Z-DIAGNOSTIC-HYPERLIQUID-HOLD-20260504T220117Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 73 / 287
+native_role_capture_target_missing_count: 214 / 287
+missing native-role targets by venue: aster=74, extended=7, lighter=125, paradex=8
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+downstream_chain_ready: false
 ```
 
 Next move:
 
 ```text
-Continue safe read-only source recovery for the remaining Aster/Extended/Paradex
-native-role gaps and identify a safe observed Lighter source with target-linked
-native role plus event-time active-order/sendTx/REST-or-weighted request
-pressure. Do not infer missing Lighter pressure from caps, account tiers,
-empty headers, or documentation-only limits.
+Prioritize a Lighter-only safe observed source with target-linked native role
+plus event-time active-order/sendTx/REST-or-weighted request pressure. Continue
+Aster/Extended/Paradex recovery only where it can improve target linkage rather
+than re-fetching already no-target-matching rows. Do not infer missing Lighter
+pressure from caps, account tiers, empty headers, or documentation-only limits.
 ```
 
 ## Phase 5.1n Forward Native-Limit Source Decision

@@ -824,6 +824,113 @@ def _count_by_venue(targets: list[CaptureTarget]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _target_time_windows_by_venue(targets: list[CaptureTarget], pad_ms: int) -> dict[str, dict[str, Any]]:
+    windows: dict[str, dict[str, Any]] = {}
+    for venue in VENUES:
+        start_ms, end_ms = _time_window_for_targets(targets, venue, pad_ms)
+        windows[venue] = {
+            "available": start_ms is not None and end_ms is not None,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "start_utc": (
+                datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).isoformat()
+                if start_ms is not None
+                else None
+            ),
+            "end_utc": (
+                datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).isoformat()
+                if end_ms is not None
+                else None
+            ),
+            "pad_ms": pad_ms,
+        }
+    return windows
+
+
+def _increment_nested(
+    counts: dict[str, dict[str, int]],
+    venue: str,
+    key: str | None,
+) -> None:
+    normalized_key = str(key or "UNKNOWN")
+    venue_counts = counts.setdefault(venue, {})
+    venue_counts[normalized_key] = venue_counts.get(normalized_key, 0) + 1
+
+
+def _build_capture_diagnostics(
+    *,
+    targets: list[CaptureTarget],
+    rows_by_venue: dict[str, list[dict[str, Any]]],
+    output_rows: list[dict[str, Any]],
+    labels: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    target_counts = _count_by_venue(targets)
+    emitted_counts: dict[str, int] = {}
+    for row in output_rows:
+        venue = str(row.get("venue_id") or "unknown")
+        emitted_counts[venue] = emitted_counts.get(venue, 0) + 1
+
+    field_status_counts: dict[str, dict[str, int]] = {}
+    target_match_status_counts: dict[str, dict[str, int]] = {}
+    capture_status_counts: dict[str, dict[str, int]] = {}
+    native_field_ready_counts: dict[str, int] = {}
+    target_matched_row_counts: dict[str, int] = {}
+    duplicate_matched_row_counts: dict[str, int] = {}
+    no_target_match_counts: dict[str, int] = {}
+    rows_with_hash_candidates: dict[str, int] = {}
+    hash_candidate_count_sum: dict[str, int] = {}
+
+    for label in labels:
+        venue = str(label.get("venue_id") or "unknown")
+        field_status = str(label.get("native_field_status") or "UNKNOWN")
+        match_status = str(label.get("target_match_status") or "UNKNOWN")
+        capture_status = str(label.get("capture_status") or "UNKNOWN")
+        hash_count = _safe_int(label.get("redacted_id_hash_candidate_count")) or 0
+
+        _increment_nested(field_status_counts, venue, field_status)
+        _increment_nested(target_match_status_counts, venue, match_status)
+        _increment_nested(capture_status_counts, venue, capture_status)
+
+        if field_status == "NATIVE_ROLE_FIELDS_READY":
+            native_field_ready_counts[venue] = native_field_ready_counts.get(venue, 0) + 1
+        if match_status == "TARGET_MATCHED_BY_REDACTED_ID_HASH":
+            target_matched_row_counts[venue] = target_matched_row_counts.get(venue, 0) + 1
+            if capture_status != "SANITIZED_SOURCE_ROW_EMITTED":
+                duplicate_matched_row_counts[venue] = duplicate_matched_row_counts.get(venue, 0) + 1
+        if match_status == "NO_TARGET_MATCH":
+            no_target_match_counts[venue] = no_target_match_counts.get(venue, 0) + 1
+        if hash_count > 0:
+            rows_with_hash_candidates[venue] = rows_with_hash_candidates.get(venue, 0) + 1
+            hash_candidate_count_sum[venue] = hash_candidate_count_sum.get(venue, 0) + hash_count
+
+    diagnostics: dict[str, dict[str, Any]] = {}
+    for venue in VENUES:
+        source_row_count = len(rows_by_venue.get(venue, []))
+        emitted_count = emitted_counts.get(venue, 0)
+        target_count = target_counts.get(venue, 0)
+        hash_rows = rows_with_hash_candidates.get(venue, 0)
+        diagnostics[venue] = {
+            "target_count": target_count,
+            "target_ready_count": emitted_count,
+            "target_missing_count": max(target_count - emitted_count, 0),
+            "source_row_count": source_row_count,
+            "native_field_ready_count": native_field_ready_counts.get(venue, 0),
+            "target_matched_row_count": target_matched_row_counts.get(venue, 0),
+            "duplicate_matched_row_count": duplicate_matched_row_counts.get(venue, 0),
+            "no_target_match_count": no_target_match_counts.get(venue, 0),
+            "rows_with_redacted_hash_candidates": hash_rows,
+            "average_redacted_hash_candidate_count": (
+                round(hash_candidate_count_sum.get(venue, 0) / hash_rows, 6)
+                if hash_rows
+                else 0.0
+            ),
+            "field_status_counts": dict(sorted(field_status_counts.get(venue, {}).items())),
+            "target_match_status_counts": dict(sorted(target_match_status_counts.get(venue, {}).items())),
+            "capture_status_counts": dict(sorted(capture_status_counts.get(venue, {}).items())),
+        }
+    return diagnostics
+
+
 def _presence(env: dict[str, str], keys: list[str]) -> dict[str, bool]:
     return {key: bool(env.get(key, "").strip()) for key in keys}
 
@@ -951,6 +1058,12 @@ def build_readonly_native_role_capture(
     for row in output_rows:
         venue = str(row.get("venue_id") or "unknown")
         recovered_by_venue[venue] = recovered_by_venue.get(venue, 0) + 1
+    capture_diagnostics = _build_capture_diagnostics(
+        targets=targets,
+        rows_by_venue=rows_by_venue,
+        output_rows=output_rows,
+        labels=labels,
+    )
     summary = {
         "schema_version": 1,
         "run_id": run_id,
@@ -962,10 +1075,12 @@ def build_readonly_native_role_capture(
         "target_summary_gate_status": target_summary.get("gate_status"),
         "native_role_target_count": len(targets),
         "native_role_target_counts_by_venue": _count_by_venue(targets),
+        "target_time_windows_by_venue": _target_time_windows_by_venue(targets, window_pad_ms),
         "sanitized_source_row_count": len(output_rows),
         "sanitized_source_row_counts_by_venue": dict(sorted(recovered_by_venue.items())),
         "capture_label_count": len(labels),
         "capture_status_counts": status_counts,
+        "capture_diagnostics_by_venue": capture_diagnostics,
         "local_source_file_counts": dict(sorted(source_file_counts.items())),
         "fetch_readonly_requested": fetch_readonly,
         "fetch_status": fetch_status,

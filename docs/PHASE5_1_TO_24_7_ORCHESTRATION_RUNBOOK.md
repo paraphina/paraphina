@@ -1092,6 +1092,35 @@ contains both target-linked native role and event-time active-order/sendTx plus
 REST-or-weighted request pressure. Do not infer Lighter request pressure from
 caps, empty headers, account tiers, or documentation-only limits.
 
+The diagnostics-enabled Phase 5.1z rerun is:
+
+```text
+runs/phase51z_readonly_native_role_capture/PHASE51Z-DIAGNOSTIC-READONLY-NATIVE-ROLE-CAPTURE-20260504T220117Z
+gate_status: HOLD
+sanitized_source_row_count: 67
+aster: target_ready=39/113, native_field_ready=824, no_target_match=784
+extended: target_ready=21/28, native_field_ready=1601, no_target_match=1579
+lighter: target_ready=0/125, native_field_ready=300, no_target_match=300
+paradex: target_ready=7/15, native_field_ready=163, no_target_match=156
+```
+
+The combined downstream readiness check is:
+
+```text
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-COMBINED-PHASE51Z-DIAGNOSTIC-HYPERLIQUID-HOLD-20260504T220117Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 73 / 287
+native_role_capture_target_missing_count: 214 / 287
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+```
+
+Operational implication: do not spend the next cycle merely refetching the same
+read-only Aster/Extended/Paradex/Lighter rows. The next highest-leverage move is
+a Lighter-only source path that supplies target-linked native role and complete
+event-time request pressure, or a proven new linkage source for remaining
+Aster/Extended/Paradex target groups.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
