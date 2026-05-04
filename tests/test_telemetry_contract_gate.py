@@ -773,6 +773,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51y_all5_native_role_adapter.py"
 
+    def _get_phase51z_readonly_native_role_capture_path(self) -> Path:
+        """Get path to the Phase 5.1z read-only native-role capture tool."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51z_readonly_native_role_capture.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -9227,6 +9232,248 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(tmp_path / "phase51y_all5"),
                     "--run-id",
                     "phase51y_all5_network_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("network source paths are prohibited", result.stderr)
+
+    def test_phase51z_readonly_native_role_capture_maps_raw_rows_to_sanitized_bundle(self):
+        """5.1z should map read-only native rows by redacted hashes without leaking raw IDs."""
+        def stable_hash(value):
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            target_run = tmp_path / "phase51u_targets"
+            capture_root = tmp_path / "phase51z_capture"
+            readiness_root = tmp_path / "phase51v_readiness"
+            observed_run.mkdir()
+            target_run.mkdir()
+            raw_ids = {
+                "aster": "aster-client-raw",
+                "extended": "extended-client-raw",
+                "lighter": "123456789",
+                "paradex": "paradex-client-raw",
+            }
+            target_rows = []
+            pfill_rows = []
+            for seq, venue in enumerate(("aster", "extended", "lighter", "paradex"), start=1):
+                group = f"{venue}-group"
+                order_key = f"{venue}-order-key"
+                target_rows.append({
+                    "canonical_group_id": group,
+                    "order_key": order_key,
+                    "venue_id": venue,
+                    "required_native_role_source": "VENUE_NATIVE_FILL_FIELD",
+                    "required_native_role_fields": ["native role field"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                })
+                pfill_rows.append({
+                    "schema_version": 1,
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "label_seq": seq,
+                    "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                    "canonical_group_id": group,
+                    "order_key": order_key,
+                    "venue_id": venue,
+                    "client_order_id_hash": stable_hash(raw_ids[venue]),
+                    "order_id_hash": None,
+                    "fill_count": 1,
+                    "first_fill_time_ms": 1700000000000 + seq,
+                    "last_fill_time_ms": 1700000000000 + seq,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                })
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51z_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": len(pfill_rows),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in pfill_rows),
+                encoding="utf-8",
+            )
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_phase51z_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "observed_pfill_run": str(observed_run),
+                "native_role_capture_target_count": len(target_rows),
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in target_rows),
+                encoding="utf-8",
+            )
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            source_path = tmp_path / "raw_readonly_native_rows.jsonl"
+            source_rows = [
+                {
+                    "venue_id": "aster",
+                    "clientOrderId": raw_ids["aster"],
+                    "orderId": "raw-aster-order",
+                    "maker": True,
+                    "qty": "0.01",
+                },
+                {
+                    "venue_id": "extended",
+                    "externalId": raw_ids["extended"],
+                    "id": "raw-extended-trade",
+                    "isTaker": False,
+                },
+                {
+                    "venue_id": "lighter",
+                    "account_index": 42,
+                    "ask_account_id": 42,
+                    "bid_account_id": 7,
+                    "ask_client_id": int(raw_ids["lighter"]),
+                    "is_maker_ask": True,
+                    "trade_id": "raw-lighter-trade",
+                },
+                {
+                    "venue_id": "paradex",
+                    "client_id": raw_ids["paradex"],
+                    "order_id": "raw-paradex-order",
+                    "liquidity": "TAKER",
+                },
+            ]
+            source_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in source_rows),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51z_readonly_native_role_capture_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    str(source_path),
+                    "--output-root",
+                    str(capture_root),
+                    "--run-id",
+                    "phase51z_capture_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            capture_dir = capture_root / "phase51z_capture_test"
+            summary = json.loads(
+                (capture_dir / "phase51z_readonly_native_role_capture_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["sanitized_source_row_count"], 4)
+            self.assertEqual(summary["raw_identifier_redaction_status"], "PASS")
+            self.assertFalse(summary["live_orders_allowed"])
+            output_text = (
+                (capture_dir / "source_snapshots" / "phase51z_forward_native_role_rows.jsonl").read_text(encoding="utf-8")
+                + (capture_dir / "phase51z_readonly_native_role_capture_labels.jsonl").read_text(encoding="utf-8")
+            )
+            for raw in raw_ids.values():
+                self.assertNotIn(str(raw), output_text)
+            self.assertNotIn("raw-aster-order", output_text)
+            self.assertNotIn("raw-extended-trade", output_text)
+            self.assertNotIn("raw-lighter-trade", output_text)
+            self.assertNotIn("raw-paradex-order", output_text)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(capture_dir / "phase51z_candidate_manifest.json"),
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51v_from_phase51z_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            readiness_summary = json.loads(
+                (
+                    readiness_root
+                    / "phase51v_from_phase51z_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertTrue(readiness_summary["generated_phase51s_manifest_ready"])
+            self.assertEqual(readiness_summary["native_role_capture_target_ready_count"], 4)
+            self.assertEqual(readiness_summary["native_role_capture_target_missing_count"], 0)
+            self.assertFalse(readiness_summary["clears_phase51_blockers"])
+
+    def test_phase51z_readonly_native_role_capture_rejects_network_sources(self):
+        """5.1z should refuse network source paths before reading any source rows."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            target_run = tmp_path / "phase51u_targets"
+            observed_run.mkdir()
+            target_run.mkdir()
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51z_network_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text("", encoding="utf-8")
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_empty_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "observed_pfill_run": str(observed_run),
+                "native_role_capture_target_count": 0,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51z_readonly_native_role_capture_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    "https://api.venue.example/private_fills.json",
+                    "--output-root",
+                    str(tmp_path / "phase51z_capture"),
+                    "--run-id",
+                    "phase51z_network_reject_test",
                 ],
                 capture_output=True,
                 text=True,

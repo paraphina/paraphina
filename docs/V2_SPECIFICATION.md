@@ -660,6 +660,21 @@ not capture venue truth by itself and does not authorize Phase 5.1s promotion,
 model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claims.
 
+Phase 5.1z adds a HOLD-only read-only private-source capture/sanitizer for the
+same venue-native role contract. It may fetch only read-only private source
+surfaces using existing local credentials, or consume already-local JSON/JSONL
+source rows. It maps raw/private venue rows to existing Phase 5.1u targets by
+redacted hashes, emits only sanitized target-linked rows for Phase 5.1y/5.1v,
+records credential presence as booleans only, rejects network paths for local
+source inputs, rejects `.env` source files, rejects unsafe true flags and
+secret-shaped fields, and does not persist raw order IDs, raw client IDs, raw
+trade IDs, tokens, signatures, or private keys. Its current read-only evidence
+run recovered `67 / 287` all-five native-role target groups (`aster=39`,
+`extended=21`, `paradex=7`) and the combined Phase 5.1v run with existing
+Hyperliquid source recognizes `73 / 287` native-role targets ready. This is
+blocker reduction, not promotion: `214 / 287` native-role targets remain
+missing and Lighter event-time native-limit pressure remains `0 / 3132`.
+
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and

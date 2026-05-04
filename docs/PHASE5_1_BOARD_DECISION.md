@@ -1524,6 +1524,104 @@ against the resulting local capture bundle and proceed to Phase 5.1s only if
 5.1v emits generated_phase51s_manifest_ready=true.
 ```
 
+## Phase 5.1z Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for bounded read-only private-source native-role
+capture and sanitized Phase 5.1v bundle input generation through
+`tools/phase51z_readonly_native_role_capture.py`.
+
+Rationale:
+
+- Phase 5.1y normalized already-local rows, but Aster, Extended, Paradex, and
+  Lighter still required a safe capture/sanitizer step that could use existing
+  local read-only credentials without writing raw identifiers or secrets.
+- Phase 5.1z is HOLD-only. It never places, edits, cancels, replaces, or
+  cancels-all orders; never enables canary/live; never changes capital or risk
+  limits; and never emits financial claims.
+- Phase 5.1z records only credential presence booleans, redacted hashes,
+  sanitized target-linked native fields, artifact hashes, and source counts.
+  Raw venue order IDs, client IDs, trade IDs, private keys, tokens, signatures,
+  and authorization headers are not persisted.
+- Lighter network capture remains delegated to the existing Phase 5.1b/5.1c
+  read-only collectors. Phase 5.1z can consume already-local Lighter source
+  rows, but the retained Lighter backfills did not match the current target
+  manifest.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1z - read-only native-role source capture
+tool: tools/phase51z_readonly_native_role_capture.py
+status: HOLD
+authorized output:
+- source_snapshots/phase51z_forward_native_role_rows.jsonl
+- phase51z_readonly_native_role_capture_labels.jsonl
+- phase51z_candidate_manifest.json
+- phase51z_readonly_native_role_capture_summary.json
+- manifest.json
+prohibited:
+- live orders
+- canary
+- order place/edit/cancel/replace/cancel-all
+- network source paths for local source inputs
+- .env source files as native source inputs
+- symlink source files
+- secret-shaped fields in source/output records
+- raw venue identifiers in output
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+```
+
+Evidence:
+
+```text
+runs/phase51z_readonly_native_role_capture/PHASE51Z-READONLY-NATIVE-ROLE-CAPTURE-20260504T000000Z
+gate_status: HOLD
+fetch_readonly_requested: true
+fetch_status: aster=268 rows, extended=1601 rows, paradex=30 rows, lighter=SKIPPED
+sanitized_source_row_count: 67
+sanitized_source_row_counts_by_venue: aster=39, extended=21, paradex=7
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-PHASE51Z-READONLY-NATIVE-ROLE-CAPTURE-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 67 / 287
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+downstream_chain_ready: false
+
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-COMBINED-PHASE51Z-HYPERLIQUID-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 73 / 287
+native_role_capture_target_missing_count: 214 / 287
+missing native-role targets by venue: aster=74, extended=7, lighter=125, paradex=8
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+downstream_chain_ready: false
+
+runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-RETAINED-BACKFILLS-HOLD-20260504T000000Z
+gate_status: HOLD
+sanitized_source_row_count: 0
+capture_status_counts: NO_TARGET_MATCH=1400
+```
+
+Next move:
+
+```text
+Continue safe read-only source recovery for the remaining Aster/Extended/Paradex
+native-role gaps and identify a safe observed Lighter source with target-linked
+native role plus event-time active-order/sendTx/REST-or-weighted request
+pressure. Do not infer missing Lighter pressure from caps, account tiers,
+empty headers, or documentation-only limits.
+```
+
 ## Phase 5.1n Forward Native-Limit Source Decision
 
 Decision: `HOLD` for model training, EV admission, canary, live orders, capital

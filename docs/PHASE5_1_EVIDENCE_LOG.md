@@ -257,6 +257,128 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1z Read-Only Native-Role Capture
+
+- Evidence date: `2026-05-04`
+- Tool: `tools/phase51z_readonly_native_role_capture.py`
+- Scope: bounded read-only native-role source capture/sanitization for Phase
+  5.1v input.
+- Official docs referenced by the tool: Aster API documentation, Extended user
+  trades API, Lighter trades API, and Paradex list fills API. These docs
+  support the read-only field selection only; repo evidence remains the gate
+  authority.
+- Gate status: `HOLD`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `admissible_for_financial_claim`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51z_readonly_native_role_capture.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z/source_snapshots/trades_backfill.sanitized.json \
+  --env-file /etc/paraphina/current.env \
+  --fetch-readonly \
+  --venue aster --venue extended --venue paradex --venue lighter \
+  --allow-paradex-jwt-cmd \
+  --limit 1000 \
+  --max-pages 10 \
+  --timeout-s 20 \
+  --run-id PHASE51Z-READONLY-NATIVE-ROLE-CAPTURE-20260504T000000Z
+```
+
+Sanitized output:
+
+```text
+run: runs/phase51z_readonly_native_role_capture/PHASE51Z-READONLY-NATIVE-ROLE-CAPTURE-20260504T000000Z
+gate_status: HOLD
+native_role_target_count: 287
+native_role_target_counts_by_venue: aster=113, extended=28, hyperliquid=6, lighter=125, paradex=15
+fetch_status: aster=268 rows, extended=1601 rows, paradex=30 rows, lighter=SKIPPED
+sanitized_source_row_count: 67
+sanitized_source_row_counts_by_venue: aster=39, extended=21, paradex=7
+capture_status_counts: NO_TARGET_MATCH=2130, SANITIZED_SOURCE_ROW_EMITTED=67, TARGET_MATCHED_BY_REDACTED_ID_HASH=2
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Credential evidence is boolean-only. No private keys, tokens, authorization
+headers, API key values, API secret values, raw order IDs, raw client IDs, or
+raw trade IDs are recorded in the repo-owned artifacts.
+
+Secret-pattern scan:
+
+```bash
+rg -c --pcre2 "0x[0-9a-fA-F]{64}|(?i)bearer\s+[A-Za-z0-9._-]{20,}|(?i)api[_-]?secret\s*[=:]|(?i)private[_-]?key\s*[=:]|(?i)authorization\s*[=:]|(?i)jwt\s*[=:]" \
+  runs/phase51z_readonly_native_role_capture/PHASE51Z-READONLY-NATIVE-ROLE-CAPTURE-20260504T000000Z
+```
+
+Result:
+
+```text
+exit code: 1
+matches: none
+```
+
+Phase 5.1v against Phase 5.1z source:
+
+```bash
+python3 tools/phase51v_forward_capture_bundle_readiness.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --candidate-manifest runs/phase51z_readonly_native_role_capture/PHASE51Z-READONLY-NATIVE-ROLE-CAPTURE-20260504T000000Z/phase51z_candidate_manifest.json \
+  --run-id PHASE51V-PHASE51Z-READONLY-NATIVE-ROLE-CAPTURE-HOLD-20260504T000000Z \
+  --timestamp-ns 1777852800000000000
+```
+
+Result:
+
+```text
+gate_status: HOLD
+native_role_capture_target_ready_count: 67 / 287
+native_role_capture_target_missing_count: 220 / 287
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+downstream_chain_ready: false
+```
+
+Combined Phase 5.1v with Phase 5.1z plus existing Hyperliquid source:
+
+```text
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-COMBINED-PHASE51Z-HYPERLIQUID-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 73 / 287
+native_role_capture_target_missing_count: 214 / 287
+missing native-role targets by venue: aster=74, extended=7, lighter=125, paradex=8
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+downstream_chain_ready: false
+```
+
+Existing retained Lighter backfills reprocessed through Phase 5.1z:
+
+```text
+runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-RETAINED-BACKFILLS-HOLD-20260504T000000Z
+gate_status: HOLD
+sanitized_source_row_count: 0
+capture_status_counts: NO_TARGET_MATCH=1400
+```
+
+Interpretation:
+
+```text
+Phase 5.1z materially reduces the all-five native-role blocker from the
+previous Hyperliquid-only 6 / 287 readiness to 73 / 287 when combined with
+Hyperliquid. It does not clear Phase 5.1 because 214 native-role targets remain
+missing and Lighter event-time native-limit pressure remains 0 / 3132. No
+model training, EV admission, canary, live orders, capital escalation,
+risk-limit relaxation, or financial claims are authorized.
+```
+
 ## Phase 5.1x Hyperliquid Native-Role Adapter
 
 - Run id: `PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z`

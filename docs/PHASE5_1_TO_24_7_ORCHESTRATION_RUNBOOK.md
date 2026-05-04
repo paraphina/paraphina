@@ -1056,6 +1056,42 @@ request pressure. Use canonical linkage or 5.1t-compatible sidecars where raw
 order IDs cannot be emitted, then validate the completed bundle by Phase 5.1v
 before Phase 5.1s.
 
+Phase 5.1z now owns the bounded read-only private-source capture/sanitizer step
+for venue-native role evidence:
+
+```text
+tool: tools/phase51z_readonly_native_role_capture.py
+run: runs/phase51z_readonly_native_role_capture/PHASE51Z-READONLY-NATIVE-ROLE-CAPTURE-20260504T000000Z
+gate_status: HOLD
+fetched rows: aster=268, extended=1601, paradex=30
+lighter network capture: skipped; use existing Phase 5.1b/5.1c local sources
+sanitized target-linked rows emitted: 67
+sanitized rows by venue: aster=39, extended=21, paradex=7
+raw_identifier_redaction_status: PASS
+```
+
+Combined with the existing Phase 5.1x Hyperliquid native-role source:
+
+```text
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-COMBINED-PHASE51Z-HYPERLIQUID-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 73 / 287
+native_role_capture_target_missing_count: 214 / 287
+missing native-role targets by venue: aster=74, extended=7, lighter=125, paradex=8
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+downstream_chain_ready: false
+```
+
+Existing retained Lighter trade-backfill sources were reprocessed through
+Phase 5.1z and recovered `0` additional target-linked rows. Treat that source
+path as exhausted for the current target manifest. The next orchestrator should
+continue safe read-only recovery for the remaining Aster/Extended/Paradex
+target gaps, but should prioritize finding a safe observed Lighter source that
+contains both target-linked native role and event-time active-order/sendTx plus
+REST-or-weighted request pressure. Do not infer Lighter request pressure from
+caps, empty headers, account tiers, or documentation-only limits.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
