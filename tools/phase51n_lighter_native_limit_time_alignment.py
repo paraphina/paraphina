@@ -169,8 +169,12 @@ def _load_phase51b_context(run_dir: Path | None) -> dict[str, Any]:
             "limitations": ["phase51b_native_limits_run_not_supplied"],
             "active_order_cap_account": None,
             "active_order_cap_market": None,
+            "sendtx_per_minute_limit": None,
             "sendtx_per_minute_remaining": None,
-            "rest_request_remaining": None,
+            "rest_requests_per_minute_limit": None,
+            "rest_requests_per_minute_remaining": None,
+            "weighted_requests_per_minute_limit": None,
+            "weighted_requests_per_minute_remaining": None,
         }
     run_dir = _resolve_path(run_dir)
     acceptance_path = run_dir / "phase51b_acceptance.json"
@@ -179,8 +183,12 @@ def _load_phase51b_context(run_dir: Path | None) -> dict[str, Any]:
     _check_unsafe(acceptance, acceptance_path, label="acceptance")
     active_order_cap_account = None
     active_order_cap_market = None
+    sendtx_per_minute_limit = None
     sendtx_per_minute_remaining = None
-    rest_request_remaining = None
+    rest_requests_per_minute_limit = None
+    rest_requests_per_minute_remaining = None
+    weighted_requests_per_minute_limit = None
+    weighted_requests_per_minute_remaining = None
     for _, event in _iter_jsonl(telemetry_path):
         _check_unsafe(event, telemetry_path, label="telemetry")
         if event.get("event_type") == "V2_LIGHTER_ACTIVE_ORDERS":
@@ -193,13 +201,29 @@ def _load_phase51b_context(run_dir: Path | None) -> dict[str, Any]:
             if market_count is not None and market_headroom is not None:
                 active_order_cap_market = market_count + market_headroom
         elif event.get("event_type") == "V2_LIGHTER_ACCOUNT_LIMITS":
+            sendtx_per_minute_limit = _safe_int(event.get("sendtx_per_minute_limit"))
             sendtx_per_minute_remaining = _safe_int(event.get("sendtx_per_minute_remaining"))
-            rest_request_remaining = _safe_int(event.get("rest_request_remaining"))
+            rest_requests_per_minute_limit = _safe_int(event.get("rest_requests_per_minute_limit"))
+            rest_requests_per_minute_remaining = _safe_int(event.get("rest_requests_per_minute_remaining"))
+            weighted_requests_per_minute_limit = _safe_int(event.get("weighted_requests_per_minute_limit"))
+            weighted_requests_per_minute_remaining = _safe_int(event.get("weighted_requests_per_minute_remaining"))
     limitations = list(acceptance.get("limitations") or [])
+    if sendtx_per_minute_limit is None and "lighter_sendtx_limit_not_observed" not in limitations:
+        limitations.append("lighter_sendtx_limit_not_observed")
     if sendtx_per_minute_remaining is None and "lighter_sendtx_remaining_not_observed" not in limitations:
         limitations.append("lighter_sendtx_remaining_not_observed")
-    if rest_request_remaining is None and "lighter_rest_request_remaining_not_observed" not in limitations:
-        limitations.append("lighter_rest_request_remaining_not_observed")
+    if (
+        rest_requests_per_minute_limit is None
+        and weighted_requests_per_minute_limit is None
+        and "lighter_rest_or_weighted_limit_not_observed" not in limitations
+    ):
+        limitations.append("lighter_rest_or_weighted_limit_not_observed")
+    if (
+        rest_requests_per_minute_remaining is None
+        and weighted_requests_per_minute_remaining is None
+        and "lighter_rest_or_weighted_remaining_not_observed" not in limitations
+    ):
+        limitations.append("lighter_rest_or_weighted_remaining_not_observed")
     return {
         "run_dir": str(run_dir),
         "run_id": acceptance.get("run_id"),
@@ -208,8 +232,12 @@ def _load_phase51b_context(run_dir: Path | None) -> dict[str, Any]:
         "limitations": limitations,
         "active_order_cap_account": active_order_cap_account,
         "active_order_cap_market": active_order_cap_market,
+        "sendtx_per_minute_limit": sendtx_per_minute_limit,
         "sendtx_per_minute_remaining": sendtx_per_minute_remaining,
-        "rest_request_remaining": rest_request_remaining,
+        "rest_requests_per_minute_limit": rest_requests_per_minute_limit,
+        "rest_requests_per_minute_remaining": rest_requests_per_minute_remaining,
+        "weighted_requests_per_minute_limit": weighted_requests_per_minute_limit,
+        "weighted_requests_per_minute_remaining": weighted_requests_per_minute_remaining,
     }
 
 
@@ -332,6 +360,97 @@ def _status_counts(records: list[dict[str, Any]], field: str) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _all_native_limit_pressure_dimensions_observed(record: dict[str, Any], context: dict[str, Any]) -> bool:
+    has_active = (
+        record.get("native_active_order_headroom_account") is not None
+        and record.get("native_active_order_headroom_market") is not None
+    )
+    has_sendtx = (
+        context.get("sendtx_per_minute_limit") is not None
+        and context.get("sendtx_per_minute_remaining") is not None
+    )
+    has_rest_or_weighted = (
+        context.get("rest_requests_per_minute_limit") is not None
+        and context.get("rest_requests_per_minute_remaining") is not None
+    ) or (
+        context.get("weighted_requests_per_minute_limit") is not None
+        and context.get("weighted_requests_per_minute_remaining") is not None
+    )
+    return (
+        record.get("native_limit_time_alignment_status") == "EVENT_TIME_ALIGNED"
+        and has_active
+        and has_sendtx
+        and has_rest_or_weighted
+    )
+
+
+def _forward_native_limit_pressure_source_row(
+    record: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    source_row = {
+        "schema_version": 1,
+        "source": "phase51n_lighter_native_limit_time_alignment",
+        "source_type": "LIGHTER_LIMITS_AT_DECISION_TIME",
+        "baseline_commit": BASELINE_COMMIT,
+        "gate_status": "HOLD",
+        "no_live_flag": True,
+        "approved_for_model_training": False,
+        "approved_for_live": False,
+        "approved_for_canary": False,
+        "approved_for_capital_escalation": False,
+        "admissible_for_financial_claim": False,
+        "admissible_for_ev_admission": False,
+        "live_orders_allowed": False,
+        "capital_change_allowed": False,
+        "risk_limit_relaxation_allowed": False,
+        "raw_identifier_redaction_status": "PASS",
+        "venue_id": "lighter",
+        "canonical_group_id": record.get("canonical_group_id"),
+        "order_key": record.get("order_key"),
+        "active_order_headroom_account": record.get("native_active_order_headroom_account"),
+        "active_order_headroom_market": record.get("native_active_order_headroom_market"),
+        "sendtx_per_minute_limit": context.get("sendtx_per_minute_limit"),
+        "sendtx_per_minute_remaining": context.get("sendtx_per_minute_remaining"),
+        "rest_requests_per_minute_limit": context.get("rest_requests_per_minute_limit"),
+        "rest_requests_per_minute_remaining": context.get("rest_requests_per_minute_remaining"),
+        "weighted_requests_per_minute_limit": context.get("weighted_requests_per_minute_limit"),
+        "weighted_requests_per_minute_remaining": context.get("weighted_requests_per_minute_remaining"),
+        "native_limit_event_time_status": record.get("native_limit_time_alignment_status"),
+        "native_limit_staleness_ms": record.get("snapshot_age_ms_abs"),
+        "source_event_time_ms": record.get("source_event_time_ms"),
+        "snapshot_ts_ms": record.get("snapshot_ts_ms"),
+        "phase51b_native_run_id": record.get("phase51b_native_run_id"),
+        "source_alignment_label_sha256": _stable_hash(record),
+    }
+    return {key: value for key, value in source_row.items() if value is not None}
+
+
+def _phase51v_manifest(forward_source_path: Path) -> dict[str, Any]:
+    return {
+        "manifest_version": 1,
+        "baseline_commit": BASELINE_COMMIT,
+        "no_live_flag": True,
+        "approved_for_live": False,
+        "approved_for_canary": False,
+        "approved_for_model_training": False,
+        "approved_for_capital_escalation": False,
+        "admissible_for_financial_claim": False,
+        "admissible_for_ev_admission": False,
+        "live_orders_allowed": False,
+        "capital_change_allowed": False,
+        "risk_limit_relaxation_allowed": False,
+        "sources": [
+            {
+                "source_id": "phase51n_lighter_forward_native_limit_pressure",
+                "venue_id": "lighter",
+                "path": str(forward_source_path),
+            }
+        ],
+        "source_links": [],
+    }
+
+
 def build_lighter_native_limit_time_alignment(
     *,
     pfill_outcome_run: Path,
@@ -361,7 +480,8 @@ def build_lighter_native_limit_time_alignment(
     account_cap = phase51b_context.get("active_order_cap_account")
     market_cap = phase51b_context.get("active_order_cap_market")
     sendtx_remaining = phase51b_context.get("sendtx_per_minute_remaining")
-    rest_remaining = phase51b_context.get("rest_request_remaining")
+    rest_remaining = phase51b_context.get("rest_requests_per_minute_remaining")
+    weighted_remaining = phase51b_context.get("weighted_requests_per_minute_remaining")
 
     records: list[dict[str, Any]] = []
     for seq, label in enumerate(pfill_labels, start=1):
@@ -397,7 +517,8 @@ def build_lighter_native_limit_time_alignment(
             "native_active_order_headroom_account": None,
             "native_active_order_headroom_market": None,
             "native_sendtx_per_minute_remaining": sendtx_remaining,
-            "native_rest_request_remaining": rest_remaining,
+            "native_rest_requests_per_minute_remaining": rest_remaining,
+            "native_weighted_requests_per_minute_remaining": weighted_remaining,
             "native_active_order_limit_source": "PHASE51B_OFFICIAL_CAP_CONTEXT" if account_cap is not None else None,
             "native_active_order_limit_conflicts": [],
             "native_limit_limitations": phase51b_context.get("limitations") or [],
@@ -452,7 +573,7 @@ def build_lighter_native_limit_time_alignment(
             record["native_limit_alignment_hold_reason"] = "event_time_snapshot_present_but_account_cap_unknown"
         else:
             record["native_limit_time_alignment_status"] = "EVENT_TIME_ALIGNED"
-            if sendtx_remaining is not None and rest_remaining is not None:
+            if _all_native_limit_pressure_dimensions_observed(record, phase51b_context):
                 record["native_limit_alignment_hold_reason"] = "requires_queue_reset_calibration_and_board_review"
                 record["native_limit_all_pressure_dimensions_observed"] = True
             else:
@@ -462,8 +583,17 @@ def build_lighter_native_limit_time_alignment(
         records.append(record)
 
     labels_path = out_dir / "lighter_native_limit_time_alignment_labels.jsonl"
+    forward_source_path = out_dir / "lighter_forward_native_limit_pressure_snapshot.jsonl"
+    phase51v_manifest_path = out_dir / "phase51v_lighter_native_limit_manifest.generated.json"
     summary_path = out_dir / "lighter_native_limit_time_alignment_summary.json"
+    forward_source_records = [
+        _forward_native_limit_pressure_source_row(record, phase51b_context)
+        for record in records
+        if _all_native_limit_pressure_dimensions_observed(record, phase51b_context)
+    ]
     _write_jsonl(labels_path, records)
+    _write_jsonl(forward_source_path, forward_source_records)
+    _write_json(phase51v_manifest_path, _phase51v_manifest(forward_source_path))
     status_counts = _status_counts(records, "native_limit_time_alignment_status")
     aligned = status_counts.get("EVENT_TIME_ALIGNED", 0)
     fully_observed = sum(1 for record in records if record.get("native_limit_all_pressure_dimensions_observed") is True)
@@ -507,6 +637,10 @@ def build_lighter_native_limit_time_alignment(
         "native_limit_all_pressure_dimensions_observed_count": fully_observed,
         "native_limit_partial_or_unobserved_count": partial_count,
         "native_limit_time_alignment_status_counts": status_counts,
+        "forward_native_limit_pressure_source_path": str(forward_source_path),
+        "forward_native_limit_pressure_source_count": len(forward_source_records),
+        "phase51v_lighter_native_limit_manifest_path": str(phase51v_manifest_path),
+        "phase51v_lighter_native_limit_manifest_ready": len(forward_source_records) > 0,
         "limitations": sorted(set(phase51b_context.get("limitations") or [])),
     }
     _write_json(summary_path, summary)
@@ -514,14 +648,17 @@ def build_lighter_native_limit_time_alignment(
     _write_json(artifact_index_path, {
         "schema_version": 1,
         "metadata": summary,
-        "artifacts": _artifact_infos(out_dir, [labels_path, summary_path]),
+        "artifacts": _artifact_infos(out_dir, [labels_path, forward_source_path, phase51v_manifest_path, summary_path]),
     })
     manifest_path = out_dir / "manifest.json"
     _write_json(manifest_path, {
         "schema_version": 1,
         "created_utc": created_utc,
         "metadata": summary,
-        "files": _artifact_infos(out_dir, [labels_path, summary_path, artifact_index_path]),
+        "files": _artifact_infos(
+            out_dir,
+            [labels_path, forward_source_path, phase51v_manifest_path, summary_path, artifact_index_path],
+        ),
     })
     return out_dir
 

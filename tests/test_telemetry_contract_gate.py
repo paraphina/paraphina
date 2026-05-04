@@ -6211,6 +6211,10 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(alignment_label["native_limit_time_alignment_status"], "EVENT_TIME_ALIGNED")
             self.assertEqual(alignment_label["native_active_order_headroom_account"], 1496)
             self.assertFalse(alignment_label["native_limit_all_pressure_dimensions_observed"])
+            self.assertEqual(alignment_summary["forward_native_limit_pressure_source_count"], 0)
+            forward_source = alignment_dir / "lighter_forward_native_limit_pressure_snapshot.jsonl"
+            self.assertTrue(forward_source.is_file())
+            self.assertEqual(forward_source.read_text(encoding="utf-8"), "")
 
             (label_lake_run / "label_lake_summary.json").write_text(json.dumps({
                 "run_id": "label_lake_phase51n_test",
@@ -6264,6 +6268,170 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "PARTIAL_NATIVE_HEADROOM_EVENT_TIME_ALIGNED_LIMITS_INCOMPLETE",
             )
             self.assertEqual(queue_label["native_limit_alignment_source"], "phase51n_lighter_native_limit_time_alignment")
+
+    def test_phase51n_complete_lighter_limit_alignment_feeds_phase51v(self):
+        """Complete event-time Lighter limit pressure should become a 5.1v-ready source row."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            source_path = tmp_path / "telemetry.jsonl"
+            snapshot_log = tmp_path / "paraphina_live.err.segment"
+            pfill_run = tmp_path / "pfill_outcome"
+            native_run = tmp_path / "phase51b_native"
+            target_run = tmp_path / "phase51u_targets"
+            alignment_root = tmp_path / "phase51n_alignment"
+            readiness_root = tmp_path / "phase51v_readiness"
+            pfill_run.mkdir()
+            native_run.mkdir()
+            target_run.mkdir()
+            source_path.write_text(
+                json.dumps({"schema_version": 1, "t": 10, "kf_last_update_ms": 1700000000000}) + "\n",
+                encoding="utf-8",
+            )
+            source_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            snapshot_log.write_text(
+                "INFO: Lighter account snapshot seq=1700000000000 ts=1700000000100 "
+                "positions=flat collateral_usd=1 available_usd=1 total_order_count=4 pending_order_count=0\n",
+                encoding="utf-8",
+            )
+            (native_run / "phase51b_acceptance.json").write_text(json.dumps({
+                "run_id": "phase51b_native_complete_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "approved_for_financial_claim": False,
+                "limitations": [],
+            }), encoding="utf-8")
+            with (native_run / "telemetry.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACCOUNT_LIMITS",
+                    "run_id": "phase51b_native_complete_test",
+                    "venue_id": "lighter",
+                    "sendtx_per_minute_limit": 120,
+                    "sendtx_per_minute_remaining": 119,
+                    "weighted_requests_per_minute_limit": 300,
+                    "weighted_requests_per_minute_remaining": 299,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+                f.write(json.dumps({
+                    "event_type": "V2_LIGHTER_ACTIVE_ORDERS",
+                    "run_id": "phase51b_native_complete_test",
+                    "venue_id": "lighter",
+                    "active_orders_count_total": 0,
+                    "active_orders_count_market": 0,
+                    "active_order_headroom_account": 1500,
+                    "active_order_headroom_market": 100,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                }) + "\n")
+            (pfill_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "pfill_phase51n_complete_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "source_telemetry_sha256": source_sha,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            with (pfill_run / "pfill_order_labels.jsonl").open("w", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                    "run_id": "pfill_phase51n_complete_test",
+                    "canonical_group_id": "lighter-group",
+                    "order_key": "lighter-order",
+                    "order_label_seq": 1,
+                    "order_source_line": 1,
+                    "order_source_t": 10,
+                    "venue_id": "lighter",
+                    "source_telemetry_sha256": source_sha,
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n")
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 0,
+                "lighter_native_limit_capture_target_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "lighter-group",
+                "order_key": "lighter-order",
+                "venue_id": "lighter",
+                "required_native_limit_source": "LIGHTER_LIMITS_AT_DECISION_TIME",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            alignment_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51n_lighter_native_limit_time_alignment_path()),
+                    "--pfill-outcome-run",
+                    str(pfill_run),
+                    "--source-telemetry",
+                    str(source_path),
+                    "--lighter-snapshot-log",
+                    str(snapshot_log),
+                    "--phase51b-native-run",
+                    str(native_run),
+                    "--output-root",
+                    str(alignment_root),
+                    "--run-id",
+                    "phase51n_complete_alignment_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(alignment_result.returncode, 0, f"stdout: {alignment_result.stdout}\nstderr: {alignment_result.stderr}")
+            alignment_dir = alignment_root / "phase51n_complete_alignment_test"
+            alignment_summary = json.loads(
+                (alignment_dir / "lighter_native_limit_time_alignment_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(alignment_summary["native_limit_all_pressure_dimensions_observed_count"], 1)
+            self.assertEqual(alignment_summary["forward_native_limit_pressure_source_count"], 1)
+            self.assertTrue(alignment_summary["phase51v_lighter_native_limit_manifest_ready"])
+            forward_source_text = (alignment_dir / "lighter_forward_native_limit_pressure_snapshot.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("sendtx_per_minute_limit", forward_source_text)
+            self.assertNotIn("client_order_id", forward_source_text)
+            self.assertNotIn("trade_id", forward_source_text)
+
+            readiness_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    alignment_summary["phase51v_lighter_native_limit_manifest_path"],
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51v_lighter_limit_from_phase51n_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(readiness_result.returncode, 0, f"stdout: {readiness_result.stdout}\nstderr: {readiness_result.stderr}")
+            readiness_summary = json.loads(
+                (
+                    readiness_root
+                    / "phase51v_lighter_limit_from_phase51n_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(readiness_summary["lighter_native_limit_capture_target_ready_count"], 1)
+            self.assertEqual(readiness_summary["lighter_native_limit_capture_target_missing_count"], 0)
+            self.assertFalse(readiness_summary["approved_for_live"])
+            self.assertFalse(readiness_summary["live_orders_allowed"])
 
     def test_phase51n_maker_taker_recovery_uses_only_venue_native_evidence(self):
         """Maker/taker recovery should recover only from explicit venue-native role evidence."""

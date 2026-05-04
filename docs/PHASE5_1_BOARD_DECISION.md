@@ -1439,3 +1439,43 @@ Build or capture the remaining Aster, Extended, Paradex, and Lighter native-role
 sources plus complete Lighter event-time native-limit pressure, then rerun
 Phase 5.1v before Phase 5.1s.
 ```
+
+## Phase 5.1n Forward Native-Limit Source Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only the repo-owned non-live plumbing that converts complete
+Phase 5.1n Lighter event-time native-limit alignment rows into a Phase 5.1v
+local source artifact.
+
+Rationale:
+
+- Phase 5.1v already requires explicit Lighter native-limit fields and cannot
+  infer missing pressure from active-order alignment alone.
+- Phase 5.1n is the correct owner of event-time Lighter active-order alignment,
+  so it should also emit a downstream `lighter_forward_native_limit_pressure_snapshot.jsonl`
+  only when active-order headroom, sendTx limit/remaining, and REST-or-weighted
+  limit/remaining are all present.
+- The generated Phase 5.1v manifest is safe only when
+  `forward_native_limit_pressure_source_count > 0`; otherwise it remains an
+  empty HOLD artifact and does not reduce the blocker.
+
+Evidence:
+
+```text
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-FORWARD-SOURCE-RETEST-20260504T000000Z
+gate_status: HOLD
+native_limit_event_time_aligned_count: 3700
+native_limit_all_pressure_dimensions_observed_count: 0
+forward_native_limit_pressure_source_count: 0
+phase51v_lighter_native_limit_manifest_ready: false
+```
+
+Next move:
+
+```text
+Capture or stage the missing event-time sendTx and REST-or-weighted
+limit/remaining pressure fields, rerun Phase 5.1n, and feed its generated
+manifest into Phase 5.1v only if complete forward rows are emitted.
+```

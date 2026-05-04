@@ -5,6 +5,69 @@ run artifacts under `runs/` are ignored by Git because they contain large
 telemetry snapshots; this file preserves the reproducible evidence boundary in
 the repository.
 
+## Phase 5.1n Lighter Native-Limit Forward Source Patch
+
+Date: 2026-05-04
+
+Purpose: make Phase 5.1n emit a downstream Phase 5.1v-ready Lighter
+native-limit source artifact only when event-time active-order headroom plus
+sendTx and REST-or-weighted limit/remaining pressure are complete.
+
+Changed repo-owned behavior:
+
+```text
+accepted: EVENT_TIME_ALIGNED Lighter row with active-order, sendTx, and REST-or-weighted pressure fields
+emitted: lighter_forward_native_limit_pressure_snapshot.jsonl
+emitted: phase51v_lighter_native_limit_manifest.generated.json
+held: event-time active-order alignment without complete sendTx and REST-or-weighted pressure
+not allowed: pressure inference, live orders, canary, capital/risk changes, model training, EV/PnL claims
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51n_lighter_native_limit_time_alignment.py tests/test_telemetry_contract_gate.py
+
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51n_lighter_native_limit_alignment_feeds_queue_churn_without_false_clearance \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51n_complete_lighter_limit_alignment_feeds_phase51v \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_accepts_local_bundle
+
+python3 -m unittest tests.test_telemetry_contract_gate
+
+python3 tools/check_docs_integrity.py
+
+git diff --check
+```
+
+Current evidence retest:
+
+```text
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-FORWARD-SOURCE-RETEST-20260504T000000Z
+gate_status: HOLD
+native_limit_event_time_aligned_count: 3700
+native_limit_all_pressure_dimensions_observed_count: 0
+forward_native_limit_pressure_source_count: 0
+phase51v_lighter_native_limit_manifest_ready: false
+limitations:
+- lighter_rest_or_weighted_limit_not_observed
+- lighter_rest_or_weighted_remaining_not_observed
+- lighter_sendtx_limit_not_observed
+- lighter_sendtx_remaining_not_observed
+```
+
+Result:
+
+```text
+py_compile: PASS
+focused Phase 5.1n/5.1v unittest: PASS, 3 tests
+tests.test_telemetry_contract_gate: PASS, 128 tests
+docs integrity: PASS
+git diff --check: PASS
+gate_status remains HOLD
+clears_phase51_blockers remains false
+```
+
 ## Phase 5.1v Source-Link Readiness Patch
 
 Date: 2026-05-04

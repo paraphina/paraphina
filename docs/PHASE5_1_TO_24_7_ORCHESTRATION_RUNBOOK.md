@@ -977,6 +977,21 @@ Use the Phase 5.1x Hyperliquid source as the Hyperliquid native-role file in the
 next all-five candidate bundle. Do not rerun Hyperliquid unless the canonical
 Phase 5.1u target manifest changes or a newer source snapshot is needed.
 
+Phase 5.1n now emits a downstream Lighter native-limit source artifact and
+Phase 5.1v manifest:
+
+```text
+lighter_forward_native_limit_pressure_snapshot.jsonl
+phase51v_lighter_native_limit_manifest.generated.json
+```
+
+Use the generated manifest only when the Phase 5.1n summary reports
+`forward_native_limit_pressure_source_count > 0`. The 2026-05-04 retest
+`PHASE51N-LIGHTER-NATIVE-LIMIT-FORWARD-SOURCE-RETEST-20260504T000000Z`
+reported `0`, because the supplied native-limit context still lacked sendTx and
+REST-or-weighted limit/remaining pressure. Event-time active-order alignment
+alone is not complete Lighter native-limit pressure.
+
 After Phase 5.1t, source-link generation is repo-owned and should be used
 before Phase 5.1s whenever a local forward source snapshot contains raw
 order/client identifiers that cannot be emitted. The first 5.1t run over
