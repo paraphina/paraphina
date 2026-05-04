@@ -60,12 +60,21 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    filled-order maker/taker status is incomplete for `287` labels, some
    venue/side buckets remain sparse, and `1613` quarantined/review groups remain
    excluded from the observed-only diagnostic pack.
-5. Next evidence move is operator/source action, not another live run: use the
-   Phase 5.1w request pack to provide six sanitized local read-only all-five
-   forward capture files, then run Phase 5.1v against the Phase 5.1u target
-   manifest. Capture or locate native snapshots with canonical group/order-key
-   linkage, or a redacted Phase 5.1t/5.1s `source_links` sidecar that validates
-   those joins by source hash. If 5.1v emits
+5. Next evidence move is operator/source action, not another live run. The
+   2026-05-04 authorized read-only private source attempt succeeded for Lighter
+   account/native-limit and trade-backfill artifacts only, at
+   `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z`
+   and
+   `runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z`.
+   It does not clear the all-five Phase 5.1w blocker. Continue by adding safe
+   repo-owned read-only native-role collectors/parsers for Aster, Extended,
+   Hyperliquid, and Paradex, and by completing Lighter event-time
+   active-order/sendTx/REST-or-weighted pressure linkage. Then use the Phase
+   5.1w request pack to provide six sanitized local read-only all-five forward
+   capture files and run Phase 5.1v against the Phase 5.1u target manifest.
+   Capture or locate native snapshots with canonical group/order-key linkage,
+   or a redacted Phase 5.1t/5.1s `source_links` sidecar that validates those
+   joins by source hash. If 5.1v emits
    `generated_phase51s_manifest_ready=true`, stage the generated manifest
    through Phase 5.1s, run Phase 5.1r, feed its sanitized outputs into Phase
    5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into Phase 5.1n, then

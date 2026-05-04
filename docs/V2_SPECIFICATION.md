@@ -604,9 +604,12 @@ native-limit pressure snapshot. Phase 5.1w does not capture source truth,
 validate source rows, call venue APIs, read secrets, clear blockers, infer
 maker/taker role, infer native-limit pressure, or authorize economics.
 
-The next evidence move is to use Phase 5.1w to acquire or produce the six
-sanitized local read-only all-five forward source-capture files, run the bundle
-through Phase 5.1v, and only if 5.1v emits
+The 2026-05-04 authorized read-only private source attempt produced Lighter-only
+sanitized account/native-limit and trade-backfill artifacts; it does not change
+this spec gate because Phase 5.1w requires all-five native role files and
+event-time Lighter native-limit pressure. The next evidence move is to acquire
+or produce the six sanitized local read-only all-five forward source-capture
+files, run the bundle through Phase 5.1v, and only if 5.1v emits
 `generated_phase51s_manifest_ready=true`, stage the generated manifest through
 Phase 5.1s. The bundle must contain native snapshots with canonical
 group/order-key linkage, or validated source-link sidecars that bind redacted

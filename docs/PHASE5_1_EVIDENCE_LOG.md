@@ -279,6 +279,134 @@ PROMOTE only for using the generated request pack to provide six sanitized
 local read-only source files, then rerunning Phase 5.1v.
 ```
 
+## Phase 5.1w Read-Only Lighter Private Source Capture Attempt
+
+Run ids:
+
+- `PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z`
+- `PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z`
+
+Local run directories:
+
+- `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z`
+- `runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z`
+
+Scope:
+
+```text
+Authorized read-only private source capture attempt using existing local
+credentials only. No live orders, no canary/live mode, no capital escalation,
+no risk-limit relaxation, and no secret values printed. The run used
+repo-owned Lighter GET-only collectors and emitted sanitized HOLD artifacts.
+```
+
+Board audit summary:
+
+```text
+Safe existing private collectors are Lighter-only.
+Aster, Extended, Hyperliquid, and Paradex still require safe repo-owned
+read-only native-role collectors/parsers before private source capture.
+The Lighter capture does not clear all-five Phase 5.1w.
+```
+
+Result:
+
+```text
+phase51b_capture_complete: true
+phase51b_event_count: 6
+phase51b_source_names:
+- account
+- account_limits
+- active_orders
+- official_limits
+- order_books
+- trades
+phase51c_source_mode: readonly_lighter_api
+phase51c_pages_fetched: 3
+phase51c_trade_count: 300
+phase51c_role_counts_for_account:
+- maker: 189
+- taker: 111
+- unknown: 0
+gate_status: HOLD
+approved_for_live: false
+approved_for_canary: false
+approved_for_capital_escalation: false
+admissible_for_financial_claim: false
+clears_all_five_phase51w_blocker: false
+```
+
+Commands:
+
+```bash
+python3 tools/phase51b_lighter_account_limits.py \
+  --fetch-readonly \
+  --include-trades \
+  --env-file /home/ubuntu/paraphina/deploy/env/all5_recover_20260314.env \
+  --allow-sdk-auth \
+  --timeout-s 20
+
+/opt/paraphina/.venv_lighter/bin/python3 tools/phase51b_lighter_account_limits.py \
+  --fetch-readonly \
+  --include-trades \
+  --env-file /home/ubuntu/paraphina/deploy/env/all5_recover_20260314.env \
+  --allow-sdk-auth \
+  --timeout-s 20
+
+/opt/paraphina/.venv_lighter/bin/python3 tools/phase51c_lighter_trade_backfill.py \
+  --env-file /home/ubuntu/paraphina/deploy/env/all5_recover_20260314.env \
+  --allow-sdk-auth \
+  --market-id 0 \
+  --market-type perp \
+  --pages 3 \
+  --limit 100 \
+  --sleep-s 1.6
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51b_lighter_account_limits.py tools/phase51c_lighter_trade_backfill.py
+python3 tools/check_telemetry_contract.py runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z/telemetry.jsonl
+python3 -m unittest tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51b_lighter_account_limits_collector_emits_valid_hold_artifact tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51c_lighter_trade_backfill_ingests_offline_pages_without_promotion
+rg -c --pcre2 "0x[0-9a-fA-F]{64}|(?i)bearer\\s+[A-Za-z0-9._-]{20,}|(?i)api[_-]?secret\\s*[=:]|(?i)private[_-]?key\\s*[=:]" runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z
+```
+
+Validation output:
+
+```text
+Initial python3 collector attempt: ERROR lighter-sdk is required for --allow-sdk-auth
+Initial /opt/paraphina/.venv_lighter collector attempt: ERROR Unsupported platform/architecture: Linux/aarch64
+py_compile: PASS
+check_telemetry_contract: OK: 6 record(s) validated against schema v2
+unittest: Ran 2 tests; OK
+secret-value-pattern scan: no matches
+```
+
+Artifact hashes:
+
+```text
+cbc1b8dc4157185ece2841786da1ccc575a0232af421d920bc610bc0547cc124  runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z/lighter_account_native_limits_summary.json
+0802e153fceea31cfbba7b0423fcbccf8f3834b559d0d783dca921b1b08dea88  runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z/telemetry.jsonl
+3a8afee51b56c71a692cab4cf3b55ab43c4bfa4bf29aa158a9f97988d39bc901  runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z/manifest.json
+ef0ddede64a08231edf46d8b64d52706752ac58fdd8eda54fb60dee6c781cc2d  runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z/lighter_trade_backfill_summary.json
+1ec3285f3cf8e4c21e7dfdd96e2cd98eac7c0aafa57e1fbcce96c97d3ef090b4  runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z/source_snapshots/trades_backfill.sanitized.json
+15629f8730ea12e603d423276fafda678d9b44640e85361f985b278d0292dc64  runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z/manifest.json
+```
+
+Verdict:
+
+```text
+HOLD for all-five Phase 5.1w completion, live, canary, model training,
+EV admission, capital escalation, risk-limit relaxation, financial claims,
+and 24/7 readiness.
+
+PROMOTE only for Lighter-only sanitized source availability. The next single
+move is to implement safe repo-owned read-only native-role collectors/parsers
+for Aster, Extended, Hyperliquid, and Paradex, and complete Lighter
+event-time native-limit pressure linkage before rerunning Phase 5.1v.
+```
+
 ## Phase 5.1t - Source-Link Sidecar Builder
 
 - Run id:

@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import shlex
 import stat
 import sys
@@ -490,7 +491,19 @@ def _resolve_safe_lighter_sdk_path(sdk_path: Path) -> Path:
     return sdk_root
 
 
+def _patch_lighter_sdk_platform_detection() -> None:
+    """Allow official lighter-sdk import on Linux/aarch64.
+
+    The SDK ships an arm64 Linux signer library, but its platform check expects
+    ``platform.machine() == "arm64"`` instead of the common ``aarch64`` value.
+    """
+    machine = platform.machine().lower()
+    if platform.system() == "Linux" and machine == "aarch64":
+        platform.machine = lambda: "arm64"  # type: ignore[assignment]
+
+
 def _import_lighter_sdk(sdk_path: Path | None) -> Any:
+    _patch_lighter_sdk_platform_detection()
     try:
         import lighter  # type: ignore
 
