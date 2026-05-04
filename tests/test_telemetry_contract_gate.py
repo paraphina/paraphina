@@ -8373,6 +8373,191 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertNotIn("client_order_id", markdown)
             self.assertNotIn("trade_id", markdown)
 
+    def test_phase51w_forward_capture_request_pack_stages_empty_local_bundle(self):
+        """5.1w can stage the six canonical local source files without clearing 5.1v."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            output_root = tmp_path / "phase51w_request_pack"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 5,
+                "lighter_native_limit_capture_target_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            role_targets = [
+                {
+                    "canonical_group_id": "aster-group",
+                    "order_key": "aster-order",
+                    "venue_id": "aster",
+                    "required_native_role_source": "ASTER_ORDER_TRADE_UPDATE",
+                    "required_native_role_fields": ["e=ORDER_TRADE_UPDATE", "o.m", "positive o.l"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "extended-group",
+                    "order_key": "extended-order",
+                    "venue_id": "extended",
+                    "required_native_role_source": "EXTENDED_ISTAKER",
+                    "required_native_role_fields": ["isTaker"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "hyper-group",
+                    "order_key": "hyper-order",
+                    "venue_id": "hyperliquid",
+                    "required_native_role_source": "HYPERLIQUID_CROSSED",
+                    "required_native_role_fields": ["crossed"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "lighter-group",
+                    "order_key": "lighter-order",
+                    "venue_id": "lighter",
+                    "required_native_role_source": "LIGHTER_TRADES_JSON",
+                    "required_native_role_fields": [
+                        "account_index",
+                        "is_maker_ask",
+                        "ask_account_id",
+                        "bid_account_id",
+                    ],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "paradex-group",
+                    "order_key": "paradex-order",
+                    "venue_id": "paradex",
+                    "required_native_role_source": "PARADEX_LIQUIDITY",
+                    "required_native_role_fields": ["liquidity"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            limit_targets = [
+                {
+                    "canonical_group_id": "lighter-group",
+                    "order_key": "lighter-order",
+                    "venue_id": "lighter",
+                    "required_native_limit_fields": [
+                        "active_order_headroom_account",
+                        "active_order_headroom_market",
+                        "sendtx_per_minute_limit",
+                        "sendtx_per_minute_remaining",
+                        "weighted_requests_per_minute_limit/weighted_requests_per_minute_remaining",
+                        "native_limit_event_time_status",
+                    ],
+                    "accepted_native_limit_event_time_status": ["EVENT_TIME_ALIGNED"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }
+            ]
+            (target_run / "native_role_capture_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in role_targets),
+                encoding="utf-8",
+            )
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in limit_targets),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51w_forward_capture_request_pack_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51w_staging_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--stage-local-source-dir",
+                    "local_source_staging",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            run_dir = output_root / "phase51w_staging_test"
+            summary = json.loads(
+                (run_dir / "phase51w_forward_capture_request_pack_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertTrue(summary["local_source_staging_enabled"])
+            self.assertFalse(summary["clears_phase51_blockers"])
+            local_manifest_path = Path(summary["local_capture_bundle_manifest_path"])
+            local_manifest = json.loads(local_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(local_manifest["sources"]), 6)
+            self.assertEqual(local_manifest["source_links"], [])
+            self.assertFalse(local_manifest["approved_for_live"])
+            self.assertFalse(local_manifest["live_orders_allowed"])
+            staged_paths = [Path(source["path"]) for source in local_manifest["sources"]]
+            self.assertEqual(len({path.name for path in staged_paths}), 6)
+            for path in staged_paths:
+                self.assertTrue(path.is_file())
+                self.assertEqual(path.suffix, ".jsonl")
+                self.assertEqual(path.read_text(encoding="utf-8"), "")
+                self.assertTrue(path.resolve().is_relative_to(run_dir.resolve()))
+            staged_text = (run_dir / "local_source_field_guide.json").read_text(encoding="utf-8")
+            self.assertNotIn("client_order_id", staged_text)
+            self.assertNotIn("trade_id", staged_text)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(local_manifest_path),
+                    "--output-root",
+                    str(tmp_path / "phase51v_readiness"),
+                    "--run-id",
+                    "phase51v_empty_staged_bundle_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            readiness_summary = json.loads(
+                (
+                    tmp_path
+                    / "phase51v_readiness"
+                    / "phase51v_empty_staged_bundle_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(readiness_summary["gate_status"], "HOLD")
+            self.assertEqual(
+                readiness_summary["gate_reason"],
+                "phase51v_forward_capture_bundle_incomplete_nonlive_hold",
+            )
+            self.assertEqual(readiness_summary["native_role_capture_target_ready_count"], 0)
+            self.assertEqual(readiness_summary["native_role_capture_target_missing_count"], 5)
+            self.assertEqual(readiness_summary["lighter_native_limit_capture_target_ready_count"], 0)
+            self.assertEqual(readiness_summary["lighter_native_limit_capture_target_missing_count"], 1)
+            self.assertEqual(readiness_summary["source_file_status_counts"], {"LOCAL_FILE_READY": 6})
+            self.assertFalse(readiness_summary["generated_phase51s_manifest_ready"])
+
     def test_phase51w_forward_capture_request_pack_rejects_unsafe_targets(self):
         """5.1w should reject unsafe target manifests instead of building a request pack."""
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -42,7 +42,8 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    forward-evidence gate. Phase 5.1u is repo-owned, non-live, and emits the
    exact target list for fresh all-five native role capture plus Lighter
    event-time native-limit pressure. Phase 5.1w emits the exact operator
-   request pack and manifest skeleton for the required sanitized local files.
+   request pack, manifest skeleton, and optional empty local staging bundle for
+   the required sanitized local files.
    Phase 5.1v consumes a local candidate capture bundle manifest, rejects
    unsafe source surfaces, and emits a generated Phase 5.1s manifest only when
    all targets are structurally ready. Phase 5.1s requires an explicit local
@@ -66,12 +67,19 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z`
    and
    `runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z`.
-   It does not clear the all-five Phase 5.1w blocker. Continue by adding safe
-   repo-owned read-only native-role collectors/parsers for Aster, Extended,
-   Hyperliquid, and Paradex, and by completing Lighter event-time
-   active-order/sendTx/REST-or-weighted pressure linkage. Then use the Phase
-   5.1w request pack to provide six sanitized local read-only all-five forward
-   capture files and run Phase 5.1v against the Phase 5.1u target manifest.
+   It does not clear the all-five Phase 5.1w blocker. Phase 5.1w now has a
+   canonical empty staged-source run at
+   `runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z`;
+   Phase 5.1v validated that manifest as six local files but correctly held
+   with `0 / 287` native-role targets and `0 / 3132` Lighter native-limit
+   targets ready at
+   `runs/phase51v_forward_capture_bundle_readiness/PHASE51V-EMPTY-STAGED-SOURCE-BUNDLE-HOLD-20260504T000000Z`.
+   Continue by adding safe repo-owned read-only native-role collectors/parsers
+   for Aster, Extended, Hyperliquid, and Paradex, and by completing Lighter
+   event-time active-order/sendTx/REST-or-weighted pressure linkage. Then
+   populate the Phase 5.1w staged files with six sanitized local read-only
+   all-five forward capture files and rerun Phase 5.1v against the Phase 5.1u
+   target manifest.
    Capture or locate native snapshots with canonical group/order-key linkage,
    or a redacted Phase 5.1t/5.1s `source_links` sidecar that validates those
    joins by source hash. If 5.1v emits

@@ -15,6 +15,8 @@ Phase 5.1w emits:
 - an operator Markdown request pack;
 - a machine-readable JSON request pack;
 - a `capture_bundle_manifest.skeleton.json` for local path replacement;
+- optionally, six empty staged local `.jsonl` source files plus
+  `local_capture_bundle_manifest.json` and `local_source_field_guide.json`;
 - a summary and manifest with artifact hashes.
 
 It performs no network access, reads no secrets, submits no orders, validates no
@@ -39,8 +41,24 @@ Outputs:
 - `forward_capture_request_pack.md`
 - `forward_capture_request_pack.json`
 - `capture_bundle_manifest.skeleton.json`
+- `local_capture_bundle_manifest.json` when `--stage-local-source-dir` is used
+- `local_source_field_guide.json` when `--stage-local-source-dir` is used
+- six empty staged `.jsonl` files when `--stage-local-source-dir` is used
 - `phase51w_forward_capture_request_pack_summary.json`
 - `phase51w_manifest.json`
+
+Optional staging mode:
+
+```text
+--stage-local-source-dir <dir-inside-run-dir>
+```
+
+When staging is enabled, Phase 5.1w writes empty local `.jsonl` templates for
+the six canonical sources and a local candidate manifest that can be passed
+directly to Phase 5.1v. This does not clear any blocker. Empty staged files are
+expected to produce `LOCAL_FILE_READY` file status in Phase 5.1v while all
+native-role and native-limit targets remain missing until real sanitized rows
+are added.
 
 ## Required Local Files
 
@@ -112,6 +130,62 @@ lighter_native_limit_capture_target_count: 3132
 required_local_source_file_count: 6
 clears_phase51_blockers: false
 raw_identifier_redaction_status: PASS
+```
+
+## Staged Local Source Bundle Evidence
+
+Run id:
+
+```text
+PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z
+```
+
+Local run directory:
+
+```text
+runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z
+```
+
+Command:
+
+```bash
+python3 tools/phase51w_forward_capture_request_pack.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --output-root runs/phase51w_forward_capture_request_pack \
+  --run-id PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z \
+  --timestamp-ns 1777894485526000000 \
+  --stage-local-source-dir local_source_staging
+```
+
+Staged files:
+
+```text
+aster_forward_native_role_snapshot.jsonl 0 bytes
+extended_forward_native_role_snapshot.jsonl 0 bytes
+hyperliquid_forward_native_role_snapshot.jsonl 0 bytes
+lighter_forward_native_limit_pressure_snapshot.jsonl 0 bytes
+lighter_forward_native_role_snapshot.jsonl 0 bytes
+paradex_forward_native_role_snapshot.jsonl 0 bytes
+```
+
+Phase 5.1v validation run:
+
+```text
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-EMPTY-STAGED-SOURCE-BUNDLE-HOLD-20260504T000000Z
+```
+
+Validation result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51v_forward_capture_bundle_incomplete_nonlive_hold
+source_file_status_counts: {"LOCAL_FILE_READY": 6}
+native_role_capture_target_ready_count: 0
+native_role_capture_target_missing_count: 287
+lighter_native_limit_capture_target_ready_count: 0
+lighter_native_limit_capture_target_missing_count: 3132
+generated_phase51s_manifest_ready: false
+clears_phase51_blockers: false
 ```
 
 ## Next Command

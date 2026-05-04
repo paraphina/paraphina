@@ -279,6 +279,99 @@ PROMOTE only for using the generated request pack to provide six sanitized
 local read-only source files, then rerunning Phase 5.1v.
 ```
 
+## Phase 5.1w Staged Local Source Bundle
+
+Run id:
+
+`PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z`
+
+Local run directory:
+
+`runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z`
+
+Input target run:
+
+`runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z`
+
+Result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51w_forward_capture_request_pack_emitted_nonlive_hold
+native_role_capture_target_count: 287
+native_role_capture_target_counts_by_venue:
+- aster: 113
+- extended: 28
+- hyperliquid: 6
+- lighter: 125
+- paradex: 15
+lighter_native_limit_capture_target_count: 3132
+required_local_source_file_count: 6
+local_source_staging_enabled: true
+source_file_count: 6
+clears_phase51_blockers: false
+no_live_flag: true
+approved_for_live: false
+live_orders_allowed: false
+```
+
+Staged files:
+
+```text
+aster_forward_native_role_snapshot.jsonl 0
+extended_forward_native_role_snapshot.jsonl 0
+hyperliquid_forward_native_role_snapshot.jsonl 0
+lighter_forward_native_limit_pressure_snapshot.jsonl 0
+lighter_forward_native_role_snapshot.jsonl 0
+paradex_forward_native_role_snapshot.jsonl 0
+```
+
+Command:
+
+```bash
+python3 tools/phase51w_forward_capture_request_pack.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --output-root runs/phase51w_forward_capture_request_pack \
+  --run-id PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z \
+  --timestamp-ns 1777894485526000000 \
+  --stage-local-source-dir local_source_staging
+```
+
+Phase 5.1v validation:
+
+```text
+run_id: PHASE51V-EMPTY-STAGED-SOURCE-BUNDLE-HOLD-20260504T000000Z
+local_run_directory: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-EMPTY-STAGED-SOURCE-BUNDLE-HOLD-20260504T000000Z
+gate_status: HOLD
+gate_reason: phase51v_forward_capture_bundle_incomplete_nonlive_hold
+source_file_status_counts: {"LOCAL_FILE_READY": 6}
+native_role_capture_target_ready_count: 0
+native_role_capture_target_missing_count: 287
+lighter_native_limit_capture_target_ready_count: 0
+lighter_native_limit_capture_target_missing_count: 3132
+generated_phase51s_manifest_ready: false
+clears_phase51_blockers: false
+```
+
+Phase 5.1v command:
+
+```bash
+python3 tools/phase51v_forward_capture_bundle_readiness.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --candidate-manifest runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z/local_capture_bundle_manifest.json \
+  --output-root runs/phase51v_forward_capture_bundle_readiness \
+  --run-id PHASE51V-EMPTY-STAGED-SOURCE-BUNDLE-HOLD-20260504T000000Z \
+  --timestamp-ns 1777894485526000000
+```
+
+Verdict:
+
+```text
+HOLD. The local staging contract is now repo-owned and Phase 5.1v-readable.
+This does not clear all-five Phase 5.1w because the staged files are empty
+templates. Populate them with sanitized native rows before rerunning 5.1v.
+```
+
 ## Phase 5.1w Read-Only Lighter Private Source Capture Attempt
 
 Run ids:

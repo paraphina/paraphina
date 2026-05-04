@@ -270,6 +270,113 @@ def _capture_manifest_skeleton(requirements: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def _resolve_stage_dir(stage_dir: Path, out_dir: Path) -> Path:
+    resolved = stage_dir if stage_dir.is_absolute() else out_dir / stage_dir
+    resolved = resolved.resolve()
+    out_resolved = out_dir.resolve()
+    try:
+        resolved.relative_to(out_resolved)
+    except ValueError as exc:
+        raise ValueError("--stage-local-source-dir must resolve inside the Phase 5.1w run directory") from exc
+    if resolved.is_symlink():
+        raise ValueError("--stage-local-source-dir must not be a symlink")
+    return resolved
+
+
+def _local_staging_file_name(source_id: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in source_id)
+    return f"{safe}.jsonl"
+
+
+def _write_empty_jsonl(path: Path) -> None:
+    if path.exists() and path.stat().st_size > 0:
+        raise ValueError(f"refusing to overwrite non-empty staged source file {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+
+
+def _local_capture_manifest(sources: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "manifest_version": 1,
+        "baseline_commit": BASELINE_COMMIT,
+        "no_live_flag": True,
+        "approved_for_model_training": False,
+        "approved_for_live": False,
+        "approved_for_canary": False,
+        "approved_for_capital_escalation": False,
+        "admissible_for_financial_claim": False,
+        "admissible_for_ev_admission": False,
+        "live_orders_allowed": False,
+        "capital_change_allowed": False,
+        "risk_limit_relaxation_allowed": False,
+        "sources": sources,
+        "source_links": [],
+    }
+
+
+def _build_local_staging_bundle(
+    *,
+    out_dir: Path,
+    stage_local_source_dir: Path,
+    requirements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    stage_dir = _resolve_stage_dir(stage_local_source_dir, out_dir)
+    staged_sources: list[dict[str, Any]] = []
+    staged_requirements: list[dict[str, Any]] = []
+    staged_paths: list[Path] = []
+    for req in requirements:
+        source_id = str(req["source_id"])
+        path = stage_dir / _local_staging_file_name(source_id)
+        _write_empty_jsonl(path)
+        staged_paths.append(path)
+        staged_sources.append(
+            {
+                "source_id": source_id,
+                "venue_id": req["venue_id"],
+                "path": str(path),
+            }
+        )
+        staged = dict(req)
+        staged["staged_path"] = str(path)
+        staged["staged_file_status"] = "EMPTY_TEMPLATE_AWAITING_SANITIZED_ROWS"
+        staged_requirements.append(staged)
+
+    manifest = _local_capture_manifest(staged_sources)
+    manifest_path = out_dir / "local_capture_bundle_manifest.json"
+    field_guide_path = out_dir / "local_source_field_guide.json"
+    _write_json(manifest_path, manifest)
+    _write_json(
+        field_guide_path,
+        {
+            "baseline_commit": BASELINE_COMMIT,
+            "gate_status": "HOLD",
+            "gate_reason": "phase51w_local_source_staging_emitted_empty_templates_nonlive_hold",
+            "staged_source_file_count": len(staged_sources),
+            "staged_source_dir": str(stage_dir),
+            "required_source_files": staged_requirements,
+            "required_join_paths": JOIN_PATHS,
+            "prohibited": PROHIBITED,
+            "no_live_flag": True,
+            "approved_for_model_training": False,
+            "approved_for_live": False,
+            "approved_for_canary": False,
+            "approved_for_capital_escalation": False,
+            "admissible_for_financial_claim": False,
+            "admissible_for_ev_admission": False,
+            "live_orders_allowed": False,
+            "capital_change_allowed": False,
+            "risk_limit_relaxation_allowed": False,
+        },
+    )
+    return {
+        "stage_dir": stage_dir,
+        "manifest_path": manifest_path,
+        "field_guide_path": field_guide_path,
+        "staged_paths": staged_paths,
+        "artifact_paths": [manifest_path, field_guide_path] + staged_paths,
+    }
+
+
 def _markdown_pack(
     *,
     run_id: str,
@@ -377,6 +484,7 @@ def build_forward_capture_request_pack(
     output_root: Path,
     run_id: str,
     timestamp_ns: int,
+    stage_local_source_dir: Path | None = None,
 ) -> Path:
     target_run = _resolve_path(target_run)
     output_root = _resolve_path(output_root)
@@ -386,6 +494,15 @@ def build_forward_capture_request_pack(
     target_summary, role_targets, limit_targets = _load_target_run(target_run)
     requirements = _role_requirements(role_targets) + _limit_requirements(limit_targets)
     capture_manifest = _capture_manifest_skeleton(requirements)
+    local_staging = (
+        _build_local_staging_bundle(
+            out_dir=out_dir,
+            stage_local_source_dir=stage_local_source_dir,
+            requirements=requirements,
+        )
+        if stage_local_source_dir is not None
+        else None
+    )
 
     request_pack = {
         "run_id": run_id,
@@ -404,6 +521,12 @@ def build_forward_capture_request_pack(
         "required_local_source_file_count": len(requirements),
         "required_source_files": requirements,
         "capture_bundle_manifest_skeleton_sha256": _stable_hash(capture_manifest),
+        "local_source_staging_enabled": local_staging is not None,
+        "local_source_staging_dir": str(local_staging["stage_dir"]) if local_staging is not None else None,
+        "local_capture_bundle_manifest_path": (
+            str(local_staging["manifest_path"]) if local_staging is not None else None
+        ),
+        "local_source_field_guide_path": str(local_staging["field_guide_path"]) if local_staging is not None else None,
         "phase51v_target_command": (
             "python3 tools/phase51v_forward_capture_bundle_readiness.py "
             f"--target-run {target_run} --candidate-manifest <local_capture_bundle_manifest.json> "
@@ -459,6 +582,12 @@ def build_forward_capture_request_pack(
         "request_pack_path": str(request_md_path),
         "request_pack_json_path": str(request_json_path),
         "capture_bundle_manifest_skeleton_path": str(capture_manifest_path),
+        "local_source_staging_enabled": local_staging is not None,
+        "local_source_staging_dir": str(local_staging["stage_dir"]) if local_staging is not None else None,
+        "local_capture_bundle_manifest_path": (
+            str(local_staging["manifest_path"]) if local_staging is not None else None
+        ),
+        "local_source_field_guide_path": str(local_staging["field_guide_path"]) if local_staging is not None else None,
         "clears_phase51_blockers": False,
         "no_live_flag": True,
         "approved_for_model_training": False,
@@ -475,6 +604,8 @@ def build_forward_capture_request_pack(
     _write_json(summary_path, summary)
 
     artifacts = [request_json_path, request_md_path, capture_manifest_path, summary_path]
+    if local_staging is not None:
+        artifacts.extend(local_staging["artifact_paths"])
     manifest_out = {
         "schema_version": 1,
         "run_id": run_id,
@@ -493,6 +624,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--run-id", default=f"phase51w_{_utc_stamp()}")
     parser.add_argument("--timestamp-ns", type=int, default=None)
+    parser.add_argument(
+        "--stage-local-source-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory, resolved inside the Phase 5.1w run directory, "
+            "where six empty local source JSONL templates and a ready-to-edit "
+            "local_capture_bundle_manifest.json are written."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -505,6 +646,7 @@ def main() -> int:
             output_root=args.output_root,
             run_id=args.run_id,
             timestamp_ns=timestamp_ns,
+            stage_local_source_dir=args.stage_local_source_dir,
         )
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         print(f"phase51w_forward_capture_request_pack: ERROR: {exc}", file=sys.stderr)

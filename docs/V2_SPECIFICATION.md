@@ -600,16 +600,24 @@ Phase 5.1w adds a HOLD-only request-pack gate in front of Phase 5.1v. It
 consumes the Phase 5.1u target run and emits an operator Markdown pack, JSON
 pack, and capture-bundle manifest skeleton for the exact six sanitized local
 files required: five venue-native role snapshots and one Lighter event-time
-native-limit pressure snapshot. Phase 5.1w does not capture source truth,
+native-limit pressure snapshot. Phase 5.1w may also emit an optional local
+staging bundle: six empty `.jsonl` source files, a ready-to-edit
+`local_capture_bundle_manifest.json`, and a field guide. The staged files are
+templates only; Phase 5.1v must still validate supplied source rows before any
+Phase 5.1s manifest is generated. Phase 5.1w does not capture source truth,
 validate source rows, call venue APIs, read secrets, clear blockers, infer
 maker/taker role, infer native-limit pressure, or authorize economics.
 
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and
-event-time Lighter native-limit pressure. The next evidence move is to acquire
-or produce the six sanitized local read-only all-five forward source-capture
-files, run the bundle through Phase 5.1v, and only if 5.1v emits
+event-time Lighter native-limit pressure. The canonical staged-source evidence
+run `PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z` proves the
+local bundle contract without clearing the blocker: Phase 5.1v sees six local
+files but remains `HOLD` with `0 / 287` native-role targets and `0 / 3132`
+Lighter native-limit targets ready. The next evidence move is to populate the
+six sanitized local read-only all-five forward source-capture files with real
+sanitized rows, run the bundle through Phase 5.1v, and only if 5.1v emits
 `generated_phase51s_manifest_ready=true`, stage the generated manifest through
 Phase 5.1s. The bundle must contain native snapshots with canonical
 group/order-key linkage, or validated source-link sidecars that bind redacted
