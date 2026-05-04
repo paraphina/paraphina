@@ -589,8 +589,12 @@ Phase 5.1v adds a HOLD-only forward capture bundle-readiness gate in front of
 Phase 5.1s. It consumes the Phase 5.1u target run and a local candidate
 capture-bundle manifest, rejects unsafe source surfaces, checks whether local
 redacted source rows cover the required all-five native role targets and
-Lighter native-limit targets, and emits a Phase 5.1s-ready generated manifest
-only when all targets are structurally ready. Its baseline run against the
+Lighter native-limit targets, applies validated source-link sidecars as join
+aids when source rows cannot carry direct `canonical_group_id` or `order_key`
+fields, and emits a Phase 5.1s-ready generated manifest only when all targets
+are structurally ready. Source-link sidecars alone are not evidence; linked
+source rows must also be present and carry the required native role or
+native-limit fields. Its baseline run against the
 Phase 5.1u placeholder template intentionally remains `HOLD`: `0 / 287`
 native-role targets ready, `0 / 3132` Lighter native-limit targets ready, and
 `PLACEHOLDER_PATH` source status. Phase 5.1v does not capture source truth,
@@ -651,9 +655,10 @@ sanitized rows, run the bundle through Phase 5.1v, and only if 5.1v emits
 `generated_phase51s_manifest_ready=true`, stage the generated manifest through
 Phase 5.1s. The bundle must contain native snapshots with canonical
 group/order-key linkage, or validated source-link sidecars that bind redacted
-source hashes to observed labels. After Phase 5.1s, run Phase 5.1r, feed the
-sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No model
-training, EV admission, canary, live orders, capital escalation,
-risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
-5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, or
-Phase 5.1x.
+source hashes to observed labels. Phase 5.1v now applies those sidecars during
+bundle-readiness validation, but only source rows with required native fields
+can mark targets ready. After Phase 5.1s, run Phase 5.1r, feed the sanitized
+outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No model training,
+EV admission, canary, live orders, capital escalation, risk-limit relaxation,
+or financial claim is authorized from Phase 5.1s, Phase 5.1r, Phase 5.1q,
+Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, or Phase 5.1x.

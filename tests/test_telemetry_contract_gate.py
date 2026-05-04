@@ -8075,6 +8075,291 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertNotIn("client_order_id", labels_text)
             self.assertNotIn("trade_id", labels_text)
 
+    def test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar(self):
+        """5.1v should use validated source-link sidecars to join source rows to targets."""
+        def stable_hash(value):
+            return hashlib.sha256(
+                json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            ).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            output_root = tmp_path / "phase51v_readiness"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "extended-group",
+                "order_key": "extended-order",
+                "venue_id": "extended",
+                "required_native_role_source": "EXTENDED_ISTAKER",
+                "required_native_role_fields": ["isTaker"],
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+            source_row = {
+                "venue_id": "extended",
+                "isTaker": False,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }
+            source_path = tmp_path / "extended_native_source.jsonl"
+            source_path.write_text(json.dumps(source_row) + "\n", encoding="utf-8")
+            source_link_path = tmp_path / "source_links.jsonl"
+            source_link_path.write_text(json.dumps({
+                "source_record_sha256": stable_hash(source_row),
+                "canonical_group_id": "extended-group",
+                "order_key": "extended-order",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            candidate_manifest = tmp_path / "capture_bundle_manifest.json"
+            candidate_manifest.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [
+                    {
+                        "source_id": "extended_source_without_direct_join_key",
+                        "venue_id": "extended",
+                        "path": str(source_path),
+                    }
+                ],
+                "source_links": [
+                    {
+                        "source_link_id": "phase51t_links",
+                        "path": str(source_link_path),
+                    }
+                ],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(candidate_manifest),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51v_source_link_ready_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            run_dir = output_root / "phase51v_source_link_ready_test"
+            summary = json.loads(
+                (run_dir / "phase51v_forward_capture_bundle_readiness_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["native_role_capture_target_ready_count"], 1)
+            self.assertEqual(summary["native_role_capture_target_missing_count"], 0)
+            self.assertEqual(summary["source_link_file_status_counts"], {"LOCAL_FILE_READY": 1})
+            self.assertEqual(summary["source_link_hash_count"], 1)
+            self.assertEqual(summary["source_link_applied_row_count"], 1)
+            self.assertTrue(summary["generated_phase51s_manifest_ready"])
+            labels = (run_dir / "capture_bundle_readiness_labels.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"role_target_join_status":"SOURCE_LINK_SIDECAR"', labels)
+            self.assertIn('"source_link_applied":true', labels)
+            self.assertFalse(summary["clears_phase51_blockers"])
+
+    def test_phase51v_forward_capture_bundle_readiness_source_link_only_holds(self):
+        """5.1v should not treat source-link sidecars alone as native source evidence."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            output_root = tmp_path / "phase51v_readiness"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "extended-group",
+                "order_key": "extended-order",
+                "venue_id": "extended",
+                "required_native_role_source": "EXTENDED_ISTAKER",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+            source_link_path = tmp_path / "source_links.jsonl"
+            source_link_path.write_text(json.dumps({
+                "source_record_sha256": "a" * 64,
+                "canonical_group_id": "extended-group",
+                "order_key": "extended-order",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            candidate_manifest = tmp_path / "capture_bundle_manifest.json"
+            candidate_manifest.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [],
+                "source_links": [
+                    {
+                        "source_link_id": "phase51t_links",
+                        "path": str(source_link_path),
+                    }
+                ],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(candidate_manifest),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51v_source_link_only_hold_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            summary = json.loads(
+                (
+                    output_root
+                    / "phase51v_source_link_only_hold_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["native_role_capture_target_ready_count"], 0)
+            self.assertEqual(summary["native_role_capture_target_missing_count"], 1)
+            self.assertEqual(summary["source_link_hash_count"], 1)
+            self.assertEqual(summary["source_link_applied_row_count"], 0)
+            self.assertFalse(summary["generated_phase51s_manifest_ready"])
+
+    def test_phase51v_forward_capture_bundle_readiness_rejects_duplicate_source_link_hash(self):
+        """5.1v should reject ambiguous source-link hashes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "extended-group",
+                "order_key": "extended-order",
+                "venue_id": "extended",
+                "required_native_role_source": "EXTENDED_ISTAKER",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+            source_link_path = tmp_path / "duplicate_source_links.jsonl"
+            source_link_path.write_text(
+                json.dumps({
+                    "source_record_sha256": "b" * 64,
+                    "canonical_group_id": "extended-group",
+                    "order_key": "extended-order",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n"
+                + json.dumps({
+                    "source_record_sha256": "b" * 64,
+                    "canonical_group_id": "extended-group",
+                    "order_key": "extended-order",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            candidate_manifest = tmp_path / "capture_bundle_manifest.json"
+            candidate_manifest.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "sources": [],
+                "source_links": [
+                    {
+                        "source_link_id": "phase51t_links",
+                        "path": str(source_link_path),
+                    }
+                ],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(candidate_manifest),
+                    "--output-root",
+                    str(tmp_path / "phase51v_readiness"),
+                    "--run-id",
+                    "phase51v_duplicate_source_link_hash_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("duplicate source link hash", result.stderr)
+
     def test_phase51v_forward_capture_bundle_readiness_holds_template_placeholders(self):
         """5.1v should keep placeholder capture manifests in HOLD with no ready targets."""
         with tempfile.TemporaryDirectory() as tmpdir:

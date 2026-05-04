@@ -62,8 +62,9 @@ that any source-capture blocker is reduced.
 ## Readiness Semantics
 
 Native role rows are counted ready only when a local source row links to a
-Phase 5.1u target by `canonical_group_id` or `order_key`, matches the target
-venue, and contains the required venue-native role field:
+Phase 5.1u target by `canonical_group_id`, `order_key`, or a validated
+source-link sidecar hash, matches the target venue, and contains the required
+venue-native role field:
 
 - Aster: `ORDER_TRADE_UPDATE` or equivalent maker-side field plus positive
   fill quantity
@@ -74,9 +75,17 @@ venue, and contains the required venue-native role field:
 - Paradex: `liquidity`
 
 Lighter native-limit rows are counted ready only when a local Lighter source
-row links to a Phase 5.1u target and contains event-time active-order headroom,
-sendTx remaining/limit, REST or weighted request remaining/limit, and an
-accepted event-time alignment status.
+row links to a Phase 5.1u target by direct join key or validated source-link
+sidecar and contains event-time active-order headroom, sendTx remaining/limit,
+REST or weighted request remaining/limit, and an accepted event-time alignment
+status.
+
+Source-link sidecars are join aids only. A sidecar must map a deterministic
+source-row hash to a Phase 5.1u target using `canonical_group_id` or
+`order_key`, must contain no raw venue identifiers or secrets, and duplicate
+source hashes are rejected. A source-link-only manifest never clears readiness:
+the linked source row must also be present in a local source file and must
+carry the required venue-native role or Lighter native-limit fields.
 
 When all targets are ready, 5.1v emits a `phase51s_manifest.generated.json`
 that can be used as the next Phase 5.1s manifest. Even then the verdict remains
@@ -118,6 +127,29 @@ generated_phase51s_manifest_ready: false
 downstream_chain_ready: false
 clears_phase51_blockers: false
 raw_identifier_redaction_status: PASS
+```
+
+## Source-Link Readiness Evidence
+
+The repo-owned Phase 5.1v validator now applies validated source-link sidecars
+during bundle readiness. Focused non-live tests prove:
+
+```text
+source row + valid source-link sidecar: can mark the linked target ready
+source-link sidecar only: remains HOLD and marks no target ready
+duplicate source-link hash: rejected
+```
+
+Validation command:
+
+```bash
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_accepts_local_bundle \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_source_link_only_holds \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_rejects_duplicate_source_link_hash \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_holds_template_placeholders \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_rejects_unsafe_manifest
 ```
 
 ## Next Command

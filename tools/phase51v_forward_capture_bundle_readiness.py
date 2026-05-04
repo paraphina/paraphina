@@ -347,6 +347,67 @@ def _resolve_target(
     return None
 
 
+def _source_link_hashes(row: dict[str, Any]) -> list[str]:
+    hashes = [
+        str(row.get(key) or "")
+        for key in SOURCE_LINK_HASH_FIELDS
+        if row.get(key)
+    ]
+    hashes.append(_stable_hash(row))
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in hashes:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _resolve_target_strict(
+    row: dict[str, Any],
+    by_group: dict[str, dict[str, Any]],
+    by_order_key: dict[str, dict[str, Any]],
+    path: Path,
+    line_no: int,
+    *,
+    target_label: str,
+) -> dict[str, Any] | None:
+    group, order_key = _row_join_keys(row)
+    group_target = by_group.get(group) if group else None
+    order_target = by_order_key.get(order_key) if order_key else None
+    if group_target is not None and order_target is not None and _target_id(group_target) != _target_id(order_target):
+        raise ValueError(f"{path}:{line_no} source link {target_label} canonical_group_id conflicts with order_key")
+    return group_target or order_target
+
+
+def _resolve_target_with_source_link(
+    row: dict[str, Any],
+    by_group: dict[str, dict[str, Any]],
+    by_order_key: dict[str, dict[str, Any]],
+    source_link_targets: dict[str, dict[str, Any]],
+    *,
+    target_key: str,
+) -> tuple[dict[str, Any] | None, str]:
+    group, order_key = _row_join_keys(row)
+    if group and group in by_group:
+        return by_group[group], "SOURCE_ROW_CANONICAL_GROUP"
+    if order_key and order_key in by_order_key:
+        return by_order_key[order_key], "SOURCE_ROW_ORDER_KEY"
+    linked_targets = {
+        _target_id(target): target
+        for source_hash in _source_link_hashes(row)
+        if source_hash in source_link_targets
+        for target in [source_link_targets[source_hash].get(target_key)]
+        if isinstance(target, dict)
+    }
+    if len(linked_targets) > 1:
+        raise ValueError("source row has ambiguous source-link sidecar targets")
+    if linked_targets:
+        return next(iter(linked_targets.values())), "SOURCE_LINK_SIDECAR"
+    return None, "NO_CANONICAL_LINK"
+
+
 def _artifact_status_counts(records: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for record in records:
@@ -570,7 +631,74 @@ def build_forward_capture_bundle_readiness(
     labels: list[dict[str, Any]] = []
     source_artifacts: list[dict[str, Any]] = []
     source_link_artifacts: list[dict[str, Any]] = []
+    source_link_targets: dict[str, dict[str, Any]] = {}
+    source_link_applied_row_count = 0
     seq = 0
+
+    for index, source_link in enumerate(_manifest_paths(manifest.get("source_links"))):
+        source_link_id = str(source_link.get("source_link_id") or f"source_link_{index}")
+        path_text = str(source_link.get("path") or "")
+        status, path = _source_status(path_text, candidate_manifest, entry_kind=f"source_links[{index}]")
+        row_count = 0
+        target_link_count = 0
+        if path is not None and status == "LOCAL_FILE_READY":
+            for line_no, row in _iter_jsonl(path):
+                _check_unsafe_flags(row, path, label="source link")
+                _check_no_secret_fields(row, path, label="source link")
+                _check_no_nested_raw_identifier_fields(row, path, label="source link")
+                unexpected = sorted(set(row) - SOURCE_LINK_ALLOWED_FIELDS)
+                if unexpected:
+                    raise ValueError(f"{path}:{line_no} source link has unsupported fields: {unexpected}")
+                source_hashes = [
+                    str(row.get(key) or "")
+                    for key in SOURCE_LINK_HASH_FIELDS
+                    if row.get(key)
+                ]
+                if not source_hashes:
+                    raise ValueError(f"{path}:{line_no} source link missing source hash")
+                group = str(row.get("canonical_group_id") or "")
+                order_key = str(row.get("order_key") or "")
+                if not group and not order_key:
+                    raise ValueError(f"{path}:{line_no} source link missing canonical_group_id or order_key")
+                role_target = _resolve_target_strict(
+                    row,
+                    role_by_group,
+                    role_by_order_key,
+                    path,
+                    line_no,
+                    target_label="native-role",
+                )
+                limit_target = _resolve_target_strict(
+                    row,
+                    limit_by_group,
+                    limit_by_order_key,
+                    path,
+                    line_no,
+                    target_label="native-limit",
+                )
+                if role_target is None and limit_target is None:
+                    raise ValueError(f"{path}:{line_no} source link does not match Phase 5.1u targets")
+                for source_hash in sorted(set(source_hashes)):
+                    if source_hash in source_link_targets:
+                        raise ValueError(f"{path}:{line_no} duplicate source link hash {source_hash}")
+                    source_link_targets[source_hash] = {
+                        "role_target": role_target,
+                        "limit_target": limit_target,
+                        "source_link_sha256": _stable_hash(row),
+                    }
+                row_count += 1
+                target_link_count += 1
+        source_link_artifacts.append(
+            {
+                "source_link_id": source_link_id,
+                "path_hash": _stable_hash(path_text),
+                "resolved_path": str(path) if path is not None and status == "LOCAL_FILE_READY" else None,
+                "status": status,
+                "row_count": row_count,
+                "target_link_count": target_link_count,
+                "sha256": _sha256_file(path) if path is not None and status == "LOCAL_FILE_READY" else None,
+            }
+        )
 
     for index, source in enumerate(_manifest_paths(manifest.get("sources"))):
         source_id = str(source.get("source_id") or f"source_{index}")
@@ -587,7 +715,13 @@ def build_forward_capture_bundle_readiness(
                 venue = _venue_id(row, venue_fallback)
                 role_ready = False
                 limit_ready = False
-                role_target = _resolve_target(row, role_by_group, role_by_order_key)
+                role_target, role_join_status = _resolve_target_with_source_link(
+                    row,
+                    role_by_group,
+                    role_by_order_key,
+                    source_link_targets,
+                    target_key="role_target",
+                )
                 if (
                     role_target is not None
                     and venue == str(role_target.get("venue_id") or "").lower()
@@ -596,11 +730,20 @@ def build_forward_capture_bundle_readiness(
                     role_ready_target_ids.add(_target_id(role_target))
                     role_ready = True
                     role_ready_count += 1
-                limit_target = _resolve_target(row, limit_by_group, limit_by_order_key)
+                limit_target, limit_join_status = _resolve_target_with_source_link(
+                    row,
+                    limit_by_group,
+                    limit_by_order_key,
+                    source_link_targets,
+                    target_key="limit_target",
+                )
                 if limit_target is not None and venue == "lighter" and _has_lighter_limit_fields(row):
                     limit_ready_target_ids.add(_target_id(limit_target))
                     limit_ready = True
                     limit_ready_count += 1
+                source_link_applied = role_join_status == "SOURCE_LINK_SIDECAR" or limit_join_status == "SOURCE_LINK_SIDECAR"
+                if source_link_applied:
+                    source_link_applied_row_count += 1
                 label = _base_record(run_id, seq, timestamp_ns, "PHASE51V_SOURCE_ROW_READINESS_LABEL")
                 seq += 1
                 label.update(
@@ -613,6 +756,9 @@ def build_forward_capture_bundle_readiness(
                         "venue_id": venue or "unknown",
                         "canonical_group_id": group,
                         "order_key": order_key,
+                        "role_target_join_status": role_join_status,
+                        "lighter_limit_target_join_status": limit_join_status,
+                        "source_link_applied": source_link_applied,
                         "source_row_readiness_status": "READY_FOR_TARGET" if role_ready or limit_ready else "NOT_TARGET_READY",
                         "role_target_ready": role_ready,
                         "lighter_limit_target_ready": limit_ready,
@@ -644,43 +790,6 @@ def build_forward_capture_bundle_readiness(
                 "row_count": row_count,
                 "role_target_ready_row_count": role_ready_count,
                 "lighter_limit_target_ready_row_count": limit_ready_count,
-                "sha256": _sha256_file(path) if path is not None and status == "LOCAL_FILE_READY" else None,
-            }
-        )
-
-    for index, source_link in enumerate(_manifest_paths(manifest.get("source_links"))):
-        source_link_id = str(source_link.get("source_link_id") or f"source_link_{index}")
-        path_text = str(source_link.get("path") or "")
-        status, path = _source_status(path_text, candidate_manifest, entry_kind=f"source_links[{index}]")
-        row_count = 0
-        target_link_count = 0
-        if path is not None and status == "LOCAL_FILE_READY":
-            for line_no, row in _iter_jsonl(path):
-                _check_unsafe_flags(row, path, label="source link")
-                _check_no_secret_fields(row, path, label="source link")
-                _check_no_nested_raw_identifier_fields(row, path, label="source link")
-                unexpected = sorted(set(row) - SOURCE_LINK_ALLOWED_FIELDS)
-                if unexpected:
-                    raise ValueError(f"{path}:{line_no} source link has unsupported fields: {unexpected}")
-                if not any(row.get(key) for key in SOURCE_LINK_HASH_FIELDS):
-                    raise ValueError(f"{path}:{line_no} source link missing source hash")
-                group = str(row.get("canonical_group_id") or "")
-                order_key = str(row.get("order_key") or "")
-                if not group and not order_key:
-                    raise ValueError(f"{path}:{line_no} source link missing canonical_group_id or order_key")
-                row_count += 1
-                role_target = _resolve_target(row, role_by_group, role_by_order_key)
-                limit_target = _resolve_target(row, limit_by_group, limit_by_order_key)
-                if role_target is not None or limit_target is not None:
-                    target_link_count += 1
-        source_link_artifacts.append(
-            {
-                "source_link_id": source_link_id,
-                "path_hash": _stable_hash(path_text),
-                "resolved_path": str(path) if path is not None and status == "LOCAL_FILE_READY" else None,
-                "status": status,
-                "row_count": row_count,
-                "target_link_count": target_link_count,
                 "sha256": _sha256_file(path) if path is not None and status == "LOCAL_FILE_READY" else None,
             }
         )
@@ -733,6 +842,8 @@ def build_forward_capture_bundle_readiness(
         "source_file_status_counts": _artifact_status_counts(source_artifacts),
         "source_link_file_status_counts": _artifact_status_counts(source_link_artifacts),
         "source_row_readiness_status_counts": _status_counts(labels, "source_row_readiness_status"),
+        "source_link_hash_count": len(source_link_targets),
+        "source_link_applied_row_count": source_link_applied_row_count,
         "generated_phase51s_manifest_path": str(phase51s_manifest_path),
         "generated_phase51s_source_count": len(generated_phase51s_manifest["sources"]),
         "generated_phase51s_source_link_count": len(generated_phase51s_manifest["source_links"]),

@@ -1209,6 +1209,10 @@ Rationale:
 - The gate rejects unsafe source surfaces and emits a generated Phase 5.1s
   manifest only when all targets are structurally covered by local redacted
   source rows or staged source-link sidecars.
+- Source-link sidecars are validated and applied as join aids inside Phase
+  5.1v, but sidecars alone do not mark targets ready; a linked source row must
+  be present and must carry the required venue-native role or Lighter
+  native-limit fields.
 - The baseline run against the Phase 5.1u placeholder template correctly
   remains `HOLD` and clears no blocker.
 
@@ -1257,6 +1261,17 @@ generated_phase51s_manifest_ready: false
 downstream_chain_ready: false
 clears_phase51_blockers: false
 raw_identifier_redaction_status: PASS
+```
+
+Source-link readiness validation:
+
+```text
+source row + valid source-link sidecar: target can become ready
+source-link sidecar only: target remains missing
+duplicate source-link hash: rejected
+summary fields:
+- source_link_hash_count
+- source_link_applied_row_count
 ```
 
 Next move:

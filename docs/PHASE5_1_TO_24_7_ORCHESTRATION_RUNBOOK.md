@@ -985,13 +985,16 @@ existing local Lighter snapshots emitted `363` redacted source-link rows from
 applied `909` source-link joins and emitted `296` native-role source records,
 but Phase 5.1q/5.1n/5.1h/5.1i still recovered `0 / 287` missing native-role
 targets and `0 / 3132` Lighter native-limit targets. Existing local Lighter
-artifacts are therefore exhausted for blocker reduction. The next command
-target is a sanitized local forward read-only native source capture bundle for
-the remaining Aster, Extended, Paradex, and Lighter native-role files, plus
-complete Lighter event-time active-order/sendTx/REST-or-weighted-request
-pressure. Use canonical linkage or 5.1t-compatible sidecars where raw order IDs
-cannot be emitted, then validate the completed bundle by Phase 5.1v before
-Phase 5.1s.
+artifacts are therefore exhausted for blocker reduction. Phase 5.1v now also
+applies validated source-link sidecars during bundle-readiness validation, but
+only linked source rows with required native role or native-limit fields can
+mark targets ready. Source-link-only manifests must remain `HOLD`. The next
+command target is a sanitized local forward read-only native source capture
+bundle for the remaining Aster, Extended, Paradex, and Lighter native-role
+files, plus complete Lighter event-time active-order/sendTx/REST-or-weighted
+request pressure. Use canonical linkage or 5.1t-compatible sidecars where raw
+order IDs cannot be emitted, then validate the completed bundle by Phase 5.1v
+before Phase 5.1s.
 
 ## Current Verdict
 

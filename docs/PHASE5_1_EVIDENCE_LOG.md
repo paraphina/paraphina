@@ -5,6 +5,55 @@ run artifacts under `runs/` are ignored by Git because they contain large
 telemetry snapshots; this file preserves the reproducible evidence boundary in
 the repository.
 
+## Phase 5.1v Source-Link Readiness Patch
+
+Date: 2026-05-04
+
+Purpose: make Phase 5.1v apply validated source-link sidecars during local
+bundle-readiness validation, matching the Phase 5.1s/5.1r source-link contract.
+This is a non-live systems/evidence-gate patch only.
+
+Changed repo-owned behavior:
+
+```text
+accepted: local source row with required native fields + source-link hash to a Phase 5.1u target
+rejected: duplicate source-link hashes
+held: source-link-only manifests with no native source rows
+not allowed: source truth inference, maker/taker inference, Lighter limit inference, EV/PnL claims
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51v_forward_capture_bundle_readiness.py tests/test_telemetry_contract_gate.py
+
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_accepts_local_bundle \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_source_link_only_holds \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_rejects_duplicate_source_link_hash \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_holds_template_placeholders \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_rejects_unsafe_manifest
+
+python3 -m unittest tests.test_telemetry_contract_gate
+
+python3 tools/check_docs_integrity.py
+
+git diff --check
+```
+
+Result:
+
+```text
+py_compile: PASS
+focused Phase 5.1v unittest: PASS, 6 tests
+tests.test_telemetry_contract_gate: PASS, 127 tests
+docs integrity: PASS
+git diff --check: PASS
+gate_status remains HOLD
+clears_phase51_blockers remains false
+```
+
 ## LTR-EV-SHADOW-001 Phase 5 Tail M4
 
 - Run id: `LTR-EV-SHADOW-001_phase5_tail_20260501T214411Z_m4`
