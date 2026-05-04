@@ -18,11 +18,12 @@ Current repo evidence boundary:
 
 - Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
 - Current Phase 5.1 evidence boundary: Phase 5.1u emits the active forward
-  capture target manifest, and Phase 5.1v is the active offline readiness gate
-  that verifies a sanitized local capture bundle before Phase 5.1s; Phase 5.1s
-  stages local source bundles, Phase 5.1t builds optional source-link
-  sidecars, and Phase 5.1r validates redacted source-hash joins before Phase
-  5.1q
+  capture target manifest, Phase 5.1w emits the operator request pack for the
+  required sanitized local files, and Phase 5.1v is the active offline
+  readiness gate that verifies a sanitized local capture bundle before Phase
+  5.1s; Phase 5.1s stages local source bundles, Phase 5.1t builds optional
+  source-link sidecars, and Phase 5.1r validates redacted source-hash joins
+  before Phase 5.1q
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
 
@@ -595,13 +596,22 @@ native-role targets ready, `0 / 3132` Lighter native-limit targets ready, and
 does not clear blockers by itself, and does not infer maker/taker role,
 native-limit pressure, EV, PnL, or economic performance.
 
-The next evidence move is to acquire or produce a sanitized local read-only
-all-five forward source-capture bundle, run it through Phase 5.1v, and only if
-5.1v emits `generated_phase51s_manifest_ready=true`, stage the generated
-manifest through Phase 5.1s. The bundle must contain native snapshots with
-canonical group/order-key linkage, or validated source-link sidecars that bind
-redacted source hashes to observed labels. After Phase 5.1s, run Phase 5.1r,
-feed the sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No
-model training, EV admission, canary, live orders, capital escalation,
+Phase 5.1w adds a HOLD-only request-pack gate in front of Phase 5.1v. It
+consumes the Phase 5.1u target run and emits an operator Markdown pack, JSON
+pack, and capture-bundle manifest skeleton for the exact six sanitized local
+files required: five venue-native role snapshots and one Lighter event-time
+native-limit pressure snapshot. Phase 5.1w does not capture source truth,
+validate source rows, call venue APIs, read secrets, clear blockers, infer
+maker/taker role, infer native-limit pressure, or authorize economics.
+
+The next evidence move is to use Phase 5.1w to acquire or produce the six
+sanitized local read-only all-five forward source-capture files, run the bundle
+through Phase 5.1v, and only if 5.1v emits
+`generated_phase51s_manifest_ready=true`, stage the generated manifest through
+Phase 5.1s. The bundle must contain native snapshots with canonical
+group/order-key linkage, or validated source-link sidecars that bind redacted
+source hashes to observed labels. After Phase 5.1s, run Phase 5.1r, feed the
+sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No model
+training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
-5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, or Phase 5.1v.
+5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, or Phase 5.1w.

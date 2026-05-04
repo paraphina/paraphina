@@ -1268,3 +1268,81 @@ generated_phase51s_manifest_ready=true run 5.1s -> 5.1r -> 5.1q -> 5.1n ->
 5.1h -> 5.1i. Require measurable blocker reduction before any
 calibration/model-training review.
 ```
+
+## Phase 5.1w Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for offline forward capture request-pack generation
+through `tools/phase51w_forward_capture_request_pack.py`.
+
+Rationale:
+
+- Phase 5.1v validates supplied local bundles, but the previous handoff still
+  required an operator to infer exact bundle requirements from several docs and
+  validator internals.
+- Phase 5.1w keeps the request pack mechanically tied to the Phase 5.1u target
+  manifest and emits the exact local file list, required fields, join strategy,
+  prohibitions, manifest skeleton, and next commands.
+- Phase 5.1w does not call venue APIs, read secrets, validate source truth,
+  infer maker/taker role, infer native-limit pressure, clear blockers, or
+  authorize economics.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1w - Forward capture request pack
+tool: tools/phase51w_forward_capture_request_pack.py
+spec: docs/PHASE5_1W_FORWARD_CAPTURE_REQUEST_PACK.md
+status: HOLD
+authorized output:
+- forward_capture_request_pack.md
+- forward_capture_request_pack.json
+- capture_bundle_manifest.skeleton.json
+- phase51w_forward_capture_request_pack_summary.json
+- phase51w_manifest.json
+prohibited:
+- live orders
+- canary
+- network source paths
+- .env source files
+- symlink source files
+- secret-shaped fields
+- raw venue identifiers
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+- source truth inference
+```
+
+Baseline request-pack evidence:
+
+```text
+runs/phase51w_forward_capture_request_pack/PHASE51W-FORWARD-CAPTURE-REQUEST-PACK-CANONICAL-20260504T000000Z
+gate_status: HOLD
+gate_reason: phase51w_forward_capture_request_pack_emitted_nonlive_hold
+native_role_capture_target_count: 287
+native_role_capture_target_counts_by_venue:
+- aster: 113
+- extended: 28
+- hyperliquid: 6
+- lighter: 125
+- paradex: 15
+lighter_native_limit_capture_target_count: 3132
+required_local_source_file_count: 6
+clears_phase51_blockers: false
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Use the Phase 5.1w request pack and skeleton manifest to provide six sanitized
+local read-only source files, then run 5.1v. If generated_phase51s_manifest_ready=true,
+run 5.1s -> 5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i. Stop if private
+credentials, live/canary/capital/risk authorization, or unredacted source
+material would be required.
+```

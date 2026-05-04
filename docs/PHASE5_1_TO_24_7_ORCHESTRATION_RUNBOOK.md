@@ -35,15 +35,17 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
 1. Keep Phase 5.1 non-live. Do not start canary, live orders, capital
    escalation, risk-limit relaxation, model training, or EV admission.
 2. Treat Phase 5.1u as the active forward capture target-manifest gate, Phase
-   5.1v as the offline capture bundle-readiness gate, Phase 5.1s as the local
-   native source-staging gate, Phase 5.1t as the optional source-link sidecar
-   builder, Phase 5.1r as the forward native source-acquisition layer, and
-   Phase 5.1q as the downstream forward-evidence gate. Phase 5.1u is
-   repo-owned, non-live, and emits the exact target list for fresh all-five
-   native role capture plus Lighter event-time native-limit pressure. Phase
-   5.1v consumes a local candidate capture bundle manifest, rejects unsafe
-   source surfaces, and emits a generated Phase 5.1s manifest only when all
-   targets are structurally ready. Phase 5.1s requires an explicit local
+   5.1w as the operator request-pack gate, Phase 5.1v as the offline capture
+   bundle-readiness gate, Phase 5.1s as the local native source-staging gate,
+   Phase 5.1t as the optional source-link sidecar builder, Phase 5.1r as the
+   forward native source-acquisition layer, and Phase 5.1q as the downstream
+   forward-evidence gate. Phase 5.1u is repo-owned, non-live, and emits the
+   exact target list for fresh all-five native role capture plus Lighter
+   event-time native-limit pressure. Phase 5.1w emits the exact operator
+   request pack and manifest skeleton for the required sanitized local files.
+   Phase 5.1v consumes a local candidate capture bundle manifest, rejects
+   unsafe source surfaces, and emits a generated Phase 5.1s manifest only when
+   all targets are structurally ready. Phase 5.1s requires an explicit local
    manifest, rejects unsafe source surfaces, strips raw identifiers, emits a
    redacted `local_native_source.jsonl` for Phase 5.1r, and stages optional
    manifest `source_links` as `local_source_link_sidecar.jsonl`.
@@ -58,20 +60,23 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    filled-order maker/taker status is incomplete for `287` labels, some
    venue/side buckets remain sparse, and `1613` quarantined/review groups remain
    excluded from the observed-only diagnostic pack.
-5. Next repo-owned move is another non-live evidence step: acquire or produce
-   a sanitized local read-only all-five forward capture bundle, then run Phase
-   5.1v against the Phase 5.1u target manifest. Capture or locate native
-   snapshots with canonical group/order-key linkage, or a redacted Phase
-   5.1t/5.1s `source_links` sidecar that validates those joins by source hash.
-   If 5.1v emits `generated_phase51s_manifest_ready=true`, stage the generated
-   manifest through Phase 5.1s, run Phase 5.1r, feed its sanitized outputs into
-   Phase 5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into Phase 5.1n,
-   then rerun the recovered 5.1h/5.1i matrix. Do not train models from Phase
-   5.1u, Phase 5.1v, Phase 5.1s, Phase 5.1r, or Phase 5.1q.
+5. Next evidence move is operator/source action, not another live run: use the
+   Phase 5.1w request pack to provide six sanitized local read-only all-five
+   forward capture files, then run Phase 5.1v against the Phase 5.1u target
+   manifest. Capture or locate native snapshots with canonical group/order-key
+   linkage, or a redacted Phase 5.1t/5.1s `source_links` sidecar that validates
+   those joins by source hash. If 5.1v emits
+   `generated_phase51s_manifest_ready=true`, stage the generated manifest
+   through Phase 5.1s, run Phase 5.1r, feed its sanitized outputs into Phase
+   5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into Phase 5.1n, then
+   rerun the recovered 5.1h/5.1i matrix. Do not train models from Phase 5.1u,
+   Phase 5.1w, Phase 5.1v, Phase 5.1s, Phase 5.1r, or Phase 5.1q.
 6. Proceed to calibrated EV shadow only after canonical outcomes, raw-ID
    hygiene, maker/taker role gaps, holdout splits, feature completeness,
    venue-native truth gaps, and quarantine exclusion policy are accepted.
-7. Use `docs/PHASE5_1V_FORWARD_CAPTURE_BUNDLE_READINESS.md` as the standing
+7. Use `docs/PHASE5_1W_FORWARD_CAPTURE_REQUEST_PACK.md` as the standing
+   contract for operator request-pack generation,
+   `docs/PHASE5_1V_FORWARD_CAPTURE_BUNDLE_READINESS.md` as the standing
    contract for capture bundle readiness,
    `docs/PHASE5_1S_LOCAL_NATIVE_SOURCE_ACQUISITION.md` as the standing
    contract for local source staging,
@@ -882,7 +887,18 @@ Capture all-five venue-native maker/taker fields and complete Lighter
 event-time active-order/sendTx/REST-or-weighted-request pressure into a
 sanitized local bundle. Use direct canonical group/order-key linkage where
 possible; otherwise use Phase 5.1t to build 5.1s-compatible source-link
-sidecars. First run Phase 5.1v:
+sidecars. The active request pack is:
+
+```text
+runs/phase51w_forward_capture_request_pack/PHASE51W-FORWARD-CAPTURE-REQUEST-PACK-CANONICAL-20260504T000000Z
+native_role_capture_target_count: 287
+lighter_native_limit_capture_target_count: 3132
+required_local_source_file_count: 6
+clears_phase51_blockers: false
+```
+
+Use its `capture_bundle_manifest.skeleton.json`, replace placeholder paths
+with sanitized local files, then run Phase 5.1v:
 
 ```bash
 python3 tools/phase51v_forward_capture_bundle_readiness.py \

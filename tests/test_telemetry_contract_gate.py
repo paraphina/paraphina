@@ -740,6 +740,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51v_forward_capture_bundle_readiness.py"
 
+    def _get_phase51w_forward_capture_request_pack_path(self) -> Path:
+        """Get path to the Phase 5.1w forward capture request-pack gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51w_forward_capture_request_pack.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -8238,6 +8243,175 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("network source[0] paths are prohibited", result.stderr)
+
+    def test_phase51w_forward_capture_request_pack_emits_operator_pack(self):
+        """5.1w should emit an operator-facing request pack from 5.1u targets."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            output_root = tmp_path / "phase51w_request_pack"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 3,
+                "lighter_native_limit_capture_target_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            role_targets = [
+                {
+                    "canonical_group_id": "hyper-group",
+                    "order_key": "hyper-order",
+                    "venue_id": "hyperliquid",
+                    "required_native_role_source": "HYPERLIQUID_CROSSED",
+                    "required_native_role_fields": ["crossed"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "lighter-group",
+                    "order_key": "lighter-order",
+                    "venue_id": "lighter",
+                    "required_native_role_source": "LIGHTER_TRADES_JSON",
+                    "required_native_role_fields": [
+                        "account_index",
+                        "is_maker_ask",
+                        "ask_account_id",
+                        "bid_account_id",
+                    ],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "lighter-group-2",
+                    "order_key": "lighter-order-2",
+                    "venue_id": "lighter",
+                    "required_native_role_source": "LIGHTER_TRADES_JSON",
+                    "required_native_role_fields": [
+                        "account_index",
+                        "is_maker_ask",
+                        "ask_account_id",
+                        "bid_account_id",
+                    ],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            limit_targets = [
+                {
+                    "canonical_group_id": "lighter-group",
+                    "order_key": "lighter-order",
+                    "venue_id": "lighter",
+                    "required_native_limit_fields": [
+                        "active_order_headroom_account",
+                        "active_order_headroom_market",
+                        "sendtx_per_minute_limit",
+                        "sendtx_per_minute_remaining",
+                        "weighted_requests_per_minute_limit/weighted_requests_per_minute_remaining",
+                        "native_limit_event_time_status",
+                    ],
+                    "accepted_native_limit_event_time_status": ["EVENT_TIME_ALIGNED"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }
+            ]
+            (target_run / "native_role_capture_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in role_targets),
+                encoding="utf-8",
+            )
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in limit_targets),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51w_forward_capture_request_pack_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51w_request_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            run_dir = output_root / "phase51w_request_test"
+            summary = json.loads(
+                (run_dir / "phase51w_forward_capture_request_pack_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["native_role_capture_target_count"], 3)
+            self.assertEqual(summary["native_role_capture_target_counts_by_venue"], {"hyperliquid": 1, "lighter": 2})
+            self.assertEqual(summary["lighter_native_limit_capture_target_count"], 1)
+            self.assertEqual(summary["required_local_source_file_count"], 3)
+            self.assertFalse(summary["clears_phase51_blockers"])
+
+            request_pack = json.loads((run_dir / "forward_capture_request_pack.json").read_text(encoding="utf-8"))
+            self.assertEqual(request_pack["required_local_source_file_count"], 3)
+            self.assertEqual(request_pack["native_role_required_source_counts"]["LIGHTER_TRADES_JSON"], 2)
+            self.assertIn("phase51v -> phase51s", request_pack["downstream_chain"])
+            self.assertFalse(request_pack["live_orders_allowed"])
+            skeleton = json.loads((run_dir / "capture_bundle_manifest.skeleton.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(skeleton["sources"]), 3)
+            self.assertFalse(skeleton["approved_for_live"])
+            markdown = (run_dir / "forward_capture_request_pack.md").read_text(encoding="utf-8")
+            self.assertIn("HYPERLIQUID_CROSSED", markdown)
+            self.assertIn("LIGHTER_TRADES_JSON", markdown)
+            self.assertIn("EVENT_TIME_ALIGNED", markdown)
+            self.assertNotIn("client_order_id", markdown)
+            self.assertNotIn("trade_id", markdown)
+
+    def test_phase51w_forward_capture_request_pack_rejects_unsafe_targets(self):
+        """5.1w should reject unsafe target manifests instead of building a request pack."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "unsafe-group",
+                "order_key": "unsafe-order",
+                "venue_id": "extended",
+                "required_native_role_source": "EXTENDED_ISTAKER",
+                "required_native_role_fields": ["isTaker"],
+                "approved_for_live": True,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51w_forward_capture_request_pack_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--output-root",
+                    str(tmp_path / "phase51w_request_pack"),
+                    "--run-id",
+                    "phase51w_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unsafe role target flag approved_for_live=true", result.stderr)
 
     def test_phase51s_source_link_sidecar_rejects_unsafe_rows(self):
         """5.1s source-link sidecars should be local, redacted, and unambiguous."""

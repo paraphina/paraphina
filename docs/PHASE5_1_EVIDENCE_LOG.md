@@ -208,6 +208,77 @@ PROMOTE only for acquiring or producing a sanitized local read-only all-five
 forward capture bundle and rerunning Phase 5.1v before Phase 5.1s.
 ```
 
+## Phase 5.1w Forward Capture Request Pack
+
+Run id: `PHASE51W-FORWARD-CAPTURE-REQUEST-PACK-CANONICAL-20260504T000000Z`
+
+Local run directory:
+`runs/phase51w_forward_capture_request_pack/PHASE51W-FORWARD-CAPTURE-REQUEST-PACK-CANONICAL-20260504T000000Z`
+
+Input target run:
+`runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z`
+
+Result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51w_forward_capture_request_pack_emitted_nonlive_hold
+native_role_capture_target_count: 287
+native_role_capture_target_counts_by_venue:
+- aster: 113
+- extended: 28
+- hyperliquid: 6
+- lighter: 125
+- paradex: 15
+lighter_native_limit_capture_target_count: 3132
+required_local_source_file_count: 6
+clears_phase51_blockers: false
+raw_identifier_redaction_status: PASS
+```
+
+Command:
+
+```bash
+python3 tools/phase51w_forward_capture_request_pack.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --output-root runs/phase51w_forward_capture_request_pack \
+  --run-id PHASE51W-FORWARD-CAPTURE-REQUEST-PACK-CANONICAL-20260504T000000Z \
+  --timestamp-ns 1777852800000000000
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51w_forward_capture_request_pack.py tests/test_telemetry_contract_gate.py
+python3 -m unittest tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51w_forward_capture_request_pack_emits_operator_pack tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51w_forward_capture_request_pack_rejects_unsafe_targets
+```
+
+Result:
+
+```text
+Ran 2 tests
+OK
+```
+
+Artifact hashes:
+
+```text
+3b0b2dcbdec00dbfe8ec2d3f156952213a499876ab1448f92fdfb0f1775844f8  phase51w_forward_capture_request_pack_summary.json
+b3f37c0cc0772e805d099c411de33b949a800c365b1e12fa8e493bb97c8cdfbe  forward_capture_request_pack.json
+93899bec8921a3539152b95ca119de2a0bcca61cb262e06b89acc04ff11c2aec  forward_capture_request_pack.md
+bcec3fad3a78e21ca40c35d52425fe72da3393e93605da0b98cfc48d1e8c2886  capture_bundle_manifest.skeleton.json
+```
+
+Verdict:
+
+```text
+HOLD for live, canary, model training, EV admission, capital escalation,
+risk-limit relaxation, financial claims, and 24/7 readiness.
+
+PROMOTE only for using the generated request pack to provide six sanitized
+local read-only source files, then rerunning Phase 5.1v.
+```
+
 ## Phase 5.1t - Source-Link Sidecar Builder
 
 - Run id:
