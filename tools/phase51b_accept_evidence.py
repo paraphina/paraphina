@@ -157,6 +157,16 @@ def _limitations(records: list[dict[str, Any]]) -> list[str]:
         limitations.append("lighter_sendtx_limit_not_exposed_by_account_limits_payload")
     elif limits.get("sendtx_per_minute_remaining") is None:
         limitations.append("lighter_sendtx_remaining_not_observed")
+    if (
+        limits.get("rest_requests_per_minute_limit") is None
+        and limits.get("weighted_requests_per_minute_limit") is None
+    ):
+        limitations.append("lighter_rest_or_weighted_limit_not_observed")
+    if (
+        limits.get("rest_requests_per_minute_remaining") is None
+        and limits.get("weighted_requests_per_minute_remaining") is None
+    ):
+        limitations.append("lighter_rest_or_weighted_remaining_not_observed")
     if limits.get("rest_requests_per_minute_limit") is None:
         limitations.append("lighter_rest_request_limit_not_exposed_by_account_limits_payload")
     if active.get("open_order_limit_status") == "UNKNOWN":

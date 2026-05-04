@@ -29,6 +29,7 @@ from tools.check_telemetry_contract import (
     validate_file,
     validate_record,
 )
+from tools.phase51b_lighter_account_limits import _sanitize_response_headers
 
 
 class TestIsFiniteNumber(unittest.TestCase):
@@ -579,6 +580,23 @@ class TestValidateFile(unittest.TestCase):
 
 class TestValidatorSubprocess(unittest.TestCase):
     """Test the validator as a subprocess (integration tests)."""
+
+    def test_phase51b_lighter_response_header_sanitizer_keeps_only_limit_headers(self):
+        """Lighter read-only probes should persist only non-secret quota headers."""
+        sanitized = _sanitize_response_headers({
+            "X-RateLimit-Limit": "60",
+            "X-RateLimit-Remaining": "58",
+            "Retry-After": "1",
+            "Set-Cookie": "must-not-appear",
+            "Authorization": "must-not-appear",
+            "X-Request-Id": "not-a-limit-field",
+        })
+        self.assertEqual(sanitized["X-RateLimit-Limit"], "60")
+        self.assertEqual(sanitized["X-RateLimit-Remaining"], "58")
+        self.assertEqual(sanitized["Retry-After"], "1")
+        self.assertNotIn("Set-Cookie", sanitized)
+        self.assertNotIn("Authorization", sanitized)
+        self.assertNotIn("X-Request-Id", sanitized)
     
     def _get_validator_path(self) -> Path:
         """Get path to the validator script."""
@@ -1251,6 +1269,11 @@ class TestValidatorSubprocess(unittest.TestCase):
             }), encoding="utf-8")
             limits_path.write_text(json.dumps({
                 "sendtx_per_minute_limit": 60,
+                "sendtx_per_minute_remaining": 59,
+                "rest_requests_per_minute_limit": 60,
+                "rest_requests_per_minute_remaining": 58,
+                "weighted_requests_per_minute_limit": 24000,
+                "weighted_requests_per_minute_remaining": 23999,
                 "active_orders_per_account_limit": 1500,
                 "active_orders_per_market_limit": 1000,
                 "volume_quota_remaining": 12.5,
@@ -1358,6 +1381,11 @@ class TestValidatorSubprocess(unittest.TestCase):
 
             limits = next(r for r in records if r["event_type"] == "V2_LIGHTER_ACCOUNT_LIMITS")
             self.assertEqual(limits["sendtx_per_minute_limit"], 60)
+            self.assertEqual(limits["sendtx_per_minute_remaining"], 59)
+            self.assertEqual(limits["rest_requests_per_minute_limit"], 60)
+            self.assertEqual(limits["rest_requests_per_minute_remaining"], 58)
+            self.assertEqual(limits["weighted_requests_per_minute_limit"], 24000)
+            self.assertEqual(limits["weighted_requests_per_minute_remaining"], 23999)
             self.assertEqual(limits["active_orders_per_account_limit"], 1500)
             self.assertEqual(limits["active_orders_per_market_limit"], 1000)
             self.assertEqual(limits["lighter_user_tier"], "premium")
@@ -1557,6 +1585,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertFalse(acceptance["approved_for_canary"])
             self.assertFalse(acceptance["approved_for_capital_escalation"])
             self.assertFalse(acceptance["secret_scan"]["sensitive_value_leak_found"])
+            self.assertIn("lighter_rest_or_weighted_limit_not_observed", acceptance["limitations"])
+            self.assertIn("lighter_rest_or_weighted_remaining_not_observed", acceptance["limitations"])
 
     def test_phase51c_label_lake_scaffold_holds_without_fill_markout_balance(self):
         """Phase 5.1c label lake should preserve labels and keep model training blocked."""
@@ -6268,6 +6298,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "PARTIAL_NATIVE_HEADROOM_EVENT_TIME_ALIGNED_LIMITS_INCOMPLETE",
             )
             self.assertEqual(queue_label["native_limit_alignment_source"], "phase51n_lighter_native_limit_time_alignment")
+            self.assertIsNone(queue_label["native_rest_requests_per_minute_remaining"])
+            self.assertIsNone(queue_label["native_weighted_requests_per_minute_remaining"])
 
     def test_phase51n_complete_lighter_limit_alignment_feeds_phase51v(self):
         """Complete event-time Lighter limit pressure should become a 5.1v-ready source row."""
@@ -6395,6 +6427,10 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(alignment_summary["native_limit_all_pressure_dimensions_observed_count"], 1)
             self.assertEqual(alignment_summary["forward_native_limit_pressure_source_count"], 1)
             self.assertTrue(alignment_summary["phase51v_lighter_native_limit_manifest_ready"])
+            alignment_label = json.loads(
+                (alignment_dir / "lighter_native_limit_time_alignment_labels.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(alignment_label["native_weighted_requests_per_minute_remaining"], 299)
             forward_source_text = (alignment_dir / "lighter_forward_native_limit_pressure_snapshot.jsonl").read_text(
                 encoding="utf-8"
             )

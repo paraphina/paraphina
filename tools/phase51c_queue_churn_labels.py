@@ -374,7 +374,15 @@ def _native_limit_pressure(
             "native_sendtx_per_minute_remaining": phase51n_alignment.get(
                 "native_sendtx_per_minute_remaining"
             ),
-            "native_rest_request_remaining": phase51n_alignment.get("native_rest_request_remaining"),
+            "native_rest_requests_per_minute_remaining": phase51n_alignment.get(
+                "native_rest_requests_per_minute_remaining"
+            ),
+            "native_weighted_requests_per_minute_remaining": phase51n_alignment.get(
+                "native_weighted_requests_per_minute_remaining"
+            ),
+            "native_rest_request_remaining": phase51n_alignment.get(
+                "native_rest_requests_per_minute_remaining"
+            ),
             "native_active_order_limit_source": phase51n_alignment.get("native_active_order_limit_source"),
             "native_active_order_limit_conflicts": phase51n_alignment.get(
                 "native_active_order_limit_conflicts"
@@ -395,6 +403,9 @@ def _native_limit_pressure(
             "native_active_order_headroom_account": None,
             "native_active_order_headroom_market": None,
             "native_sendtx_per_minute_remaining": None,
+            "native_rest_requests_per_minute_remaining": None,
+            "native_weighted_requests_per_minute_remaining": None,
+            "native_rest_request_remaining": None,
             "native_active_order_limit_source": None,
             "native_active_order_limit_conflicts": [],
             "native_limit_time_alignment_status": None,
@@ -412,6 +423,9 @@ def _native_limit_pressure(
             "native_active_order_headroom_account": None,
             "native_active_order_headroom_market": None,
             "native_sendtx_per_minute_remaining": None,
+            "native_rest_requests_per_minute_remaining": None,
+            "native_weighted_requests_per_minute_remaining": None,
+            "native_rest_request_remaining": None,
             "native_active_order_limit_source": None,
             "native_active_order_limit_conflicts": [],
             "native_limit_time_alignment_status": None,
@@ -424,6 +438,8 @@ def _native_limit_pressure(
     headroom_account = active_orders.get("active_order_headroom_account")
     headroom_market = active_orders.get("active_order_headroom_market")
     sendtx_remaining = limits.get("sendtx_per_minute_remaining")
+    rest_remaining = limits.get("rest_requests_per_minute_remaining")
+    weighted_remaining = limits.get("weighted_requests_per_minute_remaining")
     time_alignment = active_orders.get("native_limit_time_alignment_status")
     if any(value is not None for value in (headroom_account, headroom_market, sendtx_remaining)):
         if time_alignment == "EVENT_TIME_ALIGNED":
@@ -444,6 +460,9 @@ def _native_limit_pressure(
         "native_active_order_headroom_account": headroom_account,
         "native_active_order_headroom_market": headroom_market,
         "native_sendtx_per_minute_remaining": sendtx_remaining,
+        "native_rest_requests_per_minute_remaining": rest_remaining,
+        "native_weighted_requests_per_minute_remaining": weighted_remaining,
+        "native_rest_request_remaining": rest_remaining,
         "native_active_order_limit_source": active_orders.get("active_order_limit_source"),
         "native_active_order_limit_conflicts": active_orders.get("active_order_limit_conflicts") or [],
         "native_limit_time_alignment_status": time_alignment,

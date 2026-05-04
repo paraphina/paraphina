@@ -992,6 +992,17 @@ reported `0`, because the supplied native-limit context still lacked sendTx and
 REST-or-weighted limit/remaining pressure. Event-time active-order alignment
 alone is not complete Lighter native-limit pressure.
 
+The follow-up read-only header probe
+`PHASE51B-LIGHTER-READONLY-HEADER-PROBE-20260504T000000Z` used existing local
+credentials and GET-only endpoints. It passed schema/secret-scan acceptance for
+calibration-label ingestion, but the accountLimits payload still exposed only
+tier/fee/LLP-style keys, sanitized rate/quota response header names were empty,
+and no sendTx or REST-or-weighted limit/remaining fields were observed. The
+downstream rerun
+`PHASE51N-LIGHTER-NATIVE-LIMIT-HEADER-PROBE-HOLD-20260504T000000Z` remained
+`HOLD` with `3700` event-time-aligned rows, `0` complete pressure rows, and
+`phase51v_lighter_native_limit_manifest_ready=false`.
+
 After Phase 5.1t, source-link generation is repo-owned and should be used
 before Phase 5.1s whenever a local forward source snapshot contains raw
 order/client identifiers that cannot be emitted. The first 5.1t run over

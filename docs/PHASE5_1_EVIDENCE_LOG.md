@@ -5,6 +5,82 @@ run artifacts under `runs/` are ignored by Git because they contain large
 telemetry snapshots; this file preserves the reproducible evidence boundary in
 the repository.
 
+## Phase 5.1b Lighter Read-Only Header Probe And Pressure Preservation
+
+Date: 2026-05-04
+
+Purpose: preserve any observed Lighter REST/weighted remaining-pressure fields
+and sanitized rate/quota response headers from authenticated read-only GET
+endpoints, without calling `sendTx`, `sendTxBatch`, or any order path.
+
+Changed repo-owned behavior:
+
+```text
+accepted: REST/weighted remaining fields when present in accountLimits payload
+accepted: sanitized rate/limit/quota/cooldown response headers from read-only GET responses
+held: missing sendTx and REST-or-weighted limit/remaining pressure
+not allowed: inferring remaining pressure from official caps, live orders, canary, capital/risk changes, model training, EV/PnL claims
+```
+
+Validation:
+
+```bash
+python3 -m py_compile \
+  tools/phase51b_lighter_account_limits.py \
+  tools/phase51b_accept_evidence.py \
+  tools/phase51c_queue_churn_labels.py
+
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51b_lighter_response_header_sanitizer_keeps_only_limit_headers \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51b_lighter_account_limits_collector_emits_valid_hold_artifact \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51b_acceptance_promotes_only_calibration_ingestion \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51n_lighter_native_limit_alignment_feeds_queue_churn_without_false_clearance \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51n_complete_lighter_limit_alignment_feeds_phase51v
+```
+
+Read-only probe evidence:
+
+```text
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-HEADER-PROBE-20260504T000000Z
+phase51b_capture_complete: true
+phase51b_acceptance.status: PROMOTE_TO_PHASE51C_CALIBRATION_INGESTION
+safe_nonlive_flags: true
+accountLimits raw keys: tier/fee/LLP fields only
+accountLimits rate/quota response header names: []
+sendtx_per_minute_limit present: false
+sendtx_per_minute_remaining present: false
+rest_requests_per_minute_limit present: false
+rest_requests_per_minute_remaining present: false
+weighted_requests_per_minute_limit present: false
+weighted_requests_per_minute_remaining present: false
+limitations:
+- lighter_sendtx_remaining_not_observed
+- lighter_rest_or_weighted_limit_not_observed
+- lighter_rest_or_weighted_remaining_not_observed
+- lighter_rest_request_limit_not_exposed_by_account_limits_payload
+```
+
+Downstream Phase 5.1n rerun:
+
+```text
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-HEADER-PROBE-HOLD-20260504T000000Z
+gate_status: HOLD
+native_limit_event_time_aligned_count: 3700
+native_limit_all_pressure_dimensions_observed_count: 0
+forward_native_limit_pressure_source_count: 0
+phase51v_lighter_native_limit_manifest_ready: false
+```
+
+Result:
+
+```text
+py_compile: PASS
+focused Phase 5.1b/5.1n unittest: PASS, 5 tests
+read-only Lighter GET capture: PASS, no order/sendTx path
+Phase 5.1n downstream rerun: HOLD
+clears_phase51_blockers remains false
+```
+
 ## Phase 5.1n Lighter Native-Limit Forward Source Patch
 
 Date: 2026-05-04

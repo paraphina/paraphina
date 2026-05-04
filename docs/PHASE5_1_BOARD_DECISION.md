@@ -1472,10 +1472,41 @@ forward_native_limit_pressure_source_count: 0
 phase51v_lighter_native_limit_manifest_ready: false
 ```
 
+Additional 2026-05-04 read-only header probe:
+
+```text
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-HEADER-PROBE-20260504T000000Z
+phase51b_acceptance.status: PROMOTE_TO_PHASE51C_CALIBRATION_INGESTION
+safe_nonlive_flags: true
+accountLimits response header names: []
+sendTx limit/remaining observed: false
+REST-or-weighted limit/remaining observed: false
+
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-NATIVE-LIMIT-HEADER-PROBE-HOLD-20260504T000000Z
+native_limit_event_time_aligned_count: 3700
+native_limit_all_pressure_dimensions_observed_count: 0
+forward_native_limit_pressure_source_count: 0
+phase51v_lighter_native_limit_manifest_ready: false
+```
+
+Interpretation:
+
+```text
+The no-order read-only Lighter endpoints currently available to the repo do not
+expose the missing sendTx or REST-or-weighted remaining pressure fields in
+either body keys or sanitized rate/quota response headers. The board must keep
+Phase 5.1v/5.1n on HOLD rather than infer remaining pressure from official
+caps. Future payloads that do expose those fields are now preserved by the
+Phase 5.1b collector.
+```
+
 Next move:
 
 ```text
 Capture or stage the missing event-time sendTx and REST-or-weighted
-limit/remaining pressure fields, rerun Phase 5.1n, and feed its generated
-manifest into Phase 5.1v only if complete forward rows are emitted.
+limit/remaining pressure fields from a safe observed source if one becomes
+available, rerun Phase 5.1n, and feed its generated manifest into Phase 5.1v
+only if complete forward rows are emitted. Do not infer pressure from caps. In
+parallel, continue remaining all-five native-role source capture where it does
+not depend on unavailable Lighter request-pressure fields.
 ```

@@ -60,6 +60,26 @@ SENSITIVE_KEYS = {
     "signature",
     "token",
 }
+RESPONSE_HEADER_FRAGMENTS = (
+    "cooldown",
+    "quota",
+    "rate",
+    "remaining",
+    "retry-after",
+    "limit",
+)
+SENSITIVE_HEADER_FRAGMENTS = (
+    "auth",
+    "cookie",
+    "credential",
+    "jwt",
+    "password",
+    "secret",
+    "session",
+    "set-cookie",
+    "signature",
+    "token",
+)
 
 
 def _load_json(path: Path) -> dict[str, Any] | list[Any]:
@@ -408,16 +428,20 @@ def _source_record(
     payload: dict[str, Any] | list[Any] | None,
     source_path: Path | None,
     source_endpoint: str | None,
+    response_headers: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     if payload is None:
         return None
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    headers = response_headers or {}
     return {
         "name": name,
         "payload": payload,
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "source_path": str(source_path) if source_path else None,
         "source_endpoint": source_endpoint,
+        "response_headers": headers,
+        "response_headers_sha256": _stable_hash(headers) if headers else None,
     }
 
 
@@ -575,6 +599,37 @@ def _http_get_json(
     auth_token: str | None = None,
     timeout_s: float = 10.0,
 ) -> dict[str, Any] | list[Any]:
+    payload, _ = _http_get_json_with_headers(
+        base_url,
+        endpoint,
+        params=params,
+        auth_token=auth_token,
+        timeout_s=timeout_s,
+    )
+    return payload
+
+
+def _sanitize_response_headers(headers: dict[str, Any]) -> dict[str, str]:
+    sanitized: dict[str, str] = {}
+    for raw_key, raw_value in headers.items():
+        key = str(raw_key)
+        normalized = key.lower()
+        if any(fragment in normalized for fragment in SENSITIVE_HEADER_FRAGMENTS):
+            continue
+        if not any(fragment in normalized for fragment in RESPONSE_HEADER_FRAGMENTS):
+            continue
+        sanitized[key] = str(raw_value)
+    return dict(sorted(sanitized.items()))
+
+
+def _http_get_json_with_headers(
+    base_url: str,
+    endpoint: str,
+    *,
+    params: dict[str, Any] | None = None,
+    auth_token: str | None = None,
+    timeout_s: float = 10.0,
+) -> tuple[dict[str, Any] | list[Any], dict[str, str]]:
     query = urllib.parse.urlencode({k: v for k, v in (params or {}).items() if v is not None})
     url = f"{base_url.rstrip('/')}{endpoint}"
     if query:
@@ -585,9 +640,35 @@ def _http_get_json(
     request = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(request, timeout=timeout_s) as response:  # noqa: S310
         payload = json.loads(response.read().decode("utf-8"))
+        response_headers = _sanitize_response_headers(dict(response.headers.items()))
     if not isinstance(payload, (dict, list)):
         raise ValueError(f"unexpected JSON payload from {endpoint}")
-    return payload
+    return payload, response_headers
+
+
+def _http_get_source_record(
+    *,
+    name: str,
+    base_url: str,
+    endpoint: str,
+    params: dict[str, Any] | None = None,
+    auth_token: str | None = None,
+    timeout_s: float,
+) -> dict[str, Any] | None:
+    payload, response_headers = _http_get_json_with_headers(
+        base_url,
+        endpoint,
+        params=params,
+        auth_token=auth_token,
+        timeout_s=timeout_s,
+    )
+    return _source_record(
+        name=name,
+        payload=payload,
+        source_path=None,
+        source_endpoint=f"{base_url}{endpoint}",
+        response_headers=response_headers,
+    )
 
 
 def _fetch_readonly_sources(
@@ -604,58 +685,53 @@ def _fetch_readonly_sources(
     auth_token = _get_auth_token(env, allow_sdk_auth=allow_sdk_auth, sdk_path=sdk_path)
     fetched: dict[str, dict[str, Any]] = {}
     endpoint = READONLY_ENDPOINTS["account"]
-    fetched["account"] = _source_record(
+    fetched["account"] = _http_get_source_record(
         name="account",
-        payload=_http_get_json(base_url, endpoint, params={"by": "index", "value": account_index}, timeout_s=timeout_s),
-        source_path=None,
-        source_endpoint=f"{base_url}{endpoint}",
+        base_url=base_url,
+        endpoint=endpoint,
+        params={"by": "index", "value": account_index},
+        timeout_s=timeout_s,
     )
     endpoint = READONLY_ENDPOINTS["account_limits"]
-    fetched["account_limits"] = _source_record(
+    fetched["account_limits"] = _http_get_source_record(
         name="account_limits",
-        payload=_http_get_json(base_url, endpoint, params={"account_index": account_index}, auth_token=auth_token, timeout_s=timeout_s),
-        source_path=None,
-        source_endpoint=f"{base_url}{endpoint}",
+        base_url=base_url,
+        endpoint=endpoint,
+        params={"account_index": account_index},
+        auth_token=auth_token,
+        timeout_s=timeout_s,
     )
     endpoint = READONLY_ENDPOINTS["active_orders"]
-    fetched["active_orders"] = _source_record(
+    fetched["active_orders"] = _http_get_source_record(
         name="active_orders",
-        payload=_http_get_json(
-            base_url,
-            endpoint,
-            params={"account_index": account_index, "market_id": market_id},
-            auth_token=auth_token,
-            timeout_s=timeout_s,
-        ),
-        source_path=None,
-        source_endpoint=f"{base_url}{endpoint}",
+        base_url=base_url,
+        endpoint=endpoint,
+        params={"account_index": account_index, "market_id": market_id},
+        auth_token=auth_token,
+        timeout_s=timeout_s,
     )
     endpoint = READONLY_ENDPOINTS["order_books"]
-    fetched["order_books"] = _source_record(
+    fetched["order_books"] = _http_get_source_record(
         name="order_books",
-        payload=_http_get_json(base_url, endpoint, timeout_s=timeout_s),
-        source_path=None,
-        source_endpoint=f"{base_url}{endpoint}",
+        base_url=base_url,
+        endpoint=endpoint,
+        timeout_s=timeout_s,
     )
     if include_trades:
         endpoint = READONLY_ENDPOINTS["trades"]
-        fetched["trades"] = _source_record(
+        fetched["trades"] = _http_get_source_record(
             name="trades",
-            payload=_http_get_json(
-                base_url,
-                endpoint,
-                params={
-                    "account_index": account_index,
-                    "market_id": market_id,
-                    "market_type": "perp",
-                    "sort_by": "timestamp",
-                    "limit": 100,
-                },
-                auth_token=auth_token,
-                timeout_s=timeout_s,
-            ),
-            source_path=None,
-            source_endpoint=f"{base_url}{endpoint}",
+            base_url=base_url,
+            endpoint=endpoint,
+            params={
+                "account_index": account_index,
+                "market_id": market_id,
+                "market_type": "perp",
+                "sort_by": "timestamp",
+                "limit": 100,
+            },
+            auth_token=auth_token,
+            timeout_s=timeout_s,
         )
     return {k: v for k, v in fetched.items() if v is not None}
 
@@ -745,11 +821,15 @@ def _account_limits_event(
         "account_limits_status": "OBSERVED",
         "account_limits_source_sha256": limits_source["sha256"],
         "account_limits_source_endpoint": limits_source["source_endpoint"],
+        "account_limits_response_header_names": sorted((limits_source.get("response_headers") or {}).keys()),
+        "account_limits_response_headers_sha256": limits_source.get("response_headers_sha256"),
         "account_limits_raw_keys": raw_keys,
         "sendtx_per_minute_limit": _as_int(_first_value(payload, {"sendtx_per_minute_limit", "sendtxperminutelimit", "sendtx_per_minute", "sendtxperminute", "send_tx_limit", "sendtxlimit"})),
         "sendtx_per_minute_remaining": _as_int(_first_value(payload, {"sendtx_per_minute_remaining", "sendtxperminuteremaining", "send_tx_remaining", "sendtxremaining"})),
         "rest_requests_per_minute_limit": _as_int(_first_value(payload, {"rest_requests_per_minute_limit", "restrequestsperminutelimit", "standard_requests_per_minute", "standardrequestsperminute"})),
+        "rest_requests_per_minute_remaining": _as_int(_first_value(payload, {"rest_requests_per_minute_remaining", "restrequestsperminuteremaining", "standard_requests_per_minute_remaining", "standardrequestsperminuteremaining", "rest_remaining", "restremaining"})),
         "weighted_requests_per_minute_limit": _as_int(_first_value(payload, {"weighted_requests_per_minute_limit", "weightedrequestsperminutelimit", "premium_weighted_requests", "premiumweightedrequests"})),
+        "weighted_requests_per_minute_remaining": _as_int(_first_value(payload, {"weighted_requests_per_minute_remaining", "weightedrequestsperminuteremaining", "premium_weighted_requests_per_minute_remaining", "premiumweightedrequestsperminuteremaining", "premium_weighted_requests_remaining", "premiumweightedrequestsremaining", "weighted_remaining", "weightedremaining"})),
         "lighter_user_tier": _as_text(_first_value(payload, {"user_tier", "usertier"})),
         "lighter_user_tier_name": _as_text(_first_value(payload, {"user_tier_name", "usertiername"})),
         "current_maker_fee_tick": _as_int(_first_value(payload, {"current_maker_fee_tick", "currentmakerfeetick"})),
@@ -947,6 +1027,11 @@ def _copy_sanitized_sources(out_dir: Path, sources: dict[str, dict[str, Any]]) -
         path = source_dir / f"{name}.sanitized.json"
         _write_json(path, _redact(source["payload"]))
         paths.append(path)
+        response_headers = source.get("response_headers") or {}
+        if response_headers:
+            headers_path = source_dir / f"{name}.response_headers.sanitized.json"
+            _write_json(headers_path, response_headers)
+            paths.append(headers_path)
     return paths
 
 
