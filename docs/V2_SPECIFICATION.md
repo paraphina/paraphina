@@ -20,11 +20,12 @@ Current repo evidence boundary:
 - Current Phase 5.1 evidence boundary: Phase 5.1u emits the active forward
   capture target manifest, Phase 5.1w emits the operator request pack for the
   required sanitized local files, Phase 5.1x provides a Hyperliquid-only
-  offline native-role adapter for local `userFills` snapshots, and Phase 5.1v
-  is the active offline readiness gate that verifies a sanitized local capture
-  bundle before Phase 5.1s; Phase 5.1s stages local source bundles, Phase 5.1t
-  builds optional source-link sidecars, and Phase 5.1r validates redacted
-  source-hash joins before Phase 5.1q
+  offline native-role adapter for local `userFills` snapshots, Phase 5.1y
+  provides an all-venue offline native-role normalizer for already-local
+  source rows, and Phase 5.1v is the active offline readiness gate that
+  verifies a sanitized local capture bundle before Phase 5.1s; Phase 5.1s
+  stages local source bundles, Phase 5.1t builds optional source-link sidecars,
+  and Phase 5.1r validates redacted source-hash joins before Phase 5.1q
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
 
@@ -642,6 +643,23 @@ Hyperliquid subset only; it is not a source-complete all-five bundle and does
 not authorize Phase 5.1s promotion, model training, EV admission, canary, live
 orders, capital escalation, risk-limit relaxation, or financial claims.
 
+Phase 5.1y adds a HOLD-only all-venue native-role adapter for already-local
+JSON/JSONL source rows. It normalizes only explicit venue-native role fields:
+Aster `ORDER_TRADE_UPDATE` / `o.m` with positive fill quantity, Extended
+`isTaker` / `is_taker`, Hyperliquid `crossed`, Lighter `account_index` plus
+`is_maker_ask` and side account IDs, and Paradex `liquidity`. Phase 5.1y
+requires direct canonical group/order-key linkage in the source rows; rows
+without target linkage are labeled HOLD and do not emit source truth. It rejects
+network paths, `.env` files, symlink paths, unsafe flags, and secret-shaped
+fields, strips raw order/trade identifiers from output, and never infers role
+from strategy intent, post-only status, fees, or economics. The first staged
+empty-source evidence run correctly recovered `0 / 287` native-role targets,
+and a Hyperliquid-reuse evidence run recovered the existing `6 / 287`
+Hyperliquid subset only. Phase 5.1y is an intake/normalization gate; it does
+not capture venue truth by itself and does not authorize Phase 5.1s promotion,
+model training, EV admission, canary, live orders, capital escalation,
+risk-limit relaxation, or financial claims.
+
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and
@@ -667,4 +685,4 @@ can mark targets ready. After Phase 5.1s, run Phase 5.1r, feed the sanitized
 outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No model training,
 EV admission, canary, live orders, capital escalation, risk-limit relaxation,
 or financial claim is authorized from Phase 5.1s, Phase 5.1r, Phase 5.1q,
-Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, or Phase 5.1x.
+Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, Phase 5.1x, or Phase 5.1y.

@@ -768,6 +768,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51x_hyperliquid_native_role_adapter.py"
 
+    def _get_phase51y_all5_native_role_adapter_path(self) -> Path:
+        """Get path to the Phase 5.1y all-venue native-role adapter."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51y_all5_native_role_adapter.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -8959,6 +8964,269 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(tmp_path / "phase51x_hyperliquid"),
                     "--run-id",
                     "phase51x_hl_network_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("network source paths are prohibited", result.stderr)
+
+    def test_phase51y_all5_native_role_adapter_emits_phase51v_ready_rows(self):
+        """5.1y should redact local all-venue native-role rows and feed 5.1v."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            adapter_root = tmp_path / "phase51y_all5"
+            readiness_root = tmp_path / "phase51v_readiness"
+            target_run.mkdir()
+            targets = [
+                {
+                    "canonical_group_id": "aster-group",
+                    "order_key": "aster-order",
+                    "venue_id": "aster",
+                    "required_native_role_source": "ASTER_ORDER_TRADE_UPDATE",
+                    "required_native_role_fields": ["e=ORDER_TRADE_UPDATE", "o.m", "positive o.l"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "extended-group",
+                    "order_key": "extended-order",
+                    "venue_id": "extended",
+                    "required_native_role_source": "EXTENDED_ISTAKER",
+                    "required_native_role_fields": ["isTaker"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "hyper-group",
+                    "order_key": "hyper-order",
+                    "venue_id": "hyperliquid",
+                    "required_native_role_source": "HYPERLIQUID_CROSSED",
+                    "required_native_role_fields": ["crossed"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "lighter-group",
+                    "order_key": "lighter-order",
+                    "venue_id": "lighter",
+                    "required_native_role_source": "LIGHTER_TRADES_JSON",
+                    "required_native_role_fields": [
+                        "account_index",
+                        "is_maker_ask",
+                        "ask_account_id",
+                        "bid_account_id",
+                    ],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "canonical_group_id": "paradex-group",
+                    "order_key": "paradex-order",
+                    "venue_id": "paradex",
+                    "required_native_role_source": "PARADEX_LIQUIDITY",
+                    "required_native_role_fields": ["liquidity"],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_all5_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 5,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in targets),
+                encoding="utf-8",
+            )
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+            source_path = tmp_path / "all5_native_source.jsonl"
+            source_rows = [
+                {
+                    "canonical_group_id": "aster-group",
+                    "venue_id": "aster",
+                    "e": "ORDER_TRADE_UPDATE",
+                    "o": {"m": True, "l": "0.25", "orderId": "raw-aster-order"},
+                },
+                {
+                    "canonical_group_id": "extended-group",
+                    "venue_id": "extended",
+                    "isTaker": False,
+                    "client_order_id": "raw-extended-client",
+                },
+                {
+                    "canonical_group_id": "hyper-group",
+                    "venue_id": "hyperliquid",
+                    "crossed": False,
+                    "oid": "raw-hyper-oid",
+                },
+                {
+                    "canonical_group_id": "lighter-group",
+                    "venue_id": "lighter",
+                    "account_index": "42",
+                    "is_maker_ask": True,
+                    "ask_account_id": "42",
+                    "bid_account_id": "7",
+                    "trade_id": "raw-lighter-trade",
+                },
+                {
+                    "canonical_group_id": "paradex-group",
+                    "venue_id": "paradex",
+                    "liquidity": "TAKER",
+                    "order_id": "raw-paradex-order",
+                },
+            ]
+            source_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in source_rows),
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51y_all5_native_role_adapter_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    str(source_path),
+                    "--output-root",
+                    str(adapter_root),
+                    "--run-id",
+                    "phase51y_all5_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            adapter_dir = adapter_root / "phase51y_all5_test"
+            summary = json.loads(
+                (adapter_dir / "phase51y_all5_native_role_adapter_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["native_role_target_count"], 5)
+            self.assertEqual(summary["native_role_target_recovered_count"], 5)
+            self.assertEqual(summary["source_row_emitted_count"], 5)
+            self.assertEqual(summary["raw_identifier_redaction_status"], "PASS")
+            self.assertFalse(summary["live_orders_allowed"])
+            self.assertFalse(summary["admissible_for_financial_claim"])
+            output_text = (
+                (adapter_dir / "all5_forward_native_role_snapshot.jsonl").read_text(encoding="utf-8")
+                + (adapter_dir / "all5_native_role_adapter_labels.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertIn('"liquidity":"TAKER"', output_text)
+            self.assertIn('"crossed":false', output_text)
+            self.assertIn('"isTaker":false', output_text)
+            self.assertNotIn("raw-aster-order", output_text)
+            self.assertNotIn("raw-extended-client", output_text)
+            self.assertNotIn("raw-hyper-oid", output_text)
+            self.assertNotIn("raw-lighter-trade", output_text)
+            self.assertNotIn("raw-paradex-order", output_text)
+            self.assertNotIn('"orderId"', output_text)
+            self.assertNotIn('"client_order_id"', output_text)
+            self.assertNotIn('"oid"', output_text)
+            self.assertNotIn('"trade_id"', output_text)
+            self.assertNotIn('"order_id"', output_text)
+
+            candidate_manifest = tmp_path / "capture_bundle_manifest.json"
+            candidate_manifest.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [
+                    {
+                        "source_id": "all5_forward_native_role_snapshot",
+                        "venue_id": "all5",
+                        "path": str(adapter_dir / "all5_forward_native_role_snapshot.jsonl"),
+                    }
+                ],
+                "source_links": [],
+            }), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(candidate_manifest),
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51v_from_phase51y_all5_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            readiness_summary = json.loads(
+                (
+                    readiness_root
+                    / "phase51v_from_phase51y_all5_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertTrue(readiness_summary["generated_phase51s_manifest_ready"])
+            self.assertEqual(readiness_summary["native_role_capture_target_ready_count"], 5)
+            self.assertEqual(readiness_summary["native_role_capture_target_missing_count"], 0)
+            self.assertEqual(readiness_summary["source_file_status_counts"], {"LOCAL_FILE_READY": 1})
+            self.assertFalse(readiness_summary["clears_phase51_blockers"])
+
+    def test_phase51y_all5_native_role_adapter_rejects_network_sources(self):
+        """5.1y should not fetch native source rows or accept network paths."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_empty_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 0,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51y_all5_native_role_adapter_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    "https://api.venue.example/private_trades.json",
+                    "--output-root",
+                    str(tmp_path / "phase51y_all5"),
+                    "--run-id",
+                    "phase51y_all5_network_reject_test",
                 ],
                 capture_output=True,
                 text=True,

@@ -1440,6 +1440,90 @@ sources plus complete Lighter event-time native-limit pressure, then rerun
 Phase 5.1v before Phase 5.1s.
 ```
 
+## Phase 5.1y Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for offline all-venue native-role source normalization
+through `tools/phase51y_all5_native_role_adapter.py`.
+
+Rationale:
+
+- Aster, Extended, Lighter, and Paradex still need fresh native-role source
+  rows, but the repo lacked a single all-venue offline normalizer that could
+  convert already-local sanitized source rows into Phase 5.1v-ready input.
+- Phase 5.1y accepts only explicit venue-native role fields: Aster
+  `ORDER_TRADE_UPDATE` / `o.m` with positive fill quantity, Extended
+  `isTaker` / `is_taker`, Hyperliquid `crossed`, Lighter `account_index` plus
+  `is_maker_ask` and side account IDs, and Paradex `liquidity`.
+- Phase 5.1y requires direct canonical group/order-key linkage. Missing,
+  non-targeted, or ambiguous joins remain HOLD labels and do not emit source
+  truth.
+- The adapter is offline-only: it consumes already-local JSON/JSONL source
+  snapshots, performs no network calls, reads no secrets or `.env` files,
+  rejects URI paths, rejects symlink paths, strips raw venue order/trade
+  identifiers from output, and never infers maker/taker role from strategy
+  intent, post-only status, fees, or economics.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1y - all-venue native-role adapter
+tool: tools/phase51y_all5_native_role_adapter.py
+status: HOLD
+authorized output:
+- all5_forward_native_role_snapshot.jsonl
+- all5_native_role_adapter_labels.jsonl
+- phase51y_all5_native_role_adapter_summary.json
+- phase51y_manifest.json
+prohibited:
+- live orders
+- canary
+- network source paths
+- .env source files
+- symlink source files
+- secret-shaped fields
+- raw venue identifiers in output
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+- source truth inference
+```
+
+Evidence:
+
+```text
+runs/phase51y_all5_native_role_adapter/PHASE51Y-ALL5-STAGED-EMPTY-NATIVE-ROLE-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_target_recovered_count: 0 / 287
+source_row_count: 0
+source_row_emitted_count: 0
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+
+runs/phase51y_all5_native_role_adapter/PHASE51Y-HYPERLIQUID-REUSE-NATIVE-ROLE-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_target_recovered_count: 6 / 287
+native_role_target_recovered_counts_by_venue: hyperliquid=6
+source_row_count: 7
+source_row_emitted_count: 7
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Next move:
+
+```text
+Use Phase 5.1y as the offline normalization step after fresh read-only native
+role capture for Aster, Extended, Paradex, and Lighter. Reuse Phase 5.1x or
+Phase 5.1y-normalized Hyperliquid rows for Hyperliquid. Then run Phase 5.1v
+against the resulting local capture bundle and proceed to Phase 5.1s only if
+5.1v emits generated_phase51s_manifest_ready=true.
+```
+
 ## Phase 5.1n Forward Native-Limit Source Decision
 
 Decision: `HOLD` for model training, EV admission, canary, live orders, capital

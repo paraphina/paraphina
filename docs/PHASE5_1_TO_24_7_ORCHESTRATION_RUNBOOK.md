@@ -74,9 +74,12 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    with `0 / 287` native-role targets and `0 / 3132` Lighter native-limit
    targets ready at
    `runs/phase51v_forward_capture_bundle_readiness/PHASE51V-EMPTY-STAGED-SOURCE-BUNDLE-HOLD-20260504T000000Z`.
-   Continue by adding safe repo-owned read-only native-role collectors/parsers
-   for Aster, Extended, Hyperliquid, and Paradex, and by completing Lighter
-   event-time active-order/sendTx/REST-or-weighted pressure linkage. Then
+   Continue by capturing fresh read-only native-role source rows for Aster,
+   Extended, Lighter, and Paradex, then normalize already-local sanitized rows
+   through the repo-owned Phase 5.1y all-venue adapter. Reuse the Phase 5.1x
+   Hyperliquid `crossed` source, or the Phase 5.1y-normalized Hyperliquid
+   output, for the Hyperliquid subset. Complete Lighter event-time
+   active-order/sendTx/REST-or-weighted pressure linkage separately. Then
    populate the Phase 5.1w staged files with six sanitized local read-only
    all-five forward capture files and rerun Phase 5.1v against the Phase 5.1u
    target manifest.
@@ -976,6 +979,37 @@ clears_phase51_blockers: false
 Use the Phase 5.1x Hyperliquid source as the Hyperliquid native-role file in the
 next all-five candidate bundle. Do not rerun Hyperliquid unless the canonical
 Phase 5.1u target manifest changes or a newer source snapshot is needed.
+
+Phase 5.1y now covers offline all-venue native-role normalization for
+already-local source rows:
+
+```text
+runs/phase51y_all5_native_role_adapter/PHASE51Y-ALL5-STAGED-EMPTY-NATIVE-ROLE-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_target_recovered_count: 0 / 287
+source_row_count: 0
+source_row_emitted_count: 0
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+
+runs/phase51y_all5_native_role_adapter/PHASE51Y-HYPERLIQUID-REUSE-NATIVE-ROLE-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_target_recovered_count: 6 / 287
+native_role_target_recovered_counts_by_venue:
+- hyperliquid: 6
+source_row_count: 7
+source_row_emitted_count: 7
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Use Phase 5.1y after fresh read-only native-role capture produces already-local
+JSON/JSONL rows with direct canonical group/order-key linkage. Phase 5.1y
+accepts Aster `ORDER_TRADE_UPDATE` / `o.m` with positive fill quantity,
+Extended `isTaker` / `is_taker`, Hyperliquid `crossed`, Lighter
+`account_index` plus `is_maker_ask` and side account IDs, and Paradex
+`liquidity`. It does not fetch sources, infer source truth, use raw
+identifiers in output, or clear blockers without Phase 5.1v readiness.
 
 Phase 5.1n now emits a downstream Lighter native-limit source artifact and
 Phase 5.1v manifest:

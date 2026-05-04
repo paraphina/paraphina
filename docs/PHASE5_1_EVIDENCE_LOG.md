@@ -340,6 +340,95 @@ live orders, capital escalation, risk-limit relaxation, financial claims, and
 Lighter event-time native-limit pressure are captured and Phase 5.1v emits a
 source-complete generated Phase 5.1s manifest.
 
+## Phase 5.1y All-Venue Native-Role Adapter
+
+- Run id: `PHASE51Y-ALL5-STAGED-EMPTY-NATIVE-ROLE-HOLD-20260504T000000Z`
+- Local run directory: `runs/phase51y_all5_native_role_adapter/PHASE51Y-ALL5-STAGED-EMPTY-NATIVE-ROLE-HOLD-20260504T000000Z`
+- Source type: existing Phase 5.1w staged local source files
+- Gate status: `HOLD`
+- All-five native-role targets recovered: `0 / 287`
+- Source files scanned: `5`
+- Source rows scanned: `0`
+- Redacted source rows emitted: `0`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+- `clears_phase51_blockers`: `false`
+- `raw_identifier_redaction_status`: `PASS`
+
+Compatibility run:
+
+- Run id: `PHASE51Y-HYPERLIQUID-REUSE-NATIVE-ROLE-HOLD-20260504T000000Z`
+- Local run directory: `runs/phase51y_all5_native_role_adapter/PHASE51Y-HYPERLIQUID-REUSE-NATIVE-ROLE-HOLD-20260504T000000Z`
+- Source type: Phase 5.1x redacted Hyperliquid native-role snapshot
+- Gate status: `HOLD`
+- All-five native-role targets recovered: `6 / 287`
+- Recovered venue: `hyperliquid=6`
+- Source files scanned: `1`
+- Source rows scanned: `7`
+- Redacted source rows emitted: `7`
+- `clears_phase51_blockers`: `false`
+- `raw_identifier_redaction_status`: `PASS`
+
+Commands:
+
+```bash
+python3 tools/phase51y_all5_native_role_adapter.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --source-json aster=runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z/local_source_staging/aster_forward_native_role_snapshot.jsonl \
+  --source-json extended=runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z/local_source_staging/extended_forward_native_role_snapshot.jsonl \
+  --source-json hyperliquid=runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z/local_source_staging/hyperliquid_forward_native_role_snapshot.jsonl \
+  --source-json lighter=runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z/local_source_staging/lighter_forward_native_role_snapshot.jsonl \
+  --source-json paradex=runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z/local_source_staging/paradex_forward_native_role_snapshot.jsonl \
+  --output-root runs/phase51y_all5_native_role_adapter \
+  --run-id PHASE51Y-ALL5-STAGED-EMPTY-NATIVE-ROLE-HOLD-20260504T000000Z \
+  --timestamp-ns 1777896930000000000
+
+python3 tools/phase51y_all5_native_role_adapter.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --source-json hyperliquid=runs/phase51x_hyperliquid_native_role_adapter/PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z/hyperliquid_forward_native_role_snapshot.jsonl \
+  --output-root runs/phase51y_all5_native_role_adapter \
+  --run-id PHASE51Y-HYPERLIQUID-REUSE-NATIVE-ROLE-HOLD-20260504T000000Z \
+  --timestamp-ns 1777896931000000000
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51y_all5_native_role_adapter.py tests/test_telemetry_contract_gate.py
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51y_all5_native_role_adapter_emits_phase51v_ready_rows \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51y_all5_native_role_adapter_rejects_network_sources
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51x_hyperliquid_native_role_adapter_emits_phase51v_ready_rows \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_accepts_local_bundle \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51s_local_source_acquisition_feeds_phase51r_without_raw_ids \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51q_forward_native_evidence_feeds_all_five_venues_without_raw_ids
+```
+
+Result:
+
+```text
+Ran 2 tests
+OK
+
+Ran 4 tests
+OK
+```
+
+Board verdict: `PROMOTE` only for offline all-venue native-role normalization.
+The system remains `HOLD` for Phase 5.1s, model training, EV admission, canary,
+live orders, capital escalation, risk-limit relaxation, financial claims, and
+24/7 production readiness until fresh Aster, Extended, Lighter, and Paradex
+native-role source rows and complete Lighter event-time native-limit pressure
+are captured and Phase 5.1v emits a source-complete generated Phase 5.1s
+manifest.
+
 ## Phase 5.1u Forward Capture Target Manifest
 
 Run id: `PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z`
