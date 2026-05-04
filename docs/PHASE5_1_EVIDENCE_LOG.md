@@ -69,6 +69,89 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1x Hyperliquid Native-Role Adapter
+
+- Run id: `PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z`
+- Local run directory: `runs/phase51x_hyperliquid_native_role_adapter/PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z`
+- Source type: read-only Hyperliquid `info` / `userFills` snapshot captured to `/tmp`
+- Official source: `https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint`
+- Raw source commit status: not repo-owned and not committed
+- Redacted output: `hyperliquid_forward_native_role_snapshot.jsonl`
+- Gate status: `HOLD`
+- Hyperliquid native-role targets recovered: `6 / 6`
+- All-five native-role targets recovered after Phase 5.1v: `6 / 287`
+- Lighter native-limit targets recovered after Phase 5.1v: `0 / 3132`
+- Source rows scanned: `2000`
+- Source rows with boolean `crossed`: `2000`
+- Redacted source rows emitted: `7`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+- `clears_phase51_blockers`: `false`
+- `raw_identifier_redaction_status`: `PASS`
+
+Commands:
+
+```bash
+python3 tools/phase51x_hyperliquid_native_role_adapter.py \
+  --observed-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --source-json /tmp/phase51x_hyperliquid_userfills_1777896919.json \
+  --output-root runs/phase51x_hyperliquid_native_role_adapter \
+  --run-id PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z \
+  --timestamp-ns 1777896919000000000
+
+python3 tools/phase51v_forward_capture_bundle_readiness.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z \
+  --candidate-manifest /tmp/phase51x_hyperliquid_phase51v_candidate_manifest.json \
+  --output-root runs/phase51v_forward_capture_bundle_readiness \
+  --run-id PHASE51V-HYPERLIQUID-PARTIAL-SOURCE-HOLD-20260504T000000Z \
+  --timestamp-ns 1777896920000000000
+```
+
+Phase 5.1v partial-source result:
+
+```text
+gate_status: HOLD
+gate_reason: phase51v_forward_capture_bundle_incomplete_nonlive_hold
+native_role_capture_target_ready_count: 6 / 287
+native_role_capture_target_missing_count: 281
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+source_file_status_counts:
+- LOCAL_FILE_READY: 1
+generated_phase51s_manifest_ready: false
+clears_phase51_blockers: false
+raw_identifier_redaction_status: PASS
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51x_hyperliquid_native_role_adapter.py tests/test_telemetry_contract_gate.py
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51x_hyperliquid_native_role_adapter_emits_phase51v_ready_rows \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51x_hyperliquid_native_role_adapter_rejects_network_sources
+```
+
+Result:
+
+```text
+Ran 2 tests
+OK
+```
+
+Board verdict: `PROMOTE` only for Hyperliquid subset source-readiness evidence.
+The system remains `HOLD` for Phase 5.1s, model training, EV admission, canary,
+live orders, capital escalation, risk-limit relaxation, financial claims, and
+24/7 production readiness until the remaining venue-native role sources and
+Lighter event-time native-limit pressure are captured and Phase 5.1v emits a
+source-complete generated Phase 5.1s manifest.
+
 ## Phase 5.1u Forward Capture Target Manifest
 
 Run id: `PHASE51U-FORWARD-CAPTURE-TARGET-MANIFEST-CANONICAL-PFILL-20260503T000000Z`

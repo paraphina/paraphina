@@ -19,11 +19,12 @@ Current repo evidence boundary:
 - Phase 5 closeout baseline: `18dd09512288a85e440d3977e32432c3aabc1190`
 - Current Phase 5.1 evidence boundary: Phase 5.1u emits the active forward
   capture target manifest, Phase 5.1w emits the operator request pack for the
-  required sanitized local files, and Phase 5.1v is the active offline
-  readiness gate that verifies a sanitized local capture bundle before Phase
-  5.1s; Phase 5.1s stages local source bundles, Phase 5.1t builds optional
-  source-link sidecars, and Phase 5.1r validates redacted source-hash joins
-  before Phase 5.1q
+  required sanitized local files, Phase 5.1x provides a Hyperliquid-only
+  offline native-role adapter for local `userFills` snapshots, and Phase 5.1v
+  is the active offline readiness gate that verifies a sanitized local capture
+  bundle before Phase 5.1s; Phase 5.1s stages local source bundles, Phase 5.1t
+  builds optional source-link sidecars, and Phase 5.1r validates redacted
+  source-hash joins before Phase 5.1q
 - Current V2 verdict: `HOLD` for model training, EV admission, canary, live
   orders, capital escalation, risk-limit relaxation, and financial claims
 
@@ -608,6 +609,35 @@ Phase 5.1s manifest is generated. Phase 5.1w does not capture source truth,
 validate source rows, call venue APIs, read secrets, clear blockers, infer
 maker/taker role, infer native-limit pressure, or authorize economics.
 
+Phase 5.1x adds a HOLD-only Hyperliquid native-role adapter. It consumes an
+already-local Hyperliquid `userFills` or `userFillsByTime` JSON/JSONL snapshot,
+matches raw `oid`/`cloid` identity only against canonical redacted order hashes,
+and emits `hyperliquid_forward_native_role_snapshot.jsonl` rows containing only
+`venue_id`, `canonical_group_id`, `order_key`, boolean `crossed`, a source
+record hash, and safety flags. The adapter performs no network calls, reads no
+secrets or `.env` files, rejects URI paths, rejects secret-shaped fields,
+strips raw identifiers from output, and never infers maker/taker role. Official
+Hyperliquid API documentation for the `info` endpoint lists `userFills` and
+`userFillsByTime` as user-address queries and includes `crossed` on fill
+records; the docs also require querying the actual account or subaccount
+address rather than an API-agent wallet for account data.
+
+The first Phase 5.1x evidence run used a read-only public Hyperliquid account
+address from local configuration to fetch `2000` `userFills` records to `/tmp`,
+all with boolean `crossed`, then adapted that local file into redacted repo
+evidence at
+`runs/phase51x_hyperliquid_native_role_adapter/PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z`.
+Phase 5.1x recovered `6 / 6` current Hyperliquid native-role target groups and
+emitted `7` redacted `crossed` source rows. A downstream Phase 5.1v
+Hyperliquid-only candidate run at
+`runs/phase51v_forward_capture_bundle_readiness/PHASE51V-HYPERLIQUID-PARTIAL-SOURCE-HOLD-20260504T000000Z`
+recognizes `6 / 287` all-five native-role targets ready, keeps
+`281 / 287` native-role targets missing, keeps `0 / 3132` Lighter native-limit
+targets ready, and remains `HOLD`. This is real blocker reduction for the
+Hyperliquid subset only; it is not a source-complete all-five bundle and does
+not authorize Phase 5.1s promotion, model training, EV admission, canary, live
+orders, capital escalation, risk-limit relaxation, or financial claims.
+
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and
@@ -625,4 +655,5 @@ source hashes to observed labels. After Phase 5.1s, run Phase 5.1r, feed the
 sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No model
 training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
-5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, or Phase 5.1w.
+5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, or
+Phase 5.1x.

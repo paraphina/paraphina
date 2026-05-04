@@ -745,6 +745,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51w_forward_capture_request_pack.py"
 
+    def _get_phase51x_hyperliquid_native_role_adapter_path(self) -> Path:
+        """Get path to the Phase 5.1x Hyperliquid native-role adapter."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51x_hyperliquid_native_role_adapter.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -8243,6 +8248,234 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("network source[0] paths are prohibited", result.stderr)
+
+    def test_phase51x_hyperliquid_native_role_adapter_emits_phase51v_ready_rows(self):
+        """5.1x should redact local Hyperliquid fills and feed 5.1v structurally."""
+        def stable_hash(value):
+            return hashlib.sha256(
+                json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            ).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            target_run = tmp_path / "phase51u_targets"
+            adapter_root = tmp_path / "phase51x_hyperliquid"
+            readiness_root = tmp_path / "phase51v_readiness"
+            observed_run.mkdir()
+            target_run.mkdir()
+            raw_client_order_id = "client-hl-1"
+            client_order_id_hash = stable_hash(raw_client_order_id)
+            observed_label = {
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "canonical_group_id": "hl-group",
+                "order_key": "hl-order",
+                "venue_id": "hyperliquid",
+                "fill_count": 1,
+                "client_order_id_hash": client_order_id_hash,
+                "maker_taker_role_counts": {"MAKER": 0, "TAKER": 0, "UNKNOWN": 1},
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51x_hl_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(
+                json.dumps(observed_label) + "\n",
+                encoding="utf-8",
+            )
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_hl_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "hl-group",
+                "order_key": "hl-order",
+                "venue_id": "hyperliquid",
+                "required_native_role_source": "HYPERLIQUID_CROSSED",
+                "required_native_role_fields": ["crossed"],
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+            source_path = tmp_path / "hyperliquid_user_fills.json"
+            source_path.write_text(json.dumps({
+                "fills": [
+                    {
+                        "cloid": raw_client_order_id,
+                        "oid": 12345,
+                        "tid": 67890,
+                        "coin": "ETH",
+                        "px": "3200.0",
+                        "sz": "0.01",
+                        "crossed": False,
+                    }
+                ]
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51x_hyperliquid_native_role_adapter_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    str(source_path),
+                    "--output-root",
+                    str(adapter_root),
+                    "--run-id",
+                    "phase51x_hl_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            adapter_dir = adapter_root / "phase51x_hl_test"
+            summary = json.loads(
+                (adapter_dir / "phase51x_hyperliquid_native_role_adapter_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["hyperliquid_target_count"], 1)
+            self.assertEqual(summary["hyperliquid_target_recovered_count"], 1)
+            self.assertEqual(summary["source_row_emitted_count"], 1)
+            self.assertFalse(summary["live_orders_allowed"])
+            self.assertFalse(summary["admissible_for_financial_claim"])
+            output_text = (
+                (adapter_dir / "hyperliquid_forward_native_role_snapshot.jsonl").read_text(encoding="utf-8")
+                + (adapter_dir / "hyperliquid_native_role_adapter_labels.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertIn('"crossed":false', output_text)
+            self.assertNotIn("client-hl-1", output_text)
+            self.assertNotIn('"cloid"', output_text)
+            self.assertNotIn('"oid"', output_text)
+            self.assertNotIn('"tid"', output_text)
+
+            candidate_manifest = tmp_path / "capture_bundle_manifest.json"
+            candidate_manifest.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [
+                    {
+                        "source_id": "hyperliquid_forward_native_role_snapshot",
+                        "venue_id": "hyperliquid",
+                        "path": str(adapter_dir / "hyperliquid_forward_native_role_snapshot.jsonl"),
+                    }
+                ],
+                "source_links": [],
+            }), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(candidate_manifest),
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51v_from_phase51x_hl_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            readiness_summary = json.loads(
+                (
+                    readiness_root
+                    / "phase51v_from_phase51x_hl_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertTrue(readiness_summary["generated_phase51s_manifest_ready"])
+            self.assertEqual(readiness_summary["native_role_capture_target_ready_count"], 1)
+            self.assertEqual(readiness_summary["native_role_capture_target_missing_count"], 0)
+            self.assertEqual(readiness_summary["source_file_status_counts"], {"LOCAL_FILE_READY": 1})
+            self.assertFalse(readiness_summary["clears_phase51_blockers"])
+
+    def test_phase51x_hyperliquid_native_role_adapter_rejects_network_sources(self):
+        """5.1x should not fetch private source rows or accept network paths."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            target_run = tmp_path / "phase51u_targets"
+            observed_run.mkdir()
+            target_run.mkdir()
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51x_network_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text("", encoding="utf-8")
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_empty_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 0,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51x_hyperliquid_native_role_adapter_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    "https://api.hyperliquid.example/fills.json",
+                    "--output-root",
+                    str(tmp_path / "phase51x_hyperliquid"),
+                    "--run-id",
+                    "phase51x_hl_network_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("network source paths are prohibited", result.stderr)
 
     def test_phase51w_forward_capture_request_pack_emits_operator_pack(self):
         """5.1w should emit an operator-facing request pack from 5.1u targets."""

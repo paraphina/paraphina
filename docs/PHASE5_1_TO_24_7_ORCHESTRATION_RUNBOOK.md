@@ -948,6 +948,35 @@ generated_phase51s_manifest_ready: false
 clears_phase51_blockers: false
 ```
 
+Phase 5.1x now covers the Hyperliquid subset with a repo-owned offline adapter
+for already-local `userFills` snapshots:
+
+```text
+runs/phase51x_hyperliquid_native_role_adapter/PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z
+gate_status: HOLD
+hyperliquid_target_recovered_count: 6 / 6
+source_row_count: 2000
+source_row_emitted_count: 7
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+The downstream Phase 5.1v partial-source run is:
+
+```text
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-HYPERLIQUID-PARTIAL-SOURCE-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 6 / 287
+native_role_capture_target_missing_count: 281
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+clears_phase51_blockers: false
+```
+
+Use the Phase 5.1x Hyperliquid source as the Hyperliquid native-role file in the
+next all-five candidate bundle. Do not rerun Hyperliquid unless the canonical
+Phase 5.1u target manifest changes or a newer source snapshot is needed.
+
 After Phase 5.1t, source-link generation is repo-owned and should be used
 before Phase 5.1s whenever a local forward source snapshot contains raw
 order/client identifiers that cannot be emitted. The first 5.1t run over
@@ -957,10 +986,12 @@ applied `909` source-link joins and emitted `296` native-role source records,
 but Phase 5.1q/5.1n/5.1h/5.1i still recovered `0 / 287` missing native-role
 targets and `0 / 3132` Lighter native-limit targets. Existing local Lighter
 artifacts are therefore exhausted for blocker reduction. The next command
-target is a sanitized local forward read-only native source capture bundle
-with canonical linkage or 5.1t-compatible sidecars across all five venues,
-plus complete Lighter event-time active-order/sendTx/REST-or-weighted-request
-pressure, validated by Phase 5.1v before Phase 5.1s.
+target is a sanitized local forward read-only native source capture bundle for
+the remaining Aster, Extended, Paradex, and Lighter native-role files, plus
+complete Lighter event-time active-order/sendTx/REST-or-weighted-request
+pressure. Use canonical linkage or 5.1t-compatible sidecars where raw order IDs
+cannot be emitted, then validate the completed bundle by Phase 5.1v before
+Phase 5.1s.
 
 ## Current Verdict
 

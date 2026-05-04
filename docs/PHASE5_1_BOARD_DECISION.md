@@ -1346,3 +1346,81 @@ run 5.1s -> 5.1r -> 5.1q -> 5.1n -> 5.1h -> 5.1i. Stop if private
 credentials, live/canary/capital/risk authorization, or unredacted source
 material would be required.
 ```
+
+## Phase 5.1x Board Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only for Hyperliquid subset native-role source-readiness
+through `tools/phase51x_hyperliquid_native_role_adapter.py`.
+
+Rationale:
+
+- Hyperliquid has only `6` current native-role targets and the official
+  Hyperliquid `info` endpoint exposes `userFills`/`userFillsByTime` records
+  with boolean `crossed`.
+- The adapter is offline-only: it consumes already-local JSON/JSONL source
+  snapshots, performs no network calls, reads no secrets or `.env` files,
+  rejects URI paths, strips raw `oid`/`cloid`/trade identifiers from output,
+  and never infers maker/taker role.
+- Phase 5.1x recovered `6 / 6` current Hyperliquid target groups from a
+  read-only public-address source snapshot, and Phase 5.1v recognized
+  `6 / 287` all-five native-role targets ready.
+- Phase 5.1x is not an all-five source-complete bundle because Aster,
+  Extended, Lighter, Paradex, and Lighter event-time native-limit pressure
+  remain incomplete.
+
+Current repo-owned gate:
+
+```text
+Phase 5.1x - Hyperliquid native-role adapter
+tool: tools/phase51x_hyperliquid_native_role_adapter.py
+status: HOLD
+authorized output:
+- hyperliquid_forward_native_role_snapshot.jsonl
+- hyperliquid_native_role_adapter_labels.jsonl
+- phase51x_hyperliquid_native_role_adapter_summary.json
+- phase51x_manifest.json
+prohibited:
+- live orders
+- canary
+- network source paths
+- .env source files
+- symlink source files
+- secret-shaped fields
+- raw venue identifiers in output
+- model training
+- EV admission
+- capital escalation
+- risk-limit relaxation
+- financial claims
+- source truth inference
+```
+
+Evidence:
+
+```text
+runs/phase51x_hyperliquid_native_role_adapter/PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z
+gate_status: HOLD
+hyperliquid_target_recovered_count: 6 / 6
+source_row_count: 2000
+source_row_emitted_count: 7
+raw_identifier_redaction_status: PASS
+
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-HYPERLIQUID-PARTIAL-SOURCE-HOLD-20260504T000000Z
+gate_status: HOLD
+native_role_capture_target_ready_count: 6 / 287
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+generated_phase51s_manifest_ready: false
+clears_phase51_blockers: false
+```
+
+Next move:
+
+```text
+Reuse the Phase 5.1x Hyperliquid source in the next all-five candidate bundle.
+Build or capture the remaining Aster, Extended, Paradex, and Lighter native-role
+sources plus complete Lighter event-time native-limit pressure, then rerun
+Phase 5.1v before Phase 5.1s.
+```
