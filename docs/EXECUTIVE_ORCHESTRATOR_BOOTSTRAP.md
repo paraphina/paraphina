@@ -70,6 +70,27 @@ source material every session.
 When sources disagree, stop implementation work and resolve the contradiction
 against code, tests, structured state, and `ROADMAP.md`.
 
+## Research Policy
+
+Use targeted external research only when current venue/API behavior, account
+mode, fees, funding, maker/taker semantics, order fields, rate limits, native
+source fields, or official documentation can affect correctness.
+
+- Prefer primary official sources. Use third-party material only as a pointer
+  to an official source, not as authority.
+- Record source URL, access date/time, and the fact or field supported when the
+  research becomes part of an evidence pack or review note.
+- Clearly separate confirmed facts, implementation observations, model
+  estimates, counterfactuals, and inference.
+- Do not promote documentation-only facts into venue-native evidence,
+  economic claims, model labels, or readiness verdicts.
+- If official docs and connector behavior disagree, mark the issue `HOLD` until
+  the discrepancy is resolved from source capture, connector tests, or board
+  decision.
+- External research may update docs and evidence requirements. It does not
+  authorize live/canary, capital escalation, risk-limit changes, EV admission,
+  or economic claims.
+
 ## Autonomous Execution Loop
 
 This is the default loop for non-live V2 implementation and evidence work.
@@ -105,6 +126,27 @@ This is the default loop for non-live V2 implementation and evidence work.
   `phase5/runs/**`, `/etc/paraphina`, `/opt/paraphina`,
   `/var/lib/paraphina`, or `/home/ubuntu/promotion_runs` unless the operator
   explicitly authorizes that exact runtime action.
+
+## Read-Only Private Source Capture Boundary
+
+Private source capture is permitted only when the operator has explicitly
+authorized a bounded read-only attempt and only through existing local
+credentials. It remains a non-live evidence activity.
+
+- Use read-only endpoints, local captured artifacts, or connector dry-run paths
+  only.
+- Do not sign transactions, place orders, cancel orders, replace orders,
+  withdraw, transfer, create keys, mutate account settings, change account mode,
+  or call any venue write-path API unless separately authorized for that exact
+  runtime action.
+- Do not expose or commit raw private identifiers, authorization headers,
+  secrets, signed payloads, JWTs, private keys, client order IDs, venue order
+  IDs, trade IDs, or account-private values.
+- Redact source records before prompts, artifacts, commits, handoff notes, and
+  evidence logs.
+- Record credential presence as booleans or nonsecret capability status only.
+- If redaction cannot preserve the evidence value without exposing private
+  material, fail closed and keep the gate at `HOLD`.
 
 ## Do Not Do
 
@@ -191,14 +233,32 @@ Otherwise continue the autonomous loop.
 ## GitHub And Branch Hygiene
 
 - Keep changes small, bounded, and reviewable.
-- Prefer isolated branches or PRs for risky, runtime-affecting, or broad
-  changes.
-- Direct pushes to `main` are acceptable only for bounded non-live changes when
-  current repo practice or explicit operator instruction supports that path.
+- Prefer isolated branches or PRs for nontrivial code, schema, evidence,
+  runtime-adjacent, or broad documentation changes.
+- Direct pushes to `main` are acceptable only for narrow docs-only changes,
+  mechanical non-runtime updates, or explicit operator instruction.
 - Never direct-push live-affecting, promotion-state, secret-handling, or
   runtime-control changes.
 - Do not declare GitHub up to date until the pushed head is visible on GitHub
   and required Actions are green or their failures are explicitly explained.
+
+## Durable Handoff Routing
+
+Chat summaries are not durable state. Before ending any bounded move, route
+durable updates to the repo-owned source that owns the fact:
+
+- `ROADMAP.md`: strategic gates, active blocker changes, execution queue
+  changes, and target priorities.
+- `docs/V2_SPECIFICATION.md`: V2 requirement, objective, telemetry, risk,
+  venue-readiness, or acceptance-criteria changes.
+- `docs/PHASE5_1_BOARD_DECISION.md`: board verdicts, promotion/hold/reject
+  decisions, and decision rationale.
+- `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`: repeatable procedure,
+  operator workflow, gate mechanics, and recovery steps.
+- `docs/PHASE5_1_EVIDENCE_LOG.md`: evidence-pack outcomes, run summaries,
+  validation status, and residual evidence blockers.
+- Generated `phase5/**` state: only through approved tools or explicit operator
+  authorization; never by manual docs-only edits.
 
 ## Handoff Record Template
 

@@ -138,9 +138,10 @@ V2 target requirements (`docs/V2_SPECIFICATION.md`), and operator procedures
 (`docs/RUNBOOK.md`). `ROADMAP.md` now also owns the
 execution snapshot, target gates, and lane rules; `phase5/queue.yaml` remains
 the structured current queue and `phase5/status.md` is the generated human
-status board. Phase 5 is currently frozen as promoted/accepted-closeout on
-`phase5_reopened_final_closeout`, surface `19ac6e21020d39d8`, with active
-blocker `none`; live-run PnL authority is five-account balance pre/post `bPNL`.
-WP100 completion and Phase 5 closeout are not proof of unattended production
-readiness. For Phase 5, read status/queue files as context and do not mutate
-runtime state unless explicitly authorized.
+status board. Derive current Phase 5 and Phase 5.1 status from those sources at
+runtime rather than from this onboarding summary. WP100 completion, Phase 5
+closeout, implementation completeness, and non-live V2 evidence are not proof of
+unattended production readiness. Live-run PnL authority remains accepted
+balance-authoritative evidence, not telemetry/model/replay attribution. For
+Phase 5, read status/queue files as context and do not mutate runtime state
+unless explicitly authorized.
