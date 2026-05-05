@@ -3,6 +3,12 @@
 This file is the onboarding path for future Codex chats and human operators who
 need to understand Paraphina before changing it.
 
+## Executive Orchestrator Resume
+
+For interrupted or fresh Executive Orchestrator sessions, start with
+`AGENTS.md` and `docs/EXECUTIVE_ORCHESTRATOR_BOOTSTRAP.md`, then verify the
+current status from the source-of-truth order below before acting.
+
 ## First Read
 
 Read these in order:
