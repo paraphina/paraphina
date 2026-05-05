@@ -260,6 +260,16 @@ python3 tools/phase51ad_source_link_sidecar_materialize.py \
 Then run the `phase51v_validation_command` emitted in
 `phase51ad_source_link_sidecar_materialize_summary.json`.
 
+Current preferred request pack:
+
+```text
+runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+```
+
+This supersedes the narrower all-venue request pack for source-link handoff
+because it preserves `2819` current redacted unlinked source hashes while still
+remaining `HOLD` with `0` reusable existing sidecar rows.
+
 ### Gate 5.1c - Calibration Label Lake
 
 Required evidence:

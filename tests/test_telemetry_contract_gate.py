@@ -9060,6 +9060,13 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(dirty_manifest_result.returncode, 2)
             self.assertIn("raw identifier", dirty_manifest_result.stderr)
+            self.assertFalse(
+                (
+                    output_root
+                    / "phase51ad_bad_manifest_raw_identifier"
+                    / "candidate_manifest_with_materialized_sidecar.json"
+                ).exists()
+            )
             dirty_manifest_path.write_text(original_manifest_text, encoding="utf-8")
 
     def test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar(self):

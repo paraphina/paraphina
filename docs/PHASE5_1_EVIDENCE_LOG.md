@@ -344,6 +344,51 @@ inferred links, model training, EV admission, live/canary deployment, capital
 escalation, risk-limit relaxation, or economic claims.
 ```
 
+## 2026-05-05 - Current-Target Wide Source-Link Request Pack
+
+Scope:
+
+- Mode: HOLD-only read-only private-source capture using the current Phase 5.1u
+  target-link-hygiene manifest and a wider target window.
+- Source-link request pack: deterministic redacted handoff for Phase 5.1ad.
+- Live/canary/capital/risk: not authorized.
+- Link inference: not performed.
+
+Artifacts:
+
+```text
+source capture: runs/phase51z_readonly_native_role_capture/PHASE51Z-CURRENT-TARGET-WIDE-READONLY-NATIVE-ROLE-CAPTURE-HOLD-20260505T000000Z
+direct Phase 5.1v validation: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-CURRENT-TARGET-WIDE-READONLY-NATIVE-ROLE-CAPTURE-HOLD-20260505T000000Z
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+empty-sidecar validation: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z
+reuse audit: runs/phase51ac_source_link_reuse_audit/PHASE51AC-CURRENT-TARGET-WIDE-SOURCE-LINK-REUSE-AUDIT-HOLD-20260505T000000Z
+```
+
+Results:
+
+```text
+direct target-linked native-role rows: 67
+wide unlinked source hashes: 2819
+wide unlinked source hashes by venue: aster=784, extended=1579, lighter=300, paradex=156
+request-pack target count: 281
+empty-sidecar native-role targets ready: 67 / 287
+empty-sidecar Lighter native-limit targets ready: 0 / 3132
+existing sidecar reusable links: 0 / 2819
+clears_phase51_blockers: false
+```
+
+Interpretation:
+
+```text
+accepted: the wider current-target request pack is the preferred source-link
+handoff artifact for Phase 5.1ad because it preserves all currently available
+redacted unlinked source hashes without increasing readiness claims.
+
+not accepted: blocker clearance, inferred source links, model training, EV
+admission, live/canary deployment, capital escalation, risk-limit relaxation,
+or economic claims.
+```
+
 ## 2026-05-05 - Phase 5.1ac Source-Link Reuse Audit
 
 Scope:

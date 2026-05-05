@@ -617,9 +617,9 @@ def build_source_link_sidecar_materialization(
         out.update({key: value for key, value in raw.items() if key != "label_seq"})
         labels.append(out)
 
+    candidate_manifest = _materialized_candidate_manifest(request_pack, summary_in, sidecar_path)
     _write_jsonl(sidecar_path, sidecars, sidecar_output=True)
     _write_jsonl(labels_path, labels)
-    candidate_manifest = _materialized_candidate_manifest(request_pack, summary_in, sidecar_path)
     _write_json(candidate_manifest_path, candidate_manifest)
 
     materialized_source_hashes = {str(row["source_record_sha256"]) for row in sidecars}

@@ -2064,6 +2064,13 @@ reusable_source_link_count: 0
 missing_source_link_count: 2130
 missing_source_link_counts_by_venue: aster=228, extended=1579, lighter=300, paradex=23
 clears_phase51_blockers: false
+
+current wider request pack: runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+current wider reuse audit: runs/phase51ac_source_link_reuse_audit/PHASE51AC-CURRENT-TARGET-WIDE-SOURCE-LINK-REUSE-AUDIT-HOLD-20260505T000000Z
+current wider source_link_request_source_count: 2819
+current wider reusable_source_link_count: 0
+current wider missing_source_link_count: 2819
+current wider missing_source_link_counts_by_venue: aster=784, extended=1579, lighter=300, paradex=156
 ```
 
 Board interpretation:
@@ -2081,10 +2088,10 @@ model-training/EV-admission promotion, or any live/canary/capital/risk change.
 Next move:
 
 ```text
-Obtain a new validated redacted source-link sidecar for the all-venue request
-pack, or capture a different non-live authorized target-linkable native-role
-source. Keep the Lighter native-limit pressure path separate through Phase
-5.1ab.
+Obtain a new validated redacted source-link sidecar for the current-target wide
+all-venue request pack, or capture a different non-live authorized
+target-linkable native-role source. Keep the Lighter native-limit pressure path
+separate through Phase 5.1ab.
 ```
 
 ## Phase 5.1ad Source-Link Sidecar Materialization Decision
@@ -2119,8 +2126,8 @@ change.
 Next move:
 
 ```text
-Use Phase 5.1ad only after a validated redacted mapping is available. Until
-then, continue safe target-linkable source capture and Lighter native-limit
-pressure acquisition without repeating exhausted GET-only/header/empty-WS
-paths.
+Use Phase 5.1ad only after a validated redacted mapping is available for the
+current-target wide request pack. Until then, continue safe target-linkable
+source capture and Lighter native-limit pressure acquisition without repeating
+exhausted GET-only/header/empty-WS paths.
 ```

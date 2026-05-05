@@ -702,22 +702,23 @@ not an authorization for model training, EV admission, canary, live orders,
 capital escalation, risk-limit relaxation, or financial claims.
 
 The source-link request-pack step is now venue-neutral when explicitly run with
-`--venue-id all`. The 2026-05-05 all-venue request pack preserved `2130`
-sanitized unlinked source hashes (`aster=228`, `extended=1579`, `lighter=300`,
-`paradex=23`) and packaged them against the `281` current Phase 5.1u native-role
-targets for venues with unlinked request sources (`aster=113`, `extended=28`,
-`lighter=125`, `paradex=15`). Empty-sidecar validation remains `HOLD` with
-`67 / 287` native-role targets ready and `0 / 3132` Lighter native-limit targets
-ready. This converts the all-venue native-role linkage gap into a deterministic
+`--venue-id all`. The stronger current-target wide read-only run preserved
+`2819` sanitized unlinked source hashes (`aster=784`, `extended=1579`,
+`lighter=300`, `paradex=156`) and packaged them against the `281` current Phase
+5.1u native-role targets for venues with unlinked request sources (`aster=113`,
+`extended=28`, `lighter=125`, `paradex=15`). Empty-sidecar validation remains
+`HOLD` with `67 / 287` native-role targets ready and `0 / 3132` Lighter
+native-limit targets ready. This supersedes the narrower `2130`-hash request
+pack and converts the all-venue native-role linkage gap into a deterministic
 redacted sidecar request, not a readiness claim.
 
 Phase 5.1ac adds a HOLD-only source-link reuse audit. It scans existing local
 `source_links.sanitized.jsonl` sidecars and compares their redacted source hashes
 against the Phase 5.1z all-venue request pack. It performs no network access,
 does not use raw identifiers, does not infer links, and cannot clear blockers by
-itself. The first all-venue run found `0 / 2130` reusable links across `574`
-existing sidecar rows, leaving all request sources missing (`aster=228`,
-`extended=1579`, `lighter=300`, `paradex=23`). This proves that the all-venue
+itself. The current-target wide audit found `0 / 2819` reusable links across
+`785` existing sidecar rows, leaving all request sources missing (`aster=784`,
+`extended=1579`, `lighter=300`, `paradex=156`). This proves that the all-venue
 sidecar cannot be deterministically derived from existing repo-owned sidecars;
 a new validated redacted sidecar or directly target-linkable source remains
 required.
