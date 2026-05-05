@@ -321,6 +321,52 @@ runs/phase51v_forward_capture_bundle_readiness/PHASE51V-CURRENT-TARGET-WIDE-PLUS
 The reference composition remains `HOLD`: `73 / 287` native-role targets ready
 and `0 / 3132` Lighter native-limit targets ready.
 
+### Gate 5.1af - Local Source Retrieval Audit
+
+Allowed:
+
+- HOLD-only scan of explicit local Phase 5.1z request packs, expected-hash
+  bounded telemetry artifacts, and explicit runtime logs.
+- Emission of redaction-safe summary, labels, and manifest artifacts.
+- Strict retrieval statuses that distinguish missing artifacts from discovery
+  hints.
+
+Hard boundary:
+
+- Phase 5.1af must not call venue APIs, read env files, follow network paths,
+  place orders, infer source links from time/price/size, emit raw identifiers,
+  or treat log pattern hits as complete pressure evidence.
+- `clears_phase51_blockers` must remain `false`.
+
+Resume command pattern:
+
+```bash
+python3 tools/phase51af_local_source_retrieval_audit.py \
+  --request-pack runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z \
+  --bounded-telemetry <expected_sha256>=<bounded_telemetry_path> \
+  --log <runtime_log_path> \
+  --output-root runs/phase51af_local_source_retrieval_audit \
+  --run-id <phase51af_run_id>
+```
+
+Current reference audit:
+
+```text
+runs/phase51af_local_source_retrieval_audit/PHASE51AF-LOCAL-SOURCE-RETRIEVAL-AUDIT-HOLD-20260505T000000Z
+```
+
+The reference audit remains `HOLD`:
+
+```text
+source_link_retrieval_status: MISSING_REQUIRED_LINKAGE
+lighter_pressure_retrieval_status: MISSING_REQUIRED_PRESSURE_FIELDS
+runtime_log_pattern_status: NO_USABLE_PRESSURE_PATTERN
+local_retrieval_possible_without_inference: false
+```
+
+Do not repeat this audit unless the request pack, local telemetry/log inputs, or
+source semantics change materially.
+
 ### Gate 5.1c - Calibration Label Lake
 
 Required evidence:

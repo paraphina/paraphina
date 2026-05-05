@@ -395,6 +395,57 @@ admission, live/canary deployment, capital escalation, risk-limit relaxation,
 or economic claims.
 ```
 
+## 2026-05-05 - Phase 5.1af Local Source Retrieval Audit
+
+Scope:
+
+- Tool: `tools/phase51af_local_source_retrieval_audit.py`
+- Mode: HOLD-only local exhaustion audit over an explicit request pack, expected
+  bounded telemetry hashes, and explicit runtime logs.
+- Live/canary/capital/risk: not authorized.
+- Link or pressure inference: not performed.
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51af_local_source_retrieval_audit.py
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51af_local_source_retrieval_audit_holds_without_join_or_pressure
+```
+
+Real evidence run:
+
+```text
+runs/phase51af_local_source_retrieval_audit/PHASE51AF-LOCAL-SOURCE-RETRIEVAL-AUDIT-HOLD-20260505T000000Z
+```
+
+Results:
+
+```text
+request source rows scanned: 2819
+request target rows scanned: 281
+request source rows by venue: aster=784, extended=1579, lighter=300, paradex=156
+bounded telemetry hashes match: true
+bounded telemetry Lighter pressure field counts: 0, 0
+runtime log scans complete: true
+runtime log pressure status: NO_USABLE_PRESSURE_PATTERN
+source_link_retrieval_status: MISSING_REQUIRED_LINKAGE
+lighter_pressure_retrieval_status: MISSING_REQUIRED_PRESSURE_FIELDS
+local_retrieval_possible_without_inference: false
+clears_phase51_blockers: false
+```
+
+Evidence boundary:
+
+```text
+accepted: existing inspected local files are exhausted for safe deterministic
+source-link mapping and Lighter event-time pressure retrieval.
+
+not accepted: raw identifier field-name presence, native-role field presence in
+unlinked request sources, runtime rate_limit strings, or log pattern hits as
+complete source-link or pressure evidence.
+```
+
 ## 2026-05-05 - Current-Target Wide Source-Link Request Pack
 
 Scope:

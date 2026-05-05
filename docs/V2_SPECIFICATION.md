@@ -746,6 +746,20 @@ wide Aster/Extended/Lighter/Paradex request manifest with the existing
 Phase 5.1x Hyperliquid source; Phase 5.1v remains `HOLD` with `73 / 287`
 native-role targets ready and `0 / 3132` Lighter native-limit targets ready.
 
+Phase 5.1af adds a HOLD-only local source retrieval audit. It scans the
+current-target wide request pack, expected-hash bounded Phase 5 telemetry
+artifacts, and explicit runtime log files to determine whether existing local
+files can provide either a complete redacted Phase 5.1ad source-link mapping or
+complete sanitized Phase 5.1ab Lighter event-time pressure rows without
+inference. The reference run
+`PHASE51AF-LOCAL-SOURCE-RETRIEVAL-AUDIT-HOLD-20260505T000000Z` found
+`source_link_retrieval_status=MISSING_REQUIRED_LINKAGE`,
+`lighter_pressure_retrieval_status=MISSING_REQUIRED_PRESSURE_FIELDS`, and
+`runtime_log_pattern_status=NO_USABLE_PRESSURE_PATTERN`. It preserves `HOLD`:
+existing local files do not supply the missing mapping or pressure rows, and
+runtime `rate_limit` pattern counts are not evidence of event-time sendTx or
+REST-or-weighted pressure.
+
 The 2026-05-05 bounded GET-only Lighter target-window diagnostic was attempted
 after hardening the Lighter trade-backfill redaction path. The regenerated
 HOLD-only run captured `400` read-only trades, passed fail-closed raw

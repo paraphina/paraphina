@@ -2180,3 +2180,55 @@ materialized candidate manifest with the Phase 5.1x Hyperliquid source through
 Phase 5.1ae, and then rerun Phase 5.1v. Add any future Phase 5.1ab Lighter
 pressure manifest through Phase 5.1ae before all-five readiness review.
 ```
+
+## 2026-05-05 - Phase 5.1af Local Source Retrieval Audit Decision
+
+Decision: `PROMOTE` only the HOLD-only local exhaustion audit as a repo-owned
+negative-proof gate.
+
+Rationale:
+
+- The board needed a deterministic answer to whether the existing local request
+  pack, bounded telemetry artifacts, and runtime logs could retrieve the two
+  remaining artifact classes without source-owner intervention.
+- Repeating read-only Lighter GET/WS probes or broad local scans without a
+  material source change creates operational churn without reducing blockers.
+- The audit preserves the no-live boundary and makes the stop condition
+  evidence-owned instead of narrative-owned.
+
+Evidence:
+
+```text
+tool: tools/phase51af_local_source_retrieval_audit.py
+doc: docs/PHASE5_1AF_LOCAL_SOURCE_RETRIEVAL_AUDIT.md
+run: runs/phase51af_local_source_retrieval_audit/PHASE51AF-LOCAL-SOURCE-RETRIEVAL-AUDIT-HOLD-20260505T000000Z
+request source rows scanned: 2819
+request targets scanned: 281
+bounded telemetry hashes match: true
+runtime log scans complete: true
+source_link_retrieval_status: MISSING_REQUIRED_LINKAGE
+lighter_pressure_retrieval_status: MISSING_REQUIRED_PRESSURE_FIELDS
+runtime_log_pattern_status: NO_USABLE_PRESSURE_PATTERN
+local_retrieval_possible_without_inference: false
+clears_phase51_blockers: false
+```
+
+Board interpretation:
+
+```text
+accepted: existing inspected local files are exhausted for deterministic
+source-link mapping and Lighter event-time native-limit pressure retrieval.
+
+not accepted: treating raw identifier field-name presence, native-role field
+presence in unlinked request sources, runtime rate_limit strings, or log pattern
+hits as source-link or pressure evidence.
+```
+
+Next move:
+
+```text
+Obtain a validated redacted mapping for the current-target wide request pack
+and materialize it through Phase 5.1ad, then compose through Phase 5.1ae and
+rerun Phase 5.1v. Separately obtain sanitized Lighter event-time pressure rows
+and stage them through Phase 5.1ab before composing and validating.
+```

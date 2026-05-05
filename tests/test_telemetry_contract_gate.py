@@ -808,6 +808,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51ae_candidate_manifest_compose.py"
 
+    def _get_phase51af_local_source_retrieval_audit_path(self) -> Path:
+        """Get path to the Phase 5.1af local source retrieval audit gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51af_local_source_retrieval_audit.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -9408,6 +9413,130 @@ class TestValidatorSubprocess(unittest.TestCase):
                 .read_text(encoding="utf-8")
             )
             self.assertEqual(first_summary["candidate_manifest_sha256"], second_summary["candidate_manifest_sha256"])
+
+    def test_phase51af_local_source_retrieval_audit_holds_without_join_or_pressure(self):
+        """5.1af should prove local raw IDs alone do not clear source-link or pressure blockers."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            request_pack = tmp_path / "request_pack"
+            output_root = tmp_path / "phase51af"
+            telemetry_path = tmp_path / "bounded_telemetry.jsonl"
+            log_path = tmp_path / "runtime.log"
+            request_pack.mkdir()
+
+            source_hash = hashlib.sha256(b"phase51af-extended-source").hexdigest()
+            (request_pack / "phase51z_source_link_request_pack_summary.json").write_text(json.dumps({
+                "run_id": "phase51z_request_pack",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "source_request_count": 1,
+                "target_request_count": 1,
+                "next_required_artifact": "validated_redacted_source_link_mapping",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (request_pack / "source_link_request_sources.jsonl").write_text(json.dumps({
+                "venue_id": "extended",
+                "source_record_sha256": source_hash,
+                "isTaker": False,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (request_pack / "source_link_request_targets.jsonl").write_text(json.dumps({
+                "venue_id": "extended",
+                "canonical_group_id": "group-extended",
+                "order_key": "order-extended",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            telemetry_payload = [
+                {
+                    "orders": [{"client_order_id": "raw-local-id", "order_id": "raw-order-id"}],
+                    "fills": [{"decision_id": "raw-decision-id"}],
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "tick_timing": {"order_tx_pending": False},
+                    "canary_breach_response": {"open_order_count": 1, "max_open_orders": 10},
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            telemetry_path.write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in telemetry_payload),
+                encoding="utf-8",
+            )
+            telemetry_hash = hashlib.sha256(telemetry_path.read_bytes()).hexdigest()
+            log_path.write_text("rate_limit_rps=3 rate_limit_burst=6\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51af_local_source_retrieval_audit_path()),
+                    "--request-pack",
+                    str(request_pack),
+                    "--bounded-telemetry",
+                    f"{telemetry_hash}={telemetry_path}",
+                    "--log",
+                    str(log_path),
+                    "--max-log-bytes",
+                    "1000000",
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51af_hold_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            summary = json.loads(
+                (
+                    output_root
+                    / "phase51af_hold_test"
+                    / "phase51af_local_source_retrieval_audit_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertFalse(summary["clears_phase51_blockers"])
+            self.assertFalse(summary["local_retrieval_possible_without_inference"])
+            self.assertFalse(summary["source_rows_have_join_fields"])
+            self.assertEqual(summary["source_link_retrieval_status"], "MISSING_REQUIRED_LINKAGE")
+            self.assertEqual(summary["lighter_pressure_retrieval_status"], "MISSING_REQUIRED_PRESSURE_FIELDS")
+            self.assertEqual(summary["runtime_log_pattern_status"], "NO_USABLE_PRESSURE_PATTERN")
+            self.assertTrue(summary["bounded_telemetry_hashes_match"])
+            self.assertGreater(
+                summary["bounded_telemetry_audits"][0]["raw_identifier_field_presence_count"],
+                0,
+            )
+            self.assertEqual(
+                summary["bounded_telemetry_audits"][0]["lighter_pressure_field_presence_count"],
+                0,
+            )
+            self.assertEqual(summary["log_audits"][0]["pattern_counts"], {"rate_limit": 2})
+
+            network_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51af_local_source_retrieval_audit_path()),
+                    "--request-pack",
+                    str(request_pack),
+                    "--log",
+                    "https://example.invalid/log.jsonl",
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51af_network_reject_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(network_result.returncode, 2)
+            self.assertIn("network log path is prohibited", network_result.stderr)
 
     def test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar(self):
         """5.1v should use validated source-link sidecars to join source rows to targets."""
