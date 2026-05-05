@@ -1955,3 +1955,45 @@ or capture a different target-linkable non-live Lighter native-role source.
 Separately obtain event-time sendTx plus REST-or-weighted limit/remaining
 pressure before claiming Lighter native-limit readiness.
 ```
+
+## Phase 5.1z All-Venue Source-Link Request Pack Decision
+
+Decision: `PROMOTE` only the venue-neutral source-link request-pack scaffold and
+HOLD-only all-venue evidence packaging; `HOLD` for blocker reduction until a
+validated redacted sidecar or directly target-linkable source exists.
+
+Evidence:
+
+```text
+source run: runs/phase51z_readonly_native_role_capture/PHASE51Z-ALLVENUE-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-ALLVENUE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+empty-sidecar validation: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-ALLVENUE-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z
+source_link_request_source_count: 2130
+source_link_request_source_counts_by_venue: aster=228, extended=1579, lighter=300, paradex=23
+source_link_request_target_count: 281
+source_link_request_target_counts_by_venue: aster=113, extended=28, lighter=125, paradex=15
+native-role targets ready with empty sidecar: 67 / 287
+Lighter native-limit targets ready: 0 / 3132
+raw_identifier_redaction_status: PASS
+```
+
+Board interpretation:
+
+```text
+accepted: the all-venue request pack converts the native-role linkage gap into
+a deterministic redacted sidecar request across Aster, Extended, Lighter, and
+Paradex without exposing raw identifiers or changing execution behavior.
+
+not accepted: any inference that unlinked source hashes are target-ready, any
+model-training/EV-admission promotion, any live/canary/capital/risk change, or
+any Lighter native-limit pressure claim.
+```
+
+Next move:
+
+```text
+Populate a validated redacted source-link sidecar for the all-venue request
+pack, or capture a different non-live authorized source that is directly
+target-linkable to the current Phase 5.1u hashes. Separately obtain event-time
+sendTx plus REST-or-weighted limit/remaining pressure for Lighter.
+```

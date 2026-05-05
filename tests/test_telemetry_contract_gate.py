@@ -10341,6 +10341,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             target_group = "lighter-source-link-request-group"
             target_order_key = "lighter-source-link-request-order"
             source_hash = "a" * 64
+            aster_source_hash = "c" * 64
             raw_should_not_appear = "raw-lighter-trade-id"
 
             (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
@@ -10407,6 +10408,22 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "ask_account_id": 42,
                 "bid_account_id": 7,
                 "is_maker_ask": True,
+            }) + "\n" + json.dumps({
+                "schema_version": 1,
+                "label_type": "PHASE51Z_UNLINKED_NATIVE_ROLE_SOURCE",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "run_id": "phase51z_unlinked_request_test",
+                "gate_status": "HOLD",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "raw_identifier_redaction_status": "PASS",
+                "venue_id": "aster",
+                "source_record_sha256": aster_source_hash,
+                "m": True,
             }) + "\n", encoding="utf-8")
 
             result = subprocess.run(
@@ -10445,8 +10462,46 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertIn(target_group, request_targets)
             self.assertIn(target_order_key, request_targets)
             self.assertNotIn("aster-target", request_targets)
+            self.assertNotIn(aster_source_hash, request_sources)
             self.assertNotIn(raw_should_not_appear, request_sources + request_targets)
             self.assertEqual((pack_dir / "source_links.proposed.empty.jsonl").read_text(encoding="utf-8"), "")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51z_source_link_request_pack_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--source-run",
+                    str(source_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51z_source_link_request_pack_all_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--venue-id",
+                    "all",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            all_pack_dir = output_root / "phase51z_source_link_request_pack_all_test"
+            all_summary = json.loads(
+                (all_pack_dir / "phase51z_source_link_request_pack_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(all_summary["venue_id"], "all")
+            self.assertEqual(all_summary["source_link_request_source_count"], 2)
+            self.assertEqual(all_summary["source_link_request_target_count"], 2)
+            self.assertEqual(all_summary["source_link_request_source_counts_by_venue"], {"aster": 1, "lighter": 1})
+            self.assertEqual(all_summary["source_link_request_target_counts_by_venue"], {"aster": 1, "lighter": 1})
+            all_request_sources = (all_pack_dir / "source_link_request_sources.jsonl").read_text(encoding="utf-8")
+            all_request_targets = (all_pack_dir / "source_link_request_targets.jsonl").read_text(encoding="utf-8")
+            self.assertIn(source_hash, all_request_sources)
+            self.assertIn(aster_source_hash, all_request_sources)
+            self.assertIn("aster-target", all_request_targets)
+            self.assertNotIn(raw_should_not_appear, all_request_sources + all_request_targets)
 
             result = subprocess.run(
                 [

@@ -1199,6 +1199,30 @@ sidecar placeholder with a validated sidecar path, rerun Phase 5.1v. If Phase
 or claim blocker reduction; switch to a bounded GET-only target-window Lighter
 trade capture diagnostic.
 
+The all-venue source-link request pack is now the broader resume artifact for
+native-role linkage across Aster, Extended, Lighter, and Paradex:
+
+```text
+tool: tools/phase51z_source_link_request_pack.py --venue-id all
+source run: runs/phase51z_readonly_native_role_capture/PHASE51Z-ALLVENUE-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-ALLVENUE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+empty-sidecar validation: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-ALLVENUE-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z
+gate_status: HOLD
+source_link_request_source_count: 2130
+source_link_request_source_counts_by_venue: aster=228, extended=1579, lighter=300, paradex=23
+source_link_request_target_count: 281
+source_link_request_target_counts_by_venue: aster=113, extended=28, lighter=125, paradex=15
+native-role targets ready with empty sidecar: 67 / 287
+lighter native-limit pressure ready: 0 / 3132
+raw_identifier_redaction_status: PASS
+```
+
+Operational implication: the all-venue pack is preferred when resuming the
+native-role source-link blocker because it preserves one deterministic sidecar
+request across all non-Hyperliquid unlinked hashes. It still cannot clear
+Phase 5.1 without a validated redacted sidecar or a directly target-linkable
+non-live source.
+
 The bounded GET-only Lighter target-window diagnostic was attempted on
 2026-05-05 after hardening `tools/phase51c_lighter_trade_backfill.py` to hash
 raw order/trade/client/tx identifiers, hash cursor tokens, and fail closed on

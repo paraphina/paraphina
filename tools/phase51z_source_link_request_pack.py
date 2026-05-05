@@ -247,6 +247,24 @@ def _artifact_infos(root_dir: Path, artifact_paths: list[Path]) -> list[dict[str
     ]
 
 
+def _include_venue(row_venue: str, venue_id: str) -> bool:
+    return venue_id == "all" or row_venue == venue_id
+
+
+def _count_by_venue(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        venue = str(row.get("venue_id") or "unknown").lower()
+        counts[venue] = counts.get(venue, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _source_id(venue_id: str) -> str:
+    if venue_id == "all":
+        return "phase51z_unlinked_native_role_sources"
+    return f"phase51z_unlinked_{venue_id}_native_role_sources"
+
+
 def _load_target_run(target_run: Path, venue_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     target_run = _check_local_path(target_run, label="target-run")
     summary_path = target_run / "phase51u_forward_capture_target_manifest_summary.json"
@@ -261,7 +279,7 @@ def _load_target_run(target_run: Path, venue_id: str) -> tuple[dict[str, Any], l
     for _, row in _iter_jsonl(target_path):
         _check_unsafe_flags(row, target_path, label="target row")
         _check_no_secret_fields(row, target_path, label="target row")
-        if str(row.get("venue_id") or "").lower() != venue_id:
+        if not _include_venue(str(row.get("venue_id") or "").lower(), venue_id):
             continue
         out = _base_record("target_placeholder", len(targets), 0, "PHASE51Z_SOURCE_LINK_REQUEST_TARGET")
         out.update({key: row.get(key) for key in TARGET_FIELDS if key in row})
@@ -284,7 +302,7 @@ def _load_source_rows(source_path: Path, venue_id: str) -> list[dict[str, Any]]:
         _check_unsafe_flags(row, source_path, label="source row")
         _check_no_secret_fields(row, source_path, label="source row")
         _check_no_raw_identifier_fields(row, source_path, label="source row")
-        if str(row.get("venue_id") or "").lower() != venue_id:
+        if not _include_venue(str(row.get("venue_id") or "").lower(), venue_id):
             continue
         if row.get("label_type") != "PHASE51Z_UNLINKED_NATIVE_ROLE_SOURCE":
             continue
@@ -311,8 +329,6 @@ def build_source_link_request_pack(
     venue_id: str,
 ) -> Path:
     venue_id = venue_id.lower()
-    if venue_id != "lighter":
-        raise ValueError("Phase 5.1z source-link request pack currently supports venue_id=lighter only")
     if bool(source_run) == bool(source_json):
         raise ValueError("provide exactly one of --source-run or --source-json")
     run_id = run_id or f"PHASE51Z-SOURCE-LINK-REQUEST-PACK-{_utc_stamp()}"
@@ -327,6 +343,11 @@ def build_source_link_request_pack(
     source_rows = _load_source_rows(source_path, venue_id)
     if not source_rows:
         raise ValueError("no sanitized unlinked source rows found")
+    if venue_id == "all":
+        source_venues = {str(row.get("venue_id") or "").lower() for row in source_rows}
+        target_rows = [
+            row for row in target_rows if str(row.get("venue_id") or "").lower() in source_venues
+        ]
     if not target_rows:
         raise ValueError("no matching Phase 5.1u target rows found")
 
@@ -391,7 +412,7 @@ def build_source_link_request_pack(
         "risk_limit_relaxation_allowed": False,
         "sources": [
             {
-                "source_id": "phase51z_unlinked_lighter_native_role_sources",
+                "source_id": _source_id(venue_id),
                 "venue_id": venue_id,
                 "path": str(source_path),
             }
@@ -414,9 +435,10 @@ def build_source_link_request_pack(
     request_md_path.write_text(
         "\n".join(
             [
-                "# Phase 5.1z Lighter Source-Link Request Pack",
+                "# Phase 5.1z Source-Link Request Pack",
                 "",
                 "Status: HOLD. This pack requests a validated redacted source-link sidecar.",
+                f"Venue scope: `{venue_id}`.",
                 "",
                 "Required sidecar fields: `source_record_sha256` plus `canonical_group_id` or `order_key`.",
                 "Do not include raw order IDs, client IDs, trade IDs, secrets, or unsafe true flags.",
@@ -458,7 +480,9 @@ def build_source_link_request_pack(
         "source_path": str(source_path),
         "source_sha256": _sha256_file(source_path),
         "source_link_request_source_count": len(request_sources),
+        "source_link_request_source_counts_by_venue": _count_by_venue(request_sources),
         "source_link_request_target_count": len(request_targets),
+        "source_link_request_target_counts_by_venue": _count_by_venue(request_targets),
         "source_link_sidecar_template_row_count": 0,
         "candidate_manifest_with_empty_sidecar": str(candidate_manifest_path),
         "phase51v_validation_command": validation_command,

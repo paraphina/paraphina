@@ -257,6 +257,56 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1z All-Venue Source-Link Request Pack
+
+Date: 2026-05-05
+
+Scope: HOLD-only all-venue native-role source-link request packaging. This run
+does not infer joins, does not authorize model training or EV admission, and
+does not reduce Phase 5.1 readiness without a validated redacted sidecar.
+
+Artifacts:
+
+```text
+source run: runs/phase51z_readonly_native_role_capture/PHASE51Z-ALLVENUE-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-ALLVENUE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+empty-sidecar validation: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-ALLVENUE-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z
+```
+
+Results:
+
+```text
+gate_status: HOLD
+sanitized source rows: 2197
+target-linked source rows: 67
+unlinked source hashes: 2130
+unlinked source hashes by venue: aster=228, extended=1579, lighter=300, paradex=23
+request-pack target count: 281
+request-pack targets by venue: aster=113, extended=28, lighter=125, paradex=15
+empty-sidecar native-role targets ready: 67 / 287
+empty-sidecar Lighter native-limit targets ready: 0 / 3132
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51z_source_link_request_pack.py
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51z_unlinked_lighter_rows_require_source_link_sidecar \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51z_source_link_request_pack_emits_hold_only_pack \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar
+```
+
+Result:
+
+```text
+Ran 3 tests
+OK
+secret-pattern scan over generated all-venue artifacts: no matches
+```
+
 ## Phase 5.1 Lighter GET-Only Target-Window Diagnostic
 
 - Run date: `2026-05-05`

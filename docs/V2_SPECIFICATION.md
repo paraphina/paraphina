@@ -701,6 +701,16 @@ native-role target misses. The request pack is not native truth by itself and is
 not an authorization for model training, EV admission, canary, live orders,
 capital escalation, risk-limit relaxation, or financial claims.
 
+The source-link request-pack step is now venue-neutral when explicitly run with
+`--venue-id all`. The 2026-05-05 all-venue request pack preserved `2130`
+sanitized unlinked source hashes (`aster=228`, `extended=1579`, `lighter=300`,
+`paradex=23`) and packaged them against the `281` current Phase 5.1u native-role
+targets for venues with unlinked request sources (`aster=113`, `extended=28`,
+`lighter=125`, `paradex=15`). Empty-sidecar validation remains `HOLD` with
+`67 / 287` native-role targets ready and `0 / 3132` Lighter native-limit targets
+ready. This converts the all-venue native-role linkage gap into a deterministic
+redacted sidecar request, not a readiness claim.
+
 The 2026-05-05 bounded GET-only Lighter target-window diagnostic was attempted
 after hardening the Lighter trade-backfill redaction path. The regenerated
 HOLD-only run captured `400` read-only trades, passed fail-closed raw
