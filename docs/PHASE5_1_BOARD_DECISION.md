@@ -1765,3 +1765,48 @@ connect native trade rows to the current canonical target groups. Keep native
 limit pressure on HOLD unless event-time sendTx and REST-or-weighted
 limit/remaining fields are observed from a non-live-authorized source.
 ```
+
+## Phase 5.1z Unlinked Source-Row Preservation Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only the repo-owned unlinked sanitized source-row scaffold
+and its non-live HOLD evidence.
+
+Rationale:
+
+- Retained Lighter trade-backfill rows contain native role fields but do not
+  directly match the current canonical Phase 5.1u target hashes.
+- Emitting a sanitized unlinked source row preserves source truth for a later
+  validated source-link sidecar without emitting raw order IDs, client IDs, or
+  trade IDs.
+- Phase 5.1v must keep unlinked rows incomplete unless a redacted sidecar maps
+  `source_record_sha256` to the canonical group/order key and the source row has
+  the required native fields.
+
+Evidence:
+
+```text
+runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+gate_status: HOLD
+Lighter retained source rows replayed: 1400
+Lighter native-field-ready rows: 1400
+sanitized unlinked Lighter source rows emitted: 531
+target-linked Lighter source rows emitted: 0
+Phase 5.1v native-role targets ready without sidecar: 0 / 287
+Phase 5.1v Lighter native-limit targets ready: 0 / 3132
+generated_phase51s_manifest_ready: false
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Build a validated redacted source-link sidecar for the 531 sanitized unlinked
+Lighter source rows, or capture a fresh safe target-window Lighter trade source
+whose native IDs match current canonical target groups. Keep native-limit
+pressure separate and on HOLD until event-time sendTx plus REST-or-weighted
+limit/remaining fields are observed from a non-live-authorized source.
+```

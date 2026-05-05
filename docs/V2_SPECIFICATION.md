@@ -680,6 +680,17 @@ main source blocker for retained rows. This is blocker reduction, not
 promotion: `214 / 287` native-role targets remain missing and Lighter
 event-time native-limit pressure remains `0 / 3132`.
 
+Phase 5.1z may optionally emit sanitized unlinked native-role source rows behind
+the explicit `--emit-unlinked-native-role-source-rows` flag. These rows contain
+only venue ID, redacted `source_record_sha256`, and native role fields; they do
+not contain canonical target keys and cannot mark Phase 5.1v targets ready by
+themselves. The 2026-05-05 Lighter retained-backfill replay emitted `531`
+sanitized unlinked Lighter source rows, `0` target-linked Lighter source rows,
+and retained `HOLD` in Phase 5.1v without a validated redacted source-link
+sidecar. This path preserves evidence that can later be joined safely, but it
+does not authorize model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, or financial claims.
+
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and

@@ -1150,6 +1150,31 @@ limit/remaining fields; official docs indicate remaining volume quota is exposed
 by sendTx/sendTxBatch responses, which are write paths and are not authorized in
 Phase 5.1 non-live source capture.
 
+The 2026-05-05 unlinked source-row preservation run is:
+
+```text
+tool change: Phase 5.1z can emit sanitized unlinked native-role source rows only
+when --emit-unlinked-native-role-source-rows is explicitly set.
+native-role replay: runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+readiness run: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+gate_status: HOLD
+lighter source rows replayed: 1400
+lighter native-field-ready rows: 1400
+sanitized unlinked lighter source rows emitted: 531
+target-linked lighter source rows emitted: 0
+native-role targets ready without sidecar: 0 / 287
+lighter native-limit pressure recovered: 0 / 3132
+raw_identifier_redaction_status: PASS
+```
+
+Operational implication: the preserved unlinked rows are now the correct
+sidecar-ready artifact for Lighter native-role recovery. They are not target
+truth by themselves. The next orchestrator should either build a validated
+redacted source-link sidecar for those source hashes or capture a fresh safe
+target-window Lighter trade source that links directly to current canonical
+targets. Do not treat `sanitized_source_row_count` as target readiness; use
+Phase 5.1v target-ready counts as the promotion boundary.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7

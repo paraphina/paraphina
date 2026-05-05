@@ -9637,6 +9637,262 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertNotIn("unmatched-client-1", output_text)
             self.assertNotIn("unmatched-client-2", output_text)
 
+    def test_phase51z_unlinked_lighter_rows_require_source_link_sidecar(self):
+        """5.1z can preserve sanitized unlinked Lighter rows without clearing 5.1v."""
+        def stable_hash(value):
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            target_run = tmp_path / "phase51u_targets"
+            capture_root = tmp_path / "phase51z_capture"
+            readiness_root = tmp_path / "phase51v_readiness"
+            observed_run.mkdir()
+            target_run.mkdir()
+            target_group = "lighter-unlinked-group"
+            target_order_key = "lighter-unlinked-order"
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51z_unlinked_lighter_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(json.dumps({
+                "schema_version": 1,
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "label_seq": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "canonical_group_id": target_group,
+                "order_key": target_order_key,
+                "venue_id": "lighter",
+                "order_id_hash": stable_hash("target-native-order-id"),
+                "client_order_id_hash": stable_hash("target-client-order-id"),
+                "fill_count": 1,
+                "first_fill_time_ms": 1700000000000,
+                "last_fill_time_ms": 1700000000000,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_phase51z_unlinked_lighter_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "observed_pfill_run": str(observed_run),
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": target_group,
+                "order_key": target_order_key,
+                "venue_id": "lighter",
+                "required_native_role_source": "LIGHTER_TRADES_JSON",
+                "required_native_role_fields": ["is_maker_ask"],
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            raw_source_row = {
+                "venue_id": "lighter",
+                "account_index": 42,
+                "ask_account_id": 42,
+                "bid_account_id": 7,
+                "ask_id": "unmatched-native-order-id",
+                "ask_client_id": "unmatched-client-order-id",
+                "is_maker_ask": True,
+                "trade_id": "raw-lighter-trade-id",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }
+            source_path = tmp_path / "raw_unmatched_lighter_rows.jsonl"
+            source_path.write_text(json.dumps(raw_source_row) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51z_readonly_native_role_capture_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    str(source_path),
+                    "--output-root",
+                    str(capture_root),
+                    "--run-id",
+                    "phase51z_unlinked_lighter_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                    "--emit-unlinked-native-role-source-rows",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            capture_dir = capture_root / "phase51z_unlinked_lighter_test"
+            summary = json.loads(
+                (capture_dir / "phase51z_readonly_native_role_capture_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["sanitized_source_row_count"], 1)
+            self.assertEqual(summary["sanitized_source_row_counts_by_venue"], {})
+            self.assertTrue(summary["emit_unlinked_native_role_source_rows"])
+            self.assertEqual(summary["unlinked_sanitized_source_row_count"], 1)
+            self.assertEqual(summary["unlinked_sanitized_source_row_counts_by_venue"], {"lighter": 1})
+            self.assertEqual(
+                summary["capture_status_counts"],
+                {"SANITIZED_UNLINKED_SOURCE_ROW_EMITTED": 1},
+            )
+            diagnostics = summary["capture_diagnostics_by_venue"]["lighter"]
+            self.assertEqual(diagnostics["target_ready_count"], 0)
+            self.assertEqual(diagnostics["target_missing_count"], 1)
+            self.assertEqual(diagnostics["unlinked_sanitized_source_row_count"], 1)
+
+            sanitized_source_path = capture_dir / "source_snapshots" / "phase51z_forward_native_role_rows.jsonl"
+            sanitized_rows = [
+                json.loads(line)
+                for line in sanitized_source_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(sanitized_rows), 1)
+            sanitized_row = sanitized_rows[0]
+            self.assertEqual(sanitized_row["label_type"], "PHASE51Z_UNLINKED_NATIVE_ROLE_SOURCE")
+            self.assertNotIn("canonical_group_id", sanitized_row)
+            self.assertNotIn("order_key", sanitized_row)
+            self.assertEqual(sanitized_row["venue_id"], "lighter")
+            self.assertEqual(sanitized_row["account_index"], 42)
+            self.assertIsInstance(sanitized_row["source_record_sha256"], str)
+            output_text = (
+                sanitized_source_path.read_text(encoding="utf-8")
+                + (capture_dir / "phase51z_readonly_native_role_capture_labels.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("unmatched-native-order-id", output_text)
+            self.assertNotIn("unmatched-client-order-id", output_text)
+            self.assertNotIn("raw-lighter-trade-id", output_text)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(capture_dir / "phase51z_candidate_manifest.json"),
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51v_unlinked_lighter_without_sidecar_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            no_sidecar_summary = json.loads(
+                (
+                    readiness_root
+                    / "phase51v_unlinked_lighter_without_sidecar_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(no_sidecar_summary["native_role_capture_target_ready_count"], 0)
+            self.assertEqual(no_sidecar_summary["native_role_capture_target_missing_count"], 1)
+            self.assertFalse(no_sidecar_summary["generated_phase51s_manifest_ready"])
+
+            source_link_path = tmp_path / "source_links.jsonl"
+            source_link_path.write_text(json.dumps({
+                "source_record_sha256": sanitized_row["source_record_sha256"],
+                "canonical_group_id": target_group,
+                "order_key": target_order_key,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            linked_candidate_manifest = tmp_path / "linked_candidate_manifest.json"
+            linked_candidate_manifest.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [
+                    {
+                        "source_id": "phase51z_unlinked_lighter_rows",
+                        "venue_id": "lighter",
+                        "path": str(sanitized_source_path),
+                    }
+                ],
+                "source_links": [
+                    {
+                        "source_link_id": "operator_validated_source_link",
+                        "path": str(source_link_path),
+                    }
+                ],
+            }), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(linked_candidate_manifest),
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51v_unlinked_lighter_with_sidecar_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            linked_summary = json.loads(
+                (
+                    readiness_root
+                    / "phase51v_unlinked_lighter_with_sidecar_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(linked_summary["native_role_capture_target_ready_count"], 1)
+            self.assertEqual(linked_summary["native_role_capture_target_missing_count"], 0)
+            self.assertEqual(linked_summary["source_link_applied_row_count"], 1)
+            self.assertTrue(linked_summary["generated_phase51s_manifest_ready"])
+            linked_labels = (
+                readiness_root
+                / "phase51v_unlinked_lighter_with_sidecar_test"
+                / "capture_bundle_readiness_labels.jsonl"
+            ).read_text(encoding="utf-8")
+            self.assertIn('"role_target_join_status":"SOURCE_LINK_SIDECAR"', linked_labels)
+            self.assertIn('"source_link_applied":true', linked_labels)
+
     def test_phase51w_forward_capture_request_pack_emits_operator_pack(self):
         """5.1w should emit an operator-facing request pack from 5.1u targets."""
         with tempfile.TemporaryDirectory() as tmpdir:

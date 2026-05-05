@@ -765,11 +765,13 @@ def _sanitize_rows(
     timestamp_ns: int,
     rows_by_venue: dict[str, list[dict[str, Any]]],
     target_index: dict[tuple[str, str], CaptureTarget | None],
+    emit_unlinked_native_role_source_rows: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
     output_rows: list[dict[str, Any]] = []
     labels: list[dict[str, Any]] = []
     status_counts: dict[str, int] = {}
     emitted_targets: set[str] = set()
+    emitted_unlinked_source_hashes: set[str] = set()
     seq = 0
     for venue in VENUES:
         for row in rows_by_venue.get(venue, []):
@@ -794,6 +796,24 @@ def _sanitize_rows(
                     output_rows.append(out)
                     emitted_targets.add(target_id)
                     status = "SANITIZED_SOURCE_ROW_EMITTED"
+            elif (
+                emit_unlinked_native_role_source_rows
+                and native_payload is not None
+                and target is None
+                and match_status == "NO_TARGET_MATCH"
+                and source_hash not in emitted_unlinked_source_hashes
+            ):
+                out = _base_record(run_id, len(output_rows), timestamp_ns, "PHASE51Z_UNLINKED_NATIVE_ROLE_SOURCE")
+                out.update(
+                    {
+                        "venue_id": venue,
+                        "source_record_sha256": source_hash,
+                        **native_payload,
+                    }
+                )
+                output_rows.append(out)
+                emitted_unlinked_source_hashes.add(source_hash)
+                status = "SANITIZED_UNLINKED_SOURCE_ROW_EMITTED"
             label = _base_record(run_id, seq, timestamp_ns, "PHASE51Z_READONLY_NATIVE_ROLE_CAPTURE_LABEL")
             label.update(
                 {
@@ -872,9 +892,13 @@ def _build_capture_diagnostics(
 ) -> dict[str, dict[str, Any]]:
     target_counts = _count_by_venue(targets)
     emitted_counts: dict[str, int] = {}
+    unlinked_counts: dict[str, int] = {}
     for row in output_rows:
         venue = str(row.get("venue_id") or "unknown")
-        emitted_counts[venue] = emitted_counts.get(venue, 0) + 1
+        if row.get("canonical_group_id") or row.get("order_key"):
+            emitted_counts[venue] = emitted_counts.get(venue, 0) + 1
+        else:
+            unlinked_counts[venue] = unlinked_counts.get(venue, 0) + 1
 
     field_status_counts: dict[str, dict[str, int]] = {}
     target_match_status_counts: dict[str, dict[str, int]] = {}
@@ -923,6 +947,7 @@ def _build_capture_diagnostics(
             "native_field_ready_count": native_field_ready_counts.get(venue, 0),
             "target_matched_row_count": target_matched_row_counts.get(venue, 0),
             "duplicate_matched_row_count": duplicate_matched_row_counts.get(venue, 0),
+            "unlinked_sanitized_source_row_count": unlinked_counts.get(venue, 0),
             "no_target_match_count": no_target_match_counts.get(venue, 0),
             "rows_with_redacted_hash_candidates": hash_rows,
             "average_redacted_hash_candidate_count": (
@@ -956,6 +981,7 @@ def build_readonly_native_role_capture(
     max_pages: int,
     window_pad_ms: int,
     allow_paradex_jwt_cmd: bool,
+    emit_unlinked_native_role_source_rows: bool,
 ) -> Path:
     target_summary, targets = _load_targets(target_run)
     target_index = _build_hash_index(targets)
@@ -1025,6 +1051,7 @@ def build_readonly_native_role_capture(
         timestamp_ns=timestamp_ns,
         rows_by_venue=rows_by_venue,
         target_index=target_index,
+        emit_unlinked_native_role_source_rows=emit_unlinked_native_role_source_rows,
     )
 
     source_path = source_dir / "phase51z_forward_native_role_rows.jsonl"
@@ -1061,9 +1088,13 @@ def build_readonly_native_role_capture(
     )
 
     recovered_by_venue: dict[str, int] = {}
+    unlinked_by_venue: dict[str, int] = {}
     for row in output_rows:
         venue = str(row.get("venue_id") or "unknown")
-        recovered_by_venue[venue] = recovered_by_venue.get(venue, 0) + 1
+        if row.get("canonical_group_id") or row.get("order_key"):
+            recovered_by_venue[venue] = recovered_by_venue.get(venue, 0) + 1
+        else:
+            unlinked_by_venue[venue] = unlinked_by_venue.get(venue, 0) + 1
     capture_diagnostics = _build_capture_diagnostics(
         targets=targets,
         rows_by_venue=rows_by_venue,
@@ -1084,6 +1115,9 @@ def build_readonly_native_role_capture(
         "target_time_windows_by_venue": _target_time_windows_by_venue(targets, window_pad_ms),
         "sanitized_source_row_count": len(output_rows),
         "sanitized_source_row_counts_by_venue": dict(sorted(recovered_by_venue.items())),
+        "emit_unlinked_native_role_source_rows": emit_unlinked_native_role_source_rows,
+        "unlinked_sanitized_source_row_count": sum(unlinked_by_venue.values()),
+        "unlinked_sanitized_source_row_counts_by_venue": dict(sorted(unlinked_by_venue.items())),
         "capture_label_count": len(labels),
         "capture_status_counts": status_counts,
         "capture_diagnostics_by_venue": capture_diagnostics,
@@ -1139,6 +1173,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=10)
     parser.add_argument("--window-pad-ms", type=int, default=30 * 60 * 1000)
     parser.add_argument("--allow-paradex-jwt-cmd", action="store_true")
+    parser.add_argument(
+        "--emit-unlinked-native-role-source-rows",
+        action="store_true",
+        help=(
+            "Emit sanitized native-field-ready rows that lack a target hash match. "
+            "Rows remain HOLD until a validated redacted source-link sidecar joins them."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1163,6 +1205,7 @@ def main() -> int:
             max_pages=args.max_pages,
             window_pad_ms=args.window_pad_ms,
             allow_paradex_jwt_cmd=args.allow_paradex_jwt_cmd,
+            emit_unlinked_native_role_source_rows=args.emit_unlinked_native_role_source_rows,
         )
     except Exception as exc:  # noqa: BLE001 - CLI boundary
         print(f"phase51z_readonly_native_role_capture: ERROR: {exc}", file=sys.stderr)

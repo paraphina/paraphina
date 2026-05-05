@@ -340,6 +340,84 @@ read-only source path still lacks event-time sendTx and REST-or-weighted
 limit/remaining fields.
 ```
 
+## PHASE51Z UNLINKED LIGHTER NATIVE-ROLE SOURCE ROW PRESERVATION
+
+Purpose: preserve sanitized native-field-ready Lighter source rows that do not
+directly match current Phase 5.1u target hashes, without live orders, canary,
+capital escalation, risk-limit changes, raw identifier persistence, or
+financial claims.
+
+Tool change:
+
+```text
+tools/phase51z_readonly_native_role_capture.py
+- Adds --emit-unlinked-native-role-source-rows.
+- Emits PHASE51Z_UNLINKED_NATIVE_ROLE_SOURCE rows only for native-field-ready
+  rows with no target hash match.
+- Emits only venue_id, source_record_sha256, and native role fields for those
+  rows; canonical_group_id and order_key are intentionally absent.
+- Keeps Phase 5.1v target readiness blocked until a validated redacted
+  source-link sidecar joins source_record_sha256 to canonical group/order keys.
+```
+
+Evidence runs:
+
+```text
+runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z
+```
+
+Commands:
+
+```bash
+python3 tools/phase51z_readonly_native_role_capture.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-COMBINED-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-FROM-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-OFFLINE-EXISTING-20260502T1135Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T025435Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z/source_snapshots/trades_backfill.sanitized.json \
+  --output-root runs/phase51z_readonly_native_role_capture \
+  --run-id PHASE51Z-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z \
+  --timestamp-ns 1777939200000000000 \
+  --emit-unlinked-native-role-source-rows
+
+python3 tools/phase51v_forward_capture_bundle_readiness.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --candidate-manifest runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z/phase51z_candidate_manifest.json \
+  --output-root runs/phase51v_forward_capture_bundle_readiness \
+  --run-id PHASE51V-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z \
+  --timestamp-ns 1777939200000000000
+```
+
+Result:
+
+```text
+Phase 5.1z gate_status: HOLD
+Lighter retained source rows replayed: 1400
+Lighter native-field-ready rows: 1400
+sanitized unlinked Lighter source rows emitted: 531
+target-linked Lighter source rows emitted: 0
+Phase 5.1v native-role targets ready without sidecar: 0 / 287
+Phase 5.1v Lighter native-limit targets ready: 0 / 3132
+generated_phase51s_manifest_ready: false
+raw_identifier_redaction_status: PASS
+```
+
+Interpretation:
+
+```text
+The unlinked-source-row path creates a safe sidecar-ready Lighter native-role
+artifact, not target readiness. The retained source rows still do not directly
+recover current canonical Lighter targets. Phase 5.1 remains HOLD until a
+validated redacted source-link sidecar maps those source hashes to canonical
+group/order keys, or a fresh safe target-window Lighter source directly matches
+the target groups. This run does not authorize model training, EV admission,
+canary, live orders, capital escalation, risk-limit relaxation, or financial
+claims.
+```
+
 ## Phase 5.1z Read-Only Native-Role Capture
 
 - Evidence date: `2026-05-04`
