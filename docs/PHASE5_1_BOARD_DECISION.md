@@ -1900,3 +1900,58 @@ the current Phase 5.1u target hashes. Separately obtain event-time sendTx plus
 REST-or-weighted limit/remaining pressure before claiming Lighter native-limit
 readiness.
 ```
+
+## Phase 5.1aa Lighter WebSocket Account Snapshot Decision
+
+Decision: `PROMOTE` only the repo-owned non-live read-only source-surface
+collector and evidence pack generation; `HOLD` for Phase 5.1 blocker reduction.
+
+Scope:
+
+- `tools/phase51aa_lighter_ws_account_trades_snapshot.py`
+- official Lighter `account_all` and `account_all_trades` WebSocket channels
+- existing local credentials only
+- no order placement, cancellation, modification, sendTx, sendTxBatch, live
+  orders, canary, capital escalation, risk-limit relaxation, model training, EV
+  admission, or financial claims
+
+Evidence:
+
+```text
+account_all run: runs/phase51aa_lighter_ws_account_trades_snapshot/PHASE51AA-LIGHTER-WS-ACCOUNT-ALL-SNAPSHOT-HOLD-20260505T000000Z
+account_all_trades run: runs/phase51aa_lighter_ws_account_trades_snapshot/PHASE51AA-LIGHTER-WS-ACCOUNT-TRADES-PARTIALTIMEOUT-HOLD-20260505T000000Z
+Phase 5.1z run: runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-WS-SNAPSHOT-HOLD-20260505T000000Z
+Phase 5.1v run: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-WS-SNAPSHOT-HOLD-20260505T000000Z
+account_all message_count: 1
+account_all trade_count: 0
+account_all_trades message_count: 1
+account_all_trades trade_count: 0
+raw_identifier_redaction_status: PASS
+native-role targets ready: 0 / 287
+Lighter native-limit targets ready: 0 / 3132
+clears_phase51_blockers: false
+```
+
+Board interpretation:
+
+```text
+accepted: Phase 5.1aa collector is a safe, tested, read-only account WebSocket
+source-surface probe that preserves HOLD boundaries, writes message metadata
+rather than private account payloads, and fails closed on raw identifier-like
+output keys.
+
+not accepted: any claim that Lighter native-role targets are recovered, any
+claim that Lighter native-limit pressure is observed, or any live/canary/model
+training/EV-admission promotion.
+```
+
+Next move:
+
+```text
+Do not repeat the same Lighter account WebSocket snapshot unless account
+activity, target window, or source semantics change. Obtain a validated
+redacted source-link sidecar for the existing Phase 5.1z Lighter request pack,
+or capture a different target-linkable non-live Lighter native-role source.
+Separately obtain event-time sendTx plus REST-or-weighted limit/remaining
+pressure before claiming Lighter native-limit readiness.
+```

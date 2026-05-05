@@ -783,6 +783,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51z_source_link_request_pack.py"
 
+    def _get_phase51aa_lighter_ws_account_trades_snapshot_path(self) -> Path:
+        """Get path to the Phase 5.1aa Lighter WS account-trades snapshot tool."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51aa_lighter_ws_account_trades_snapshot.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -9540,6 +9545,354 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(readiness_summary["native_role_capture_target_ready_count"], 4)
             self.assertEqual(readiness_summary["native_role_capture_target_missing_count"], 0)
             self.assertFalse(readiness_summary["clears_phase51_blockers"])
+
+    def test_phase51aa_lighter_ws_snapshot_feeds_phase51z_without_raw_ids(self):
+        """5.1aa should sanitize Lighter WS trades and feed existing 5.1z/5.1v gates."""
+        def stable_hash(value):
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill"
+            target_run = tmp_path / "phase51u_targets"
+            ws_root = tmp_path / "phase51aa_ws"
+            capture_root = tmp_path / "phase51z_capture"
+            readiness_root = tmp_path / "phase51v_readiness"
+            observed_run.mkdir()
+            target_run.mkdir()
+            raw_lighter_order_id = 987654321
+            raw_lighter_bid_id = 123456789
+            raw_trade_id = 555666777
+            raw_tx_hash = "0x" + "a" * 64
+
+            (observed_run / "pfill_outcome_summary.json").write_text(json.dumps({
+                "run_id": "observed_phase51aa_test",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "order_label_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (observed_run / "pfill_order_labels.jsonl").write_text(json.dumps({
+                "schema_version": 1,
+                "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                "label_seq": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "canonical_group_id": "lighter-group",
+                "order_key": "lighter-order-key",
+                "venue_id": "lighter",
+                "order_id_hash": stable_hash(raw_lighter_order_id),
+                "client_order_id_hash": None,
+                "fill_count": 1,
+                "first_fill_time_ms": 1700000000000,
+                "last_fill_time_ms": 1700000000000,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_phase51aa_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "observed_pfill_run": str(observed_run),
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "lighter-group",
+                "order_key": "lighter-order-key",
+                "venue_id": "lighter",
+                "required_native_role_source": "LIGHTER_TRADES_JSON",
+                "required_native_role_fields": [
+                    "account_index",
+                    "is_maker_ask",
+                    "ask_account_id",
+                    "bid_account_id",
+                ],
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            message_path = tmp_path / "ws_account_all_trades.json"
+            message_path.write_text(json.dumps({
+                "channel": "account_all_trades:42",
+                "type": "update/account_all_trades",
+                "trades": {
+                    "0": [
+                        {
+                            "trade_id": raw_trade_id,
+                            "tx_hash": raw_tx_hash,
+                            "type": "trade",
+                            "market_id": 0,
+                            "size": "0.01",
+                            "price": "100.0",
+                            "ask_id": raw_lighter_order_id,
+                            "bid_id": raw_lighter_bid_id,
+                            "ask_account_id": 42,
+                            "bid_account_id": 7,
+                            "is_maker_ask": True,
+                            "timestamp": 1700000000,
+                        }
+                    ],
+                },
+            }), encoding="utf-8")
+
+            ws_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51aa_lighter_ws_account_trades_snapshot_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--message-json",
+                    str(message_path),
+                    "--account-index",
+                    "42",
+                    "--output-root",
+                    str(ws_root),
+                    "--run-id",
+                    "phase51aa_ws_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                ws_result.returncode,
+                0,
+                f"stdout: {ws_result.stdout}\nstderr: {ws_result.stderr}",
+            )
+            ws_dir = ws_root / "phase51aa_ws_test"
+            ws_summary = json.loads(
+                (ws_dir / "phase51aa_lighter_ws_account_trades_snapshot_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(ws_summary["gate_status"], "HOLD")
+            self.assertEqual(ws_summary["trade_count"], 1)
+            self.assertEqual(ws_summary["raw_identifier_redaction_status"], "PASS")
+            self.assertEqual(ws_summary["raw_identifier_key_violation_count"], 0)
+            source_path = ws_dir / "source_snapshots" / "lighter_ws_account_trades.sanitized.jsonl"
+            output_text = source_path.read_text(encoding="utf-8")
+            self.assertNotIn(str(raw_lighter_order_id), output_text)
+            self.assertNotIn(str(raw_lighter_bid_id), output_text)
+            self.assertNotIn(str(raw_trade_id), output_text)
+            self.assertNotIn(raw_tx_hash, output_text)
+            self.assertIn("ask_id_sha256", output_text)
+
+            capture_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51z_readonly_native_role_capture_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--source-json",
+                    f"lighter={source_path}",
+                    "--output-root",
+                    str(capture_root),
+                    "--run-id",
+                    "phase51aa_to_phase51z_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                capture_result.returncode,
+                0,
+                f"stdout: {capture_result.stdout}\nstderr: {capture_result.stderr}",
+            )
+            capture_dir = capture_root / "phase51aa_to_phase51z_test"
+            capture_summary = json.loads(
+                (capture_dir / "phase51z_readonly_native_role_capture_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(capture_summary["capture_diagnostics_by_venue"]["lighter"]["target_ready_count"], 1)
+
+            readiness_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(capture_dir / "phase51z_candidate_manifest.json"),
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51aa_to_phase51v_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                readiness_result.returncode,
+                0,
+                f"stdout: {readiness_result.stdout}\nstderr: {readiness_result.stderr}",
+            )
+            readiness_summary = json.loads(
+                (
+                    readiness_root
+                    / "phase51aa_to_phase51v_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(readiness_summary["native_role_capture_target_ready_count"], 1)
+            self.assertEqual(readiness_summary["native_role_capture_target_missing_count"], 0)
+            self.assertTrue(readiness_summary["generated_phase51s_manifest_ready"])
+            self.assertFalse(readiness_summary["clears_phase51_blockers"])
+
+    def test_phase51aa_lighter_ws_snapshot_rejects_unsafe_messages(self):
+        """5.1aa should reject offline WS messages that try to promote unsafe flags."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_phase51aa_unsafe_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 0,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+            message_path = tmp_path / "unsafe_ws_message.json"
+            message_path.write_text(json.dumps({
+                "channel": "account_all_trades:42",
+                "type": "update/account_all_trades",
+                "approved_for_live": True,
+                "trades": {},
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51aa_lighter_ws_account_trades_snapshot_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--message-json",
+                    str(message_path),
+                    "--account-index",
+                    "42",
+                    "--output-root",
+                    str(tmp_path / "phase51aa_ws"),
+                    "--run-id",
+                    "phase51aa_unsafe_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unsafe input message flag approved_for_live=true", result.stderr)
+
+    def test_phase51aa_lighter_ws_snapshot_accepts_account_all_source_channel(self):
+        """5.1aa should accept account_all snapshots as a read-only Lighter trade source."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_phase51aa_account_all_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 0,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+
+            message_path = tmp_path / "ws_account_all.json"
+            message_path.write_text(json.dumps({
+                "channel": "account_all:42",
+                "type": "update/account_all",
+                "assets": [
+                    {
+                        "asset_id": 3,
+                        "symbol": "USDC",
+                    }
+                ],
+                "trades": {
+                    "0": [
+                        {
+                            "trade_id": 111222333,
+                            "market_id": 0,
+                            "size": "0.01",
+                            "price": "100.0",
+                            "ask_id": 444555666,
+                            "bid_id": 777888999,
+                            "ask_account_id": 42,
+                            "bid_account_id": 7,
+                            "is_maker_ask": False,
+                            "timestamp": 1700000000,
+                        }
+                    ],
+                },
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51aa_lighter_ws_account_trades_snapshot_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--message-json",
+                    str(message_path),
+                    "--account-index",
+                    "42",
+                    "--channel",
+                    "account_all",
+                    "--output-root",
+                    str(tmp_path / "phase51aa_ws"),
+                    "--run-id",
+                    "phase51aa_account_all_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            ws_dir = tmp_path / "phase51aa_ws" / "phase51aa_account_all_test"
+            summary = json.loads(
+                (ws_dir / "phase51aa_lighter_ws_account_trades_snapshot_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["requested_channels"], ["account_all"])
+            self.assertEqual(summary["trade_count"], 1)
+            rows = [
+                json.loads(line)
+                for line in (ws_dir / "source_snapshots" / "lighter_ws_account_trades.sanitized.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            self.assertEqual(rows[0]["source_channel"], "account_all")
+            self.assertIn("ask_id_sha256", rows[0])
+            self.assertNotIn("ask_id", rows[0])
+            sanitized_message_path = (
+                ws_dir / "source_snapshots" / "lighter_ws_messages.sanitized.jsonl"
+            )
+            sanitized_message_text = sanitized_message_path.read_text(encoding="utf-8")
+            message_rows = [json.loads(line) for line in sanitized_message_text.splitlines() if line]
+            self.assertEqual(message_rows[0]["source_channel"], "account_all")
+            self.assertEqual(message_rows[0]["trade_row_count"], 1)
+            self.assertIn("assets", message_rows[0]["top_level_keys"])
+            self.assertNotIn('"asset_id":', sanitized_message_text)
+            self.assertNotIn('"assets":', sanitized_message_text)
 
     def test_phase51z_readonly_native_role_capture_rejects_network_sources(self):
         """5.1z should refuse network source paths before reading any source rows."""

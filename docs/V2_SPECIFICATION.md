@@ -712,6 +712,19 @@ the GET-only diagnostic path is redaction-safe but not target-linkable for the
 current Phase 5.1u Lighter targets. Do not repeat the same diagnostic unless
 the target window or source surface changes.
 
+The 2026-05-05 Phase 5.1aa Lighter WebSocket account-source diagnostic then
+tested a different source surface: official `account_all` and
+`account_all_trades` account snapshot channels. The collector is repo-owned,
+HOLD-only, read-only, writes message metadata instead of private account
+payloads, source-redacts trade rows, and fails closed on raw identifier-like
+output keys. The authorized local-credential captures reached both channels,
+but each snapshot contained `0` trade rows. The downstream Phase 5.1z/5.1v run
+therefore remained `HOLD` with `0 / 287` native-role targets ready and
+`0 / 3132` Lighter native-limit targets ready. This confirms the WebSocket
+account-source surface is safe and runnable, but it does not reduce the current
+Lighter blocker unless future account activity or source semantics produce
+target-linkable trade rows.
+
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and

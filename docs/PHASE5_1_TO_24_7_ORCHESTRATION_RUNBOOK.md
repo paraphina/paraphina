@@ -1227,6 +1227,36 @@ that directly links to the current target hashes. Lighter request-pressure
 evidence remains a separate blocker requiring event-time sendTx plus
 REST-or-weighted limit/remaining fields.
 
+Phase 5.1aa was added on 2026-05-05 as the next changed Lighter source
+surface. It is a HOLD-only read-only WebSocket account snapshot collector for
+the official `account_all` and `account_all_trades` channels.
+
+```text
+tool: tools/phase51aa_lighter_ws_account_trades_snapshot.py
+account_all run: runs/phase51aa_lighter_ws_account_trades_snapshot/PHASE51AA-LIGHTER-WS-ACCOUNT-ALL-SNAPSHOT-HOLD-20260505T000000Z
+account_all_trades run: runs/phase51aa_lighter_ws_account_trades_snapshot/PHASE51AA-LIGHTER-WS-ACCOUNT-TRADES-PARTIALTIMEOUT-HOLD-20260505T000000Z
+downstream Phase 5.1z run: runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-WS-SNAPSHOT-HOLD-20260505T000000Z
+downstream Phase 5.1v run: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-WS-SNAPSHOT-HOLD-20260505T000000Z
+account_all message_count: 1
+account_all trade_count: 0
+account_all_trades message_count: 1
+account_all_trades trade_count: 0
+raw_identifier_redaction_status: PASS
+native-role targets ready: 0 / 287
+Lighter native-limit pressure ready: 0 / 3132
+```
+
+Operational implication: the Lighter account WebSocket source surface is now
+repo-owned, tested, reachable, and metadata-only/source-row redacted. It should not be repeated as
+the next move unless account activity, target window, or source semantics
+change, because the captured snapshots contained zero trade rows and cannot
+link current Phase 5.1u targets. The next Lighter native-role move remains a
+validated redacted source-link sidecar for the existing request pack, or a
+different non-live authorized source that directly links to current target
+hashes. Lighter native-limit pressure still requires event-time sendTx plus
+REST-or-weighted limit/remaining evidence; do not infer pressure from caps,
+empty headers, tiers, docs, or empty WebSocket account snapshots.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7

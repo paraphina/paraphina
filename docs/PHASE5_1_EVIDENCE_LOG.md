@@ -328,6 +328,87 @@ Raw exact-key scan: PASS, no matches
 Operational verdict: HOLD; diagnostic path is redaction-safe but not target-linkable for current Phase 5.1u Lighter targets.
 ```
 
+## Phase 5.1aa Lighter WebSocket Account Snapshot Diagnostic
+
+- Run date: `2026-05-05`
+- Scope: bounded read-only Lighter WebSocket diagnostic against official account snapshot channels; generated `runs/` artifacts are local ignored evidence and are not committed
+- Tool: `tools/phase51aa_lighter_ws_account_trades_snapshot.py`
+- Account snapshot run: `runs/phase51aa_lighter_ws_account_trades_snapshot/PHASE51AA-LIGHTER-WS-ACCOUNT-ALL-SNAPSHOT-HOLD-20260505T000000Z`
+- Account trades snapshot run: `runs/phase51aa_lighter_ws_account_trades_snapshot/PHASE51AA-LIGHTER-WS-ACCOUNT-TRADES-PARTIALTIMEOUT-HOLD-20260505T000000Z`
+- Native-role replay: `runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-WS-SNAPSHOT-HOLD-20260505T000000Z`
+- Readiness run: `runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-WS-SNAPSHOT-HOLD-20260505T000000Z`
+- Official source: `https://apidocs.lighter.xyz/docs/websocket-reference`
+- Gate status: `HOLD`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `approved_for_model_training`: `false`
+- `approved_for_financial_claim`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+
+Evidence summary:
+
+```text
+account_all fetch_status: FETCHED
+account_all message_count: 1
+account_all trade_count: 0
+account_all raw_identifier_redaction_status: PASS
+account_all_trades fetch_status: FETCHED
+account_all_trades message_count: 1
+account_all_trades trade_count: 0
+account_all_trades raw_identifier_redaction_status: PASS
+Phase 5.1z Lighter source rows: 0
+Phase 5.1z Lighter target matches: 0 / 125
+Phase 5.1v native-role targets ready: 0 / 287
+Phase 5.1v Lighter native-limit pressure ready: 0 / 3132
+clears_phase51_blockers: false
+```
+
+Implementation note:
+
+```text
+The collector waits for the Lighter WebSocket connected message before
+subscribing, treats bounded timeout after partial messages as a completed
+snapshot rather than discarding evidence, supports account_all and
+account_all_trades, writes message metadata rather than private account
+payloads, and fails closed if sanitized metadata/source artifacts retain raw
+identifier-like keys.
+```
+
+Validation:
+
+```bash
+python3 -m py_compile \
+  tools/phase51aa_lighter_ws_account_trades_snapshot.py \
+  tests/test_telemetry_contract_gate.py
+
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51aa_lighter_ws_snapshot_feeds_phase51z_without_raw_ids \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51aa_lighter_ws_snapshot_rejects_unsafe_messages \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51aa_lighter_ws_snapshot_accepts_account_all_source_channel \
+  -v
+
+rg -n '"(id|hash|cursor|next_cursor|asset_id|session_id|account|ask_id|ask_id_str|ask_client_id|ask_client_id_str|bid_id|bid_id_str|bid_client_id|bid_client_id_str|trade_id|trade_id_str|tx_hash)"[[:space:]]*:' \
+  runs/phase51aa_lighter_ws_account_trades_snapshot/PHASE51AA-LIGHTER-WS-ACCOUNT-ALL-SNAPSHOT-HOLD-20260505T000000Z \
+  runs/phase51aa_lighter_ws_account_trades_snapshot/PHASE51AA-LIGHTER-WS-ACCOUNT-TRADES-PARTIALTIMEOUT-HOLD-20260505T000000Z \
+  runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-WS-SNAPSHOT-HOLD-20260505T000000Z \
+  runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-WS-SNAPSHOT-HOLD-20260505T000000Z
+```
+
+Result:
+
+```text
+Compile: PASS
+Focused tests: PASS, 3 tests
+Raw exact-key scan: PASS, no matches
+Operational verdict: HOLD; the WebSocket account-source surface is reachable,
+the committed source path is metadata-only/source-row redacted, and the captured
+snapshots contain zero trade rows, so they do not reduce current Phase 5.1u
+Lighter native-role targets.
+```
+
 ## Phase 5.1z Lighter Source-Link Request Pack
 
 - Run id: `PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z`
