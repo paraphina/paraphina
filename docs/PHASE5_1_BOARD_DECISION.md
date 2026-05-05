@@ -1810,3 +1810,48 @@ whose native IDs match current canonical target groups. Keep native-limit
 pressure separate and on HOLD until event-time sendTx plus REST-or-weighted
 limit/remaining fields are observed from a non-live-authorized source.
 ```
+
+## Phase 5.1z Source-Link Request Pack Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only the repo-owned source-link request-pack scaffold and
+its empty-sidecar HOLD validation.
+
+Rationale:
+
+- Existing Phase 5.1t sidecars have `0` overlap with the `531` preserved
+  Lighter source hashes, so no current artifact can safely mark those rows
+  target-ready.
+- The `531` source rows lack raw identity fields by design; a sidecar cannot be
+  derived from them alone without inventing linkage.
+- A request pack gives a reviewer the exact redacted source hashes, target
+  canonical keys, allowed sidecar schema, and Phase 5.1v validation manifest
+  without reopening raw identifiers.
+
+Evidence:
+
+```text
+runs/phase51z_source_link_request_pack/PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z
+gate_status: HOLD
+source_link_request_source_count: 531
+source_link_request_target_count: 125
+source_link_sidecar_template_row_count: 0
+Phase 5.1v native-role targets ready with empty sidecar: 0 / 287
+Phase 5.1v Lighter native-limit targets ready: 0 / 3132
+generated_phase51s_manifest_ready: false
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Populate the request pack's proposed sidecar with validated redacted links only:
+source_record_sha256 plus canonical_group_id or order_key. Rerun Phase 5.1v
+against candidate_manifest_with_empty_sidecar.json after replacing the empty
+sidecar path with the validated sidecar. If no sidecar can be produced, use a
+bounded GET-only target-window Lighter /api/v1/trades capture as a diagnostic,
+not as a promotion path.
+```

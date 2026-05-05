@@ -691,6 +691,16 @@ sidecar. This path preserves evidence that can later be joined safely, but it
 does not authorize model training, EV admission, canary, live orders, capital
 escalation, risk-limit relaxation, or financial claims.
 
+Phase 5.1z also includes a HOLD-only source-link request-pack step for those
+unlinked rows. The request pack emits the `531` redacted source hashes, the
+`125` current Lighter native-role targets, an empty proposed sidecar placeholder,
+and a Phase 5.1v candidate manifest for validation. The empty-sidecar validation
+must remain `HOLD`; only a separately validated redacted sidecar that maps
+`source_record_sha256` to `canonical_group_id` or `order_key` may reduce Lighter
+native-role target misses. The request pack is not native truth by itself and is
+not an authorization for model training, EV admission, canary, live orders,
+capital escalation, risk-limit relaxation, or financial claims.
+
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and

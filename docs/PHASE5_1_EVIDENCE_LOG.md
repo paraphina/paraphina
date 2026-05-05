@@ -257,6 +257,84 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1z Lighter Source-Link Request Pack
+
+- Run id: `PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z`
+- Local run directory: `runs/phase51z_source_link_request_pack/PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z`
+- Target run: `runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z`
+- Source run: `runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z`
+- Empty-sidecar validation run: `runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z`
+- Gate status: `HOLD`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+- `admissible_for_financial_claim`: `false`
+- `admissible_for_ev_admission`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51z_source_link_request_pack.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --source-run runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-UNLINKED-NATIVE-ROLE-SOURCE-HOLD-20260505T000000Z \
+  --output-root runs/phase51z_source_link_request_pack \
+  --run-id PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z \
+  --timestamp-ns 1777939200000000000
+```
+
+Request-pack result:
+
+```text
+gate_status: HOLD
+source_link_request_source_count: 531
+source_link_request_target_count: 125
+source_link_sidecar_template_row_count: 0
+clears_phase51_blockers: false
+raw_identifier_redaction_status: PASS
+next_required_artifact: validated_redacted_source_link_sidecar
+```
+
+Empty-sidecar validation command:
+
+```bash
+python3 tools/phase51v_forward_capture_bundle_readiness.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --candidate-manifest runs/phase51z_source_link_request_pack/PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z/candidate_manifest_with_empty_sidecar.json \
+  --output-root runs/phase51v_forward_capture_bundle_readiness \
+  --run-id PHASE51V-LIGHTER-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z \
+  --timestamp-ns 1777939200000000000
+```
+
+Empty-sidecar validation result:
+
+```text
+gate_status: HOLD
+native_role_capture_target_ready_count: 0
+native_role_capture_target_missing_count: 287
+lighter_native_limit_capture_target_ready_count: 0
+lighter_native_limit_capture_target_missing_count: 3132
+source_link_hash_count: 0
+source_link_applied_row_count: 0
+generated_phase51s_manifest_ready: false
+clears_phase51_blockers: false
+raw_identifier_redaction_status: PASS
+```
+
+Interpretation:
+
+```text
+The request pack is a redaction-safe handoff artifact for Lighter native-role
+linkage. It packages the 531 preserved source hashes and 125 current Lighter
+targets, but it does not infer links and does not clear any Phase 5.1 blocker.
+Only a validated redacted source-link sidecar containing source_record_sha256
+plus canonical_group_id or order_key may reduce Lighter native-role target
+misses. If no valid sidecar can be produced, the next safe diagnostic is a
+bounded GET-only target-window Lighter /api/v1/trades capture.
+```
+
 ## PHASE51U/PHASE51Z TARGET-LINK HYGIENE REPLAY
 
 Purpose: preserve redacted target-link fields in Phase 5.1u, allow Phase 5.1z to

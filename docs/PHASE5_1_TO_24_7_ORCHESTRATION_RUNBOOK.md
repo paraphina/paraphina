@@ -1175,6 +1175,30 @@ target-window Lighter trade source that links directly to current canonical
 targets. Do not treat `sanitized_source_row_count` as target readiness; use
 Phase 5.1v target-ready counts as the promotion boundary.
 
+The 2026-05-05 source-link request-pack run is:
+
+```text
+tool: tools/phase51z_source_link_request_pack.py
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+empty-sidecar validation: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z
+gate_status: HOLD
+source_link_request_source_count: 531
+source_link_request_target_count: 125
+source_link_sidecar_template_row_count: 0
+native-role targets ready with empty sidecar: 0 / 287
+lighter native-limit pressure ready: 0 / 3132
+raw_identifier_redaction_status: PASS
+```
+
+Operational implication: use this request pack as the resume point for Lighter
+native-role linkage. A valid sidecar row must contain `source_record_sha256`
+plus `canonical_group_id` or `order_key`, and must not contain raw order IDs,
+client IDs, trade IDs, secrets, or unsafe true flags. After replacing the empty
+sidecar placeholder with a validated sidecar path, rerun Phase 5.1v. If Phase
+5.1v still reports zero Lighter target readiness, do not run downstream gates
+or claim blocker reduction; switch to a bounded GET-only target-window Lighter
+trade capture diagnostic.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
