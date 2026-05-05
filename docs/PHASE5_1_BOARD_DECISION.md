@@ -1997,3 +1997,50 @@ pack, or capture a different non-live authorized source that is directly
 target-linkable to the current Phase 5.1u hashes. Separately obtain event-time
 sendTx plus REST-or-weighted limit/remaining pressure for Lighter.
 ```
+
+## Phase 5.1ab Lighter Native-Limit Pressure Source Preflight Decision
+
+Decision: `PROMOTE` only the repo-owned HOLD-only local source preflight
+scaffold; `HOLD` for blocker reduction until non-live-authorized observed
+pressure rows are supplied.
+
+Scope:
+
+```text
+tool: tools/phase51ab_lighter_native_limit_pressure_source.py
+mode: local sanitized JSONL input only
+network access: none
+venue write paths: none
+sendTx/sendTxBatch/nextNonce: prohibited
+outputs: lighter_forward_native_limit_pressure_snapshot.jsonl, labels, Phase 5.1v candidate manifest
+```
+
+Board interpretation:
+
+```text
+accepted: Phase 5.1ab makes future sanitized Lighter event-time pressure rows
+reviewable by Phase 5.1v and rejects raw identifiers, secret-shaped fields,
+unsafe authorization flags, network paths, env files, and symlink chains.
+
+not accepted: any claim that Lighter pressure has been observed by this tool,
+any inference from GET-only caps, empty headers, docs-only limits, account
+tiers, or empty WebSocket snapshots, or any model-training/EV-admission/live
+promotion.
+```
+
+Validation:
+
+```text
+python3 -m py_compile tools/phase51ab_lighter_native_limit_pressure_source.py
+python3 -m unittest tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51ab_lighter_native_limit_pressure_source_feeds_phase51v_without_false_clearance
+```
+
+Next move:
+
+```text
+Supply a non-live-authorized sanitized Lighter pressure JSONL with event-time
+active-order headroom, sendTx limit/remaining, REST-or-weighted limit/remaining,
+and event-time alignment, then run Phase 5.1ab and the emitted Phase 5.1v
+validation command. Keep native-role source-link sidecar acquisition moving in
+parallel.
+```

@@ -257,6 +257,52 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## 2026-05-05 - Phase 5.1ab Lighter Native-Limit Pressure Source Preflight
+
+Scope:
+
+- Tool: `tools/phase51ab_lighter_native_limit_pressure_source.py`
+- Mode: HOLD-only local sanitized JSONL input preflight.
+- Purpose: Stage externally supplied Lighter event-time native-limit pressure
+  rows into `lighter_forward_native_limit_pressure_snapshot.jsonl`, labels, and
+  a Phase 5.1v candidate manifest.
+- Live/canary/capital/risk: not authorized.
+- Network/sendTx/sendTxBatch/nextNonce: not used.
+
+Required complete-row fields:
+
+- active-order account and market headroom;
+- sendTx per-minute limit and remaining;
+- REST or weighted request limit and remaining;
+- `native_limit_event_time_status=EVENT_TIME_ALIGNED`;
+- direct canonical group/order-key linkage or a validated redacted source hash.
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51ab_lighter_native_limit_pressure_source.py
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51ab_lighter_native_limit_pressure_source_feeds_phase51v_without_false_clearance
+```
+
+Result:
+
+```text
+Ran 1 test
+OK
+```
+
+Evidence boundary:
+
+```text
+accepted: a complete sanitized row can feed Phase 5.1v and mark a matching
+Lighter native-limit target ready while preserving clears_phase51_blockers=false.
+
+not accepted: observed Lighter request-pressure evidence, model training,
+EV admission, live/canary deployment, capital escalation, risk-limit
+relaxation, or economic claims.
+```
+
 ## Phase 5.1z All-Venue Source-Link Request Pack
 
 Date: 2026-05-05

@@ -102,7 +102,9 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    contract for local source staging,
    `docs/PHASE5_1R_FORWARD_NATIVE_SOURCE_ACQUISITION.md` as the standing
    contract for source acquisition, `docs/PHASE5_1Q_FORWARD_NATIVE_EVIDENCE.md`
-   for downstream forward native evidence, and
+   for downstream forward native evidence,
+   `tools/phase51ab_lighter_native_limit_pressure_source.py` as the local
+   sanitized Lighter native-limit pressure preflight gate, and
    `docs/PHASE5_1P_LIGHTER_NATIVE_ROLE_EVIDENCE.md` for the exhausted
    quarantined Lighter historical join.
 
@@ -153,6 +155,47 @@ Hold or rollback condition:
 - Any `sendTx`, live-order, canary, capital, or risk-relaxation path.
 - Unredacted secrets.
 - Attempt to use the pack as financial or live authority.
+
+### Gate 5.1ab - Lighter Native-Limit Pressure Source Preflight
+
+Allowed:
+
+- Local-only staging of externally supplied sanitized Lighter native-limit
+  pressure rows through `tools/phase51ab_lighter_native_limit_pressure_source.py`.
+- Phase 5.1v validation of the generated candidate manifest.
+
+Required fields in each complete row:
+
+- `active_order_headroom_account`
+- `active_order_headroom_market`
+- `sendtx_per_minute_limit`
+- `sendtx_per_minute_remaining`
+- `rest_requests_per_minute_limit` and `rest_requests_per_minute_remaining`, or
+  `weighted_requests_per_minute_limit` and `weighted_requests_per_minute_remaining`
+- `native_limit_event_time_status=EVENT_TIME_ALIGNED`
+- `canonical_group_id`, `order_key`, or a validated redacted source hash/sidecar
+
+Hard boundary:
+
+- Phase 5.1ab performs no network access and must not call `sendTx`,
+  `sendTxBatch`, `nextNonce`, or any venue write path.
+- It rejects raw identifiers, secret-shaped fields, unsafe true flags, network
+  paths, `.env` inputs, and symlink chains.
+- It is a preflight path only. It does not observe pressure by itself, does not
+  infer missing pressure from official caps or account tiers, and does not clear
+  Phase 5.1 blockers.
+
+Resume command pattern:
+
+```bash
+python3 tools/phase51ab_lighter_native_limit_pressure_source.py \
+  --input-jsonl <sanitized_lighter_pressure_rows.jsonl> \
+  --target-run runs/phase51u_forward_capture_target_manifest/<phase51u_run> \
+  --output-root runs/phase51ab_lighter_native_limit_pressure_source \
+  --run-id <phase51ab_run_id>
+```
+
+Then run the `phase51v_validation_command` emitted in the Phase 5.1ab summary.
 
 ### Gate 5.1c - Calibration Label Lake
 

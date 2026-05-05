@@ -735,6 +735,19 @@ account-source surface is safe and runnable, but it does not reduce the current
 Lighter blocker unless future account activity or source semantics produce
 target-linkable trade rows.
 
+Phase 5.1ab adds a HOLD-only repo-owned preflight gate for externally supplied
+sanitized Lighter native-limit pressure rows. The gate accepts only local
+`.jsonl` inputs, performs no network access, does not call `sendTx`,
+`sendTxBatch`, `nextNonce`, or any venue write path, rejects raw identifiers,
+secret-shaped fields, unsafe true flags, network/env/symlink inputs, and emits a
+Phase 5.1v candidate manifest plus `lighter_forward_native_limit_pressure_snapshot.jsonl`.
+It requires explicit event-time active-order headroom, sendTx limit/remaining,
+REST-or-weighted limit/remaining, and native-limit event-time status. Phase 5.1ab
+does not observe pressure by itself, does not infer pressure from docs/account
+tiers/GET caps/empty headers, and does not clear Phase 5.1 blockers. Its purpose
+is to make any future non-live-authorized sanitized pressure rows immediately
+replayable and reviewable by Phase 5.1v without changing the no-live boundary.
+
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and

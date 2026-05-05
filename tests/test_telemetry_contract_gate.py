@@ -788,6 +788,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51aa_lighter_ws_account_trades_snapshot.py"
 
+    def _get_phase51ab_lighter_native_limit_pressure_source_path(self) -> Path:
+        """Get path to the Phase 5.1ab Lighter native-limit pressure source gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51ab_lighter_native_limit_pressure_source.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -8383,6 +8388,294 @@ class TestValidatorSubprocess(unittest.TestCase):
             labels_text = (run_dir / "capture_bundle_readiness_labels.jsonl").read_text(encoding="utf-8")
             self.assertNotIn("client_order_id", labels_text)
             self.assertNotIn("trade_id", labels_text)
+
+    def test_phase51ab_lighter_native_limit_pressure_source_feeds_phase51v_without_false_clearance(self):
+        """5.1ab should stage sanitized Lighter pressure rows for 5.1v without clearing blockers."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            source_root = tmp_path / "phase51ab_pressure_source"
+            readiness_root = tmp_path / "phase51v_readiness"
+            target_run.mkdir()
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 0,
+                "lighter_native_limit_capture_target_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": "lighter-limit-group",
+                "order_key": "lighter-limit-order",
+                "venue_id": "lighter",
+                "required_native_limit_source": "LIGHTER_LIMITS_AT_DECISION_TIME",
+                "required_native_limit_fields": [
+                    "active_order_headroom_account",
+                    "active_order_headroom_market",
+                    "sendtx_per_minute_limit",
+                    "sendtx_per_minute_remaining",
+                    "weighted_requests_per_minute_limit/weighted_requests_per_minute_remaining",
+                    "native_limit_event_time_status",
+                ],
+                "accepted_native_limit_event_time_status": ["EVENT_TIME_ALIGNED"],
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            pressure_row = {
+                "venue_id": "lighter",
+                "canonical_group_id": "lighter-limit-group",
+                "order_key": "lighter-limit-order",
+                "active_order_headroom_account": 100,
+                "active_order_headroom_market": 50,
+                "sendtx_per_minute_limit": 120,
+                "sendtx_per_minute_remaining": 119,
+                "weighted_requests_per_minute_limit": 24000,
+                "weighted_requests_per_minute_remaining": 23999,
+                "native_limit_event_time_status": "EVENT_TIME_ALIGNED",
+                "native_limit_staleness_ms": 5.0,
+                "pressure_capture_mode": "NONLIVE_TESTNET_OR_PAPER_CAPTURE",
+                "approved_for_live": False,
+                "approved_for_financial_claim": False,
+                "approved_for_model_training": False,
+            }
+            pressure_input = tmp_path / "sanitized_lighter_pressure.jsonl"
+            pressure_input.write_text(json.dumps(pressure_row) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ab_lighter_native_limit_pressure_source_path()),
+                    "--input-jsonl",
+                    str(pressure_input),
+                    "--target-run",
+                    str(target_run),
+                    "--output-root",
+                    str(source_root),
+                    "--run-id",
+                    "phase51ab_pressure_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout: {result.stdout}\nstderr: {result.stderr}",
+            )
+            source_dir = source_root / "phase51ab_pressure_test"
+            source_summary = json.loads(
+                (source_dir / "phase51ab_lighter_native_limit_pressure_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(source_summary["gate_status"], "HOLD")
+            self.assertEqual(source_summary["complete_lighter_native_limit_source_row_count"], 1)
+            self.assertFalse(source_summary["clears_phase51_blockers"])
+            self.assertIn("phase51v_forward_capture_bundle_readiness.py", source_summary["phase51v_validation_command"])
+            staged_text = Path(source_summary["source_path"]).read_text(encoding="utf-8")
+            self.assertNotIn("client_order_id", staged_text)
+            self.assertNotIn("trade_id", staged_text)
+
+            readiness_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    source_summary["candidate_manifest_path"],
+                    "--output-root",
+                    str(readiness_root),
+                    "--run-id",
+                    "phase51v_phase51ab_pressure_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                readiness_result.returncode,
+                0,
+                f"stdout: {readiness_result.stdout}\nstderr: {readiness_result.stderr}",
+            )
+            readiness_summary = json.loads(
+                (
+                    readiness_root
+                    / "phase51v_phase51ab_pressure_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(readiness_summary["lighter_native_limit_capture_target_ready_count"], 1)
+            self.assertEqual(readiness_summary["lighter_native_limit_capture_target_missing_count"], 0)
+            self.assertTrue(readiness_summary["generated_phase51s_manifest_ready"])
+            self.assertFalse(readiness_summary["clears_phase51_blockers"])
+            labels_text = (
+                readiness_root
+                / "phase51v_phase51ab_pressure_test"
+                / "capture_bundle_readiness_labels.jsonl"
+            ).read_text(encoding="utf-8")
+            self.assertIn('"lighter_limit_target_ready":true', labels_text)
+            self.assertNotIn("client_order_id", labels_text)
+            self.assertNotIn("trade_id", labels_text)
+
+            unsafe_input = tmp_path / "unsafe_lighter_pressure.jsonl"
+            unsafe_row = dict(pressure_row, order_id="raw-order-id")
+            unsafe_input.write_text(json.dumps(unsafe_row) + "\n", encoding="utf-8")
+            unsafe_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ab_lighter_native_limit_pressure_source_path()),
+                    "--input-jsonl",
+                    str(unsafe_input),
+                    "--output-root",
+                    str(source_root),
+                    "--run-id",
+                    "phase51ab_unsafe_pressure_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe_result.returncode, 2)
+            self.assertIn("raw identifier", unsafe_result.stderr)
+
+            unsafe_flag_input = tmp_path / "unsafe_flag_lighter_pressure.jsonl"
+            unsafe_flag_row = dict(pressure_row, no_live_flag=False)
+            unsafe_flag_input.write_text(json.dumps(unsafe_flag_row) + "\n", encoding="utf-8")
+            unsafe_flag_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ab_lighter_native_limit_pressure_source_path()),
+                    "--input-jsonl",
+                    str(unsafe_flag_input),
+                    "--output-root",
+                    str(source_root),
+                    "--run-id",
+                    "phase51ab_unsafe_flag_pressure_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe_flag_result.returncode, 2)
+            self.assertIn("no_live_flag", unsafe_flag_result.stderr)
+
+            unsafe_model_training_input = tmp_path / "unsafe_model_training_lighter_pressure.jsonl"
+            unsafe_model_training_row = dict(pressure_row, admissible_for_model_training=True)
+            unsafe_model_training_input.write_text(
+                json.dumps(unsafe_model_training_row) + "\n",
+                encoding="utf-8",
+            )
+            unsafe_model_training_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ab_lighter_native_limit_pressure_source_path()),
+                    "--input-jsonl",
+                    str(unsafe_model_training_input),
+                    "--output-root",
+                    str(source_root),
+                    "--run-id",
+                    "phase51ab_unsafe_model_training_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe_model_training_result.returncode, 2)
+            self.assertIn("admissible_for_model_training", unsafe_model_training_result.stderr)
+
+            nested_raw_input = tmp_path / "nested_raw_lighter_pressure.jsonl"
+            nested_raw_row = dict(pressure_row, native_limit_pressure_source={"i": "raw-lighter-id"})
+            nested_raw_input.write_text(json.dumps(nested_raw_row) + "\n", encoding="utf-8")
+            nested_raw_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ab_lighter_native_limit_pressure_source_path()),
+                    "--input-jsonl",
+                    str(nested_raw_input),
+                    "--output-root",
+                    str(source_root),
+                    "--run-id",
+                    "phase51ab_nested_raw_pressure_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(nested_raw_result.returncode, 2)
+            self.assertIn("raw identifier", nested_raw_result.stderr)
+
+            non_scalar_input = tmp_path / "non_scalar_lighter_pressure.jsonl"
+            non_scalar_row = dict(pressure_row, native_limit_pressure_source={"safe": "but-nested"})
+            non_scalar_input.write_text(json.dumps(non_scalar_row) + "\n", encoding="utf-8")
+            non_scalar_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ab_lighter_native_limit_pressure_source_path()),
+                    "--input-jsonl",
+                    str(non_scalar_input),
+                    "--output-root",
+                    str(source_root),
+                    "--run-id",
+                    "phase51ab_non_scalar_pressure_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(non_scalar_result.returncode, 2)
+            self.assertIn("must be scalar", non_scalar_result.stderr)
+
+            bool_pressure_input = tmp_path / "bool_pressure_lighter_pressure.jsonl"
+            bool_pressure_row = dict(pressure_row, sendtx_per_minute_remaining=True)
+            bool_pressure_input.write_text(json.dumps(bool_pressure_row) + "\n", encoding="utf-8")
+            bool_pressure_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ab_lighter_native_limit_pressure_source_path()),
+                    "--input-jsonl",
+                    str(bool_pressure_input),
+                    "--output-root",
+                    str(source_root),
+                    "--run-id",
+                    "phase51ab_bool_pressure_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(bool_pressure_result.returncode, 2)
+            self.assertIn("sendtx_per_minute_remaining", bool_pressure_result.stderr)
+
+            unsafe_run_id_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ab_lighter_native_limit_pressure_source_path()),
+                    "--input-jsonl",
+                    str(pressure_input),
+                    "--output-root",
+                    str(source_root),
+                    "--run-id",
+                    "../phase51ab_unsafe_run_id_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe_run_id_result.returncode, 2)
+            self.assertIn("run_id", unsafe_run_id_result.stderr)
 
     def test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar(self):
         """5.1v should use validated source-link sidecars to join source rows to targets."""
