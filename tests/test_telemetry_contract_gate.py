@@ -793,6 +793,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51ab_lighter_native_limit_pressure_source.py"
 
+    def _get_phase51ac_source_link_reuse_audit_path(self) -> Path:
+        """Get path to the Phase 5.1ac source-link reuse audit gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51ac_source_link_reuse_audit.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -8676,6 +8681,137 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(unsafe_run_id_result.returncode, 2)
             self.assertIn("run_id", unsafe_run_id_result.stderr)
+
+    def test_phase51ac_source_link_reuse_audit_reports_reusable_and_missing_hashes(self):
+        """5.1ac should compare request-pack hashes with existing sanitized sidecars."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            request_pack = tmp_path / "request_pack"
+            sidecar_root = tmp_path / "sidecars"
+            output_root = tmp_path / "phase51ac"
+            request_pack.mkdir()
+            sidecar_root.mkdir()
+
+            request_sources = [
+                {
+                    "label_type": "PHASE51Z_SOURCE_LINK_REQUEST_SOURCE",
+                    "source_record_sha256": "hash-reusable",
+                    "venue_id": "lighter",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "PHASE51Z_SOURCE_LINK_REQUEST_SOURCE",
+                    "source_record_sha256": "hash-missing",
+                    "venue_id": "aster",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            request_targets = [
+                {
+                    "label_type": "PHASE51Z_SOURCE_LINK_REQUEST_TARGET",
+                    "canonical_group_id": "group-lighter",
+                    "order_key": "order-lighter",
+                    "venue_id": "lighter",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+                {
+                    "label_type": "PHASE51Z_SOURCE_LINK_REQUEST_TARGET",
+                    "canonical_group_id": "group-aster",
+                    "order_key": "order-aster",
+                    "venue_id": "aster",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                },
+            ]
+            (request_pack / "source_link_request_sources.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in request_sources),
+                encoding="utf-8",
+            )
+            (request_pack / "source_link_request_targets.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in request_targets),
+                encoding="utf-8",
+            )
+            reusable_sidecar_dir = sidecar_root / "existing"
+            reusable_sidecar_dir.mkdir()
+            (reusable_sidecar_dir / "source_links.sanitized.jsonl").write_text(json.dumps({
+                "source_record_sha256": "hash-reusable",
+                "canonical_group_id": "group-lighter",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ac_source_link_reuse_audit_path()),
+                    "--request-pack",
+                    str(request_pack),
+                    "--sidecar-root",
+                    str(sidecar_root),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51ac_reuse_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51ac_reuse_test"
+            summary = json.loads(
+                (run_dir / "phase51ac_source_link_reuse_audit_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["source_link_request_source_count"], 2)
+            self.assertEqual(summary["existing_sidecar_file_count"], 1)
+            self.assertEqual(summary["existing_sidecar_row_count"], 1)
+            self.assertEqual(summary["reusable_source_link_count"], 1)
+            self.assertEqual(summary["missing_source_link_count"], 1)
+            self.assertEqual(summary["reusable_source_link_counts_by_venue"], {"lighter": 1})
+            self.assertEqual(summary["missing_source_link_counts_by_venue"], {"aster": 1})
+            self.assertFalse(summary["candidate_sidecar_complete"])
+            self.assertFalse(summary["clears_phase51_blockers"])
+            reusable_text = (run_dir / "reusable_source_links.jsonl").read_text(encoding="utf-8")
+            missing_text = (run_dir / "missing_source_link_request_sources.jsonl").read_text(encoding="utf-8")
+            self.assertIn("hash-reusable", reusable_text)
+            self.assertIn("hash-missing", missing_text)
+            self.assertNotIn("client_order_id", reusable_text + missing_text)
+            self.assertNotIn("trade_id", reusable_text + missing_text)
+
+            unsafe_dir = sidecar_root / "unsafe"
+            unsafe_dir.mkdir()
+            (unsafe_dir / "source_links.sanitized.jsonl").write_text(json.dumps({
+                "source_record_sha256": "hash-reusable",
+                "canonical_group_id": "group-lighter",
+                "client_order_id": "raw-client-id",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            unsafe_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ac_source_link_reuse_audit_path()),
+                    "--request-pack",
+                    str(request_pack),
+                    "--sidecar-root",
+                    str(unsafe_dir),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51ac_unsafe_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe_result.returncode, 2)
+            self.assertIn("raw identifier", unsafe_result.stderr)
 
     def test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar(self):
         """5.1v should use validated source-link sidecars to join source rows to targets."""

@@ -711,6 +711,17 @@ targets for venues with unlinked request sources (`aster=113`, `extended=28`,
 ready. This converts the all-venue native-role linkage gap into a deterministic
 redacted sidecar request, not a readiness claim.
 
+Phase 5.1ac adds a HOLD-only source-link reuse audit. It scans existing local
+`source_links.sanitized.jsonl` sidecars and compares their redacted source hashes
+against the Phase 5.1z all-venue request pack. It performs no network access,
+does not use raw identifiers, does not infer links, and cannot clear blockers by
+itself. The first all-venue run found `0 / 2130` reusable links across `574`
+existing sidecar rows, leaving all request sources missing (`aster=228`,
+`extended=1579`, `lighter=300`, `paradex=23`). This proves that the all-venue
+sidecar cannot be deterministically derived from existing repo-owned sidecars;
+a new validated redacted sidecar or directly target-linkable source remains
+required.
+
 The 2026-05-05 bounded GET-only Lighter target-window diagnostic was attempted
 after hardening the Lighter trade-backfill redaction path. The regenerated
 HOLD-only run captured `400` read-only trades, passed fail-closed raw

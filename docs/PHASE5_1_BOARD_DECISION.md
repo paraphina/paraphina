@@ -2044,3 +2044,45 @@ and event-time alignment, then run Phase 5.1ab and the emitted Phase 5.1v
 validation command. Keep native-role source-link sidecar acquisition moving in
 parallel.
 ```
+
+## Phase 5.1ac Source-Link Reuse Audit Decision
+
+Decision: `PROMOTE` only the repo-owned HOLD-only reuse audit scaffold and
+HOLD evidence pack; `HOLD` for blocker reduction because no reusable sidecar
+rows were found.
+
+Evidence:
+
+```text
+tool: tools/phase51ac_source_link_reuse_audit.py
+run: runs/phase51ac_source_link_reuse_audit/PHASE51AC-ALLVENUE-SOURCE-LINK-REUSE-AUDIT-HOLD-20260505T000000Z
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-ALLVENUE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+existing_sidecar_file_count: 2
+existing_sidecar_row_count: 574
+source_link_request_source_count: 2130
+reusable_source_link_count: 0
+missing_source_link_count: 2130
+missing_source_link_counts_by_venue: aster=228, extended=1579, lighter=300, paradex=23
+clears_phase51_blockers: false
+```
+
+Board interpretation:
+
+```text
+accepted: existing repo-owned sanitized sidecars do not overlap the all-venue
+request-pack source hashes, and the native-role linkage blocker is now
+machine-checkably non-derivable from those sidecars.
+
+not accepted: any inference that missing links can be reconstructed without a
+new validated redacted sidecar or directly target-linkable source, any
+model-training/EV-admission promotion, or any live/canary/capital/risk change.
+```
+
+Next move:
+
+```text
+Obtain a new validated redacted source-link sidecar for the all-venue request
+pack, or capture a different non-live authorized target-linkable native-role
+source. Keep the Lighter native-limit pressure path separate through Phase
+5.1ab.
+```

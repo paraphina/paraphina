@@ -303,6 +303,55 @@ EV admission, live/canary deployment, capital escalation, risk-limit
 relaxation, or economic claims.
 ```
 
+## 2026-05-05 - Phase 5.1ac Source-Link Reuse Audit
+
+Scope:
+
+- Tool: `tools/phase51ac_source_link_reuse_audit.py`
+- Mode: HOLD-only read-only comparison of a Phase 5.1z request pack against
+  existing local `source_links.sanitized.jsonl` files.
+- Live/canary/capital/risk: not authorized.
+- Link inference: not performed.
+
+Run:
+
+```text
+runs/phase51ac_source_link_reuse_audit/PHASE51AC-ALLVENUE-SOURCE-LINK-REUSE-AUDIT-HOLD-20260505T000000Z
+```
+
+Result:
+
+```text
+existing_sidecar_file_count: 2
+existing_sidecar_row_count: 574
+source_link_request_source_count: 2130
+source_link_request_target_count: 281
+reusable_source_link_count: 0
+missing_source_link_count: 2130
+missing_source_link_counts_by_venue: aster=228, extended=1579, lighter=300, paradex=23
+candidate_sidecar_complete: false
+clears_phase51_blockers: false
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51ac_source_link_reuse_audit.py
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51ac_source_link_reuse_audit_reports_reusable_and_missing_hashes
+```
+
+Evidence boundary:
+
+```text
+accepted: no existing sanitized source-link sidecar rows overlap the all-venue
+request-pack source hashes.
+
+not accepted: blocker clearance, inferred source links, model training, EV
+admission, live/canary deployment, capital escalation, risk-limit relaxation,
+or economic claims.
+```
+
 ## Phase 5.1z All-Venue Source-Link Request Pack
 
 Date: 2026-05-05

@@ -104,7 +104,9 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    contract for source acquisition, `docs/PHASE5_1Q_FORWARD_NATIVE_EVIDENCE.md`
    for downstream forward native evidence,
    `tools/phase51ab_lighter_native_limit_pressure_source.py` as the local
-   sanitized Lighter native-limit pressure preflight gate, and
+   sanitized Lighter native-limit pressure preflight gate,
+   `tools/phase51ac_source_link_reuse_audit.py` as the source-link sidecar
+   reuse/non-derivability audit, and
    `docs/PHASE5_1P_LIGHTER_NATIVE_ROLE_EVIDENCE.md` for the exhausted
    quarantined Lighter historical join.
 
@@ -196,6 +198,35 @@ python3 tools/phase51ab_lighter_native_limit_pressure_source.py \
 ```
 
 Then run the `phase51v_validation_command` emitted in the Phase 5.1ab summary.
+
+### Gate 5.1ac - Source-Link Reuse Audit
+
+Allowed:
+
+- Read-only comparison of a Phase 5.1z source-link request pack against local
+  `source_links.sanitized.jsonl` files.
+- Emission of reusable-link and missing-hash HOLD artifacts.
+
+Hard boundary:
+
+- Phase 5.1ac must not infer missing links.
+- Phase 5.1ac must not read raw order IDs, client IDs, trade IDs, secrets, or
+  unsafe true authorization flags.
+- A zero-overlap result is a non-derivability proof for existing local sidecars,
+  not a blocker clearance.
+
+Resume command pattern:
+
+```bash
+python3 tools/phase51ac_source_link_reuse_audit.py \
+  --request-pack runs/phase51z_source_link_request_pack/<phase51z_request_pack> \
+  --sidecar-root runs \
+  --output-root runs/phase51ac_source_link_reuse_audit \
+  --run-id <phase51ac_run_id>
+```
+
+If `reusable_source_link_count` is zero or `candidate_sidecar_complete=false`,
+obtain a new validated redacted sidecar or directly target-linkable source.
 
 ### Gate 5.1c - Calibration Label Lake
 
