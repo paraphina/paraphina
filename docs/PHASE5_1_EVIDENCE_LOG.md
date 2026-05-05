@@ -257,6 +257,89 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## PHASE51U/PHASE51Z TARGET-LINK HYGIENE REPLAY
+
+Purpose: preserve redacted target-link fields in Phase 5.1u, allow Phase 5.1z to
+match Lighter native side order IDs, and replay retained Lighter read-only trade
+sources without live orders, canary, capital escalation, risk-limit changes, or
+financial claims.
+
+Tool changes:
+
+```text
+tools/phase51u_forward_capture_target_manifest.py
+- Preserves redacted order_id_hash, client_order_id_hash, decision_id_hash,
+  first_fill_time_ms, and last_fill_time_ms from canonical P-fill labels.
+
+tools/phase51z_readonly_native_role_capture.py
+- Adds Lighter ask_id/ask_id_str/askId and bid_id/bid_id_str/bidId as
+  candidate identity hashes.
+```
+
+Evidence runs:
+
+```text
+runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z
+runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-TARGET-LINK-HYGIENE-REPLAY-HOLD-20260505T000000Z
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-TARGET-LINK-HYGIENE-HOLD-20260505T000000Z
+```
+
+Commands:
+
+```bash
+python3 tools/phase51u_forward_capture_target_manifest.py \
+  --observed-pfill-run runs/phase51i_redacted_canonical_pfill_outcome/PHASE51I-REDACTED-CANONICAL-PFILL-OUTCOME-REBUILD-TWO-LANE-20260502T000000Z \
+  --output-root runs/phase51u_forward_capture_target_manifest \
+  --run-id PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --timestamp-ns 1777939200000000000
+
+python3 tools/phase51z_readonly_native_role_capture.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-COMBINED-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-FROM-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-OFFLINE-EXISTING-20260502T1135Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T025435Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-TERMINAL-STALE-7200S-20260429T073231Z/source_snapshots/trades_backfill.sanitized.json \
+  --source-json lighter=runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z/source_snapshots/trades_backfill.sanitized.json \
+  --output-root runs/phase51z_readonly_native_role_capture \
+  --run-id PHASE51Z-LIGHTER-TARGET-LINK-HYGIENE-REPLAY-HOLD-20260505T000000Z \
+  --timestamp-ns 1777939200000000000
+
+python3 tools/phase51v_forward_capture_bundle_readiness.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --candidate-manifest runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-TARGET-LINK-HYGIENE-REPLAY-HOLD-20260505T000000Z/phase51z_candidate_manifest.json \
+  --output-root runs/phase51v_forward_capture_bundle_readiness \
+  --run-id PHASE51V-LIGHTER-TARGET-LINK-HYGIENE-HOLD-20260505T000000Z \
+  --timestamp-ns 1777939200000000000
+```
+
+Result:
+
+```text
+Phase 5.1z gate_status: HOLD
+Lighter source rows replayed: 1400
+Lighter native-field-ready rows: 1400
+Lighter rows with redacted hash candidates: 1400
+Average redacted hash candidates per Lighter row: 8.0
+Current Lighter native-role targets recovered: 0 / 125
+Phase 5.1v native-role targets ready in this replay: 0 / 287
+Phase 5.1v Lighter native-limit targets ready: 0 / 3132
+generated_phase51s_manifest_ready: false
+raw_identifier_redaction_status: PASS
+```
+
+Interpretation:
+
+```text
+The target-link hygiene patch is correct and covered by tests, but the retained
+Lighter trade-backfill sources still do not match current canonical target
+groups. They are exhausted for current blocker reduction. A new safe observed
+Lighter source or validated linkage sidecar is required for native role.
+Complete Lighter native-limit pressure remains blocked because the no-order
+read-only source path still lacks event-time sendTx and REST-or-weighted
+limit/remaining fields.
+```
+
 ## Phase 5.1z Read-Only Native-Role Capture
 
 - Evidence date: `2026-05-04`

@@ -708,9 +708,15 @@ def _extract_lighter_source(row: dict[str, Any]) -> tuple[list[str], dict[str, A
     if is_maker_ask is None:
         is_maker_ask = row.get("isMakerAsk")
     hashes = _candidate_hashes(
+        row.get("ask_id"),
+        row.get("ask_id_str"),
+        row.get("askId"),
         row.get("ask_client_id"),
         row.get("ask_client_id_str"),
         row.get("askClientId"),
+        row.get("bid_id"),
+        row.get("bid_id_str"),
+        row.get("bidId"),
         row.get("bid_client_id"),
         row.get("bid_client_id_str"),
         row.get("bidClientId"),

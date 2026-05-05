@@ -1721,3 +1721,47 @@ only if complete forward rows are emitted. Do not infer pressure from caps. In
 parallel, continue remaining all-five native-role source capture where it does
 not depend on unavailable Lighter request-pressure fields.
 ```
+
+## Phase 5.1u/5.1z Target-Link Hygiene Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only the repo-owned target-link hygiene patch and its
+non-live replay evidence.
+
+Rationale:
+
+- Phase 5.1u target rows should preserve already-redacted `order_id_hash`,
+  `client_order_id_hash`, `decision_id_hash`, `first_fill_time_ms`, and
+  `last_fill_time_ms` from canonical P-fill labels so downstream source capture
+  can be audited without re-opening raw identifiers.
+- Phase 5.1z should consider official Lighter trade side order IDs
+  (`ask_id`/`bid_id`) as candidate identity hashes as well as side client IDs.
+- The patched replay still recovered `0 / 125` current Lighter native-role
+  targets from the retained Lighter trade-backfill sources, so those sources are
+  exhausted for current blocker reduction.
+
+Evidence:
+
+```text
+runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z
+runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-TARGET-LINK-HYGIENE-REPLAY-HOLD-20260505T000000Z
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-TARGET-LINK-HYGIENE-HOLD-20260505T000000Z
+gate_status: HOLD
+Lighter source rows replayed: 1400
+Lighter native-field-ready rows: 1400
+Lighter target-linked rows emitted: 0
+Lighter native-limit pressure target ready count: 0 / 3132
+raw_identifier_redaction_status: PASS
+```
+
+Next move:
+
+```text
+Do not refetch or replay the same retained Lighter trade snapshots for blocker
+reduction. Find a new safe read-only Lighter source or linkage sidecar that can
+connect native trade rows to the current canonical target groups. Keep native
+limit pressure on HOLD unless event-time sendTx and REST-or-weighted
+limit/remaining fields are observed from a non-live-authorized source.
+```

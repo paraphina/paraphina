@@ -1121,6 +1121,35 @@ a Lighter-only source path that supplies target-linked native role and complete
 event-time request pressure, or a proven new linkage source for remaining
 Aster/Extended/Paradex target groups.
 
+The 2026-05-05 target-link hygiene replay is:
+
+```text
+tool changes: Phase 5.1u now preserves redacted order/client/decision hashes and
+fill-time fields in target rows; Phase 5.1z now considers Lighter ask/bid native
+side order IDs as candidate hashes in addition to side client IDs.
+target run: runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z
+native-role replay: runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-TARGET-LINK-HYGIENE-REPLAY-HOLD-20260505T000000Z
+readiness run: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-TARGET-LINK-HYGIENE-HOLD-20260505T000000Z
+gate_status: HOLD
+lighter source rows replayed: 1400
+lighter native-field-ready rows: 1400
+lighter rows with redacted hash candidates: 1400
+average Lighter redacted hash candidates per row: 8.0
+current Lighter native-role targets recovered: 0 / 125
+Lighter native-limit pressure recovered: 0 / 3132
+raw_identifier_redaction_status: PASS
+```
+
+Operational implication: the current retained Lighter trade-backfill sources are
+exhausted even after target-link hygiene and native side-order-ID matching. Do
+not keep replaying those same six source snapshots as a blocker-reduction move.
+The next Lighter-native-role move requires a new target-linkable observed source
+or a new safe linkage sidecar. The Lighter-native-limit move remains blocked
+unless a read-only source exposes event-time sendTx and REST-or-weighted
+limit/remaining fields; official docs indicate remaining volume quota is exposed
+by sendTx/sendTxBatch responses, which are write paths and are not authorized in
+Phase 5.1 non-live source capture.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7

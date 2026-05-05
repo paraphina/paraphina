@@ -7979,12 +7979,17 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "label_type": "ORDER_PFILL_OUTCOME_LABEL",
                     "canonical_group_id": "lighter-filled",
                     "order_key": "lighter-order",
+                    "order_id_hash": "lighter-order-id-hash",
+                    "client_order_id_hash": "lighter-client-order-id-hash",
+                    "decision_id_hash": "lighter-decision-id-hash",
                     "source_telemetry_sha256": "source-lighter",
                     "venue_id": "lighter",
                     "side": "BID",
                     "price": 100.0,
                     "size": 0.01,
                     "fill_count": 2,
+                    "first_fill_time_ms": 1700000000100,
+                    "last_fill_time_ms": 1700000000200,
                     "order_source_t": 10,
                     "order_source_line": 20,
                     "source_order_keys": ["source-lighter-a", "source-lighter-b"],
@@ -8085,12 +8090,17 @@ class TestValidatorSubprocess(unittest.TestCase):
                 for line in (run_dir / "native_role_capture_targets.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             lighter_target = next(target for target in role_targets if target["venue_id"] == "lighter")
+            self.assertEqual(lighter_target["order_id_hash"], "lighter-order-id-hash")
+            self.assertEqual(lighter_target["client_order_id_hash"], "lighter-client-order-id-hash")
+            self.assertEqual(lighter_target["decision_id_hash"], "lighter-decision-id-hash")
+            self.assertEqual(lighter_target["first_fill_time_ms"], 1700000000100)
+            self.assertEqual(lighter_target["last_fill_time_ms"], 1700000000200)
             self.assertEqual(lighter_target["missing_native_role_count"], 1)
             self.assertEqual(lighter_target["required_native_role_source"], "LIGHTER_TRADES_JSON")
             self.assertFalse(lighter_target["role_inference_allowed"])
             output_text = (run_dir / "native_role_capture_targets.jsonl").read_text(encoding="utf-8")
-            self.assertNotIn("client_order_id", output_text)
-            self.assertNotIn("trade_id", output_text)
+            self.assertNotIn('"client_order_id":', output_text)
+            self.assertNotIn('"trade_id":', output_text)
             template = json.loads((run_dir / "capture_bundle_manifest_template.json").read_text(encoding="utf-8"))
             self.assertEqual(template["native_role_capture_target_count"], 2)
             self.assertEqual(template["lighter_native_limit_capture_target_count"], 2)
@@ -9257,6 +9267,7 @@ class TestValidatorSubprocess(unittest.TestCase):
                 "aster": "aster-client-raw",
                 "extended": "extended-client-raw",
                 "lighter": "123456789",
+                "lighter_order": "987654321",
                 "paradex": "paradex-client-raw",
             }
             target_rows = []
@@ -9281,8 +9292,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "canonical_group_id": group,
                     "order_key": order_key,
                     "venue_id": venue,
-                    "client_order_id_hash": stable_hash(raw_ids[venue]),
-                    "order_id_hash": None,
+                    "client_order_id_hash": stable_hash(raw_ids[venue]) if venue != "lighter" else None,
+                    "order_id_hash": stable_hash(raw_ids["lighter_order"]) if venue == "lighter" else None,
                     "fill_count": 1,
                     "first_fill_time_ms": 1700000000000 + seq,
                     "last_fill_time_ms": 1700000000000 + seq,
@@ -9340,7 +9351,7 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "account_index": 42,
                     "ask_account_id": 42,
                     "bid_account_id": 7,
-                    "ask_client_id": int(raw_ids["lighter"]),
+                    "ask_id": int(raw_ids["lighter_order"]),
                     "is_maker_ask": True,
                     "trade_id": "raw-lighter-trade",
                 },
