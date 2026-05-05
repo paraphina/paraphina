@@ -80,6 +80,40 @@ SENSITIVE_HEADER_FRAGMENTS = (
     "signature",
     "token",
 )
+RAW_IDENTIFIER_VALUE_KEYS = {
+    "askclientid",
+    "askclientidstr",
+    "askid",
+    "askidstr",
+    "bidclientid",
+    "bidclientidstr",
+    "bidid",
+    "bididstr",
+    "clientid",
+    "clientidstr",
+    "clientorderid",
+    "clientorderidstr",
+    "cursor",
+    "decisionid",
+    "hash",
+    "id",
+    "idstr",
+    "nativeorderid",
+    "nextcursor",
+    "nextpagecursor",
+    "origclientorderid",
+    "origclientorderidstr",
+    "orderid",
+    "orderidstr",
+    "rawclientorderid",
+    "raworderid",
+    "tradeid",
+    "tradeidstr",
+    "transactionhash",
+    "transactionid",
+    "txhash",
+    "venueorderid",
+}
 
 
 def _load_json(path: Path) -> dict[str, Any] | list[Any]:
@@ -166,6 +200,9 @@ def _redact(value: Any) -> Any:
                 or normalized == "jwt"
             ):
                 redacted[str(key)] = "<redacted>"
+            elif normalized in RAW_IDENTIFIER_VALUE_KEYS and not normalized.endswith("sha256"):
+                hashed_key = f"{key}_sha256"
+                redacted[str(hashed_key)] = _stable_hash(item) if item not in (None, "") else None
             else:
                 redacted[str(key)] = _redact(item)
         return redacted

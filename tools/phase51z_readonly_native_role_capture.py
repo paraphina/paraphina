@@ -112,6 +112,12 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _is_sha256_hex(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(ch in "0123456789abcdef" for ch in value.lower())
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -403,7 +409,7 @@ def _build_hash_index(targets: list[CaptureTarget]) -> dict[tuple[str, str], Cap
     return index
 
 
-def _candidate_hashes(*values: Any) -> list[str]:
+def _candidate_hashes(*values: Any, prehashed_values: tuple[Any, ...] = ()) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for value in values:
@@ -417,6 +423,13 @@ def _candidate_hashes(*values: Any) -> list[str]:
             if hashed not in seen:
                 seen.add(hashed)
                 out.append(hashed)
+    for value in prehashed_values:
+        if value in (None, "") or not _is_sha256_hex(value):
+            continue
+        hashed = str(value).lower()
+        if hashed not in seen:
+            seen.add(hashed)
+            out.append(hashed)
     return out
 
 
@@ -720,6 +733,20 @@ def _extract_lighter_source(row: dict[str, Any]) -> tuple[list[str], dict[str, A
         row.get("bid_client_id"),
         row.get("bid_client_id_str"),
         row.get("bidClientId"),
+        prehashed_values=(
+            row.get("ask_id_sha256"),
+            row.get("ask_id_str_sha256"),
+            row.get("askId_sha256"),
+            row.get("ask_client_id_sha256"),
+            row.get("ask_client_id_str_sha256"),
+            row.get("askClientId_sha256"),
+            row.get("bid_id_sha256"),
+            row.get("bid_id_str_sha256"),
+            row.get("bidId_sha256"),
+            row.get("bid_client_id_sha256"),
+            row.get("bid_client_id_str_sha256"),
+            row.get("bidClientId_sha256"),
+        ),
     )
     if account_index is None:
         return hashes, None, "LIGHTER_ACCOUNT_INDEX_MISSING"

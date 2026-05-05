@@ -1855,3 +1855,48 @@ sidecar path with the validated sidecar. If no sidecar can be produced, use a
 bounded GET-only target-window Lighter /api/v1/trades capture as a diagnostic,
 not as a promotion path.
 ```
+
+## Phase 5.1 Lighter GET-Only Diagnostic Decision
+
+Decision: `HOLD` for model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, financial claims, and 24/7 readiness.
+
+Decision: `PROMOTE` only the fail-closed redaction hardening and the retained
+HOLD-only diagnostic evidence path.
+
+Rationale:
+
+- The bounded GET-only Lighter `/api/v1/trades` diagnostic can be generated
+  without live orders and now hashes raw order/trade/client/tx identifiers and
+  cursor tokens before artifact write.
+- The diagnostic produced native-role fields but no direct target linkage to
+  the current Phase 5.1u Lighter targets.
+- Repeating the same target-window diagnostic is not expected to reduce the
+  blocker unless the target window or source surface changes.
+
+Evidence:
+
+```text
+runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TARGET-WINDOW-GETONLY-DIAGNOSTIC-SANITIZED-20260505T143000Z
+runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-GETONLY-SANITIZED-DIAGNOSTIC-20260505T143000Z
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-GETONLY-SANITIZED-DIAGNOSTIC-20260505T143000Z
+gate_status: HOLD
+trade_count: 400
+raw_identifier_redaction_status: PASS
+raw_identifier_key_violation_count: 0
+sanitized unlinked Lighter source rows: 400
+Lighter target-linked rows: 0 / 125
+Phase 5.1v native-role targets ready: 0 / 287
+Phase 5.1v Lighter native-limit targets ready: 0 / 3132
+generated_phase51s_manifest_ready: false
+```
+
+Next move:
+
+```text
+Obtain a deterministic redacted source-link sidecar for the existing request
+pack, or a different non-live authorized Lighter source that directly links to
+the current Phase 5.1u target hashes. Separately obtain event-time sendTx plus
+REST-or-weighted limit/remaining pressure before claiming Lighter native-limit
+readiness.
+```

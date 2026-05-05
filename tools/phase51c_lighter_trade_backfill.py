@@ -18,6 +18,7 @@ from typing import Any
 
 from phase51b_lighter_account_limits import (
     DEFAULT_BASE_URL,
+    RAW_IDENTIFIER_VALUE_KEYS,
     READONLY_ENDPOINTS,
     _artifact_infos,
     _as_int,
@@ -28,6 +29,7 @@ from phase51b_lighter_account_limits import (
     _redact,
     _resolve_base_url,
     _sha256_file,
+    _stable_hash,
     _write_json,
 )
 
@@ -95,6 +97,41 @@ def _page_next_cursor(payload: Any) -> str | None:
 
 def _page_trades(payload: Any) -> list[dict[str, Any]]:
     return _extract_items(payload, {"trades", "trade_history", "tradehistory"})
+
+
+ALLOWED_RAW_ID_KEYS = {
+    "accountid",
+    "accountindex",
+    "askaccountid",
+    "bidaccountid",
+    "marketid",
+}
+
+
+def _normalized_key(key: Any) -> str:
+    return "".join(ch for ch in str(key).lower() if ch.isalnum())
+
+
+def _raw_identifier_key_violations(value: Any, path: str = "$") -> list[str]:
+    violations: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_str = str(key)
+            normalized = _normalized_key(key)
+            if normalized.endswith("sha256") or normalized in ALLOWED_RAW_ID_KEYS:
+                pass
+            elif (
+                normalized in RAW_IDENTIFIER_VALUE_KEYS
+                or normalized.endswith("id")
+                or normalized.endswith("hash")
+                or "cursor" in normalized
+            ):
+                violations.append(f"{path}.{key_str}")
+            violations.extend(_raw_identifier_key_violations(item, f"{path}.{key_str}"))
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            violations.extend(_raw_identifier_key_violations(item, f"{path}[{idx}]"))
+    return violations
 
 
 def _fetch_pages(
@@ -252,13 +289,23 @@ def build_trade_backfill(
         )
         source_mode = "readonly_lighter_api"
 
+    redacted_pages = _redact(fetched_pages)
+    redacted_trades = _redact(trades)
+    raw_identifier_key_violations = _raw_identifier_key_violations({
+        "pages": redacted_pages,
+        "trades": redacted_trades,
+    })
+    if raw_identifier_key_violations:
+        sample = ", ".join(raw_identifier_key_violations[:10])
+        raise ValueError(f"redaction left raw identifier-like keys in sanitized output: {sample}")
+
     pages_path = source_dir / "trades_backfill_pages.sanitized.json"
     trades_path = source_dir / "trades_backfill.sanitized.json"
     _write_json(pages_path, {
         "schema_version": 1,
         "source_mode": source_mode,
         "official_docs": [OFFICIAL_TRADES_DOC_URL],
-        "pages": _redact(fetched_pages),
+        "pages": redacted_pages,
     })
     trade_summary = _summarize_trades(trades, resolved_account_index)
     _write_json(trades_path, {
@@ -268,7 +315,7 @@ def build_trade_backfill(
         "account_index": resolved_account_index,
         "market_id": market_id,
         "market_type": market_type,
-        "trades": _redact(trades),
+        "trades": redacted_trades,
         **trade_summary,
     })
 
@@ -296,10 +343,12 @@ def build_trade_backfill(
         "stop_at_or_before_ms": stop_at_or_before_ms,
         "complete_to_requested_stop": complete_to_requested_stop,
         "next_cursor_present": bool(next_cursor),
-        "next_cursor": next_cursor,
+        "next_cursor_sha256": _stable_hash(next_cursor) if next_cursor else None,
         "trades_path": str(trades_path),
         "trades_sha256": _sha256_file(trades_path),
         "pages_sha256": _sha256_file(pages_path),
+        "raw_identifier_redaction_status": "PASS",
+        "raw_identifier_key_violation_count": len(raw_identifier_key_violations),
         "approved_for_model_training": False,
         "approved_for_live": False,
         "approved_for_canary": False,

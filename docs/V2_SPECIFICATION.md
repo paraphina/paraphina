@@ -701,6 +701,17 @@ native-role target misses. The request pack is not native truth by itself and is
 not an authorization for model training, EV admission, canary, live orders,
 capital escalation, risk-limit relaxation, or financial claims.
 
+The 2026-05-05 bounded GET-only Lighter target-window diagnostic was attempted
+after hardening the Lighter trade-backfill redaction path. The regenerated
+HOLD-only run captured `400` read-only trades, passed fail-closed raw
+identifier/cursor key validation, and Phase 5.1z emitted `400` sanitized
+unlinked Lighter native-role rows. It recovered `0 / 125` current Lighter
+native-role targets, and Phase 5.1v remained `HOLD` with `0 / 287` native-role
+targets ready and `0 / 3132` Lighter native-limit targets ready. This confirms
+the GET-only diagnostic path is redaction-safe but not target-linkable for the
+current Phase 5.1u Lighter targets. Do not repeat the same diagnostic unless
+the target window or source surface changes.
+
 The 2026-05-04 authorized read-only private source attempt produced Lighter-only
 sanitized account/native-limit and trade-backfill artifacts; it does not change
 this spec gate because Phase 5.1w requires all-five native role files and
@@ -714,16 +725,19 @@ any of the `3132` Lighter native-limit targets. The canonical staged-source evid
 run `PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z` proves the
 local bundle contract without clearing the blocker: Phase 5.1v sees six local
 files but remains `HOLD` with `0 / 287` native-role targets and `0 / 3132`
-Lighter native-limit targets ready. The next evidence move is to populate the
-six sanitized local read-only all-five forward source-capture files with real
-sanitized rows, run the bundle through Phase 5.1v, and only if 5.1v emits
-`generated_phase51s_manifest_ready=true`, stage the generated manifest through
-Phase 5.1s. The bundle must contain native snapshots with canonical
-group/order-key linkage, or validated source-link sidecars that bind redacted
-source hashes to observed labels. Phase 5.1v now applies those sidecars during
-bundle-readiness validation, but only source rows with required native fields
-can mark targets ready. After Phase 5.1s, run Phase 5.1r, feed the sanitized
-outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No model training,
-EV admission, canary, live orders, capital escalation, risk-limit relaxation,
-or financial claim is authorized from Phase 5.1s, Phase 5.1r, Phase 5.1q,
-Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, Phase 5.1x, or Phase 5.1y.
+Lighter native-limit targets ready. The next evidence move is a deterministic
+redacted Lighter source-link sidecar, a different target-linkable Lighter
+source, and a separate event-time Lighter request-pressure source. For all
+venues, populate sanitized local read-only all-five forward source-capture
+files with real native rows, run the bundle through Phase 5.1v, and only if
+5.1v emits `generated_phase51s_manifest_ready=true`, stage the generated
+manifest through Phase 5.1s. The bundle must contain native snapshots with
+canonical group/order-key linkage, or validated source-link sidecars that bind
+redacted source hashes to observed labels. Phase 5.1v now applies those
+sidecars during bundle-readiness validation, but only source rows with required
+native fields can mark targets ready. After Phase 5.1s, run Phase 5.1r, feed
+the sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No
+model training, EV admission, canary, live orders, capital escalation,
+risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
+5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, Phase 5.1x,
+Phase 5.1y, or Phase 5.1z.

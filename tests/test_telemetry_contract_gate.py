@@ -2069,6 +2069,9 @@ class TestValidatorSubprocess(unittest.TestCase):
                         "bid_client_id_str": "222",
                         "is_maker_ask": True,
                         "timestamp": 1777448154939,
+                        "trade_id": "raw-trade-id-one",
+                        "trade_id_str": "raw-trade-id-one",
+                        "tx_hash": "raw-tx-hash-one",
                     },
                     {
                         "ask_account_id": 456,
@@ -2079,6 +2082,8 @@ class TestValidatorSubprocess(unittest.TestCase):
                         "bid_id_str": "44",
                         "is_maker_ask": False,
                         "timestamp": 1777448164939,
+                        "trade_id": "raw-trade-id-two",
+                        "tx_hash": "raw-tx-hash-two",
                     },
                 ],
             }), encoding="utf-8")
@@ -2114,10 +2119,41 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(summary["timestamp_max_ms"], 1777448164939)
             self.assertTrue(summary["complete_to_requested_stop"])
             self.assertEqual(summary["role_counts_for_account"], {"maker": 2, "taker": 0, "unknown": 0})
+            self.assertEqual(summary["raw_identifier_redaction_status"], "PASS")
             self.assertFalse(summary["approved_for_model_training"])
             self.assertFalse(summary["approved_for_live"])
             trades = json.loads((run_dir / "source_snapshots" / "trades_backfill.sanitized.json").read_text(encoding="utf-8"))
             self.assertEqual(len(trades["trades"]), 2)
+            pages = json.loads(
+                (run_dir / "source_snapshots" / "trades_backfill_pages.sanitized.json").read_text(encoding="utf-8")
+            )
+            raw_identifier_keys = {
+                "ask_id",
+                "ask_id_str",
+                "ask_client_id",
+                "ask_client_id_str",
+                "bid_id",
+                "bid_id_str",
+                "bid_client_id",
+                "bid_client_id_str",
+                "trade_id",
+                "trade_id_str",
+                "tx_hash",
+            }
+            for trade in trades["trades"]:
+                self.assertTrue(raw_identifier_keys.isdisjoint(trade.keys()), trade)
+            for page in pages["pages"]:
+                for trade in page["payload"]["trades"]:
+                    self.assertTrue(raw_identifier_keys.isdisjoint(trade.keys()), trade)
+            self.assertIn("ask_id_sha256", trades["trades"][0])
+            self.assertIn("ask_id_str_sha256", trades["trades"][0])
+            self.assertIn("ask_client_id_sha256", trades["trades"][0])
+            self.assertIn("bid_id_sha256", trades["trades"][0])
+            self.assertIn("trade_id_sha256", trades["trades"][0])
+            self.assertIn("tx_hash_sha256", trades["trades"][0])
+            sanitized_text = json.dumps({"pages": pages, "trades": trades}, sort_keys=True)
+            self.assertNotIn("raw-trade-id-one", sanitized_text)
+            self.assertNotIn("raw-tx-hash-one", sanitized_text)
             manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
             for file_info in manifest["files"]:
                 artifact = run_dir / file_info["path"]
@@ -2126,6 +2162,45 @@ class TestValidatorSubprocess(unittest.TestCase):
                     file_info["sha256"],
                     file_info["path"],
                 )
+
+    def test_phase51c_lighter_trade_backfill_rejects_unknown_raw_identifier_key(self):
+        """Trade backfill should fail closed if an unknown raw identifier-like key survives redaction."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            page_path = tmp_path / "trades_page.json"
+            output_root = tmp_path / "trade_backfill_runs"
+            page_path.write_text(json.dumps({
+                "trades": [
+                    {
+                        "ask_account_id": 123,
+                        "bid_account_id": 456,
+                        "is_maker_ask": True,
+                        "timestamp": 1777448154939,
+                        "unexpected_venue_id": "raw-unexpected-id",
+                    },
+                ],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51c_lighter_trade_backfill_path()),
+                    "--page-json",
+                    str(page_path),
+                    "--account-index",
+                    "123",
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51c_trade_backfill_bad_identifier_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("redaction left raw identifier-like keys", result.stderr)
 
     def test_phase51c_pfill_outcome_labels_filled_cancelled_censored_without_promotion(self):
         """P_fill outcome labels should distinguish filled, terminal unfilled, and censored orders."""
@@ -9255,7 +9330,7 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertIn("network source paths are prohibited", result.stderr)
 
     def test_phase51z_readonly_native_role_capture_maps_raw_rows_to_sanitized_bundle(self):
-        """5.1z should map read-only native rows by redacted hashes without leaking raw IDs."""
+        """5.1z should map read-only native rows and prehashed Lighter rows without leaking raw IDs."""
         def stable_hash(value):
             encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
             return hashlib.sha256(encoded).hexdigest()
@@ -9356,9 +9431,10 @@ class TestValidatorSubprocess(unittest.TestCase):
                     "account_index": 42,
                     "ask_account_id": 42,
                     "bid_account_id": 7,
-                    "ask_id": int(raw_ids["lighter_order"]),
+                    "ask_id_sha256": stable_hash(int(raw_ids["lighter_order"])),
+                    "ask_id_str_sha256": stable_hash(raw_ids["lighter_order"]),
                     "is_maker_ask": True,
-                    "trade_id": "raw-lighter-trade",
+                    "trade_id_sha256": stable_hash("raw-lighter-trade"),
                 },
                 {
                     "venue_id": "paradex",

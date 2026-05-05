@@ -257,6 +257,77 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## Phase 5.1 Lighter GET-Only Target-Window Diagnostic
+
+- Run date: `2026-05-05`
+- Scope: bounded GET-only Lighter `/api/v1/trades` diagnostic against the current Phase 5.1u Lighter target window
+- Gate status: `HOLD`
+- Trade diagnostic: `runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TARGET-WINDOW-GETONLY-DIAGNOSTIC-SANITIZED-20260505T143000Z`
+- Native-role replay: `runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-GETONLY-SANITIZED-DIAGNOSTIC-20260505T143000Z`
+- Readiness run: `runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-GETONLY-SANITIZED-DIAGNOSTIC-20260505T143000Z`
+- Official source: `https://apidocs.lighter.xyz/reference/trades`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `approved_for_model_training`: `false`
+- `approved_for_financial_claim`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+
+Evidence summary:
+
+```text
+trade_count: 400
+pages_fetched: 4 / 8
+complete_to_requested_stop: true
+raw_identifier_redaction_status: PASS
+raw_identifier_key_violation_count: 0
+Phase 5.1z sanitized unlinked Lighter source rows: 400
+Phase 5.1z Lighter target matches: 0 / 125
+Phase 5.1v native-role targets ready: 0 / 287
+Phase 5.1v Lighter native-limit pressure ready: 0 / 3132
+clears_phase51_blockers: false
+```
+
+Implementation note:
+
+```text
+tools/phase51b_lighter_account_limits.py hashes raw order/trade/client/tx/cursor identifier values.
+tools/phase51c_lighter_trade_backfill.py fails closed if sanitized output still contains raw identifier-like keys.
+tools/phase51z_readonly_native_role_capture.py and tools/phase51p_lighter_native_role_canonical_join.py consume prehashed Lighter side identifiers.
+```
+
+Validation:
+
+```bash
+python3 -m py_compile \
+  tools/phase51b_lighter_account_limits.py \
+  tools/phase51c_lighter_trade_backfill.py \
+  tools/phase51z_readonly_native_role_capture.py \
+  tools/phase51p_lighter_native_role_canonical_join.py
+
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51c_lighter_trade_backfill_ingests_offline_pages_without_promotion \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51z_readonly_native_role_capture_maps_raw_rows_to_sanitized_bundle \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51p_lighter_native_role_join_feeds_recovery_without_raw_ids \
+  -v
+
+rg -n '"(id|hash|cursor|next_cursor|ask_id|ask_id_str|ask_client_id|ask_client_id_str|bid_id|bid_id_str|bid_client_id|bid_client_id_str|trade_id|trade_id_str|tx_hash)"[[:space:]]*:' \
+  runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TARGET-WINDOW-GETONLY-DIAGNOSTIC-SANITIZED-20260505T143000Z \
+  runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-GETONLY-SANITIZED-DIAGNOSTIC-20260505T143000Z \
+  runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-GETONLY-SANITIZED-DIAGNOSTIC-20260505T143000Z
+```
+
+Result:
+
+```text
+Compile: PASS
+Focused tests: PASS, 3 tests
+Raw exact-key scan: PASS, no matches
+Operational verdict: HOLD; diagnostic path is redaction-safe but not target-linkable for current Phase 5.1u Lighter targets.
+```
+
 ## Phase 5.1z Lighter Source-Link Request Pack
 
 - Run id: `PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z`

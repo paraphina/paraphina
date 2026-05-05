@@ -61,6 +61,12 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _is_sha256_hex(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(ch in "0123456789abcdef" for ch in value.lower())
+
+
 def _hash_or_none(value: Any) -> str | None:
     return _stable_hash(value) if value not in (None, "") else None
 
@@ -193,13 +199,17 @@ def _extract_items(payload: Any, keys: set[str]) -> list[dict[str, Any]]:
     return []
 
 
-def _id_hashes(*values: Any) -> set[str]:
+def _id_hashes(*values: Any, prehashed_values: tuple[Any, ...] = ()) -> set[str]:
     hashes: set[str] = set()
     for value in values:
         if value in (None, ""):
             continue
         hashes.add(_stable_hash(value))
         hashes.add(_stable_hash(str(value)))
+    for value in prehashed_values:
+        if value in (None, "") or not _is_sha256_hex(value):
+            continue
+        hashes.add(str(value).lower())
     return hashes
 
 
@@ -217,6 +227,13 @@ def _trade_uid_hash(trade: dict[str, Any]) -> str:
         trade.get("bid_id"),
         trade.get("ask_client_id"),
         trade.get("bid_client_id"),
+        trade.get("trade_id_sha256"),
+        trade.get("trade_id_str_sha256"),
+        trade.get("tx_hash_sha256"),
+        trade.get("ask_id_sha256"),
+        trade.get("bid_id_sha256"),
+        trade.get("ask_client_id_sha256"),
+        trade.get("bid_client_id_sha256"),
     ])
 
 
@@ -244,6 +261,12 @@ def _side_hashes(trade: dict[str, Any], account_side: str | None) -> set[str]:
             trade.get("ask_id_str"),
             trade.get("ask_client_id"),
             trade.get("ask_client_id_str"),
+            prehashed_values=(
+                trade.get("ask_id_sha256"),
+                trade.get("ask_id_str_sha256"),
+                trade.get("ask_client_id_sha256"),
+                trade.get("ask_client_id_str_sha256"),
+            ),
         )
     if account_side == "BID":
         return _id_hashes(
@@ -251,6 +274,12 @@ def _side_hashes(trade: dict[str, Any], account_side: str | None) -> set[str]:
             trade.get("bid_id_str"),
             trade.get("bid_client_id"),
             trade.get("bid_client_id_str"),
+            prehashed_values=(
+                trade.get("bid_id_sha256"),
+                trade.get("bid_id_str_sha256"),
+                trade.get("bid_client_id_sha256"),
+                trade.get("bid_client_id_str_sha256"),
+            ),
         )
     return set()
 
@@ -374,7 +403,11 @@ def _load_native_trade_index(lighter_trade_backfill_runs: list[Path]) -> tuple[d
                 "native_trade_timestamp_ms": _safe_int(
                     trade.get("timestamp") or trade.get("time") or trade.get("created_at")
                 ),
-                "native_trade_hash": _hash_or_none(trade.get("tx_hash")),
+                "native_trade_hash": (
+                    str(trade.get("tx_hash_sha256")).lower()
+                    if _is_sha256_hex(trade.get("tx_hash_sha256"))
+                    else _hash_or_none(trade.get("tx_hash"))
+                ),
                 "lighter_trade_backfill_run": str(run),
             }
             for identity_hash in _side_hashes(trade, account_side):

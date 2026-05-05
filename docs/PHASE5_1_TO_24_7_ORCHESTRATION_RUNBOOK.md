@@ -1199,6 +1199,34 @@ sidecar placeholder with a validated sidecar path, rerun Phase 5.1v. If Phase
 or claim blocker reduction; switch to a bounded GET-only target-window Lighter
 trade capture diagnostic.
 
+The bounded GET-only Lighter target-window diagnostic was attempted on
+2026-05-05 after hardening `tools/phase51c_lighter_trade_backfill.py` to hash
+raw order/trade/client/tx identifiers, hash cursor tokens, and fail closed on
+raw identifier-like keys before writing sanitized artifacts.
+
+```text
+trade diagnostic: runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TARGET-WINDOW-GETONLY-DIAGNOSTIC-SANITIZED-20260505T143000Z
+native-role replay: runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-GETONLY-SANITIZED-DIAGNOSTIC-20260505T143000Z
+readiness run: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-GETONLY-SANITIZED-DIAGNOSTIC-20260505T143000Z
+gate_status: HOLD
+trade rows fetched: 400
+raw_identifier_redaction_status: PASS
+raw_identifier_key_violation_count: 0
+sanitized unlinked Lighter source rows: 400
+current Lighter native-role targets recovered: 0 / 125
+native-role targets ready: 0 / 287
+Lighter native-limit pressure ready: 0 / 3132
+```
+
+Operational implication: the GET-only `/api/v1/trades` surface is now safe as a
+diagnostic artifact path, but this target-window sample still does not link to
+the current Phase 5.1u Lighter targets. Do not repeat the same diagnostic unless
+the target window or source surface changes. The next move remains a validated
+redacted source-link sidecar or a different non-live authorized Lighter source
+that directly links to the current target hashes. Lighter request-pressure
+evidence remains a separate blocker requiring event-time sendTx plus
+REST-or-weighted limit/remaining fields.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
