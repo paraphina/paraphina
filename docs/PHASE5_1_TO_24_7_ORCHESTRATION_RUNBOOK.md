@@ -1384,11 +1384,18 @@ lighter native-limit pressure ready: 0 / 3132
 raw_identifier_redaction_status: PASS
 ```
 
-Operational implication: the all-venue pack is preferred when resuming the
-native-role source-link blocker because it preserves one deterministic sidecar
-request across all non-Hyperliquid unlinked hashes. It still cannot clear
-Phase 5.1 without a validated redacted sidecar or a directly target-linkable
-non-live source.
+Operational implication: this all-venue pack is retained as historical
+evidence, but it is no longer the preferred resume artifact. Use the
+current-target wide request pack instead:
+
+```text
+runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+```
+
+The current-target wide pack preserves the broader `2819` current unlinked
+source hashes and supersedes the older all-venue pack for source-link handoff.
+Neither pack can clear Phase 5.1 without a validated redacted sidecar or a
+directly target-linkable non-live source.
 
 The bounded GET-only Lighter target-window diagnostic was attempted on
 2026-05-05 after hardening `tools/phase51c_lighter_trade_backfill.py` to hash
@@ -1453,6 +1460,32 @@ empty headers, tiers, docs, or empty WebSocket account snapshots.
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
 production readiness.
 
-`PROMOTE` only for the next Phase 5.1 non-live maker-taker/native-limit
-feature-completeness evidence step. No model training, EV admission, canary, or
-live trading is authorized.
+`PROMOTE` only for the fail-closed non-live evidence tooling already accepted
+through Phase 5.1ae. No model training, EV admission, canary, or live trading
+is authorized.
+
+Current resume path:
+
+```text
+native-role blocker:
+1. Obtain a validated redacted mapping for
+   runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z.
+2. Run Phase 5.1ad to materialize source_links.sanitized.jsonl.
+3. Run Phase 5.1ae to compose the materialized manifest with the existing
+   Hyperliquid source.
+4. Run Phase 5.1v against the composed candidate manifest.
+
+Lighter pressure blocker:
+1. Obtain sanitized event-time Lighter pressure rows with active-order
+   headroom, sendTx limit/remaining, REST-or-weighted limit/remaining, and
+   event-time alignment.
+2. Run Phase 5.1ab to stage the rows.
+3. Include the Phase 5.1ab candidate manifest through Phase 5.1ae before the
+   next all-five Phase 5.1v readiness review.
+```
+
+Current stop condition: without those source-owner artifacts or a materially
+different non-live source surface, there is no safe local implementation move
+that can reduce the Phase 5.1 HOLD blocker. Do not infer source links or
+Lighter pressure from time/price/size proximity, documentation-only limits,
+GET-only caps, empty headers, account tiers, or empty WebSocket snapshots.
