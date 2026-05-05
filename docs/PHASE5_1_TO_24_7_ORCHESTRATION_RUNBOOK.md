@@ -228,6 +228,38 @@ python3 tools/phase51ac_source_link_reuse_audit.py \
 If `reusable_source_link_count` is zero or `candidate_sidecar_complete=false`,
 obtain a new validated redacted sidecar or directly target-linkable source.
 
+### Gate 5.1ad - Source-Link Sidecar Materialization
+
+Allowed:
+
+- HOLD-only materialization of a Phase 5.1v-compatible
+  `source_links.sanitized.jsonl` from a Phase 5.1z request pack and a redacted
+  mapping file.
+- Mapping file fields are limited to `source_record_sha256` or equivalent
+  accepted source hash field plus `canonical_group_id` or `order_key`.
+- Emission of a candidate manifest that points at the materialized sidecar.
+
+Hard boundary:
+
+- Phase 5.1ad must not infer missing links.
+- Phase 5.1ad must not read or emit raw order IDs, client IDs, trade IDs,
+  secrets, unsafe true authorization flags, or cross-venue mappings.
+- Materialization is not blocker clearance; it must be followed by Phase 5.1v
+  validation against the materialized candidate manifest.
+
+Resume command pattern:
+
+```bash
+python3 tools/phase51ad_source_link_sidecar_materialize.py \
+  --request-pack runs/phase51z_source_link_request_pack/<phase51z_request_pack> \
+  --mapping <validated_redacted_mapping.jsonl> \
+  --output-root runs/phase51ad_source_link_sidecar_materialize \
+  --run-id <phase51ad_run_id>
+```
+
+Then run the `phase51v_validation_command` emitted in
+`phase51ad_source_link_sidecar_materialize_summary.json`.
+
 ### Gate 5.1c - Calibration Label Lake
 
 Required evidence:

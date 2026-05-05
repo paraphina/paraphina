@@ -722,6 +722,17 @@ sidecar cannot be deterministically derived from existing repo-owned sidecars;
 a new validated redacted sidecar or directly target-linkable source remains
 required.
 
+Phase 5.1ad adds a HOLD-only source-link sidecar materializer. It consumes a
+Phase 5.1z request pack plus an externally validated redacted mapping containing
+only `source_record_sha256` and `canonical_group_id` or `order_key`, validates
+the mapping against request-pack sources and Phase 5.1u targets, rejects raw
+identifier fields, secrets, unsafe true flags, duplicate source hashes, unknown
+source hashes, unknown target keys, and cross-venue joins, and emits a
+Phase 5.1v-compatible `source_links.sanitized.jsonl` plus candidate manifest.
+It does not infer missing links and does not itself clear blockers; it makes the
+next redacted sidecar submission deterministic and repo-owned once a validated
+mapping exists.
+
 The 2026-05-05 bounded GET-only Lighter target-window diagnostic was attempted
 after hardening the Lighter trade-backfill redaction path. The regenerated
 HOLD-only run captured `400` read-only trades, passed fail-closed raw

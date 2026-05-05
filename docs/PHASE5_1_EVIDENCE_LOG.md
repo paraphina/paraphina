@@ -303,6 +303,47 @@ EV admission, live/canary deployment, capital escalation, risk-limit
 relaxation, or economic claims.
 ```
 
+## 2026-05-05 - Phase 5.1ad Source-Link Sidecar Materializer
+
+Scope:
+
+- Tool: `tools/phase51ad_source_link_sidecar_materialize.py`
+- Mode: HOLD-only materialization of a Phase 5.1v-compatible sidecar from a
+  Phase 5.1z request pack plus a validated redacted mapping file.
+- Live/canary/capital/risk: not authorized.
+- Link inference: not performed.
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51ad_source_link_sidecar_materialize.py
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51ad_source_link_sidecar_materialize_validates_redacted_mappings
+```
+
+Result:
+
+```text
+focused test: PASS
+downstream Phase 5.1v compatibility: PASS in synthetic fixture
+rejects unknown source hash: PASS
+rejects raw identifier mapping: PASS
+rejects duplicate source hash mapping: PASS
+clears_phase51_blockers: false
+```
+
+Evidence boundary:
+
+```text
+accepted: the repo can now fail-closed materialize a sanitized source-link
+sidecar from validated redacted mappings and produce a candidate manifest for
+Phase 5.1v validation.
+
+not accepted: an actual all-venue request-pack sidecar, blocker clearance,
+inferred links, model training, EV admission, live/canary deployment, capital
+escalation, risk-limit relaxation, or economic claims.
+```
+
 ## 2026-05-05 - Phase 5.1ac Source-Link Reuse Audit
 
 Scope:

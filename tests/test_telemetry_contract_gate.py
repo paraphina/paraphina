@@ -798,6 +798,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51ac_source_link_reuse_audit.py"
 
+    def _get_phase51ad_source_link_sidecar_materialize_path(self) -> Path:
+        """Get path to the Phase 5.1ad source-link sidecar materializer gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51ad_source_link_sidecar_materialize.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -8812,6 +8817,250 @@ class TestValidatorSubprocess(unittest.TestCase):
             )
             self.assertEqual(unsafe_result.returncode, 2)
             self.assertIn("raw identifier", unsafe_result.stderr)
+
+    def test_phase51ad_source_link_sidecar_materialize_validates_redacted_mappings(self):
+        """5.1ad should materialize only request-pack source hashes and target keys."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            request_pack = tmp_path / "request_pack"
+            target_run = tmp_path / "phase51u_targets"
+            source_path = tmp_path / "phase51z_sources.jsonl"
+            mapping_path = tmp_path / "mapping.jsonl"
+            output_root = tmp_path / "phase51ad"
+            phase51v_root = tmp_path / "phase51v"
+            request_pack.mkdir()
+            target_run.mkdir()
+
+            source_hash = hashlib.sha256(b"phase51ad-source").hexdigest()
+            canonical_group_id = "group-aster"
+            order_key = "order-aster"
+            source_row = {
+                "label_type": "PHASE51Z_UNLINKED_NATIVE_ROLE_SOURCE",
+                "source_record_sha256": source_hash,
+                "venue_id": "aster",
+                "e": "ORDER_TRADE_UPDATE",
+                "o": {"m": True, "l": "0.01"},
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }
+            target_row = {
+                "label_type": "PHASE51U_NATIVE_ROLE_CAPTURE_TARGET",
+                "canonical_group_id": canonical_group_id,
+                "order_key": order_key,
+                "venue_id": "aster",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }
+            source_path.write_text(json.dumps(source_row) + "\n", encoding="utf-8")
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 1,
+                "lighter_native_limit_capture_target_count": 0,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(
+                json.dumps(target_row) + "\n",
+                encoding="utf-8",
+            )
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text("", encoding="utf-8")
+            (request_pack / "source_link_request_sources.jsonl").write_text(
+                json.dumps({
+                    "label_type": "PHASE51Z_SOURCE_LINK_REQUEST_SOURCE",
+                    "source_record_sha256": source_hash,
+                    "venue_id": "aster",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            (request_pack / "source_link_request_targets.jsonl").write_text(
+                json.dumps({
+                    "label_type": "PHASE51Z_SOURCE_LINK_REQUEST_TARGET",
+                    "canonical_group_id": canonical_group_id,
+                    "order_key": order_key,
+                    "venue_id": "aster",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            empty_sidecar_path = request_pack / "source_links.proposed.empty.jsonl"
+            empty_sidecar_path.write_text("", encoding="utf-8")
+            empty_manifest_path = request_pack / "candidate_manifest_with_empty_sidecar.json"
+            empty_manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [{"source_id": "source", "venue_id": "aster", "path": str(source_path)}],
+                "source_links": [{"source_link_id": "empty", "path": str(empty_sidecar_path)}],
+            }), encoding="utf-8")
+            (request_pack / "phase51z_source_link_request_pack_summary.json").write_text(json.dumps({
+                "run_id": "phase51z_request_pack",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "target_run": str(target_run),
+                "source_path": str(source_path),
+                "candidate_manifest_with_empty_sidecar": str(empty_manifest_path),
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            mapping_path.write_text(json.dumps({
+                "source_record_sha256": source_hash,
+                "canonical_group_id": canonical_group_id,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ad_source_link_sidecar_materialize_path()),
+                    "--request-pack",
+                    str(request_pack),
+                    "--mapping",
+                    str(mapping_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51ad_materialize_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51ad_materialize_test"
+            summary = json.loads(
+                (run_dir / "phase51ad_source_link_sidecar_materialize_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["source_link_request_source_count"], 1)
+            self.assertEqual(summary["materialized_source_link_count"], 1)
+            self.assertTrue(summary["candidate_sidecar_complete"])
+            self.assertFalse(summary["clears_phase51_blockers"])
+            sidecar_text = (run_dir / "source_links.sanitized.jsonl").read_text(encoding="utf-8")
+            self.assertIn(source_hash, sidecar_text)
+            self.assertIn(canonical_group_id, sidecar_text)
+            self.assertNotIn("client_order_id", sidecar_text)
+            self.assertNotIn("trade_id", sidecar_text)
+
+            phase51v_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(run_dir / "candidate_manifest_with_materialized_sidecar.json"),
+                    "--output-root",
+                    str(phase51v_root),
+                    "--run-id",
+                    "phase51ad_materialize_to_phase51v_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                phase51v_result.returncode,
+                0,
+                f"stdout: {phase51v_result.stdout}\nstderr: {phase51v_result.stderr}",
+            )
+            phase51v_summary = json.loads(
+                (
+                    phase51v_root
+                    / "phase51ad_materialize_to_phase51v_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(phase51v_summary["native_role_capture_target_ready_count"], 1)
+            self.assertEqual(phase51v_summary["source_link_applied_row_count"], 1)
+
+            rejection_cases = [
+                (
+                    "unknown_source",
+                    {"source_record_sha256": hashlib.sha256(b"unknown").hexdigest(), "canonical_group_id": canonical_group_id},
+                    "source hash not found",
+                ),
+                (
+                    "raw_identifier",
+                    {"source_record_sha256": source_hash, "canonical_group_id": canonical_group_id, "client_order_id": "raw"},
+                    "raw identifier",
+                ),
+                (
+                    "duplicate_source",
+                    [
+                        {"source_record_sha256": source_hash, "canonical_group_id": canonical_group_id},
+                        {"source_record_sha256": source_hash, "canonical_group_id": canonical_group_id},
+                    ],
+                    "duplicate mapping",
+                ),
+            ]
+            for suffix, payload, expected_error in rejection_cases:
+                bad_mapping = tmp_path / f"bad_{suffix}.jsonl"
+                rows = payload if isinstance(payload, list) else [payload]
+                bad_mapping.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                bad_result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(self._get_phase51ad_source_link_sidecar_materialize_path()),
+                        "--request-pack",
+                        str(request_pack),
+                        "--mapping",
+                        str(bad_mapping),
+                        "--output-root",
+                        str(output_root),
+                        "--run-id",
+                        f"phase51ad_bad_{suffix}",
+                        "--timestamp-ns",
+                        "1700000000000000000",
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(bad_result.returncode, 2)
+                self.assertIn(expected_error, bad_result.stderr)
+
+            dirty_manifest_path = request_pack / "candidate_manifest_with_empty_sidecar.json"
+            original_manifest_text = dirty_manifest_path.read_text(encoding="utf-8")
+            dirty_manifest = json.loads(original_manifest_text)
+            dirty_manifest["sources"][0]["client_order_id"] = "raw-client-id"
+            dirty_manifest_path.write_text(json.dumps(dirty_manifest), encoding="utf-8")
+            dirty_manifest_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ad_source_link_sidecar_materialize_path()),
+                    "--request-pack",
+                    str(request_pack),
+                    "--mapping",
+                    str(mapping_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51ad_bad_manifest_raw_identifier",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(dirty_manifest_result.returncode, 2)
+            self.assertIn("raw identifier", dirty_manifest_result.stderr)
+            dirty_manifest_path.write_text(original_manifest_text, encoding="utf-8")
 
     def test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar(self):
         """5.1v should use validated source-link sidecars to join source rows to targets."""

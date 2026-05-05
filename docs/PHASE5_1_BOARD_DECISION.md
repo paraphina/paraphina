@@ -2086,3 +2086,41 @@ pack, or capture a different non-live authorized target-linkable native-role
 source. Keep the Lighter native-limit pressure path separate through Phase
 5.1ab.
 ```
+
+## Phase 5.1ad Source-Link Sidecar Materialization Decision
+
+Decision: `PROMOTE` only the repo-owned HOLD-only materializer scaffold;
+`HOLD` for blocker reduction until a validated redacted mapping exists and
+Phase 5.1v validates the materialized candidate manifest.
+
+Evidence:
+
+```text
+tool: tools/phase51ad_source_link_sidecar_materialize.py
+input contract: Phase 5.1z request pack + redacted mapping file
+mapping fields: source_record_sha256 plus canonical_group_id or order_key
+output: source_links.sanitized.jsonl and candidate_manifest_with_materialized_sidecar.json
+clears_phase51_blockers: false
+```
+
+Board interpretation:
+
+```text
+accepted: the repo can now materialize and validate externally supplied
+redacted source-link mappings without raw identifier persistence, link
+inference, or manual manifest surgery.
+
+not accepted: any claim that a source-link sidecar has been obtained for the
+all-venue request pack, any blocker clearance without Phase 5.1v validation,
+any model-training/EV-admission promotion, or any live/canary/capital/risk
+change.
+```
+
+Next move:
+
+```text
+Use Phase 5.1ad only after a validated redacted mapping is available. Until
+then, continue safe target-linkable source capture and Lighter native-limit
+pressure acquisition without repeating exhausted GET-only/header/empty-WS
+paths.
+```
