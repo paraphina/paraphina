@@ -3,10 +3,15 @@
 Status: Phase 5.1/V2 is non-live unless the current `ROADMAP.md` and a fresh
 board decision explicitly say otherwise.
 
-Purpose: allow a future Executive Orchestrator to resume Paraphina with a short
-prompt, while preserving safety boundaries and evidence discipline. This file is
-a bootstrap checklist and resume card. It is not a roadmap, evidence log, board
-decision, live runbook, or live-trading authorization.
+Purpose: define the evergreen Executive Orchestrator operating system for
+Paraphina. This file tells an orchestrator how to resume, govern a small board
+of subagents, continue autonomous non-live work, audit itself, and stop at the
+right boundaries.
+
+This file is not a roadmap, evidence log, board decision, live runbook,
+production-readiness declaration, or live-trading authorization. Do not encode
+volatile blocker counts, run IDs, artifact paths, next moves, or commit SHAs
+here.
 
 ## Short Resume Prompt
 
@@ -14,17 +19,17 @@ decision, live runbook, or live-trading authorization.
 Resume Paraphina Executive Orchestrator mode.
 
 Use `AGENTS.md` and `docs/EXECUTIVE_ORCHESTRATOR_BOOTSTRAP.md` as bootstrap
-instructions, then verify `ROADMAP.md`, `docs/V2_SPECIFICATION.md`,
-`docs/PHASE5_1_BOARD_DECISION.md`,
-`docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`,
-`docs/PHASE5_1_EVIDENCE_LOG.md`, the latest git state, and GitHub CI.
+instructions. Derive current status from `ROADMAP.md`, generated Phase 5 state,
+Phase 5.1 evidence docs, git, and GitHub CI.
 
-Identify the single highest-leverage safe next move and execute autonomously
-until the bounded objective is implemented, validated, documented, committed,
-pushed, and CI-green.
+Operate the autonomous non-live V2 workflow: choose the single highest-leverage
+safe next move, deploy a bounded board only where useful, implement, validate,
+document, commit, push, verify CI, audit, record handoff, then repeat.
 
-Preserve all no-live, no-canary, no-capital-escalation, no-risk-relaxation,
-no-secrets, and no-unverified-economic-claims constraints.
+Stop only at explicit stop conditions: live/canary/capital/risk authorization,
+secrets or credentials boundary, missing human-provided evidence, dirty or
+contradictory repo state, failing tests/CI, or any request to make unverified
+economic or production-readiness claims.
 ```
 
 ## Bootstrap Checklist
@@ -34,15 +39,54 @@ no-secrets, and no-unverified-economic-claims constraints.
 3. Read `AGENTS.md`.
 4. Read `docs/AGENT_START_HERE.md`.
 5. Read the Phase 5.1/V2 gate in `ROADMAP.md`.
-6. Read the current relevant section of `docs/V2_SPECIFICATION.md`.
-7. Read the latest relevant section of `docs/PHASE5_1_BOARD_DECISION.md`.
-8. Read the current resume section of
+6. Read generated Phase 5 state only as context: `phase5/status.md` and
+   `phase5/queue.yaml`.
+7. Read the current relevant section of `docs/V2_SPECIFICATION.md`.
+8. Read the latest relevant section of `docs/PHASE5_1_BOARD_DECISION.md`.
+9. Read the current procedure section of
    `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`.
-9. Read the latest relevant section of `docs/PHASE5_1_EVIDENCE_LOG.md`.
-10. Verify GitHub Actions for the current head before claiming GitHub is up to
+10. Read the latest relevant section of `docs/PHASE5_1_EVIDENCE_LOG.md`.
+11. Verify GitHub Actions for the current head before claiming GitHub is up to
     date.
-11. State the active phase, gate status, blocker, next single move, and stop
+12. State the active phase, gate status, blocker, next single move, and stop
     conditions before editing files.
+
+## Authority And Status Derivation
+
+Use this file for process mechanics only. Derive volatile status from current
+source material every session.
+
+1. Executable code and tests.
+2. Structured generated state, including `phase5/queue.yaml`.
+3. Current status boards, including `phase5/status.md`.
+4. `ROADMAP.md` for strategic and execution-control authority.
+5. `docs/V2_SPECIFICATION.md` for Phase 5.1/V2 target requirements.
+6. `docs/PHASE5_1_BOARD_DECISION.md`,
+   `docs/PHASE5_1_TO_24_7_ORCHESTRATION_RUNBOOK.md`, and
+   `docs/PHASE5_1_EVIDENCE_LOG.md` for non-live gate procedure and evidence
+   status.
+7. Historical or generated supporting docs.
+
+When sources disagree, stop implementation work and resolve the contradiction
+against code, tests, structured state, and `ROADMAP.md`.
+
+## Autonomous Execution Loop
+
+This is the default loop for non-live V2 implementation and evidence work.
+
+1. Rehydrate current repo, roadmap, evidence, and CI state.
+2. Assert the active safety boundary and current stop conditions.
+3. Identify the single highest-leverage safe next move.
+4. Constitute the smallest useful board; reuse or close agents as needed.
+5. Assign each subagent a bounded mandate, inputs, outputs, and stop condition.
+6. Integrate findings into one executive decision.
+7. Implement the smallest repo-owned change that advances the blocker.
+8. Generate or update non-live evidence packs only where relevant.
+9. Run focused checks first, then the relevant broader gates.
+10. Update docs and handoff notes so another orchestrator can resume.
+11. Audit the plan, implementation, evidence, and safety boundary.
+12. Commit, push, verify GitHub CI, and record the final handoff.
+13. Repeat automatically unless a stop condition is reached.
 
 ## Standing Safety Boundary
 
@@ -54,68 +98,31 @@ no-secrets, and no-unverified-economic-claims constraints.
   authorization material, private keys, JWTs, or `.env` contents.
 - Do not make economic or profitability claims without accepted
   balance-authoritative evidence.
+- Do not infer production readiness from implementation completeness,
+  shadow/replay evidence, model EV, telemetry PnL, fill-level PnL, or
+  counterfactual labels.
 - Do not mutate `phase5/queue.yaml`, `phase5/orchestration.yaml`,
   `phase5/runs/**`, `/etc/paraphina`, `/opt/paraphina`,
   `/var/lib/paraphina`, or `/home/ubuntu/promotion_runs` unless the operator
   explicitly authorizes that exact runtime action.
 
-## Current Resume Card
-
-Verify this card against `ROADMAP.md` before acting; it is a convenience
-summary and may become stale.
-
-- Latest known commit at creation: `d1a702b16ea7dd48d3b8c7247038d03fd69cbd1d`
-  (`Add Phase 5.1z source-link request pack`).
-- Latest known Phase 5.1/V2 status: `specified_holding_nonlive`.
-- Latest known verdict: `HOLD` for model training, EV admission, canary, live
-  orders, capital escalation, risk-limit relaxation, financial claims, and
-  24/7 readiness.
-- Latest known blocker: `214 / 287` native-role targets still missing after
-  Phase 5.1z plus Hyperliquid, and Lighter event-time native-limit pressure
-  remains `0 / 3132`.
-- Latest known Lighter source-link resume point:
-  `runs/phase51z_source_link_request_pack/PHASE51Z-LIGHTER-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z`.
-- Latest known empty-sidecar validation:
-  `runs/phase51v_forward_capture_bundle_readiness/PHASE51V-LIGHTER-SOURCE-LINK-REQUEST-PACK-EMPTY-SIDECAR-HOLD-20260505T000000Z`.
-
-## Next Single Move
-
-Verify against `ROADMAP.md` before acting.
-
-Populate the request pack sidecar with validated redacted links only:
-`source_record_sha256` plus `canonical_group_id` or `order_key`. The sidecar
-must not contain raw order IDs, client IDs, trade IDs, secrets, authorization
-material, or unsafe true flags. Rerun Phase 5.1v against the request-pack
-candidate manifest after replacing the empty sidecar path with the validated
-sidecar.
-
-If no valid sidecar can be produced, the next safe diagnostic is a bounded
-GET-only target-window Lighter `/api/v1/trades` capture. That diagnostic is not
-a promotion path.
-
-Separately find a non-live-authorized source for event-time sendTx plus
-REST-or-weighted limit/remaining pressure. Do not infer missing Lighter
-pressure from GET-only caps, empty headers, account tiers, or
-documentation-only limits.
-
 ## Do Not Do
 
-- Do not rerun retained Lighter trade-backfill snapshots as blocker-reduction
-  work; the current roadmap marks them exhausted for direct current target
-  recovery.
-- Do not infer native role, request pressure, profitability, or economic
-  readiness from documentation-only facts.
-- Do not run downstream Phase 5.1s, Phase 5.1r, Phase 5.1q, Phase 5.1n,
-  Phase 5.1h, or Phase 5.1i unless Phase 5.1v reports target readiness
-  improvement and emits the required readiness output.
-- Do not train models or admit EV from Phase 5.1u, 5.1w, 5.1v, 5.1s, 5.1r,
-  5.1q, or 5.1z artifacts.
-- Do not treat source-link-only manifests as native truth; linked source rows
-  still need required native role or native-limit fields.
+- Do not infer venue-native truth from documentation-only facts, account tiers,
+  configured caps, empty headers, source-link-only manifests, or intent-only
+  telemetry.
+- Do not treat source-link-only rows as native truth; linked source rows still
+  need required native role or native-limit fields.
+- Do not train models, admit EV, promote live/canary, escalate capital, relax
+  risk limits, or claim economic readiness from Phase 5.1 evidence without fresh
+  committed authority.
+- Do not encode current blocker counts, run paths, issue lists, next moves, or
+  CI IDs here.
 
-## Board Structure
+## Board Operating Model
 
-Use the smallest board that materially advances the active blocker.
+Use the smallest board that materially advances the active blocker. The board is
+mandate-driven, not title-driven.
 
 - Executive Orchestrator: owns sequencing, repo safety, GitHub state, final
   decisions, and the single next move.
@@ -130,23 +137,98 @@ Use the smallest board that materially advances the active blocker.
 - Independent Auditor: use to challenge whether the proposed next move is still
   highest-leverage and safe.
 
-Deploy subagents only when parallel work is genuinely useful. Reuse or close
-agents as soon as their mandate is complete. Do not leave agents running without
-a specific active mandate.
+Dynamic specialists may be deployed for ML/calibration, venue microstructure,
+security/secrets, CI/GitHub, documentation/handoff, or other bounded specialties
+only when they materially accelerate or de-risk the active blocker.
 
-## Required Handoff After Each Move
+## Subagent Use Rules
+
+- Deploy subagents only when parallel work is genuinely useful.
+- Reuse existing agents when their context is still relevant.
+- Close stale, redundant, or completed agents promptly.
+- Do not leave agents running without a specific active mandate.
+- Do not duplicate work between the orchestrator and subagents.
+- Assign each agent a clear mandate, allowed read/write scope, expected output,
+  and stop condition.
+- Replace or close any agent that proposes live/canary/capital/risk overreach,
+  unverified economic claims, secrets exposure, or scope expansion.
+- The Executive Orchestrator remains accountable for final decisions.
+
+## Audit Cadence
+
+Audit at these points:
+
+- after planning;
+- after subagent findings;
+- after implementation;
+- after evidence generation;
+- before commit;
+- after GitHub CI;
+- before any gate verdict, promotion recommendation, or claim of readiness.
+
+The Independent Auditor must explicitly answer: `Is this still the
+highest-leverage safe move?`
+
+## Stop Conditions
+
+Stop and ask for operator action if any condition occurs:
+
+- live, canary, capital, or risk-limit authorization is required;
+- a secret, private key, JWT, signed payload, auth header, or raw private
+  identifier would need to be exposed or committed;
+- repo/runtime state contradicts the safety boundary;
+- current work requires a private source the orchestrator cannot safely fetch
+  with existing local credentials;
+- working tree is dirty in a way that conflicts with the task;
+- tests, docs checks, or GitHub CI fail and cannot be safely resolved locally;
+- a model, EV-admission, economic, financial, or production-readiness claim
+  would require evidence beyond the current committed authority;
+- source-of-truth docs disagree and the conflict cannot be resolved from code,
+  tests, structured state, and `ROADMAP.md`.
+
+Otherwise continue the autonomous loop.
+
+## GitHub And Branch Hygiene
+
+- Keep changes small, bounded, and reviewable.
+- Prefer isolated branches or PRs for risky, runtime-affecting, or broad
+  changes.
+- Direct pushes to `main` are acceptable only for bounded non-live changes when
+  current repo practice or explicit operator instruction supports that path.
+- Never direct-push live-affecting, promotion-state, secret-handling, or
+  runtime-control changes.
+- Do not declare GitHub up to date until the pushed head is visible on GitHub
+  and required Actions are green or their failures are explicitly explained.
+
+## Handoff Record Template
 
 Before declaring a bounded objective complete, record:
 
-- Current phase and active blocker.
-- Board/subagent structure used.
-- Executive decision.
-- Files changed.
-- Evidence generated.
-- Tests and checks run.
-- Commit SHA.
-- GitHub/CI status.
-- Remaining blocker.
-- Next single move.
+```text
+Current phase and active blocker:
+Board/subagent structure used:
+Executive decision:
+Files changed:
+Evidence generated:
+Tests and checks run:
+Commit SHA:
+GitHub/CI status:
+Remaining blocker:
+Next single move:
+Stop conditions still active:
+```
 
 If any item cannot be verified, say so and keep the gate at `HOLD`.
+
+## Do Not Encode Here
+
+Do not store any of the following in this bootstrap document:
+
+- volatile blocker counts;
+- commit SHAs;
+- run IDs or artifact paths;
+- PR, issue, or CI IDs;
+- next single moves;
+- live/canary recipes;
+- promotion decisions;
+- venue secrets, raw identifiers, signed payloads, or account-private values.

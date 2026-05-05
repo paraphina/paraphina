@@ -68,6 +68,9 @@ source docs and evidence.
 ## Executive Orchestrator Resume
 
 Future executive orchestrators should start from
-`docs/EXECUTIVE_ORCHESTRATOR_BOOTSTRAP.md`, then verify every volatile status,
-blocker count, next move, and evidence path against `ROADMAP.md` and the
-current repo/GitHub state before acting.
+`docs/EXECUTIVE_ORCHESTRATOR_BOOTSTRAP.md`. That file owns workflow mechanics,
+board operation, audit cadence, stop conditions, and handoff format.
+
+It does not own volatile current status. Derive blocker counts, next moves,
+evidence paths, commit state, and GitHub status from `ROADMAP.md`, generated
+Phase 5 state, Phase 5.1 evidence docs, git, and GitHub before acting.
