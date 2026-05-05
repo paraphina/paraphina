@@ -257,6 +257,71 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## 2026-05-05 - Authorized Read-Only Source Capture Follow-Up
+
+Scope: local and venue read-only source search under explicit authorization,
+using existing local credentials only. No live/canary mode, order submission,
+cancel/replace, capital escalation, risk-limit relaxation, model training, EV
+admission, or financial claim was authorized.
+
+Actions:
+
+```text
+targeted local metadata scan: 500 likely Phase 5.1 artifacts inspected
+complete Lighter event-time pressure candidates found: 0
+read-only native-role capture:
+  runs/phase51z_readonly_native_role_capture/PHASE51Z-AUTHORIZED-READONLY-NATIVE-ROLE-CAPTURE-HOLD-20260505TREADONLYZ
+Lighter target-window local sanitizer:
+  runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-TARGET-WINDOW-LOCAL-SOURCE-HOLD-20260505T2335Z
+attempted Lighter Phase 5.1b read-only limit refresh:
+  blocked before capture because LIGHTER_AUTH_TOKEN is absent and no local lighter-sdk package/path is available for --allow-sdk-auth
+```
+
+Read-only native-role capture result:
+
+```text
+gate_status: HOLD
+Aster fetched rows: 2283
+Extended fetched rows: 1601
+Paradex fetched rows: 480
+Lighter network capture: skipped by tool design; Lighter uses local 5.1b/5.1c sources
+target-linked rows emitted: 67
+target-linked rows by venue: aster=39, extended=21, paradex=7
+unlinked source rows emitted: 4295
+unlinked source rows by venue: aster=2243, extended=1579, paradex=473
+clears_phase51_blockers: false
+```
+
+Lighter target-window local sanitizer result:
+
+```text
+input source: retained 400-row read-only Lighter target-window trade snapshot
+gate_status: HOLD
+native-field-ready Lighter rows: 400
+target-linked Lighter rows emitted: 0
+unlinked Lighter source rows emitted: 400
+current Lighter native-role targets still missing: 125 / 125
+```
+
+Interpretation:
+
+```text
+accepted: the post-authorization read-only attempt confirms the existing
+  Aster/Extended/Paradex read-only source path is exhausted for direct current
+  target recovery, and the retained Lighter target-window local source remains
+  non-target-linkable under the redacted hash contract.
+accepted: no complete local Lighter event-time pressure row source was found.
+not accepted: inferred source links from time/price/size proximity, inferred
+  native-limit pressure from current caps/headers/docs, blocker clearance,
+  live/canary authorization, model training, EV admission, or financial claims.
+```
+
+Next required artifact remains unchanged: a validated redacted source-link
+mapping for the current-target wide request pack, or a different directly
+target-linkable non-live source, plus observed Lighter event-time pressure rows
+with active-order headroom, sendTx limit/remaining, REST-or-weighted
+limit/remaining, and event-time alignment.
+
 ## 2026-05-05 - Phase 5.1ab Lighter Native-Limit Pressure Source Preflight
 
 Scope:
