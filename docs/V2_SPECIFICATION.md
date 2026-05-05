@@ -734,6 +734,18 @@ It does not infer missing links and does not itself clear blockers; it makes the
 next redacted sidecar submission deterministic and repo-owned once a validated
 mapping exists.
 
+Phase 5.1ae adds a HOLD-only candidate-manifest composer. It combines
+already-local Phase 5.1v candidate manifests plus explicit local source or
+source-link artifacts into a single `candidate_manifest.composed.json`, with
+fail-closed checks for network paths, env files, symlinks, secrets, raw
+identifier fields, unsafe true flags, missing files, baseline mismatches, and
+conflicting duplicate paths. Its purpose is to remove manual manifest stitching
+after Phase 5.1ad materialization, while preserving the no-live/no-claim
+boundary. The first real Phase 5.1ae evidence run combines the current-target
+wide Aster/Extended/Lighter/Paradex request manifest with the existing
+Phase 5.1x Hyperliquid source; Phase 5.1v remains `HOLD` with `73 / 287`
+native-role targets ready and `0 / 3132` Lighter native-limit targets ready.
+
 The 2026-05-05 bounded GET-only Lighter target-window diagnostic was attempted
 after hardening the Lighter trade-backfill redaction path. The regenerated
 HOLD-only run captured `400` read-only trades, passed fail-closed raw
@@ -799,4 +811,4 @@ the sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No
 model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
 5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, Phase 5.1x,
-Phase 5.1y, or Phase 5.1z.
+Phase 5.1y, Phase 5.1z, Phase 5.1ad, or Phase 5.1ae.

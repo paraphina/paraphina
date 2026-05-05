@@ -803,6 +803,11 @@ class TestValidatorSubprocess(unittest.TestCase):
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "phase51ad_source_link_sidecar_materialize.py"
 
+    def _get_phase51ae_candidate_manifest_compose_path(self) -> Path:
+        """Get path to the Phase 5.1ae candidate-manifest composition gate."""
+        script_dir = Path(__file__).parent.parent
+        return script_dir / "tools" / "phase51ae_candidate_manifest_compose.py"
+
     def _make_valid_telemetry_record(self, tick: int = 0, **overrides) -> dict:
         """Create a valid telemetry record."""
         record = {
@@ -9068,6 +9073,341 @@ class TestValidatorSubprocess(unittest.TestCase):
                 ).exists()
             )
             dirty_manifest_path.write_text(original_manifest_text, encoding="utf-8")
+
+    def test_phase51ae_candidate_manifest_compose_validates_all_inputs(self):
+        """5.1ae should compose Phase 5.1v manifests without manual stitching."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target_run = tmp_path / "phase51u_targets"
+            target_run.mkdir()
+            output_root = tmp_path / "phase51ae"
+            phase51v_root = tmp_path / "phase51v"
+            aster_source_path = tmp_path / "aster_source.jsonl"
+            hyper_source_path = tmp_path / "hyper_source.jsonl"
+            source_link_path = tmp_path / "source_links.sanitized.jsonl"
+            aster_manifest_path = tmp_path / "aster_manifest.json"
+            hyper_manifest_path = tmp_path / "hyper_manifest.json"
+
+            source_hash = hashlib.sha256(b"phase51ae-aster-source").hexdigest()
+            aster_group = "group-aster"
+            aster_order = "order-aster"
+            hyper_group = "group-hyper"
+            hyper_order = "order-hyper"
+            limit_group = "group-lighter-limit"
+            limit_order = "order-lighter-limit"
+
+            (target_run / "phase51u_forward_capture_target_manifest_summary.json").write_text(json.dumps({
+                "run_id": "phase51u_targets",
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "gate_status": "HOLD",
+                "native_role_capture_target_count": 2,
+                "lighter_native_limit_capture_target_count": 1,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }), encoding="utf-8")
+            (target_run / "native_role_capture_targets.jsonl").write_text(
+                json.dumps({
+                    "canonical_group_id": aster_group,
+                    "order_key": aster_order,
+                    "venue_id": "aster",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n" + json.dumps({
+                    "canonical_group_id": hyper_group,
+                    "order_key": hyper_order,
+                    "venue_id": "hyperliquid",
+                    "approved_for_live": False,
+                    "approved_for_model_training": False,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            (target_run / "lighter_native_limit_capture_targets.jsonl").write_text(json.dumps({
+                "canonical_group_id": limit_group,
+                "order_key": limit_order,
+                "venue_id": "lighter",
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            aster_source_path.write_text(json.dumps({
+                "venue_id": "aster",
+                "source_record_sha256": source_hash,
+                "e": "ORDER_TRADE_UPDATE",
+                "o": {"m": True, "l": "0.01"},
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            source_link_path.write_text(json.dumps({
+                "source_record_sha256": source_hash,
+                "canonical_group_id": aster_group,
+                "order_key": aster_order,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            hyper_source_path.write_text(json.dumps({
+                "venue_id": "hyperliquid",
+                "canonical_group_id": hyper_group,
+                "order_key": hyper_order,
+                "crossed": False,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+
+            aster_manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [{"source_id": "aster_source", "venue_id": "aster", "path": str(aster_source_path)}],
+                "source_links": [{"source_link_id": "aster_links", "path": str(source_link_path)}],
+            }), encoding="utf-8")
+            hyper_manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [{"source_id": "hyper_source", "venue_id": "hyperliquid", "path": str(hyper_source_path)}],
+                "source_links": [],
+            }), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ae_candidate_manifest_compose_path()),
+                    "--candidate-manifest",
+                    str(aster_manifest_path),
+                    "--candidate-manifest",
+                    str(hyper_manifest_path),
+                    "--target-run",
+                    str(target_run),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51ae_compose_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}\nstderr: {result.stderr}")
+            run_dir = output_root / "phase51ae_compose_test"
+            summary = json.loads(
+                (run_dir / "phase51ae_candidate_manifest_compose_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["gate_status"], "HOLD")
+            self.assertEqual(summary["input_candidate_manifest_count"], 2)
+            self.assertEqual(summary["source_count"], 2)
+            self.assertEqual(summary["source_link_count"], 1)
+            self.assertFalse(summary["clears_phase51_blockers"])
+            composed = json.loads((run_dir / "candidate_manifest.composed.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(composed["sources"]), 2)
+            self.assertEqual(len(composed["source_links"]), 1)
+            self.assertFalse(composed["approved_for_live"])
+
+            phase51v_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51v_forward_capture_bundle_readiness_path()),
+                    "--target-run",
+                    str(target_run),
+                    "--candidate-manifest",
+                    str(run_dir / "candidate_manifest.composed.json"),
+                    "--output-root",
+                    str(phase51v_root),
+                    "--run-id",
+                    "phase51ae_compose_to_phase51v_test",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                phase51v_result.returncode,
+                0,
+                f"stdout: {phase51v_result.stdout}\nstderr: {phase51v_result.stderr}",
+            )
+            phase51v_summary = json.loads(
+                (
+                    phase51v_root
+                    / "phase51ae_compose_to_phase51v_test"
+                    / "phase51v_forward_capture_bundle_readiness_summary.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(phase51v_summary["native_role_capture_target_ready_count"], 2)
+            self.assertEqual(phase51v_summary["lighter_native_limit_capture_target_ready_count"], 0)
+            self.assertEqual(phase51v_summary["lighter_native_limit_capture_target_missing_count"], 1)
+            self.assertEqual(phase51v_summary["source_link_applied_row_count"], 1)
+            self.assertFalse(phase51v_summary["generated_phase51s_manifest_ready"])
+
+            unsafe_manifest_path = tmp_path / "unsafe_manifest.json"
+            unsafe_payload = json.loads(aster_manifest_path.read_text(encoding="utf-8"))
+            unsafe_payload["approved_for_live"] = True
+            unsafe_manifest_path.write_text(json.dumps(unsafe_payload), encoding="utf-8")
+            unsafe_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51ae_candidate_manifest_compose_path()),
+                    "--candidate-manifest",
+                    str(unsafe_manifest_path),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51ae_unsafe_manifest_test",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(unsafe_result.returncode, 2)
+            self.assertIn("unsafe candidate manifest flag approved_for_live=true", unsafe_result.stderr)
+
+    def test_phase51ae_candidate_manifest_compose_rejects_unsafe_inputs(self):
+        """5.1ae should fail closed on unsafe or ambiguous composition inputs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            output_root = tmp_path / "phase51ae"
+            source_path = tmp_path / "source.jsonl"
+            source_link_path = tmp_path / "source_links.sanitized.jsonl"
+            manifest_path = tmp_path / "candidate_manifest.json"
+
+            source_path.write_text(json.dumps({
+                "venue_id": "aster",
+                "canonical_group_id": "group-1",
+                "order_key": "order-1",
+                "m": True,
+                "approved_for_live": False,
+                "approved_for_model_training": False,
+            }) + "\n", encoding="utf-8")
+            source_link_path.write_text("", encoding="utf-8")
+            manifest_path.write_text(json.dumps({
+                "manifest_version": 1,
+                "baseline_commit": "18dd09512288a85e440d3977e32432c3aabc1190",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_model_training": False,
+                "approved_for_capital_escalation": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_ev_admission": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "sources": [{"source_id": "source_a", "venue_id": "aster", "path": str(source_path)}],
+                "source_links": [],
+            }), encoding="utf-8")
+
+            def run_compose(*args):
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        str(self._get_phase51ae_candidate_manifest_compose_path()),
+                        "--output-root",
+                        str(output_root),
+                        *args,
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+
+            source_link_only = run_compose(
+                "--source-link",
+                f"links={source_link_path}",
+                "--run-id",
+                "source_link_only",
+            )
+            self.assertEqual(source_link_only.returncode, 2)
+            self.assertIn("source-link-only composition is prohibited", source_link_only.stderr)
+
+            network_source = run_compose(
+                "--source",
+                "network=aster=https://example.invalid/source.jsonl",
+                "--run-id",
+                "network_source",
+            )
+            self.assertEqual(network_source.returncode, 2)
+            self.assertIn("network source[0] path is prohibited", network_source.stderr)
+
+            conflicting_duplicate = run_compose(
+                "--source",
+                f"source_a=aster={source_path}",
+                "--source",
+                f"source_b=aster={source_path}",
+                "--run-id",
+                "conflicting_duplicate",
+            )
+            self.assertEqual(conflicting_duplicate.returncode, 2)
+            self.assertIn("conflicting source metadata", conflicting_duplicate.stderr)
+
+            raw_identifier_manifest = tmp_path / "raw_identifier_manifest.json"
+            raw_identifier_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw_identifier_payload["order_id"] = "raw-order-id"
+            raw_identifier_manifest.write_text(json.dumps(raw_identifier_payload), encoding="utf-8")
+            raw_identifier = run_compose(
+                "--candidate-manifest",
+                str(raw_identifier_manifest),
+                "--run-id",
+                "raw_identifier",
+            )
+            self.assertEqual(raw_identifier.returncode, 2)
+            self.assertIn("candidate manifest leaked raw identifier fields", raw_identifier.stderr)
+
+            secret_manifest = tmp_path / "secret_manifest.json"
+            secret_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            secret_payload["api_key"] = "not-a-real-key"
+            secret_manifest.write_text(json.dumps(secret_payload), encoding="utf-8")
+            secret = run_compose(
+                "--candidate-manifest",
+                str(secret_manifest),
+                "--run-id",
+                "secret_manifest",
+            )
+            self.assertEqual(secret.returncode, 2)
+            self.assertIn("secret-shaped candidate manifest field", secret.stderr)
+
+            first = run_compose(
+                "--candidate-manifest",
+                str(manifest_path),
+                "--run-id",
+                "deterministic_a",
+                "--timestamp-ns",
+                "1700000000000000000",
+            )
+            second = run_compose(
+                "--candidate-manifest",
+                str(manifest_path),
+                "--run-id",
+                "deterministic_b",
+                "--timestamp-ns",
+                "1700000000000000000",
+            )
+            self.assertEqual(first.returncode, 0, f"stdout: {first.stdout}\nstderr: {first.stderr}")
+            self.assertEqual(second.returncode, 0, f"stdout: {second.stdout}\nstderr: {second.stderr}")
+            first_summary = json.loads(
+                (output_root / "deterministic_a" / "phase51ae_candidate_manifest_compose_summary.json")
+                .read_text(encoding="utf-8")
+            )
+            second_summary = json.loads(
+                (output_root / "deterministic_b" / "phase51ae_candidate_manifest_compose_summary.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(first_summary["candidate_manifest_sha256"], second_summary["candidate_manifest_sha256"])
 
     def test_phase51v_forward_capture_bundle_readiness_applies_source_link_sidecar(self):
         """5.1v should use validated source-link sidecars to join source rows to targets."""

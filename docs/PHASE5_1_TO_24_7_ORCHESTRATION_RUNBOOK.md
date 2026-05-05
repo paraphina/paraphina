@@ -270,6 +270,57 @@ This supersedes the narrower all-venue request pack for source-link handoff
 because it preserves `2819` current redacted unlinked source hashes while still
 remaining `HOLD` with `0` reusable existing sidecar rows.
 
+### Gate 5.1ae - Candidate Manifest Composition
+
+Allowed:
+
+- HOLD-only composition of already-local Phase 5.1v candidate manifests.
+- Optional addition of explicit local source artifacts using
+  `SOURCE_ID=VENUE_ID=PATH`.
+- Optional addition of explicit local source-link artifacts using
+  `SOURCE_LINK_ID=PATH`.
+- Emission of `candidate_manifest.composed.json` for Phase 5.1v validation.
+
+Hard boundary:
+
+- Phase 5.1ae must not infer source links or native roles.
+- Phase 5.1ae must not read or emit raw order IDs, client IDs, trade IDs,
+  secrets, network paths, env files, symlink inputs, unsafe true authorization
+  flags, or conflicting duplicate path metadata.
+- Composition is not blocker clearance; it must be followed by Phase 5.1v
+  validation against the composed candidate manifest.
+
+Resume command pattern:
+
+```bash
+python3 tools/phase51ae_candidate_manifest_compose.py \
+  --candidate-manifest runs/phase51ad_source_link_sidecar_materialize/<phase51ad_run_id>/candidate_manifest_with_materialized_sidecar.json \
+  --source phase51x_hyperliquid_forward_native_role_snapshot=hyperliquid=runs/phase51x_hyperliquid_native_role_adapter/PHASE51X-HYPERLIQUID-USERFILLS-NATIVE-ROLE-20260504T000000Z/hyperliquid_forward_native_role_snapshot.jsonl \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --output-root runs/phase51ae_candidate_manifest_compose \
+  --run-id <phase51ae_run_id>
+```
+
+Then run:
+
+```bash
+python3 tools/phase51v_forward_capture_bundle_readiness.py \
+  --target-run runs/phase51u_forward_capture_target_manifest/PHASE51U-FORWARD-CAPTURE-TARGET-LINK-HYGIENE-20260505T000000Z \
+  --candidate-manifest runs/phase51ae_candidate_manifest_compose/<phase51ae_run_id>/candidate_manifest.composed.json \
+  --output-root runs/phase51v_forward_capture_bundle_readiness \
+  --run-id <phase51v_composed_run_id>
+```
+
+Current reference composition:
+
+```text
+runs/phase51ae_candidate_manifest_compose/PHASE51AE-CURRENT-TARGET-WIDE-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260505T000000Z
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-CURRENT-TARGET-WIDE-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260505T000000Z
+```
+
+The reference composition remains `HOLD`: `73 / 287` native-role targets ready
+and `0 / 3132` Lighter native-limit targets ready.
+
 ### Gate 5.1c - Calibration Label Lake
 
 Required evidence:

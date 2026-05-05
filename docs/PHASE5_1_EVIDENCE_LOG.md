@@ -344,6 +344,57 @@ inferred links, model training, EV admission, live/canary deployment, capital
 escalation, risk-limit relaxation, or economic claims.
 ```
 
+## 2026-05-05 - Phase 5.1ae Candidate Manifest Composer
+
+Scope:
+
+- Tool: `tools/phase51ae_candidate_manifest_compose.py`
+- Mode: HOLD-only composition of local Phase 5.1v candidate manifests and
+  explicit local source/source-link artifacts.
+- Live/canary/capital/risk: not authorized.
+- Link inference: not performed.
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51ae_candidate_manifest_compose.py
+python3 -m unittest \
+  tests.test_telemetry_contract_gate.TestValidatorSubprocess.test_phase51ae_candidate_manifest_compose_validates_all_inputs
+```
+
+Real evidence run:
+
+```text
+composition: runs/phase51ae_candidate_manifest_compose/PHASE51AE-CURRENT-TARGET-WIDE-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260505T000000Z
+Phase 5.1v validation: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-CURRENT-TARGET-WIDE-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260505T000000Z
+```
+
+Results:
+
+```text
+composed source count: 2
+composed source-link count: 1
+native-role targets ready: 73 / 287
+native-role targets missing: 214 / 287
+Lighter native-limit targets ready: 0 / 3132
+Lighter native-limit targets missing: 3132 / 3132
+source-link applied row count: 0
+clears_phase51_blockers: false
+```
+
+Evidence boundary:
+
+```text
+accepted: the repo can now compose the current-target wide request/materialized
+manifest with the existing Hyperliquid source and future Lighter-pressure
+candidate manifests without manual manifest surgery.
+
+not accepted: a validated wide source-link mapping, blocker clearance,
+inferred links, Lighter native-limit pressure evidence, model training, EV
+admission, live/canary deployment, capital escalation, risk-limit relaxation,
+or economic claims.
+```
+
 ## 2026-05-05 - Current-Target Wide Source-Link Request Pack
 
 Scope:

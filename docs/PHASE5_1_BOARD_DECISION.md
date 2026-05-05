@@ -2131,3 +2131,52 @@ current-target wide request pack. Until then, continue safe target-linkable
 source capture and Lighter native-limit pressure acquisition without repeating
 exhausted GET-only/header/empty-WS paths.
 ```
+
+## Phase 5.1ae Candidate Manifest Composition Decision
+
+Decision: `PROMOTE` only the HOLD-only candidate-manifest composition gate.
+
+Rationale:
+
+- Phase 5.1ad produces a materialized manifest for the current-target wide
+  source-link request pack, but all-five validation also needs already accepted
+  Hyperliquid native-role source and, later, any Lighter native-limit pressure
+  manifest.
+- Prior combined manifests existed only as run artifacts. Phase 5.1ae makes
+  this composition deterministic, tested, and repo-owned.
+- The gate does not infer source links, does not create native-role evidence,
+  and does not clear Phase 5.1 blockers by itself.
+
+Evidence:
+
+```text
+tool: tools/phase51ae_candidate_manifest_compose.py
+input contract: local Phase 5.1v candidate manifest(s), optional local sources, optional local source-link artifacts
+output: candidate_manifest.composed.json for Phase 5.1v
+real composition run: runs/phase51ae_candidate_manifest_compose/PHASE51AE-CURRENT-TARGET-WIDE-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260505T000000Z
+Phase 5.1v validation: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-CURRENT-TARGET-WIDE-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260505T000000Z
+native-role targets ready: 73 / 287
+Lighter native-limit targets ready: 0 / 3132
+clears_phase51_blockers: false
+```
+
+Board interpretation:
+
+```text
+accepted: post-materialization validation can now compose the current-target
+wide materialized manifest with Hyperliquid and future Lighter-pressure
+manifests without manual manifest surgery.
+
+not accepted: blocker clearance, source-link inference, native-role evidence
+creation, Lighter native-limit pressure claims, model-training/EV-admission
+promotion, or any live/canary/capital/risk change.
+```
+
+Next move:
+
+```text
+When a validated redacted mapping exists, run Phase 5.1ad, compose the
+materialized candidate manifest with the Phase 5.1x Hyperliquid source through
+Phase 5.1ae, and then rerun Phase 5.1v. Add any future Phase 5.1ab Lighter
+pressure manifest through Phase 5.1ae before all-five readiness review.
+```
