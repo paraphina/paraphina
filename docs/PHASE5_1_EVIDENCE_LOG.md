@@ -5,6 +5,75 @@ run artifacts under `runs/` are ignored by Git because they contain large
 telemetry snapshots; this file preserves the reproducible evidence boundary in
 the repository.
 
+## 2026-05-06 - Phase 5.1ah Lighter Explorer Bridge Diagnostic
+
+Purpose: test the remaining non-duplicative historical Lighter source surface:
+official read-only Explorer account logs plus transaction GET details. This is
+HOLD-only evidence; it does not authorize live orders, canary, capital
+escalation, risk-limit changes, model training, EV admission, or economic
+claims.
+
+Official source scope used for design:
+
+```text
+GET https://explorer.elliot.ai/api/accounts/{param}/logs
+GET https://explorer.elliot.ai/api/logs/{hash}
+GET https://mainnet.zklighter.elliot.ai/api/v1/tx
+GET https://mainnet.zklighter.elliot.ai/api/v1/txs
+Lighter Explorer REST limit: 90 weighted requests per rolling minute
+```
+
+Changed repo-owned behavior:
+
+```text
+tool: tools/phase51ah_lighter_explorer_bridge_diagnostic.py
+test: tests/test_phase51ah_lighter_explorer_bridge_diagnostic.py
+accepted source link: fetched raw row hash must equal a current request-pack source_record_sha256 and uniquely hash-match a current Lighter target
+not allowed: order placement, cancel/modify, sendTx/sendTxBatch, env/secret exposure, time/price/size inference, account-role-only inference
+redaction: persisted source snapshots hash raw identifiers and persist embedded JSON-string fields only as presence plus SHA256
+```
+
+Real read-only diagnostic:
+
+```text
+runs/phase51ah_lighter_explorer_bridge_diagnostic/PHASE51AH-LIGHTER-EXPLORER-BRIDGE-DIAGNOSTIC-HOLD-20260506T0955Z
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+explorer log payloads: 5
+explorer log rows: 500
+explorer log time coverage: 2026-04-29T00:09:16.706Z to 2026-04-30T23:10:04.293Z
+transaction hashes followed: 40
+transaction detail payloads: 80
+labels evaluated: 1847
+bridge_status_counts.NO_REQUEST_SOURCE_OR_TARGET_MATCH: 1847
+materializable_source_link_count: 0
+gate_status: HOLD
+clears_phase51_blockers: false
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51ah_lighter_explorer_bridge_diagnostic.py
+python3 -m unittest tests.test_phase51ah_lighter_explorer_bridge_diagnostic
+rg -n "secret-signature|ClientOrderIndex|ApiKeyIndex|Sig|0x|l1_address\"|tx_hash\"|\"hash\"" \
+  runs/phase51ah_lighter_explorer_bridge_diagnostic/PHASE51AH-LIGHTER-EXPLORER-BRIDGE-DIAGNOSTIC-HOLD-20260506T0955Z
+```
+
+Result:
+
+```text
+py_compile: PASS
+focused Phase 5.1ah unittest: PASS
+raw-id/secret scan: PASS, no matches
+Phase 5.1ah remains HOLD and does not reduce Phase 5.1 blockers.
+```
+
+Operational interpretation: bounded Lighter Explorer logs and transaction GET
+details are now a repo-owned, tested, redaction-safe diagnostic lane, but the
+observed run produced no deterministic current request-pack source links. Do
+not repeat this lane unless account activity, target window, source semantics,
+auth material, or local artifacts change materially.
+
 ## Phase 5.1b Lighter Read-Only Header Probe And Pressure Preservation
 
 Date: 2026-05-04

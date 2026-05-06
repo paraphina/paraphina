@@ -404,6 +404,48 @@ Do not repeat Lighter inactive-order/export bridge capture unless account
 activity, target window, source semantics, auth material, or local artifacts
 change materially.
 
+### Gate 5.1ah - Lighter Explorer Log/Tx Bridge Diagnostic
+
+Allowed:
+
+- HOLD-only read-only Lighter Explorer account-log capture from
+  `GET https://explorer.elliot.ai/api/accounts/{param}/logs`.
+- Optional read-only follow-up through `GET /api/logs/{hash}` and
+  `GET /api/v1/tx`.
+- Emission of `source_links.proposed.sanitized.jsonl` only when a fetched raw
+  row hashes exactly to a current request-pack `source_record_sha256` and its
+  raw identifier hash uniquely matches a current Lighter target.
+
+Hard boundary:
+
+- Phase 5.1ah must not call `sendTx`, `sendTxBatch`, `nextNonce`, or any
+  order/cancel/modify endpoint.
+- Persisted artifacts must redact raw identifiers and must persist embedded
+  JSON-string fields only as presence plus SHA256.
+- Explorer logs/txs that do not overlap current request-pack source hashes and
+  target hashes are not valid source-link evidence.
+- Time/price/size/account-role-only inference remains prohibited.
+
+Reference diagnostic:
+
+```text
+runs/phase51ah_lighter_explorer_bridge_diagnostic/PHASE51AH-LIGHTER-EXPLORER-BRIDGE-DIAGNOSTIC-HOLD-20260506T0955Z
+```
+
+Reference result:
+
+```text
+explorer log rows: 500
+time coverage: 2026-04-29T00:09:16.706Z to 2026-04-30T23:10:04.293Z
+transaction detail payloads: 80
+labels evaluated: 1847
+materializable source links: 0
+```
+
+Do not repeat Lighter Explorer log/tx bridge capture unless account activity,
+target window, source semantics, auth material, or local artifacts change
+materially.
+
 ### Gate 5.1c - Calibration Label Lake
 
 Required evidence:
@@ -1571,4 +1613,7 @@ Current stop condition: without those source-owner artifacts or a materially
 different non-live source surface, there is no safe local implementation move
 that can reduce the Phase 5.1 HOLD blocker. Do not infer source links or
 Lighter pressure from time/price/size proximity, documentation-only limits,
-GET-only caps, empty headers, account tiers, or empty WebSocket snapshots.
+GET-only caps, empty headers, account tiers, empty WebSocket snapshots,
+inactive-order target overlap without native-source overlap, trade-export CSV
+rows without order/client identifiers, or Explorer logs/txs that do not overlap
+current request-pack source hashes and target hashes.
