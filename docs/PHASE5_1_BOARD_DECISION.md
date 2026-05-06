@@ -2277,3 +2277,47 @@ redacted source-link mapping or directly target-linkable source required by the
 current-target wide request pack, and separately obtain Lighter event-time
 pressure rows for Phase 5.1ab.
 ```
+
+## 2026-05-06 - Expanded AEP Plus Hyperliquid Recheck Decision
+
+Decision: `HOLD`. The board accepts the expanded Aster/Extended/Paradex
+read-only capture plus Phase 5.1ae/5.1v recheck as negative evidence. It does
+not reduce the Phase 5.1 blocker and does not authorize model training, EV
+admission, canary, live orders, capital escalation, risk-limit relaxation, or
+financial claims.
+
+Evidence:
+
+```text
+expanded capture: runs/phase51z_readonly_native_role_capture/PHASE51Z-EXPANDED-AEP-READONLY-NATIVE-ROLE-CAPTURE-HOLD-20260506T000000Z
+composition: runs/phase51ae_candidate_manifest_compose/PHASE51AE-EXPANDED-AEP-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260506T000000Z
+readiness: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-EXPANDED-AEP-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260506T000000Z
+target-linked native-role rows: 67 (aster=39, extended=21, paradex=7)
+unlinked sanitized source rows: 3028
+Phase 5.1v native-role ready: 73 / 287
+Phase 5.1v native-role missing: 214 / 287
+Phase 5.1v Lighter native-limit ready: 0 / 3132
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Board interpretation:
+
+```text
+accepted: the latest resumed local read-only capture attempt is fully replayed
+through Phase 5.1ae and Phase 5.1v and remains HOLD.
+
+not accepted: repeating the same retrospective AEP capture loop without changed
+source semantics, target window, account activity, retained source rows, or auth
+material.
+```
+
+Next move:
+
+```text
+Obtain a validated redacted source-link mapping for the current-target wide
+request pack or a materially different directly target-linkable non-live source.
+Separately obtain complete sanitized Lighter event-time pressure rows for
+Phase 5.1ab. Then run Phase 5.1ad/5.1ab, compose through Phase 5.1ae, and
+rerun Phase 5.1v.
+```

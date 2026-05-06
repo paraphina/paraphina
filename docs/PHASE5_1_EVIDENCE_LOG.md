@@ -5,6 +5,52 @@ run artifacts under `runs/` are ignored by Git because they contain large
 telemetry snapshots; this file preserves the reproducible evidence boundary in
 the repository.
 
+## 2026-05-06 - Expanded AEP Plus Hyperliquid Readiness Recheck
+
+Purpose: exhaust the last resumed read-only capture attempt authorized in this
+workflow interruption window by composing the expanded Aster/Extended/Paradex
+sanitized capture with the existing Hyperliquid source and rerunning Phase 5.1v.
+This is HOLD-only evidence; it does not authorize live orders, canary, capital
+escalation, risk-limit changes, model training, EV admission, or economic
+claims.
+
+Evidence:
+
+```text
+expanded capture: runs/phase51z_readonly_native_role_capture/PHASE51Z-EXPANDED-AEP-READONLY-NATIVE-ROLE-CAPTURE-HOLD-20260506T000000Z
+composition: runs/phase51ae_candidate_manifest_compose/PHASE51AE-EXPANDED-AEP-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260506T000000Z
+readiness: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-EXPANDED-AEP-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260506T000000Z
+fetch_status.aster: FETCHED row_count=1220
+fetch_status.extended: FETCHED row_count=1601
+fetch_status.paradex: FETCHED row_count=276
+target-linked native-role rows: 67 (aster=39, extended=21, paradex=7)
+unlinked sanitized source rows: 3028 (aster=1180, extended=1579, paradex=269)
+Phase 5.1v native-role ready: 73 / 287
+Phase 5.1v native-role missing: 214 / 287
+Phase 5.1v Lighter native-limit ready: 0 / 3132
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Result:
+
+```text
+gate_status: HOLD
+generated_phase51s_manifest_ready: false
+approved_for_live: false
+approved_for_canary: false
+approved_for_capital_escalation: false
+approved_for_model_training: false
+admissible_for_ev_admission: false
+admissible_for_financial_claim: false
+```
+
+Interpretation: the expanded read-only Aster/Extended/Paradex capture plus the
+existing Hyperliquid source does not improve the established `73 / 287`
+native-role readiness baseline and leaves Lighter event-time pressure at
+`0 / 3132`. This lane should not be repeated without changed account activity,
+target window, retained source rows, source semantics, or auth material.
+
 ## 2026-05-06 - Phase 5.1ai Non-Lighter Order-History Bridge Diagnostic
 
 Purpose: test the final bounded non-Lighter retrospective source-link surface

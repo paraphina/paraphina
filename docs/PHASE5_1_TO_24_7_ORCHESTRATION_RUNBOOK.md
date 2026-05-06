@@ -61,31 +61,25 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    filled-order maker/taker status is incomplete for `287` labels, some
    venue/side buckets remain sparse, and `1613` quarantined/review groups remain
    excluded from the observed-only diagnostic pack.
-5. Next evidence move is operator/source action, not another live run. The
-   2026-05-04 authorized read-only private source attempt succeeded for Lighter
-   account/native-limit and trade-backfill artifacts only, at
-   `runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-ACCOUNT-NATIVE-LIMITS_20260504T110402Z`
-   and
-   `runs/phase51c_lighter_trade_backfill/PHASE51C-LIGHTER-TRADE-BACKFILL-20260504T110416Z`.
-   It does not clear the all-five Phase 5.1w blocker. Phase 5.1w now has a
-   canonical empty staged-source run at
-   `runs/phase51w_forward_capture_request_pack/PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z`;
-   Phase 5.1v validated that manifest as six local files but correctly held
-   with `0 / 287` native-role targets and `0 / 3132` Lighter native-limit
-   targets ready at
-   `runs/phase51v_forward_capture_bundle_readiness/PHASE51V-EMPTY-STAGED-SOURCE-BUNDLE-HOLD-20260504T000000Z`.
-   Continue by capturing fresh read-only native-role source rows for Aster,
-   Extended, Lighter, and Paradex, then normalize already-local sanitized rows
-   through the repo-owned Phase 5.1y all-venue adapter. Reuse the Phase 5.1x
-   Hyperliquid `crossed` source, or the Phase 5.1y-normalized Hyperliquid
-   output, for the Hyperliquid subset. Complete Lighter event-time
-   active-order/sendTx/REST-or-weighted pressure linkage separately. Then
-   populate the Phase 5.1w staged files with six sanitized local read-only
-   all-five forward capture files and rerun Phase 5.1v against the Phase 5.1u
-   target manifest.
-   Capture or locate native snapshots with canonical group/order-key linkage,
-   or a redacted Phase 5.1t/5.1s `source_links` sidecar that validates those
-   joins by source hash. If 5.1v emits
+5. Next evidence move is operator/source action, not another local capture
+   loop. Phase 5.1z plus Hyperliquid currently leaves Phase 5.1v at `73 / 287`
+   native-role targets ready, `214 / 287` missing (`aster=74`,
+   `extended=7`, `lighter=125`, `paradex=8`), and `0 / 3132` Lighter
+   event-time native-limit pressure targets ready. The latest expanded
+   Aster/Extended/Paradex read-only capture plus Hyperliquid composition at
+   `runs/phase51v_forward_capture_bundle_readiness/PHASE51V-EXPANDED-AEP-PLUS-HYPERLIQUID-COMPOSE-HOLD-20260506T000000Z`
+   confirms the same HOLD counts. Do not repeat the existing retrospective
+   local/source loops unless account activity, target window, retained source
+   rows, auth material, or source semantics change materially.
+   The native-role path now requires a validated redacted mapping for
+   `runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z`
+   or a materially different directly target-linkable non-live source. Run any
+   validated mapping through Phase 5.1ad, compose the materialized manifest with
+   the existing Phase 5.1x Hyperliquid source through Phase 5.1ae, and rerun
+   Phase 5.1v. The Lighter pressure path separately requires complete
+   sanitized event-time active-order headroom, sendTx limit/remaining, and
+   REST-or-weighted limit/remaining rows; stage them through Phase 5.1ab,
+   compose through Phase 5.1ae, and rerun Phase 5.1v. If 5.1v emits
    `generated_phase51s_manifest_ready=true`, stage the generated manifest
    through Phase 5.1s, run Phase 5.1r, feed its sanitized outputs into Phase
    5.1q, feed Phase 5.1q `native_role_evidence.jsonl` into Phase 5.1n, then

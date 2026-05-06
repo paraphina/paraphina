@@ -793,6 +793,13 @@ artifacts. These diagnostics are negative evidence lanes only; they do not
 authorize model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claims.
 
+The resumed expanded Aster/Extended/Paradex read-only capture plus Hyperliquid
+composition also preserves `HOLD`: Phase 5.1v remains `73 / 287` native-role
+ready, `214 / 287` native-role targets missing, and `0 / 3132` Lighter
+native-limit targets ready. This confirms the current blocker is not solved by
+repeating the same retrospective read-only capture lane without materially
+different target-linkable source semantics or a validated redacted sidecar.
+
 Phase 5.1ab adds a HOLD-only repo-owned preflight gate for externally supplied
 sanitized Lighter native-limit pressure rows. The gate accepts only local
 `.jsonl` inputs, performs no network access, does not call `sendTx`,
@@ -822,16 +829,13 @@ files but remains `HOLD` with `0 / 287` native-role targets and `0 / 3132`
 Lighter native-limit targets ready. The next evidence move is a deterministic
 redacted all-venue source-link sidecar or a different directly target-linkable
 non-live source for the current Phase 5.1u hashes, plus a separate event-time
-Lighter request-pressure source. For all
-venues, populate sanitized local read-only all-five forward source-capture
-files with real native rows, run the bundle through Phase 5.1v, and only if
-5.1v emits `generated_phase51s_manifest_ready=true`, stage the generated
-manifest through Phase 5.1s. The bundle must contain native snapshots with
-canonical group/order-key linkage, or validated source-link sidecars that bind
-redacted source hashes to observed labels. Phase 5.1v now applies those
-sidecars during bundle-readiness validation, but only source rows with required
-native fields can mark targets ready. After Phase 5.1s, run Phase 5.1r, feed
-the sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No
+Lighter request-pressure source. The source-link path must run through Phase
+5.1ad, compose through Phase 5.1ae with the existing Hyperliquid source, and
+then rerun Phase 5.1v. The Lighter pressure path must stage complete sanitized
+event-time rows through Phase 5.1ab before Phase 5.1ae/5.1v validation. After a
+ready Phase 5.1v result, stage the generated manifest through Phase 5.1s, run
+Phase 5.1r, feed the sanitized outputs into Phase 5.1q, and rerun Phase
+5.1n/5.1h/5.1i. No
 model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
 5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, Phase 5.1x,
