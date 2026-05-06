@@ -97,6 +97,7 @@ MANIFEST_ALLOWED_FIELDS = {
     "admissible_for_model_training",
     "approved_for_canary",
     "approved_for_capital_escalation",
+    "approved_for_financial_claim",
     "approved_for_live",
     "approved_for_model_training",
     "baseline_commit",

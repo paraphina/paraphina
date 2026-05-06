@@ -2438,3 +2438,58 @@ Separately obtain complete sanitized Lighter event-time pressure rows for
 Phase 5.1ab. Compose all accepted manifests through Phase 5.1ae and rerun
 Phase 5.1v.
 ```
+
+## Phase 5.1ak Blocker Resolution Runner Decision
+
+Decision: `PROMOTE` only the HOLD-only repo-owned blocker-resolution runner and
+`HOLD` the current evidence result. Phase 5.1ak is accepted as the canonical
+non-live wrapper for composing current-pack recovery artifacts, running
+Phase 5.1v, and emitting target-level recovery/forward-refresh decisions. It
+does not connect to venues, infer source links, create Lighter pressure, or
+authorize model training, EV admission, canary, live orders, capital
+escalation, risk-limit relaxation, or financial claims.
+
+Evidence:
+
+```text
+tool: tools/phase51ak_blocker_resolution_runner.py
+test: tests/test_phase51ak_blocker_resolution_runner.py
+doc: docs/PHASE5_1AK_BLOCKER_RESOLUTION_RUNNER.md
+
+Phase 5.1ak run:
+runs/phase51ak_blocker_resolution_runner/PHASE51AK-CURRENT-BLOCKER-RESOLUTION-HOLD-20260506T000000Z
+
+Phase 5.1v component run:
+runs/phase51ak_blocker_resolution_runner/PHASE51AK-CURRENT-BLOCKER-RESOLUTION-HOLD-20260506T000000Z/component_runs/phase51v_forward_capture_bundle_readiness/PHASE51AK-CURRENT-BLOCKER-RESOLUTION-HOLD-20260506T000000Z-PHASE51V-HOLD
+
+Phase 5.1v native-role ready: 73 / 287
+Phase 5.1v native-role missing: 214 / 287
+Phase 5.1v missing by venue: aster=74, extended=7, lighter=125, paradex=8
+Phase 5.1v Lighter native-limit ready: 0 / 3132
+Phase 5.1v Lighter native-limit missing: 3132 / 3132
+Phase 5.1ak decision counts:
+RECOVERED_CURRENT_PACK=73
+UNRECOVERABLE_FROM_LOCAL_ARTIFACTS=3346
+```
+
+Board interpretation:
+
+```text
+accepted: Phase 5.1ak makes the current-pack blocker decision machine-readable
+and prevents another manual loop through exhausted local artifacts.
+
+not accepted: treating Phase 5.1ak as source evidence by itself. It only
+validates supplied artifacts and reports whether the current pack is recovered
+or still requires a validated mapping or forward-refresh target pack with
+event-time source truth.
+```
+
+Next move:
+
+```text
+Use Phase 5.1ak as the final wrapper after any future Phase 5.1ad mapping,
+Phase 5.1aj directly target-linkable source, or Phase 5.1ab Lighter pressure
+artifact is produced. If the current-pack result remains incomplete, stop
+retrospective local mining and move only to a board-documented forward-refresh
+capture whose target rows and source truth are captured at event time.
+```

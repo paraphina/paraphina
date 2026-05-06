@@ -1674,6 +1674,29 @@ target IDs already counted ready by existing Phase 5.1z evidence. Do not repeat
 Phase 5.1aj over the same local artifacts unless account activity, target
 window, retained rows, or source semantics change materially.
 
+Phase 5.1ak was added on 2026-05-06 as the repo-owned blocker-resolution
+wrapper. It composes accepted Phase 5.1ad/5.1aj/5.1ab artifacts through
+Phase 5.1ae, runs Phase 5.1v, and emits a target-level decision artifact.
+
+```text
+tool: tools/phase51ak_blocker_resolution_runner.py
+doc: docs/PHASE5_1AK_BLOCKER_RESOLUTION_RUNNER.md
+current run: runs/phase51ak_blocker_resolution_runner/PHASE51AK-CURRENT-BLOCKER-RESOLUTION-HOLD-20260506T000000Z
+native-role ready: 73 / 287
+native-role missing: 214 / 287 (aster=74, extended=7, lighter=125, paradex=8)
+Lighter native-limit pressure ready: 0 / 3132
+target decisions: RECOVERED_CURRENT_PACK=73, UNRECOVERABLE_FROM_LOCAL_ARTIFACTS=3346
+next action: obtain_validated_mapping_or_forward_refresh_target_pack_with_event_time_sources
+```
+
+Operational implication: after any future validated mapping, directly
+target-linkable private/native source, or sanitized Lighter event-time pressure
+artifact is produced, use Phase 5.1ak as the final wrapper before declaring
+Phase 5.1v readiness. If Phase 5.1ak still reports
+`UNRECOVERABLE_FROM_LOCAL_ARTIFACTS`, do not start another retrospective local
+mining loop; use only a board-documented forward-refresh capture where target
+rows and source truth are captured at event time.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
@@ -1693,14 +1716,15 @@ native-role blocker:
 2. If using a mapping, run Phase 5.1ad to materialize source_links.sanitized.jsonl.
 3. Run Phase 5.1ae to compose the accepted manifest with the existing
    Hyperliquid source.
-4. Run Phase 5.1v against the composed candidate manifest.
+4. Run Phase 5.1ak as the final wrapper, or run Phase 5.1ae/5.1v directly only
+   for focused debugging.
 
 Lighter pressure blocker:
 1. Obtain sanitized event-time Lighter pressure rows with active-order
    headroom, sendTx limit/remaining, REST-or-weighted limit/remaining, and
    event-time alignment.
 2. Run Phase 5.1ab to stage the rows.
-3. Include the Phase 5.1ab candidate manifest through Phase 5.1ae before the
+3. Include the Phase 5.1ab candidate manifest through Phase 5.1ak before the
    next all-five Phase 5.1v readiness review.
 ```
 

@@ -602,6 +602,52 @@ different non-live forward source that is explicitly not expected to clear
 current retained targets until matching future events exist.
 ```
 
+## Phase 5.1ak Current Blocker Resolution Runner
+
+- Run id: `PHASE51AK-CURRENT-BLOCKER-RESOLUTION-HOLD-20260506T000000Z`
+- Local run directory: `runs/phase51ak_blocker_resolution_runner/PHASE51AK-CURRENT-BLOCKER-RESOLUTION-HOLD-20260506T000000Z`
+- Tool: `tools/phase51ak_blocker_resolution_runner.py`
+- Gate status: `HOLD`
+- Gate reason: `phase51ak_current_pack_incomplete_forward_refresh_required_nonlive_hold`
+- Native-role targets ready: `73 / 287`
+- Native-role targets missing: `214 / 287`
+- Native-role missing by venue: `aster=74`, `extended=7`, `lighter=125`, `paradex=8`
+- Lighter native-limit pressure ready: `0 / 3132`
+- Lighter native-limit pressure missing: `3132 / 3132`
+- Target decisions: `RECOVERED_CURRENT_PACK=73`, `UNRECOVERABLE_FROM_LOCAL_ARTIFACTS=3346`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Command:
+
+```bash
+python3 tools/phase51ak_blocker_resolution_runner.py \
+  --run-id PHASE51AK-CURRENT-BLOCKER-RESOLUTION-HOLD-20260506T000000Z \
+  --timestamp-ns 1778025600000000000
+```
+
+Validation:
+
+```bash
+python3 -m unittest tests.test_phase51ak_blocker_resolution_runner -v
+python3 tools/phase51ak_blocker_resolution_runner.py \
+  --run-id PHASE51AK-CURRENT-BLOCKER-RESOLUTION-HOLD-20260506T000000Z \
+  --timestamp-ns 1778025600000000000
+```
+
+Result:
+
+```text
+Ran 2 tests
+OK
+phase51ak_blocker_resolution_runner: status HOLD (non-live blocker decision only)
+```
+
 ## 2026-05-05 - Authorized Read-Only Source Capture Follow-Up
 
 Scope: local and venue read-only source search under explicit authorization,
