@@ -793,6 +793,24 @@ artifacts. These diagnostics are negative evidence lanes only; they do not
 authorize model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claims.
 
+Phase 5.1aj adds the remaining repo-owned direct private-source path. The
+HOLD-only normalizer `tools/phase51aj_forward_private_stream_source.py` consumes
+already-local private/native `.json`, `.jsonl`, or `.ndjson` rows and emits
+Phase 5.1v-compatible sanitized source rows only when the same row contains
+venue-native maker/taker role fields and a raw or prehashed client/order
+identifier that uniquely matches a current Phase 5.1u target hash. It may emit
+a source-link sidecar only when that same row hash is already present in the
+current Phase 5.1z request pack. It performs no network access and forbids
+env/network/symlink inputs, secrets, raw identifier persistence, unsafe true
+flags, and time/price/size/account-role inference. The local recheck
+`PHASE51AJ-LOCAL-SANITIZED-SOURCE-RECHECK-HOLD-20260506T000000Z` emitted `28`
+directly target-linked Extended/Paradex source rows and `0` sidecar links from
+existing sanitized artifacts; Phase 5.1v remained `HOLD` with `73 / 287`
+native-role targets ready and `0 / 3132` Lighter native-limit targets ready
+because those `28` rows overlap target IDs already counted ready by existing
+Phase 5.1z evidence. Phase 5.1aj is therefore accepted as forward
+infrastructure, not blocker clearance.
+
 The resumed expanded Aster/Extended/Paradex read-only capture plus Hyperliquid
 composition also preserves `HOLD`: Phase 5.1v remains `73 / 287` native-role
 ready, `214 / 287` native-role targets missing, and `0 / 3132` Lighter
@@ -848,4 +866,5 @@ model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
 5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, Phase 5.1x,
 Phase 5.1y, Phase 5.1z, Phase 5.1aa, Phase 5.1ab, Phase 5.1ac, Phase 5.1ad,
-Phase 5.1ae, Phase 5.1af, Phase 5.1ag, Phase 5.1ah, or Phase 5.1ai.
+Phase 5.1ae, Phase 5.1af, Phase 5.1ag, Phase 5.1ah, Phase 5.1ai, or Phase
+5.1aj.

@@ -5,6 +5,68 @@ run artifacts under `runs/` are ignored by Git because they contain large
 telemetry snapshots; this file preserves the reproducible evidence boundary in
 the repository.
 
+## 2026-05-06 - Phase 5.1aj Forward Private-Stream Source Recheck
+
+Purpose: formalize the remaining "directly target-linkable source" path as a
+repo-owned HOLD-only normalizer, then test it against existing sanitized local
+Extended, Paradex, and Lighter artifacts. This is native-role source evidence
+only; it does not authorize live orders, canary, capital escalation, risk-limit
+changes, model training, EV admission, or economic claims.
+
+Changed repo-owned behavior:
+
+```text
+tool: tools/phase51aj_forward_private_stream_source.py
+test: tests/test_phase51aj_forward_private_stream_source.py
+doc: docs/PHASE5_1AJ_FORWARD_PRIVATE_STREAM_SOURCE.md
+accepted source row: local private/native row must contain native role fields and a raw/prehashed client/order identifier that uniquely matches a current Phase 5.1u target hash
+accepted sidecar: same row must also hash to a current request-pack source_record_sha256
+not allowed: network access, order placement, cancel/modify, sendTx/sendTxBatch, env/secret inputs, time/price/size/account-role inference, raw identifier persistence
+```
+
+Real local recheck:
+
+```text
+runs/phase51aj_forward_private_stream_source/PHASE51AJ-LOCAL-SANITIZED-SOURCE-RECHECK-HOLD-20260506T000000Z
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+raw_row_count: 1731
+raw_row_count_by_venue: extended=1601, lighter=100, paradex=30
+direct_target_linked_source_row_count: 28
+direct_target_linked_source_row_count_by_venue: extended=21, paradex=7
+request_source_hash_overlap_count: 0
+source_link_count: 0
+lighter deterministic target overlap: 0
+raw_identifier_redaction_status: PASS
+gate_status: HOLD
+```
+
+Downstream readiness:
+
+```text
+composition: runs/phase51ae_candidate_manifest_compose/PHASE51AE-BLOCKER-RECHECK-PLUS-PHASE51AJ-HOLD-20260506T000000Z
+readiness: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-BLOCKER-RECHECK-PLUS-PHASE51AJ-HOLD-20260506T000000Z
+Phase 5.1v native-role ready: 73 / 287
+Phase 5.1v native-role missing: 214 / 287
+Phase 5.1v Lighter native-limit ready: 0 / 3132
+clears_phase51_blockers: false
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51aj_forward_private_stream_source.py
+python3 -m unittest tests.test_phase51aj_forward_private_stream_source
+python3 tools/phase51ae_candidate_manifest_compose.py --candidate-manifest ... --candidate-manifest ...
+python3 tools/phase51v_forward_capture_bundle_readiness.py --target-run ... --candidate-manifest ...
+```
+
+Interpretation: Phase 5.1aj creates the repo-owned direct private-source path
+needed for future rows, but the current local recheck does not reduce the
+canonical `73 / 287` ready count because its `28` target-linked rows overlap
+target IDs already counted ready by existing Phase 5.1z evidence. Do not repeat
+this lane unless materially new directly target-linkable private/native rows
+exist.
+
 ## 2026-05-06 - Expanded AEP Plus Hyperliquid Readiness Recheck
 
 Purpose: exhaust the last resumed read-only capture attempt authorized in this

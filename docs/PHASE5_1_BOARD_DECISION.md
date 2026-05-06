@@ -2382,3 +2382,59 @@ Phase 5.1ab. If only forward-only Extended/Paradex private streams are added,
 label them future-capture infrastructure and do not claim they clear current
 retained targets until matching future events exist.
 ```
+
+## Phase 5.1aj Forward Private-Stream Source Decision
+
+Decision: `PROMOTE` only the HOLD-only repo-owned normalizer and `HOLD` the
+current evidence result. Phase 5.1aj is accepted as the direct
+private/native-source path required by the blocker, but the current local
+recheck does not reduce the canonical Phase 5.1v target count and does not
+authorize model training, EV admission, canary, live orders, capital escalation,
+risk-limit relaxation, or financial claims.
+
+Evidence:
+
+```text
+tool: tools/phase51aj_forward_private_stream_source.py
+test: tests/test_phase51aj_forward_private_stream_source.py
+doc: docs/PHASE5_1AJ_FORWARD_PRIVATE_STREAM_SOURCE.md
+
+Phase 5.1aj run:
+runs/phase51aj_forward_private_stream_source/PHASE51AJ-LOCAL-SANITIZED-SOURCE-RECHECK-HOLD-20260506T000000Z
+
+Phase 5.1ae composition:
+runs/phase51ae_candidate_manifest_compose/PHASE51AE-BLOCKER-RECHECK-PLUS-PHASE51AJ-HOLD-20260506T000000Z
+
+Phase 5.1v readiness:
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-BLOCKER-RECHECK-PLUS-PHASE51AJ-HOLD-20260506T000000Z
+
+raw rows processed: 1731
+directly target-linked source rows: 28 (extended=21, paradex=7)
+source-link sidecar rows: 0
+Lighter deterministic target overlap: 0
+Phase 5.1v native-role ready: 73 / 287
+Phase 5.1v native-role missing: 214 / 287
+Phase 5.1v Lighter native-limit ready: 0 / 3132
+```
+
+Board interpretation:
+
+```text
+accepted: Phase 5.1aj provides a safe local path for materially new directly
+target-linkable private/native rows and proves the path is Phase 5.1v-compatible.
+
+not accepted: blocker clearance from the current Phase 5.1aj recheck. The 28
+rows overlap already-ready target IDs, and no Lighter pressure or Lighter native
+role targets were recovered.
+```
+
+Next move:
+
+```text
+Use Phase 5.1aj only when materially new directly target-linkable private/native
+rows exist. Otherwise obtain a validated redacted source-link mapping for the
+current-target wide request pack and materialize it through Phase 5.1ad.
+Separately obtain complete sanitized Lighter event-time pressure rows for
+Phase 5.1ab. Compose all accepted manifests through Phase 5.1ae and rerun
+Phase 5.1v.
+```

@@ -1648,6 +1648,32 @@ current snapshot rather than event-time pressure. Do not repeat this capture
 loop unless the source semantics, account activity, target window, auth
 material, or retained source rows change materially.
 
+Phase 5.1aj was added on 2026-05-06 as the repo-owned direct private/native
+source path. It consumes already-local private/native rows and emits Phase
+5.1v-compatible sanitized source rows only when the same row contains required
+native role fields and raw or prehashed client/order identifiers that uniquely
+match current Phase 5.1u target hashes.
+
+```text
+tool: tools/phase51aj_forward_private_stream_source.py
+doc: docs/PHASE5_1AJ_FORWARD_PRIVATE_STREAM_SOURCE.md
+local recheck: runs/phase51aj_forward_private_stream_source/PHASE51AJ-LOCAL-SANITIZED-SOURCE-RECHECK-HOLD-20260506T000000Z
+composition: runs/phase51ae_candidate_manifest_compose/PHASE51AE-BLOCKER-RECHECK-PLUS-PHASE51AJ-HOLD-20260506T000000Z
+readiness: runs/phase51v_forward_capture_bundle_readiness/PHASE51V-BLOCKER-RECHECK-PLUS-PHASE51AJ-HOLD-20260506T000000Z
+directly target-linked source rows: 28 (extended=21, paradex=7)
+source-link sidecar rows: 0
+Lighter deterministic target overlap: 0
+native-role ready: 73 / 287
+Lighter native-limit pressure ready: 0 / 3132
+```
+
+Operational implication: Phase 5.1aj is the correct lane for materially new
+directly target-linkable private/native rows, but the current local artifact
+recheck does not clear the blocker because its `28` target-linked rows overlap
+target IDs already counted ready by existing Phase 5.1z evidence. Do not repeat
+Phase 5.1aj over the same local artifacts unless account activity, target
+window, retained rows, or source semantics change materially.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
@@ -1661,10 +1687,11 @@ Current resume path:
 
 ```text
 native-role blocker:
-1. Obtain a validated redacted mapping for
+1. Obtain materially new directly target-linkable private/native rows and run
+   Phase 5.1aj, or obtain a validated redacted mapping for
    runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z.
-2. Run Phase 5.1ad to materialize source_links.sanitized.jsonl.
-3. Run Phase 5.1ae to compose the materialized manifest with the existing
+2. If using a mapping, run Phase 5.1ad to materialize source_links.sanitized.jsonl.
+3. Run Phase 5.1ae to compose the accepted manifest with the existing
    Hyperliquid source.
 4. Run Phase 5.1v against the composed candidate manifest.
 
@@ -1686,4 +1713,5 @@ inactive-order target overlap without native-source overlap, trade-export CSV
 rows without order/client identifiers, or Explorer logs/txs that do not overlap
 current request-pack source hashes and target hashes, or Extended/Paradex
 order-history rows that do not bridge request-pack native source hashes to
-target hashes.
+target hashes, or Phase 5.1aj duplicate source rows that overlap already-ready
+targets.
