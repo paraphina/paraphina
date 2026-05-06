@@ -2321,3 +2321,64 @@ Separately obtain complete sanitized Lighter event-time pressure rows for
 Phase 5.1ab. Then run Phase 5.1ad/5.1ab, compose through Phase 5.1ae, and
 rerun Phase 5.1v.
 ```
+
+## 2026-05-06 - Explicit Lighter Blocker Recheck Decision
+
+Decision: `HOLD`. The board accepts the explicit local read-only Lighter
+blocker recheck as completed negative evidence. Existing local credentials and
+permissions do not supply the missing event-time Lighter pressure rows, do not
+reduce the current native-role blocker, and do not authorize model training, EV
+admission, canary, live orders, capital escalation, risk-limit relaxation, or
+financial claims.
+
+Evidence:
+
+```text
+Phase 5.1b capture:
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-BLOCKER-RECHECK-HOLD-20260506T000000Z
+
+Phase 5.1n:
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-BLOCKER-RECHECK-025435-HOLD-20260506T000000Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-BLOCKER-RECHECK-073231-HOLD-20260506T000000Z
+
+Phase 5.1ae composition:
+runs/phase51ae_candidate_manifest_compose/PHASE51AE-BLOCKER-RECHECK-PLUS-LIGHTER-HOLD-20260506T000000Z
+
+Phase 5.1v readiness:
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-BLOCKER-RECHECK-PLUS-LIGHTER-HOLD-20260506T000000Z
+
+Phase 5.1b limitations:
+lighter_sendtx_remaining_not_observed
+lighter_rest_or_weighted_limit_not_observed
+lighter_rest_or_weighted_remaining_not_observed
+lighter_rest_request_limit_not_exposed_by_account_limits_payload
+
+Phase 5.1n forward pressure rows: 0
+Phase 5.1n event-time-aligned rows: 0
+Phase 5.1v native-role ready: 73 / 287
+Phase 5.1v native-role missing: 214 / 287
+Phase 5.1v missing by venue: aster=74, extended=7, lighter=125, paradex=8
+Phase 5.1v Lighter native-limit ready: 0 / 3132
+```
+
+Board interpretation:
+
+```text
+accepted: one bounded read-only local credential recheck was completed and
+replayed through Phase 5.1b, Phase 5.1n, Phase 5.1ae, and Phase 5.1v.
+
+not accepted: another repetition of the same Lighter account-limits/current
+snapshot capture loop without changed source semantics, account activity,
+target window, retained rows, or auth material.
+```
+
+Next move:
+
+```text
+Obtain a validated redacted source-link mapping for the current-target wide
+request pack or a materially different directly target-linkable non-live source.
+Separately obtain complete sanitized Lighter event-time pressure rows for
+Phase 5.1ab. If only forward-only Extended/Paradex private streams are added,
+label them future-capture infrastructure and do not claim they clear current
+retained targets until matching future events exist.
+```

@@ -440,6 +440,106 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## 2026-05-06 - Explicit Lighter Read-Only Blocker Recheck
+
+Purpose: execute the authorized full local read-only blocker recheck using
+existing local Lighter credentials only, then replay the result through the
+repo-owned Phase 5.1 gates. No live, canary, capital, risk-limit, order,
+cancel, `sendTx`, or `sendTxBatch` action was authorized or performed.
+
+Evidence:
+
+```text
+Phase 5.1b capture:
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-BLOCKER-RECHECK-HOLD-20260506T000000Z
+
+Phase 5.1b acceptance:
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-BLOCKER-RECHECK-HOLD-20260506T000000Z/phase51b_acceptance.json
+
+Phase 5.1n lane 025435:
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-BLOCKER-RECHECK-025435-HOLD-20260506T000000Z
+
+Phase 5.1n lane 073231:
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-BLOCKER-RECHECK-073231-HOLD-20260506T000000Z
+
+Phase 5.1ae composition:
+runs/phase51ae_candidate_manifest_compose/PHASE51AE-BLOCKER-RECHECK-PLUS-LIGHTER-HOLD-20260506T000000Z
+
+Phase 5.1v readiness:
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-BLOCKER-RECHECK-PLUS-LIGHTER-HOLD-20260506T000000Z
+```
+
+Phase 5.1b outcome:
+
+```text
+phase51b_capture_complete: true
+gate_status: HOLD
+approved_for_nonlive_evidence_review: true
+approved_for_calibration_label_ingestion: false
+sendtx_per_minute_limit: null
+sendtx_per_minute_remaining: null
+rest_requests_per_minute_limit: null
+rest_requests_per_minute_remaining: null
+weighted_requests_per_minute_limit: null
+weighted_requests_per_minute_remaining: null
+active_order_headroom_account: 1500
+active_order_headroom_market: 1000
+native_limit_time_alignment_status: CURRENT_SNAPSHOT_NOT_LABEL_EVENT_TIME
+limitations:
+  lighter_sendtx_remaining_not_observed
+  lighter_rest_or_weighted_limit_not_observed
+  lighter_rest_or_weighted_remaining_not_observed
+  lighter_rest_request_limit_not_exposed_by_account_limits_payload
+```
+
+Phase 5.1n outcome:
+
+```text
+025435 lighter_label_count: 2194
+025435 forward_native_limit_pressure_source_count: 0
+025435 native_limit_event_time_aligned_count: 0
+025435 native_limit_all_pressure_dimensions_observed_count: 0
+025435 status_counts: MISSING_LIGHTER_ACCOUNT_SNAPSHOT=2194, NOT_APPLICABLE_NON_LIGHTER=2926
+
+073231 lighter_label_count: 3954
+073231 forward_native_limit_pressure_source_count: 0
+073231 native_limit_event_time_aligned_count: 0
+073231 native_limit_all_pressure_dimensions_observed_count: 0
+073231 status_counts: MISSING_LIGHTER_ACCOUNT_SNAPSHOT=3954, NOT_APPLICABLE_NON_LIGHTER=2861
+```
+
+Final Phase 5.1v outcome:
+
+```text
+gate_status: HOLD
+native_role_capture_target_ready_count: 73 / 287
+native_role_capture_target_missing_count: 214 / 287
+native_role_missing_counts_by_venue: aster=74, extended=7, lighter=125, paradex=8
+lighter_native_limit_capture_target_ready_count: 0 / 3132
+lighter_native_limit_capture_target_missing_count: 3132 / 3132
+source_link_applied_row_count: 0
+generated_phase51s_source_count: 4
+```
+
+Board interpretation:
+
+```text
+accepted: the explicit local read-only blocker recheck was completed and
+replayed through Phase 5.1b acceptance, Phase 5.1n, Phase 5.1ae, and Phase
+5.1v.
+
+not accepted: treating current account/headroom snapshots, missing response
+headers, account-tier documentation, or permissions alone as event-time Lighter
+sendTx plus REST-or-weighted pressure evidence.
+
+next move: stop repeating retrospective local Lighter account-limit captures
+unless account activity, target window, auth material, retained source rows, or
+source semantics change materially. Obtain the validated redacted source-link
+mapping and complete sanitized Lighter event-time pressure rows, or implement a
+different non-live forward source that is explicitly not expected to clear
+current retained targets until matching future events exist.
+```
+
 ## 2026-05-05 - Authorized Read-Only Source Capture Follow-Up
 
 Scope: local and venue read-only source search under explicit authorization,

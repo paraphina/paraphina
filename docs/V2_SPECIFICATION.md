@@ -822,8 +822,16 @@ for Lighter rows where event-time active-order headroom plus sendTx and
 REST-or-weighted limit/remaining pressure are all observed. The retest
 `PHASE51N-LIGHTER-NATIVE-LIMIT-FORWARD-SOURCE-RETEST-20260504T000000Z`
 emitted `0` complete forward rows, so it preserves `HOLD` and does not clear
-any of the `3132` Lighter native-limit targets. The canonical staged-source evidence
-run `PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z` proves the
+any of the `3132` Lighter native-limit targets. The 2026-05-06 explicit
+local-credential read-only blocker recheck
+`PHASE51B-LIGHTER-READONLY-BLOCKER-RECHECK-HOLD-20260506T000000Z` also remains
+`HOLD`: account limits still do not expose sendTx plus REST-or-weighted
+limit/remaining pressure, and the paired Phase 5.1n rechecks emitted `0`
+event-time-aligned forward rows. The final Phase 5.1v recheck
+`PHASE51V-BLOCKER-RECHECK-PLUS-LIGHTER-HOLD-20260506T000000Z` remains `HOLD`
+with `73 / 287` native-role targets ready and `0 / 3132` Lighter native-limit
+targets ready. The canonical staged-source evidence run
+`PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z` proves the
 local bundle contract without clearing the blocker: Phase 5.1v sees six local
 files but remains `HOLD` with `0 / 287` native-role targets and `0 / 3132`
 Lighter native-limit targets ready. The next evidence move is a deterministic

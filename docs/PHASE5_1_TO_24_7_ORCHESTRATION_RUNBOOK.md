@@ -1622,6 +1622,32 @@ hashes. Lighter native-limit pressure still requires event-time sendTx plus
 REST-or-weighted limit/remaining evidence; do not infer pressure from caps,
 empty headers, tiers, docs, or empty WebSocket account snapshots.
 
+The 2026-05-06 explicit local read-only blocker recheck was completed with
+existing local Lighter credentials only and is now part of the resume context:
+
+```text
+Phase 5.1b capture:
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-BLOCKER-RECHECK-HOLD-20260506T000000Z
+
+Phase 5.1n:
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-BLOCKER-RECHECK-025435-HOLD-20260506T000000Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-BLOCKER-RECHECK-073231-HOLD-20260506T000000Z
+
+Final Phase 5.1v:
+runs/phase51v_forward_capture_bundle_readiness/PHASE51V-BLOCKER-RECHECK-PLUS-LIGHTER-HOLD-20260506T000000Z
+
+native-role ready: 73 / 287
+native-role missing: 214 / 287 (aster=74, extended=7, lighter=125, paradex=8)
+Lighter native-limit pressure ready: 0 / 3132
+```
+
+Operational implication: permissions and current local credentials do not clear
+the blocker. The latest account-limits payload still lacks sendTx and
+REST-or-weighted limit/remaining fields, while active-order headroom is a
+current snapshot rather than event-time pressure. Do not repeat this capture
+loop unless the source semantics, account activity, target window, auth
+material, or retained source rows change materially.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
