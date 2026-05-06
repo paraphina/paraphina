@@ -784,6 +784,15 @@ account-source surface is safe and runnable, but it does not reduce the current
 Lighter blocker unless future account activity or source semantics produce
 target-linkable trade rows.
 
+The subsequent deterministic bridge diagnostics also preserve `HOLD`. Phase
+5.1ag found Lighter inactive-order target-hash overlap but `0` native
+trade-source overlap, Phase 5.1ah found `0` materializable Lighter Explorer
+log/tx source links, and Phase 5.1ai found `0` materializable Extended/Paradex
+order-history bridge links despite successful read-only fetches and sanitized
+artifacts. These diagnostics are negative evidence lanes only; they do not
+authorize model training, EV admission, canary, live orders, capital escalation,
+risk-limit relaxation, or financial claims.
+
 Phase 5.1ab adds a HOLD-only repo-owned preflight gate for externally supplied
 sanitized Lighter native-limit pressure rows. The gate accepts only local
 `.jsonl` inputs, performs no network access, does not call `sendTx`,
@@ -811,8 +820,9 @@ run `PHASE51W-LOCAL-STAGED-SOURCE-BUNDLE-CANONICAL-20260504T000000Z` proves the
 local bundle contract without clearing the blocker: Phase 5.1v sees six local
 files but remains `HOLD` with `0 / 287` native-role targets and `0 / 3132`
 Lighter native-limit targets ready. The next evidence move is a deterministic
-redacted Lighter source-link sidecar, a different target-linkable Lighter
-source, and a separate event-time Lighter request-pressure source. For all
+redacted all-venue source-link sidecar or a different directly target-linkable
+non-live source for the current Phase 5.1u hashes, plus a separate event-time
+Lighter request-pressure source. For all
 venues, populate sanitized local read-only all-five forward source-capture
 files with real native rows, run the bundle through Phase 5.1v, and only if
 5.1v emits `generated_phase51s_manifest_ready=true`, stage the generated
@@ -825,4 +835,5 @@ the sanitized outputs into Phase 5.1q, and rerun Phase 5.1n/5.1h/5.1i. No
 model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
 5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, Phase 5.1x,
-Phase 5.1y, Phase 5.1z, Phase 5.1ad, or Phase 5.1ae.
+Phase 5.1y, Phase 5.1z, Phase 5.1aa, Phase 5.1ab, Phase 5.1ac, Phase 5.1ad,
+Phase 5.1ae, Phase 5.1af, Phase 5.1ag, Phase 5.1ah, or Phase 5.1ai.

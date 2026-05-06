@@ -2232,3 +2232,48 @@ and materialize it through Phase 5.1ad, then compose through Phase 5.1ae and
 rerun Phase 5.1v. Separately obtain sanitized Lighter event-time pressure rows
 and stage them through Phase 5.1ab before composing and validating.
 ```
+
+## 2026-05-06 - Phase 5.1ai Non-Lighter Order-History Bridge Decision
+
+Decision: `PROMOTE` only the HOLD-only diagnostic tooling and negative
+evidence. `BLOCK` further autonomous local capture loops unless a materially
+different source surface or new account activity is available.
+
+Rationale:
+
+- Extended and Paradex official docs expose read-only order-history surfaces
+  with client/external identifiers, so one bounded diagnostic was justified.
+- The diagnostic preserved the source-link contract: a native trade/fill row
+  had to hash to a current request-pack `source_record_sha256` and bridge by a
+  deterministic order key to a uniquely target-matched order-history row.
+- The real capture emitted zero materializable links; therefore this lane does
+  not reduce the Phase 5.1 native-role blocker.
+
+Evidence:
+
+```text
+tool: tools/phase51ai_non_lighter_order_history_bridge_diagnostic.py
+test: tests/test_phase51ai_non_lighter_order_history_bridge_diagnostic.py
+run: runs/phase51ai_non_lighter_order_history_bridge_diagnostic/PHASE51AI-NON-LIGHTER-ORDER-HISTORY-BRIDGE-DIAGNOSTIC-HOLD-20260506T000000Z
+extended native rows: 1601
+extended order-history rows: 1664
+extended request-source overlap: 1579
+extended order-history target matches: 21
+paradex native rows: 30
+paradex order-history rows: 668
+paradex request-source overlap: 23
+paradex order-history target matches: 15
+materializable_source_link_count: 0
+raw_identifier_redaction_status: PASS
+clears_phase51_blockers: false
+```
+
+Next move:
+
+```text
+Do not repeat Phase 5.1ai without changed source semantics, target window,
+retained source rows, account activity, or auth material. Obtain the validated
+redacted source-link mapping or directly target-linkable source required by the
+current-target wide request pack, and separately obtain Lighter event-time
+pressure rows for Phase 5.1ab.
+```

@@ -446,6 +446,54 @@ Do not repeat Lighter Explorer log/tx bridge capture unless account activity,
 target window, source semantics, auth material, or local artifacts change
 materially.
 
+### Gate 5.1ai - Non-Lighter Order-History Bridge Diagnostic
+
+Allowed:
+
+- HOLD-only read-only Extended order-history capture from
+  `GET /api/v1/user/orders/history` plus Extended native trades from
+  `GET /api/v1/user/trades`.
+- HOLD-only read-only Paradex order-history capture from `GET /v1/orders-history`
+  plus Paradex native fills from `GET /v1/fills`.
+- Emission of `source_links.proposed.sanitized.jsonl` only when a native
+  trade/fill raw row hashes exactly to a current request-pack
+  `source_record_sha256`, order-history identifiers uniquely hash-match a
+  current target, and the native row shares a deterministic raw order key with
+  that target-linked order-history row.
+
+Hard boundary:
+
+- Phase 5.1ai must not call any order placement, cancel, modify, transfer, or
+  venue write endpoint.
+- Persisted artifacts must redact raw identifiers and secret-shaped fields.
+- Order-history target matches alone are not valid source-link evidence unless
+  the matching native trade/fill row is already in the current request pack.
+- Time/price/size/account-role-only inference remains prohibited.
+
+Reference diagnostic:
+
+```text
+runs/phase51ai_non_lighter_order_history_bridge_diagnostic/PHASE51AI-NON-LIGHTER-ORDER-HISTORY-BRIDGE-DIAGNOSTIC-HOLD-20260506T000000Z
+```
+
+Reference result:
+
+```text
+Extended native rows: 1601
+Extended order-history rows: 1664
+Extended request-source overlap: 1579
+Extended order-history target matches: 21
+Paradex native rows: 30
+Paradex order-history rows: 668
+Paradex request-source overlap: 23
+Paradex order-history target matches: 15
+materializable source links: 0
+```
+
+Do not repeat Extended/Paradex order-history bridge capture unless account
+activity, target window, retained source rows, source semantics, auth material,
+or local artifacts change materially.
+
 ### Gate 5.1c - Calibration Label Lake
 
 Required evidence:
@@ -1616,4 +1664,6 @@ Lighter pressure from time/price/size proximity, documentation-only limits,
 GET-only caps, empty headers, account tiers, empty WebSocket snapshots,
 inactive-order target overlap without native-source overlap, trade-export CSV
 rows without order/client identifiers, or Explorer logs/txs that do not overlap
-current request-pack source hashes and target hashes.
+current request-pack source hashes and target hashes, or Extended/Paradex
+order-history rows that do not bridge request-pack native source hashes to
+target hashes.

@@ -5,6 +5,74 @@ run artifacts under `runs/` are ignored by Git because they contain large
 telemetry snapshots; this file preserves the reproducible evidence boundary in
 the repository.
 
+## 2026-05-06 - Phase 5.1ai Non-Lighter Order-History Bridge Diagnostic
+
+Purpose: test the final bounded non-Lighter retrospective source-link surface
+identified by the board: read-only Extended and Paradex order history joined to
+their native trade/fill rows. This is HOLD-only evidence; it does not authorize
+live orders, canary, capital escalation, risk-limit changes, model training,
+EV admission, or economic claims.
+
+Official source scope used for design:
+
+```text
+Extended GET /api/v1/user/orders/history
+Extended GET /api/v1/user/trades
+Paradex GET /v1/orders-history
+Paradex GET /v1/fills
+```
+
+Changed repo-owned behavior:
+
+```text
+tool: tools/phase51ai_non_lighter_order_history_bridge_diagnostic.py
+test: tests/test_phase51ai_non_lighter_order_history_bridge_diagnostic.py
+accepted source link: native trade/fill raw row hash must equal a current request-pack source_record_sha256, order-history identifiers must uniquely hash-match a current target, and native/order-history rows must share a deterministic raw order key
+not allowed: order placement, cancel/modify, venue write calls, env/secret exposure, time/price/size inference, account-role-only inference
+redaction: persisted source snapshots hash raw identifiers, persist secret-shaped fields as presence-only redacted fields, and never persist credential variable names or values
+```
+
+Real read-only diagnostic:
+
+```text
+runs/phase51ai_non_lighter_order_history_bridge_diagnostic/PHASE51AI-NON-LIGHTER-ORDER-HISTORY-BRIDGE-DIAGNOSTIC-HOLD-20260506T000000Z
+request pack: runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z
+gate_status: HOLD
+fetch_status.extended: FETCHED native_row_count=1601 order_history_row_count=1664
+fetch_status.paradex: FETCHED native_row_count=30 order_history_row_count=668
+request_source_hash_overlap_count.extended: 1579
+request_source_hash_overlap_count.paradex: 23
+order_history_target_match_count.extended: 21
+order_history_target_match_count.paradex: 15
+materializable_source_link_count: 0
+materializable_target_count: 0
+bridge_status_counts.NO_ORDER_HISTORY_TARGET_MATCH: 1602
+bridge_status_counts.NATIVE_SOURCE_HASH_NOT_IN_REQUEST: 29
+raw_identifier_redaction_status: PASS
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51ai_non_lighter_order_history_bridge_diagnostic.py
+python3 -m unittest tests.test_phase51ai_non_lighter_order_history_bridge_diagnostic
+rg -l "secret-signature|PRIVATE|private|Authorization|Bearer|PARADEX|EXTENDED_API_KEY|PARADEX_JWT|PARADEX_READONLY_TOKEN|PARADEX_JWT_CMD|starkExSignature|0x[0-9A-Fa-f]{8}|external-client|paradex-client" \
+  runs/phase51ai_non_lighter_order_history_bridge_diagnostic/PHASE51AI-NON-LIGHTER-ORDER-HISTORY-BRIDGE-DIAGNOSTIC-HOLD-20260506T000000Z
+```
+
+Result:
+
+```text
+focused Phase 5.1ai unittest: PASS
+obvious raw-id/secret scan: PASS (no matching files)
+```
+
+Phase 5.1ai remains HOLD and does not reduce Phase 5.1 blockers. The run
+proves Extended/Paradex read-only order history is accessible and sanitized,
+but does not produce a deterministic current-pack source-link sidecar. Do not
+repeat this lane unless account activity, retained source rows, target window,
+or source semantics change materially.
+
 ## 2026-05-06 - Phase 5.1ah Lighter Explorer Bridge Diagnostic
 
 Purpose: test the remaining non-duplicative historical Lighter source surface:
