@@ -811,6 +811,30 @@ because those `28` rows overlap target IDs already counted ready by existing
 Phase 5.1z evidence. Phase 5.1aj is therefore accepted as forward
 infrastructure, not blocker clearance.
 
+Phase 5.1ak adds the HOLD-only blocker-resolution wrapper. It composes accepted
+Phase 5.1ad, Phase 5.1aj, Phase 5.1ab, or explicit candidate-manifest inputs
+through Phase 5.1ae, reruns Phase 5.1v, and emits target-level decisions. For
+the current retained pack, ready targets are labeled `RECOVERED_CURRENT_PACK`
+and missing targets remain `UNRECOVERABLE_FROM_LOCAL_ARTIFACTS`. For a
+board-documented forward-refresh pack, ready targets are labeled
+`READY_FORWARD_REFRESH_PACK` and incomplete targets are labeled
+`FORWARD_REFRESH_PACK_INCOMPLETE`. Phase 5.1ak is a validation wrapper only; it
+does not create source evidence, infer links, infer pressure, or authorize any
+promotion.
+
+Phase 5.1al adds the HOLD-only forward-refresh capture gate. It accepts only
+already-sanitized local `.jsonl` rows where target join keys and source truth
+are captured together: venue-native role fields for native-role targets, or
+complete Lighter event-time active-order/sendTx/REST-or-weighted pressure
+fields for Lighter native-limit targets. It emits a Phase 5.1u-compatible
+`target_run`, Phase 5.1ae/5.1v candidate manifest, minimal Phase 5.1ak request
+pack, source snapshots, source-link sidecar, labels, summary, and artifact
+index. It rejects raw identifiers, secrets, unsafe true flags, network/env/
+symlink inputs, missing native source fields, missing Lighter pressure fields,
+and duplicate target keys. Phase 5.1al is the correct future lane once a
+non-live capture can record target rows and source truth at event time; it does
+not recover current retained targets by itself.
+
 The resumed expanded Aster/Extended/Paradex read-only capture plus Hyperliquid
 composition also preserves `HOLD`: Phase 5.1v remains `73 / 287` native-role
 ready, `214 / 287` native-role targets missing, and `0 / 3132` Lighter
@@ -859,12 +883,13 @@ Lighter request-pressure source. The source-link path must run through Phase
 5.1ad, compose through Phase 5.1ae with the existing Hyperliquid source, and
 then rerun Phase 5.1v. The Lighter pressure path must stage complete sanitized
 event-time rows through Phase 5.1ab before Phase 5.1ae/5.1v validation. After a
-ready Phase 5.1v result, stage the generated manifest through Phase 5.1s, run
-Phase 5.1r, feed the sanitized outputs into Phase 5.1q, and rerun Phase
-5.1n/5.1h/5.1i. No
+ready Phase 5.1v result, or a Phase 5.1al forward-refresh pack that Phase 5.1ak
+marks `READY_FORWARD_REFRESH_PACK`, stage the generated manifest through Phase
+5.1s, run Phase 5.1r, feed the sanitized outputs into Phase 5.1q, and rerun
+Phase 5.1n/5.1h/5.1i. No
 model training, EV admission, canary, live orders, capital escalation,
 risk-limit relaxation, or financial claim is authorized from Phase 5.1s, Phase
 5.1r, Phase 5.1q, Phase 5.1t, Phase 5.1u, Phase 5.1v, Phase 5.1w, Phase 5.1x,
 Phase 5.1y, Phase 5.1z, Phase 5.1aa, Phase 5.1ab, Phase 5.1ac, Phase 5.1ad,
 Phase 5.1ae, Phase 5.1af, Phase 5.1ag, Phase 5.1ah, Phase 5.1ai, or Phase
-5.1aj.
+5.1aj, Phase 5.1ak, or Phase 5.1al.

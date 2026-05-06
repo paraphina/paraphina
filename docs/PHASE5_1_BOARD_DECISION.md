@@ -2493,3 +2493,58 @@ artifact is produced. If the current-pack result remains incomplete, stop
 retrospective local mining and move only to a board-documented forward-refresh
 capture whose target rows and source truth are captured at event time.
 ```
+
+## Phase 5.1al Forward-Refresh Capture Gate Decision
+
+Decision: `PROMOTE` only the HOLD-only repo-owned forward-refresh capture gate
+and `HOLD` all live/canary/model-training/EV-admission implications. Phase
+5.1al is accepted as the canonical non-live lane for future forward-refresh
+packs where target rows and source truth are captured together at event time.
+It does not recover the current retained target pack and must not be used to
+infer source links, infer role, infer Lighter pressure, place orders, cancel
+orders, call `sendTx`/`sendTxBatch`, connect to venues, read env files, expose
+secrets, escalate capital, relax risk limits, or make financial claims.
+
+Evidence:
+
+```text
+tool: tools/phase51al_forward_refresh_capture_gate.py
+test: tests/test_phase51al_forward_refresh_capture_gate.py
+doc: docs/PHASE5_1AL_FORWARD_REFRESH_CAPTURE_GATE.md
+
+Phase 5.1al fixture run:
+runs/phase51al_forward_refresh_capture_gate/PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z
+
+Phase 5.1ak forward-refresh wrapper run:
+runs/phase51ak_blocker_resolution_runner/PHASE51AK-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z
+
+Phase 5.1ak fixture decision counts:
+READY_FORWARD_REFRESH_PACK=2
+
+Fixture readiness:
+native-role ready: 1 / 1
+Lighter native-limit pressure ready: 1 / 1
+```
+
+Board interpretation:
+
+```text
+accepted: Phase 5.1al makes the forward-refresh lane machine-checkable and
+prevents future target/source truth captures from being handled by manual
+manifest stitching.
+
+not accepted: treating the fixture as current-pack recovery, live readiness, a
+performance claim, model-training evidence, EV-admission evidence, or proof that
+current retained source-link or Lighter pressure blockers are solved.
+```
+
+Next move:
+
+```text
+Use Phase 5.1al only when a real future forward-refresh capture input already
+contains deterministic target keys plus venue-native role or Lighter pressure
+source truth. Then run Phase 5.1ak with --target-pack-mode forward-refresh.
+For current retained targets, continue to require a validated mapping for
+Phase 5.1ad, materially new direct rows for Phase 5.1aj, or complete sanitized
+Lighter pressure rows for Phase 5.1ab.
+```

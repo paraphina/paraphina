@@ -1697,6 +1697,39 @@ Phase 5.1v readiness. If Phase 5.1ak still reports
 mining loop; use only a board-documented forward-refresh capture where target
 rows and source truth are captured at event time.
 
+Phase 5.1al was added on 2026-05-06 as that repo-owned forward-refresh capture
+gate. It consumes a local sanitized `.jsonl` of new forward-refresh rows where
+each row already contains deterministic target join keys plus required native
+role source truth or complete Lighter event-time pressure truth. It emits a
+Phase 5.1u-compatible `target_run`, local source snapshots, a strict
+Phase 5.1ae/5.1v candidate manifest, and the minimal request pack required by
+Phase 5.1ak.
+
+```text
+tool: tools/phase51al_forward_refresh_capture_gate.py
+doc: docs/PHASE5_1AL_FORWARD_REFRESH_CAPTURE_GATE.md
+fixture run: runs/phase51al_forward_refresh_capture_gate/PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z
+Phase 5.1ak fixture wrapper: runs/phase51ak_blocker_resolution_runner/PHASE51AK-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z
+fixture decisions: READY_FORWARD_REFRESH_PACK=2
+fixture native-role ready: 1 / 1
+fixture Lighter native-limit pressure ready: 1 / 1
+```
+
+Operational implication: Phase 5.1al is now the correct next local tool when a
+future non-live source owner can capture target rows and source truth together
+at event time. It is not a retrospective mining lane and it does not clear the
+current retained Phase 5.1 blocker by itself. If a Phase 5.1al run is produced,
+validate it through Phase 5.1ak with:
+
+```text
+python3 tools/phase51ak_blocker_resolution_runner.py \
+  --target-run runs/phase51al_forward_refresh_capture_gate/<RUN_ID>/target_run \
+  --request-pack runs/phase51al_forward_refresh_capture_gate/<RUN_ID>/phase51al_request_pack \
+  --no-default-current-manifest \
+  --candidate-manifest runs/phase51al_forward_refresh_capture_gate/<RUN_ID>/candidate_manifest.forward_refresh.json \
+  --target-pack-mode forward-refresh
+```
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
@@ -1709,6 +1742,13 @@ is authorized.
 Current resume path:
 
 ```text
+forward-refresh lane:
+1. Capture new non-live target rows and source truth together at event time.
+2. Stage the sanitized rows through Phase 5.1al.
+3. Run Phase 5.1ak with --target-pack-mode forward-refresh.
+4. Treat READY_FORWARD_REFRESH_PACK as readiness for that new forward-refresh
+   pack only, not proof that current retained targets are recovered.
+
 native-role blocker:
 1. Obtain materially new directly target-linkable private/native rows and run
    Phase 5.1aj, or obtain a validated redacted mapping for

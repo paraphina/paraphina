@@ -94,10 +94,13 @@ Lighter native trade join attempt with `0 / 125` exact canonical recoveries.
 Phase 5.1q adds the all-five forward path for explicit venue-native maker/taker
 role evidence and Lighter event-time sendTx/REST native-limit pressure. Phase
 5.1r adds the redaction-safe local source adapter, but its baseline no-source
-run clears no blockers.
-Blockers remain: native-limit pressure is still partial, venue-native
-maker/taker evidence is incomplete for `287` filled rows, calibration buckets
-are sparse, and observed-only selection-bias quarantine policy remains
+run clears no blockers. Phase 5.1ak is now the canonical HOLD-only wrapper for
+validating current-pack or forward-refresh source artifacts through Phase 5.1v.
+Phase 5.1al is the repo-owned forward-refresh capture gate for future non-live
+rows where target keys and source truth are captured together at event time.
+Blockers remain for the current retained target pack: native-limit pressure is
+still missing, venue-native maker/taker evidence is incomplete, calibration
+buckets are sparse, and observed-only selection-bias quarantine policy remains
 unresolved.
 
 Part II below remains the hash-locked v1 appendix. It is historical target/spec

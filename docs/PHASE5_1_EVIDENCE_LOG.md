@@ -648,6 +648,75 @@ OK
 phase51ak_blocker_resolution_runner: status HOLD (non-live blocker decision only)
 ```
 
+## Phase 5.1al Forward-Refresh Capture Gate
+
+- Run id: `PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z`
+- Local run directory: `runs/phase51al_forward_refresh_capture_gate/PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z`
+- Tool: `tools/phase51al_forward_refresh_capture_gate.py`
+- Gate status: `HOLD`
+- Gate reason: `phase51al_forward_refresh_capture_gate_nonlive_hold`
+- Native-role targets materialized: `1`
+- Lighter native-limit pressure targets materialized: `1`
+- Source rows materialized: `2`
+- Source links materialized: `2`
+- `approved_for_live`: `false`
+- `approved_for_canary`: `false`
+- `approved_for_capital_escalation`: `false`
+- `live_orders_allowed`: `false`
+- `capital_change_allowed`: `false`
+- `risk_limit_relaxation_allowed`: `false`
+- `admissible_for_financial_claim`: `false`
+
+Phase 5.1ak wrapper:
+
+- Run id: `PHASE51AK-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z`
+- Local run directory: `runs/phase51ak_blocker_resolution_runner/PHASE51AK-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z`
+- Gate reason: `phase51ak_forward_refresh_pack_ready_nonlive_hold`
+- Target pack mode: `forward-refresh`
+- Native-role targets ready: `1 / 1`
+- Lighter native-limit pressure ready: `1 / 1`
+- Target decisions: `READY_FORWARD_REFRESH_PACK=2`
+
+Commands:
+
+```bash
+python3 tools/phase51al_forward_refresh_capture_gate.py \
+  --input-jsonl /tmp/phase51al_forward_refresh_fixture.jsonl \
+  --run-id PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z \
+  --timestamp-ns 1778025600000000000
+
+python3 tools/phase51ak_blocker_resolution_runner.py \
+  --target-run runs/phase51al_forward_refresh_capture_gate/PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z/target_run \
+  --request-pack runs/phase51al_forward_refresh_capture_gate/PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z/phase51al_request_pack \
+  --no-default-current-manifest \
+  --candidate-manifest runs/phase51al_forward_refresh_capture_gate/PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z/candidate_manifest.forward_refresh.json \
+  --target-pack-mode forward-refresh \
+  --run-id PHASE51AK-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z \
+  --timestamp-ns 1778025600000000000
+```
+
+Validation:
+
+```bash
+python3 -m py_compile tools/phase51al_forward_refresh_capture_gate.py tools/phase51ak_blocker_resolution_runner.py
+python3 -m unittest tests.test_phase51al_forward_refresh_capture_gate tests.test_phase51ak_blocker_resolution_runner -v
+```
+
+Result:
+
+```text
+Ran 5 tests
+OK
+phase51al_forward_refresh_capture_gate: status HOLD (non-live forward-refresh capture gate only)
+phase51ak_blocker_resolution_runner: status HOLD (non-live blocker decision only)
+```
+
+Interpretation: This is fixture contract evidence only. It proves the
+forward-refresh lane can be materialized and validated through Phase 5.1ak when
+complete sanitized source truth is present. It does not clear current retained
+Phase 5.1 blockers and does not authorize live/canary/model-training/EV
+admission or financial claims.
+
 ## 2026-05-05 - Authorized Read-Only Source Capture Follow-Up
 
 Scope: local and venue read-only source search under explicit authorization,

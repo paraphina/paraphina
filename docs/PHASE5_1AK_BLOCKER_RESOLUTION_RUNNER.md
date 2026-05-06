@@ -54,15 +54,30 @@ python3 tools/phase51ak_blocker_resolution_runner.py \
 Use `--no-default-current-manifest` only for tests or for a board-documented
 forward-refresh target pack.
 
+Forward-refresh validation after Phase 5.1al:
+
+```bash
+python3 tools/phase51ak_blocker_resolution_runner.py \
+  --target-run runs/phase51al_forward_refresh_capture_gate/<RUN_ID>/target_run \
+  --request-pack runs/phase51al_forward_refresh_capture_gate/<RUN_ID>/phase51al_request_pack \
+  --no-default-current-manifest \
+  --candidate-manifest runs/phase51al_forward_refresh_capture_gate/<RUN_ID>/candidate_manifest.forward_refresh.json \
+  --target-pack-mode forward-refresh
+```
+
 ## Decision Semantics
 
 Each target receives one of these statuses:
 
 - `RECOVERED_CURRENT_PACK`: the final Phase 5.1v validation found a source row
-  that satisfies the target.
+  that satisfies a current-pack target.
 - `UNRECOVERABLE_FROM_LOCAL_ARTIFACTS`: the supplied local artifacts did not
   satisfy the target, so the next action is `FORWARD_REFRESH_REQUIRED` unless a
   validated redacted current-pack mapping is obtained.
+- `READY_FORWARD_REFRESH_PACK`: the final Phase 5.1v validation found a source
+  row that satisfies a board-documented forward-refresh target.
+- `FORWARD_REFRESH_PACK_INCOMPLETE`: the supplied forward-refresh pack still
+  lacks required source truth for that target.
 
 Phase 5.1ak remains `HOLD` even when Phase 5.1v reports
 `downstream_chain_ready=true`; downstream promotion still requires the normal
@@ -81,3 +96,18 @@ Lighter native-limit pressure ready: 0 / 3132
 decision counts: RECOVERED_CURRENT_PACK=73, UNRECOVERABLE_FROM_LOCAL_ARTIFACTS=3346
 next required action: obtain_validated_mapping_or_forward_refresh_target_pack_with_event_time_sources
 ```
+
+Forward-refresh fixture evidence:
+
+```text
+run: runs/phase51ak_blocker_resolution_runner/PHASE51AK-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z
+source gate: runs/phase51al_forward_refresh_capture_gate/PHASE51AL-FORWARD-REFRESH-FIXTURE-HOLD-20260506T000000Z
+gate_reason: phase51ak_forward_refresh_pack_ready_nonlive_hold
+target_pack_mode: forward-refresh
+native-role ready: 1 / 1
+Lighter native-limit pressure ready: 1 / 1
+decision counts: READY_FORWARD_REFRESH_PACK=2
+```
+
+The fixture proves runner compatibility with Phase 5.1al only. It does not
+recover the current retained target pack.

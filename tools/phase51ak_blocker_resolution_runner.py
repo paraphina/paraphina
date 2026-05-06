@@ -294,6 +294,7 @@ def _decision_rows(
     timestamp_ns: int,
     target_run: Path,
     phase51v_run: Path,
+    target_pack_mode: str,
 ) -> list[dict[str, Any]]:
     role_targets, limit_targets = _load_targets(target_run)
     missing_role_ids = {
@@ -314,8 +315,12 @@ def _decision_rows(
         for target in targets:
             target_id = _target_id(target)
             missing = target_id in missing_ids
-            decision_status = "UNRECOVERABLE_FROM_LOCAL_ARTIFACTS" if missing else "RECOVERED_CURRENT_PACK"
-            next_required_action = "FORWARD_REFRESH_REQUIRED" if missing else "NONE"
+            if target_pack_mode == "forward-refresh":
+                decision_status = "FORWARD_REFRESH_PACK_INCOMPLETE" if missing else "READY_FORWARD_REFRESH_PACK"
+                next_required_action = "FORWARD_REFRESH_SOURCE_TRUTH_REQUIRED" if missing else "NONE"
+            else:
+                decision_status = "UNRECOVERABLE_FROM_LOCAL_ARTIFACTS" if missing else "RECOVERED_CURRENT_PACK"
+                next_required_action = "FORWARD_REFRESH_REQUIRED" if missing else "NONE"
             row = {
                 "schema_version": 1,
                 "label_type": "PHASE51AK_BLOCKER_TARGET_DECISION",
@@ -330,6 +335,7 @@ def _decision_rows(
                 "current_pack_missing_after_final_validation": missing,
                 "next_required_action": next_required_action,
                 "forward_refresh_required": missing,
+                "target_pack_mode": target_pack_mode,
                 "phase51v_run": str(phase51v_run),
                 "no_live_flag": True,
                 "approved_for_model_training": False,
@@ -470,6 +476,7 @@ def build_blocker_resolution_runner(
         timestamp_ns=timestamp_ns,
         target_run=target_run,
         phase51v_run=phase51v_run,
+        target_pack_mode=target_pack_mode,
     )
     decision_path = out_dir / "phase51ak_blocker_target_decisions.jsonl"
     summary_path = out_dir / "phase51ak_blocker_resolution_summary.json"
@@ -486,9 +493,17 @@ def build_blocker_resolution_runner(
         "baseline_commit": BASELINE_COMMIT,
         "gate_status": "HOLD",
         "gate_reason": (
-            "phase51ak_current_pack_ready_nonlive_hold"
+            (
+                "phase51ak_forward_refresh_pack_ready_nonlive_hold"
+                if target_pack_mode == "forward-refresh"
+                else "phase51ak_current_pack_ready_nonlive_hold"
+            )
             if downstream_ready
-            else "phase51ak_current_pack_incomplete_forward_refresh_required_nonlive_hold"
+            else (
+                "phase51ak_forward_refresh_pack_incomplete_nonlive_hold"
+                if target_pack_mode == "forward-refresh"
+                else "phase51ak_current_pack_incomplete_forward_refresh_required_nonlive_hold"
+            )
         ),
         "target_pack_mode": target_pack_mode,
         "target_run": str(target_run),
