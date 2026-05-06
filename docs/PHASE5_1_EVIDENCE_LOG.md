@@ -274,7 +274,8 @@ read-only native-role capture:
 Lighter target-window local sanitizer:
   runs/phase51z_readonly_native_role_capture/PHASE51Z-LIGHTER-TARGET-WINDOW-LOCAL-SOURCE-HOLD-20260505T2335Z
 attempted Lighter Phase 5.1b read-only limit refresh:
-  blocked before capture because LIGHTER_AUTH_TOKEN is absent and no local lighter-sdk package/path is available for --allow-sdk-auth
+  initially blocked because LIGHTER_AUTH_TOKEN was absent in the command env;
+  later retried successfully through the local signer venv, see 2026-05-06 follow-up below
 ```
 
 Read-only native-role capture result:
@@ -321,6 +322,86 @@ mapping for the current-target wide request pack, or a different directly
 target-linkable non-live source, plus observed Lighter event-time pressure rows
 with active-order headroom, sendTx limit/remaining, REST-or-weighted
 limit/remaining, and event-time alignment.
+
+## 2026-05-06 - Lighter Signer-Venv Read-Only Retry
+
+Scope: continue the same non-live evidence search using the already-running
+local Lighter signer environment. No live/canary mode, order submission,
+cancel/replace, `sendTx`, `sendTxBatch`, capital escalation, risk-limit
+relaxation, model training, EV admission, or financial claim was authorized.
+
+Local auth finding:
+
+```text
+local signer health: http://127.0.0.1:9001/health returned ok=true
+local SDK path: /opt/paraphina/.venv_lighter/lib/python3.12/site-packages/lighter
+```
+
+Read-only capture:
+
+```text
+run:
+  runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-AUTHORIZED-READONLY-LIMITS-SIGNERVENV-HOLD-20260506T0005Z
+capture status: HOLD
+phase51b_capture_complete: true
+sources captured:
+  account
+  account_limits
+  active_orders
+  official_limits
+  order_books
+  trades
+```
+
+Observed limitation from the captured telemetry:
+
+```text
+sendtx_per_minute_limit: null
+sendtx_per_minute_remaining: null
+rest_requests_per_minute_limit: null
+rest_requests_per_minute_remaining: null
+weighted_requests_per_minute_limit: null
+weighted_requests_per_minute_remaining: null
+active_order evidence: current snapshot, not label event time
+```
+
+Source-link retry:
+
+```text
+source-link builder:
+  runs/phase51t_source_link_sidecar_builder/PHASE51T-LIGHTER-SIGNERVENV-SOURCE-LINK-RETRY-HOLD-20260506T0015Z
+source links emitted: 363
+current-wide reuse audit:
+  runs/phase51ac_source_link_reuse_audit/PHASE51AC-SIGNERVENV-SOURCE-LINK-RETRY-REUSE-AUDIT-HOLD-20260506T0016Z
+reusable current-wide source links: 0 / 2819
+missing source links by venue: aster=784, extended=1579, lighter=300, paradex=156
+```
+
+Event-time pressure retry:
+
+```text
+025435 lane:
+  runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-SIGNERVENV-LIMIT-CAPTURE-025435-HOLD-20260506T0017Z
+073231 lane:
+  runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-SIGNERVENV-LIMIT-CAPTURE-073231-HOLD-20260506T0017Z
+forward_native_limit_pressure_source_count: 0
+native_limit_all_pressure_dimensions_observed_count: 0
+phase51v_lighter_native_limit_manifest_ready: false
+```
+
+Interpretation:
+
+```text
+accepted: local Lighter SDK availability is no longer a blocker for read-only
+  current snapshot capture.
+accepted: the current Lighter account-limit endpoint still did not expose the
+  sendTx/REST/weighted remaining pressure fields required by Phase 5.1.
+accepted: the newly emitted source-link sidecar rows do not overlap the current
+  wide source-link request pack.
+not accepted: blocker clearance, inferred event-time pressure from current
+  snapshots or official caps, inferred source links, live/canary authorization,
+  model training, EV admission, or financial claims.
+```
 
 ## 2026-05-05 - Phase 5.1ab Lighter Native-Limit Pressure Source Preflight
 
