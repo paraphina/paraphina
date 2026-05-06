@@ -1291,8 +1291,10 @@ class TestValidatorSubprocess(unittest.TestCase):
             account_path = tmp_path / "account.json"
             limits_path = tmp_path / "account_limits.json"
             active_orders_path = tmp_path / "active_orders.json"
+            inactive_orders_path = tmp_path / "inactive_orders.json"
             order_books_path = tmp_path / "order_books.json"
             trades_path = tmp_path / "trades.json"
+            trade_export_path = tmp_path / "trade_export.json"
             env_path = tmp_path / "lighter.env"
             env_path.write_text(
                 "LIGHTER_ACCOUNT_INDEX='123'\n"
@@ -1335,6 +1337,17 @@ class TestValidatorSubprocess(unittest.TestCase):
                     {"order_id": "3", "market_id": 8, "status": "OPEN"},
                 ]
             }), encoding="utf-8")
+            inactive_orders_path.write_text(json.dumps({
+                "orders": [
+                    {
+                        "order_id": "inactive-1",
+                        "client_order_id": "client-inactive-1",
+                        "market_index": 0,
+                        "status": "FILLED",
+                    }
+                ],
+                "next_cursor": "cursor-should-hash",
+            }), encoding="utf-8")
             order_books_path.write_text(json.dumps({
                 "order_books": [{
                     "market_id": 0,
@@ -1352,6 +1365,19 @@ class TestValidatorSubprocess(unittest.TestCase):
                     {"trade_id": "t3"},
                 ]
             }), encoding="utf-8")
+            trade_export_path.write_text(json.dumps({
+                "data_url": "https://example.invalid/presigned?signature=should-redact",
+                "rows": [
+                    {
+                        "trade_id": "te1",
+                        "ask_id": "ask-1",
+                        "bid_id": "bid-1",
+                        "ask_account_id": 123,
+                        "bid_account_id": 456,
+                        "is_maker_ask": True,
+                    }
+                ],
+            }), encoding="utf-8")
 
             result = subprocess.run(
                 [
@@ -1367,10 +1393,14 @@ class TestValidatorSubprocess(unittest.TestCase):
                     str(limits_path),
                     "--active-orders-json",
                     str(active_orders_path),
+                    "--inactive-orders-json",
+                    str(inactive_orders_path),
                     "--order-books-json",
                     str(order_books_path),
                     "--trades-json",
                     str(trades_path),
+                    "--trade-export-json",
+                    str(trade_export_path),
                     "--env-file",
                     str(env_path),
                     "--market-symbol",
@@ -1471,6 +1501,8 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(sanitized_account["accounts"][0]["credential"], "<redacted>")
             summary = json.loads((run_dir / "lighter_account_native_limits_summary.json").read_text(encoding="utf-8"))
             self.assertTrue(summary["phase51b_capture_complete"])
+            self.assertIn("inactive_orders", summary["source_names"])
+            self.assertIn("trade_export", summary["source_names"])
             gate = json.loads((run_dir / "gate_result.json").read_text(encoding="utf-8"))
             self.assertEqual(gate["status"], "HOLD")
             self.assertTrue(gate["approved_for_nonlive_evidence_review"])
@@ -1484,6 +1516,23 @@ class TestValidatorSubprocess(unittest.TestCase):
                     content = artifact.read_text(encoding="utf-8", errors="ignore")
                     self.assertNotIn("should-not-appear-in-artifacts", content, str(artifact))
                     self.assertNotIn("should-redact", content, str(artifact))
+                    self.assertNotIn("inactive-1", content, str(artifact))
+                    self.assertNotIn("client-inactive-1", content, str(artifact))
+                    self.assertNotIn("cursor-should-hash", content, str(artifact))
+                    self.assertNotIn("presigned?signature", content, str(artifact))
+            sanitized_inactive = json.loads(
+                (run_dir / "source_snapshots" / "inactive_orders.sanitized.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("order_id_sha256", sanitized_inactive["orders"][0])
+            self.assertIn("client_order_id_sha256", sanitized_inactive["orders"][0])
+            self.assertIn("next_cursor_sha256", sanitized_inactive)
+            sanitized_export = json.loads(
+                (run_dir / "source_snapshots" / "trade_export.sanitized.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(sanitized_export["data_url_present"])
+            self.assertIn("data_url_sha256", sanitized_export)
+            self.assertIn("ask_id_sha256", sanitized_export["rows"][0])
+            self.assertIn("bid_id_sha256", sanitized_export["rows"][0])
             self.assertFalse(gate["approved_for_live"])
 
     def test_phase51b_lighter_account_limits_rejects_live_or_sendtx_specs(self):

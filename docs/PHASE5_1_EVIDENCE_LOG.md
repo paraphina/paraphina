@@ -403,6 +403,75 @@ not accepted: blocker clearance, inferred event-time pressure from current
   model training, EV admission, or financial claims.
 ```
 
+## 2026-05-06 - Lighter Inactive-Order / Export Bridge Audit
+
+Scope: test the last identified non-duplicative Lighter historical read-only
+source lane. No live/canary mode, order submission, cancel/replace, `sendTx`,
+`sendTxBatch`, capital escalation, risk-limit relaxation, model training, EV
+admission, or financial claim was authorized.
+
+Repo changes:
+
+```text
+tools/phase51b_lighter_account_limits.py:
+  optional read-only accountInactiveOrders capture
+  optional read-only export?type=trade capture
+  throttled inactive-order pagination
+  presigned data_url redaction
+
+tools/phase51ag_lighter_inactive_order_bridge_audit.py:
+  HOLD-only local bridge audit
+  consumes sanitized inactive orders plus retained Lighter trade sources
+  emits only source_record_sha256 -> canonical_group_id/order_key proposals
+  does not infer links from time/price/size
+```
+
+Read-only captures:
+
+```text
+inactive full-window run:
+  runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-INACTIVE-PAGED-FULLWINDOW-THROTTLED-HOLD-20260506T0135Z
+pages fetched: 28
+inactive orders captured: 2800
+oldest inactive order timestamp: 2026-04-29T02:42:55Z
+target actual Lighter window covered: yes
+status: HOLD
+
+export run:
+  runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-HISTORICAL-INACTIVE-PAGED-EXPORT-HOLD-20260506T0115Z
+export rows parsed: 382 CSV rows
+order/client identifiers exposed by export rows: no
+status: HOLD
+```
+
+Bridge audit:
+
+```text
+run:
+  runs/phase51ag_lighter_inactive_order_bridge_audit/PHASE51AG-LIGHTER-INACTIVE-ORDER-BRIDGE-AUDIT-V2-HOLD-20260506T0145Z
+current-wide Lighter request source hashes: 300
+current-wide Lighter target hashes: 125
+inactive-order target hash matches: 70
+inactive-order target matches: 70
+native trade source rows checked across retained backfills: 1800
+native trade source rows overlapping current request hashes: 1129
+materializable source links: 0
+materializable bridge targets: 0
+```
+
+Evidence boundary:
+
+```text
+accepted: Lighter inactive orders can deterministically match 70 current target
+  hashes, but those hashes do not overlap any retained Lighter native trade row
+  source_record_sha256 that can satisfy Phase 5.1v native-role readiness.
+not accepted: using inactive-order target matches alone as maker/taker evidence,
+  using trade-export role CSV rows without order/client identifiers as
+  target-linkable evidence, inferred source links from time/price/size, model
+  training, EV admission, live/canary deployment, capital escalation,
+  risk-limit relaxation, or economic claims.
+```
+
 ## 2026-05-05 - Phase 5.1ab Lighter Native-Limit Pressure Source Preflight
 
 Scope:

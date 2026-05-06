@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import hashlib
+import io
 import json
 import os
 import platform
@@ -38,8 +40,10 @@ READONLY_ENDPOINTS = {
     "account": "/api/v1/account",
     "account_limits": "/api/v1/accountLimits",
     "active_orders": "/api/v1/accountActiveOrders",
+    "inactive_orders": "/api/v1/accountInactiveOrders",
     "order_books": "/api/v1/orderBooks",
     "trades": "/api/v1/trades",
+    "trade_export": "/api/v1/export",
 }
 SENSITIVE_KEYS = {
     "auth",
@@ -113,6 +117,12 @@ RAW_IDENTIFIER_VALUE_KEYS = {
     "transactionid",
     "txhash",
     "venueorderid",
+}
+PRESIGNED_URL_VALUE_KEYS = {
+    "dataurl",
+    "downloadurl",
+    "fileurl",
+    "signedurl",
 }
 
 
@@ -200,6 +210,9 @@ def _redact(value: Any) -> Any:
                 or normalized == "jwt"
             ):
                 redacted[str(key)] = "<redacted>"
+            elif normalized in PRESIGNED_URL_VALUE_KEYS:
+                redacted[f"{key}_present"] = item not in (None, "")
+                redacted[f"{key}_sha256"] = _stable_hash(item) if item not in (None, "") else None
             elif normalized in RAW_IDENTIFIER_VALUE_KEYS and not normalized.endswith("sha256"):
                 hashed_key = f"{key}_sha256"
                 redacted[str(hashed_key)] = _stable_hash(item) if item not in (None, "") else None
@@ -683,6 +696,62 @@ def _http_get_json_with_headers(
     return payload, response_headers
 
 
+def _http_get_bytes_with_headers(
+    url: str,
+    *,
+    timeout_s: float = 10.0,
+) -> tuple[bytes, dict[str, str], str | None]:
+    headers = {"Accept": "*/*", "User-Agent": "paraphina-phase51b-readonly/1"}
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:  # noqa: S310
+        body = response.read()
+        response_headers = _sanitize_response_headers(dict(response.headers.items()))
+        content_type = response.headers.get("Content-Type")
+    return body, response_headers, content_type
+
+
+def _parse_export_body(body: bytes, content_type: str | None) -> dict[str, Any]:
+    text = body.decode("utf-8-sig", errors="replace")
+    stripped = text.strip()
+    if not stripped:
+        return {
+            "parse_status": "EMPTY",
+            "rows": [],
+            "raw_body_sha256": hashlib.sha256(body).hexdigest(),
+            "raw_body_bytes": len(body),
+            "content_type": content_type,
+        }
+    if "json" in (content_type or "").lower() or stripped[0] in "[{":
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, (dict, list)):
+            return {
+                "parse_status": "JSON",
+                "payload": payload,
+                "raw_body_sha256": hashlib.sha256(body).hexdigest(),
+                "raw_body_bytes": len(body),
+                "content_type": content_type,
+            }
+    sample = stripped[:2048]
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+    except csv.Error:
+        dialect = csv.excel
+    try:
+        rows = list(csv.DictReader(io.StringIO(stripped), dialect=dialect))
+    except csv.Error:
+        rows = []
+    return {
+        "parse_status": "CSV" if rows else "UNPARSED",
+        "rows": rows,
+        "raw_body_sha256": hashlib.sha256(body).hexdigest(),
+        "raw_body_bytes": len(body),
+        "content_type": content_type,
+    }
+
+
 def _http_get_source_record(
     *,
     name: str,
@@ -708,6 +777,186 @@ def _http_get_source_record(
     )
 
 
+def _http_get_trade_export_source_record(
+    *,
+    name: str,
+    base_url: str,
+    endpoint: str,
+    params: dict[str, Any],
+    auth_token: str,
+    timeout_s: float,
+) -> dict[str, Any] | None:
+    payload, response_headers = _http_get_json_with_headers(
+        base_url,
+        endpoint,
+        params=params,
+        auth_token=auth_token,
+        timeout_s=timeout_s,
+    )
+    data_url = payload.get("data_url") if isinstance(payload, dict) else None
+    export_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "export_request": {k: v for k, v in params.items() if v is not None},
+        "export_response": payload,
+        "export_response_headers": response_headers,
+        "export_data_fetch_status": "NO_DATA_URL",
+    }
+    export_headers: dict[str, str] = dict(response_headers)
+    if isinstance(data_url, str) and data_url.strip():
+        try:
+            body, data_headers, content_type = _http_get_bytes_with_headers(data_url, timeout_s=timeout_s)
+            parsed = _parse_export_body(body, content_type)
+            export_payload.update({
+                "export_data_fetch_status": parsed["parse_status"],
+                "export_data": parsed,
+            })
+            export_headers.update({f"data:{key}": value for key, value in data_headers.items()})
+        except Exception as exc:  # noqa: BLE001 - optional read-only evidence should remain auditable
+            export_payload.update({
+                "export_data_fetch_status": "ERROR",
+                "export_data_error_type": type(exc).__name__,
+                "export_data_error_status_code": getattr(exc, "code", None),
+                "export_data_error_message_hash": _stable_hash(str(exc)),
+            })
+    return _source_record(
+        name=name,
+        payload=export_payload,
+        source_path=None,
+        source_endpoint=f"{base_url}{endpoint}",
+        response_headers=export_headers,
+    )
+
+
+def _optional_error_source_record(name: str, exc: Exception, endpoint: str | None) -> dict[str, Any]:
+    return _source_record(
+        name=f"{name}_error",
+        payload={
+            "schema_version": 1,
+            "source_name": name,
+            "fetch_status": "ERROR",
+            "error_type": type(exc).__name__,
+            "error_status_code": getattr(exc, "code", None),
+            "error_message_hash": _stable_hash(str(exc)),
+        },
+        source_path=None,
+        source_endpoint=endpoint,
+    )
+
+
+def _payload_next_cursor(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        cursor = payload.get("next_cursor") or payload.get("nextCursor")
+        if cursor:
+            return str(cursor)
+    return None
+
+
+def _order_timestamp_ms(order: dict[str, Any]) -> int | None:
+    raw = (
+        order.get("timestamp")
+        or order.get("created_at")
+        or order.get("updated_at")
+        or order.get("transaction_time")
+    )
+    value = _as_int(raw)
+    if value is None:
+        return None
+    return value * 1000 if value < 10_000_000_000 else value
+
+
+def _fetch_inactive_orders_source_record(
+    *,
+    base_url: str,
+    endpoint: str,
+    account_index: int,
+    market_id: int | None,
+    auth_token: str,
+    timeout_s: float,
+    pages: int,
+    limit: int,
+    stop_at_or_before_ms: int | None,
+    between_timestamps: str | None,
+    sleep_s: float,
+) -> dict[str, Any] | None:
+    fetched_pages: list[dict[str, Any]] = []
+    all_orders: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for page_index in range(pages):
+        params = {
+            "account_index": account_index,
+            "market_id": market_id,
+            "market_type": "perp",
+            "between_timestamps": between_timestamps if page_index == 0 else None,
+            "cursor": cursor,
+            "limit": limit,
+        }
+        try:
+            payload, response_headers = _http_get_json_with_headers(
+                base_url,
+                endpoint,
+                params=params,
+                auth_token=auth_token,
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep partial read-only evidence auditable
+            fetched_pages.append({
+                "page_index": page_index,
+                "params": {k: v for k, v in params.items() if v is not None and k != "cursor"},
+                "cursor_present": cursor is not None,
+                "fetch_status": "ERROR",
+                "error_type": type(exc).__name__,
+                "error_status_code": getattr(exc, "code", None),
+                "error_message_hash": _stable_hash(str(exc)),
+            })
+            break
+        orders = _extract_active_orders(payload)
+        timestamps = [ts for ts in (_order_timestamp_ms(order) for order in orders) if ts is not None]
+        fetched_pages.append({
+            "page_index": page_index,
+            "params": {k: v for k, v in params.items() if v is not None and k != "cursor"},
+            "cursor_present": cursor is not None,
+            "fetch_status": "OBSERVED",
+            "response_headers": response_headers,
+            "order_count": len(orders),
+            "timestamp_min_ms": min(timestamps) if timestamps else None,
+            "timestamp_max_ms": max(timestamps) if timestamps else None,
+            "payload": payload,
+        })
+        all_orders.extend(orders)
+        next_cursor = _payload_next_cursor(payload)
+        if stop_at_or_before_ms is not None and timestamps and min(timestamps) <= stop_at_or_before_ms:
+            break
+        if not orders or not next_cursor:
+            break
+        cursor = next_cursor
+        if page_index + 1 < pages and sleep_s > 0:
+            time.sleep(sleep_s)
+    payload = {
+        "schema_version": 1,
+        "fetch_status": "OBSERVED" if any(page.get("fetch_status") == "OBSERVED" for page in fetched_pages) else "ERROR",
+        "pages_requested": pages,
+        "pages_fetched": len(fetched_pages),
+        "limit": limit,
+        "stop_at_or_before_ms": stop_at_or_before_ms,
+        "between_timestamps_present": between_timestamps is not None,
+        "sleep_s": sleep_s,
+        "order_count": len(all_orders),
+        "pages": fetched_pages,
+        "orders": all_orders,
+    }
+    headers: dict[str, str] = {}
+    for page in fetched_pages:
+        for key, value in (page.get("response_headers") or {}).items():
+            headers[f"page{page['page_index']}:{key}"] = value
+    return _source_record(
+        name="inactive_orders",
+        payload=payload,
+        source_path=None,
+        source_endpoint=f"{base_url}{endpoint}",
+        response_headers=headers,
+    )
+
+
 def _fetch_readonly_sources(
     *,
     env: dict[str, str],
@@ -715,6 +964,14 @@ def _fetch_readonly_sources(
     account_index: int,
     market_id: int | None,
     include_trades: bool,
+    include_inactive_orders: bool,
+    include_trade_export: bool,
+    historical_start_ms: int | None,
+    historical_end_ms: int | None,
+    inactive_order_pages: int,
+    inactive_order_limit: int,
+    inactive_order_stop_at_or_before_ms: int | None,
+    inactive_order_sleep_s: float,
     allow_sdk_auth: bool,
     sdk_path: Path | None,
     timeout_s: float,
@@ -770,6 +1027,58 @@ def _fetch_readonly_sources(
             auth_token=auth_token,
             timeout_s=timeout_s,
         )
+    if include_inactive_orders:
+        endpoint = READONLY_ENDPOINTS["inactive_orders"]
+        try:
+            fetched["inactive_orders"] = _fetch_inactive_orders_source_record(
+                base_url=base_url,
+                endpoint=endpoint,
+                account_index=account_index,
+                market_id=market_id,
+                auth_token=auth_token,
+                timeout_s=timeout_s,
+                pages=inactive_order_pages,
+                limit=inactive_order_limit,
+                stop_at_or_before_ms=inactive_order_stop_at_or_before_ms,
+                between_timestamps=(
+                    f"{historical_start_ms},{historical_end_ms}"
+                    if historical_start_ms is not None and historical_end_ms is not None
+                    else None
+                ),
+                sleep_s=inactive_order_sleep_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - optional read-only evidence should not erase base capture
+            fetched["inactive_orders_error"] = _optional_error_source_record(
+                "inactive_orders",
+                exc,
+                f"{base_url}{endpoint}",
+            )
+    if include_trade_export:
+        endpoint = READONLY_ENDPOINTS["trade_export"]
+        try:
+            fetched["trade_export"] = _http_get_trade_export_source_record(
+                name="trade_export",
+                base_url=base_url,
+                endpoint=endpoint,
+                params={
+                    "account_index": account_index,
+                    "market_id": market_id,
+                    "type": "trade",
+                    "start_timestamp": historical_start_ms,
+                    "end_timestamp": historical_end_ms,
+                    "side": "all",
+                    "role": "all",
+                    "trade_type": "all",
+                },
+                auth_token=auth_token,
+                timeout_s=timeout_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - optional read-only evidence should not erase base capture
+            fetched["trade_export_error"] = _optional_error_source_record(
+                "trade_export",
+                exc,
+                f"{base_url}{endpoint}",
+            )
     return {k: v for k, v in fetched.items() if v is not None}
 
 
@@ -1080,12 +1389,22 @@ def run(
     account_json: Path | None,
     account_limits_json: Path | None,
     active_orders_json: Path | None,
+    inactive_orders_json: Path | None,
     official_limits_json: Path | None,
     order_books_json: Path | None,
     trades_json: Path | None,
+    trade_export_json: Path | None,
     env_file: Path | None,
     fetch_readonly: bool,
     include_trades: bool,
+    include_inactive_orders: bool,
+    include_trade_export: bool,
+    historical_start_ms: int | None,
+    historical_end_ms: int | None,
+    inactive_order_pages: int,
+    inactive_order_limit: int,
+    inactive_order_stop_at_or_before_ms: int | None,
+    inactive_order_sleep_s: float,
     allow_sdk_auth: bool,
     lighter_sdk_path: Path | None,
     base_url: str | None,
@@ -1131,9 +1450,11 @@ def run(
             "account": _load_source_file("account", account_json),
             "account_limits": _load_source_file("account_limits", account_limits_json),
             "active_orders": _load_source_file("active_orders", active_orders_json),
+            "inactive_orders": _load_source_file("inactive_orders", inactive_orders_json),
             "official_limits": _load_source_file("official_limits", official_limits_json),
             "order_books": _load_source_file("order_books", order_books_json),
             "trades": _load_source_file("trades", trades_json),
+            "trade_export": _load_source_file("trade_export", trade_export_json),
         }.items()
         if value is not None
     }
@@ -1146,6 +1467,14 @@ def run(
             account_index=resolved_account_index,
             market_id=resolved_market_id,
             include_trades=include_trades,
+            include_inactive_orders=include_inactive_orders,
+            include_trade_export=include_trade_export,
+            historical_start_ms=historical_start_ms,
+            historical_end_ms=historical_end_ms,
+            inactive_order_pages=inactive_order_pages,
+            inactive_order_limit=inactive_order_limit,
+            inactive_order_stop_at_or_before_ms=inactive_order_stop_at_or_before_ms,
+            inactive_order_sleep_s=inactive_order_sleep_s,
             allow_sdk_auth=allow_sdk_auth,
             sdk_path=lighter_sdk_path,
             timeout_s=timeout_s,
@@ -1276,6 +1605,14 @@ def run(
         "market_symbol": resolved_market_symbol,
         "fetch_readonly": fetch_readonly,
         "include_trades": include_trades,
+        "include_inactive_orders": include_inactive_orders,
+        "include_trade_export": include_trade_export,
+        "historical_start_ms": historical_start_ms,
+        "historical_end_ms": historical_end_ms,
+        "inactive_order_pages": inactive_order_pages,
+        "inactive_order_limit": inactive_order_limit,
+        "inactive_order_stop_at_or_before_ms": inactive_order_stop_at_or_before_ms,
+        "inactive_order_sleep_s": inactive_order_sleep_s,
         "allow_sdk_auth": allow_sdk_auth,
         "env_file": str(env_file) if env_file else None,
         "official_limits_json": str(official_limits_json) if official_limits_json else None,
@@ -1288,6 +1625,12 @@ def run(
         "fetch_readonly": fetch_readonly,
         "lighter_auth_token_present": bool(env.get("LIGHTER_AUTH_TOKEN", "").strip()),
         "lighter_api_private_key_present": bool(env.get("LIGHTER_API_PRIVATE_KEY_HEX", "").strip()),
+        "include_inactive_orders": include_inactive_orders,
+        "include_trade_export": include_trade_export,
+        "historical_window_present": historical_start_ms is not None and historical_end_ms is not None,
+        "inactive_order_pages": inactive_order_pages,
+        "inactive_order_limit": inactive_order_limit,
+        "inactive_order_sleep_s": inactive_order_sleep_s,
     }
     _write_json(summary_path, summary)
     _write_json(gate_path, gate)
@@ -1325,9 +1668,11 @@ def main() -> int:
     parser.add_argument("--account-json", type=Path, default=None)
     parser.add_argument("--account-limits-json", type=Path, default=None)
     parser.add_argument("--active-orders-json", type=Path, default=None)
+    parser.add_argument("--inactive-orders-json", type=Path, default=None)
     parser.add_argument("--official-limits-json", type=Path, default=None)
     parser.add_argument("--order-books-json", type=Path, default=None)
     parser.add_argument("--trades-json", type=Path, default=None)
+    parser.add_argument("--trade-export-json", type=Path, default=None)
     parser.add_argument(
         "--env-file",
         type=Path,
@@ -1336,6 +1681,14 @@ def main() -> int:
     )
     parser.add_argument("--fetch-readonly", action="store_true")
     parser.add_argument("--include-trades", action="store_true")
+    parser.add_argument("--include-inactive-orders", action="store_true")
+    parser.add_argument("--include-trade-export", action="store_true")
+    parser.add_argument("--historical-start-ms", type=int, default=None)
+    parser.add_argument("--historical-end-ms", type=int, default=None)
+    parser.add_argument("--inactive-order-pages", type=int, default=1)
+    parser.add_argument("--inactive-order-limit", type=int, default=100)
+    parser.add_argument("--inactive-order-stop-at-or-before-ms", type=int, default=None)
+    parser.add_argument("--inactive-order-sleep-s", type=float, default=0.0)
     parser.add_argument("--allow-sdk-auth", action="store_true")
     parser.add_argument(
         "--lighter-sdk-path",
@@ -1350,6 +1703,15 @@ def main() -> int:
     parser.add_argument("--timestamp-ns", type=int, default=None)
     parser.add_argument("--timeout-s", type=float, default=10.0)
     args = parser.parse_args()
+    if args.inactive_order_pages < 1:
+        print("phase51b_lighter_account_limits: ERROR: --inactive-order-pages must be >= 1", file=sys.stderr)
+        return 2
+    if args.inactive_order_limit < 1 or args.inactive_order_limit > 100:
+        print("phase51b_lighter_account_limits: ERROR: --inactive-order-limit must be between 1 and 100", file=sys.stderr)
+        return 2
+    if args.inactive_order_sleep_s < 0:
+        print("phase51b_lighter_account_limits: ERROR: --inactive-order-sleep-s must be >= 0", file=sys.stderr)
+        return 2
     try:
         out_dir = run(
             spec_path=args.spec,
@@ -1358,12 +1720,22 @@ def main() -> int:
             account_json=args.account_json,
             account_limits_json=args.account_limits_json,
             active_orders_json=args.active_orders_json,
+            inactive_orders_json=args.inactive_orders_json,
             official_limits_json=args.official_limits_json,
             order_books_json=args.order_books_json,
             trades_json=args.trades_json,
+            trade_export_json=args.trade_export_json,
             env_file=args.env_file,
             fetch_readonly=args.fetch_readonly,
             include_trades=args.include_trades,
+            include_inactive_orders=args.include_inactive_orders,
+            include_trade_export=args.include_trade_export,
+            historical_start_ms=args.historical_start_ms,
+            historical_end_ms=args.historical_end_ms,
+            inactive_order_pages=args.inactive_order_pages,
+            inactive_order_limit=args.inactive_order_limit,
+            inactive_order_stop_at_or_before_ms=args.inactive_order_stop_at_or_before_ms,
+            inactive_order_sleep_s=args.inactive_order_sleep_s,
             allow_sdk_auth=args.allow_sdk_auth,
             lighter_sdk_path=args.lighter_sdk_path,
             base_url=args.base_url,

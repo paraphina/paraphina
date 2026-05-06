@@ -367,6 +367,43 @@ local_retrieval_possible_without_inference: false
 Do not repeat this audit unless the request pack, local telemetry/log inputs, or
 source semantics change materially.
 
+### Gate 5.1ag - Lighter Inactive-Order Bridge Audit
+
+Allowed:
+
+- HOLD-only local bridge audit from sanitized Lighter inactive orders to the
+  current source-link request pack and retained Lighter native trade sources.
+- Consumption of local raw identifier-shaped trade inputs only for hashing and
+  matching; output must remain redacted hash-only.
+- Emission of a proposed `source_links.proposed.sanitized.jsonl` only when a
+  deterministic inactive-order hash uniquely maps a request source hash to a
+  current target.
+
+Hard boundary:
+
+- Phase 5.1ag must not call venue APIs, read env files, place orders, infer
+  source links from time/price/size, or emit raw identifiers.
+- Inactive-order target matches alone are not maker/taker evidence.
+- Trade-export role CSV rows without order/client identifiers are not
+  target-linkable evidence.
+
+Reference audit:
+
+```text
+runs/phase51ag_lighter_inactive_order_bridge_audit/PHASE51AG-LIGHTER-INACTIVE-ORDER-BRIDGE-AUDIT-V2-HOLD-20260506T0145Z
+```
+
+Reference result:
+
+```text
+inactive-order target matches: 70
+materializable source links: 0
+```
+
+Do not repeat Lighter inactive-order/export bridge capture unless account
+activity, target window, source semantics, auth material, or local artifacts
+change materially.
+
 ### Gate 5.1c - Calibration Label Lake
 
 Required evidence:
