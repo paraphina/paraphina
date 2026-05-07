@@ -502,6 +502,65 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## PHASE51-MAY7-FORWARD-REFRESH-BLOCKER-AUDIT
+
+- Date: `2026-05-07`
+- Decision: `HOLD`
+- Purpose: determine whether a real Phase 5.1al forward-refresh pack exists or
+  whether another repo-owned gate is needed before future deterministic source
+  capture.
+- Board verdict: no real Phase 5.1al pack exists beyond the fixture; no
+  additional validation gate is missing because Phase 5.1ak already validates
+  Phase 5.1al outputs with `--target-pack-mode forward-refresh`.
+- Current retained blocker remains: native-role ready `73 / 287`; Lighter
+  native-limit pressure ready `0 / 3132`.
+
+Evidence generated:
+
+```text
+Fresh read-only Lighter capture:
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-FORWARD-REFRESH-ATTEMPT-HOLD-20260507T000000Z
+
+Phase 5.1n replays:
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-FORWARD-REFRESH-ATTEMPT-025435-HOLD-20260507T000000Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-FORWARD-REFRESH-ATTEMPT-073231-HOLD-20260507T000000Z
+```
+
+Key result:
+
+```text
+phase51b gate_status: HOLD
+phase51b no_live_flag: true
+phase51n complete Lighter pressure rows: 0
+phase51n native_limit_all_pressure_dimensions_observed_count: 0
+phase51n native_limit_event_time_aligned_count: 0
+limitations:
+- lighter_sendtx_limit_not_observed
+- lighter_sendtx_remaining_not_observed
+- lighter_rest_or_weighted_limit_not_observed
+- lighter_rest_or_weighted_remaining_not_observed
+```
+
+Interpretation:
+
+```text
+The May 7 read-only refresh proves that existing local credentials can still
+reach the read-only Lighter account/native-limit endpoints, but those endpoints
+do not expose the event-time sendTx and REST-or-weighted limit/remaining fields
+required to clear Phase 5.1v Lighter pressure readiness. This is a source-truth
+gap, not a repo-permission or tooling gap.
+```
+
+Next single move:
+
+```text
+Wait for a source-owner artifact, then route it through the existing gate:
+- real sanitized Phase 5.1al forward-refresh rows -> Phase 5.1al -> Phase 5.1ak;
+- validated redacted source mapping -> Phase 5.1ad -> Phase 5.1ak;
+- directly target-linkable private/native rows -> Phase 5.1aj -> Phase 5.1ak;
+- complete Lighter pressure rows -> Phase 5.1ab -> Phase 5.1ak.
+```
+
 ## 2026-05-06 - Explicit Lighter Read-Only Blocker Recheck
 
 Purpose: execute the authorized full local read-only blocker recheck using

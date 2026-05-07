@@ -1730,6 +1730,25 @@ python3 tools/phase51ak_blocker_resolution_runner.py \
   --target-pack-mode forward-refresh
 ```
 
+The 2026-05-07 executive-orchestrator audit confirmed that no real Phase 5.1al
+pack is present beyond the deterministic fixture, and that no additional
+post-5.1al validation gate is missing. The correct validator is already
+Phase 5.1ak with `--target-pack-mode forward-refresh`.
+
+The same audit ran a fresh local-credential, read-only Lighter refresh:
+
+```text
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-FORWARD-REFRESH-ATTEMPT-HOLD-20260507T000000Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-FORWARD-REFRESH-ATTEMPT-025435-HOLD-20260507T000000Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-FORWARD-REFRESH-ATTEMPT-073231-HOLD-20260507T000000Z
+```
+
+Operational implication: this refresh did not reduce the blocker. Phase 5.1n
+again emitted `0` complete Lighter event-time pressure rows because sendTx and
+REST-or-weighted limit/remaining fields were still not observed. Do not repeat
+this read-only collector loop unless source semantics, target window, account
+activity, auth material, retained rows, or local artifacts change materially.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7

@@ -2548,3 +2548,59 @@ For current retained targets, continue to require a validated mapping for
 Phase 5.1ad, materially new direct rows for Phase 5.1aj, or complete sanitized
 Lighter pressure rows for Phase 5.1ab.
 ```
+
+## 2026-05-07 Forward-Refresh Blocker Audit Decision
+
+Decision: `HOLD`. The board accepts the May 7 executive-orchestrator audit as
+negative evidence for further local/current-pack mining. There is no real
+Phase 5.1al forward-refresh pack available beyond the deterministic fixture,
+and no additional repo-owned validation gate is required before a real pack
+arrives because Phase 5.1ak already validates Phase 5.1al outputs through
+Phase 5.1ae and Phase 5.1v using `--target-pack-mode forward-refresh`.
+
+Evidence:
+
+```text
+Fresh read-only Lighter capture:
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-READONLY-FORWARD-REFRESH-ATTEMPT-HOLD-20260507T000000Z
+
+Phase 5.1n replay:
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-FORWARD-REFRESH-ATTEMPT-025435-HOLD-20260507T000000Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-FORWARD-REFRESH-ATTEMPT-073231-HOLD-20260507T000000Z
+
+Phase 5.1n result:
+complete Lighter pressure rows: 0
+native_limit_all_pressure_dimensions_observed_count: 0
+native_limit_event_time_aligned_count: 0
+limitations:
+- lighter_sendtx_limit_not_observed
+- lighter_sendtx_remaining_not_observed
+- lighter_rest_or_weighted_limit_not_observed
+- lighter_rest_or_weighted_remaining_not_observed
+```
+
+Board interpretation:
+
+```text
+accepted: current local credentials can run the read-only Lighter collector,
+but the observed account-limits payload still does not expose the event-time
+sendTx and REST-or-weighted limit/remaining fields required by Phase 5.1v.
+
+not accepted: treating account tier, static docs, current active-order
+snapshots, empty response headers, runtime config strings, or prior fixture
+rows as Lighter pressure evidence.
+
+not accepted: adding another local mining tool when the required missing input
+is source-owner truth rather than repo logic.
+```
+
+Next move:
+
+```text
+Do not repeat retrospective local mining. Proceed only when one of these
+source-owner artifacts exists:
+1. a real sanitized Phase 5.1al forward-refresh input;
+2. a validated redacted Phase 5.1ad mapping;
+3. materially new directly target-linkable Phase 5.1aj private/native rows;
+4. complete sanitized Phase 5.1ab Lighter event-time pressure rows.
+```
