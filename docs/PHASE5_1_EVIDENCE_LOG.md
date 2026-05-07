@@ -502,6 +502,90 @@ sparse_calibration_bucket: 2000
 counterfactual_only_nonfinancial: 2000
 ```
 
+## PHASE51-MAY7-SOURCE-TRUTH-CAPTURE-ATTEMPT
+
+- Date: `2026-05-07`
+- Decision: `HOLD`
+- Scope: read-only attempt to obtain missing source-truth evidence using
+  existing local credentials only
+- Live/canary/capital/risk authorization: `false`
+- Financial/economic claim authority: `false`
+
+Artifacts:
+
+```text
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-SOURCE-TRUTH-CAPTURE-025435-HOLD-20260507T165132Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-SOURCE-TRUTH-CAPTURE-073231-HOLD-20260507T165132Z
+runs/phase51z_readonly_native_role_capture/PHASE51Z-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+runs/phase51ak_blocker_resolution_runner/PHASE51AK-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+```
+
+Lighter capture result:
+
+```text
+schema validation: PASS
+phase51b_acceptance: HOLD
+account/account-limits/active-orders/inactive-orders/order-books/trades: captured
+sendtx_per_minute_limit: null
+sendtx_per_minute_remaining: null
+rest_requests_per_minute_limit: null
+rest_requests_per_minute_remaining: null
+weighted_requests_per_minute_limit: null
+weighted_requests_per_minute_remaining: null
+```
+
+Phase 5.1n pressure result:
+
+```text
+complete Lighter pressure rows: 0
+native_limit_all_pressure_dimensions_observed_count: 0
+native_limit_event_time_aligned_count: 0
+limitations:
+- lighter_sendtx_limit_not_observed
+- lighter_sendtx_remaining_not_observed
+- lighter_rest_or_weighted_limit_not_observed
+- lighter_rest_or_weighted_remaining_not_observed
+- lighter_rest_request_limit_not_exposed_by_account_limits_payload
+```
+
+Native-role source result:
+
+```text
+Aster rows fetched: 824
+Extended rows fetched: 1601
+Paradex rows fetched: 163
+Lighter local trade rows normalized: 100
+target-linked Aster rows: 39
+target-linked Extended rows: 21
+target-linked Paradex rows: 7
+target-linked Lighter rows: 0
+unlinked sanitized rows: 2519
+```
+
+Final Phase 5.1ak result:
+
+```text
+gate_status: HOLD
+native-role ready: 73 / 287
+native-role missing: 214 / 287
+Lighter native-limit pressure ready: 0 / 3132
+RECOVERED_CURRENT_PACK: 73
+UNRECOVERABLE_FROM_LOCAL_ARTIFACTS: 3346
+clears_phase51_blockers: false
+next_required_action: obtain_validated_mapping_or_forward_refresh_target_pack_with_event_time_sources
+```
+
+Conclusion:
+
+```text
+The remaining Phase 5.1 blocker cannot be cleared from currently available
+local/read-only source surfaces. Do not infer source links or pressure rows.
+Proceed only with a validated redacted mapping, complete sanitized Lighter
+event-time pressure rows, materially new directly target-linkable rows, or a
+real Phase 5.1al forward-refresh pack.
+```
+
 ## PHASE51-MAY7-FORWARD-REFRESH-BLOCKER-AUDIT
 
 - Date: `2026-05-07`

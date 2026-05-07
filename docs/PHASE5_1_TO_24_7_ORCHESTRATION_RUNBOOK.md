@@ -1749,6 +1749,22 @@ REST-or-weighted limit/remaining fields were still not observed. Do not repeat
 this read-only collector loop unless source semantics, target window, account
 activity, auth material, retained rows, or local artifacts change materially.
 
+The later 2026-05-07 source-truth capture attempt also remained `HOLD`:
+
+```text
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-SOURCE-TRUTH-CAPTURE-025435-HOLD-20260507T165132Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-SOURCE-TRUTH-CAPTURE-073231-HOLD-20260507T165132Z
+runs/phase51z_readonly_native_role_capture/PHASE51Z-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+runs/phase51ak_blocker_resolution_runner/PHASE51AK-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+```
+
+Operational implication: currently available local/read-only source surfaces
+have now been exhausted for this blocker. Phase 5.1ak still reports `73 / 287`
+native-role targets ready and `0 / 3132` Lighter native-limit targets ready.
+The next orchestrator must not continue local mining without a materially new
+source-owner artifact or a real Phase 5.1al forward-refresh input.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7

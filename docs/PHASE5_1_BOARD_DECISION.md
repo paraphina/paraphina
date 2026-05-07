@@ -2604,3 +2604,69 @@ source-owner artifacts exists:
 3. materially new directly target-linkable Phase 5.1aj private/native rows;
 4. complete sanitized Phase 5.1ab Lighter event-time pressure rows.
 ```
+
+## 2026-05-07 Source-Truth Capture Attempt Decision
+
+Decision: `HOLD`. The board accepts the 2026-05-07 source-truth capture attempt
+as a completed read-only blocker-resolution attempt. It does not clear the
+current retained Phase 5.1 blocker.
+
+Evidence:
+
+```text
+Fresh read-only Lighter account/native-limit capture:
+runs/phase51b_lighter_account_native_limits/PHASE51B-LIGHTER-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+
+Fresh Lighter Phase 5.1n pressure alignment:
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-SOURCE-TRUTH-CAPTURE-025435-HOLD-20260507T165132Z
+runs/phase51n_lighter_native_limit_time_alignment/PHASE51N-LIGHTER-SOURCE-TRUTH-CAPTURE-073231-HOLD-20260507T165132Z
+
+Fresh Aster/Extended/Paradex read-only native-role capture plus sanitized
+Lighter local trade normalization:
+runs/phase51z_readonly_native_role_capture/PHASE51Z-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+
+Final Phase 5.1ak validation:
+runs/phase51ak_blocker_resolution_runner/PHASE51AK-SOURCE-TRUTH-CAPTURE-HOLD-20260507T165132Z
+```
+
+Result:
+
+```text
+Phase 5.1ak gate_status: HOLD
+native-role ready: 73 / 287
+native-role missing: 214 / 287
+Lighter native-limit pressure ready: 0 / 3132
+RECOVERED_CURRENT_PACK: 73
+UNRECOVERABLE_FROM_LOCAL_ARTIFACTS: 3346
+next_required_action: obtain_validated_mapping_or_forward_refresh_target_pack_with_event_time_sources
+```
+
+Board interpretation:
+
+```text
+accepted: existing local credentials and read-only collectors were sufficient
+to query the available account/source surfaces and produce sanitized evidence
+packs.
+
+not accepted: the available Lighter account-limits payload as complete
+event-time pressure evidence, because sendTx and REST-or-weighted
+limit/remaining fields remain unobserved.
+
+not accepted: the fresh Aster/Extended/Paradex retrospective read-only rows as
+new blocker-clearing source truth, because they recover the same target-linked
+counts already recognized by prior Phase 5.1v/5.1ak evidence.
+
+not accepted: any inference-based source-link or Lighter-pressure recovery.
+```
+
+Next move:
+
+```text
+Stop this local/read-only source lane unless new source-owner truth appears.
+The only valid blocker-clearing inputs are still:
+1. a validated redacted source_record_sha256 -> canonical_group_id/order_key mapping;
+2. complete sanitized Lighter event-time pressure rows;
+3. materially new directly target-linkable private/native rows;
+4. a real Phase 5.1al forward-refresh pack with target keys and source truth
+   captured together.
+```
