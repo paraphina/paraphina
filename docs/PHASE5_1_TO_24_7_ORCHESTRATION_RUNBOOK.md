@@ -71,6 +71,12 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    confirms the same HOLD counts. Do not repeat the existing retrospective
    local/source loops unless account activity, target window, retained source
    rows, auth material, or source semantics change materially.
+   Phase 5.1am is the autonomous non-live executive control point for this
+   state: run `tools/phase51am_nonlive_executive_orchestrator.py` at the end of
+   each blocker task to classify the four admissible source-owner routes and
+   emit route ledgers, subagent work packets, workflow optimization ledgers, and
+   source-owner requests instead of leaving the workflow at an unstructured
+   HOLD.
    The native-role path now requires a validated redacted mapping for
    `runs/phase51z_source_link_request_pack/PHASE51Z-CURRENT-TARGET-WIDE-SOURCE-LINK-REQUEST-PACK-HOLD-20260505T000000Z`
    or a materially different directly target-linkable non-live source. Run any
@@ -97,6 +103,9 @@ promote V2 behavior beyond the gates in `ROADMAP.md`.
    `docs/PHASE5_1R_FORWARD_NATIVE_SOURCE_ACQUISITION.md` as the standing
    contract for source acquisition, `docs/PHASE5_1Q_FORWARD_NATIVE_EVIDENCE.md`
    for downstream forward native evidence,
+   `docs/PHASE5_1AM_NONLIVE_EXECUTIVE_ORCHESTRATOR.md` as the standing
+   contract for autonomous non-live route classification and subagent packet
+   emission,
    `tools/phase51ab_lighter_native_limit_pressure_source.py` as the local
    sanitized Lighter native-limit pressure preflight gate,
    `tools/phase51ac_source_link_reuse_audit.py` as the source-link sidecar
@@ -1765,6 +1774,25 @@ native-role targets ready and `0 / 3132` Lighter native-limit targets ready.
 The next orchestrator must not continue local mining without a materially new
 source-owner artifact or a real Phase 5.1al forward-refresh input.
 
+Phase 5.1an was added on 2026-05-15 as the source-owner inbox scaffold for the
+Phase 5.1al lane:
+
+```text
+tool: tools/phase51an_source_owner_forward_refresh_capture.py
+doc: docs/PHASE5_1AN_SOURCE_OWNER_FORWARD_REFRESH_CAPTURE.md
+run: runs/phase51an_source_owner_forward_refresh_capture/PHASE51AN-SOURCE-OWNER-FORWARD-REFRESH-CAPTURE-HOLD-20260515T000000Z
+source-owner inbox: /home/ubuntu/source_owner_inbox/phase51
+forward-refresh input: /home/ubuntu/source_owner_inbox/phase51/forward_refresh.jsonl
+capture contract: /home/ubuntu/source_owner_inbox/phase51/SOURCE_OWNER_CAPTURE_CONTRACT.md
+```
+
+Operational implication: use Phase 5.1an before Phase 5.1am whenever the
+source-owner inbox changes. If `forward_refresh.jsonl` is empty, Phase 5.1an
+keeps the intake manifest in a safe waiting state with empty artifact lists. If
+sanitized rows are present, it safety-scans them, materializes Phase 5.1al, and
+writes the Phase 5.1al summary path into the intake manifest. Do not route raw
+`forward_refresh.jsonl` directly into Phase 5.1aj or Phase 5.1ab.
+
 ## Current Verdict
 
 `HOLD` for live, canary, capital escalation, risk-limit relaxation, and 24/7
@@ -1777,11 +1805,31 @@ is authorized.
 Current resume path:
 
 ```text
+executive control:
+1. Run tools/phase51am_nonlive_executive_orchestrator.py at the start or end of
+   each blocker-resolution task.
+2. If selected_route != none, execute the emitted selected-route packet and
+   validate through the named downstream Phase 5.1 gate.
+3. If selected_route == none, dispatch the emitted subagent/source-owner work
+   packets using the generated subagent_prompt_pack/ files; do not repeat
+   exhausted local mining.
+4. Apply the emitted workflow_optimization_ledger.jsonl actions to resize the
+   board, suppress duplicated work, preserve route priority, and schedule audit.
+5. When source-owner truth arrives, write one local source-owner intake manifest
+   using the emitted source_owner_intake_manifest.template.json, then rerun
+   Phase 5.1am with --source-owner-intake-manifest <path>.
+6. Re-run Phase 5.1am after each supplied artifact or completed task.
+
 forward-refresh lane:
 1. Capture new non-live target rows and source truth together at event time.
-2. Stage the sanitized rows through Phase 5.1al.
-3. Run Phase 5.1ak with --target-pack-mode forward-refresh.
-4. Treat READY_FORWARD_REFRESH_PACK as readiness for that new forward-refresh
+2. Write sanitized rows only to
+   /home/ubuntu/source_owner_inbox/phase51/forward_refresh.jsonl.
+3. Run Phase 5.1an with --update-intake-manifest.
+4. Rerun Phase 5.1am with
+   --source-owner-intake-manifest /home/ubuntu/source_owner_inbox/phase51/intake.json.
+5. Run Phase 5.1ak with --target-pack-mode forward-refresh if Phase 5.1am
+   selects the forward-refresh route.
+6. Treat READY_FORWARD_REFRESH_PACK as readiness for that new forward-refresh
    pack only, not proof that current retained targets are recovered.
 
 native-role blocker:
@@ -1803,14 +1851,15 @@ Lighter pressure blocker:
    next all-five Phase 5.1v readiness review.
 ```
 
-Current stop condition: without those source-owner artifacts or a materially
-different non-live source surface, there is no safe local implementation move
-that can reduce the Phase 5.1 HOLD blocker. Do not infer source links or
-Lighter pressure from time/price/size proximity, documentation-only limits,
-GET-only caps, empty headers, account tiers, empty WebSocket snapshots,
-inactive-order target overlap without native-source overlap, trade-export CSV
-rows without order/client identifiers, or Explorer logs/txs that do not overlap
-current request-pack source hashes and target hashes, or Extended/Paradex
-order-history rows that do not bridge request-pack native source hashes to
-target hashes, or Phase 5.1aj duplicate source rows that overlap already-ready
-targets.
+Current evidence boundary: without those source-owner artifacts or a materially
+different non-live source surface, there is no safe local evidence route that
+can reduce the Phase 5.1 HOLD blocker. The autonomous workflow must still
+continue by running Phase 5.1am, dispatching its generated work packets, and
+auditing the result after each task. Do not infer source links or Lighter
+pressure from time/price/size proximity, documentation-only limits, GET-only
+caps, empty headers, account tiers, empty WebSocket snapshots, inactive-order
+target overlap without native-source overlap, trade-export CSV rows without
+order/client identifiers, or Explorer logs/txs that do not overlap current
+request-pack source hashes and target hashes, or Extended/Paradex order-history
+rows that do not bridge request-pack native source hashes to target hashes, or
+Phase 5.1aj duplicate source rows that overlap already-ready targets.

@@ -2670,3 +2670,166 @@ The only valid blocker-clearing inputs are still:
 4. a real Phase 5.1al forward-refresh pack with target keys and source truth
    captured together.
 ```
+
+## 2026-05-14 Phase 5.1am Autonomous Control Decision
+
+Decision: `HOLD` for blocker clearance and all live/canary/capital/risk
+actions. Continue using Phase 5.1am as the non-live autonomous control point
+after each blocker task.
+
+Evidence:
+
+```text
+tool: tools/phase51am_nonlive_executive_orchestrator.py
+test: tests/test_phase51am_nonlive_executive_orchestrator.py
+run: runs/phase51am_nonlive_executive_orchestrator/PHASE51AM-CONTENT-SAFETY-REROUTE-HOLD-20260514T000000Z
+```
+
+Result:
+
+```text
+gate_status: HOLD
+control_status: AWAITING_SOURCE_OWNER_INPUT
+selected_route: none
+ready_route_count: 0
+route_status_counts.BLOCKED: 4
+subagent_work_packet_count: 5
+subagent_prompt_count: 5
+workflow_optimization_status: CONTINUOUS_ACTIVE
+workflow_optimization_action_count: 7
+source_owner_intake_manifest_supplied: false
+phase51am_delta.staleness_status: UNCHANGED_NO_READY_ROUTE
+phase51am_delta.optimization_signal: avoid_duplicate_local_mining_and_keep_source_owner_handoff
+native-role ready: 73 / 287
+native-role missing: 214 / 287
+Lighter native-limit pressure ready: 0 / 3132
+autonomous_continuation_status: source_owner_and_subagent_work_packets_emitted
+```
+
+Board interpretation:
+
+```text
+accepted: an exhausted local evidence route is no longer an unstructured
+workflow halt. Phase 5.1am emits an auditable route ledger, workflow
+optimization ledger, source-owner request, and subagent packets for the four
+admissible source-owner routes.
+
+accepted: the autonomous-control run compares against the previous Phase 5.1am
+summary and explicitly flags unchanged no-ready-route loops, so repeated local
+mining requires a material-change reason.
+
+accepted: source-owner truth can now be supplied through a single local intake
+manifest, which Phase 5.1am merges with explicit arguments, safety-checks, and
+routes without ad hoc command reconstruction.
+
+accepted: Phase 5.1am renders each work packet into a subagent prompt pack, so
+the executive orchestrator can dispatch lanes from generated prompt files
+instead of manually reformatting JSONL packet records.
+
+accepted: Phase 5.1am parses and safety-checks supplied mapping, direct
+private-row, and Lighter pressure artifacts before any route can become ready;
+raw identifier fields, secret-shaped fields, and unsafe true flags fail closed
+at intake.
+
+accepted: fixture-only Phase 5.1al evidence does not select the forward-refresh
+route, and no route is marked ready without supplied real source-owner truth.
+
+not accepted: treating Phase 5.1am as blocker-clearing evidence, EV admission,
+model-training authority, production-readiness evidence, or live/canary/capital
+authorization.
+```
+
+Next move:
+
+```text
+Run Phase 5.1am at the start or end of each autonomous blocker-resolution task.
+If selected_route is none, dispatch the generated subagent/source-owner packets
+and apply the workflow optimization ledger before auditing the result. If
+selected_route is ready, execute the emitted route through the named Phase 5.1
+gate and keep Phase 5.1ak as the final wrapper.
+```
+
+Autonomous packet audit:
+
+```text
+forward_refresh packet: HOLD; only the deterministic Phase 5.1al fixture exists
+locally, and it is correctly excluded as nonblocking fixture evidence.
+
+validated_mapping/direct_private_rows packet: HOLD; no Phase 5.1ad mapping
+exists for the current request pack, existing sidecars have zero overlap with
+current source hashes/target keys, and Phase 5.1aj has only the already-known
+28 duplicate Extended/Paradex rows.
+
+lighter_pressure packet: HOLD; 11
+lighter_forward_native_limit_pressure_snapshot.jsonl files exist with 0 total
+rows, and Phase 5.1n/5.1b summaries still lack complete event-time sendTx plus
+REST-or-weighted pressure.
+
+independent audit packet: HOLD; Phase 5.1am remains the highest-leverage safe
+control continuation, with no blocker-clearing route ready and no live/canary/
+capital/risk authorization implied.
+```
+
+## 2026-05-15 Phase 5.1an Source-Owner Capture Decision
+
+Decision: `HOLD` for blocker clearance and all live/canary/capital/risk
+actions. Accept Phase 5.1an as the compliant source-owner forward-refresh
+inbox scaffold.
+
+Evidence:
+
+```text
+tool: tools/phase51an_source_owner_forward_refresh_capture.py
+test: tests/test_phase51an_source_owner_forward_refresh_capture.py
+doc: docs/PHASE5_1AN_SOURCE_OWNER_FORWARD_REFRESH_CAPTURE.md
+run: runs/phase51an_source_owner_forward_refresh_capture/PHASE51AN-SOURCE-OWNER-FORWARD-REFRESH-CAPTURE-HOLD-20260515T000000Z
+inbox: /home/ubuntu/source_owner_inbox/phase51
+```
+
+Result:
+
+```text
+gate_status: HOLD
+control_status: AWAITING_SOURCE_OWNER_ROWS
+forward_refresh_jsonl: /home/ubuntu/source_owner_inbox/phase51/forward_refresh.jsonl
+forward_refresh_row_count: 0
+phase51al_summary_path: null
+generated_intake_manifest_path: /home/ubuntu/source_owner_inbox/phase51/intake.generated.json
+updated_intake_manifest_path: /home/ubuntu/source_owner_inbox/phase51/intake.json
+capture_contract_path: /home/ubuntu/source_owner_inbox/phase51/SOURCE_OWNER_CAPTURE_CONTRACT.md
+source_link_inference_allowed: false
+time_price_size_inference_allowed: false
+role_inference_allowed: false
+lighter_pressure_inference_allowed: false
+```
+
+Board interpretation:
+
+```text
+accepted: source-owner rows now have a single local inbox contract and a
+fail-closed wrapper before Phase 5.1al materialization.
+
+accepted: empty forward_refresh.jsonl no longer misroutes into Phase 5.1aj or
+Phase 5.1ab. The corrected intake manifest keeps all artifact lists empty until
+a real Phase 5.1al summary exists.
+
+accepted: when sanitized rows arrive, Phase 5.1an safety-scans them, invokes
+Phase 5.1al, and points Phase 5.1am at the generated Phase 5.1al summary.
+
+accepted: the runtime telemetry/event-log path is not used for this source
+owner lane because it can carry raw identifiers and does not currently preserve
+all venue-native maker/taker or Lighter event-time pressure truth.
+
+not accepted: treating Phase 5.1an as evidence that clears the blocker, or as
+authorization for live/canary/capital/risk/model/EV action.
+```
+
+Next move:
+
+```text
+Keep /home/ubuntu/source_owner_inbox/phase51/forward_refresh.jsonl as the sole
+source-owner forward-refresh data file. When sanitized rows are added, rerun
+tools/phase51an_source_owner_forward_refresh_capture.py with
+--update-intake-manifest, then rerun Phase 5.1am with the generated
+/home/ubuntu/source_owner_inbox/phase51/intake.json.
+```

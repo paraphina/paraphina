@@ -109,6 +109,18 @@ This is the default loop for non-live V2 implementation and evidence work.
 12. Commit, push, verify GitHub CI, and record the final handoff.
 13. Repeat automatically unless a stop condition is reached.
 
+For Phase 5.1/V2 blocker work, use
+`tools/phase51am_nonlive_executive_orchestrator.py` when the next route is not
+obvious or after each blocker task completes. Its role is to convert HOLD/no
+ready-route states into a machine-readable route ledger, subagent work packets,
+a workflow optimization ledger, a source-owner intake template/status, and a
+source-owner request. Apply the optimization ledger during the task loop to
+resize the board, suppress duplicate work, preserve route priority, compare
+against the previous Phase 5.1am run, and schedule the next
+audit/reclassification. When source-owner truth appears, route it through one
+local intake manifest with `--source-owner-intake-manifest`. It is not
+blocker-clearing evidence or promotion authority.
+
 ## Standing Safety Boundary
 
 - Do not place live orders.
