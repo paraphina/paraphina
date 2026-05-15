@@ -254,3 +254,19 @@ pub enum ExecutionEvent {
     CancelAllRejected(CancelAllRejected),
     OrderSnapshot(OrderSnapshot),
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Phase51ForwardRefreshCaptureAudit {
+    pub enabled: bool,
+    pub target_type: Option<String>,
+    pub venue_id: Option<String>,
+    pub canonical_group_id: Option<String>,
+    pub order_key: Option<String>,
+    pub native_role_source: Option<String>,
+    pub lighter_pressure_status: Option<String>,
+    pub sanitized_row_emitted: bool,
+    pub no_live_flag: bool,
+    pub approved_for_live: bool,
+    pub approved_for_canary: bool,
+    pub approved_for_capital_escalation: bool,
+}

@@ -2668,6 +2668,16 @@ pub async fn run_live_loop(
         .ok()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let _phase51_forward_refresh_capture =
+        match super::phase51_forward_refresh_capture::Phase51ForwardRefreshCapture::from_config(
+            &cfg.phase51_forward_refresh_capture,
+            super::phase51_forward_refresh_capture::Phase51CaptureExecutionMode::from_trade_mode_text(
+                &trade_mode,
+            ),
+        ) {
+            Ok(capture) => capture,
+            Err(err) => panic!("phase51 forward-refresh capture failed closed: {err}"),
+        };
     let skip_reconcile_kill = matches!(trade_mode.as_str(), "paper" | "p");
     let order_snapshot_fill_inference_enabled = !skip_reconcile_kill;
     let canary_enabled = std::env::var("PARAPHINA_CANARY_MODE")

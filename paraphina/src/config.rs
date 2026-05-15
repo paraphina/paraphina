@@ -52,6 +52,30 @@ pub struct Config {
     pub exit: ExitConfig,
     /// Toxicity scoring + venue health config.
     pub toxicity: ToxicityConfig,
+    /// Passive Phase 5.1 forward-refresh source-owner capture, disabled by default.
+    pub phase51_forward_refresh_capture: Phase51ForwardRefreshCaptureConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phase51ForwardRefreshCaptureConfig {
+    pub enabled: bool,
+    pub output_path: String,
+    pub allow_live: bool,
+    pub append_only: bool,
+    pub max_rows: usize,
+}
+
+impl Default for Phase51ForwardRefreshCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            output_path: "/home/ubuntu/source_owner_inbox/phase51/forward_refresh.remaining.jsonl"
+                .to_string(),
+            allow_live: false,
+            append_only: true,
+            max_rows: 5_000,
+        }
+    }
 }
 
 /// Coarse risk profile preset used by the CLI / research harness.
@@ -1300,6 +1324,7 @@ impl Default for Config {
             hedge,
             exit,
             toxicity,
+            phase51_forward_refresh_capture: Phase51ForwardRefreshCaptureConfig::default(),
         }
     }
 }
