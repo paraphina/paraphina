@@ -4438,6 +4438,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let hedge_fill = FillEvent {
             venue_index: 1,
@@ -4568,6 +4569,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let hedge_fill = FillEvent {
             venue_index: 1,
@@ -4695,6 +4697,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let record = builder.build_record(TelemetryInputs {
             cfg: &cfg,
@@ -4750,6 +4753,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         });
 
         let mut builder = TelemetryBuilder::new(&cfg);

@@ -5130,6 +5130,7 @@ impl LiveRestClient for LighterConnector {
                 post_only: req.post_only,
                 reduce_only: req.reduce_only,
                 client_order_id: Some(req.client_order_id.clone()),
+                phase51_target_key: None,
             });
             let sign_req = SignCreateOrderRequest {
                 op: "create_order".to_string(),

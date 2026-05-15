@@ -108,6 +108,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("exit_ioc_1".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(paraphina::types::PlaceOrderIntent {
                 venue_index: 0,
@@ -120,6 +121,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("hedge_ioc_1".to_string()),
+                phase51_target_key: None,
             }),
         ];
         let request = paraphina::live::runner::LiveOrderRequest {

@@ -93,6 +93,7 @@ mod tests {
                     post_only: req.post_only,
                     reduce_only: req.reduce_only,
                     client_order_id: Some(req.client_order_id.clone()),
+                    phase51_target_key: None,
                 });
                 let request = paraphina::live::runner::LiveOrderRequest {
                     intents: vec![intent],
@@ -242,6 +243,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let res = gateway
             .submit_intent(&intent, 1, 1_000, TransportHint::Default)
@@ -280,6 +282,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let res = gateway
             .submit_intent(&intent, 2, 1_000, TransportHint::Default)
@@ -320,6 +323,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let res = gateway
             .submit_intent(&intent, 3, 1_000, TransportHint::Default)
@@ -363,6 +367,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let _ = gateway
             .submit_intent(&intent, 4, 1_000, TransportHint::Default)
@@ -400,6 +405,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let placed = gateway
             .submit_intent(&intent, 5, 1_000, TransportHint::Default)
@@ -453,6 +459,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: Some("co_cancel_all_1".to_string()),
+            phase51_target_key: None,
         });
         let _ = gateway
             .submit_intent(&intent, 10, 1_000, TransportHint::Default)
@@ -496,6 +503,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: Some("co_replay_1".to_string()),
+            phase51_target_key: None,
         });
         let _ = gateway
             .submit_intent(&intent, 11, 1_000, TransportHint::Default)
@@ -535,6 +543,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let _ = gateway
             .submit_intent(&intent, 42, 1_000, TransportHint::Default)

@@ -1143,6 +1143,7 @@ fn plan_side(
             post_only: true,
             reduce_only: false,
             client_order_id,
+            phase51_target_key: None,
         });
         intents.push(intent);
         if supported_replace {
@@ -1268,6 +1269,7 @@ fn plan_side(
             order_id: supported_native_replace_order_id(&vstate.id, cur)
                 .unwrap_or_else(|| cur.order_id.clone()),
             client_order_id,
+            phase51_target_key: None,
         }));
     }
 }

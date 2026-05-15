@@ -909,6 +909,7 @@ pub fn hedge_plan_to_order_intents_into(plan: &HedgePlan, out: &mut Vec<OrderInt
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         }));
     }
 }
@@ -959,6 +960,7 @@ pub fn compute_hedge_orders_into(
                 post_only: false,
                 reduce_only: true,
                 client_order_id: None,
+                phase51_target_key: None,
             }));
         }
     }

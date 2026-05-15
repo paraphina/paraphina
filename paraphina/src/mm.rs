@@ -1643,6 +1643,7 @@ pub fn mm_quotes_to_order_intents_into(quotes: &[MmQuote], out: &mut Vec<OrderIn
                 post_only: true,
                 reduce_only: false,
                 client_order_id: None,
+                phase51_target_key: None,
             }));
         }
 
@@ -1658,6 +1659,7 @@ pub fn mm_quotes_to_order_intents_into(quotes: &[MmQuote], out: &mut Vec<OrderIn
                 post_only: true,
                 reduce_only: false,
                 client_order_id: None,
+                phase51_target_key: None,
             }));
         }
     }

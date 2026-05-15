@@ -427,6 +427,7 @@ async fn handle_order_request(
                     post_only: replace.post_only,
                     reduce_only: replace.reduce_only,
                     client_order_id: replace.client_order_id.clone(),
+                    phase51_target_key: replace.phase51_target_key.clone(),
                 };
                 let cancel_events =
                     handle_cancel_intent(cancel, now_ms, venues, execution_log, open_orders).await;

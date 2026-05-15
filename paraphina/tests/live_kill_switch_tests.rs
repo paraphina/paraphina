@@ -4,6 +4,7 @@ mod tests {
     use paraphina::config::Config;
     use paraphina::execution_events::apply_execution_events;
     use paraphina::live::mock_exchange::{spawn_mock_exchange, MockExchangeConfig};
+    use paraphina::live::phase51_target_key_registry::Phase51TargetKeyRegistry;
     use paraphina::live::runner::{handle_kill_switch, LiveOrderRequest};
     use paraphina::types::{ExecutionEvent, OrderIntent, OrderPurpose, Side, TimeInForce};
 
@@ -26,6 +27,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: Some("mm_kill_1".to_string()),
+            phase51_target_key: None,
         });
         handle
             .order_tx
@@ -62,10 +64,12 @@ mod tests {
         state.kill_switch = true;
         state.kill_reason = paraphina::state::KillReason::DeltaHardBreach;
         let audit_dir = std::path::PathBuf::from("/tmp/paraphina_kill_audit_test_missing");
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
         handle_kill_switch(
             &cfg,
             &mut state,
             &handle.order_tx,
+            &mut phase51_target_key_registry,
             1_100,
             1,
             false,
@@ -95,6 +99,7 @@ mod tests {
             post_only: false,
             reduce_only: false,
             client_order_id: Some("kill_open_long".to_string()),
+            phase51_target_key: None,
         });
         handle
             .order_tx
@@ -137,10 +142,12 @@ mod tests {
 
         let before = handle.position(0).await.abs();
         let audit_dir = std::path::PathBuf::from("/tmp/paraphina_kill_audit_test_missing");
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
         handle_kill_switch(
             &cfg,
             &mut state,
             &handle.order_tx,
+            &mut phase51_target_key_registry,
             2_100,
             2,
             true,
@@ -178,6 +185,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: Some("hl_kill_1".to_string()),
+            phase51_target_key: None,
         });
         handle
             .order_tx
@@ -215,10 +223,12 @@ mod tests {
         state.kill_switch = true;
         state.kill_reason = paraphina::state::KillReason::DeltaHardBreach;
         let audit_dir = std::path::PathBuf::from("/tmp/paraphina_kill_audit_test_missing");
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
         handle_kill_switch(
             &cfg,
             &mut state,
             &handle.order_tx,
+            &mut phase51_target_key_registry,
             3_100,
             3,
             false,

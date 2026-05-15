@@ -721,6 +721,7 @@ pub fn compute_exit_intents_into(
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         }));
 
         remaining -= rounded_size;

@@ -97,6 +97,7 @@ impl ShadowAckAdapter {
                             post_only: replace.post_only,
                             reduce_only: replace.reduce_only,
                             client_order_id: replace.client_order_id.clone(),
+                            phase51_target_key: replace.phase51_target_key.clone(),
                         },
                         tick,
                         now_ms,

@@ -26,6 +26,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: Some("health_mm_1".to_string()),
+            phase51_target_key: None,
         });
         let request = paraphina::live::runner::LiveOrderRequest {
             intents: vec![intent],

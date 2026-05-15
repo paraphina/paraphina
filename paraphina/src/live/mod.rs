@@ -14,6 +14,7 @@ pub mod order_state;
 pub mod orderbook_l2;
 pub mod paper_adapter;
 pub mod phase51_forward_refresh_capture;
+pub mod phase51_target_key_registry;
 pub mod rest_health_monitor;
 pub mod runner;
 pub mod shadow_adapter;

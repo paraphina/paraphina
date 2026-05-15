@@ -1457,6 +1457,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         })];
 
         let results = gateway
@@ -1501,6 +1502,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         })];
 
         let results = gateway
@@ -1545,6 +1547,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         })];
 
         let results = gateway
@@ -1589,6 +1592,7 @@ mod tests {
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         })];
 
         let results = gateway

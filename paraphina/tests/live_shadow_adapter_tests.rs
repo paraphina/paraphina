@@ -83,6 +83,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: None,
+            phase51_target_key: None,
         });
 
         let events = adapter.handle_intents(vec![place.clone()], 42, 1_000);
@@ -120,6 +121,7 @@ mod tests {
             post_only: false,
             reduce_only: false,
             client_order_id: None,
+            phase51_target_key: None,
         });
         let ioc_events = adapter.handle_intents(vec![ioc], 43, 1_001);
         let core_ioc_events: Vec<_> = ioc_events.iter().filter_map(core_event_from_live).collect();

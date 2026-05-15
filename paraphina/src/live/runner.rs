@@ -15,6 +15,7 @@ use super::ops::{
 };
 use super::order_state::{LiveOrder, OrderStatus};
 use super::phase51_forward_refresh_capture::{Phase51CaptureResult, Phase51ForwardRefreshCapture};
+use super::phase51_target_key_registry::Phase51TargetKeyRegistry;
 use super::venue_health::{VenueHealthErrorSource, VenueHealthManager};
 use crate::actions::{intents_to_actions, ActionBatch, ActionIdGenerator};
 use crate::config::{Config, MmVenueRole};
@@ -1785,6 +1786,7 @@ fn flush_batched_fills(
 /// Returns `Some(events)` on success, `None` on channel-full / handler-dropped / timeout.
 async fn send_order_and_wait(
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     intents: Vec<OrderIntent>,
     action_batch: ActionBatch,
     now_ms: TimestampMs,
@@ -1795,6 +1797,7 @@ async fn send_order_and_wait(
 ) -> Option<Vec<super::types::ExecutionEvent>> {
     match send_order_and_wait_with_status(
         priority_order_tx,
+        phase51_target_key_registry,
         intents,
         action_batch,
         now_ms,
@@ -1812,6 +1815,7 @@ async fn send_order_and_wait(
 
 async fn send_order_and_wait_with_status(
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     intents: Vec<OrderIntent>,
     action_batch: ActionBatch,
     now_ms: TimestampMs,
@@ -1824,6 +1828,7 @@ async fn send_order_and_wait_with_status(
     Option<Vec<super::types::ExecutionEvent>>,
 ) {
     let (response_tx, response_rx) = oneshot::channel();
+    phase51_target_key_registry.register_intents(&intents);
     let request = LiveOrderRequest {
         intents,
         action_batch,
@@ -1841,7 +1846,10 @@ async fn send_order_and_wait_with_status(
         return (OrderWaitOutcomeKind::ChannelFull, None);
     }
     match tokio::time::timeout(Duration::from_millis(timeout_ms), response_rx).await {
-        Ok(Ok(events)) => (OrderWaitOutcomeKind::Events, Some(events)),
+        Ok(Ok(mut events)) => {
+            phase51_target_key_registry.observe_execution_events(&mut events);
+            (OrderWaitOutcomeKind::Events, Some(events))
+        }
         Ok(Err(_)) => {
             eprintln!(
                 "[runner] tick={} {}: oneshot closed (handler dropped sender)",
@@ -1861,6 +1869,7 @@ async fn send_order_and_wait_with_status(
 
 fn send_order_fire_and_forget(
     order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     intents: Vec<OrderIntent>,
     action_batch: ActionBatch,
     now_ms: TimestampMs,
@@ -1868,6 +1877,7 @@ fn send_order_fire_and_forget(
     label: &str,
     tick: u64,
 ) -> bool {
+    phase51_target_key_registry.register_intents(&intents);
     let request = LiveOrderRequest {
         intents,
         action_batch,
@@ -1932,6 +1942,7 @@ async fn dispatch_canary_breach_flatten_intents_sync_wait(
     cfg: &Config,
     state: &mut GlobalState,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     flatten_intents: Vec<OrderIntent>,
     now_ms: TimestampMs,
     batch_id: u64,
@@ -1964,6 +1975,7 @@ async fn dispatch_canary_breach_flatten_intents_sync_wait(
         let async_label = format!("{label}_async_submit");
         if send_order_fire_and_forget(
             priority_order_tx,
+            phase51_target_key_registry,
             async_intents,
             action_batch,
             now_ms,
@@ -1998,6 +2010,7 @@ async fn dispatch_canary_breach_flatten_intents_sync_wait(
     let action_batch = build_live_action_batch(cfg, &sync_intents, now_ms, sync_batch_id);
     let (outcome, events) = send_order_and_wait_with_status(
         priority_order_tx,
+        phase51_target_key_registry,
         sync_intents,
         action_batch,
         now_ms,
@@ -2678,6 +2691,7 @@ pub async fn run_live_loop(
         Ok(capture) => capture,
         Err(err) => panic!("phase51 forward-refresh capture failed closed: {err}"),
     };
+    let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
     let skip_reconcile_kill = matches!(trade_mode.as_str(), "paper" | "p");
     let order_snapshot_fill_inference_enabled = !skip_reconcile_kill;
     let canary_enabled = std::env::var("PARAPHINA_CANARY_MODE")
@@ -3628,15 +3642,17 @@ pub async fn run_live_loop(
                                 event: EventLogPayload::LiveExecution(event.clone()),
                             });
                         }
+                        let mut event = event;
                         capture_phase51_forward_refresh_from_live_events(
                             &mut phase51_forward_refresh_capture,
+                            &mut phase51_target_key_registry,
                             &audit_dir,
-                            std::slice::from_ref(&event),
+                            std::slice::from_mut(&mut event),
                         )
                         .unwrap_or_else(|err| {
                             panic!("phase51 forward-refresh capture failed closed: {err}")
                         });
-                        let core_events = live_events_to_core(&[event]);
+                        let core_events = live_events_to_core(std::slice::from_ref(&event));
                         tick_exec_events.extend(core_events.iter().cloned());
                         let fills = apply_execution_events(&mut state, &core_events, now_ms);
                         if !fills.is_empty() {
@@ -3917,6 +3933,7 @@ pub async fn run_live_loop(
                     cfg,
                     &mut state,
                     &priority_order_tx,
+                    &mut phase51_target_key_registry,
                     &mut emergency_request_latches,
                     cancel_intents,
                     now_ms,
@@ -4279,6 +4296,7 @@ pub async fn run_live_loop(
                     inventory_brake.request_dispatches = send_emergency_single_flight_requests(
                         cfg,
                         &priority_order_tx,
+                        &mut phase51_target_key_registry,
                         &mut emergency_request_latches,
                         &state,
                         async_brake_requests,
@@ -4301,6 +4319,7 @@ pub async fn run_live_loop(
                         if inventory_brake_waits_for_responses(&inventory_brake) {
                             send_order_and_wait_with_status(
                                 &priority_order_tx,
+                                &mut phase51_target_key_registry,
                                 sync_brake_intents,
                                 action_batch,
                                 now_ms,
@@ -4312,6 +4331,7 @@ pub async fn run_live_loop(
                             .await
                         } else if send_order_fire_and_forget(
                             &priority_order_tx,
+                            &mut phase51_target_key_registry,
                             sync_brake_intents,
                             action_batch,
                             now_ms,
@@ -4536,6 +4556,7 @@ pub async fn run_live_loop(
                         &canary_limits_after_response,
                         &mut canary_breach_response,
                         &priority_order_tx,
+                        &mut phase51_target_key_registry,
                         &mut emergency_request_latches,
                         now_ms,
                         tick,
@@ -4602,6 +4623,7 @@ pub async fn run_live_loop(
                         &canary_limits_after_response,
                         &mut canary_breach_response,
                         &priority_order_tx,
+                        &mut phase51_target_key_registry,
                         now_ms,
                         tick,
                         hooks.as_ref(),
@@ -4663,6 +4685,7 @@ pub async fn run_live_loop(
                         &canary_limits_after_response,
                         &mut canary_breach_response,
                         &priority_order_tx,
+                        &mut phase51_target_key_registry,
                         now_ms,
                         tick,
                         hooks.as_ref(),
@@ -4987,6 +5010,7 @@ pub async fn run_live_loop(
                     cfg,
                     &mut state,
                     &priority_order_tx,
+                    &mut phase51_target_key_registry,
                     now_ms,
                     tick,
                     kill_best_effort_flatten,
@@ -5384,6 +5408,7 @@ pub async fn run_live_loop(
                     let (outcome, events, _) = send_terminal_exit_cancel_intents_sync(
                         cfg,
                         &priority_order_tx,
+                        &mut phase51_target_key_registry,
                         aster_cancel_intents,
                         now_ms,
                         tick,
@@ -5458,6 +5483,7 @@ pub async fn run_live_loop(
                 post_only: false,
                 reduce_only: false,
                 client_order_id: None,
+                phase51_target_key: None,
             }));
         }
         if !intents.is_empty() {
@@ -5494,6 +5520,7 @@ pub async fn run_live_loop(
             }
             let _ = send_order_fire_and_forget(
                 &order_tx,
+                &mut phase51_target_key_registry,
                 intents,
                 action_batch,
                 now_ms,
@@ -5721,6 +5748,7 @@ pub async fn run_live_loop(
                 let _ = send_emergency_single_flight_requests(
                     cfg,
                     &priority_order_tx,
+                    &mut phase51_target_key_registry,
                     &mut emergency_request_latches,
                     &state,
                     async_soft_unwind_requests,
@@ -5744,6 +5772,7 @@ pub async fn run_live_loop(
                         );
                         send_order_and_wait_with_status(
                             &priority_order_tx,
+                            &mut phase51_target_key_registry,
                             sync_soft_unwind_intents,
                             action_batch,
                             now_ms,
@@ -5826,6 +5855,7 @@ pub async fn run_live_loop(
                 }
                 if let Some(events) = send_order_and_wait(
                     &priority_order_tx,
+                    &mut phase51_target_key_registry,
                     exit_intents,
                     action_batch,
                     now_ms,
@@ -5837,7 +5867,7 @@ pub async fn run_live_loop(
                 .await
                 {
                     let mut exit_fills = Vec::new();
-                    for event in events {
+                    for mut event in events {
                         if deduper.is_duplicate(&event) {
                             continue;
                         }
@@ -5880,13 +5910,14 @@ pub async fn run_live_loop(
                         log_live_execution_event(&mut event_log, tick, now_ms, "gateway", &event);
                         capture_phase51_forward_refresh_from_live_events(
                             &mut phase51_forward_refresh_capture,
+                            &mut phase51_target_key_registry,
                             &audit_dir,
-                            std::slice::from_ref(&event),
+                            std::slice::from_mut(&mut event),
                         )
                         .unwrap_or_else(|err| {
                             panic!("phase51 forward-refresh capture failed closed: {err}")
                         });
-                        let core_events = live_events_to_core(&[event]);
+                        let core_events = live_events_to_core(std::slice::from_ref(&event));
                         tick_exec_events.extend(core_events.iter().cloned());
                         let fills = apply_execution_events(&mut state, &core_events, now_ms);
                         if !fills.is_empty() {
@@ -5930,6 +5961,7 @@ pub async fn run_live_loop(
                     }
                     if let Some(events) = send_order_and_wait(
                         &priority_order_tx,
+                        &mut phase51_target_key_registry,
                         hedge_intents,
                         action_batch,
                         now_ms,
@@ -5941,7 +5973,7 @@ pub async fn run_live_loop(
                     .await
                     {
                         let mut hedge_fills = Vec::new();
-                        for event in events {
+                        for mut event in events {
                             if deduper.is_duplicate(&event) {
                                 continue;
                             }
@@ -5990,13 +6022,14 @@ pub async fn run_live_loop(
                             );
                             capture_phase51_forward_refresh_from_live_events(
                                 &mut phase51_forward_refresh_capture,
+                                &mut phase51_target_key_registry,
                                 &audit_dir,
-                                std::slice::from_ref(&event),
+                                std::slice::from_mut(&mut event),
                             )
                             .unwrap_or_else(|err| {
                                 panic!("phase51 forward-refresh capture failed closed: {err}")
                             });
-                            let core_events = live_events_to_core(&[event]);
+                            let core_events = live_events_to_core(std::slice::from_ref(&event));
                             tick_exec_events.extend(core_events.iter().cloned());
                             let fills = apply_execution_events(&mut state, &core_events, now_ms);
                             if !fills.is_empty() {
@@ -6216,6 +6249,7 @@ pub async fn handle_kill_switch(
     cfg: &Config,
     state: &mut GlobalState,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     now_ms: TimestampMs,
     tick: u64,
     best_effort_flatten: bool,
@@ -6259,6 +6293,7 @@ pub async fn handle_kill_switch(
         }
         if let Some(events) = send_order_and_wait(
             priority_order_tx,
+            phase51_target_key_registry,
             cancel_intents,
             action_batch,
             now_ms,
@@ -6292,6 +6327,7 @@ pub async fn handle_kill_switch(
             }
             if let Some(events) = send_order_and_wait(
                 priority_order_tx,
+                phase51_target_key_registry,
                 flatten_intents,
                 action_batch,
                 now_ms,
@@ -6321,6 +6357,7 @@ async fn handle_canary_breach_response(
     limits: &CanaryLimitStatus,
     status: &mut CanaryBreachResponseStatus,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     emergency_request_latches: &mut EmergencyRequestLatchSet,
     now_ms: TimestampMs,
     tick: u64,
@@ -6377,6 +6414,7 @@ async fn handle_canary_breach_response(
         cfg,
         state,
         priority_order_tx,
+        phase51_target_key_registry,
         early_flatten_intents,
         now_ms,
         tick.saturating_mul(2).saturating_add(2),
@@ -6397,6 +6435,7 @@ async fn handle_canary_breach_response(
             cfg,
             state,
             priority_order_tx,
+            phase51_target_key_registry,
             emergency_request_latches,
             cancel_intents,
             now_ms,
@@ -6415,6 +6454,7 @@ async fn handle_canary_breach_response(
         cfg,
         state,
         priority_order_tx,
+        phase51_target_key_registry,
         deferred_flatten_intents,
         now_ms,
         tick.saturating_mul(2).saturating_add(4),
@@ -6435,6 +6475,7 @@ async fn retry_canary_breach_flatten_response(
     limits: &CanaryLimitStatus,
     status: &mut CanaryBreachResponseStatus,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     now_ms: TimestampMs,
     tick: u64,
     hooks: Option<&LiveRuntimeHooks>,
@@ -6464,6 +6505,7 @@ async fn retry_canary_breach_flatten_response(
         cfg,
         state,
         priority_order_tx,
+        phase51_target_key_registry,
         flatten_intents,
         now_ms,
         tick.saturating_mul(2).saturating_add(3),
@@ -7677,6 +7719,7 @@ fn build_aster_terminal_quiesce_explicit_cancel_retry_intents(
 async fn send_terminal_exit_cancel_intents_sync(
     cfg: &Config,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     mut cancel_intents: Vec<OrderIntent>,
     now_ms: TimestampMs,
     tick: u64,
@@ -7695,6 +7738,7 @@ async fn send_terminal_exit_cancel_intents_sync(
     );
     let (outcome, events) = send_order_and_wait_with_status(
         priority_order_tx,
+        phase51_target_key_registry,
         cancel_intents,
         action_batch,
         now_ms,
@@ -7743,6 +7787,7 @@ async fn dispatch_disabled_cancel_intents(
     cfg: &Config,
     state: &mut GlobalState,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     emergency_request_latches: &mut EmergencyRequestLatchSet,
     cancel_intents: Vec<OrderIntent>,
     now_ms: TimestampMs,
@@ -7766,6 +7811,7 @@ async fn dispatch_disabled_cancel_intents(
     dispatches.extend(send_emergency_single_flight_requests(
         cfg,
         priority_order_tx,
+        phase51_target_key_registry,
         emergency_request_latches,
         state,
         async_cancel_requests,
@@ -7782,6 +7828,7 @@ async fn dispatch_disabled_cancel_intents(
         let action_batch = build_live_action_batch(cfg, &sync_cancel_intents, now_ms, batch_id);
         send_order_and_wait_with_status(
             priority_order_tx,
+            phase51_target_key_registry,
             sync_cancel_intents,
             action_batch,
             now_ms,
@@ -8124,6 +8171,7 @@ fn build_canary_breach_flatten_intents(
             post_only: false,
             reduce_only: true,
             client_order_id: Some(format!("canary_exit_{}_{}", venue_index, tick)),
+            phase51_target_key: None,
         }));
     }
     intents
@@ -8220,6 +8268,7 @@ fn take_emergency_single_flight_intents(
 fn send_emergency_single_flight_requests(
     cfg: &Config,
     order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     latches: &mut EmergencyRequestLatchSet,
     state: &GlobalState,
     requests: Vec<(usize, Vec<OrderIntent>)>,
@@ -8250,6 +8299,7 @@ fn send_emergency_single_flight_requests(
         );
         let accepted = send_order_fire_and_forget(
             order_tx,
+            phase51_target_key_registry,
             intents,
             action_batch,
             now_ms,
@@ -11737,6 +11787,7 @@ fn build_soft_unwind_intents_with_fallback_fee_guard_and_markout_status_impl(
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         }));
     }
 
@@ -12029,6 +12080,7 @@ fn build_aster_terminal_sub_lot_residual_convergence_intents(
         post_only: false,
         reduce_only: true,
         client_order_id: None,
+        phase51_target_key: None,
     }));
 
     intents
@@ -12146,6 +12198,7 @@ fn build_hyperliquid_terminal_sub_lot_residual_convergence_intents(
         post_only: false,
         reduce_only: true,
         client_order_id: None,
+        phase51_target_key: None,
     }));
 
     intents
@@ -12269,6 +12322,7 @@ fn build_extended_terminal_sub_lot_residual_convergence_intents(
         post_only: false,
         reduce_only: true,
         client_order_id: None,
+        phase51_target_key: None,
     }));
 
     intents
@@ -12318,6 +12372,7 @@ fn build_lighter_orderly_exit_residual_convergence_intents(
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         }));
     }
 
@@ -12560,6 +12615,7 @@ fn build_inventory_brake_intents_with_terminal_defer_status(
             post_only: false,
             reduce_only: true,
             client_order_id: None,
+            phase51_target_key: None,
         }));
     }
 
@@ -13679,9 +13735,11 @@ fn live_events_to_core(events: &[LiveExecutionEvent]) -> Vec<ExecutionEvent> {
 
 fn capture_phase51_forward_refresh_from_live_events(
     capture: &mut Phase51ForwardRefreshCapture,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     audit_dir: &std::path::Path,
-    events: &[LiveExecutionEvent],
+    events: &mut [LiveExecutionEvent],
 ) -> Phase51CaptureResult<()> {
+    phase51_target_key_registry.observe_execution_events(events);
     for event in events {
         let LiveExecutionEvent::Filled(fill) = event else {
             continue;
@@ -15183,6 +15241,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_42_v3_mm_0".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: 3,
@@ -15195,6 +15254,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: None,
+                phase51_target_key: None,
             }),
             OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: 2,
@@ -15207,6 +15267,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_42_v2_mm_0".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -15264,6 +15325,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_42_v0_mm_0".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Replace(crate::types::ReplaceOrderIntent {
                 venue_index: 0,
@@ -15277,6 +15339,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_42_v0_mm_1".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -15317,6 +15380,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: None,
+                phase51_target_key: None,
             }),
             OrderIntent::Replace(crate::types::ReplaceOrderIntent {
                 venue_index: 4,
@@ -15330,6 +15394,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: None,
+                phase51_target_key: None,
             }),
         ];
 
@@ -15370,6 +15435,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: Some((LIGHTER_CLIENT_ORDER_INDEX_MAX + 1).to_string()),
+            phase51_target_key: None,
         })];
 
         normalize_live_client_order_ids(&mut intents, 7);
@@ -15500,6 +15566,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_new_pdx_bid".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -15566,6 +15633,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_new_hl_bid".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Cancel(crate::types::CancelOrderIntent {
                 venue_index: paradex,
@@ -15583,6 +15651,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_new_pdx_bid".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -15648,6 +15717,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("235635911036591".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: extended,
@@ -15660,6 +15730,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_duplicate_extended_ask".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: extended,
@@ -15672,6 +15743,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_extended_bid".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -18535,6 +18607,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_1".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Replace(crate::types::ReplaceOrderIntent {
                 venue_index: 4,
@@ -18548,6 +18621,7 @@ mod tests {
                 reduce_only: false,
                 order_id: "oid_4".to_string(),
                 client_order_id: Some("co_4".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Cancel(crate::types::CancelOrderIntent {
                 venue_index: 2,
@@ -23387,6 +23461,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: None,
+                phase51_target_key: None,
             }),
         ];
 
@@ -23466,6 +23541,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: None,
+                phase51_target_key: None,
             }),
             OrderIntent::Replace(crate::types::ReplaceOrderIntent {
                 venue_index: 0,
@@ -23479,6 +23555,7 @@ mod tests {
                 reduce_only: false,
                 order_id: "replace_me".to_string(),
                 client_order_id: None,
+                phase51_target_key: None,
             }),
         ];
 
@@ -23501,6 +23578,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: None,
+                phase51_target_key: None,
             }),
             OrderIntent::Cancel(crate::types::CancelOrderIntent {
                 venue_index: 0,
@@ -23582,6 +23660,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_lighter_place".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Replace(crate::types::ReplaceOrderIntent {
                 venue_index: lighter,
@@ -23595,6 +23674,7 @@ mod tests {
                 reduce_only: false,
                 order_id: "oid_lighter".to_string(),
                 client_order_id: Some("co_lighter_replace".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Cancel(crate::types::CancelOrderIntent {
                 venue_index: lighter,
@@ -23616,6 +23696,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_aster_place".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -23810,9 +23891,11 @@ mod tests {
             })
             .expect("pre-fill order channel");
 
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
         let dispatches = send_emergency_single_flight_requests(
             &cfg,
             &order_tx,
+            &mut phase51_target_key_registry,
             &mut latches,
             &state,
             vec![(
@@ -24306,6 +24389,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("extended_mm".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: lighter,
@@ -24318,6 +24402,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("lighter_mm".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Cancel(crate::types::CancelOrderIntent {
                 venue_index: lighter,
@@ -24335,6 +24420,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("hyperliquid_mm".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -24463,6 +24549,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("canary_exit_hl".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: lighter,
@@ -24475,6 +24562,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("canary_exit_lighter".to_string()),
+                phase51_target_key: None,
             }),
         ];
         let cancel_intents = vec![
@@ -24527,6 +24615,7 @@ mod tests {
         let mut status = CanaryBreachResponseStatus::default();
         let mut would_send_intents = Vec::new();
         let mut last_exit_intent = None;
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
 
         {
             let handle_fut = handle_canary_breach_response(
@@ -24535,6 +24624,7 @@ mod tests {
                 &limits,
                 &mut status,
                 &priority_order_tx,
+                &mut phase51_target_key_registry,
                 &mut latches,
                 now_ms,
                 tick,
@@ -24629,6 +24719,7 @@ mod tests {
         let mut status = CanaryBreachResponseStatus::default();
         let mut would_send_intents = Vec::new();
         let mut last_exit_intent = None;
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
 
         {
             let handle_fut = handle_canary_breach_response(
@@ -24637,6 +24728,7 @@ mod tests {
                 &limits,
                 &mut status,
                 &priority_order_tx,
+                &mut phase51_target_key_registry,
                 &mut latches,
                 now_ms,
                 tick,
@@ -24741,6 +24833,7 @@ mod tests {
         let mut status = CanaryBreachResponseStatus::default();
         let mut would_send_intents = Vec::new();
         let mut last_exit_intent = None;
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
 
         let sent = {
             let retry_fut = retry_canary_breach_flatten_response(
@@ -24749,6 +24842,7 @@ mod tests {
                 &limits,
                 &mut status,
                 &priority_order_tx,
+                &mut phase51_target_key_registry,
                 now_ms,
                 tick,
                 None,
@@ -24822,6 +24916,7 @@ mod tests {
         let mut status = CanaryBreachResponseStatus::default();
         let mut would_send_intents = Vec::new();
         let mut last_exit_intent = None;
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
 
         let sent = {
             let retry_fut = retry_canary_breach_flatten_response(
@@ -24830,6 +24925,7 @@ mod tests {
                 &limits,
                 &mut status,
                 &priority_order_tx,
+                &mut phase51_target_key_registry,
                 now_ms,
                 tick,
                 None,
@@ -24900,6 +24996,7 @@ mod tests {
         let mut status = CanaryBreachResponseStatus::default();
         let mut would_send_intents = Vec::new();
         let mut last_exit_intent = None;
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
 
         let sent = {
             let retry_fut = retry_canary_breach_flatten_response(
@@ -24908,6 +25005,7 @@ mod tests {
                 &limits,
                 &mut status,
                 &priority_order_tx,
+                &mut phase51_target_key_registry,
                 now_ms,
                 tick,
                 None,
@@ -24978,6 +25076,7 @@ mod tests {
         let mut status = CanaryBreachResponseStatus::default();
         let mut would_send_intents = Vec::new();
         let mut last_exit_intent = None;
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
 
         let sent = {
             let retry_fut = retry_canary_breach_flatten_response(
@@ -24986,6 +25085,7 @@ mod tests {
                 &limits,
                 &mut status,
                 &priority_order_tx,
+                &mut phase51_target_key_registry,
                 now_ms,
                 tick,
                 None,
@@ -25056,6 +25156,7 @@ mod tests {
         let mut status = CanaryBreachResponseStatus::default();
         let mut would_send_intents = Vec::new();
         let mut last_exit_intent = None;
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
 
         let sent = {
             let retry_fut = retry_canary_breach_flatten_response(
@@ -25064,6 +25165,7 @@ mod tests {
                 &limits,
                 &mut status,
                 &priority_order_tx,
+                &mut phase51_target_key_registry,
                 now_ms,
                 tick,
                 None,
@@ -25135,6 +25237,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("hl_hedge".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Cancel(crate::types::CancelOrderIntent {
                 venue_index: hyperliquid,
@@ -25152,6 +25255,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("aster_hedge".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -25420,6 +25524,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("co_lighter".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: aster,
@@ -25432,6 +25537,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("co_aster".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -25458,6 +25564,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("co_lighter".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: aster,
@@ -25470,6 +25577,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("co_aster".to_string()),
+                phase51_target_key: None,
             }),
         ];
 
@@ -25682,6 +25790,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some(format!("co_{venue_id}")),
+                phase51_target_key: None,
             })
         };
 

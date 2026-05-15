@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::types::Phase51ForwardRefreshTargetKey;
 use crate::types::{FundingSource, OrderPurpose, SettlementPriceKind, Side, TimestampMs};
 
 use super::orderbook_l2::{BookLevel, BookLevelDelta};
@@ -168,12 +169,6 @@ pub struct OrderRejected {
     #[serde(default)]
     pub reduce_only: Option<bool>,
     pub reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Phase51ForwardRefreshTargetKey {
-    pub canonical_group_id: String,
-    pub order_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

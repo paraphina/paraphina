@@ -836,6 +836,7 @@ impl GlobalState {
             post_only: false,
             reduce_only: true,
             client_order_id: Some(format!("kill_exit_{}_{}", venue_index, timebase_id)),
+            phase51_target_key: None,
         }))
     }
 }

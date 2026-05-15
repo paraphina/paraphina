@@ -4013,6 +4013,7 @@ fn expand_live_gateway_intents(
                         post_only: replace.post_only,
                         reduce_only: replace.reduce_only,
                         client_order_id: replace.client_order_id,
+                        phase51_target_key: None,
                     },
                 ));
             }
@@ -4991,6 +4992,7 @@ mod tests {
             reduce_only: false,
             order_id: "0x1234567890abcdef1234567890abcdef".to_string(),
             client_order_id: Some("new-coid".to_string()),
+            phase51_target_key: None,
         })];
         let expanded = super::expand_live_gateway_intents(intents);
         assert_eq!(expanded.len(), 1);
@@ -5018,6 +5020,7 @@ mod tests {
             reduce_only: false,
             order_id: "123456789".to_string(),
             client_order_id: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+            phase51_target_key: None,
         })];
         let expanded = super::expand_live_gateway_intents(intents);
         assert_eq!(expanded.len(), 1);
@@ -5038,6 +5041,7 @@ mod tests {
             reduce_only: false,
             order_id: "old-order-id".to_string(),
             client_order_id: Some("co_lighter".to_string()),
+            phase51_target_key: None,
         })];
         let expanded = super::expand_live_gateway_intents(intents);
         assert_eq!(expanded.len(), 2);
@@ -5059,6 +5063,7 @@ mod tests {
             reduce_only: false,
             order_id: "55".to_string(),
             client_order_id: Some("77".to_string()),
+            phase51_target_key: None,
         })];
         let expanded = super::expand_live_gateway_intents(intents);
         assert_eq!(expanded.len(), 1);
@@ -5091,6 +5096,7 @@ mod tests {
             reduce_only: false,
             order_id: "d0_mm_v4_buy".to_string(),
             client_order_id: Some("d1_mm_v4_buy".to_string()),
+            phase51_target_key: None,
         })];
         let expanded = super::expand_live_gateway_intents(intents);
         assert_eq!(expanded.len(), 1);
@@ -5123,6 +5129,7 @@ mod tests {
             reduce_only: false,
             order_id: "d0_mm_v4_buy".to_string(),
             client_order_id: Some("d1_mm_v4_buy".to_string()),
+            phase51_target_key: None,
         })];
         let expanded_disabled = super::expand_live_gateway_intents(disabled);
         assert_eq!(expanded_disabled.len(), 2);
@@ -5142,6 +5149,7 @@ mod tests {
             reduce_only: false,
             order_id: "1784963886257016832".to_string(),
             client_order_id: Some("d1_mm_v4_sell".to_string()),
+            phase51_target_key: None,
         })];
         let expanded_numeric = super::expand_live_gateway_intents(numeric);
         assert_eq!(expanded_numeric.len(), 2);
@@ -5163,6 +5171,7 @@ mod tests {
             reduce_only: false,
             order_id: "pdx_old".to_string(),
             client_order_id: Some("co_pdx_new".to_string()),
+            phase51_target_key: None,
         });
         let mut seq = 10_u64;
         let events = super::execution_events_from_gateway_result(
@@ -5365,6 +5374,7 @@ mod tests {
                     post_only: true,
                     reduce_only: false,
                     client_order_id: Some("co_queued".to_string()),
+                    phase51_target_key: None,
                 })],
                 action_batch: ActionBatch::new(0, 3, "test"),
                 now_ms: 3,
@@ -5397,6 +5407,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("co_pending".to_string()),
+                phase51_target_key: None,
             })],
             action_batch: ActionBatch::new(0, 2, "test"),
             now_ms: 2,
@@ -5437,6 +5448,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("hl-buy-old".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(PlaceOrderIntent {
                 venue_index: 0,
@@ -5449,6 +5461,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("hl-sell".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(PlaceOrderIntent {
                 venue_index: 0,
@@ -5461,6 +5474,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("hl-buy-latest".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(PlaceOrderIntent {
                 venue_index: 0,
@@ -5473,6 +5487,7 @@ mod tests {
                 post_only: false,
                 reduce_only: true,
                 client_order_id: Some("hl-exit".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(PlaceOrderIntent {
                 venue_index: 1,
@@ -5485,6 +5500,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("lighter-buy".to_string()),
+                phase51_target_key: None,
             }),
         ]);
 
@@ -5520,6 +5536,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("lighter-1".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Place(PlaceOrderIntent {
                 venue_index: 0,
@@ -5532,6 +5549,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("hl-place".to_string()),
+                phase51_target_key: None,
             }),
             OrderIntent::Cancel(CancelOrderIntent {
                 venue_index: 0,
@@ -5554,6 +5572,7 @@ mod tests {
                 post_only: true,
                 reduce_only: false,
                 client_order_id: Some("paradex-1".to_string()),
+                phase51_target_key: None,
             }),
         ]);
 
@@ -5650,6 +5669,7 @@ mod tests {
                     post_only: false,
                     reduce_only: true,
                     client_order_id: Some("hedge-flatten".to_string()),
+                    phase51_target_key: None,
                 })],
                 action_batch: ActionBatch::new(0, 32, "test"),
                 now_ms: 32,
@@ -5671,6 +5691,7 @@ mod tests {
                     post_only: false,
                     reduce_only: true,
                     client_order_id: Some("critical-exit-flatten".to_string()),
+                    phase51_target_key: None,
                 })],
                 action_batch: ActionBatch::new(0, 33, "test"),
                 now_ms: 33,

@@ -95,6 +95,12 @@ pub enum OrderIntent {
     CancelAll(CancelAllOrderIntent),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Phase51ForwardRefreshTargetKey {
+    pub canonical_group_id: String,
+    pub order_key: String,
+}
+
 /// Place a new order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaceOrderIntent {
@@ -109,6 +115,9 @@ pub struct PlaceOrderIntent {
     pub reduce_only: bool,
     /// Optional deterministic client order ID (used for MM tracking).
     pub client_order_id: Option<String>,
+    /// Optional explicit Phase 5.1 target key. This must be carried from
+    /// upstream target selection and must never be inferred from order fields.
+    pub phase51_target_key: Option<Phase51ForwardRefreshTargetKey>,
 }
 
 /// Cancel an existing order.
@@ -142,6 +151,9 @@ pub struct ReplaceOrderIntent {
     pub order_id: String,
     /// Optional deterministic client order ID for the new order.
     pub client_order_id: Option<String>,
+    /// Optional explicit Phase 5.1 target key. This must be carried from
+    /// upstream target selection and must never be inferred from order fields.
+    pub phase51_target_key: Option<Phase51ForwardRefreshTargetKey>,
 }
 
 /// Execution events emitted by the gateway.

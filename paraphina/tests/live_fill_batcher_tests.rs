@@ -161,6 +161,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: Some("kill_open_mm".to_string()),
+            phase51_target_key: None,
         });
         handle
             .order_tx

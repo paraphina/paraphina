@@ -2250,6 +2250,7 @@ impl LiveRestClient for HyperliquidConnector {
                 post_only: req.post_only,
                 reduce_only: req.reduce_only,
                 client_order_id: Some(req.client_order_id.clone()),
+                phase51_target_key: None,
             });
             HyperliquidConnector::place_order(self, &intent, 0)
                 .await
@@ -2278,6 +2279,7 @@ impl LiveRestClient for HyperliquidConnector {
                 post_only: req.post_only,
                 reduce_only: req.reduce_only,
                 client_order_id: Some(req.client_order_id.clone()),
+                phase51_target_key: None,
             });
             if self.cfg.paper_mode {
                 return Ok(LiveRestResponse {
@@ -2462,6 +2464,7 @@ impl LiveRestClient for HyperliquidConnector {
                     post_only: req.post_only,
                     reduce_only: req.reduce_only,
                     client_order_id: Some(req.client_order_id.clone()),
+                    phase51_target_key: None,
                 })
                 .collect();
             let intent_refs: Vec<&crate::types::PlaceOrderIntent> = intents.iter().collect();
@@ -2528,6 +2531,7 @@ impl LiveRestClient for HyperliquidConnector {
                     post_only: req.post_only,
                     reduce_only: req.reduce_only,
                     client_order_id: Some(req.client_order_id.clone()),
+                    phase51_target_key: None,
                 })
                 .collect();
             let intent_refs: Vec<&crate::types::PlaceOrderIntent> = intents.iter().collect();
@@ -3961,6 +3965,7 @@ fn build_modify_action(
         post_only: req.post_only,
         reduce_only: req.reduce_only,
         client_order_id: Some(req.client_order_id.clone()),
+        phase51_target_key: None,
     };
     let action = HlModifyAction {
         action_type: "modify".to_string(),
@@ -3988,6 +3993,7 @@ fn build_batch_modify_action(
                 post_only: req.post_only,
                 reduce_only: req.reduce_only,
                 client_order_id: Some(req.client_order_id.clone()),
+                phase51_target_key: None,
             };
             Ok(HlBatchModifyWire {
                 oid: build_modify_oid_value(&req.order_id)?,
@@ -4340,6 +4346,7 @@ mod tests {
             post_only: true,
             reduce_only: false,
             client_order_id: Some("0xc8f74824e72973753f7a01a83e322717".to_string()),
+            phase51_target_key: None,
         };
 
         let wire = build_hl_order_wire(
