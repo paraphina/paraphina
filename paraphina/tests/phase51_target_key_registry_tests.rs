@@ -4,7 +4,9 @@ use paraphina::config::Phase51ForwardRefreshCaptureConfig;
 use paraphina::live::phase51_forward_refresh_capture::{
     Phase51CaptureExecutionMode, Phase51ForwardRefreshCapture,
 };
-use paraphina::live::phase51_target_key_registry::Phase51TargetKeyRegistry;
+use paraphina::live::phase51_target_key_registry::{
+    Phase51TargetKeyRegistry, Phase51TargetKeyRegistryStage,
+};
 use paraphina::live::types::{ExecutionEvent, Fill, OrderAccepted};
 use paraphina::types::{
     OrderIntent, OrderPurpose, Phase51ForwardRefreshTargetKey, PlaceOrderIntent,
@@ -138,6 +140,46 @@ fn no_explicit_target_key_means_no_registry_entry() {
         None
     );
     assert_eq!(registry.counts().client_bindings, 0);
+}
+
+#[test]
+fn dropped_stage_after_enqueue_failure_leaves_no_registry_entry() {
+    let registry = Phase51TargetKeyRegistry::default();
+    let stage = Phase51TargetKeyRegistryStage::from_intents(&[place_intent(
+        Some("stage-fail-client"),
+        Some(target_key("stage-fail")),
+    )]);
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(()).expect("pre-fill channel");
+
+    assert!(tx.try_send(()).is_err());
+    drop(stage);
+
+    assert_eq!(
+        registry.resolve_fill(&fill(Some("stage-fail-client"), None)),
+        None
+    );
+    assert_eq!(registry.counts().client_bindings, 0);
+}
+
+#[test]
+fn successful_enqueue_commits_staged_registry_entry() {
+    let key = target_key("stage-success");
+    let mut registry = Phase51TargetKeyRegistry::default();
+    let stage = Phase51TargetKeyRegistryStage::from_intents(&[place_intent(
+        Some("stage-success-client"),
+        Some(key.clone()),
+    )]);
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+    assert!(tx.try_send(()).is_ok());
+    registry.commit_stage(stage);
+
+    assert_eq!(
+        registry.resolve_fill(&fill(Some("stage-success-client"), None)),
+        Some(key)
+    );
+    assert_eq!(registry.counts().client_bindings, 1);
 }
 
 #[test]

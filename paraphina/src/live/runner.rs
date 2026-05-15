@@ -15,7 +15,7 @@ use super::ops::{
 };
 use super::order_state::{LiveOrder, OrderStatus};
 use super::phase51_forward_refresh_capture::{Phase51CaptureResult, Phase51ForwardRefreshCapture};
-use super::phase51_target_key_registry::Phase51TargetKeyRegistry;
+use super::phase51_target_key_registry::{Phase51TargetKeyRegistry, Phase51TargetKeyRegistryStage};
 use super::venue_health::{VenueHealthErrorSource, VenueHealthManager};
 use crate::actions::{intents_to_actions, ActionBatch, ActionIdGenerator};
 use crate::config::{Config, MmVenueRole};
@@ -1828,7 +1828,7 @@ async fn send_order_and_wait_with_status(
     Option<Vec<super::types::ExecutionEvent>>,
 ) {
     let (response_tx, response_rx) = oneshot::channel();
-    phase51_target_key_registry.register_intents(&intents);
+    let phase51_target_key_stage = Phase51TargetKeyRegistryStage::from_intents(&intents);
     let request = LiveOrderRequest {
         intents,
         action_batch,
@@ -1845,6 +1845,7 @@ async fn send_order_and_wait_with_status(
         );
         return (OrderWaitOutcomeKind::ChannelFull, None);
     }
+    phase51_target_key_registry.commit_stage(phase51_target_key_stage);
     match tokio::time::timeout(Duration::from_millis(timeout_ms), response_rx).await {
         Ok(Ok(mut events)) => {
             phase51_target_key_registry.observe_execution_events(&mut events);
@@ -1877,7 +1878,7 @@ fn send_order_fire_and_forget(
     label: &str,
     tick: u64,
 ) -> bool {
-    phase51_target_key_registry.register_intents(&intents);
+    let phase51_target_key_stage = Phase51TargetKeyRegistryStage::from_intents(&intents);
     let request = LiveOrderRequest {
         intents,
         action_batch,
@@ -1894,6 +1895,7 @@ fn send_order_fire_and_forget(
         );
         return false;
     }
+    phase51_target_key_registry.commit_stage(phase51_target_key_stage);
     true
 }
 

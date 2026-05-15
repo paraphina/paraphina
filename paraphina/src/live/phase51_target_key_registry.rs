@@ -31,9 +31,31 @@ pub struct Phase51TargetKeyRegistry {
     insertion_order: VecDeque<Phase51RegistryHandle>,
 }
 
+pub struct Phase51TargetKeyRegistryStage {
+    client_bindings: Vec<(String, Phase51ForwardRefreshTargetKey)>,
+}
+
 impl Default for Phase51TargetKeyRegistry {
     fn default() -> Self {
         Self::new(DEFAULT_PHASE51_TARGET_KEY_REGISTRY_CAPACITY)
+    }
+}
+
+impl Phase51TargetKeyRegistryStage {
+    pub fn from_intents(intents: &[OrderIntent]) -> Self {
+        let client_bindings = intents
+            .iter()
+            .filter_map(staged_client_binding)
+            .collect::<Vec<_>>();
+        Self { client_bindings }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.client_bindings.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.client_bindings.len()
     }
 }
 
@@ -56,10 +78,7 @@ impl Phase51TargetKeyRegistry {
     }
 
     pub fn register_intents(&mut self, intents: &[OrderIntent]) -> usize {
-        intents
-            .iter()
-            .filter(|intent| self.register_intent(intent))
-            .count()
+        self.commit_stage(Phase51TargetKeyRegistryStage::from_intents(intents))
     }
 
     pub fn register_intent(&mut self, intent: &OrderIntent) -> bool {
@@ -74,6 +93,16 @@ impl Phase51TargetKeyRegistry {
             ),
             OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => false,
         }
+    }
+
+    pub fn commit_stage(&mut self, stage: Phase51TargetKeyRegistryStage) -> usize {
+        let mut committed = 0;
+        for (client_order_id, target_key) in stage.client_bindings {
+            if self.insert_client_binding(&client_order_id, target_key) {
+                committed += 1;
+            }
+        }
+        committed
     }
 
     pub fn observe_order_accepted(&mut self, accepted: &OrderAccepted) -> bool {
@@ -200,6 +229,29 @@ impl Phase51TargetKeyRegistry {
             }
         }
     }
+}
+
+fn staged_client_binding(intent: &OrderIntent) -> Option<(String, Phase51ForwardRefreshTargetKey)> {
+    match intent {
+        OrderIntent::Place(place) => staged_client_binding_parts(
+            place.client_order_id.as_deref(),
+            place.phase51_target_key.as_ref(),
+        ),
+        OrderIntent::Replace(replace) => staged_client_binding_parts(
+            replace.client_order_id.as_deref(),
+            replace.phase51_target_key.as_ref(),
+        ),
+        OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => None,
+    }
+}
+
+fn staged_client_binding_parts(
+    client_order_id: Option<&str>,
+    target_key: Option<&Phase51ForwardRefreshTargetKey>,
+) -> Option<(String, Phase51ForwardRefreshTargetKey)> {
+    let target_key = target_key.cloned()?;
+    let client_order_id = valid_handle(client_order_id)?;
+    Some((client_order_id.to_string(), target_key))
 }
 
 fn valid_handle(handle: Option<&str>) -> Option<&str> {
