@@ -16098,10 +16098,12 @@ mod tests {
             bid: Some(MmLevel {
                 price: 2_349.0,
                 size: 0.01,
+                canonical_target_identity: None,
             }),
             ask: Some(MmLevel {
                 price: 2_351.0,
                 size: 0.01,
+                canonical_target_identity: None,
             }),
             generated_spread_cap_applied: false,
             generated_spread_cap_bid_suppressed: false,
@@ -16193,10 +16195,12 @@ mod tests {
                 bid: Some(MmLevel {
                     price: 2_000.0,
                     size: 0.01,
+                    canonical_target_identity: None,
                 }),
                 ask: Some(MmLevel {
                     price: 2_001.0,
                     size: 0.01,
+                    canonical_target_identity: None,
                 }),
                 generated_spread_cap_applied: false,
                 generated_spread_cap_bid_suppressed: false,
@@ -16268,10 +16272,12 @@ mod tests {
                 bid: Some(MmLevel {
                     price: 2_000.0,
                     size: 0.01,
+                    canonical_target_identity: None,
                 }),
                 ask: Some(MmLevel {
                     price: 2_001.0,
                     size: 0.01,
+                    canonical_target_identity: None,
                 }),
                 generated_spread_cap_applied: false,
                 generated_spread_cap_bid_suppressed: false,
@@ -16337,10 +16343,12 @@ mod tests {
                     bid: Some(MmLevel {
                         price: 2_000.0,
                         size: 0.01,
+                        canonical_target_identity: None,
                     }),
                     ask: Some(MmLevel {
                         price: 2_001.0,
                         size: 0.01,
+                        canonical_target_identity: None,
                     }),
                     generated_spread_cap_applied: false,
                     generated_spread_cap_bid_suppressed: false,
@@ -16425,10 +16433,12 @@ mod tests {
                 bid: Some(MmLevel {
                     price: 2_000.0,
                     size: 0.01,
+                    canonical_target_identity: None,
                 }),
                 ask: Some(MmLevel {
                     price: 2_001.0,
                     size: 0.01,
+                    canonical_target_identity: None,
                 }),
                 generated_spread_cap_applied: false,
                 generated_spread_cap_bid_suppressed: false,
@@ -16516,10 +16526,12 @@ mod tests {
                 bid: Some(MmLevel {
                     price: 2_000.0,
                     size: 0.01,
+                    canonical_target_identity: None,
                 }),
                 ask: Some(MmLevel {
                     price: 2_001.0,
                     size: 0.01,
+                    canonical_target_identity: None,
                 }),
                 generated_spread_cap_applied: false,
                 generated_spread_cap_bid_suppressed: false,

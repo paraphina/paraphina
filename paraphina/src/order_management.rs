@@ -1326,8 +1326,16 @@ mod tests {
         MmQuote {
             venue_index,
             venue_id: "test".into(),
-            bid: bid.map(|(p, s)| MmLevel { price: p, size: s }),
-            ask: ask.map(|(p, s)| MmLevel { price: p, size: s }),
+            bid: bid.map(|(p, s)| MmLevel {
+                price: p,
+                size: s,
+                canonical_target_identity: None,
+            }),
+            ask: ask.map(|(p, s)| MmLevel {
+                price: p,
+                size: s,
+                canonical_target_identity: None,
+            }),
             generated_spread_cap_applied: false,
             generated_spread_cap_bid_suppressed: false,
             generated_spread_cap_ask_suppressed: false,
@@ -1406,6 +1414,7 @@ mod tests {
             bid: Some(MmLevel {
                 price: 299.0,
                 size: 1.0,
+                canonical_target_identity: None,
             }),
             ask: None,
             generated_spread_cap_applied: false,
@@ -1452,6 +1461,7 @@ mod tests {
             bid: Some(MmLevel {
                 price: 299.0,
                 size: 0.02,
+                canonical_target_identity: None,
             }),
             ask: None,
             generated_spread_cap_applied: false,
@@ -1499,6 +1509,7 @@ mod tests {
             bid: Some(MmLevel {
                 price: 299.0,
                 size: 1.0,
+                canonical_target_identity: None,
             }),
             ask: None,
             generated_spread_cap_applied: false,
@@ -1546,6 +1557,7 @@ mod tests {
             bid: Some(MmLevel {
                 price: 299.0,
                 size: 0.02,
+                canonical_target_identity: None,
             }),
             ask: None,
             generated_spread_cap_applied: false,
@@ -2434,6 +2446,7 @@ mod tests {
             bid: Some(MmLevel {
                 price: 295.0,
                 size: 2.0,
+                canonical_target_identity: None,
             }),
             ask: None,
             generated_spread_cap_applied: false,
@@ -2515,10 +2528,12 @@ mod tests {
             bid: Some(MmLevel {
                 price: 100.0,
                 size: 1.0,
+                canonical_target_identity: None,
             }),
             ask: Some(MmLevel {
                 price: 101.0,
                 size: 1.0,
+                canonical_target_identity: None,
             }),
             generated_spread_cap_applied: false,
             generated_spread_cap_bid_suppressed: false,
@@ -2604,6 +2619,7 @@ mod tests {
             ask: Some(MmLevel {
                 price: best_ask + tick,
                 size: 0.01,
+                canonical_target_identity: None,
             }),
             generated_spread_cap_applied: true,
             generated_spread_cap_bid_suppressed: false,
@@ -2664,6 +2680,7 @@ mod tests {
             ask: Some(MmLevel {
                 price: best_ask + tick,
                 size: 0.01,
+                canonical_target_identity: None,
             }),
             generated_spread_cap_applied: true,
             generated_spread_cap_bid_suppressed: false,

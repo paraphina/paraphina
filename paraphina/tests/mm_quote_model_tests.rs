@@ -1929,10 +1929,12 @@ fn compute_order_actions_place_new() {
         bid: Some(paraphina::mm::MmLevel {
             price: 299.90,
             size: 1.0,
+            canonical_target_identity: None,
         }),
         ask: Some(paraphina::mm::MmLevel {
             price: 300.20,
             size: 1.0,
+            canonical_target_identity: None,
         }),
         generated_spread_cap_applied: false,
         generated_spread_cap_bid_suppressed: false,

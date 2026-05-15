@@ -40,7 +40,8 @@ use crate::state::{
     VenueUtilityTier,
 };
 use crate::types::{
-    OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce, TimestampMs, VenueStatus,
+    CanonicalTargetIdentity, OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce,
+    TimestampMs, VenueStatus,
 };
 use serde::Serialize;
 
@@ -49,6 +50,7 @@ use serde::Serialize;
 pub struct MmLevel {
     pub price: f64,
     pub size: f64,
+    pub canonical_target_identity: Option<CanonicalTargetIdentity>,
 }
 
 /// Per-venue MM quote (bid/ask).
@@ -2184,6 +2186,7 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
         Some(MmLevel {
             price: bid_price,
             size: size_bid,
+            canonical_target_identity: None,
         })
     } else {
         None
@@ -2193,6 +2196,7 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
         Some(MmLevel {
             price: ask_price,
             size: size_ask,
+            canonical_target_identity: None,
         })
     } else {
         None
@@ -2594,6 +2598,7 @@ fn compute_single_venue_quotes(
         Some(MmLevel {
             price: bid_price,
             size: size_bid,
+            canonical_target_identity: None,
         })
     } else {
         None
@@ -2603,6 +2608,7 @@ fn compute_single_venue_quotes(
         Some(MmLevel {
             price: ask_price,
             size: size_ask,
+            canonical_target_identity: None,
         })
     } else {
         None
@@ -3604,6 +3610,7 @@ pub fn compute_order_actions(
                     old_level: MmLevel {
                         price: current.price,
                         size: current.size,
+                        canonical_target_identity: None,
                     },
                     new_level: desired.clone(),
                     side: Side::Buy,
@@ -3648,6 +3655,7 @@ pub fn compute_order_actions(
                     old_level: MmLevel {
                         price: current.price,
                         size: current.size,
+                        canonical_target_identity: None,
                     },
                     new_level: desired.clone(),
                     side: Side::Sell,
@@ -3708,6 +3716,73 @@ mod tests {
         }
 
         (cfg, state)
+    }
+
+    #[test]
+    fn computed_mm_quote_levels_do_not_attach_canonical_target_identity_yet() {
+        let (cfg, state) = setup_test();
+        let quotes = compute_mm_quotes(&cfg, &state);
+        let mut inspected_bids = 0;
+        let mut inspected_asks = 0;
+
+        for quote in &quotes {
+            if let Some(bid) = &quote.bid {
+                inspected_bids += 1;
+                assert!(bid.canonical_target_identity.is_none());
+            }
+            if let Some(ask) = &quote.ask {
+                inspected_asks += 1;
+                assert!(ask.canonical_target_identity.is_none());
+            }
+        }
+        assert!(inspected_bids > 0);
+        assert!(inspected_asks > 0);
+    }
+
+    #[test]
+    fn mm_quote_identity_schema_does_not_populate_phase51_target_key_yet() {
+        let (cfg, _) = setup_test();
+        let identity = CanonicalTargetIdentity::from_explicit("canonical-group", "order-key")
+            .expect("complete identity");
+        let quote = MmQuote {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            bid: Some(MmLevel {
+                price: 299.0,
+                size: 1.0,
+                canonical_target_identity: Some(identity.clone()),
+            }),
+            ask: Some(MmLevel {
+                price: 301.0,
+                size: 1.0,
+                canonical_target_identity: Some(identity),
+            }),
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "quoted",
+            ask_terminal_reason: "quoted",
+        };
+
+        let intents = mm_quotes_to_order_intents(&[quote]);
+        assert_eq!(intents.len(), 2);
+        let mut saw_buy = false;
+        let mut saw_sell = false;
+        for intent in &intents {
+            match intent {
+                OrderIntent::Place(place) => {
+                    assert!(place.phase51_target_key.is_none());
+                    match place.side {
+                        Side::Buy => saw_buy = true,
+                        Side::Sell => saw_sell = true,
+                    }
+                }
+                other => panic!("expected place intent, got {other:?}"),
+            }
+        }
+        assert!(saw_buy);
+        assert!(saw_sell);
     }
 
     #[test]

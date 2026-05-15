@@ -101,6 +101,60 @@ pub struct Phase51ForwardRefreshTargetKey {
     pub order_key: String,
 }
 
+/// First-class upstream target identity for canonical order labels.
+///
+/// This object is architecture state, not source-owner evidence. It must be
+/// created before order intent construction from explicit in-memory target
+/// selection state, and must never be derived from order/client IDs, price,
+/// side, size, timing, purpose, generated names, hashes, snapshots, config, or
+/// proximity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CanonicalTargetIdentity {
+    canonical_group_id: String,
+    order_key: String,
+}
+
+impl CanonicalTargetIdentity {
+    pub fn from_explicit(
+        canonical_group_id: impl Into<String>,
+        order_key: impl Into<String>,
+    ) -> Option<Self> {
+        let canonical_group_id = canonical_group_id.into();
+        let order_key = order_key.into();
+        if canonical_group_id.trim().is_empty() || order_key.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            canonical_group_id,
+            order_key,
+        })
+    }
+
+    pub fn canonical_group_id(&self) -> &str {
+        &self.canonical_group_id
+    }
+
+    pub fn order_key(&self) -> &str {
+        &self.order_key
+    }
+
+    pub fn to_phase51_target_key(&self) -> Phase51ForwardRefreshTargetKey {
+        Phase51ForwardRefreshTargetKey {
+            canonical_group_id: self.canonical_group_id.clone(),
+            order_key: self.order_key.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CanonicalTargetIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonicalTargetIdentity")
+            .field("canonical_group_id", &"<redacted>")
+            .field("order_key", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Place a new order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaceOrderIntent {
@@ -188,6 +242,41 @@ pub struct OrderAck {
     pub price: Option<f64>,
     pub size: Option<f64>,
     pub purpose: Option<OrderPurpose>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_target_identity_requires_complete_fields() {
+        assert!(CanonicalTargetIdentity::from_explicit("", "order").is_none());
+        assert!(CanonicalTargetIdentity::from_explicit("group", "").is_none());
+        assert!(CanonicalTargetIdentity::from_explicit("   ", "order").is_none());
+        assert!(CanonicalTargetIdentity::from_explicit("group", "   ").is_none());
+        assert!(CanonicalTargetIdentity::from_explicit("group", "order").is_some());
+    }
+
+    #[test]
+    fn canonical_target_identity_debug_redacts_values() {
+        let identity =
+            CanonicalTargetIdentity::from_explicit("sensitive-group", "sensitive-order")
+                .expect("complete identity");
+        let debug = format!("{identity:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("sensitive-group"));
+        assert!(!debug.contains("sensitive-order"));
+    }
+
+    #[test]
+    fn canonical_target_identity_converts_to_phase51_key() {
+        let identity =
+            CanonicalTargetIdentity::from_explicit("canonical-group", "canonical-order")
+                .expect("complete identity");
+        let target_key = identity.to_phase51_target_key();
+        assert_eq!(target_key.canonical_group_id, identity.canonical_group_id());
+        assert_eq!(target_key.order_key, identity.order_key());
+    }
 }
 
 #[derive(Debug, Clone)]
