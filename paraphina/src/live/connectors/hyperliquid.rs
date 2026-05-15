@@ -471,7 +471,8 @@ use crate::types::{
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
-    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, Phase51ForwardRefreshNativeRole,
+    PositionSnapshot, TopOfBook,
 };
 use crate::live::gateway::{
     BoxFuture, LiveGatewayError, LiveRestCancelAllRequest, LiveRestCancelRequest, LiveRestClient,
@@ -5432,6 +5433,106 @@ mod tests {
         assert_eq!(subscriptions[1]["subscription"]["type"], "userEvents");
     }
 
+    fn hyperliquid_fill_payload() -> serde_json::Value {
+        serde_json::json!({
+            "side": "B",
+            "px": "101.25",
+            "sz": "0.5",
+            "feeBps": "1.25",
+            "purpose": "Mm"
+        })
+    }
+
+    fn parsed_hyperliquid_user_fill(fill: serde_json::Value) -> crate::live::types::Fill {
+        let msg = serde_json::json!({
+            "channel": "userFills",
+            "seq": 42,
+            "data": {
+                "timestamp": 1_700_000_000_123i64,
+                "fills": [fill]
+            }
+        });
+        let mut events = translate_private_events(&msg);
+        assert_eq!(events.len(), 1);
+        match events.remove(0) {
+            ExecutionEvent::Filled(fill) => fill,
+            _ => panic!("expected fill event"),
+        }
+    }
+
+    #[test]
+    fn hyperliquid_user_fill_crossed_true_populates_native_role() {
+        let mut payload = hyperliquid_fill_payload();
+        payload["crossed"] = serde_json::json!(true);
+
+        let fill = parsed_hyperliquid_user_fill(payload);
+
+        assert_eq!(fill.venue_id, "hyperliquid");
+        assert_eq!(
+            fill.phase51_native_role,
+            Some(Phase51ForwardRefreshNativeRole::Hyperliquid { crossed: true })
+        );
+        assert_eq!(fill.phase51_lighter_native_limit, None);
+    }
+
+    #[test]
+    fn hyperliquid_user_fill_crossed_false_populates_native_role() {
+        let mut payload = hyperliquid_fill_payload();
+        payload["crossed"] = serde_json::json!(false);
+
+        let fill = parsed_hyperliquid_user_fill(payload);
+
+        assert_eq!(fill.venue_id, "hyperliquid");
+        assert_eq!(
+            fill.phase51_native_role,
+            Some(Phase51ForwardRefreshNativeRole::Hyperliquid { crossed: false })
+        );
+        assert_eq!(fill.phase51_lighter_native_limit, None);
+    }
+
+    #[test]
+    fn hyperliquid_user_fill_missing_crossed_leaves_native_role_none() {
+        let fill = parsed_hyperliquid_user_fill(hyperliquid_fill_payload());
+
+        assert_eq!(fill.venue_id, "hyperliquid");
+        assert_eq!(fill.phase51_native_role, None);
+        assert_eq!(fill.phase51_lighter_native_limit, None);
+    }
+
+    #[test]
+    fn hyperliquid_user_fill_non_bool_crossed_leaves_native_role_none() {
+        for crossed in [
+            serde_json::Value::Null,
+            serde_json::json!("true"),
+            serde_json::json!(1),
+            serde_json::json!({ "value": true }),
+            serde_json::json!([true]),
+        ] {
+            let mut payload = hyperliquid_fill_payload();
+            payload["crossed"] = crossed;
+
+            let fill = parsed_hyperliquid_user_fill(payload);
+
+            assert_eq!(fill.phase51_native_role, None);
+            assert_eq!(fill.phase51_lighter_native_limit, None);
+        }
+    }
+
+    #[test]
+    fn hyperliquid_user_fill_auxiliary_fields_do_not_create_native_role() {
+        let mut payload = hyperliquid_fill_payload();
+        payload["timestamp"] = serde_json::json!(1_700_000_000_124i64);
+        payload["oid"] = serde_json::json!("synthetic-order-handle");
+        payload["cloid"] = serde_json::json!("synthetic-client-handle");
+        payload["tid"] = serde_json::json!("synthetic-fill-handle");
+
+        let fill = parsed_hyperliquid_user_fill(payload);
+
+        assert_eq!(fill.venue_id, "hyperliquid");
+        assert_eq!(fill.phase51_native_role, None);
+        assert_eq!(fill.phase51_lighter_native_limit, None);
+    }
+
     #[test]
     fn translate_account_event_parses_wrapped_clearinghouse_state_payload() {
         let msg = serde_json::json!({
@@ -6430,12 +6531,7 @@ fn parse_user_fill(
         .and_then(|v| v.as_i64())
         .or_else(|| data.get("timestamp").and_then(|v| v.as_i64()))
         .unwrap_or(0);
-    let venue_id = fill
-        .get("coin")
-        .or_else(|| data.get("coin"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("UNKNOWN")
-        .to_string();
+    let venue_id = "hyperliquid".to_string();
     let venue_index = 0;
     let side = parse_side(fill.get("side")?)?;
     let price = fill
@@ -6454,6 +6550,10 @@ fn parse_user_fill(
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.0);
     let purpose = parse_purpose(fill.get("purpose")).unwrap_or(OrderPurpose::Mm);
+    let phase51_native_role =
+        fill.get("crossed")
+            .and_then(|v| v.as_bool())
+            .map(|crossed| Phase51ForwardRefreshNativeRole::Hyperliquid { crossed });
 
     Some(ExecutionEvent::Filled(super::super::types::Fill {
         venue_index,
@@ -6464,7 +6564,7 @@ fn parse_user_fill(
         client_order_id,
         fill_id,
         phase51_target_key: None,
-        phase51_native_role: None,
+        phase51_native_role,
         phase51_lighter_native_limit: None,
         side,
         price,
