@@ -7,7 +7,9 @@ use paraphina::live::phase51_forward_refresh_capture::{
 use paraphina::live::phase51_target_key_registry::{
     Phase51TargetKeyRegistry, Phase51TargetKeyRegistryStage,
 };
-use paraphina::live::types::{ExecutionEvent, Fill, OrderAccepted};
+use paraphina::live::types::{
+    ExecutionEvent, Fill, OrderAccepted, Phase51ForwardRefreshNativeRole,
+};
 use paraphina::types::{
     OrderIntent, OrderPurpose, Phase51ForwardRefreshTargetKey, PlaceOrderIntent,
     ReplaceOrderIntent, Side, TimeInForce,
@@ -325,6 +327,48 @@ fn target_key_only_fill_emits_no_forward_refresh_row_without_native_fields() {
     fill.phase51_target_key = Some(target_key("target-only"));
 
     let audit = capture.capture_fill(&fill).unwrap();
+
+    assert!(audit.enabled);
+    assert!(!audit.sanitized_row_emitted);
+    assert_eq!(capture.rows_written(), 0);
+    assert!(!output.exists());
+}
+
+#[test]
+fn mm_intents_without_target_keys_do_not_register_or_emit_forward_refresh_rows() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_capture_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let mut registry = Phase51TargetKeyRegistry::default();
+    let intents = vec![
+        place_intent(Some("generated-client-place"), None),
+        replace_intent(Some("generated-client-replace"), None),
+    ];
+    let stage = Phase51TargetKeyRegistryStage::from_intents(&intents);
+
+    registry.commit_stage(stage);
+    assert_eq!(registry.counts().client_bindings, 0);
+    assert_eq!(registry.counts().order_bindings, 0);
+    assert!(!registry.observe_order_accepted(&accepted(
+        Some("generated-client-place"),
+        "generated-order-place",
+    )));
+
+    let mut native_fill = fill(
+        Some("generated-client-place"),
+        Some("generated-order-place"),
+    );
+    native_fill.phase51_native_role =
+        Some(Phase51ForwardRefreshNativeRole::Extended { is_taker: true });
+
+    assert!(!registry.enrich_fill(&mut native_fill));
+    assert!(native_fill.phase51_target_key.is_none());
+
+    let audit = capture.capture_fill(&native_fill).unwrap();
 
     assert!(audit.enabled);
     assert!(!audit.sanitized_row_emitted);

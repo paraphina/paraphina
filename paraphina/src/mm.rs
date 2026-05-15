@@ -3958,6 +3958,68 @@ mod tests {
     }
 
     #[test]
+    fn compute_mm_quotes_with_now_empty_identity_authority_matches_legacy_and_keeps_identity_none()
+    {
+        let (cfg, mut state) = setup_test();
+        let now_ms = 50_000;
+        for venue in &mut state.venues {
+            venue.last_mid_update_ms = Some(now_ms - 10);
+        }
+
+        let legacy = compute_mm_quotes_with_now(&cfg, &state, Some(now_ms));
+        let with_empty_authority = compute_mm_quotes_with_now_and_identity_authority(
+            &cfg,
+            &state,
+            Some(now_ms),
+            &MmQuoteIdentityAuthority::empty(),
+        );
+
+        assert_eq!(legacy.len(), with_empty_authority.len());
+        assert!(!legacy.is_empty());
+
+        for (baseline, candidate) in legacy.iter().zip(with_empty_authority.iter()) {
+            assert_eq!(baseline.venue_index, candidate.venue_index);
+            assert_eq!(baseline.venue_id, candidate.venue_id);
+            assert_eq!(
+                baseline.generated_spread_cap_applied,
+                candidate.generated_spread_cap_applied
+            );
+            assert_eq!(
+                baseline.generated_spread_cap_bid_suppressed,
+                candidate.generated_spread_cap_bid_suppressed
+            );
+            assert_eq!(
+                baseline.generated_spread_cap_ask_suppressed,
+                candidate.generated_spread_cap_ask_suppressed
+            );
+            assert_eq!(baseline.touch_mode_kind, candidate.touch_mode_kind);
+            assert_eq!(baseline.bid_terminal_reason, candidate.bid_terminal_reason);
+            assert_eq!(baseline.ask_terminal_reason, candidate.ask_terminal_reason);
+
+            match (&baseline.bid, &candidate.bid) {
+                (Some(left), Some(right)) => {
+                    assert_eq!(left.price, right.price);
+                    assert_eq!(left.size, right.size);
+                    assert!(left.canonical_target_identity.is_none());
+                    assert!(right.canonical_target_identity.is_none());
+                }
+                (None, None) => {}
+                _ => panic!("bid presence changed for venue {}", baseline.venue_index),
+            }
+            match (&baseline.ask, &candidate.ask) {
+                (Some(left), Some(right)) => {
+                    assert_eq!(left.price, right.price);
+                    assert_eq!(left.size, right.size);
+                    assert!(left.canonical_target_identity.is_none());
+                    assert!(right.canonical_target_identity.is_none());
+                }
+                (None, None) => {}
+                _ => panic!("ask presence changed for venue {}", baseline.venue_index),
+            }
+        }
+    }
+
+    #[test]
     fn computed_mm_quote_levels_attach_explicit_canonical_target_identity() {
         let (cfg, state) = setup_test();
         let mut authority = MmQuoteIdentityAuthority::with_venue_count(cfg.venues.len());

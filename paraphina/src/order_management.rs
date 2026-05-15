@@ -1487,6 +1487,64 @@ mod tests {
     }
 
     #[test]
+    fn plan_mm_order_actions_from_empty_authority_quotes_emits_no_phase51_target_keys() {
+        let cfg = Config::default();
+        let mut state = mk_state_with_quote(&cfg);
+        let now_ms = 10_000;
+        state.fv_available = true;
+        state.sigma_eff = 0.02;
+        state.spread_mult = 1.0;
+        state.size_mult = 1.0;
+        state.vol_ratio_clipped = 1.0;
+        state.delta_limit_usd = 100_000.0;
+        for venue in &mut state.venues {
+            venue.last_mid_update_ms = Some(now_ms - 10);
+            venue.depth_near_mid = 10_000.0;
+            venue.margin_available_usd = 10_000.0;
+            venue.dist_liq_sigma = 10.0;
+            venue.status = crate::types::VenueStatus::Healthy;
+            venue.toxicity = 0.0;
+        }
+
+        let quotes = crate::mm::compute_mm_quotes_with_now_and_identity_authority(
+            &cfg,
+            &state,
+            Some(now_ms),
+            &crate::mm::MmQuoteIdentityAuthority::empty(),
+        );
+        assert!(quotes.iter().any(|quote| quote.bid.is_some()));
+        assert!(quotes.iter().any(|quote| quote.ask.is_some()));
+        for quote in &quotes {
+            if let Some(bid) = &quote.bid {
+                assert!(bid.canonical_target_identity.is_none());
+            }
+            if let Some(ask) = &quote.ask {
+                assert!(ask.canonical_target_identity.is_none());
+            }
+        }
+
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
+
+        assert!(
+            plan.intents.iter().any(|intent| {
+                matches!(
+                    intent,
+                    OrderIntent::Place(place) if place.purpose == OrderPurpose::Mm
+                )
+            }),
+            "expected at least one MM place intent"
+        );
+        for intent in &plan.intents {
+            match intent {
+                OrderIntent::Place(place) => assert!(place.phase51_target_key.is_none()),
+                OrderIntent::Replace(replace) => assert!(replace.phase51_target_key.is_none()),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
     fn plan_mm_order_actions_replace_converts_quote_identity_to_phase51_target_key() {
         let cfg = Config::default();
         let mut state = mk_state_with_quote(&cfg);
