@@ -21,8 +21,9 @@ The default Rust config mirrors this block. Enabling the lane requires an explic
 
 - `paraphina/src/live/phase51_forward_refresh_capture.rs`: runtime capture scaffold, row sanitizer, fail-closed checks.
 - `paraphina/src/live/mod.rs`: exports the scaffold types.
-- `paraphina/src/live/runner.rs`: initializes the scaffold and fails closed if an enabled configuration is unsafe.
-- `paraphina/src/live/types.rs`: safe audit telemetry shape for capture status reporting.
+- `paraphina/src/live/runner.rs`: initializes the scaffold, wires already-keyed fill evidence into capture, and fails closed if an enabled configuration is unsafe.
+- `paraphina/src/live/types.rs`: safe runtime evidence fields and audit telemetry shape for capture status reporting.
+- `paraphina/src/live/ops.rs`: appends safe capture audit rows when enabled evidence is present.
 - `paraphina/src/config.rs`: disabled-by-default config block.
 - `tools/phase51ao_forward_refresh_remaining_merge.py`: append-safe merge tool for `forward_refresh.jsonl` and `forward_refresh.remaining.jsonl`.
 - `paraphina/tests/phase51_forward_refresh_capture_tests.rs`: unit coverage for disabled, fail-closed, sanitization, target-key, role, and Lighter pressure behavior.
@@ -46,6 +47,18 @@ It fails closed when:
 - the output path references `.env` content or a symlink
 - `max_rows` would be exceeded
 - a row contains raw identifiers, secrets, or unsafe true flags
+
+## Runtime Wiring
+
+The runner calls the capture lane only from live execution fill handling after deduplication and before core fill conversion. The fill event carries optional Phase 5.1 evidence fields:
+
+- `phase51_target_key`
+- `phase51_native_role`
+- `phase51_lighter_native_limit`
+
+All existing fill producers set these fields to `None`. A future connector may populate them only when the exact target key and venue-native/source-owner fields are already present in memory at event time. The capture path does not inspect raw order identifiers and does not derive evidence from fill side, purpose, fee, price, size, post-only settings, timing, account role, or snapshots.
+
+When capture is enabled and a fill carries safe Phase 5.1 evidence, the runner appends a safe audit record to `phase51_forward_refresh_capture_audit.jsonl` under the configured live audit directory. The audit contains only capture status, venue, target key, native-role source label, Lighter pressure status, and fail-closed safety flags.
 
 ## Output Rows
 

@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::live::instrument::InstrumentSpec;
 use crate::live::state_cache::AccountReconcileDiff;
 use crate::live::trade_mode::TradeMode;
+use crate::live::types::Phase51ForwardRefreshCaptureAudit;
 use crate::sim_eval::BuildInfo;
 use crate::telemetry::ReconcileDriftRecord;
 
@@ -461,6 +462,21 @@ pub fn append_reconcile_drift_audit(
 ) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let path = dir.join("reconcile_drift.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string());
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+pub fn append_phase51_forward_refresh_capture_audit(
+    dir: &Path,
+    record: &Phase51ForwardRefreshCaptureAudit,
+) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join("phase51_forward_refresh_capture_audit.jsonl");
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)

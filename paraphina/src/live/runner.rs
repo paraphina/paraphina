@@ -10,10 +10,11 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::gateway::TransportHint;
 use super::ops::{
-    append_account_reconcile_audit, append_reconcile_drift_audit, default_audit_dir, HealthState,
-    LiveMetrics,
+    append_account_reconcile_audit, append_phase51_forward_refresh_capture_audit,
+    append_reconcile_drift_audit, default_audit_dir, HealthState, LiveMetrics,
 };
 use super::order_state::{LiveOrder, OrderStatus};
+use super::phase51_forward_refresh_capture::{Phase51CaptureResult, Phase51ForwardRefreshCapture};
 use super::venue_health::{VenueHealthErrorSource, VenueHealthManager};
 use crate::actions::{intents_to_actions, ActionBatch, ActionIdGenerator};
 use crate::config::{Config, MmVenueRole};
@@ -2668,16 +2669,15 @@ pub async fn run_live_loop(
         .ok()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let _phase51_forward_refresh_capture =
-        match super::phase51_forward_refresh_capture::Phase51ForwardRefreshCapture::from_config(
-            &cfg.phase51_forward_refresh_capture,
-            super::phase51_forward_refresh_capture::Phase51CaptureExecutionMode::from_trade_mode_text(
-                &trade_mode,
-            ),
-        ) {
-            Ok(capture) => capture,
-            Err(err) => panic!("phase51 forward-refresh capture failed closed: {err}"),
-        };
+    let mut phase51_forward_refresh_capture = match Phase51ForwardRefreshCapture::from_config(
+        &cfg.phase51_forward_refresh_capture,
+        super::phase51_forward_refresh_capture::Phase51CaptureExecutionMode::from_trade_mode_text(
+            &trade_mode,
+        ),
+    ) {
+        Ok(capture) => capture,
+        Err(err) => panic!("phase51 forward-refresh capture failed closed: {err}"),
+    };
     let skip_reconcile_kill = matches!(trade_mode.as_str(), "paper" | "p");
     let order_snapshot_fill_inference_enabled = !skip_reconcile_kill;
     let canary_enabled = std::env::var("PARAPHINA_CANARY_MODE")
@@ -3628,6 +3628,14 @@ pub async fn run_live_loop(
                                 event: EventLogPayload::LiveExecution(event.clone()),
                             });
                         }
+                        capture_phase51_forward_refresh_from_live_events(
+                            &mut phase51_forward_refresh_capture,
+                            &audit_dir,
+                            std::slice::from_ref(&event),
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!("phase51 forward-refresh capture failed closed: {err}")
+                        });
                         let core_events = live_events_to_core(&[event]);
                         tick_exec_events.extend(core_events.iter().cloned());
                         let fills = apply_execution_events(&mut state, &core_events, now_ms);
@@ -5870,6 +5878,14 @@ pub async fn run_live_loop(
                         }
                         #[cfg(feature = "event_log")]
                         log_live_execution_event(&mut event_log, tick, now_ms, "gateway", &event);
+                        capture_phase51_forward_refresh_from_live_events(
+                            &mut phase51_forward_refresh_capture,
+                            &audit_dir,
+                            std::slice::from_ref(&event),
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!("phase51 forward-refresh capture failed closed: {err}")
+                        });
                         let core_events = live_events_to_core(&[event]);
                         tick_exec_events.extend(core_events.iter().cloned());
                         let fills = apply_execution_events(&mut state, &core_events, now_ms);
@@ -5972,6 +5988,14 @@ pub async fn run_live_loop(
                                 "gateway",
                                 &event,
                             );
+                            capture_phase51_forward_refresh_from_live_events(
+                                &mut phase51_forward_refresh_capture,
+                                &audit_dir,
+                                std::slice::from_ref(&event),
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!("phase51 forward-refresh capture failed closed: {err}")
+                            });
                             let core_events = live_events_to_core(&[event]);
                             tick_exec_events.extend(core_events.iter().cloned());
                             let fills = apply_execution_events(&mut state, &core_events, now_ms);
@@ -13490,6 +13514,9 @@ fn infer_fills_from_order_snapshot(
                 order_id: fill.order_id,
                 client_order_id: fill.client_order_id,
                 fill_id: None,
+                phase51_target_key: None,
+                phase51_native_role: None,
+                phase51_lighter_native_limit: None,
                 side: fill.side,
                 price: fill.price,
                 size: fill.size,
@@ -13532,6 +13559,9 @@ fn infer_fills_from_account_position_syncs(
                 order_id: fill.order_id,
                 client_order_id: fill.client_order_id,
                 fill_id: None,
+                phase51_target_key: None,
+                phase51_native_role: None,
+                phase51_lighter_native_limit: None,
                 side: fill.side,
                 price: fill.price,
                 size: fill.size,
@@ -13645,6 +13675,33 @@ fn live_events_to_core(events: &[LiveExecutionEvent]) -> Vec<ExecutionEvent> {
         }
     }
     out
+}
+
+fn capture_phase51_forward_refresh_from_live_events(
+    capture: &mut Phase51ForwardRefreshCapture,
+    audit_dir: &std::path::Path,
+    events: &[LiveExecutionEvent],
+) -> Phase51CaptureResult<()> {
+    for event in events {
+        let LiveExecutionEvent::Filled(fill) = event else {
+            continue;
+        };
+        let audit = capture.capture_fill(fill)?;
+        if audit.enabled
+            && (audit.sanitized_row_emitted
+                || audit.canonical_group_id.is_some()
+                || audit.order_key.is_some()
+                || audit.native_role_source.is_some()
+                || audit.lighter_pressure_status.is_some())
+        {
+            append_phase51_forward_refresh_capture_audit(audit_dir, &audit).map_err(|err| {
+                super::phase51_forward_refresh_capture::Phase51CaptureError::from_message(format!(
+                    "phase51 forward-refresh audit append failed: {err}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_live_fills(
@@ -14177,6 +14234,9 @@ mod tests {
             order_id: Some("oid_1".to_string()),
             client_order_id: Some("co_1".to_string()),
             fill_id: Some("fill_1".to_string()),
+            phase51_target_key: None,
+            phase51_native_role: None,
+            phase51_lighter_native_limit: None,
             side: Side::Buy,
             price: 100.0,
             size: 0.5,

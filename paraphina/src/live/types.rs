@@ -170,6 +170,46 @@ pub struct OrderRejected {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Phase51ForwardRefreshTargetKey {
+    pub canonical_group_id: String,
+    pub order_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase51ForwardRefreshNativeRole {
+    Aster {
+        maker: bool,
+        last_filled_qty: String,
+    },
+    Extended {
+        is_taker: bool,
+    },
+    Hyperliquid {
+        crossed: bool,
+    },
+    Lighter {
+        account_index: i64,
+        is_maker_ask: bool,
+        ask_account_id: i64,
+        bid_account_id: i64,
+    },
+    Paradex {
+        liquidity: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Phase51ForwardRefreshLighterNativeLimit {
+    pub active_order_headroom_account: Option<i64>,
+    pub active_order_sendtx_utilization_account: Option<i64>,
+    pub rest_open_orders_count: Option<i64>,
+    pub rest_open_orders_cap: Option<i64>,
+    pub weighted_open_order_slots_used: Option<i64>,
+    pub weighted_open_order_slots_cap: Option<i64>,
+    pub native_limit_event_time_status: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fill {
     pub venue_index: usize,
@@ -179,6 +219,12 @@ pub struct Fill {
     pub order_id: Option<String>,
     pub client_order_id: Option<String>,
     pub fill_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase51_target_key: Option<Phase51ForwardRefreshTargetKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase51_native_role: Option<Phase51ForwardRefreshNativeRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase51_lighter_native_limit: Option<Phase51ForwardRefreshLighterNativeLimit>,
     pub side: Side,
     pub price: f64,
     pub size: f64,

@@ -7,6 +7,11 @@ use paraphina::live::phase51_forward_refresh_capture::{
     Phase51CaptureExecutionMode, Phase51CaptureTargetKey, Phase51ForwardRefreshCapture,
     Phase51LighterNativeLimitPressure, Phase51VenueNativeRole,
 };
+use paraphina::live::types::{
+    Fill, Phase51ForwardRefreshLighterNativeLimit, Phase51ForwardRefreshNativeRole,
+    Phase51ForwardRefreshTargetKey,
+};
+use paraphina::types::{OrderPurpose, Side};
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -47,6 +52,26 @@ fn assert_safe_flags(row: &Value) {
             Some(false),
             "{flag}"
         );
+    }
+}
+
+fn runtime_fill() -> Fill {
+    Fill {
+        venue_index: 0,
+        venue_id: "extended".to_string(),
+        seq: 42,
+        timestamp_ms: 1_700_000_000_000,
+        order_id: Some("raw-order-id-runtime".to_string()),
+        client_order_id: Some("raw-client-order-id-runtime".to_string()),
+        fill_id: Some("raw-fill-id-runtime".to_string()),
+        phase51_target_key: None,
+        phase51_native_role: None,
+        phase51_lighter_native_limit: None,
+        side: Side::Buy,
+        price: 100.0,
+        size: 1.0,
+        purpose: OrderPurpose::Mm,
+        fee_bps: 0.0,
     }
 }
 
@@ -120,6 +145,126 @@ fn no_exact_target_key_means_no_row() {
     assert!(emitted.is_none());
     assert_eq!(capture.rows_written(), 0);
     assert!(!output.exists());
+}
+
+#[test]
+fn runtime_fill_without_phase51_fields_emits_no_rows_and_safe_audit() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let fill = runtime_fill();
+
+    let audit = capture.capture_fill(&fill).unwrap();
+
+    assert!(audit.enabled);
+    assert!(!audit.sanitized_row_emitted);
+    assert_eq!(audit.canonical_group_id, None);
+    assert_eq!(audit.order_key, None);
+    assert_eq!(capture.rows_written(), 0);
+    assert!(!output.exists());
+    let audit_json = serde_json::to_string(&audit).unwrap();
+    assert!(!audit_json.contains("raw-order-id-runtime"));
+    assert!(!audit_json.contains("raw-client-order-id-runtime"));
+    assert!(!audit_json.contains("raw-fill-id-runtime"));
+}
+
+#[test]
+fn runtime_already_keyed_native_fill_emits_sanitized_row() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let mut fill = runtime_fill();
+    fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+        canonical_group_id: "cg-runtime-native".to_string(),
+        order_key: "ok-runtime-native".to_string(),
+    });
+    fill.phase51_native_role = Some(Phase51ForwardRefreshNativeRole::Extended { is_taker: true });
+
+    let audit = capture.capture_fill(&fill).unwrap();
+
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(audit.target_type.as_deref(), Some("native_role"));
+    assert_eq!(
+        audit.native_role_source.as_deref(),
+        Some("extended.isTaker")
+    );
+    assert_eq!(
+        audit.canonical_group_id.as_deref(),
+        Some("cg-runtime-native")
+    );
+    assert_eq!(audit.order_key.as_deref(), Some("ok-runtime-native"));
+
+    let raw_output = fs::read_to_string(&output).unwrap();
+    assert!(!raw_output.contains("raw-order-id-runtime"));
+    assert!(!raw_output.contains("raw-client-order-id-runtime"));
+    assert!(!raw_output.contains("raw-fill-id-runtime"));
+    let rows = read_rows(&output);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("target_type").and_then(Value::as_str),
+        Some("native_role")
+    );
+    assert_eq!(rows[0].get("isTaker").and_then(Value::as_bool), Some(true));
+    assert_safe_flags(&rows[0]);
+}
+
+#[test]
+fn runtime_lighter_pressure_requires_complete_event_time_fields() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let mut fill = runtime_fill();
+    fill.venue_id = "lighter".to_string();
+    fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+        canonical_group_id: "cg-runtime-lighter".to_string(),
+        order_key: "ok-runtime-lighter".to_string(),
+    });
+    fill.phase51_lighter_native_limit = Some(Phase51ForwardRefreshLighterNativeLimit {
+        active_order_headroom_account: Some(20),
+        active_order_sendtx_utilization_account: None,
+        rest_open_orders_count: Some(4),
+        rest_open_orders_cap: Some(200),
+        weighted_open_order_slots_used: None,
+        weighted_open_order_slots_cap: None,
+        native_limit_event_time_status: Some("EVENT_TIME_ALIGNED".to_string()),
+    });
+
+    let audit = capture.capture_fill(&fill).unwrap();
+    assert!(!audit.sanitized_row_emitted);
+    assert!(!output.exists());
+
+    fill.phase51_lighter_native_limit = Some(Phase51ForwardRefreshLighterNativeLimit {
+        active_order_headroom_account: Some(20),
+        active_order_sendtx_utilization_account: Some(7),
+        rest_open_orders_count: Some(4),
+        rest_open_orders_cap: Some(200),
+        weighted_open_order_slots_used: None,
+        weighted_open_order_slots_cap: None,
+        native_limit_event_time_status: Some("EVENT_TIME_ALIGNED".to_string()),
+    });
+
+    let audit = capture.capture_fill(&fill).unwrap();
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(audit.target_type.as_deref(), Some("lighter_native_limit"));
+    let rows = read_rows(&output);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("target_type").and_then(Value::as_str),
+        Some("lighter_native_limit")
+    );
+    assert_safe_flags(&rows[0]);
 }
 
 #[test]

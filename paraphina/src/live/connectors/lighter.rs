@@ -4507,6 +4507,9 @@ pub fn translate_private_event(
                 .get("fill_id")
                 .and_then(|v| v.as_str())
                 .map(|v| v.to_string()),
+            phase51_target_key: None,
+            phase51_native_role: None,
+            phase51_lighter_native_limit: None,
             side: parse_side(value.get("side")?)?,
             price: value.get("price")?.as_f64()?,
             size: value.get("size")?.as_f64()?,
