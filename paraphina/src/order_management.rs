@@ -1400,6 +1400,83 @@ mod tests {
     }
 
     #[test]
+    fn plan_mm_order_actions_place_keeps_phase51_target_key_none_when_quote_identity_present() {
+        let cfg = Config::default();
+        let state = mk_state_with_quote(&cfg);
+        let identity =
+            crate::types::CanonicalTargetIdentity::from_explicit("canonical-group", "order-key")
+                .expect("complete identity");
+        let quotes = vec![MmQuote {
+            venue_index: 0,
+            venue_id: "test".into(),
+            bid: Some(MmLevel {
+                price: 299.0,
+                size: 1.0,
+                canonical_target_identity: Some(identity),
+            }),
+            ask: None,
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "active",
+            ask_terminal_reason: "active",
+        }];
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, 1_000, &mut gen);
+
+        assert_eq!(plan.intents.len(), 1);
+        match &plan.intents[0] {
+            OrderIntent::Place(place) => assert!(place.phase51_target_key.is_none()),
+            other => panic!("expected place, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_mm_order_actions_replace_keeps_phase51_target_key_none_when_quote_identity_present() {
+        let cfg = Config::default();
+        let mut state = mk_state_with_quote(&cfg);
+        let now_ms = 10_000;
+        let identity =
+            crate::types::CanonicalTargetIdentity::from_explicit("canonical-group", "order-key")
+                .expect("complete identity");
+
+        state.venues[0].mm_open_bid = Some(MmOpenOrder {
+            price: 299.0,
+            size: 1.0,
+            timestamp_ms: now_ms - (cfg.mm.min_quote_lifetime_ms + 1),
+            order_id: "co_1".to_string(),
+            client_order_id: None,
+            tracking_source: crate::state::MmOpenTrackingSource::OpenSnapshot,
+        });
+
+        let quotes = vec![MmQuote {
+            venue_index: 0,
+            venue_id: "test".into(),
+            bid: Some(MmLevel {
+                price: 295.0,
+                size: 2.0,
+                canonical_target_identity: Some(identity),
+            }),
+            ask: None,
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "active",
+            ask_terminal_reason: "active",
+        }];
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
+
+        assert_eq!(plan.intents.len(), 1);
+        match &plan.intents[0] {
+            OrderIntent::Replace(replace) => assert!(replace.phase51_target_key.is_none()),
+            other => panic!("expected replace, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn supported_replace_visibility_records_no_current_same_side() {
         let cfg = Config::default();
         let state = mk_state_with_quote(&cfg);

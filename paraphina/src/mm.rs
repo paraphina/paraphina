@@ -53,6 +53,74 @@ pub struct MmLevel {
     pub canonical_target_identity: Option<CanonicalTargetIdentity>,
 }
 
+/// Explicit upstream identity authority for MM quote levels.
+///
+/// This is only an in-memory carrier for canonical target identities that were
+/// created before quote construction. Venue/side lookup may select an explicit
+/// slot, but must not create or derive the identity values.
+#[derive(Debug, Clone, Default)]
+pub struct MmQuoteIdentityAuthority {
+    slots: Vec<MmQuoteIdentitySlot>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MmQuoteIdentitySlot {
+    bid: Option<CanonicalTargetIdentity>,
+    ask: Option<CanonicalTargetIdentity>,
+}
+
+impl MmQuoteIdentityAuthority {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn with_venue_count(venue_count: usize) -> Self {
+        Self {
+            slots: vec![MmQuoteIdentitySlot::default(); venue_count],
+        }
+    }
+
+    pub fn insert_explicit(
+        &mut self,
+        venue_index: usize,
+        side: Side,
+        canonical_group_id: impl Into<String>,
+        order_key: impl Into<String>,
+    ) -> bool {
+        let Some(identity) = CanonicalTargetIdentity::from_explicit(canonical_group_id, order_key)
+        else {
+            return false;
+        };
+        self.insert_identity(venue_index, side, identity);
+        true
+    }
+
+    pub fn insert_identity(
+        &mut self,
+        venue_index: usize,
+        side: Side,
+        identity: CanonicalTargetIdentity,
+    ) {
+        if self.slots.len() <= venue_index {
+            self.slots
+                .resize_with(venue_index + 1, MmQuoteIdentitySlot::default);
+        }
+        let slot = &mut self.slots[venue_index];
+        match side {
+            Side::Buy => slot.bid = Some(identity),
+            Side::Sell => slot.ask = Some(identity),
+        }
+    }
+
+    pub fn identity_for(&self, venue_index: usize, side: Side) -> Option<CanonicalTargetIdentity> {
+        let slot = self.slots.get(venue_index)?;
+        match side {
+            Side::Buy => slot.bid.clone(),
+            Side::Sell => slot.ask.clone(),
+        }
+    }
+}
+
 /// Per-venue MM quote (bid/ask).
 ///
 /// Note: `venue_id` uses `Arc<str>` for cheap cloning in hot paths.
@@ -1156,6 +1224,14 @@ pub fn compute_mm_quotes(cfg: &Config, state: &GlobalState) -> Vec<MmQuote> {
     compute_mm_quotes_with_now(cfg, state, None)
 }
 
+pub fn compute_mm_quotes_with_identity_authority(
+    cfg: &Config,
+    state: &GlobalState,
+    authority: &MmQuoteIdentityAuthority,
+) -> Vec<MmQuote> {
+    compute_mm_quotes_with_now_and_identity_authority(cfg, state, None, authority)
+}
+
 /// Main MM quoting function with explicit timestamp for staleness guard.
 ///
 /// Same as `compute_mm_quotes` but with explicit `now_ms` for staleness checking.
@@ -1169,6 +1245,17 @@ pub fn compute_mm_quotes_with_now(
     let n = cfg.venues.len();
     let mut out = Vec::with_capacity(n);
     compute_mm_quotes_impl::<false, false>(cfg, state, now_ms, &mut out);
+    out
+}
+
+pub fn compute_mm_quotes_with_now_and_identity_authority(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: Option<TimestampMs>,
+    authority: &MmQuoteIdentityAuthority,
+) -> Vec<MmQuote> {
+    let mut out = compute_mm_quotes_with_now(cfg, state, now_ms);
+    attach_canonical_target_identities(&mut out, authority);
     out
 }
 
@@ -1187,6 +1274,16 @@ pub fn compute_mm_quotes_into(cfg: &Config, state: &GlobalState, out: &mut Vec<M
     compute_mm_quotes_impl::<false, false>(cfg, state, None, out)
 }
 
+pub fn compute_mm_quotes_into_with_identity_authority(
+    cfg: &Config,
+    state: &GlobalState,
+    out: &mut Vec<MmQuote>,
+    authority: &MmQuoteIdentityAuthority,
+) {
+    compute_mm_quotes_into(cfg, state, out);
+    attach_canonical_target_identities(out, authority);
+}
+
 /// Main MM quoting function (buffer-reusing variant) with explicit timestamp.
 ///
 /// Same as `compute_mm_quotes_into` but with explicit `now_ms` for staleness checking.
@@ -1197,6 +1294,17 @@ pub fn compute_mm_quotes_into_with_now(
     out: &mut Vec<MmQuote>,
 ) {
     compute_mm_quotes_impl::<false, false>(cfg, state, now_ms, out)
+}
+
+pub fn compute_mm_quotes_into_with_now_and_identity_authority(
+    cfg: &Config,
+    state: &GlobalState,
+    now_ms: Option<TimestampMs>,
+    out: &mut Vec<MmQuote>,
+    authority: &MmQuoteIdentityAuthority,
+) {
+    compute_mm_quotes_into_with_now(cfg, state, now_ms, out);
+    attach_canonical_target_identities(out, authority);
 }
 
 /// Main MM quoting function (fully buffer-reusing variant).
@@ -1217,6 +1325,17 @@ pub fn compute_mm_quotes_into_with_scratch(
     scratch: &mut MmScratch,
 ) {
     compute_mm_quotes_impl_with_scratch::<false, false>(cfg, state, None, out, scratch)
+}
+
+pub fn compute_mm_quotes_into_with_scratch_and_identity_authority(
+    cfg: &Config,
+    state: &GlobalState,
+    out: &mut Vec<MmQuote>,
+    scratch: &mut MmScratch,
+    authority: &MmQuoteIdentityAuthority,
+) {
+    compute_mm_quotes_into_with_scratch(cfg, state, out, scratch);
+    attach_canonical_target_identities(out, authority);
 }
 
 /// Main MM quoting function with ablation support.
@@ -1367,6 +1486,20 @@ fn clear_mm_quote_slot(q: &mut MmQuote, reason: &'static str) {
     q.touch_mode_kind = None;
     q.bid_terminal_reason = reason;
     q.ask_terminal_reason = reason;
+}
+
+fn attach_canonical_target_identities(
+    quotes: &mut [MmQuote],
+    authority: &MmQuoteIdentityAuthority,
+) {
+    for quote in quotes {
+        if let Some(bid) = quote.bid.as_mut() {
+            bid.canonical_target_identity = authority.identity_for(quote.venue_index, Side::Buy);
+        }
+        if let Some(ask) = quote.ask.as_mut() {
+            ask.canonical_target_identity = authority.identity_for(quote.venue_index, Side::Sell);
+        }
+    }
 }
 
 /// Core MM quoting implementation with scratch buffer reuse.
@@ -3718,6 +3851,85 @@ mod tests {
         (cfg, state)
     }
 
+    fn test_identity(group: &str, order: &str) -> CanonicalTargetIdentity {
+        CanonicalTargetIdentity::from_explicit(group, order).expect("complete identity")
+    }
+
+    #[test]
+    fn mm_quote_identity_authority_returns_only_explicit_entries() {
+        let mut authority = MmQuoteIdentityAuthority::with_venue_count(2);
+        assert!(authority.insert_explicit(0, Side::Buy, "group-bid", "order-bid"));
+        assert!(authority.insert_explicit(1, Side::Sell, "group-ask", "order-ask"));
+
+        let bid_identity = authority
+            .identity_for(0, Side::Buy)
+            .expect("explicit bid identity");
+        assert_eq!(bid_identity.canonical_group_id(), "group-bid");
+        assert_eq!(bid_identity.order_key(), "order-bid");
+
+        let ask_identity = authority
+            .identity_for(1, Side::Sell)
+            .expect("explicit ask identity");
+        assert_eq!(ask_identity.canonical_group_id(), "group-ask");
+        assert_eq!(ask_identity.order_key(), "order-ask");
+
+        assert!(authority.identity_for(0, Side::Sell).is_none());
+        assert!(authority.identity_for(1, Side::Buy).is_none());
+        assert!(authority.identity_for(2, Side::Buy).is_none());
+    }
+
+    #[test]
+    fn mm_quote_identity_authority_rejects_incomplete_entries() {
+        let mut authority = MmQuoteIdentityAuthority::with_venue_count(1);
+
+        assert!(!authority.insert_explicit(0, Side::Buy, "", "order"));
+        assert!(!authority.insert_explicit(0, Side::Buy, "group", ""));
+        assert!(!authority.insert_explicit(0, Side::Sell, "   ", "order"));
+        assert!(!authority.insert_explicit(0, Side::Sell, "group", "   "));
+
+        assert!(authority.identity_for(0, Side::Buy).is_none());
+        assert!(authority.identity_for(0, Side::Sell).is_none());
+    }
+
+    #[test]
+    fn mm_quote_identity_authority_does_not_derive_from_runtime_fields() {
+        let mut quotes = vec![MmQuote {
+            venue_index: 0,
+            venue_id: "generated-looking-venue".into(),
+            bid: Some(MmLevel {
+                price: 299.0,
+                size: 1.0,
+                canonical_target_identity: None,
+            }),
+            ask: Some(MmLevel {
+                price: 301.0,
+                size: 1.0,
+                canonical_target_identity: None,
+            }),
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "quoted",
+            ask_terminal_reason: "quoted",
+        }];
+
+        attach_canonical_target_identities(&mut quotes, &MmQuoteIdentityAuthority::empty());
+
+        assert!(quotes[0]
+            .bid
+            .as_ref()
+            .expect("bid")
+            .canonical_target_identity
+            .is_none());
+        assert!(quotes[0]
+            .ask
+            .as_ref()
+            .expect("ask")
+            .canonical_target_identity
+            .is_none());
+    }
+
     #[test]
     fn computed_mm_quote_levels_do_not_attach_canonical_target_identity_yet() {
         let (cfg, state) = setup_test();
@@ -3740,10 +3952,207 @@ mod tests {
     }
 
     #[test]
-    fn mm_quote_identity_schema_does_not_populate_phase51_target_key_yet() {
+    fn computed_mm_quote_levels_attach_explicit_canonical_target_identity() {
+        let (cfg, state) = setup_test();
+        let mut authority = MmQuoteIdentityAuthority::with_venue_count(cfg.venues.len());
+        for venue_index in 0..cfg.venues.len() {
+            assert!(authority.insert_explicit(
+                venue_index,
+                Side::Buy,
+                format!("cg-v{venue_index}-bid"),
+                format!("ok-v{venue_index}-bid"),
+            ));
+            assert!(authority.insert_explicit(
+                venue_index,
+                Side::Sell,
+                format!("cg-v{venue_index}-ask"),
+                format!("ok-v{venue_index}-ask"),
+            ));
+        }
+
+        let quotes = compute_mm_quotes_with_identity_authority(&cfg, &state, &authority);
+        let mut inspected_bids = 0;
+        let mut inspected_asks = 0;
+
+        for quote in &quotes {
+            if let Some(bid) = &quote.bid {
+                inspected_bids += 1;
+                assert_eq!(
+                    bid.canonical_target_identity,
+                    authority.identity_for(quote.venue_index, Side::Buy)
+                );
+            }
+            if let Some(ask) = &quote.ask {
+                inspected_asks += 1;
+                assert_eq!(
+                    ask.canonical_target_identity,
+                    authority.identity_for(quote.venue_index, Side::Sell)
+                );
+            }
+        }
+
+        assert!(inspected_bids > 0);
+        assert!(inspected_asks > 0);
+    }
+
+    #[test]
+    fn quote_identity_attachment_leaves_missing_authority_sides_none() {
+        let (cfg, state) = setup_test();
+        let mut authority = MmQuoteIdentityAuthority::with_venue_count(cfg.venues.len());
+        assert!(authority.insert_explicit(0, Side::Buy, "cg-v0-bid", "ok-v0-bid"));
+
+        let quotes = compute_mm_quotes_with_identity_authority(&cfg, &state, &authority);
+        let mut saw_seeded_bid = false;
+        let mut saw_missing_side = false;
+
+        for quote in &quotes {
+            if let Some(bid) = &quote.bid {
+                if quote.venue_index == 0 {
+                    saw_seeded_bid = true;
+                    assert!(bid.canonical_target_identity.is_some());
+                } else {
+                    saw_missing_side = true;
+                    assert!(bid.canonical_target_identity.is_none());
+                }
+            }
+            if let Some(ask) = &quote.ask {
+                saw_missing_side = true;
+                assert!(ask.canonical_target_identity.is_none());
+            }
+        }
+
+        assert!(saw_seeded_bid);
+        assert!(saw_missing_side);
+    }
+
+    #[test]
+    fn quote_identity_attachment_does_not_mutate_quote_economics() {
+        let (cfg, state) = setup_test();
+        let baseline = compute_mm_quotes(&cfg, &state);
+        let mut with_identity = baseline.clone();
+        let mut authority = MmQuoteIdentityAuthority::with_venue_count(cfg.venues.len());
+        for venue_index in 0..cfg.venues.len() {
+            authority.insert_identity(
+                venue_index,
+                Side::Buy,
+                test_identity(
+                    &format!("cg-v{venue_index}-bid"),
+                    &format!("ok-v{venue_index}-bid"),
+                ),
+            );
+            authority.insert_identity(
+                venue_index,
+                Side::Sell,
+                test_identity(
+                    &format!("cg-v{venue_index}-ask"),
+                    &format!("ok-v{venue_index}-ask"),
+                ),
+            );
+        }
+
+        attach_canonical_target_identities(&mut with_identity, &authority);
+
+        assert_eq!(baseline.len(), with_identity.len());
+        for (before, after) in baseline.iter().zip(with_identity.iter()) {
+            assert_eq!(before.venue_index, after.venue_index);
+            assert_eq!(before.venue_id, after.venue_id);
+            assert_eq!(
+                before.generated_spread_cap_applied,
+                after.generated_spread_cap_applied
+            );
+            assert_eq!(
+                before.generated_spread_cap_bid_suppressed,
+                after.generated_spread_cap_bid_suppressed
+            );
+            assert_eq!(
+                before.generated_spread_cap_ask_suppressed,
+                after.generated_spread_cap_ask_suppressed
+            );
+            assert_eq!(before.touch_mode_kind, after.touch_mode_kind);
+            assert_eq!(before.bid_terminal_reason, after.bid_terminal_reason);
+            assert_eq!(before.ask_terminal_reason, after.ask_terminal_reason);
+
+            match (&before.bid, &after.bid) {
+                (Some(before_bid), Some(after_bid)) => {
+                    assert_eq!(before_bid.price, after_bid.price);
+                    assert_eq!(before_bid.size, after_bid.size);
+                }
+                (None, None) => {}
+                _ => panic!("bid presence changed"),
+            }
+            match (&before.ask, &after.ask) {
+                (Some(before_ask), Some(after_ask)) => {
+                    assert_eq!(before_ask.price, after_ask.price);
+                    assert_eq!(before_ask.size, after_ask.size);
+                }
+                (None, None) => {}
+                _ => panic!("ask presence changed"),
+            }
+        }
+    }
+
+    #[test]
+    fn quote_identity_attachment_does_not_leak_across_reused_quote_slots() {
+        let (cfg, state) = setup_test();
+        let mut out = Vec::new();
+        let mut scratch = MmScratch::new();
+        let mut authority = MmQuoteIdentityAuthority::with_venue_count(cfg.venues.len());
+        for venue_index in 0..cfg.venues.len() {
+            assert!(authority.insert_explicit(
+                venue_index,
+                Side::Buy,
+                format!("cg-v{venue_index}-bid"),
+                format!("ok-v{venue_index}-bid"),
+            ));
+            assert!(authority.insert_explicit(
+                venue_index,
+                Side::Sell,
+                format!("cg-v{venue_index}-ask"),
+                format!("ok-v{venue_index}-ask"),
+            ));
+        }
+
+        compute_mm_quotes_into_with_scratch_and_identity_authority(
+            &cfg,
+            &state,
+            &mut out,
+            &mut scratch,
+            &authority,
+        );
+        assert!(out.iter().any(|quote| {
+            quote
+                .bid
+                .as_ref()
+                .and_then(|level| level.canonical_target_identity.as_ref())
+                .is_some()
+                || quote
+                    .ask
+                    .as_ref()
+                    .and_then(|level| level.canonical_target_identity.as_ref())
+                    .is_some()
+        }));
+
+        compute_mm_quotes_into_with_scratch_and_identity_authority(
+            &cfg,
+            &state,
+            &mut out,
+            &mut scratch,
+            &MmQuoteIdentityAuthority::empty(),
+        );
+        for quote in &out {
+            if let Some(bid) = &quote.bid {
+                assert!(bid.canonical_target_identity.is_none());
+            }
+            if let Some(ask) = &quote.ask {
+                assert!(ask.canonical_target_identity.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mm_quotes_to_order_intents_keeps_phase51_target_key_none_when_quote_identity_present() {
         let (cfg, _) = setup_test();
-        let identity = CanonicalTargetIdentity::from_explicit("canonical-group", "order-key")
-            .expect("complete identity");
+        let identity = test_identity("canonical-group", "order-key");
         let quote = MmQuote {
             venue_index: 0,
             venue_id: cfg.venues[0].id_arc.clone(),
@@ -3783,6 +4192,40 @@ mod tests {
         }
         assert!(saw_buy);
         assert!(saw_sell);
+    }
+
+    #[test]
+    fn mm_quotes_to_order_intents_into_keeps_phase51_target_key_none_when_quote_identity_present() {
+        let (cfg, _) = setup_test();
+        let identity = test_identity("canonical-group", "order-key");
+        let quote = MmQuote {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            bid: Some(MmLevel {
+                price: 299.0,
+                size: 1.0,
+                canonical_target_identity: Some(identity.clone()),
+            }),
+            ask: Some(MmLevel {
+                price: 301.0,
+                size: 1.0,
+                canonical_target_identity: Some(identity),
+            }),
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "quoted",
+            ask_terminal_reason: "quoted",
+        };
+
+        let mut intents = Vec::with_capacity(2);
+        mm_quotes_to_order_intents_into(&[quote], &mut intents);
+        assert_eq!(intents.len(), 2);
+        assert!(intents.iter().all(|intent| match intent {
+            OrderIntent::Place(place) => place.phase51_target_key.is_none(),
+            _ => false,
+        }));
     }
 
     #[test]
