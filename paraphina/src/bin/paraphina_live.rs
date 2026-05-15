@@ -4013,7 +4013,7 @@ fn expand_live_gateway_intents(
                         post_only: replace.post_only,
                         reduce_only: replace.reduce_only,
                         client_order_id: replace.client_order_id,
-                        phase51_target_key: None,
+                        phase51_target_key: replace.phase51_target_key,
                     },
                 ));
             }
@@ -4813,7 +4813,7 @@ mod tests {
     use paraphina::live::venues::ROADMAP_B_VENUES;
     use paraphina::types::{
         CancelAllOrderIntent, CancelOrderIntent, OrderIntent, OrderPurpose, PlaceOrderIntent,
-        ReplaceOrderIntent, Side, TimeInForce,
+        Phase51ForwardRefreshTargetKey, ReplaceOrderIntent, Side, TimeInForce,
     };
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -4823,6 +4823,13 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn phase51_target_key(label: &str) -> Phase51ForwardRefreshTargetKey {
+        Phase51ForwardRefreshTargetKey {
+            canonical_group_id: format!("canonical-{label}"),
+            order_key: format!("order-{label}"),
+        }
     }
 
     struct EnvVarGuard {
@@ -5047,6 +5054,87 @@ mod tests {
         assert_eq!(expanded.len(), 2);
         assert!(matches!(expanded[0], OrderIntent::Cancel(_)));
         assert!(matches!(expanded[1], OrderIntent::Place(_)));
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_preserves_explicit_phase51_target_key_for_split_replace() {
+        let target_key = phase51_target_key("split-replace");
+        let intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 3,
+            venue_id: "aster".into(),
+            side: Side::Sell,
+            price: 2_105.0,
+            size: 0.04,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "previous-handle".to_string(),
+            client_order_id: Some("replacement-client-handle".to_string()),
+            phase51_target_key: Some(target_key.clone()),
+        })];
+        let expanded = super::expand_live_gateway_intents(intents);
+        assert_eq!(expanded.len(), 2);
+        assert!(matches!(expanded[0], OrderIntent::Cancel(_)));
+        let preserved = match &expanded[1] {
+            OrderIntent::Place(place) => match place.phase51_target_key.as_ref() {
+                Some(key) => {
+                    key.canonical_group_id == target_key.canonical_group_id
+                        && key.order_key == target_key.order_key
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        assert!(preserved);
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_keeps_absent_phase51_target_key_none_for_split_replace() {
+        let intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 3,
+            venue_id: "aster".into(),
+            side: Side::Buy,
+            price: 2_106.0,
+            size: 0.03,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "previous-handle".to_string(),
+            client_order_id: Some("replacement-client-handle".to_string()),
+            phase51_target_key: None,
+        })];
+        let expanded = super::expand_live_gateway_intents(intents);
+        assert_eq!(expanded.len(), 2);
+        match &expanded[1] {
+            OrderIntent::Place(place) => assert!(place.phase51_target_key.is_none()),
+            _ => panic!("expected place intent"),
+        }
+    }
+
+    #[test]
+    fn expand_live_gateway_intents_does_not_derive_phase51_target_key_for_generated_handles() {
+        let intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 3,
+            venue_id: "aster".into(),
+            side: Side::Sell,
+            price: 2_107.0,
+            size: 0.02,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "generated-looking-previous-handle".to_string(),
+            client_order_id: Some("generated-looking-replacement-handle".to_string()),
+            phase51_target_key: None,
+        })];
+        let expanded = super::expand_live_gateway_intents(intents);
+        assert_eq!(expanded.len(), 2);
+        match &expanded[1] {
+            OrderIntent::Place(place) => assert!(place.phase51_target_key.is_none()),
+            _ => panic!("expected place intent"),
+        }
     }
 
     #[test]
