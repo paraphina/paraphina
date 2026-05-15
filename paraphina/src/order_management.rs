@@ -1143,7 +1143,10 @@ fn plan_side(
             post_only: true,
             reduce_only: false,
             client_order_id,
-            phase51_target_key: None,
+            phase51_target_key: desired
+                .canonical_target_identity
+                .as_ref()
+                .map(|identity| identity.to_phase51_target_key()),
         });
         intents.push(intent);
         if supported_replace {
@@ -1269,7 +1272,10 @@ fn plan_side(
             order_id: supported_native_replace_order_id(&vstate.id, cur)
                 .unwrap_or_else(|| cur.order_id.clone()),
             client_order_id,
-            phase51_target_key: None,
+            phase51_target_key: desired
+                .canonical_target_identity
+                .as_ref()
+                .map(|identity| identity.to_phase51_target_key()),
         }));
     }
 }
@@ -1400,19 +1406,21 @@ mod tests {
     }
 
     #[test]
-    fn plan_mm_order_actions_place_keeps_phase51_target_key_none_when_quote_identity_present() {
+    fn plan_mm_order_actions_place_converts_quote_identity_to_phase51_target_key() {
         let cfg = Config::default();
         let state = mk_state_with_quote(&cfg);
-        let identity =
-            crate::types::CanonicalTargetIdentity::from_explicit("canonical-group", "order-key")
-                .expect("complete identity");
+        let identity = crate::types::CanonicalTargetIdentity::from_explicit(
+            "canonical-group-place",
+            "order-key-place",
+        )
+        .expect("complete identity");
         let quotes = vec![MmQuote {
             venue_index: 0,
             venue_id: "test".into(),
             bid: Some(MmLevel {
                 price: 299.0,
                 size: 1.0,
-                canonical_target_identity: Some(identity),
+                canonical_target_identity: Some(identity.clone()),
             }),
             ask: None,
             generated_spread_cap_applied: false,
@@ -1427,26 +1435,74 @@ mod tests {
 
         assert_eq!(plan.intents.len(), 1);
         match &plan.intents[0] {
-            OrderIntent::Place(place) => assert!(place.phase51_target_key.is_none()),
+            OrderIntent::Place(place) => {
+                assert!(place.client_order_id.is_some());
+                assert_eq!(
+                    place.phase51_target_key,
+                    Some(identity.to_phase51_target_key())
+                );
+                assert_ne!(
+                    place
+                        .phase51_target_key
+                        .as_ref()
+                        .map(|key| key.order_key.as_str()),
+                    place.client_order_id.as_deref()
+                );
+            }
             other => panic!("expected place, got {other:?}"),
         }
     }
 
     #[test]
-    fn plan_mm_order_actions_replace_keeps_phase51_target_key_none_when_quote_identity_present() {
+    fn plan_mm_order_actions_place_missing_identity_keeps_phase51_target_key_none() {
+        let cfg = Config::default();
+        let state = mk_state_with_quote(&cfg);
+        let quotes = vec![MmQuote {
+            venue_index: 0,
+            venue_id: "target-looking-venue".into(),
+            bid: Some(MmLevel {
+                price: 299.0,
+                size: 1.0,
+                canonical_target_identity: None,
+            }),
+            ask: None,
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "canonical-group-looking-reason",
+            ask_terminal_reason: "order-key-looking-reason",
+        }];
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, 1_000, &mut gen);
+
+        assert_eq!(plan.intents.len(), 1);
+        match &plan.intents[0] {
+            OrderIntent::Place(place) => {
+                assert!(place.client_order_id.is_some());
+                assert!(place.phase51_target_key.is_none());
+            }
+            other => panic!("expected place, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_mm_order_actions_replace_converts_quote_identity_to_phase51_target_key() {
         let cfg = Config::default();
         let mut state = mk_state_with_quote(&cfg);
         let now_ms = 10_000;
-        let identity =
-            crate::types::CanonicalTargetIdentity::from_explicit("canonical-group", "order-key")
-                .expect("complete identity");
+        let identity = crate::types::CanonicalTargetIdentity::from_explicit(
+            "canonical-group-replace",
+            "order-key-replace",
+        )
+        .expect("complete identity");
 
         state.venues[0].mm_open_bid = Some(MmOpenOrder {
             price: 299.0,
             size: 1.0,
             timestamp_ms: now_ms - (cfg.mm.min_quote_lifetime_ms + 1),
-            order_id: "co_1".to_string(),
-            client_order_id: None,
+            order_id: "runtime-order-id-looking".to_string(),
+            client_order_id: Some("runtime-client-id-looking".to_string()),
             tracking_source: crate::state::MmOpenTrackingSource::OpenSnapshot,
         });
 
@@ -1456,7 +1512,7 @@ mod tests {
             bid: Some(MmLevel {
                 price: 295.0,
                 size: 2.0,
-                canonical_target_identity: Some(identity),
+                canonical_target_identity: Some(identity.clone()),
             }),
             ask: None,
             generated_spread_cap_applied: false,
@@ -1471,7 +1527,71 @@ mod tests {
 
         assert_eq!(plan.intents.len(), 1);
         match &plan.intents[0] {
-            OrderIntent::Replace(replace) => assert!(replace.phase51_target_key.is_none()),
+            OrderIntent::Replace(replace) => {
+                assert!(replace.client_order_id.is_some());
+                assert_eq!(
+                    replace.phase51_target_key,
+                    Some(identity.to_phase51_target_key())
+                );
+                assert_ne!(
+                    replace
+                        .phase51_target_key
+                        .as_ref()
+                        .map(|key| key.order_key.as_str()),
+                    Some(replace.order_id.as_str())
+                );
+                assert_ne!(
+                    replace
+                        .phase51_target_key
+                        .as_ref()
+                        .map(|key| key.order_key.as_str()),
+                    replace.client_order_id.as_deref()
+                );
+            }
+            other => panic!("expected replace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_mm_order_actions_replace_missing_identity_keeps_phase51_target_key_none() {
+        let cfg = Config::default();
+        let mut state = mk_state_with_quote(&cfg);
+        let now_ms = 10_000;
+
+        state.venues[0].mm_open_bid = Some(MmOpenOrder {
+            price: 299.0,
+            size: 1.0,
+            timestamp_ms: now_ms - (cfg.mm.min_quote_lifetime_ms + 1),
+            order_id: "runtime-order-id-looking".to_string(),
+            client_order_id: Some("runtime-client-id-looking".to_string()),
+            tracking_source: crate::state::MmOpenTrackingSource::OpenSnapshot,
+        });
+
+        let quotes = vec![MmQuote {
+            venue_index: 0,
+            venue_id: "target-looking-venue".into(),
+            bid: Some(MmLevel {
+                price: 295.0,
+                size: 2.0,
+                canonical_target_identity: None,
+            }),
+            ask: None,
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "canonical-group-looking-reason",
+            ask_terminal_reason: "order-key-looking-reason",
+        }];
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
+
+        assert_eq!(plan.intents.len(), 1);
+        match &plan.intents[0] {
+            OrderIntent::Replace(replace) => {
+                assert!(replace.client_order_id.is_some());
+                assert!(replace.phase51_target_key.is_none());
+            }
             other => panic!("expected replace, got {other:?}"),
         }
     }

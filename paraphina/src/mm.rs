@@ -1778,7 +1778,10 @@ pub fn mm_quotes_to_order_intents_into(quotes: &[MmQuote], out: &mut Vec<OrderIn
                 post_only: true,
                 reduce_only: false,
                 client_order_id: None,
-                phase51_target_key: None,
+                phase51_target_key: bid
+                    .canonical_target_identity
+                    .as_ref()
+                    .map(|identity| identity.to_phase51_target_key()),
             }));
         }
 
@@ -1794,7 +1797,10 @@ pub fn mm_quotes_to_order_intents_into(quotes: &[MmQuote], out: &mut Vec<OrderIn
                 post_only: true,
                 reduce_only: false,
                 client_order_id: None,
-                phase51_target_key: None,
+                phase51_target_key: ask
+                    .canonical_target_identity
+                    .as_ref()
+                    .map(|identity| identity.to_phase51_target_key()),
             }));
         }
     }
@@ -4150,21 +4156,22 @@ mod tests {
     }
 
     #[test]
-    fn mm_quotes_to_order_intents_keeps_phase51_target_key_none_when_quote_identity_present() {
+    fn mm_quotes_to_order_intents_converts_canonical_target_identity_to_phase51_target_key() {
         let (cfg, _) = setup_test();
-        let identity = test_identity("canonical-group", "order-key");
+        let bid_identity = test_identity("canonical-group-bid", "order-key-bid");
+        let ask_identity = test_identity("canonical-group-ask", "order-key-ask");
         let quote = MmQuote {
             venue_index: 0,
             venue_id: cfg.venues[0].id_arc.clone(),
             bid: Some(MmLevel {
                 price: 299.0,
                 size: 1.0,
-                canonical_target_identity: Some(identity.clone()),
+                canonical_target_identity: Some(bid_identity.clone()),
             }),
             ask: Some(MmLevel {
                 price: 301.0,
                 size: 1.0,
-                canonical_target_identity: Some(identity),
+                canonical_target_identity: Some(ask_identity.clone()),
             }),
             generated_spread_cap_applied: false,
             generated_spread_cap_bid_suppressed: false,
@@ -4180,13 +4187,22 @@ mod tests {
         let mut saw_sell = false;
         for intent in &intents {
             match intent {
-                OrderIntent::Place(place) => {
-                    assert!(place.phase51_target_key.is_none());
-                    match place.side {
-                        Side::Buy => saw_buy = true,
-                        Side::Sell => saw_sell = true,
+                OrderIntent::Place(place) => match place.side {
+                    Side::Buy => {
+                        saw_buy = true;
+                        assert_eq!(
+                            place.phase51_target_key,
+                            Some(bid_identity.to_phase51_target_key())
+                        );
                     }
-                }
+                    Side::Sell => {
+                        saw_sell = true;
+                        assert_eq!(
+                            place.phase51_target_key,
+                            Some(ask_identity.to_phase51_target_key())
+                        );
+                    }
+                },
                 other => panic!("expected place intent, got {other:?}"),
             }
         }
@@ -4195,21 +4211,22 @@ mod tests {
     }
 
     #[test]
-    fn mm_quotes_to_order_intents_into_keeps_phase51_target_key_none_when_quote_identity_present() {
+    fn mm_quotes_to_order_intents_into_converts_canonical_target_identity_to_phase51_target_key() {
         let (cfg, _) = setup_test();
-        let identity = test_identity("canonical-group", "order-key");
+        let bid_identity = test_identity("canonical-group-bid", "order-key-bid");
+        let ask_identity = test_identity("canonical-group-ask", "order-key-ask");
         let quote = MmQuote {
             venue_index: 0,
             venue_id: cfg.venues[0].id_arc.clone(),
             bid: Some(MmLevel {
                 price: 299.0,
                 size: 1.0,
-                canonical_target_identity: Some(identity.clone()),
+                canonical_target_identity: Some(bid_identity.clone()),
             }),
             ask: Some(MmLevel {
                 price: 301.0,
                 size: 1.0,
-                canonical_target_identity: Some(identity),
+                canonical_target_identity: Some(ask_identity.clone()),
             }),
             generated_spread_cap_applied: false,
             generated_spread_cap_bid_suppressed: false,
@@ -4221,6 +4238,46 @@ mod tests {
 
         let mut intents = Vec::with_capacity(2);
         mm_quotes_to_order_intents_into(&[quote], &mut intents);
+        assert_eq!(intents.len(), 2);
+        for intent in &intents {
+            match intent {
+                OrderIntent::Place(place) if place.side == Side::Buy => assert_eq!(
+                    place.phase51_target_key,
+                    Some(bid_identity.to_phase51_target_key())
+                ),
+                OrderIntent::Place(place) if place.side == Side::Sell => assert_eq!(
+                    place.phase51_target_key,
+                    Some(ask_identity.to_phase51_target_key())
+                ),
+                other => panic!("unexpected intent: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mm_quotes_to_order_intents_leaves_phase51_target_key_none_without_quote_identity() {
+        let quote = MmQuote {
+            venue_index: 0,
+            venue_id: "target-looking-venue".into(),
+            bid: Some(MmLevel {
+                price: 299.0,
+                size: 1.0,
+                canonical_target_identity: None,
+            }),
+            ask: Some(MmLevel {
+                price: 301.0,
+                size: 1.0,
+                canonical_target_identity: None,
+            }),
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "canonical-group-looking-reason",
+            ask_terminal_reason: "order-key-looking-reason",
+        };
+
+        let intents = mm_quotes_to_order_intents(&[quote]);
         assert_eq!(intents.len(), 2);
         assert!(intents.iter().all(|intent| match intent {
             OrderIntent::Place(place) => place.phase51_target_key.is_none(),
