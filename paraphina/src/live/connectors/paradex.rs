@@ -928,7 +928,8 @@ use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
     LiquidationSnapshot, MarginSnapshot, MarketDataEvent, OpenOrderSnapshot, OrderSnapshot,
-    PositionSnapshot, TopOfBook,
+    Phase51ForwardRefreshNativeRole, Phase51ForwardRefreshSourceOwnerFill, PositionSnapshot,
+    TopOfBook,
 };
 use crate::live::{live_market_pub_drain_max, live_market_pub_queue_cap, MarketPublisher};
 use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
@@ -2157,13 +2158,19 @@ impl ParadexRestClient {
             .send(Message::Text(auth.to_string().into()))
             .await
             .map_err(|err| anyhow::anyhow!("Paradex private order WS auth send error: {err}"))?;
-        let channel = format!("orders.{}", self.cfg.market);
-        let subscribe = ParadexSubscribeCandidate::new(
+        let order_channel = format!("orders.{}", self.cfg.market);
+        let order_subscribe = ParadexSubscribeCandidate::new(
             "subscribe",
-            serde_json::json!({ "channel": channel.clone() }),
+            serde_json::json!({ "channel": order_channel.clone() }),
+        );
+        let fill_channel = format!("fills.{}", self.cfg.market);
+        let fill_subscribe = ParadexSubscribeCandidate::new(
+            "subscribe",
+            serde_json::json!({ "channel": fill_channel.clone() }),
         );
         let mut authenticated = false;
-        let mut subscribed = false;
+        let mut orders_subscribed = false;
+        let mut fills_subscribed = false;
         let mut seq_state = ParadexPrivateSeqState::default();
 
         loop {
@@ -2193,6 +2200,13 @@ impl ParadexRestClient {
             let value: Value = serde_json::from_str(&payload)
                 .map_err(|err| anyhow::anyhow!("Paradex private order WS parse error: {err}"))?;
             if let Some(error_message) = paradex_private_ws_error_message(&value) {
+                if value.get("id").and_then(|raw| raw.as_i64()) == Some(2) {
+                    eprintln!(
+                        "WARN: Paradex private fills WS subscribe failed; Phase 5.1 source-owner capture disabled for this session"
+                    );
+                    fills_subscribed = false;
+                    continue;
+                }
                 if paradex_private_ws_error_requires_token_refresh(&value) {
                     self.invalidate_cached_token().await;
                 }
@@ -2203,25 +2217,45 @@ impl ParadexRestClient {
                     && value.get("result").is_some()
                 {
                     authenticated = true;
-                    send_paradex_subscribe(&mut write, &subscribe).await?;
+                    send_paradex_subscribe_with_id(&mut write, &order_subscribe, 1).await?;
+                    send_paradex_subscribe_with_id(&mut write, &fill_subscribe, 2).await?;
                 }
                 continue;
             }
-            if !subscribed {
-                if value.get("id").and_then(|raw| raw.as_i64()) == Some(1)
-                    && value.get("result").is_some()
+            if value.get("result").is_some() {
+                match value.get("id").and_then(|raw| raw.as_i64()) {
+                    Some(1) => orders_subscribed = true,
+                    Some(2) => fills_subscribed = true,
+                    _ => {}
+                }
+                continue;
+            }
+            if fills_subscribed {
+                for source_owner_fill in
+                    phase51_paradex_source_owner_fills_from_subscription_message(
+                        &value,
+                        order_state.snapshot.venue_index,
+                        &order_state.snapshot.venue_id,
+                        &self.cfg.market,
+                    )
                 {
-                    subscribed = true;
+                    exec_tx
+                        .send(ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+                            source_owner_fill,
+                        ))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("paradex exec_tx closed"))?;
                 }
-                continue;
             }
-            if let Some(snapshot) =
-                order_state.apply_subscription_message(&value, &mut seq_state, self)
-            {
-                exec_tx
-                    .send(ExecutionEvent::OrderSnapshot(snapshot))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("paradex exec_tx closed"))?;
+            if orders_subscribed {
+                if let Some(snapshot) =
+                    order_state.apply_subscription_message(&value, &mut seq_state, self)
+                {
+                    exec_tx
+                        .send(ExecutionEvent::OrderSnapshot(snapshot))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("paradex exec_tx closed"))?;
+                }
             }
         }
 
@@ -3364,6 +3398,91 @@ impl ParadexPrivateOrderState {
         let _ = timestamp_ms;
         true
     }
+}
+
+fn phase51_paradex_source_owner_fills_from_subscription_message(
+    value: &Value,
+    venue_index: usize,
+    venue_id: &str,
+    market: &str,
+) -> Vec<Phase51ForwardRefreshSourceOwnerFill> {
+    let Some(payload) = value.get("params") else {
+        return Vec::new();
+    };
+    let Some(channel) = payload.get("channel").and_then(|raw| raw.as_str()) else {
+        return Vec::new();
+    };
+    if channel != format!("fills.{market}") {
+        return Vec::new();
+    }
+    let Some(data) = payload.get("data") else {
+        return Vec::new();
+    };
+    let fills: Vec<&Value> = match data.as_array() {
+        Some(items) => items.iter().collect(),
+        None => vec![data],
+    };
+    fills
+        .into_iter()
+        .enumerate()
+        .filter_map(|(fill_index, fill)| {
+            let fill_market =
+                parse_stringish_value(fill.get("market").or_else(|| fill.get("symbol")));
+            if fill_market.as_deref() != Some(market) {
+                return None;
+            }
+            let fill_type = parse_stringish_value(fill.get("fill_type"))?;
+            if !fill_type.trim().eq_ignore_ascii_case("FILL") {
+                return None;
+            }
+            let liquidity = parse_stringish_value(fill.get("liquidity"))?;
+            let normalized_liquidity = liquidity.trim().to_ascii_uppercase();
+            if normalized_liquidity != "MAKER" && normalized_liquidity != "TAKER" {
+                return None;
+            }
+            let size = fill.get("size").and_then(parse_f64)?;
+            if !size.is_finite() || size <= 0.0 {
+                return None;
+            }
+            let timestamp_ms = fill.get("created_at").and_then(parse_i64_value)?;
+            let order_id = parse_nonempty_stringish(
+                fill.get("order_id").or_else(|| fill.get("orderId")),
+            );
+            let client_order_id = parse_nonempty_stringish(
+                fill.get("client_id")
+                    .or_else(|| fill.get("client_order_id"))
+                    .or_else(|| fill.get("clientOrderId")),
+            );
+            if order_id.is_none() && client_order_id.is_none() {
+                return None;
+            }
+
+            Some(Phase51ForwardRefreshSourceOwnerFill::new(
+                venue_index,
+                venue_id,
+                phase51_paradex_source_owner_seq(timestamp_ms, fill_index),
+                timestamp_ms,
+                order_id,
+                client_order_id,
+                Some(Phase51ForwardRefreshNativeRole::Paradex {
+                    liquidity: normalized_liquidity,
+                }),
+            ))
+        })
+        .collect()
+}
+
+fn phase51_paradex_source_owner_seq(timestamp_ms: TimestampMs, fill_index: usize) -> u64 {
+    (timestamp_ms.max(0) as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(fill_index as u64)
+}
+
+fn parse_nonempty_stringish(value: Option<&Value>) -> Option<String> {
+    parse_stringish_value(value).and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 fn paradex_private_ws_error_message(value: &Value) -> Option<String> {
@@ -7289,6 +7408,178 @@ mod tests {
             .expect("closed snapshot");
         assert_eq!(snapshot.seq, 12);
         assert!(snapshot.open_orders.is_empty());
+    }
+
+    #[test]
+    fn private_fill_messages_exact_liquidity_create_source_owner_fills() {
+        let message = serde_json::json!({
+            "params": {
+                "channel": "fills.ETH-USD-PERP",
+                "data": [
+                    {
+                        "market": "ETH-USD-PERP",
+                        "fill_type": "FILL",
+                        "liquidity": "MAKER",
+                        "size": "0.01",
+                        "created_at": 1_700_000_000_333i64,
+                        "order_id": "pdx_order_1",
+                        "client_id": "co_pdx_1"
+                    },
+                    {
+                        "market": "ETH-USD-PERP",
+                        "fill_type": "FILL",
+                        "liquidity": "taker",
+                        "size": "0.02",
+                        "created_at": 1_700_000_000_333i64,
+                        "orderId": "pdx_order_2",
+                        "clientOrderId": "co_pdx_2"
+                    }
+                ]
+            }
+        });
+
+        let fills = phase51_paradex_source_owner_fills_from_subscription_message(
+            &message,
+            4,
+            "paradex",
+            "ETH-USD-PERP",
+        );
+
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].venue_id, "paradex");
+        assert_eq!(fills[0].order_id(), Some("pdx_order_1"));
+        assert_eq!(fills[0].client_order_id(), Some("co_pdx_1"));
+        assert_eq!(fills[0].seq, 1_700_000_000_333_000_000);
+        assert_eq!(fills[0].timestamp_ms, 1_700_000_000_333i64);
+        assert_eq!(fills[0].phase51_lighter_native_limit, None);
+        assert_eq!(
+            fills[0].phase51_native_role,
+            Some(Phase51ForwardRefreshNativeRole::Paradex {
+                liquidity: "MAKER".to_string()
+            })
+        );
+        assert_eq!(fills[1].order_id(), Some("pdx_order_2"));
+        assert_eq!(fills[1].client_order_id(), Some("co_pdx_2"));
+        assert_eq!(fills[1].seq, 1_700_000_000_333_000_001);
+        assert_eq!(
+            fills[1].phase51_native_role,
+            Some(Phase51ForwardRefreshNativeRole::Paradex {
+                liquidity: "TAKER".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn private_fill_message_missing_or_invalid_liquidity_creates_no_source_owner_fill() {
+        for fill in [
+            serde_json::json!({
+                "market": "ETH-USD-PERP",
+                "fill_type": "FILL",
+                "size": "0.01",
+                "created_at": 1_700_000_000_333i64,
+                "order_id": "pdx_order_1"
+            }),
+            serde_json::json!({
+                "market": "ETH-USD-PERP",
+                "fill_type": "FILL",
+                "liquidity": "UNKNOWN",
+                "size": "0.01",
+                "created_at": 1_700_000_000_333i64,
+                "order_id": "pdx_order_1"
+            }),
+        ] {
+            let message = serde_json::json!({
+                "params": {
+                    "channel": "fills.ETH-USD-PERP",
+                    "data": fill
+                }
+            });
+
+            assert!(phase51_paradex_source_owner_fills_from_subscription_message(
+                &message,
+                4,
+                "paradex",
+                "ETH-USD-PERP",
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn private_fill_message_wrong_market_non_fill_or_without_handle_creates_no_source_owner_fill() {
+        for fill in [
+            serde_json::json!({
+                "market": "BTC-USD-PERP",
+                "fill_type": "FILL",
+                "liquidity": "MAKER",
+                "size": "0.01",
+                "created_at": 1_700_000_000_333i64,
+                "order_id": "pdx_order_1"
+            }),
+            serde_json::json!({
+                "market": "ETH-USD-PERP",
+                "fill_type": "LIQUIDATION",
+                "liquidity": "MAKER",
+                "size": "0.01",
+                "created_at": 1_700_000_000_333i64,
+                "order_id": "pdx_order_1"
+            }),
+            serde_json::json!({
+                "market": "ETH-USD-PERP",
+                "fill_type": "FILL",
+                "liquidity": "MAKER",
+                "size": "0",
+                "created_at": 1_700_000_000_333i64,
+                "order_id": "pdx_order_1"
+            }),
+            serde_json::json!({
+                "market": "ETH-USD-PERP",
+                "fill_type": "FILL",
+                "liquidity": "MAKER",
+                "size": "0.01",
+                "created_at": 1_700_000_000_333i64,
+                "id": "fill_id_not_order_id"
+            }),
+        ] {
+            let message = serde_json::json!({
+                "params": {
+                    "channel": "fills.ETH-USD-PERP",
+                    "data": fill
+                }
+            });
+
+            assert!(phase51_paradex_source_owner_fills_from_subscription_message(
+                &message,
+                4,
+                "paradex",
+                "ETH-USD-PERP",
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn private_order_messages_do_not_create_source_owner_fills() {
+        let message = serde_json::json!({
+            "params": {
+                "channel": "orders.ETH-USD-PERP",
+                "data": {
+                    "market": "ETH-USD-PERP",
+                    "status": "FILLED",
+                    "id": "pdx_order_1",
+                    "client_id": "co_pdx_1",
+                    "liquidity": "MAKER"
+                }
+            }
+        });
+
+        assert!(phase51_paradex_source_owner_fills_from_subscription_message(
+            &message,
+            4,
+            "paradex",
+            "ETH-USD-PERP",
+        )
+        .is_empty());
     }
 
     #[test]
