@@ -245,7 +245,8 @@ use super::super::gateway::{
 use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
-    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, PositionSnapshot, TopOfBook,
+    LiquidationSnapshot, MarginSnapshot, MarketDataEvent, Phase51ForwardRefreshNativeRole,
+    PositionSnapshot, TopOfBook,
 };
 use super::lighter_nonce::{load_last_nonce, store_last_nonce, LighterNonceManager};
 use super::lighter_signer::{
@@ -3177,6 +3178,158 @@ mod tests {
                 assert!((fill.size - 0.01).abs() < 1e-9);
                 assert_eq!(fill.purpose, OrderPurpose::Mm);
                 assert!((fill.fee_bps - 1.5).abs() < 1e-9);
+                assert!(fill.phase51_native_role.is_none());
+                assert!(fill.phase51_lighter_native_limit.is_none());
+            }
+            other => panic!("expected fill event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lighter_private_fill_complete_native_role_fields_populate_phase51_native_role() {
+        for is_maker_ask in [true, false] {
+            let text = serde_json::json!({
+                "type": "fill",
+                "seq": 47,
+                "ts": 1_700_000_123_459i64,
+                "order_id": "oid-native",
+                "client_order_id": "coid-native",
+                "fill_id": "fill-native",
+                "side": "sell",
+                "price": 2081.57,
+                "size": 0.01,
+                "purpose": "Mm",
+                "fee_bps": 1.5,
+                "account_index": 123_i64,
+                "is_maker_ask": is_maker_ask,
+                "ask_account_id": 456_i64,
+                "bid_account_id": 789_i64
+            })
+            .to_string();
+            let event = translate_private_event(&text, 3, "lighter").expect("fill");
+            match event {
+                ExecutionEvent::Filled(fill) => {
+                    assert_eq!(
+                        fill.phase51_native_role,
+                        Some(Phase51ForwardRefreshNativeRole::Lighter {
+                            account_index: 123,
+                            is_maker_ask,
+                            ask_account_id: 456,
+                            bid_account_id: 789,
+                        })
+                    );
+                    assert!(fill.phase51_lighter_native_limit.is_none());
+                }
+                other => panic!("expected fill event, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lighter_private_fill_incomplete_native_role_fields_leave_none() {
+        for missing_field in [
+            "account_index",
+            "is_maker_ask",
+            "ask_account_id",
+            "bid_account_id",
+        ] {
+            let mut payload = serde_json::json!({
+                "type": "fill",
+                "seq": 48,
+                "ts": 1_700_000_123_460i64,
+                "order_id": "oid-incomplete",
+                "client_order_id": "coid-incomplete",
+                "fill_id": "fill-incomplete",
+                "side": "sell",
+                "price": 2081.57,
+                "size": 0.01,
+                "purpose": "Mm",
+                "account_index": 123_i64,
+                "is_maker_ask": true,
+                "ask_account_id": 456_i64,
+                "bid_account_id": 789_i64
+            });
+            payload
+                .as_object_mut()
+                .expect("object")
+                .remove(missing_field);
+
+            let event = translate_private_event(&payload.to_string(), 3, "lighter").expect("fill");
+            match event {
+                ExecutionEvent::Filled(fill) => {
+                    assert!(fill.phase51_native_role.is_none());
+                    assert!(fill.phase51_lighter_native_limit.is_none());
+                }
+                other => panic!("expected fill event, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lighter_private_fill_non_exact_native_role_types_leave_none() {
+        for (field, value) in [
+            ("account_index", serde_json::json!("123")),
+            ("account_index", serde_json::json!(123.5)),
+            ("is_maker_ask", serde_json::json!("true")),
+            ("ask_account_id", serde_json::json!("456")),
+            ("ask_account_id", serde_json::json!(456.5)),
+            ("bid_account_id", serde_json::json!("789")),
+            ("bid_account_id", serde_json::json!(789.5)),
+            ("is_maker_ask", serde_json::json!(1)),
+        ] {
+            let mut payload = serde_json::json!({
+                "type": "fill",
+                "seq": 49,
+                "ts": 1_700_000_123_461i64,
+                "order_id": "oid-non-exact",
+                "client_order_id": "coid-non-exact",
+                "fill_id": "fill-non-exact",
+                "side": "sell",
+                "price": 2081.57,
+                "size": 0.01,
+                "purpose": "Mm",
+                "account_index": 123_i64,
+                "is_maker_ask": true,
+                "ask_account_id": 456_i64,
+                "bid_account_id": 789_i64
+            });
+            payload
+                .as_object_mut()
+                .expect("object")
+                .insert(field.to_string(), value);
+
+            let event = translate_private_event(&payload.to_string(), 3, "lighter").expect("fill");
+            match event {
+                ExecutionEvent::Filled(fill) => {
+                    assert!(fill.phase51_native_role.is_none());
+                    assert!(fill.phase51_lighter_native_limit.is_none());
+                }
+                other => panic!("expected fill event, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lighter_private_fill_order_fields_do_not_create_native_role() {
+        let text = serde_json::json!({
+            "type": "fill",
+            "seq": 50,
+            "ts": 1_700_000_123_462i64,
+            "order_id": "maker-looking-order",
+            "client_order_id": "coid-maker-looking",
+            "fill_id": "fill-maker-looking",
+            "side": "sell",
+            "price": 2081.57,
+            "size": 0.01,
+            "purpose": "Mm",
+            "fee_bps": -1.0
+        })
+        .to_string();
+        let event = translate_private_event(&text, 3, "lighter").expect("fill");
+        match event {
+            ExecutionEvent::Filled(fill) => {
+                assert!(fill.phase51_native_role.is_none());
+                assert!(fill.phase51_lighter_native_limit.is_none());
             }
             other => panic!("expected fill event, got {other:?}"),
         }
@@ -4490,34 +4643,48 @@ pub fn translate_private_event(
                 order_id: value.get("order_id")?.as_str()?.to_string(),
             },
         )),
-        "fill" => Some(ExecutionEvent::Filled(super::super::types::Fill {
-            venue_index,
-            venue_id,
-            seq,
-            timestamp_ms,
-            order_id: value
-                .get("order_id")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string()),
-            client_order_id: value
-                .get("client_order_id")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string()),
-            fill_id: value
-                .get("fill_id")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string()),
-            phase51_target_key: None,
-            phase51_native_role: None,
-            phase51_lighter_native_limit: None,
-            side: parse_side(value.get("side")?)?,
-            price: value.get("price")?.as_f64()?,
-            size: value.get("size")?.as_f64()?,
-            purpose: parse_purpose(value.get("purpose"))?,
-            fee_bps: value.get("fee_bps").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        })),
+        "fill" => {
+            let phase51_native_role = phase51_lighter_native_role_from_fill(&value);
+            Some(ExecutionEvent::Filled(super::super::types::Fill {
+                venue_index,
+                venue_id,
+                seq,
+                timestamp_ms,
+                order_id: value
+                    .get("order_id")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                client_order_id: value
+                    .get("client_order_id")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                fill_id: value
+                    .get("fill_id")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string()),
+                phase51_target_key: None,
+                phase51_native_role,
+                phase51_lighter_native_limit: None,
+                side: parse_side(value.get("side")?)?,
+                price: value.get("price")?.as_f64()?,
+                size: value.get("size")?.as_f64()?,
+                purpose: parse_purpose(value.get("purpose"))?,
+                fee_bps: value.get("fee_bps").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            }))
+        }
         _ => None,
     }
+}
+
+fn phase51_lighter_native_role_from_fill(
+    value: &serde_json::Value,
+) -> Option<Phase51ForwardRefreshNativeRole> {
+    Some(Phase51ForwardRefreshNativeRole::Lighter {
+        account_index: value.get("account_index")?.as_i64()?,
+        is_maker_ask: value.get("is_maker_ask")?.as_bool()?,
+        ask_account_id: value.get("ask_account_id")?.as_i64()?,
+        bid_account_id: value.get("bid_account_id")?.as_i64()?,
+    })
 }
 
 fn parse_side(value: &serde_json::Value) -> Option<Side> {
