@@ -221,6 +221,14 @@ pub fn resolve_effective_profile(
     }
 }
 
+fn parse_bool_env(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VenueConfig {
     /// Stable identifier used in logs / routing (e.g. "extended").
@@ -1424,6 +1432,13 @@ impl Config {
     ///   - PARAPHINA_MAIN_LOOP_INTERVAL_MS  (i64, ms)
     ///   - PARAPHINA_HEDGE_LOOP_INTERVAL_MS (i64, ms)
     ///   - PARAPHINA_RISK_LOOP_INTERVAL_MS  (i64, ms)
+    ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED (bool)
+    ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH (string)
+    ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS (positive usize)
+    ///
+    /// Phase 5.1 forward-refresh capture intentionally has no env override for
+    /// allow_live or append_only; live/capital enablement and write mode must
+    /// stay fail-closed.
     ///
     /// Any variable that fails to parse is ignored with a warning.
     pub fn from_env_or_profile(profile: RiskProfile) -> Self {
@@ -2697,6 +2712,55 @@ impl Config {
             );
         }
 
+        if let Ok(raw) = env::var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED") {
+            match parse_bool_env(&raw) {
+                Some(enabled) => {
+                    cfg.phase51_forward_refresh_capture.enabled = enabled;
+                    eprintln!(
+                        "[config] PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED = {} (overrode default)",
+                        cfg.phase51_forward_refresh_capture.enabled
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED = {:?} as bool; using default {}",
+                        raw, cfg.phase51_forward_refresh_capture.enabled
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH") {
+            if raw.trim().is_empty() {
+                eprintln!(
+                    "[config] WARN: PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH was empty; using default"
+                );
+            } else {
+                cfg.phase51_forward_refresh_capture.output_path = raw.trim().to_string();
+                eprintln!(
+                    "[config] PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH set (overrode default)"
+                );
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS") {
+            match raw.parse::<usize>() {
+                Ok(max_rows) if max_rows > 0 => {
+                    cfg.phase51_forward_refresh_capture.max_rows = max_rows;
+                    eprintln!(
+                        "[config] PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS = {} (overrode default)",
+                        cfg.phase51_forward_refresh_capture.max_rows
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS = {:?} as positive usize; using default {}",
+                        raw, cfg.phase51_forward_refresh_capture.max_rows
+                    );
+                }
+            }
+        }
+
         cfg
     }
 
@@ -2769,6 +2833,126 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn phase51_forward_refresh_capture_env_defaults_disabled_and_fail_closed() {
+        use std::env;
+
+        const ENABLED_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED";
+        const OUTPUT_PATH_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH";
+        const MAX_ROWS_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS";
+        const ALLOW_LIVE_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ALLOW_LIVE";
+        const APPEND_ONLY_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_APPEND_ONLY";
+
+        let _lock = env_lock().lock().unwrap();
+        let _enabled = EnvGuard::new(ENABLED_KEY);
+        let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
+        let _max_rows = EnvGuard::new(MAX_ROWS_KEY);
+        let _allow_live = EnvGuard::new(ALLOW_LIVE_KEY);
+        let _append_only = EnvGuard::new(APPEND_ONLY_KEY);
+
+        for key in [
+            ENABLED_KEY,
+            OUTPUT_PATH_KEY,
+            MAX_ROWS_KEY,
+            ALLOW_LIVE_KEY,
+            APPEND_ONLY_KEY,
+        ] {
+            env::remove_var(key);
+        }
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(
+            cfg.phase51_forward_refresh_capture,
+            Phase51ForwardRefreshCaptureConfig::default()
+        );
+
+        env::set_var(ALLOW_LIVE_KEY, "true");
+        env::set_var(APPEND_ONLY_KEY, "false");
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert!(
+            !cfg.phase51_forward_refresh_capture.allow_live,
+            "Phase 5.1 capture allow_live must not be env-overridable"
+        );
+        assert!(
+            cfg.phase51_forward_refresh_capture.append_only,
+            "Phase 5.1 capture append_only must not be env-overridable"
+        );
+    }
+
+    #[test]
+    fn phase51_forward_refresh_capture_env_overrides_safe_observation_knobs_only() {
+        use std::env;
+
+        const ENABLED_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED";
+        const OUTPUT_PATH_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH";
+        const MAX_ROWS_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS";
+        const ALLOW_LIVE_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ALLOW_LIVE";
+        const APPEND_ONLY_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_APPEND_ONLY";
+
+        let _lock = env_lock().lock().unwrap();
+        let _enabled = EnvGuard::new(ENABLED_KEY);
+        let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
+        let _max_rows = EnvGuard::new(MAX_ROWS_KEY);
+        let _allow_live = EnvGuard::new(ALLOW_LIVE_KEY);
+        let _append_only = EnvGuard::new(APPEND_ONLY_KEY);
+
+        env::set_var(ENABLED_KEY, "true");
+        env::set_var(
+            OUTPUT_PATH_KEY,
+            "/tmp/paraphina_phase51_forward_refresh_test.jsonl",
+        );
+        env::set_var(APPEND_ONLY_KEY, "false");
+        env::set_var(MAX_ROWS_KEY, "17");
+        env::set_var(ALLOW_LIVE_KEY, "true");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert!(cfg.phase51_forward_refresh_capture.enabled);
+        assert_eq!(
+            cfg.phase51_forward_refresh_capture.output_path,
+            "/tmp/paraphina_phase51_forward_refresh_test.jsonl"
+        );
+        assert!(
+            cfg.phase51_forward_refresh_capture.append_only,
+            "Phase 5.1 capture append_only must stay true even if an env var is present"
+        );
+        assert_eq!(cfg.phase51_forward_refresh_capture.max_rows, 17);
+        assert!(
+            !cfg.phase51_forward_refresh_capture.allow_live,
+            "Phase 5.1 capture allow_live must stay false even if an env var is present"
+        );
+    }
+
+    #[test]
+    fn phase51_forward_refresh_capture_env_ignores_invalid_values() {
+        use std::env;
+
+        const ENABLED_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED";
+        const OUTPUT_PATH_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH";
+        const MAX_ROWS_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS";
+
+        let _lock = env_lock().lock().unwrap();
+        let _enabled = EnvGuard::new(ENABLED_KEY);
+        let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
+        let _max_rows = EnvGuard::new(MAX_ROWS_KEY);
+
+        env::set_var(ENABLED_KEY, "maybe");
+        env::set_var(OUTPUT_PATH_KEY, "   ");
+        env::set_var(MAX_ROWS_KEY, "0");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(
+            cfg.phase51_forward_refresh_capture,
+            Phase51ForwardRefreshCaptureConfig::default()
+        );
+
+        env::set_var(MAX_ROWS_KEY, "not_a_number");
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(
+            cfg.phase51_forward_refresh_capture,
+            Phase51ForwardRefreshCaptureConfig::default()
+        );
     }
 
     /// Test that PARAPHINA_HL_STATE_STALE_MS_OVERRIDE sets hyperliquid's

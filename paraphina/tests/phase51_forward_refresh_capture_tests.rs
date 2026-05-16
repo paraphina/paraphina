@@ -110,6 +110,13 @@ fn fail_closed_for_allow_live_or_live_execution_mode() {
     let output = dir.path().join("forward_refresh.remaining.jsonl");
 
     let mut cfg = enabled_config(&output);
+    cfg.enabled = false;
+    cfg.allow_live = true;
+    let err = Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Shadow)
+        .unwrap_err();
+    assert!(err.to_string().contains("allow_live=true"));
+
+    let mut cfg = enabled_config(&output);
     cfg.allow_live = true;
     let err = Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Shadow)
         .unwrap_err();
@@ -120,6 +127,90 @@ fn fail_closed_for_allow_live_or_live_execution_mode() {
     let err = Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Live)
         .unwrap_err();
     assert!(err.to_string().contains("non-live/shadow-safe"));
+}
+
+#[test]
+fn fail_closed_for_canary_and_unknown_execution_modes() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+
+    for mode in [
+        Phase51CaptureExecutionMode::Canary,
+        Phase51CaptureExecutionMode::Unknown("production".to_string()),
+    ] {
+        let err =
+            Phase51ForwardRefreshCapture::from_config(&enabled_config(&output), mode).unwrap_err();
+        assert!(err.to_string().contains("non-live/shadow-safe"));
+    }
+}
+
+#[test]
+fn fail_closed_for_non_append_only_enabled_capture() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+
+    let mut cfg = enabled_config(&output);
+    cfg.append_only = false;
+    let err = Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Shadow)
+        .unwrap_err();
+    assert!(err.to_string().contains("append_only=true"));
+}
+
+#[test]
+fn fail_closed_for_env_like_output_path() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("unsafe.env");
+
+    let err = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains(".env"));
+}
+
+#[test]
+fn existing_output_over_max_rows_fails_closed() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    fs::write(&output, "{}\n{}\n").unwrap();
+
+    let mut cfg = enabled_config(&output);
+    cfg.max_rows = 1;
+    let err = Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Shadow)
+        .unwrap_err();
+    assert!(err.to_string().contains("already exceeds max_rows"));
+}
+
+#[test]
+fn max_rows_limit_rejects_writes_at_limit() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut cfg = enabled_config(&output);
+    cfg.max_rows = 1;
+    let target = Phase51CaptureTargetKey::new("cg-max-rows", "ok-max-rows");
+    let mut capture =
+        Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Shadow)
+            .unwrap();
+
+    capture
+        .capture_native_role(
+            Some(&target),
+            "hyperliquid",
+            Some(Phase51VenueNativeRole::Hyperliquid { crossed: true }),
+        )
+        .unwrap()
+        .unwrap();
+    let err = capture
+        .capture_native_role(
+            Some(&target),
+            "hyperliquid",
+            Some(Phase51VenueNativeRole::Hyperliquid { crossed: false }),
+        )
+        .unwrap_err();
+
+    assert!(err.to_string().contains("max_rows reached"));
+    assert_eq!(read_rows(&output).len(), 1);
 }
 
 #[test]
