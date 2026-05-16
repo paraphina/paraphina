@@ -9,7 +9,8 @@ use crate::config::Phase51ForwardRefreshCaptureConfig;
 
 use super::types::{
     Fill, Phase51ForwardRefreshCaptureAudit, Phase51ForwardRefreshLighterNativeLimit,
-    Phase51ForwardRefreshNativeRole, Phase51ForwardRefreshTargetKey,
+    Phase51ForwardRefreshNativeRole, Phase51ForwardRefreshSourceOwnerFill,
+    Phase51ForwardRefreshTargetKey,
 };
 
 const FORBIDDEN_FIELD_NAMES: &[&str] = &[
@@ -436,6 +437,58 @@ impl Phase51ForwardRefreshCapture {
         Ok(audit)
     }
 
+    pub fn capture_source_owner_fill(
+        &mut self,
+        fill: &Phase51ForwardRefreshSourceOwnerFill,
+    ) -> Phase51CaptureResult<Phase51ForwardRefreshCaptureAudit> {
+        let mut audit = phase51_capture_audit_from_source_owner_fill(self.config.enabled, fill);
+        if !self.config.enabled {
+            return Ok(audit);
+        }
+
+        let Some(runtime_target_key) = fill.phase51_target_key.as_ref() else {
+            return Ok(audit);
+        };
+        let target_key = target_key_from_runtime(runtime_target_key);
+        if !target_key.is_complete() {
+            return Ok(audit);
+        }
+        audit.canonical_group_id = Some(target_key.canonical_group_id.clone());
+        audit.order_key = Some(target_key.order_key.clone());
+
+        if let Some(runtime_native_role) = fill.phase51_native_role.as_ref() {
+            audit.native_role_source = Some(native_role_audit_source(runtime_native_role));
+            let emitted = self.capture_native_role(
+                Some(&target_key),
+                &fill.venue_id,
+                Some(native_role_from_runtime(runtime_native_role)),
+            )?;
+            if emitted.is_some() {
+                audit.target_type = Some("native_role".to_string());
+                audit.sanitized_row_emitted = true;
+            }
+        }
+
+        if let Some(runtime_lighter_pressure) = fill.phase51_lighter_native_limit.as_ref() {
+            audit.lighter_pressure_status = runtime_lighter_pressure
+                .native_limit_event_time_status
+                .clone();
+            let emitted = self.capture_lighter_native_limit(
+                Some(&target_key),
+                Some(lighter_pressure_from_runtime(runtime_lighter_pressure)),
+            )?;
+            if emitted.is_some() {
+                audit.target_type = Some(match audit.target_type.as_deref() {
+                    Some("native_role") => "native_role,lighter_native_limit".to_string(),
+                    _ => "lighter_native_limit".to_string(),
+                });
+                audit.sanitized_row_emitted = true;
+            }
+        }
+
+        Ok(audit)
+    }
+
     pub fn capture_native_role(
         &mut self,
         target_key: Option<&Phase51CaptureTargetKey>,
@@ -534,6 +587,32 @@ impl Phase51ForwardRefreshCapture {
 fn phase51_capture_audit_from_fill(
     enabled: bool,
     fill: &Fill,
+) -> Phase51ForwardRefreshCaptureAudit {
+    Phase51ForwardRefreshCaptureAudit {
+        enabled,
+        target_type: None,
+        venue_id: Some(canonical_venue_id(&fill.venue_id)),
+        canonical_group_id: None,
+        order_key: None,
+        native_role_source: fill
+            .phase51_native_role
+            .as_ref()
+            .map(native_role_audit_source),
+        lighter_pressure_status: fill
+            .phase51_lighter_native_limit
+            .as_ref()
+            .and_then(|pressure| pressure.native_limit_event_time_status.clone()),
+        sanitized_row_emitted: false,
+        no_live_flag: true,
+        approved_for_live: false,
+        approved_for_canary: false,
+        approved_for_capital_escalation: false,
+    }
+}
+
+fn phase51_capture_audit_from_source_owner_fill(
+    enabled: bool,
+    fill: &Phase51ForwardRefreshSourceOwnerFill,
 ) -> Phase51ForwardRefreshCaptureAudit {
     Phase51ForwardRefreshCaptureAudit {
         enabled,

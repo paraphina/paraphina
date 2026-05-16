@@ -13,6 +13,7 @@ use paraphina::live::phase51_target_key_registry::{
 };
 use paraphina::live::types::{
     ExecutionEvent, Fill, OrderAccepted, Phase51ForwardRefreshNativeRole,
+    Phase51ForwardRefreshSourceOwnerFill,
 };
 use paraphina::mm::{compute_mm_quotes_with_now_and_identity_authority, MmQuoteIdentityAllocator};
 use paraphina::order_management::plan_mm_order_actions;
@@ -23,6 +24,7 @@ use paraphina::types::{
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use serde_json::Value;
 use tempfile::tempdir;
 
 fn target_key(label: &str) -> Phase51ForwardRefreshTargetKey {
@@ -104,6 +106,24 @@ fn fill(client_order_id: Option<&str>, order_id: Option<&str>) -> Fill {
         purpose: OrderPurpose::Mm,
         fee_bps: 0.0,
     }
+}
+
+fn source_owner_fill(
+    client_order_id: Option<&str>,
+    order_id: Option<&str>,
+) -> Phase51ForwardRefreshSourceOwnerFill {
+    Phase51ForwardRefreshSourceOwnerFill::new(
+        0,
+        "aster",
+        3,
+        1_700_000_000_002,
+        order_id.map(str::to_string),
+        client_order_id.map(str::to_string),
+        Some(Phase51ForwardRefreshNativeRole::Aster {
+            maker: true,
+            last_filled_qty: "0.01".to_string(),
+        }),
+    )
 }
 
 fn enabled_capture_config(path: &std::path::Path) -> Phase51ForwardRefreshCaptureConfig {
@@ -424,6 +444,69 @@ fn allocator_keyed_mm_intent_registers_enriches_and_emits_sanitized_native_row()
     let raw_output = fs::read_to_string(&output).unwrap();
     assert!(!raw_output.contains(&client_order_id));
     assert!(!raw_output.contains("fill-handle"));
+}
+
+#[test]
+fn source_owner_fill_is_enriched_and_emits_sanitized_native_row() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_capture_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let intent = keyed_mm_place_intent();
+    let (client_order_id, target_key) = match &intent {
+        OrderIntent::Place(place) => (
+            place.client_order_id.clone().expect("client order handle"),
+            place.phase51_target_key.clone().expect("target key"),
+        ),
+        _ => panic!("expected keyed place"),
+    };
+    let mut registry = Phase51TargetKeyRegistry::default();
+    registry.commit_stage(Phase51TargetKeyRegistryStage::from_intents(&[intent]));
+
+    let mut native_fill = source_owner_fill(Some(&client_order_id), None);
+    assert!(registry.enrich_source_owner_fill(&mut native_fill));
+    assert_eq!(native_fill.phase51_target_key, Some(target_key.clone()));
+
+    let audit = capture.capture_source_owner_fill(&native_fill).unwrap();
+
+    assert!(audit.enabled);
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(
+        audit.canonical_group_id.as_deref(),
+        Some(target_key.canonical_group_id.as_str())
+    );
+    assert_eq!(
+        audit.order_key.as_deref(),
+        Some(target_key.order_key.as_str())
+    );
+    assert_eq!(capture.rows_written(), 1);
+
+    let raw_output = fs::read_to_string(&output).unwrap();
+    assert!(!raw_output.contains(&client_order_id));
+    assert!(!raw_output.contains("source-owner-order"));
+    let rows: Vec<Value> = raw_output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("target_type").and_then(Value::as_str),
+        Some("native_role")
+    );
+    assert_eq!(
+        rows[0].get("venue_id").and_then(Value::as_str),
+        Some("aster")
+    );
+    assert_eq!(
+        rows[0].get("e").and_then(Value::as_str),
+        Some("ORDER_TRADE_UPDATE")
+    );
+    assert_eq!(rows[0].get("m").and_then(Value::as_bool), Some(true));
+    assert_eq!(rows[0].get("l").and_then(Value::as_str), Some("0.01"));
 }
 
 #[test]

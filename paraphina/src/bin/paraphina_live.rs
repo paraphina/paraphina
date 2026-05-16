@@ -1408,6 +1408,11 @@ fn rewrite_execution_event(
             fill.venue_index = venue_index;
             paraphina::live::types::ExecutionEvent::Filled(fill)
         }
+        paraphina::live::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(mut fill) => {
+            fill.venue_id = venue_id.to_string();
+            fill.venue_index = venue_index;
+            paraphina::live::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill)
+        }
         paraphina::live::types::ExecutionEvent::CancelAccepted(mut ack) => {
             ack.venue_id = venue_id.to_string();
             ack.venue_index = venue_index;
@@ -4812,8 +4817,8 @@ mod tests {
     };
     use paraphina::live::venues::ROADMAP_B_VENUES;
     use paraphina::types::{
-        CancelAllOrderIntent, CancelOrderIntent, OrderIntent, OrderPurpose, PlaceOrderIntent,
-        Phase51ForwardRefreshTargetKey, ReplaceOrderIntent, Side, TimeInForce,
+        CancelAllOrderIntent, CancelOrderIntent, OrderIntent, OrderPurpose,
+        Phase51ForwardRefreshTargetKey, PlaceOrderIntent, ReplaceOrderIntent, Side, TimeInForce,
     };
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex, OnceLock};

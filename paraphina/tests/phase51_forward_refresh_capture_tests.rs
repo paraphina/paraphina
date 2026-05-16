@@ -9,7 +9,7 @@ use paraphina::live::phase51_forward_refresh_capture::{
 };
 use paraphina::live::types::{
     Fill, Phase51ForwardRefreshLighterNativeLimit, Phase51ForwardRefreshNativeRole,
-    Phase51ForwardRefreshTargetKey,
+    Phase51ForwardRefreshSourceOwnerFill, Phase51ForwardRefreshTargetKey,
 };
 use paraphina::types::{OrderPurpose, Side};
 use serde_json::Value;
@@ -305,6 +305,125 @@ fn runtime_already_keyed_native_fill_emits_sanitized_row() {
     );
     assert_eq!(rows[0].get("isTaker").and_then(Value::as_bool), Some(true));
     assert_safe_flags(&rows[0]);
+}
+
+#[test]
+fn source_owner_fill_with_target_and_native_role_emits_sanitized_row() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let mut fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        2,
+        "aster",
+        99,
+        1_700_000_000_100,
+        Some("raw-order-id-source-owner".to_string()),
+        Some("raw-client-order-id-source-owner".to_string()),
+        Some(Phase51ForwardRefreshNativeRole::Aster {
+            maker: true,
+            last_filled_qty: "0.01".to_string(),
+        }),
+    );
+    fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+        canonical_group_id: "cg-source-owner".to_string(),
+        order_key: "ok-source-owner".to_string(),
+    });
+
+    let audit = capture.capture_source_owner_fill(&fill).unwrap();
+
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(audit.target_type.as_deref(), Some("native_role"));
+    assert_eq!(
+        audit.native_role_source.as_deref(),
+        Some("aster.ORDER_TRADE_UPDATE")
+    );
+
+    let raw_output = fs::read_to_string(&output).unwrap();
+    assert!(!raw_output.contains("raw-order-id-source-owner"));
+    assert!(!raw_output.contains("raw-client-order-id-source-owner"));
+    let rows = read_rows(&output);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("venue_id").and_then(Value::as_str),
+        Some("aster")
+    );
+    assert_eq!(
+        rows[0].get("e").and_then(Value::as_str),
+        Some("ORDER_TRADE_UPDATE")
+    );
+    assert_eq!(rows[0].get("m").and_then(Value::as_bool), Some(true));
+    assert_eq!(rows[0].get("l").and_then(Value::as_str), Some("0.01"));
+    assert_safe_flags(&rows[0]);
+}
+
+#[test]
+fn source_owner_fill_invalid_aster_last_qty_emits_no_row() {
+    for invalid_qty in ["", "0", "-0.01", "not-a-number"] {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("forward_refresh.remaining.jsonl");
+        let mut capture = Phase51ForwardRefreshCapture::from_config(
+            &enabled_config(&output),
+            Phase51CaptureExecutionMode::Shadow,
+        )
+        .unwrap();
+        let mut fill = Phase51ForwardRefreshSourceOwnerFill::new(
+            2,
+            "aster",
+            101,
+            1_700_000_000_300,
+            Some("raw-order-id-source-owner".to_string()),
+            Some("raw-client-order-id-source-owner".to_string()),
+            Some(Phase51ForwardRefreshNativeRole::Aster {
+                maker: true,
+                last_filled_qty: invalid_qty.to_string(),
+            }),
+        );
+        fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+            canonical_group_id: "cg-source-owner".to_string(),
+            order_key: "ok-source-owner".to_string(),
+        });
+
+        let audit = capture.capture_source_owner_fill(&fill).unwrap();
+
+        assert!(audit.enabled);
+        assert!(!audit.sanitized_row_emitted);
+        assert_eq!(capture.rows_written(), 0);
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn source_owner_fill_without_target_key_emits_no_row() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        2,
+        "aster",
+        100,
+        1_700_000_000_200,
+        Some("raw-order-id-source-owner".to_string()),
+        Some("raw-client-order-id-source-owner".to_string()),
+        Some(Phase51ForwardRefreshNativeRole::Aster {
+            maker: false,
+            last_filled_qty: "0.02".to_string(),
+        }),
+    );
+
+    let audit = capture.capture_source_owner_fill(&fill).unwrap();
+
+    assert!(audit.enabled);
+    assert!(!audit.sanitized_row_emitted);
+    assert_eq!(capture.rows_written(), 0);
+    assert!(!output.exists());
 }
 
 #[test]

@@ -78,4 +78,32 @@ mod tests {
         let expected = r#"{"OrderAccepted":{"venue_index":0,"venue_id":"venue_a","seq":99,"timestamp_ms":3000,"order_id":"order_1","client_order_id":"client_1","side":"Buy","price":100.0,"size":0.5,"purpose":"Mm"}}"#;
         assert_eq!(json, expected);
     }
+
+    #[test]
+    fn serialize_source_owner_fill_redacts_raw_handles() {
+        let event = ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+            Phase51ForwardRefreshSourceOwnerFill::new(
+                2,
+                "aster",
+                101,
+                4_000,
+                Some("raw-order-id".to_string()),
+                Some("raw-client-order-id".to_string()),
+                Some(Phase51ForwardRefreshNativeRole::Aster {
+                    maker: true,
+                    last_filled_qty: "0.01".to_string(),
+                }),
+            ),
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+
+        assert!(!json.contains("raw-order-id"));
+        assert!(!json.contains("raw-client-order-id"));
+        assert!(!format!("{event:?}").contains("raw-order-id"));
+        assert!(!format!("{event:?}").contains("raw-client-order-id"));
+        assert!(json.contains("Phase51ForwardRefreshSourceOwnerFill"));
+        assert!(json.contains("phase51_native_role"));
+        assert!(json.contains("Aster"));
+    }
 }

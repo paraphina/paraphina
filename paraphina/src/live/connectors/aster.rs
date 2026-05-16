@@ -29,7 +29,8 @@ use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
     LiquidationSnapshot, MarginSnapshot, MarketDataEvent, OpenOrderSnapshot, OrderSnapshot,
-    PositionSnapshot, TopOfBook,
+    Phase51ForwardRefreshNativeRole, Phase51ForwardRefreshSourceOwnerFill, PositionSnapshot,
+    TopOfBook,
 };
 use crate::live::{live_market_pub_drain_max, live_market_pub_queue_cap, MarketPublisher};
 use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
@@ -2248,6 +2249,23 @@ impl AsterRestClient {
                     .and_then(|raw| raw.as_i64())
                     .or_else(|| value.get("T").and_then(|raw| raw.as_i64()))
                     .unwrap_or((self.timestamp_fn)());
+                if let Some(source_owner_fill) =
+                    phase51_aster_source_owner_fill_from_order_trade_update(
+                        &value,
+                        self.cfg.venue_index,
+                        &self.cfg.venue_id,
+                        seq,
+                        timestamp_ms,
+                        &self.cfg.market,
+                    )
+                {
+                    exec_tx
+                        .send(ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+                            source_owner_fill,
+                        ))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("aster exec_tx closed"))?;
+                }
                 if let Some(snapshot) = order_state.apply_update(&value, seq, timestamp_ms) {
                     exec_tx
                         .send(ExecutionEvent::OrderSnapshot(snapshot))
@@ -2860,6 +2878,74 @@ impl AsterOrderState {
         self.snapshot.open_orders = self.open_orders.values().cloned().collect();
         Some(self.snapshot.clone())
     }
+}
+
+fn phase51_aster_source_owner_fill_from_order_trade_update(
+    value: &Value,
+    venue_index: usize,
+    venue_id: &str,
+    seq: u64,
+    timestamp_ms: TimestampMs,
+    market: &str,
+) -> Option<Phase51ForwardRefreshSourceOwnerFill> {
+    if value.get("e").and_then(|raw| raw.as_str()) != Some("ORDER_TRADE_UPDATE") {
+        return None;
+    }
+    let order = value.get("o")?;
+    let symbol = order.get("s").and_then(|raw| raw.as_str()).unwrap_or("");
+    if !symbol_matches(symbol, market) {
+        return None;
+    }
+    let maker = order.get("m")?.as_bool()?;
+    let last_filled_qty = order.get("l")?;
+    let last_filled_qty_value = parse_f64(last_filled_qty)?;
+    if !last_filled_qty_value.is_finite() || last_filled_qty_value <= 0.0 {
+        return None;
+    }
+    let last_filled_qty = match last_filled_qty {
+        Value::String(raw) if !raw.trim().is_empty() => raw.trim().to_string(),
+        Value::Number(raw) => raw.to_string(),
+        _ => return None,
+    };
+    let order_id = parse_aster_order_id(order);
+    let client_order_id = order
+        .get("c")
+        .and_then(|raw| raw.as_str())
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| raw.to_string());
+    if order_id.is_none() && client_order_id.is_none() {
+        return None;
+    }
+
+    Some(Phase51ForwardRefreshSourceOwnerFill::new(
+        venue_index,
+        venue_id,
+        seq,
+        timestamp_ms,
+        order_id,
+        client_order_id,
+        Some(Phase51ForwardRefreshNativeRole::Aster {
+            maker,
+            last_filled_qty,
+        }),
+    ))
+}
+
+fn parse_aster_order_id(order: &Value) -> Option<String> {
+    order
+        .get("i")
+        .and_then(|raw| raw.as_i64().map(|id| id.to_string()))
+        .or_else(|| {
+            order
+                .get("i")
+                .and_then(|raw| raw.as_u64().map(|id| id.to_string()))
+        })
+        .or_else(|| {
+            order
+                .get("i")
+                .and_then(|raw| raw.as_str().map(|id| id.to_string()))
+        })
+        .filter(|id| !id.trim().is_empty())
 }
 
 async fn fetch_public_funding(client: &Client, cfg: &AsterConfig) -> anyhow::Result<FundingUpdate> {
@@ -4531,6 +4617,135 @@ mod tests {
             .expect("snapshot after cancel");
         assert_eq!(after_cancel.open_orders.len(), 1);
         assert_eq!(after_cancel.open_orders[0].order_id, "77");
+    }
+
+    #[test]
+    fn order_trade_update_complete_native_role_fields_create_source_owner_fill() {
+        let update = serde_json::json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 2000,
+            "o": {
+                "s": "ETHUSDT",
+                "c": "co_1_v2_mm_2",
+                "S": "SELL",
+                "q": "0.05",
+                "p": "2105",
+                "X": "PARTIALLY_FILLED",
+                "i": 77,
+                "z": "0.01",
+                "m": true,
+                "l": "0.01"
+            }
+        });
+
+        let fill = phase51_aster_source_owner_fill_from_order_trade_update(
+            &update, 2, "aster", 9, 2000, "ETHUSDT",
+        )
+        .expect("source-owner fill");
+
+        assert_eq!(fill.venue_index, 2);
+        assert_eq!(fill.venue_id, "aster");
+        assert_eq!(fill.seq, 9);
+        assert_eq!(fill.timestamp_ms, 2000);
+        assert_eq!(fill.order_id(), Some("77"));
+        assert_eq!(fill.client_order_id(), Some("co_1_v2_mm_2"));
+        assert_eq!(
+            fill.phase51_native_role,
+            Some(Phase51ForwardRefreshNativeRole::Aster {
+                maker: true,
+                last_filled_qty: "0.01".to_string(),
+            })
+        );
+        assert!(fill.phase51_lighter_native_limit.is_none());
+    }
+
+    #[test]
+    fn order_trade_update_missing_or_non_exact_native_role_fields_create_no_source_owner_fill() {
+        let base = serde_json::json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 2000,
+            "o": {
+                "s": "ETHUSDT",
+                "c": "co_1_v2_mm_2",
+                "S": "SELL",
+                "q": "0.05",
+                "p": "2105",
+                "X": "PARTIALLY_FILLED",
+                "i": 77,
+                "z": "0.01",
+                "m": true,
+                "l": "0.01"
+            }
+        });
+        let cases = [
+            ("m", serde_json::Value::Null),
+            ("m", serde_json::json!("true")),
+            ("l", serde_json::Value::Null),
+            ("l", serde_json::json!("0")),
+            ("l", serde_json::json!("-0.01")),
+            ("l", serde_json::json!({ "qty": "0.01" })),
+        ];
+
+        for (field, value) in cases {
+            let mut payload = base.clone();
+            payload["o"][field] = value;
+            assert!(
+                phase51_aster_source_owner_fill_from_order_trade_update(
+                    &payload, 2, "aster", 9, 2000, "ETHUSDT",
+                )
+                .is_none(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_trade_update_for_other_market_or_without_handle_creates_no_source_owner_fill() {
+        let other_market = serde_json::json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 2000,
+            "o": {
+                "s": "BTCUSDT",
+                "c": "co_1_v2_mm_2",
+                "S": "SELL",
+                "q": "0.05",
+                "p": "2105",
+                "X": "PARTIALLY_FILLED",
+                "i": 77,
+                "z": "0.01",
+                "m": true,
+                "l": "0.01"
+            }
+        });
+        assert!(phase51_aster_source_owner_fill_from_order_trade_update(
+            &other_market,
+            2,
+            "aster",
+            9,
+            2000,
+            "ETHUSDT",
+        )
+        .is_none());
+
+        let no_handle = serde_json::json!({
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 2000,
+            "o": {
+                "s": "ETHUSDT",
+                "c": "",
+                "S": "SELL",
+                "q": "0.05",
+                "p": "2105",
+                "X": "PARTIALLY_FILLED",
+                "z": "0.01",
+                "m": true,
+                "l": "0.01"
+            }
+        });
+        assert!(phase51_aster_source_owner_fill_from_order_trade_update(
+            &no_handle, 2, "aster", 9, 2000, "ETHUSDT",
+        )
+        .is_none());
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! Live trading event types (feature-gated).
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 pub use crate::types::Phase51ForwardRefreshTargetKey;
@@ -194,6 +196,82 @@ pub enum Phase51ForwardRefreshNativeRole {
     },
 }
 
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Phase51ForwardRefreshSourceOwnerFill {
+    pub venue_index: usize,
+    pub venue_id: String,
+    pub seq: u64,
+    pub timestamp_ms: TimestampMs,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    order_id: Option<String>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    client_order_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase51_target_key: Option<Phase51ForwardRefreshTargetKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase51_native_role: Option<Phase51ForwardRefreshNativeRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase51_lighter_native_limit: Option<Phase51ForwardRefreshLighterNativeLimit>,
+}
+
+impl Phase51ForwardRefreshSourceOwnerFill {
+    pub fn new(
+        venue_index: usize,
+        venue_id: impl Into<String>,
+        seq: u64,
+        timestamp_ms: TimestampMs,
+        order_id: Option<String>,
+        client_order_id: Option<String>,
+        phase51_native_role: Option<Phase51ForwardRefreshNativeRole>,
+    ) -> Self {
+        Self {
+            venue_index,
+            venue_id: venue_id.into(),
+            seq,
+            timestamp_ms,
+            order_id,
+            client_order_id,
+            phase51_target_key: None,
+            phase51_native_role,
+            phase51_lighter_native_limit: None,
+        }
+    }
+
+    pub fn order_id(&self) -> Option<&str> {
+        self.order_id.as_deref()
+    }
+
+    pub fn client_order_id(&self) -> Option<&str> {
+        self.client_order_id.as_deref()
+    }
+
+    pub fn set_phase51_target_key(&mut self, target_key: Phase51ForwardRefreshTargetKey) {
+        self.phase51_target_key = Some(target_key);
+    }
+}
+
+impl fmt::Debug for Phase51ForwardRefreshSourceOwnerFill {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Phase51ForwardRefreshSourceOwnerFill")
+            .field("venue_index", &self.venue_index)
+            .field("venue_id", &self.venue_id)
+            .field("seq", &self.seq)
+            .field("timestamp_ms", &self.timestamp_ms)
+            .field("order_id", &self.order_id.as_ref().map(|_| "<redacted>"))
+            .field(
+                "client_order_id",
+                &self.client_order_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("phase51_target_key", &self.phase51_target_key)
+            .field("phase51_native_role", &self.phase51_native_role)
+            .field(
+                "phase51_lighter_native_limit",
+                &self.phase51_lighter_native_limit,
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Phase51ForwardRefreshLighterNativeLimit {
     pub active_order_headroom_account: Option<i64>,
@@ -289,6 +367,7 @@ pub enum ExecutionEvent {
     OrderAccepted(OrderAccepted),
     OrderRejected(OrderRejected),
     Filled(Fill),
+    Phase51ForwardRefreshSourceOwnerFill(Phase51ForwardRefreshSourceOwnerFill),
     CancelAccepted(CancelAccepted),
     CancelRejected(CancelRejected),
     CancelAllAccepted(CancelAllAccepted),

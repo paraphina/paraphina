@@ -1706,6 +1706,12 @@ fn execution_event_key(event: &super::types::ExecutionEvent) -> Option<String> {
                 ))
             }
         }
+        super::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill) => {
+            Some(format!(
+                "phase51_source_owner_fill:venue:{}:seq:{}",
+                fill.venue_index, fill.seq
+            ))
+        }
         super::types::ExecutionEvent::CancelAllAccepted(ack) => Some(format!(
             "cancel_all:venue:{}:seq:{}",
             ack.venue_index, ack.seq
@@ -2521,6 +2527,9 @@ fn ordered_event_for_execution(event: super::types::ExecutionEvent) -> Option<Or
             (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
         super::types::ExecutionEvent::Filled(e) => {
+            (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
+        }
+        super::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(e) => {
             (e.venue_index, e.venue_id.clone(), e.seq, e.timestamp_ms)
         }
         super::types::ExecutionEvent::CancelAccepted(e) => {
@@ -3641,12 +3650,19 @@ pub async fn run_live_loop(
                     } else {
                         #[cfg(feature = "event_log")]
                         if let Some(writer) = event_log.as_mut() {
-                            writer.log_event(&EventLogRecord {
-                                tick,
-                                now_ms,
-                                phase: "execution".to_string(),
-                                event: EventLogPayload::LiveExecution(event.clone()),
-                            });
+                            if !matches!(
+                                event,
+                                super::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+                                    _
+                                )
+                            ) {
+                                writer.log_event(&EventLogRecord {
+                                    tick,
+                                    now_ms,
+                                    phase: "execution".to_string(),
+                                    event: EventLogPayload::LiveExecution(event.clone()),
+                                });
+                            }
                         }
                         let mut event = event;
                         capture_phase51_forward_refresh_from_live_events(
@@ -13730,6 +13746,7 @@ fn live_events_to_core(events: &[LiveExecutionEvent]) -> Vec<ExecutionEvent> {
                     fee_bps: fill.fee_bps,
                 }));
             }
+            LiveExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(_) => {}
             LiveExecutionEvent::CancelAllAccepted(cancel) => {
                 out.push(ExecutionEvent::OrderAck(OrderAck {
                     venue_index: cancel.venue_index,
@@ -13769,10 +13786,13 @@ fn capture_phase51_forward_refresh_from_live_events(
 ) -> Phase51CaptureResult<()> {
     phase51_target_key_registry.observe_execution_events(events);
     for event in events {
-        let LiveExecutionEvent::Filled(fill) = event else {
-            continue;
+        let audit = match event {
+            LiveExecutionEvent::Filled(fill) => capture.capture_fill(fill)?,
+            LiveExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill) => {
+                capture.capture_source_owner_fill(fill)?
+            }
+            _ => continue,
         };
-        let audit = capture.capture_fill(fill)?;
         if audit.enabled
             && (audit.sanitized_row_emitted
                 || audit.canonical_group_id.is_some()
@@ -13921,6 +13941,7 @@ fn log_live_execution_event(
         return;
     };
     let payload = match event {
+        super::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(_) => return,
         super::types::ExecutionEvent::OrderSnapshot(snapshot) => {
             EventLogPayload::OrderSnapshot(snapshot.clone())
         }
@@ -13946,6 +13967,7 @@ fn log_live_execution_events_env(
     };
     for event in events {
         let payload = match event {
+            super::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(_) => continue,
             super::types::ExecutionEvent::OrderSnapshot(snapshot) => {
                 EventLogPayload::OrderSnapshot(snapshot.clone())
             }
@@ -14331,6 +14353,32 @@ mod tests {
         });
         assert!(!deduper.is_duplicate(&event));
         assert!(deduper.is_duplicate(&event));
+    }
+
+    #[test]
+    fn source_owner_fill_dedupes_but_produces_no_core_fill() {
+        let mut deduper = ExecutionEventDeduper::new(10);
+        let event = types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+            types::Phase51ForwardRefreshSourceOwnerFill::new(
+                2,
+                "aster",
+                12,
+                1_700_000_000_200,
+                Some("oid_source_owner".to_string()),
+                Some("co_source_owner".to_string()),
+                Some(types::Phase51ForwardRefreshNativeRole::Aster {
+                    maker: true,
+                    last_filled_qty: "0.01".to_string(),
+                }),
+            ),
+        );
+
+        assert!(!deduper.is_duplicate(&event));
+        assert!(deduper.is_duplicate(&event));
+        let deduper_debug = format!("{deduper:?}");
+        assert!(!deduper_debug.contains("oid_source_owner"));
+        assert!(!deduper_debug.contains("co_source_owner"));
+        assert!(live_events_to_core(&[event]).is_empty());
     }
 
     #[test]

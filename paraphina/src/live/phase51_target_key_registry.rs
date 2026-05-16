@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::types::{OrderIntent, Phase51ForwardRefreshTargetKey};
 
-use super::types::{ExecutionEvent, Fill, OrderAccepted};
+use super::types::{ExecutionEvent, Fill, OrderAccepted, Phase51ForwardRefreshSourceOwnerFill};
 
 const DEFAULT_PHASE51_TARGET_KEY_REGISTRY_CAPACITY: usize = 8_192;
 
@@ -119,6 +119,9 @@ impl Phase51TargetKeyRegistry {
         match event {
             ExecutionEvent::OrderAccepted(accepted) => self.observe_order_accepted(accepted),
             ExecutionEvent::Filled(fill) => self.enrich_fill(fill),
+            ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill) => {
+                self.enrich_source_owner_fill(fill)
+            }
             _ => false,
         }
     }
@@ -153,6 +156,41 @@ impl Phase51TargetKeyRegistry {
         let order_target = fill
             .order_id
             .as_deref()
+            .and_then(|handle| self.order_bindings.get(handle))
+            .cloned();
+        match (client_target, order_target) {
+            (Some(client), Some(order)) if client == order => Some(client),
+            (Some(_), Some(_)) => None,
+            (Some(client), None) => Some(client),
+            (None, Some(order)) => Some(order),
+            (None, None) => None,
+        }
+    }
+
+    pub fn enrich_source_owner_fill(
+        &self,
+        fill: &mut Phase51ForwardRefreshSourceOwnerFill,
+    ) -> bool {
+        if fill.phase51_target_key.is_some() {
+            return false;
+        }
+        let Some(target_key) = self.resolve_source_owner_fill(fill) else {
+            return false;
+        };
+        fill.set_phase51_target_key(target_key);
+        true
+    }
+
+    pub fn resolve_source_owner_fill(
+        &self,
+        fill: &Phase51ForwardRefreshSourceOwnerFill,
+    ) -> Option<Phase51ForwardRefreshTargetKey> {
+        let client_target = fill
+            .client_order_id()
+            .and_then(|handle| self.client_bindings.get(handle))
+            .cloned();
+        let order_target = fill
+            .order_id()
             .and_then(|handle| self.order_bindings.get(handle))
             .cloned();
         match (client_target, order_target) {
