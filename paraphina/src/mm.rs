@@ -43,6 +43,8 @@ use crate::types::{
     CanonicalTargetIdentity, OrderIntent, OrderPurpose, PlaceOrderIntent, Side, TimeInForce,
     TimestampMs, VenueStatus,
 };
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::Serialize;
 
 /// Internal MM quote level (one side of the book).
@@ -119,6 +121,68 @@ impl MmQuoteIdentityAuthority {
             Side::Sell => slot.ask.clone(),
         }
     }
+}
+
+/// First-class upstream allocator for opaque MM quote target identities.
+///
+/// Values produced here are independent architecture identities. They are
+/// allocated before quote construction and must not encode venue, side, tick,
+/// time, price, size, purpose, config, hashes, snapshots, or order handles.
+pub struct MmQuoteIdentityAllocator<R = OsRng> {
+    rng: R,
+}
+
+impl Default for MmQuoteIdentityAllocator<OsRng> {
+    fn default() -> Self {
+        Self { rng: OsRng }
+    }
+}
+
+impl<R: RngCore> MmQuoteIdentityAllocator<R> {
+    pub fn with_rng(rng: R) -> Self {
+        Self { rng }
+    }
+
+    pub fn populated_authority(&mut self, venue_count: usize) -> MmQuoteIdentityAuthority {
+        if venue_count == 0 {
+            return MmQuoteIdentityAuthority::empty();
+        }
+        let canonical_group_id = self.next_opaque_id();
+        let mut authority = MmQuoteIdentityAuthority::with_venue_count(venue_count);
+        for venue_index in 0..venue_count {
+            let bid_order_key = self.next_opaque_id();
+            let ask_order_key = self.next_opaque_id();
+            authority.insert_explicit(
+                venue_index,
+                Side::Buy,
+                canonical_group_id.clone(),
+                bid_order_key,
+            );
+            authority.insert_explicit(
+                venue_index,
+                Side::Sell,
+                canonical_group_id.clone(),
+                ask_order_key,
+            );
+        }
+        authority
+    }
+
+    fn next_opaque_id(&mut self) -> String {
+        let mut bytes = [0_u8; 16];
+        self.rng.fill_bytes(&mut bytes);
+        encode_opaque_identity_bytes(&bytes)
+    }
+}
+
+fn encode_opaque_identity_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Per-venue MM quote (bid/ask).
@@ -1354,6 +1418,17 @@ pub fn compute_mm_quotes_with_ablations(
     out
 }
 
+pub fn compute_mm_quotes_with_ablations_and_identity_authority(
+    cfg: &Config,
+    state: &GlobalState,
+    ablations: &AblationSet,
+    authority: &MmQuoteIdentityAuthority,
+) -> Vec<MmQuote> {
+    let mut out = compute_mm_quotes_with_ablations(cfg, state, ablations);
+    attach_canonical_target_identities(&mut out, authority);
+    out
+}
+
 /// Main MM quoting function with ablation support (buffer-reusing variant).
 ///
 /// Dispatches once per tick based on the two MM-relevant ablation flags
@@ -1381,6 +1456,17 @@ pub fn compute_mm_quotes_with_ablations_into(
         (false, true) => compute_mm_quotes_impl::<false, true>(cfg, state, None, out),
         (true, true) => compute_mm_quotes_impl::<true, true>(cfg, state, None, out),
     }
+}
+
+pub fn compute_mm_quotes_with_ablations_into_and_identity_authority(
+    cfg: &Config,
+    state: &GlobalState,
+    ablations: &AblationSet,
+    out: &mut Vec<MmQuote>,
+    authority: &MmQuoteIdentityAuthority,
+) {
+    compute_mm_quotes_with_ablations_into(cfg, state, ablations, out);
+    attach_canonical_target_identities(out, authority);
 }
 
 /// Main MM quoting function with ablation support (fully buffer-reusing variant).
@@ -3827,6 +3913,9 @@ mod tests {
     use crate::config::Config;
     use crate::state::GlobalState;
     use crate::types::VenueStatus;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+    use std::collections::HashSet;
 
     /// Helper to create a test config and state.
     fn setup_test() -> (Config, GlobalState) {
@@ -3859,6 +3948,131 @@ mod tests {
 
     fn test_identity(group: &str, order: &str) -> CanonicalTargetIdentity {
         CanonicalTargetIdentity::from_explicit(group, order).expect("complete identity")
+    }
+
+    fn seeded_identity_allocator(seed: u64) -> MmQuoteIdentityAllocator<ChaCha8Rng> {
+        MmQuoteIdentityAllocator::with_rng(ChaCha8Rng::seed_from_u64(seed))
+    }
+
+    fn assert_opaque_identity_value(value: &str) {
+        assert_eq!(value.len(), 32);
+        assert!(value.chars().all(|ch| ch.is_ascii_hexdigit()));
+        for forbidden in [
+            "venue", "side", "buy", "sell", "bid", "ask", "tick", "time", "price", "size",
+            "purpose", "config", "client", "order_id", "co_", "hash", "snapshot",
+        ] {
+            assert!(
+                !value.contains(forbidden),
+                "opaque identity unexpectedly contained forbidden fragment {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn mm_quote_identity_allocator_populates_complete_opaque_unique_slots() {
+        let mut allocator = seeded_identity_allocator(51);
+        let authority = allocator.populated_authority(3);
+        let mut order_keys = HashSet::new();
+        let mut canonical_group_id = None;
+
+        for venue_index in 0..3 {
+            for side in [Side::Buy, Side::Sell] {
+                let identity = authority
+                    .identity_for(venue_index, side)
+                    .expect("identity slot");
+                assert_opaque_identity_value(identity.canonical_group_id());
+                assert_opaque_identity_value(identity.order_key());
+                if let Some(expected) = canonical_group_id.as_deref() {
+                    assert_eq!(identity.canonical_group_id(), expected);
+                } else {
+                    canonical_group_id = Some(identity.canonical_group_id().to_string());
+                }
+                assert!(
+                    order_keys.insert(identity.order_key().to_string()),
+                    "order key must be unique per populated quote slot"
+                );
+            }
+        }
+
+        assert_eq!(order_keys.len(), 6);
+        assert!(authority.identity_for(3, Side::Buy).is_none());
+    }
+
+    #[test]
+    fn mm_quote_identity_allocator_is_independent_of_runtime_order_fields() {
+        let mut first = seeded_identity_allocator(77);
+        let mut second = seeded_identity_allocator(77);
+        let first_authority = first.populated_authority(2);
+        let second_authority = second.populated_authority(2);
+
+        for venue_index in 0..2 {
+            for side in [Side::Buy, Side::Sell] {
+                let left = first_authority
+                    .identity_for(venue_index, side)
+                    .expect("left identity");
+                let right = second_authority
+                    .identity_for(venue_index, side)
+                    .expect("right identity");
+                assert_eq!(left, right);
+                assert_opaque_identity_value(left.canonical_group_id());
+                assert_opaque_identity_value(left.order_key());
+            }
+        }
+    }
+
+    #[test]
+    fn mm_quote_identity_allocator_consecutive_authorities_are_disjoint() {
+        let mut allocator = seeded_identity_allocator(99);
+        let first_authority = allocator.populated_authority(2);
+        let second_authority = allocator.populated_authority(2);
+        let mut first_values = HashSet::new();
+        let mut second_values = HashSet::new();
+
+        for venue_index in 0..2 {
+            for side in [Side::Buy, Side::Sell] {
+                let first = first_authority
+                    .identity_for(venue_index, side)
+                    .expect("first identity");
+                let second = second_authority
+                    .identity_for(venue_index, side)
+                    .expect("second identity");
+                first_values.insert(first.canonical_group_id().to_string());
+                first_values.insert(first.order_key().to_string());
+                second_values.insert(second.canonical_group_id().to_string());
+                second_values.insert(second.order_key().to_string());
+            }
+        }
+
+        assert!(first_values.is_disjoint(&second_values));
+    }
+
+    #[test]
+    fn mm_quote_identity_allocator_empty_authority_has_no_identity_values() {
+        let mut allocator = seeded_identity_allocator(123);
+        let empty = allocator.populated_authority(0);
+        assert!(empty.identity_for(0, Side::Buy).is_none());
+        let populated_after_empty = allocator.populated_authority(1);
+        let mut direct_allocator = seeded_identity_allocator(123);
+        let direct_populated = direct_allocator.populated_authority(1);
+        assert_eq!(
+            populated_after_empty.identity_for(0, Side::Buy),
+            direct_populated.identity_for(0, Side::Buy)
+        );
+        assert_eq!(
+            populated_after_empty.identity_for(0, Side::Sell),
+            direct_populated.identity_for(0, Side::Sell)
+        );
+        let populated = populated_after_empty;
+        assert!(populated.identity_for(0, Side::Buy).is_some());
+        assert!(populated.identity_for(0, Side::Sell).is_some());
+    }
+
+    #[test]
+    fn mm_quote_identity_allocator_has_no_runtime_field_inputs() {
+        let _: fn(ChaCha8Rng) -> MmQuoteIdentityAllocator<ChaCha8Rng> =
+            MmQuoteIdentityAllocator::with_rng;
+        let _: fn(&mut MmQuoteIdentityAllocator<ChaCha8Rng>, usize) -> MmQuoteIdentityAuthority =
+            MmQuoteIdentityAllocator::<ChaCha8Rng>::populated_authority;
     }
 
     #[test]
@@ -4064,6 +4278,40 @@ mod tests {
     }
 
     #[test]
+    fn ablation_quotes_attach_explicit_canonical_target_identity() {
+        let (cfg, state) = setup_test();
+        let ablations = AblationSet::from_ids(&["disable_fair_value_gating".to_string()]).unwrap();
+        let mut allocator = seeded_identity_allocator(151);
+        let authority = allocator.populated_authority(cfg.venues.len());
+
+        let quotes = compute_mm_quotes_with_ablations_and_identity_authority(
+            &cfg, &state, &ablations, &authority,
+        );
+        let mut inspected_bids = 0;
+        let mut inspected_asks = 0;
+
+        for quote in &quotes {
+            if let Some(bid) = &quote.bid {
+                inspected_bids += 1;
+                assert_eq!(
+                    bid.canonical_target_identity,
+                    authority.identity_for(quote.venue_index, Side::Buy)
+                );
+            }
+            if let Some(ask) = &quote.ask {
+                inspected_asks += 1;
+                assert_eq!(
+                    ask.canonical_target_identity,
+                    authority.identity_for(quote.venue_index, Side::Sell)
+                );
+            }
+        }
+
+        assert!(inspected_bids > 0);
+        assert!(inspected_asks > 0);
+    }
+
+    #[test]
     fn quote_identity_attachment_leaves_missing_authority_sides_none() {
         let (cfg, state) = setup_test();
         let mut authority = MmQuoteIdentityAuthority::with_venue_count(cfg.venues.len());
@@ -4152,6 +4400,71 @@ mod tests {
                 (Some(before_ask), Some(after_ask)) => {
                     assert_eq!(before_ask.price, after_ask.price);
                     assert_eq!(before_ask.size, after_ask.size);
+                }
+                (None, None) => {}
+                _ => panic!("ask presence changed"),
+            }
+        }
+    }
+
+    #[test]
+    fn populated_identity_authority_does_not_mutate_quote_economics() {
+        let (cfg, mut state) = setup_test();
+        let now_ms = 60_000;
+        for venue in &mut state.venues {
+            venue.last_mid_update_ms = Some(now_ms - 10);
+        }
+        let mut allocator = seeded_identity_allocator(88);
+        let authority = allocator.populated_authority(cfg.venues.len());
+
+        let baseline = compute_mm_quotes_with_now(&cfg, &state, Some(now_ms));
+        let with_identity = compute_mm_quotes_with_now_and_identity_authority(
+            &cfg,
+            &state,
+            Some(now_ms),
+            &authority,
+        );
+
+        assert_eq!(baseline.len(), with_identity.len());
+        for (before, after) in baseline.iter().zip(with_identity.iter()) {
+            assert_eq!(before.venue_index, after.venue_index);
+            assert_eq!(before.venue_id, after.venue_id);
+            assert_eq!(
+                before.generated_spread_cap_applied,
+                after.generated_spread_cap_applied
+            );
+            assert_eq!(
+                before.generated_spread_cap_bid_suppressed,
+                after.generated_spread_cap_bid_suppressed
+            );
+            assert_eq!(
+                before.generated_spread_cap_ask_suppressed,
+                after.generated_spread_cap_ask_suppressed
+            );
+            assert_eq!(before.touch_mode_kind, after.touch_mode_kind);
+            assert_eq!(before.bid_terminal_reason, after.bid_terminal_reason);
+            assert_eq!(before.ask_terminal_reason, after.ask_terminal_reason);
+
+            match (&before.bid, &after.bid) {
+                (Some(before_bid), Some(after_bid)) => {
+                    assert_eq!(before_bid.price, after_bid.price);
+                    assert_eq!(before_bid.size, after_bid.size);
+                    assert_eq!(
+                        after_bid.canonical_target_identity,
+                        authority.identity_for(after.venue_index, Side::Buy)
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("bid presence changed"),
+            }
+            match (&before.ask, &after.ask) {
+                (Some(before_ask), Some(after_ask)) => {
+                    assert_eq!(before_ask.price, after_ask.price);
+                    assert_eq!(before_ask.size, after_ask.size);
+                    assert_eq!(
+                        after_ask.canonical_target_identity,
+                        authority.identity_for(after.venue_index, Side::Sell)
+                    );
                 }
                 (None, None) => {}
                 _ => panic!("ask presence changed"),

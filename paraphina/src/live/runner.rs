@@ -30,9 +30,10 @@ use crate::fill_batcher::FillBatcher;
 use crate::hedge::{compute_hedge_plan, hedge_plan_to_order_intents};
 use crate::loop_scheduler::LoopScheduler;
 use crate::mm::{
-    compute_mm_quotes_with_ablations, compute_mm_quotes_with_now_and_identity_authority,
-    compute_venue_utility_decision, quote_spread_gate_reason,
-    venue_utility_conversion_penalties_enabled, MmQuoteIdentityAuthority,
+    compute_mm_quotes_with_ablations_and_identity_authority,
+    compute_mm_quotes_with_now_and_identity_authority, compute_venue_utility_decision,
+    quote_spread_gate_reason, venue_utility_conversion_penalties_enabled, MmQuoteIdentityAllocator,
+    MmQuoteIdentityAuthority,
 };
 use crate::order_management::{plan_mm_order_actions, MmOrderDecisionSummary};
 use crate::sim_eval::AblationSet;
@@ -2695,7 +2696,8 @@ pub async fn run_live_loop(
         Err(err) => panic!("phase51 forward-refresh capture failed closed: {err}"),
     };
     let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
-    let mm_quote_identity_authority = MmQuoteIdentityAuthority::empty();
+    let mut mm_quote_identity_allocator = MmQuoteIdentityAllocator::default();
+    let empty_mm_quote_identity_authority = MmQuoteIdentityAuthority::empty();
     let skip_reconcile_kill = matches!(trade_mode.as_str(), "paper" | "p");
     let order_snapshot_fill_inference_enabled = !skip_reconcile_kill;
     let canary_enabled = std::env::var("PARAPHINA_CANARY_MODE")
@@ -4146,13 +4148,18 @@ pub async fn run_live_loop(
             && !canary_breach_response_active
         {
             let mut provisional_mm_quotes = if disable_fv_gate {
-                compute_mm_quotes_with_ablations(cfg, &state, &fv_ablations)
+                compute_mm_quotes_with_ablations_and_identity_authority(
+                    cfg,
+                    &state,
+                    &fv_ablations,
+                    &empty_mm_quote_identity_authority,
+                )
             } else {
                 compute_mm_quotes_with_now_and_identity_authority(
                     cfg,
                     &state,
                     Some(now_ms),
-                    &mm_quote_identity_authority,
+                    &empty_mm_quote_identity_authority,
                 )
             };
             let _provisional_projected_mm_budget = apply_projected_mm_budget_to_quotes(
@@ -5212,8 +5219,15 @@ pub async fn run_live_loop(
             continue;
         }
 
+        let mm_quote_identity_authority =
+            mm_quote_identity_allocator.populated_authority(cfg.venues.len());
         let mut mm_quotes = if disable_fv_gate {
-            compute_mm_quotes_with_ablations(cfg, &state, &fv_ablations)
+            compute_mm_quotes_with_ablations_and_identity_authority(
+                cfg,
+                &state,
+                &fv_ablations,
+                &mm_quote_identity_authority,
+            )
         } else {
             // Use staleness-guarded quoting in live mode with current timestamp.
             compute_mm_quotes_with_now_and_identity_authority(

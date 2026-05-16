@@ -1,5 +1,9 @@
 #![cfg(feature = "live")]
 
+use std::fs;
+
+use paraphina::actions::ActionIdGenerator;
+use paraphina::config::Config;
 use paraphina::config::Phase51ForwardRefreshCaptureConfig;
 use paraphina::live::phase51_forward_refresh_capture::{
     Phase51CaptureExecutionMode, Phase51ForwardRefreshCapture,
@@ -10,10 +14,15 @@ use paraphina::live::phase51_target_key_registry::{
 use paraphina::live::types::{
     ExecutionEvent, Fill, OrderAccepted, Phase51ForwardRefreshNativeRole,
 };
+use paraphina::mm::{compute_mm_quotes_with_now_and_identity_authority, MmQuoteIdentityAllocator};
+use paraphina::order_management::plan_mm_order_actions;
+use paraphina::state::GlobalState;
 use paraphina::types::{
     OrderIntent, OrderPurpose, Phase51ForwardRefreshTargetKey, PlaceOrderIntent,
-    ReplaceOrderIntent, Side, TimeInForce,
+    ReplaceOrderIntent, Side, TimeInForce, VenueStatus,
 };
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use tempfile::tempdir;
 
 fn target_key(label: &str) -> Phase51ForwardRefreshTargetKey {
@@ -105,6 +114,41 @@ fn enabled_capture_config(path: &std::path::Path) -> Phase51ForwardRefreshCaptur
         append_only: true,
         max_rows: 5_000,
     }
+}
+
+fn keyed_mm_place_intent() -> OrderIntent {
+    let cfg = Config::default();
+    let mut state = GlobalState::new(&cfg);
+    let now_ms = 10_000;
+    state.fair_value = Some(300.0);
+    state.fair_value_prev = 300.0;
+    state.fv_available = true;
+    state.sigma_eff = 0.02;
+    state.spread_mult = 1.0;
+    state.size_mult = 1.0;
+    state.vol_ratio_clipped = 1.0;
+    state.delta_limit_usd = 100_000.0;
+    for venue in &mut state.venues {
+        venue.mid = Some(300.0);
+        venue.spread = Some(1.0);
+        venue.last_mid_update_ms = Some(now_ms - 10);
+        venue.depth_near_mid = 10_000.0;
+        venue.margin_available_usd = 10_000.0;
+        venue.dist_liq_sigma = 10.0;
+        venue.status = VenueStatus::Healthy;
+        venue.toxicity = 0.0;
+    }
+    let mut allocator = MmQuoteIdentityAllocator::with_rng(ChaCha8Rng::seed_from_u64(121));
+    let authority = allocator.populated_authority(cfg.venues.len());
+    let quotes =
+        compute_mm_quotes_with_now_and_identity_authority(&cfg, &state, Some(now_ms), &authority);
+    let mut gen = ActionIdGenerator::new(0);
+    let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
+
+    plan.intents
+        .into_iter()
+        .find(|intent| matches!(intent, OrderIntent::Place(place) if place.phase51_target_key.is_some()))
+        .expect("keyed MM place intent")
 }
 
 #[test]
@@ -329,6 +373,91 @@ fn target_key_only_fill_emits_no_forward_refresh_row_without_native_fields() {
     let audit = capture.capture_fill(&fill).unwrap();
 
     assert!(audit.enabled);
+    assert!(!audit.sanitized_row_emitted);
+    assert_eq!(capture.rows_written(), 0);
+    assert!(!output.exists());
+}
+
+#[test]
+fn allocator_keyed_mm_intent_registers_enriches_and_emits_sanitized_native_row() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_capture_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let intent = keyed_mm_place_intent();
+    let (client_order_id, target_key) = match &intent {
+        OrderIntent::Place(place) => (
+            place.client_order_id.clone().expect("client order handle"),
+            place.phase51_target_key.clone().expect("target key"),
+        ),
+        _ => panic!("expected keyed place"),
+    };
+    let mut registry = Phase51TargetKeyRegistry::default();
+    registry.commit_stage(Phase51TargetKeyRegistryStage::from_intents(&[intent]));
+
+    assert_eq!(registry.counts().client_bindings, 1);
+
+    let mut native_fill = fill(Some(&client_order_id), None);
+    native_fill.phase51_native_role =
+        Some(Phase51ForwardRefreshNativeRole::Extended { is_taker: false });
+
+    assert!(registry.enrich_fill(&mut native_fill));
+    assert_eq!(native_fill.phase51_target_key, Some(target_key.clone()));
+
+    let audit = capture.capture_fill(&native_fill).unwrap();
+
+    assert!(audit.enabled);
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(
+        audit.canonical_group_id.as_deref(),
+        Some(target_key.canonical_group_id.as_str())
+    );
+    assert_eq!(
+        audit.order_key.as_deref(),
+        Some(target_key.order_key.as_str())
+    );
+    assert_eq!(capture.rows_written(), 1);
+
+    let raw_output = fs::read_to_string(&output).unwrap();
+    assert!(!raw_output.contains(&client_order_id));
+    assert!(!raw_output.contains("fill-handle"));
+}
+
+#[test]
+fn allocator_keyed_mm_native_fill_emits_no_row_when_capture_disabled() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.remaining.jsonl");
+    let mut disabled_cfg = enabled_capture_config(&output);
+    disabled_cfg.enabled = false;
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &disabled_cfg,
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let intent = keyed_mm_place_intent();
+    let (client_order_id, target_key) = match &intent {
+        OrderIntent::Place(place) => (
+            place.client_order_id.clone().expect("client order handle"),
+            place.phase51_target_key.clone().expect("target key"),
+        ),
+        _ => panic!("expected keyed place"),
+    };
+    let mut registry = Phase51TargetKeyRegistry::default();
+    registry.commit_stage(Phase51TargetKeyRegistryStage::from_intents(&[intent]));
+
+    let mut native_fill = fill(Some(&client_order_id), None);
+    native_fill.phase51_native_role =
+        Some(Phase51ForwardRefreshNativeRole::Extended { is_taker: false });
+
+    assert!(registry.enrich_fill(&mut native_fill));
+    assert_eq!(native_fill.phase51_target_key, Some(target_key));
+
+    let audit = capture.capture_fill(&native_fill).unwrap();
+
+    assert!(!audit.enabled);
     assert!(!audit.sanitized_row_emitted);
     assert_eq!(capture.rows_written(), 0);
     assert!(!output.exists());

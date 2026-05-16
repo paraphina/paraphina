@@ -1286,6 +1286,8 @@ mod tests {
     use crate::config::Config;
     use crate::state::GlobalState;
     use crate::state::MmOpenOrder;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -1542,6 +1544,169 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn plan_mm_order_actions_from_populated_authority_quotes_emits_phase51_target_keys() {
+        let cfg = Config::default();
+        let mut state = mk_state_with_quote(&cfg);
+        let now_ms = 10_000;
+        state.fv_available = true;
+        state.sigma_eff = 0.02;
+        state.spread_mult = 1.0;
+        state.size_mult = 1.0;
+        state.vol_ratio_clipped = 1.0;
+        state.delta_limit_usd = 100_000.0;
+        for venue in &mut state.venues {
+            venue.last_mid_update_ms = Some(now_ms - 10);
+            venue.depth_near_mid = 10_000.0;
+            venue.margin_available_usd = 10_000.0;
+            venue.dist_liq_sigma = 10.0;
+            venue.status = crate::types::VenueStatus::Healthy;
+            venue.toxicity = 0.0;
+        }
+        let mut allocator =
+            crate::mm::MmQuoteIdentityAllocator::with_rng(ChaCha8Rng::seed_from_u64(91));
+        let authority = allocator.populated_authority(cfg.venues.len());
+        let quotes = crate::mm::compute_mm_quotes_with_now_and_identity_authority(
+            &cfg,
+            &state,
+            Some(now_ms),
+            &authority,
+        );
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
+
+        assert!(
+            plan.intents.iter().any(|intent| {
+                matches!(
+                    intent,
+                    OrderIntent::Place(place) if place.purpose == OrderPurpose::Mm
+                )
+            }),
+            "expected at least one MM place intent"
+        );
+        for intent in &plan.intents {
+            match intent {
+                OrderIntent::Place(place) => {
+                    assert_eq!(
+                        place.phase51_target_key,
+                        authority
+                            .identity_for(place.venue_index, place.side)
+                            .map(|identity| identity.to_phase51_target_key())
+                    );
+                    assert_ne!(
+                        place
+                            .phase51_target_key
+                            .as_ref()
+                            .map(|key| key.order_key.as_str()),
+                        place.client_order_id.as_deref()
+                    );
+                }
+                OrderIntent::Replace(replace) => {
+                    assert_eq!(
+                        replace.phase51_target_key,
+                        authority
+                            .identity_for(replace.venue_index, replace.side)
+                            .map(|identity| identity.to_phase51_target_key())
+                    );
+                    assert_ne!(
+                        replace
+                            .phase51_target_key
+                            .as_ref()
+                            .map(|key| key.order_key.as_str()),
+                        replace.client_order_id.as_deref()
+                    );
+                    assert_ne!(
+                        replace
+                            .phase51_target_key
+                            .as_ref()
+                            .map(|key| key.order_key.as_str()),
+                        Some(replace.order_id.as_str())
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn plan_mm_order_actions_replace_from_populated_authority_quotes_emits_phase51_target_key() {
+        let cfg = Config::default();
+        let mut state = mk_state_with_quote(&cfg);
+        let now_ms = 10_000;
+        state.fv_available = true;
+        state.sigma_eff = 0.02;
+        state.spread_mult = 1.0;
+        state.size_mult = 1.0;
+        state.vol_ratio_clipped = 1.0;
+        state.delta_limit_usd = 100_000.0;
+        for venue in &mut state.venues {
+            venue.last_mid_update_ms = Some(now_ms - 10);
+            venue.depth_near_mid = 10_000.0;
+            venue.margin_available_usd = 10_000.0;
+            venue.dist_liq_sigma = 10.0;
+            venue.status = crate::types::VenueStatus::Healthy;
+            venue.toxicity = 0.0;
+        }
+        state.venues[0].mm_open_bid = Some(MmOpenOrder {
+            price: 299.0,
+            size: 1.0,
+            timestamp_ms: now_ms - (cfg.mm.min_quote_lifetime_ms + 1),
+            order_id: "runtime-order-id-looking".to_string(),
+            client_order_id: Some("runtime-client-id-looking".to_string()),
+            tracking_source: crate::state::MmOpenTrackingSource::OpenSnapshot,
+        });
+
+        let mut allocator =
+            crate::mm::MmQuoteIdentityAllocator::with_rng(ChaCha8Rng::seed_from_u64(92));
+        let authority = allocator.populated_authority(cfg.venues.len());
+        let mut quotes = crate::mm::compute_mm_quotes_with_now_and_identity_authority(
+            &cfg,
+            &state,
+            Some(now_ms),
+            &authority,
+        );
+        let bid = quotes[0].bid.as_mut().expect("venue 0 bid quote");
+        bid.price = 295.0;
+        bid.size = 2.0;
+        let expected_key = bid
+            .canonical_target_identity
+            .as_ref()
+            .expect("allocator identity")
+            .to_phase51_target_key();
+
+        let mut gen = ActionIdGenerator::new(0);
+        let plan = plan_mm_order_actions(&cfg, &state, &quotes, now_ms, &mut gen);
+
+        let replace = plan
+            .intents
+            .iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Replace(replace)
+                    if replace.venue_index == 0 && replace.side == Side::Buy =>
+                {
+                    Some(replace)
+                }
+                _ => None,
+            })
+            .expect("expected exact venue-side replace");
+        assert!(replace.client_order_id.is_some());
+        assert_eq!(replace.phase51_target_key, Some(expected_key));
+        assert_ne!(
+            replace
+                .phase51_target_key
+                .as_ref()
+                .map(|key| key.order_key.as_str()),
+            replace.client_order_id.as_deref()
+        );
+        assert_ne!(
+            replace
+                .phase51_target_key
+                .as_ref()
+                .map(|key| key.order_key.as_str()),
+            Some(replace.order_id.as_str())
+        );
     }
 
     #[test]
