@@ -1461,7 +1461,8 @@ use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
     LiquidationSnapshot, MarginSnapshot, MarketDataEvent, OpenOrderSnapshot, OrderSnapshot,
-    PositionSnapshot, TopOfBook,
+    Phase51ForwardRefreshNativeRole, Phase51ForwardRefreshSourceOwnerFill, PositionSnapshot,
+    TopOfBook,
 };
 use crate::live::{live_market_pub_drain_max, live_market_pub_queue_cap, MarketPublisher};
 use crate::types::{FundingSource, SettlementPriceKind, Side, TimeInForce, TimestampMs};
@@ -4521,7 +4522,23 @@ impl ExtendedRestClient {
                         .map_err(|_| anyhow::anyhow!("extended exec_tx closed"))?;
                 }
             }
-            "TRADE" => {}
+            "TRADE" => {
+                for source_owner_fill in phase51_extended_source_owner_fills_from_trade_message(
+                    &value,
+                    order_state.snapshot.venue_index,
+                    &order_state.snapshot.venue_id,
+                    seq,
+                    timestamp_ms,
+                    &self.cfg.market,
+                ) {
+                    exec_tx
+                        .send(ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+                            source_owner_fill,
+                        ))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("extended exec_tx closed"))?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -5179,6 +5196,80 @@ impl ExtendedPrivateOrderState {
         self.snapshot.open_orders = self.open_orders.values().cloned().collect();
         Some(self.snapshot.clone())
     }
+}
+
+fn phase51_extended_source_owner_fills_from_trade_message(
+    value: &Value,
+    venue_index: usize,
+    venue_id: &str,
+    seq: u64,
+    timestamp_ms: TimestampMs,
+    market: &str,
+) -> Vec<Phase51ForwardRefreshSourceOwnerFill> {
+    if value.get("type").and_then(|raw| raw.as_str()) != Some("TRADE") {
+        return Vec::new();
+    }
+    let data = value.get("data").unwrap_or(value);
+    let trades = data
+        .get("trades")
+        .or_else(|| data.get("trade"))
+        .unwrap_or(data);
+    iter_value_items(trades)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(trade_index, trade)| {
+            let symbol = trade
+                .get("market")
+                .or_else(|| trade.get("symbol"))
+                .and_then(|raw| raw.as_str())
+                .unwrap_or("");
+            if !symbol_matches(symbol, market) {
+                return None;
+            }
+            let is_taker = trade.get("isTaker")?.as_bool()?;
+            let order_id = parse_extended_stringish(
+                trade
+                    .get("orderId")
+                    .or_else(|| trade.get("order_id")),
+            );
+            let client_order_id = parse_extended_stringish(
+                trade
+                    .get("externalId")
+                    .or_else(|| trade.get("externalOrderId"))
+                    .or_else(|| trade.get("clientOrderId"))
+                    .or_else(|| trade.get("client_order_id")),
+            );
+            if order_id.is_none() && client_order_id.is_none() {
+                return None;
+            }
+
+            Some(Phase51ForwardRefreshSourceOwnerFill::new(
+                venue_index,
+                venue_id,
+                phase51_extended_source_owner_seq(seq, trade_index),
+                timestamp_ms,
+                order_id,
+                client_order_id,
+                Some(Phase51ForwardRefreshNativeRole::Extended { is_taker }),
+            ))
+        })
+        .collect()
+}
+
+fn phase51_extended_source_owner_seq(seq: u64, trade_index: usize) -> u64 {
+    seq.saturating_mul(1_000_000)
+        .saturating_add(trade_index as u64)
+}
+
+fn parse_extended_stringish(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(|raw| {
+            raw.as_str()
+                .map(|id| id.to_string())
+                .or_else(|| raw.as_i64().map(|id| id.to_string()))
+                .or_else(|| raw.as_u64().map(|id| id.to_string()))
+        })
+        .filter(|id| !id.trim().is_empty())
 }
 
 async fn fetch_public_funding(
@@ -6309,6 +6400,110 @@ mod tests {
             .apply_order_message(&closed_msg, 22, 1_700_000_000_444_i64)
             .expect("closed order snapshot");
         assert!(snapshot.open_orders.is_empty());
+    }
+
+    #[test]
+    fn trade_message_exact_is_taker_fields_create_source_owner_fills() {
+        let trade_msg = serde_json::json!({
+            "type": "TRADE",
+            "seq": 31_u64,
+            "ts": 1_700_000_000_555_i64,
+            "data": {
+                "trades": [
+                    {
+                        "market": "ETH-USD",
+                        "orderId": "oid_ext_1",
+                        "clientOrderId": "co_ext_1",
+                        "isTaker": true
+                    },
+                    {
+                        "market": "ETH-USD",
+                        "orderId": "oid_ext_2",
+                        "externalOrderId": "co_ext_2",
+                        "isTaker": false
+                    }
+                ]
+            }
+        });
+
+        let fills = phase51_extended_source_owner_fills_from_trade_message(
+            &trade_msg,
+            2,
+            "extended",
+            31,
+            1_700_000_000_555_i64,
+            "ETH-USD",
+        );
+
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].venue_id, "extended");
+        assert_eq!(fills[0].order_id(), Some("oid_ext_1"));
+        assert_eq!(fills[0].client_order_id(), Some("co_ext_1"));
+        assert_eq!(fills[0].seq, 31_000_000);
+        assert_eq!(fills[0].phase51_lighter_native_limit, None);
+        assert_eq!(
+            fills[0].phase51_native_role,
+            Some(Phase51ForwardRefreshNativeRole::Extended { is_taker: true })
+        );
+        assert_eq!(fills[1].order_id(), Some("oid_ext_2"));
+        assert_eq!(fills[1].client_order_id(), Some("co_ext_2"));
+        assert_eq!(fills[1].seq, 31_000_001);
+        assert_eq!(
+            fills[1].phase51_native_role,
+            Some(Phase51ForwardRefreshNativeRole::Extended { is_taker: false })
+        );
+    }
+
+    #[test]
+    fn trade_message_missing_or_non_bool_is_taker_creates_no_source_owner_fill() {
+        for trade in [
+            serde_json::json!({"market": "ETH-USD", "orderId": "oid_ext_1"}),
+            serde_json::json!({"market": "ETH-USD", "orderId": "oid_ext_1", "isTaker": "true"}),
+            serde_json::json!({"market": "ETH-USD", "orderId": "oid_ext_1", "isTaker": 1}),
+            serde_json::json!({"market": "ETH-USD", "orderId": "oid_ext_1", "isTaker": null}),
+        ] {
+            let trade_msg = serde_json::json!({
+                "type": "TRADE",
+                "seq": 32_u64,
+                "data": { "trades": [trade] }
+            });
+
+            assert!(phase51_extended_source_owner_fills_from_trade_message(
+                &trade_msg, 2, "extended", 32, 1_700_000_000_666_i64, "ETH-USD",
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn trade_message_other_market_or_without_handle_creates_no_source_owner_fill() {
+        for trade in [
+            serde_json::json!({
+                "market": "BTC-USD",
+                "orderId": "oid_ext_1",
+                "isTaker": true
+            }),
+            serde_json::json!({
+                "market": "ETH-USD",
+                "isTaker": true
+            }),
+            serde_json::json!({
+                "market": "ETH-USD",
+                "id": "trade_id_not_order_id",
+                "isTaker": true
+            }),
+        ] {
+            let trade_msg = serde_json::json!({
+                "type": "TRADE",
+                "seq": 33_u64,
+                "data": { "trades": [trade] }
+            });
+
+            assert!(phase51_extended_source_owner_fills_from_trade_message(
+                &trade_msg, 2, "extended", 33, 1_700_000_000_777_i64, "ETH-USD",
+            )
+            .is_empty());
+        }
     }
 
     fn apply_market_event_to_test_state(
