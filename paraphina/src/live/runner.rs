@@ -1821,6 +1821,66 @@ async fn send_order_and_wait(
     }
 }
 
+fn phase51_lighter_native_role_strict_canary_validate_order_intents(
+    intents: &[OrderIntent],
+) -> Result<(), &'static str> {
+    if !phase51_lighter_native_role_strict_canary_enabled() {
+        return Ok(());
+    }
+    if intents.is_empty() {
+        return Ok(());
+    }
+
+    let mut place_count = 0usize;
+    let mut cancel_count = 0usize;
+    for intent in intents {
+        match intent {
+            OrderIntent::Place(place) => {
+                place_count += 1;
+                if place.venue_id.as_ref() != "lighter" {
+                    return Err("non_lighter_place");
+                }
+                if place.purpose != OrderPurpose::Mm {
+                    return Err("non_mm_place");
+                }
+                if place.time_in_force != TimeInForce::Gtc {
+                    return Err("non_gtc_place");
+                }
+                if !place.post_only {
+                    return Err("non_post_only_place");
+                }
+                if place.reduce_only {
+                    return Err("reduce_only_place");
+                }
+            }
+            OrderIntent::Replace(_) => {
+                return Err("replace_disabled");
+            }
+            OrderIntent::Cancel(cancel) => {
+                cancel_count += 1;
+                if cancel.venue_id.as_ref() != "lighter" {
+                    return Err("non_lighter_cancel");
+                }
+            }
+            OrderIntent::CancelAll(cancel_all) => {
+                cancel_count += 1;
+                if let Some(venue_id) = cancel_all.venue_id.as_ref() {
+                    if venue_id.as_ref() != "lighter" {
+                        return Err("non_lighter_cancel_all");
+                    }
+                }
+            }
+        }
+    }
+    if place_count > 1 {
+        return Err("multiple_places");
+    }
+    if place_count > 0 && cancel_count > 0 {
+        return Err("cancel_and_place_replacement_disabled");
+    }
+    Ok(())
+}
+
 async fn send_order_and_wait_with_status(
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
@@ -1835,6 +1895,14 @@ async fn send_order_and_wait_with_status(
     OrderWaitOutcomeKind,
     Option<Vec<super::types::ExecutionEvent>>,
 ) {
+    if let Err(reason) = phase51_lighter_native_role_strict_canary_validate_order_intents(&intents)
+    {
+        eprintln!(
+            "[runner] tick={} phase51_lighter_native_role_strict_canary_blocked_request reason={}",
+            tick, reason
+        );
+        return (OrderWaitOutcomeKind::HandlerDropped, None);
+    }
     let (response_tx, response_rx) = oneshot::channel();
     let phase51_target_key_stage = Phase51TargetKeyRegistryStage::from_intents(&intents);
     let request = LiveOrderRequest {
@@ -1886,6 +1954,14 @@ fn send_order_fire_and_forget(
     label: &str,
     tick: u64,
 ) -> bool {
+    if let Err(reason) = phase51_lighter_native_role_strict_canary_validate_order_intents(&intents)
+    {
+        eprintln!(
+            "[runner] tick={} phase51_lighter_native_role_strict_canary_blocked_request reason={}",
+            tick, reason
+        );
+        return false;
+    }
     let phase51_target_key_stage = Phase51TargetKeyRegistryStage::from_intents(&intents);
     let request = LiveOrderRequest {
         intents,
@@ -2575,6 +2651,12 @@ const RECONCILE_TOL_EPSILON: f64 = 1e-9;
 const KILL_CANCEL_ALL_TIMEOUT_MS_MIN: u64 = 5_000;
 const KILL_CANCEL_ALL_TIMEOUT_MS_PER_VENUE: u64 = 1_000;
 const KILL_FLATTEN_TIMEOUT_MS: u64 = 2_000;
+const PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY";
+const PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS";
+const PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW";
 
 fn realtime_tick_interval(interval_ms: u64) -> tokio::time::Interval {
     let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
@@ -2697,11 +2779,15 @@ pub async fn run_live_loop(
         .to_ascii_lowercase();
     let phase51_live_native_role_canary_context = Phase51LiveNativeRoleCanaryContext {
         canary_enabled: phase51_true_env("PARAPHINA_CANARY_MODE"),
+        native_role_strict_canary_enabled: phase51_lighter_native_role_strict_canary_enabled(),
         venue_ids: cfg.venues.iter().map(|venue| venue.id.clone()).collect(),
+        canary_max_open_orders: phase51_usize_env("PARAPHINA_CANARY_MAX_OPEN_ORDERS"),
         canary_enforce_post_only: phase51_true_env("PARAPHINA_CANARY_ENFORCE_POST_ONLY"),
         canary_enforce_reduce_only: phase51_true_env("PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY"),
         strict_maker_only_observation_enabled:
             phase51_lighter_strict_maker_only_observation_env_enabled(),
+        replacements_disabled: phase51_lighter_native_role_replacements_disabled(),
+        stop_after_first_row: phase51_lighter_native_role_stop_after_first_row_enabled(),
     };
     let mut phase51_forward_refresh_capture = match Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
         &cfg.phase51_forward_refresh_capture,
@@ -3674,15 +3760,21 @@ pub async fn run_live_loop(
                             }
                         }
                         let mut event = event;
-                        capture_phase51_forward_refresh_from_live_events(
-                            &mut phase51_forward_refresh_capture,
-                            &mut phase51_target_key_registry,
-                            &audit_dir,
-                            std::slice::from_mut(&mut event),
-                        )
-                        .unwrap_or_else(|err| {
-                            panic!("phase51 forward-refresh capture failed closed: {err}")
-                        });
+                        let phase51_native_role_row_captured =
+                            capture_phase51_forward_refresh_from_live_events(
+                                &mut phase51_forward_refresh_capture,
+                                &mut phase51_target_key_registry,
+                                &audit_dir,
+                                std::slice::from_mut(&mut event),
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!("phase51 forward-refresh capture failed closed: {err}")
+                            });
+                        phase51_lighter_native_role_strict_canary_apply_stop(
+                            &mut state,
+                            tick,
+                            phase51_native_role_row_captured,
+                        );
                         let core_events = live_events_to_core(std::slice::from_ref(&event));
                         tick_exec_events.extend(core_events.iter().cloned());
                         let fills = apply_execution_events(&mut state, &core_events, now_ms);
@@ -5961,15 +6053,21 @@ pub async fn run_live_loop(
                         }
                         #[cfg(feature = "event_log")]
                         log_live_execution_event(&mut event_log, tick, now_ms, "gateway", &event);
-                        capture_phase51_forward_refresh_from_live_events(
-                            &mut phase51_forward_refresh_capture,
-                            &mut phase51_target_key_registry,
-                            &audit_dir,
-                            std::slice::from_mut(&mut event),
-                        )
-                        .unwrap_or_else(|err| {
-                            panic!("phase51 forward-refresh capture failed closed: {err}")
-                        });
+                        let phase51_native_role_row_captured =
+                            capture_phase51_forward_refresh_from_live_events(
+                                &mut phase51_forward_refresh_capture,
+                                &mut phase51_target_key_registry,
+                                &audit_dir,
+                                std::slice::from_mut(&mut event),
+                            )
+                            .unwrap_or_else(|err| {
+                                panic!("phase51 forward-refresh capture failed closed: {err}")
+                            });
+                        phase51_lighter_native_role_strict_canary_apply_stop(
+                            &mut state,
+                            tick,
+                            phase51_native_role_row_captured,
+                        );
                         let core_events = live_events_to_core(std::slice::from_ref(&event));
                         tick_exec_events.extend(core_events.iter().cloned());
                         let fills = apply_execution_events(&mut state, &core_events, now_ms);
@@ -6073,15 +6171,21 @@ pub async fn run_live_loop(
                                 "gateway",
                                 &event,
                             );
-                            capture_phase51_forward_refresh_from_live_events(
-                                &mut phase51_forward_refresh_capture,
-                                &mut phase51_target_key_registry,
-                                &audit_dir,
-                                std::slice::from_mut(&mut event),
-                            )
-                            .unwrap_or_else(|err| {
-                                panic!("phase51 forward-refresh capture failed closed: {err}")
-                            });
+                            let phase51_native_role_row_captured =
+                                capture_phase51_forward_refresh_from_live_events(
+                                    &mut phase51_forward_refresh_capture,
+                                    &mut phase51_target_key_registry,
+                                    &audit_dir,
+                                    std::slice::from_mut(&mut event),
+                                )
+                                .unwrap_or_else(|err| {
+                                    panic!("phase51 forward-refresh capture failed closed: {err}")
+                                });
+                            phase51_lighter_native_role_strict_canary_apply_stop(
+                                &mut state,
+                                tick,
+                                phase51_native_role_row_captured,
+                            );
                             let core_events = live_events_to_core(std::slice::from_ref(&event));
                             tick_exec_events.extend(core_events.iter().cloned());
                             let fills = apply_execution_events(&mut state, &core_events, now_ms);
@@ -10386,8 +10490,26 @@ fn phase51_true_env(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn phase51_usize_env(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+}
+
 fn phase51_lighter_strict_maker_only_observation_env_enabled() -> bool {
     phase51_true_env("PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION")
+}
+
+fn phase51_lighter_native_role_strict_canary_enabled() -> bool {
+    phase51_true_env(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV)
+}
+
+fn phase51_lighter_native_role_replacements_disabled() -> bool {
+    phase51_true_env(PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV)
+}
+
+fn phase51_lighter_native_role_stop_after_first_row_enabled() -> bool {
+    phase51_true_env(PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -13807,8 +13929,9 @@ fn capture_phase51_forward_refresh_from_live_events(
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     audit_dir: &std::path::Path,
     events: &mut [LiveExecutionEvent],
-) -> Phase51CaptureResult<()> {
+) -> Phase51CaptureResult<bool> {
     phase51_target_key_registry.observe_execution_events(events);
+    let mut emitted_lighter_native_role_row = false;
     for event in events {
         let audit = match event {
             LiveExecutionEvent::Filled(fill) => capture.capture_fill(fill)?,
@@ -13830,8 +13953,50 @@ fn capture_phase51_forward_refresh_from_live_events(
                 ))
             })?;
         }
+        if phase51_audit_is_compliant_lighter_native_role_row(&audit) {
+            emitted_lighter_native_role_row = true;
+        }
     }
-    Ok(())
+    Ok(emitted_lighter_native_role_row)
+}
+
+fn phase51_audit_is_compliant_lighter_native_role_row(
+    audit: &super::types::Phase51ForwardRefreshCaptureAudit,
+) -> bool {
+    audit.enabled
+        && audit.sanitized_row_emitted
+        && audit.target_type.as_deref() == Some("native_role")
+        && audit.venue_id.as_deref() == Some("lighter")
+        && audit
+            .canonical_group_id
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        && audit
+            .order_key
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        && audit.native_role_source.as_deref()
+            == Some("lighter.account_index.is_maker_ask.ask_account_id.bid_account_id")
+}
+
+fn phase51_lighter_native_role_strict_canary_should_stop_after_capture(captured: bool) -> bool {
+    captured
+        && phase51_lighter_native_role_strict_canary_enabled()
+        && phase51_lighter_native_role_stop_after_first_row_enabled()
+}
+
+fn phase51_lighter_native_role_strict_canary_apply_stop(
+    state: &mut GlobalState,
+    tick: u64,
+    captured: bool,
+) {
+    if phase51_lighter_native_role_strict_canary_should_stop_after_capture(captured) {
+        state.kill_switch = true;
+        eprintln!(
+            "[runner] tick={} phase51_lighter_native_role_strict_canary_stop_after_first_row=true",
+            tick
+        );
+    }
 }
 
 fn apply_live_fills(
@@ -14302,7 +14467,8 @@ mod tests {
     use crate::state::{MmOpenOrder, OpenOrderRecord};
     use crate::telemetry::{TelemetryBuilder, TelemetryInputs};
     use crate::types::{
-        CancelOrderIntent, FundingSource, OrderPurpose, SettlementPriceKind, Side, TimeInForce,
+        CancelAllOrderIntent, CancelOrderIntent, FundingSource, OrderPurpose, PlaceOrderIntent,
+        ReplaceOrderIntent, SettlementPriceKind, Side, TimeInForce,
     };
     use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
@@ -14334,6 +14500,190 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn lighter_place_intent() -> OrderIntent {
+        OrderIntent::Place(PlaceOrderIntent {
+            venue_index: 0,
+            venue_id: "lighter".into(),
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            client_order_id: None,
+            phase51_target_key: None,
+        })
+    }
+
+    fn lighter_replace_intent() -> OrderIntent {
+        OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 0,
+            venue_id: "lighter".into(),
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "redacted-test-order".to_string(),
+            client_order_id: None,
+            phase51_target_key: None,
+        })
+    }
+
+    fn lighter_cancel_intent() -> OrderIntent {
+        OrderIntent::Cancel(CancelOrderIntent {
+            venue_index: 0,
+            venue_id: "lighter".into(),
+            order_id: "redacted-test-order".to_string(),
+        })
+    }
+
+    fn with_phase51_strict_native_role_canary_env<R>(f: impl FnOnce() -> R) -> R {
+        let keys = [
+            PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV,
+            PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV,
+            PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV,
+        ];
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&keys);
+        std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV, "true");
+        std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV, "true");
+        std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV, "true");
+        f()
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_strict_canary_rejects_replace_and_multi_place() {
+        with_phase51_strict_native_role_canary_env(|| {
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[
+                    lighter_replace_intent()
+                ]),
+                Err("replace_disabled")
+            );
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[
+                    lighter_place_intent(),
+                    lighter_place_intent(),
+                ]),
+                Err("multiple_places")
+            );
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[
+                    lighter_cancel_intent(),
+                    lighter_place_intent(),
+                ]),
+                Err("cancel_and_place_replacement_disabled")
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_strict_canary_allows_single_maker_gtc_place_and_cancels() {
+        with_phase51_strict_native_role_canary_env(|| {
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[
+                    lighter_place_intent()
+                ]),
+                Ok(())
+            );
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[
+                    lighter_cancel_intent()
+                ]),
+                Ok(())
+            );
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[
+                    OrderIntent::CancelAll(CancelAllOrderIntent {
+                        venue_index: Some(0),
+                        venue_id: Some("lighter".into()),
+                    })
+                ]),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_strict_canary_rejects_non_maker_post_only_shape() {
+        with_phase51_strict_native_role_canary_env(|| {
+            let mut non_mm = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut non_mm {
+                place.purpose = OrderPurpose::Hedge;
+            }
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[non_mm]),
+                Err("non_mm_place")
+            );
+
+            let mut non_gtc = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut non_gtc {
+                place.time_in_force = TimeInForce::Ioc;
+            }
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[non_gtc]),
+                Err("non_gtc_place")
+            );
+
+            let mut not_post_only = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut not_post_only {
+                place.post_only = false;
+            }
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[not_post_only]),
+                Err("non_post_only_place")
+            );
+
+            let mut reduce_only = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut reduce_only {
+                place.reduce_only = true;
+            }
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[reduce_only]),
+                Err("reduce_only_place")
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_strict_canary_stop_requires_compliant_lighter_native_row() {
+        with_phase51_strict_native_role_canary_env(|| {
+            let audit = types::Phase51ForwardRefreshCaptureAudit {
+                enabled: true,
+                target_type: Some("native_role".to_string()),
+                venue_id: Some("lighter".to_string()),
+                canonical_group_id: Some("cg".to_string()),
+                order_key: Some("ok".to_string()),
+                native_role_source: Some(
+                    "lighter.account_index.is_maker_ask.ask_account_id.bid_account_id".to_string(),
+                ),
+                lighter_pressure_status: None,
+                sanitized_row_emitted: true,
+                no_live_flag: true,
+                approved_for_live: false,
+                approved_for_canary: false,
+                approved_for_capital_escalation: false,
+            };
+            assert!(
+                phase51_lighter_native_role_strict_canary_should_stop_after_capture(
+                    phase51_audit_is_compliant_lighter_native_role_row(&audit)
+                )
+            );
+
+            let mut incomplete = audit.clone();
+            incomplete.order_key = None;
+            assert!(
+                !phase51_lighter_native_role_strict_canary_should_stop_after_capture(
+                    phase51_audit_is_compliant_lighter_native_role_row(&incomplete)
+                )
+            );
+        });
     }
 
     #[test]

@@ -40,10 +40,14 @@ fn approved_live_native_role_config(path: &std::path::Path) -> Phase51ForwardRef
 fn lighter_strict_live_context() -> Phase51LiveNativeRoleCanaryContext {
     Phase51LiveNativeRoleCanaryContext {
         canary_enabled: true,
+        native_role_strict_canary_enabled: true,
         venue_ids: vec!["lighter".to_string()],
+        canary_max_open_orders: Some(1),
         canary_enforce_post_only: true,
         canary_enforce_reduce_only: false,
         strict_maker_only_observation_enabled: true,
+        replacements_disabled: true,
+        stop_after_first_row: true,
     }
 }
 
@@ -174,6 +178,16 @@ fn live_native_role_canary_requires_all_runtime_guards() {
     assert!(err.to_string().contains("canary mode"));
 
     let mut context = lighter_strict_live_context();
+    context.native_role_strict_canary_enabled = false;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("strict native-role canary"));
+
+    let mut context = lighter_strict_live_context();
     context.strict_maker_only_observation_enabled = false;
     let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
         &cfg,
@@ -213,8 +227,38 @@ fn live_native_role_canary_requires_all_runtime_guards() {
     .unwrap_err();
     assert!(err.to_string().contains("non-reduce-only"));
 
+    let mut context = lighter_strict_live_context();
+    context.canary_max_open_orders = Some(2);
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("max_open_orders=1"));
+
+    let mut context = lighter_strict_live_context();
+    context.replacements_disabled = false;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("replacements disabled"));
+
+    let mut context = lighter_strict_live_context();
+    context.stop_after_first_row = false;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("stop-after-first-row"));
+
     let mut high_rows = cfg.clone();
-    high_rows.max_rows = 26;
+    high_rows.max_rows = 2;
     let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
         &high_rows,
         Phase51CaptureExecutionMode::Live,
@@ -247,6 +291,20 @@ fn live_native_role_canary_requires_all_runtime_guards() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("absent or empty future output"));
+}
+
+#[test]
+fn strict_lighter_native_role_canary_profile_enforces_one_open_order() {
+    let profile = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("configs/phase51_lighter_native_role_strict_canary.toml");
+    let raw = fs::read_to_string(profile).unwrap();
+    assert!(raw.contains("base_order_size = 0.01"));
+    assert!(raw.contains("max_order_size = 0.01"));
+    assert!(raw.contains("max_open_orders = 1"));
+    assert!(raw.contains("post_only = true"));
+    assert!(raw.contains("reduce_only = false"));
 }
 
 #[test]

@@ -122,10 +122,14 @@ impl Phase51CaptureExecutionMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phase51LiveNativeRoleCanaryContext {
     pub canary_enabled: bool,
+    pub native_role_strict_canary_enabled: bool,
     pub venue_ids: Vec<String>,
+    pub canary_max_open_orders: Option<usize>,
     pub canary_enforce_post_only: bool,
     pub canary_enforce_reduce_only: bool,
     pub strict_maker_only_observation_enabled: bool,
+    pub replacements_disabled: bool,
+    pub stop_after_first_row: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -793,6 +797,11 @@ fn validate_live_native_role_canary_context(
             "phase51 live native-role canary capture requires canary mode",
         ));
     }
+    if !live_context.native_role_strict_canary_enabled {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires strict native-role canary mode",
+        ));
+    }
     let venue_ids: Vec<String> = live_context
         .venue_ids
         .iter()
@@ -819,9 +828,24 @@ fn validate_live_native_role_canary_context(
             "phase51 live native-role canary capture requires non-reduce-only canary enforcement",
         ));
     }
-    if config.max_rows == 0 || config.max_rows > 25 {
+    if live_context.canary_max_open_orders != Some(1) {
         return Err(Phase51CaptureError::new(
-            "phase51 live native-role canary capture requires max_rows between 1 and 25",
+            "phase51 live native-role canary capture requires max_open_orders=1",
+        ));
+    }
+    if !live_context.replacements_disabled {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires replacements disabled",
+        ));
+    }
+    if !live_context.stop_after_first_row {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires stop-after-first-row",
+        ));
+    }
+    if config.max_rows != 1 {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires max_rows=1",
         ));
     }
     Ok(())
