@@ -263,6 +263,7 @@ def _assemble_packet(facts: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         "sendtx_provenance_state": packet_schema.OBSERVED_PROVENANCE,
         "request_pressure_provenance_state": packet_schema.OBSERVED_PROVENANCE,
         "pressure_packet_state": packet_schema.PACKET_STATE,
+        "pressure_state": packet_schema.PRESSURE_COMPLETE,
         "raw_identifier_redaction_status": packet_schema.REDACTION_STATUS,
         "fixture_provenance": packet_schema.FIXTURE_PROVENANCE,
         "native_limit_pressure_source": packet_schema.PRESSURE_SOURCE,

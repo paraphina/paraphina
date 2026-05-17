@@ -35,6 +35,7 @@ def complete_packet(**overrides):
         "sendtx_provenance_state": "SYNTHETIC_EVENT_TIME_SOURCE",
         "request_pressure_provenance_state": "SYNTHETIC_EVENT_TIME_SOURCE",
         "pressure_packet_state": "SYNTHETIC_SANITIZED_EVENT_TIME_COMPLETE",
+        "pressure_state": "pressure_complete",
         "raw_identifier_redaction_status": "PASS",
         "fixture_provenance": "SYNTHETIC_FIXTURE_ONLY",
         "native_limit_pressure_source": "SYNTHETIC_FIXTURE_PRESSURE_SOURCE",
@@ -59,6 +60,59 @@ def complete_packet(**overrides):
         "live_orders_allowed": False,
         "capital_change_allowed": False,
         "risk_limit_relaxation_allowed": False,
+        "blocker_cleared": False,
+    }
+    packet.update(overrides)
+    return packet
+
+
+def unavailable_packet(**overrides):
+    packet = {
+        "schema_version": 1,
+        "producer": "Phase51LighterPressureSource",
+        "target_type": "lighter_native_limit",
+        "venue_id": "lighter",
+        "run_id": "governance-closeout",
+        "gate_status": "HOLD",
+        "native_limit_event_time_status": "PRESSURE_UNAVAILABLE",
+        "active_order_provenance_state": "AUDITED_EXPLICIT_SOURCE_UNAVAILABLE",
+        "sendtx_provenance_state": "AUDITED_EXPLICIT_SOURCE_UNAVAILABLE",
+        "request_pressure_provenance_state": "AUDITED_EXPLICIT_SOURCE_UNAVAILABLE",
+        "pressure_packet_state": "AUDITED_SANITIZED_PRESSURE_UNAVAILABLE",
+        "pressure_state": "pressure_unavailable",
+        "raw_identifier_redaction_status": "PASS",
+        "fixture_provenance": "SANITIZED_GOVERNANCE_CLOSEOUT",
+        "native_limit_pressure_source": "LIGHTER_SOURCE_ROUTE_CLOSED_NEGATIVE",
+        "transform_version": "governance-transform-v1",
+        "redaction_policy_version": "governance-redaction-v1",
+        "source_count": 5,
+        "account_limits_probe_status": "REQUIRED_DIMENSIONS_ABSENT",
+        "passive_sendtx_observation_status": "REQUIRED_DIMENSIONS_ABSENT",
+        "repo_docs_sdk_audit_status": "NO_EXPLICIT_SOURCE_FOUND",
+        "websocket_schema_audit_status": "NO_COMPLETE_PRESSURE_DIMENSIONS",
+        "pressure_unavailable_reason": "LIGHTER_EXPLICIT_PRESSURE_SOURCE_CLOSED_NEGATIVE",
+        "governance_decision_sha256": "a" * 64,
+        "completeness_flag": False,
+        "is_synthetic_fixture": False,
+        "derived_from_real_evidence": True,
+        "runtime_observation": False,
+        "capture_enabled": False,
+        "gap_or_staleness_flag": True,
+        "missing_pressure_values_inferred": False,
+        "volume_quota_substitute_rejected": True,
+        "no_live_flag": True,
+        "approved_for_model_training": False,
+        "approved_for_live": False,
+        "approved_for_canary": False,
+        "approved_for_capital_escalation": False,
+        "approved_for_financial_claim": False,
+        "admissible_for_model_training": False,
+        "admissible_for_financial_claim": False,
+        "admissible_for_ev_admission": False,
+        "live_orders_allowed": False,
+        "capital_change_allowed": False,
+        "risk_limit_relaxation_allowed": False,
+        "blocker_cleared": False,
     }
     packet.update(overrides)
     return packet
@@ -82,6 +136,72 @@ class Phase51ApLighterPressureSidecarSchemaTests(unittest.TestCase):
 
         self.assertTrue(result.accepted, result.reject_reasons)
         self.assertEqual(result.sanitized_packet, packet)
+        self.assertEqual(schema.classify_pressure_state(packet), "pressure_complete")
+        self.assertFalse(result.sanitized_packet["blocker_cleared"])
+
+    def test_lighter_pressure_unavailable_packet_is_accepted_as_distinct_state(self):
+        packet = unavailable_packet()
+
+        result = schema.validate_packet(packet)
+
+        self.assertTrue(result.accepted, result.reject_reasons)
+        self.assertEqual(result.sanitized_packet["pressure_state"], "pressure_unavailable")
+        self.assertEqual(
+            result.sanitized_packet["native_limit_event_time_status"],
+            "PRESSURE_UNAVAILABLE",
+        )
+        self.assertFalse(result.sanitized_packet["completeness_flag"])
+        self.assertFalse(result.sanitized_packet["blocker_cleared"])
+        self.assertNotIn("sendtx_per_minute_remaining", result.sanitized_packet)
+        self.assertEqual(schema.classify_pressure_state(packet), "pressure_unavailable")
+
+    def test_pressure_unavailable_rejects_inferred_or_synthesized_pressure_values(self):
+        self.assert_rejected_with(
+            unavailable_packet(sendtx_per_minute_remaining=59),
+            "sendtx_per_minute_remaining must be absent/null when pressure_state is pressure_unavailable",
+        )
+        self.assert_rejected_with(
+            unavailable_packet(missing_pressure_values_inferred=True),
+            "missing_pressure_values_inferred must be False",
+        )
+        self.assert_rejected_with(
+            unavailable_packet(volume_quota_substitute_rejected=False),
+            "volume_quota_substitute_rejected must be True",
+        )
+        self.assert_rejected_with(
+            unavailable_packet(volume_quota_remaining=10780),
+            "unsupported field volume_quota_remaining",
+        )
+
+    def test_pressure_unavailable_requires_sanitized_governance_evidence(self):
+        self.assert_rejected_with(
+            unavailable_packet(governance_decision_sha256="not-a-sha"),
+            "governance_decision_sha256 must be a lowercase sanitized sha256",
+        )
+        self.assert_rejected_with(
+            unavailable_packet(pressure_unavailable_reason="UNKNOWN"),
+            "pressure_unavailable_reason must be",
+        )
+        self.assert_rejected_with(
+            unavailable_packet(repo_docs_sdk_audit_status=""),
+            "repo_docs_sdk_audit_status must be a non-empty string",
+        )
+
+    def test_incomplete_or_unknown_state_is_rejected(self):
+        packet = complete_packet(pressure_state="pressure_incomplete_or_unknown")
+        del packet["sendtx_per_minute_remaining"]
+
+        result = self.assert_rejected_with(
+            packet,
+            "pressure_incomplete_or_unknown is not an accepted Phase 5.1 pressure state",
+        )
+        self.assertIsNone(result.sanitized_packet)
+
+    def test_missing_pressure_state_is_rejected_instead_of_silently_complete(self):
+        packet = complete_packet()
+        del packet["pressure_state"]
+
+        self.assert_rejected_with(packet, "pressure_state must be one of")
 
     def test_complete_weighted_packet_is_accepted(self):
         packet = complete_packet(

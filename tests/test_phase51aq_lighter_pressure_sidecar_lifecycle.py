@@ -35,6 +35,7 @@ def common_fact(fact_type, sample_id="synthetic-sample-1", **overrides):
         "live_orders_allowed": False,
         "capital_change_allowed": False,
         "risk_limit_relaxation_allowed": False,
+        "blocker_cleared": False,
     }
     fact.update(overrides)
     return fact

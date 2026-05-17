@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Synthetic-only Phase 5.1 Lighter pressure sidecar packet schema.
+"""Synthetic/governance Phase 5.1 Lighter pressure sidecar packet schema.
 
-This module is a design-gate validator for synthetic fixtures only. It performs
-no network access, reads no evidence files, writes no evidence rows, does not
-call transaction-submission APIs, and does not observe runtime traffic. Its only
-purpose is to prove the packet contract, provenance gates, redaction gates, and
-completeness gates that a future source-owner sidecar would need to satisfy.
+This module is a design-gate validator for synthetic fixtures and governance
+closeouts only. It performs no network access, reads no evidence files, writes
+no evidence rows, does not call transaction-submission APIs, and does not
+observe runtime traffic. Its purpose is to prove the packet contract,
+provenance gates, redaction gates, completeness gates, and the explicit state
+used when Lighter pressure fields have been audited and are unavailable.
 """
 
 from __future__ import annotations
@@ -30,6 +31,20 @@ REDACTION_STATUS = "PASS"
 FIXTURE_PROVENANCE = "SYNTHETIC_FIXTURE_ONLY"
 PRESSURE_SOURCE = "SYNTHETIC_FIXTURE_PRESSURE_SOURCE"
 MAX_OBSERVATION_LAG_MS = 60_000
+PRESSURE_COMPLETE = "pressure_complete"
+PRESSURE_UNAVAILABLE = "pressure_unavailable"
+PRESSURE_INCOMPLETE_OR_UNKNOWN = "pressure_incomplete_or_unknown"
+PRESSURE_STATES = {
+    PRESSURE_COMPLETE,
+    PRESSURE_UNAVAILABLE,
+    PRESSURE_INCOMPLETE_OR_UNKNOWN,
+}
+UNAVAILABLE_EVENT_TIME_STATUS = "PRESSURE_UNAVAILABLE"
+UNAVAILABLE_PACKET_STATE = "AUDITED_SANITIZED_PRESSURE_UNAVAILABLE"
+UNAVAILABLE_PROVENANCE = "AUDITED_EXPLICIT_SOURCE_UNAVAILABLE"
+UNAVAILABLE_FIXTURE_PROVENANCE = "SANITIZED_GOVERNANCE_CLOSEOUT"
+UNAVAILABLE_PRESSURE_SOURCE = "LIGHTER_SOURCE_ROUTE_CLOSED_NEGATIVE"
+UNAVAILABLE_REASON = "LIGHTER_EXPLICIT_PRESSURE_SOURCE_CLOSED_NEGATIVE"
 
 REQUIRED_FALSE_FLAGS = {
     "approved_for_model_training",
@@ -43,23 +58,20 @@ REQUIRED_FALSE_FLAGS = {
     "live_orders_allowed",
     "capital_change_allowed",
     "risk_limit_relaxation_allowed",
+    "blocker_cleared",
 }
 
-REQUIRED_STRINGS = {
+COMMON_REQUIRED_STRINGS = {
     "producer",
     "target_type",
     "venue_id",
-    "baseline_commit",
     "run_id",
-    "canonical_group_id",
-    "order_key",
-    "public_market_key",
     "native_limit_event_time_status",
-    "target_key_provenance_state",
     "active_order_provenance_state",
     "sendtx_provenance_state",
     "request_pressure_provenance_state",
     "pressure_packet_state",
+    "pressure_state",
     "raw_identifier_redaction_status",
     "fixture_provenance",
     "native_limit_pressure_source",
@@ -68,7 +80,26 @@ REQUIRED_STRINGS = {
     "gate_status",
 }
 
-REQUIRED_INTS = {
+COMPLETE_REQUIRED_STRINGS = {
+    "baseline_commit",
+    "canonical_group_id",
+    "order_key",
+    "public_market_key",
+    "target_key_provenance_state",
+}
+
+UNAVAILABLE_REQUIRED_STRINGS = {
+    "account_limits_probe_status",
+    "governance_decision_sha256",
+    "passive_sendtx_observation_status",
+    "pressure_unavailable_reason",
+    "repo_docs_sdk_audit_status",
+    "websocket_schema_audit_status",
+}
+
+REQUIRED_STRINGS = COMMON_REQUIRED_STRINGS | COMPLETE_REQUIRED_STRINGS
+
+COMPLETE_REQUIRED_INTS = {
     "source_event_time_ms",
     "observed_at_ms",
     "active_order_headroom_account",
@@ -77,6 +108,12 @@ REQUIRED_INTS = {
     "sendtx_per_minute_remaining",
     "source_count",
 }
+
+UNAVAILABLE_REQUIRED_INTS = {
+    "source_count",
+}
+
+REQUIRED_INTS = COMPLETE_REQUIRED_INTS
 
 REQUEST_LIMIT_PAIRS = (
     ("rest_requests_per_minute_limit", "rest_requests_per_minute_remaining"),
@@ -88,9 +125,10 @@ OPTIONAL_INTS = {field for pair in REQUEST_LIMIT_PAIRS for field in pair}
 OPTIONAL_SHA256_FIELDS = {
     "sanitized_source_record_sha256",
     "sanitized_packet_sha256",
+    "governance_decision_sha256",
 }
 
-REQUIRED_BOOLS = {
+COMMON_REQUIRED_BOOLS = {
     "no_live_flag",
     "completeness_flag",
     "is_synthetic_fixture",
@@ -101,13 +139,24 @@ REQUIRED_BOOLS = {
     *REQUIRED_FALSE_FLAGS,
 }
 
+UNAVAILABLE_REQUIRED_BOOLS = {
+    "missing_pressure_values_inferred",
+    "volume_quota_substitute_rejected",
+}
+
+REQUIRED_BOOLS = COMMON_REQUIRED_BOOLS
+
 ALLOWED_FIELDS = {
     "schema_version",
-    *REQUIRED_STRINGS,
-    *REQUIRED_INTS,
+    *COMMON_REQUIRED_STRINGS,
+    *COMPLETE_REQUIRED_STRINGS,
+    *UNAVAILABLE_REQUIRED_STRINGS,
+    *COMPLETE_REQUIRED_INTS,
+    *UNAVAILABLE_REQUIRED_INTS,
     *OPTIONAL_INTS,
     *OPTIONAL_SHA256_FIELDS,
-    *REQUIRED_BOOLS,
+    *COMMON_REQUIRED_BOOLS,
+    *UNAVAILABLE_REQUIRED_BOOLS,
 }
 
 RAW_IDENTIFIER_FIELDS = {
@@ -235,57 +284,138 @@ def validate_packet(packet: Mapping[str, Any]) -> ValidationResult:
             reasons.append(f"field {key} contains secret-shaped or raw-identifier-shaped value")
         _check_nested_safety(value, reasons)
 
+    pressure_state = _declared_pressure_state(packet, reasons)
+
     _require_exact(packet, "schema_version", SCHEMA_VERSION, reasons)
     _require_exact(packet, "producer", PRODUCER, reasons)
     _require_exact(packet, "target_type", TARGET_TYPE, reasons)
     _require_exact(packet, "venue_id", VENUE_ID, reasons)
     _require_exact(packet, "gate_status", "HOLD", reasons)
+    _require_exact(packet, "raw_identifier_redaction_status", REDACTION_STATUS, reasons)
+    _require_exact(packet, "no_live_flag", True, reasons)
+    _require_exact(packet, "runtime_observation", False, reasons)
+    _require_exact(packet, "capture_enabled", False, reasons)
+
+    for flag in sorted(REQUIRED_FALSE_FLAGS):
+        _require_exact(packet, flag, False, reasons)
+
+    for field in sorted(COMMON_REQUIRED_STRINGS):
+        _require_nonempty_string(packet, field, reasons)
+
+    for field in sorted(COMMON_REQUIRED_BOOLS):
+        _require_bool(packet, field, reasons)
+
+    for field in sorted(OPTIONAL_SHA256_FIELDS):
+        if field in packet and not _valid_sha256(packet[field]):
+            reasons.append(f"{field} must be a lowercase sanitized sha256")
+
+    if pressure_state == PRESSURE_COMPLETE:
+        _validate_complete_packet(packet, reasons)
+    elif pressure_state == PRESSURE_UNAVAILABLE:
+        _validate_unavailable_packet(packet, reasons)
+    elif pressure_state == PRESSURE_INCOMPLETE_OR_UNKNOWN:
+        reasons.append("pressure_incomplete_or_unknown is not an accepted Phase 5.1 pressure state")
+
+    if reasons:
+        return ValidationResult(False, tuple(dict.fromkeys(reasons)), None)
+
+    return ValidationResult(True, (), dict(packet))
+
+
+def classify_pressure_state(packet: Mapping[str, Any]) -> str:
+    state = packet.get("pressure_state")
+    if state in PRESSURE_STATES:
+        return str(state)
+    if _has_complete_pressure_dimensions(packet):
+        return PRESSURE_COMPLETE
+    return PRESSURE_INCOMPLETE_OR_UNKNOWN
+
+
+def _declared_pressure_state(packet: Mapping[str, Any], reasons: list[str]) -> str:
+    state = packet.get("pressure_state")
+    if state not in PRESSURE_STATES:
+        reasons.append("pressure_state must be one of pressure_complete, pressure_unavailable, pressure_incomplete_or_unknown")
+        return PRESSURE_INCOMPLETE_OR_UNKNOWN
+    return str(state)
+
+
+def _validate_complete_packet(packet: Mapping[str, Any], reasons: list[str]) -> None:
     _require_exact(packet, "native_limit_event_time_status", EVENT_TIME_STATUS, reasons)
     _require_exact(packet, "target_key_provenance_state", TARGET_KEY_PROVENANCE, reasons)
     _require_exact(packet, "active_order_provenance_state", OBSERVED_PROVENANCE, reasons)
     _require_exact(packet, "sendtx_provenance_state", OBSERVED_PROVENANCE, reasons)
     _require_exact(packet, "request_pressure_provenance_state", OBSERVED_PROVENANCE, reasons)
     _require_exact(packet, "pressure_packet_state", PACKET_STATE, reasons)
-    _require_exact(packet, "raw_identifier_redaction_status", REDACTION_STATUS, reasons)
     _require_exact(packet, "fixture_provenance", FIXTURE_PROVENANCE, reasons)
     _require_exact(packet, "native_limit_pressure_source", PRESSURE_SOURCE, reasons)
-    _require_exact(packet, "no_live_flag", True, reasons)
     _require_exact(packet, "completeness_flag", True, reasons)
     _require_exact(packet, "is_synthetic_fixture", True, reasons)
     _require_exact(packet, "derived_from_real_evidence", False, reasons)
-    _require_exact(packet, "runtime_observation", False, reasons)
-    _require_exact(packet, "capture_enabled", False, reasons)
     _require_exact(packet, "gap_or_staleness_flag", False, reasons)
 
-    for flag in sorted(REQUIRED_FALSE_FLAGS):
-        _require_exact(packet, flag, False, reasons)
-
-    for field in sorted(REQUIRED_STRINGS):
+    for field in sorted(COMPLETE_REQUIRED_STRINGS):
         _require_nonempty_string(packet, field, reasons)
-
-    for field in sorted(REQUIRED_BOOLS):
-        _require_bool(packet, field, reasons)
-
-    for field in sorted(REQUIRED_INTS):
+    for field in sorted(COMPLETE_REQUIRED_INTS):
         _require_nonnegative_int(packet, field, reasons)
-
     for field in sorted(OPTIONAL_INTS):
         if field in packet:
             _require_nonnegative_int(packet, field, reasons)
-
-    for field in sorted(OPTIONAL_SHA256_FIELDS):
-        if field in packet and not _valid_sha256(packet[field]):
-            reasons.append(f"{field} must be a lowercase sanitized sha256")
 
     _check_provenance_values(packet, reasons)
     _check_event_time(packet, reasons)
     _check_pressure_pairs(packet, reasons)
     _check_source_count(packet, reasons)
 
-    if reasons:
-        return ValidationResult(False, tuple(dict.fromkeys(reasons)), None)
 
-    return ValidationResult(True, (), dict(packet))
+def _validate_unavailable_packet(packet: Mapping[str, Any], reasons: list[str]) -> None:
+    _require_exact(packet, "native_limit_event_time_status", UNAVAILABLE_EVENT_TIME_STATUS, reasons)
+    _require_exact(packet, "active_order_provenance_state", UNAVAILABLE_PROVENANCE, reasons)
+    _require_exact(packet, "sendtx_provenance_state", UNAVAILABLE_PROVENANCE, reasons)
+    _require_exact(packet, "request_pressure_provenance_state", UNAVAILABLE_PROVENANCE, reasons)
+    _require_exact(packet, "pressure_packet_state", UNAVAILABLE_PACKET_STATE, reasons)
+    _require_exact(packet, "fixture_provenance", UNAVAILABLE_FIXTURE_PROVENANCE, reasons)
+    _require_exact(packet, "native_limit_pressure_source", UNAVAILABLE_PRESSURE_SOURCE, reasons)
+    _require_exact(packet, "pressure_unavailable_reason", UNAVAILABLE_REASON, reasons)
+    _require_exact(packet, "completeness_flag", False, reasons)
+    _require_exact(packet, "is_synthetic_fixture", False, reasons)
+    _require_exact(packet, "derived_from_real_evidence", True, reasons)
+    _require_exact(packet, "gap_or_staleness_flag", True, reasons)
+    _require_exact(packet, "missing_pressure_values_inferred", False, reasons)
+    _require_exact(packet, "volume_quota_substitute_rejected", True, reasons)
+
+    for field in sorted(UNAVAILABLE_REQUIRED_STRINGS):
+        _require_nonempty_string(packet, field, reasons)
+    for field in sorted(UNAVAILABLE_REQUIRED_INTS):
+        _require_nonnegative_int(packet, field, reasons)
+    for field in sorted(UNAVAILABLE_REQUIRED_BOOLS):
+        _require_bool(packet, field, reasons)
+
+    unavailable_prohibited_ints = (COMPLETE_REQUIRED_INTS - UNAVAILABLE_REQUIRED_INTS) | OPTIONAL_INTS
+    for field in sorted(unavailable_prohibited_ints):
+        if field in packet and packet[field] is not None:
+            reasons.append(f"{field} must be absent/null when pressure_state is pressure_unavailable")
+    if "target_key_provenance_state" in packet:
+        reasons.append("target_key_provenance_state is prohibited when pressure_state is pressure_unavailable")
+    for field in sorted(COMPLETE_REQUIRED_STRINGS - {"baseline_commit"}):
+        if field in packet and str(packet[field]).strip():
+            reasons.append(f"{field} is prohibited when pressure_state is pressure_unavailable")
+    _check_source_count(packet, reasons)
+
+
+def _has_complete_pressure_dimensions(packet: Mapping[str, Any]) -> bool:
+    has_active = all(
+        _is_nonnegative_int(packet.get(field))
+        for field in ("active_order_headroom_account", "active_order_headroom_market")
+    )
+    has_sendtx = all(
+        _is_nonnegative_int(packet.get(field))
+        for field in ("sendtx_per_minute_limit", "sendtx_per_minute_remaining")
+    )
+    has_request_pair = any(
+        all(_is_nonnegative_int(packet.get(field)) for field in pair)
+        for pair in REQUEST_LIMIT_PAIRS
+    )
+    return has_active and has_sendtx and has_request_pair
 
 
 def _check_field_name(key: str, reasons: list[str]) -> None:
@@ -417,14 +547,25 @@ __all__ = [
     "FIXTURE_PROVENANCE",
     "OBSERVED_PROVENANCE",
     "PACKET_STATE",
+    "PRESSURE_COMPLETE",
+    "PRESSURE_INCOMPLETE_OR_UNKNOWN",
     "PRESSURE_SOURCE",
+    "PRESSURE_STATES",
+    "PRESSURE_UNAVAILABLE",
     "PRODUCER",
     "REDACTION_STATUS",
     "SCHEMA_VERSION",
     "TARGET_KEY_PROVENANCE",
     "TARGET_TYPE",
+    "UNAVAILABLE_EVENT_TIME_STATUS",
+    "UNAVAILABLE_FIXTURE_PROVENANCE",
+    "UNAVAILABLE_PACKET_STATE",
+    "UNAVAILABLE_PRESSURE_SOURCE",
+    "UNAVAILABLE_PROVENANCE",
+    "UNAVAILABLE_REASON",
     "VENUE_ID",
     "ValidationResult",
+    "classify_pressure_state",
     "packet_digest",
     "validate_packet",
 ]
