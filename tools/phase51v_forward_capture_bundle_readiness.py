@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import phase51ap_lighter_pressure_sidecar_schema as pressure_schema
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_COMMIT = "18dd09512288a85e440d3977e32432c3aabc1190"
@@ -118,6 +120,8 @@ LIGHTER_LIMIT_ALIGNMENT_OK = {
     "SNAPSHOT_AT_DECISION_TIME",
     "OBSERVED_AT_DECISION_TIME",
 }
+PRESSURE_UNAVAILABLE_STATUS = "PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD"
+PRESSURE_UNAVAILABLE_REASON = "lighter_explicit_pressure_source_closed_negative"
 
 
 def _sha256_file(path: Path) -> str:
@@ -558,6 +562,25 @@ def _has_lighter_limit_fields(row: dict[str, Any]) -> bool:
     return has_active and has_sendtx and has_rest_or_weighted and row.get("native_limit_event_time_status") in LIGHTER_LIMIT_ALIGNMENT_OK
 
 
+def _pressure_state(row: dict[str, Any], path: Path, line_no: int) -> str:
+    state = row.get("pressure_state")
+    if state is None:
+        return "pressure_complete" if _has_lighter_limit_fields(row) else "pressure_incomplete_or_unknown"
+    if state == pressure_schema.PRESSURE_UNAVAILABLE:
+        result = pressure_schema.validate_packet(row)
+        if not result.accepted:
+            joined = "; ".join(result.reject_reasons)
+            raise ValueError(f"{path}:{line_no} invalid pressure_unavailable governance packet: {joined}")
+        return pressure_schema.PRESSURE_UNAVAILABLE
+    if state == pressure_schema.PRESSURE_COMPLETE:
+        if not _has_lighter_limit_fields(row):
+            raise ValueError(f"{path}:{line_no} pressure_complete row lacks complete explicit pressure dimensions")
+        return pressure_schema.PRESSURE_COMPLETE
+    if state == pressure_schema.PRESSURE_INCOMPLETE_OR_UNKNOWN:
+        return pressure_schema.PRESSURE_INCOMPLETE_OR_UNKNOWN
+    raise ValueError(f"{path}:{line_no} unsupported pressure_state {state!r}")
+
+
 def _load_manifest(manifest_path: Path) -> dict[str, Any]:
     manifest = _load_json(manifest_path)
     if not isinstance(manifest, dict):
@@ -633,6 +656,8 @@ def build_forward_capture_bundle_readiness(
     source_link_artifacts: list[dict[str, Any]] = []
     source_link_targets: dict[str, dict[str, Any]] = {}
     source_link_applied_row_count = 0
+    lighter_pressure_state_counts: dict[str, int] = {}
+    lighter_pressure_unavailable_source_count = 0
     seq = 0
 
     for index, source_link in enumerate(_manifest_paths(manifest.get("source_links"))):
@@ -715,6 +740,8 @@ def build_forward_capture_bundle_readiness(
                 venue = _venue_id(row, venue_fallback)
                 role_ready = False
                 limit_ready = False
+                lighter_pressure_state = "not_lighter"
+                lighter_limit_governance_status = "NOT_APPLICABLE"
                 role_target, role_join_status = _resolve_target_with_source_link(
                     row,
                     role_by_group,
@@ -737,7 +764,24 @@ def build_forward_capture_bundle_readiness(
                     source_link_targets,
                     target_key="limit_target",
                 )
-                if limit_target is not None and venue == "lighter" and _has_lighter_limit_fields(row):
+                if venue == "lighter":
+                    lighter_pressure_state = _pressure_state(row, path, line_no)
+                    lighter_pressure_state_counts[lighter_pressure_state] = (
+                        lighter_pressure_state_counts.get(lighter_pressure_state, 0) + 1
+                    )
+                    if lighter_pressure_state == pressure_schema.PRESSURE_UNAVAILABLE:
+                        lighter_pressure_unavailable_source_count += 1
+                        lighter_limit_governance_status = PRESSURE_UNAVAILABLE_STATUS
+                    elif lighter_pressure_state == pressure_schema.PRESSURE_COMPLETE:
+                        lighter_limit_governance_status = "PRESSURE_COMPLETE"
+                    else:
+                        lighter_limit_governance_status = "PRESSURE_INCOMPLETE_OR_UNKNOWN"
+                if (
+                    limit_target is not None
+                    and venue == "lighter"
+                    and lighter_pressure_state == pressure_schema.PRESSURE_COMPLETE
+                    and _has_lighter_limit_fields(row)
+                ):
                     limit_ready_target_ids.add(_target_id(limit_target))
                     limit_ready = True
                     limit_ready_count += 1
@@ -762,6 +806,8 @@ def build_forward_capture_bundle_readiness(
                         "source_row_readiness_status": "READY_FOR_TARGET" if role_ready or limit_ready else "NOT_TARGET_READY",
                         "role_target_ready": role_ready,
                         "lighter_limit_target_ready": limit_ready,
+                        "lighter_limit_pressure_state": lighter_pressure_state,
+                        "lighter_limit_governance_status": lighter_limit_governance_status,
                     }
                 )
                 labels.append(label)
@@ -800,6 +846,7 @@ def build_forward_capture_bundle_readiness(
     missing_limit_targets = [
         row for row in limit_targets if _target_id(row) not in limit_ready_target_ids
     ]
+    limit_unavailable_count = len(missing_limit_targets) if lighter_pressure_unavailable_source_count else 0
     role_ready_count = len(role_targets) - len(missing_role_targets)
     limit_ready_count = len(limit_targets) - len(missing_limit_targets)
     bundle_ready = bool(role_targets or limit_targets) and not missing_role_targets and not missing_limit_targets
@@ -837,6 +884,14 @@ def build_forward_capture_bundle_readiness(
         "lighter_native_limit_capture_target_count": len(limit_targets),
         "lighter_native_limit_capture_target_ready_count": limit_ready_count,
         "lighter_native_limit_capture_target_missing_count": len(missing_limit_targets),
+        "lighter_native_limit_pressure_unavailable_source_count": lighter_pressure_unavailable_source_count,
+        "lighter_native_limit_pressure_unavailable_target_count": limit_unavailable_count,
+        "lighter_native_limit_pressure_state_counts": dict(sorted(lighter_pressure_state_counts.items())),
+        "lighter_native_limit_pressure_unavailable_status": (
+            PRESSURE_UNAVAILABLE_STATUS if lighter_pressure_unavailable_source_count else "NOT_OBSERVED"
+        ),
+        "revised_pressure_unavailable_contract_observed": bool(lighter_pressure_unavailable_source_count),
+        "revised_pressure_unavailable_contract_clears_blocker": False,
         "source_file_count": len(source_artifacts),
         "source_link_file_count": len(source_link_artifacts),
         "source_file_status_counts": _artifact_status_counts(source_artifacts),

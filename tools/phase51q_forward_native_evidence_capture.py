@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import phase51ap_lighter_pressure_sidecar_schema as pressure_schema
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_COMMIT = "18dd09512288a85e440d3977e32432c3aabc1190"
@@ -67,6 +69,8 @@ VENUE_SPECIFIC_ROLE_SOURCES = {
     "EXTENDED_ISTAKER": "extended",
 }
 ROLE_VALUES = {"MAKER", "TAKER", "UNKNOWN"}
+PRESSURE_UNAVAILABLE_STATUS = "PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD"
+PRESSURE_UNAVAILABLE_REASON = "lighter_explicit_pressure_source_closed_negative"
 
 
 def _sha256_file(path: Path) -> str:
@@ -259,6 +263,8 @@ def _load_native_roles(paths: list[Path]) -> tuple[dict[str, dict[str, Any]], li
 
 
 def _normalize_limit_source(row: dict[str, Any], path: Path, line_no: int) -> dict[str, Any]:
+    if row.get("pressure_state") == pressure_schema.PRESSURE_UNAVAILABLE:
+        return _normalize_pressure_unavailable_source(row, path, line_no)
     canonical_group_id = str(row.get("canonical_group_id") or "")
     if not canonical_group_id:
         raise ValueError(f"{path}:{line_no} missing canonical_group_id")
@@ -282,8 +288,117 @@ def _normalize_limit_source(row: dict[str, Any], path: Path, line_no: int) -> di
     }
 
 
-def _load_native_limits(paths: list[Path]) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+def _normalize_pressure_unavailable_source(row: dict[str, Any], path: Path, line_no: int) -> dict[str, Any]:
+    if row.get("producer") == pressure_schema.PRODUCER:
+        result = pressure_schema.validate_packet(row)
+        if not result.accepted:
+            joined = "; ".join(result.reject_reasons)
+            raise ValueError(f"{path}:{line_no} invalid pressure_unavailable governance packet: {joined}")
+        packet = result.sanitized_packet or dict(row)
+    else:
+        packet = row
+        allowed = {
+            "schema_version",
+            "label_type",
+            "label_seq",
+            "timestamp_local_ns",
+            "run_id",
+            "baseline_commit",
+            "gate_status",
+            "no_live_flag",
+            "approved_for_model_training",
+            "approved_for_live",
+            "approved_for_canary",
+            "approved_for_capital_escalation",
+            "admissible_for_financial_claim",
+            "admissible_for_ev_admission",
+            "live_orders_allowed",
+            "capital_change_allowed",
+            "risk_limit_relaxation_allowed",
+            "raw_identifier_redaction_status",
+            "venue_id",
+            "pressure_state",
+            "native_limit_event_time_status",
+            "native_limit_pressure_status",
+            "native_limit_pressure_hold_reason",
+            "account_limits_probe_status",
+            "passive_sendtx_observation_status",
+            "repo_docs_sdk_audit_status",
+            "websocket_schema_audit_status",
+            "pressure_unavailable_reason",
+            "governance_decision_sha256",
+            "missing_pressure_values_inferred",
+            "volume_quota_substitute_rejected",
+            "blocker_cleared",
+            "source_record_sha256",
+            "native_limit_source_sha256",
+        }
+        unexpected = sorted(set(packet) - allowed)
+        if unexpected:
+            raise ValueError(f"{path}:{line_no} unsupported pressure_unavailable fields: {unexpected}")
+        required = {
+            "pressure_state": pressure_schema.PRESSURE_UNAVAILABLE,
+            "native_limit_event_time_status": pressure_schema.UNAVAILABLE_EVENT_TIME_STATUS,
+            "missing_pressure_values_inferred": False,
+            "volume_quota_substitute_rejected": True,
+            "blocker_cleared": False,
+        }
+        for field, expected in required.items():
+            if packet.get(field) != expected:
+                raise ValueError(f"{path}:{line_no} {field} must be {expected!r}")
+        if packet.get("venue_id") != "lighter":
+            raise ValueError(f"{path}:{line_no} pressure_unavailable is only accepted for venue_id=lighter")
+        for field in (
+            "account_limits_probe_status",
+            "passive_sendtx_observation_status",
+            "repo_docs_sdk_audit_status",
+            "websocket_schema_audit_status",
+            "pressure_unavailable_reason",
+            "governance_decision_sha256",
+        ):
+            value = packet.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{path}:{line_no} {field} must be a non-empty sanitized governance field")
+        governance_sha = str(packet.get("governance_decision_sha256") or "")
+        if len(governance_sha) != 64 or any(char not in "0123456789abcdef" for char in governance_sha):
+            raise ValueError(f"{path}:{line_no} governance_decision_sha256 must be a lowercase sanitized sha256")
+        for field in (
+            "active_order_headroom_account",
+            "active_order_headroom_market",
+            "sendtx_per_minute_limit",
+            "sendtx_per_minute_remaining",
+            "rest_requests_per_minute_limit",
+            "rest_requests_per_minute_remaining",
+            "weighted_requests_per_minute_limit",
+            "weighted_requests_per_minute_remaining",
+            "volume_quota_remaining",
+        ):
+            if packet.get(field) is not None:
+                raise ValueError(f"{path}:{line_no} {field} is prohibited for pressure_unavailable")
+
+    return {
+        "canonical_group_id": None,
+        "venue_id": "lighter",
+        "pressure_state": pressure_schema.PRESSURE_UNAVAILABLE,
+        "native_limit_event_time_status": pressure_schema.UNAVAILABLE_EVENT_TIME_STATUS,
+        "native_limit_pressure_status": PRESSURE_UNAVAILABLE_STATUS,
+        "native_limit_pressure_hold_reason": PRESSURE_UNAVAILABLE_REASON,
+        "account_limits_probe_status": packet.get("account_limits_probe_status"),
+        "passive_sendtx_observation_status": packet.get("passive_sendtx_observation_status"),
+        "repo_docs_sdk_audit_status": packet.get("repo_docs_sdk_audit_status"),
+        "websocket_schema_audit_status": packet.get("websocket_schema_audit_status"),
+        "pressure_unavailable_reason": packet.get("pressure_unavailable_reason"),
+        "governance_decision_sha256": packet.get("governance_decision_sha256"),
+        "missing_pressure_values_inferred": False,
+        "volume_quota_substitute_rejected": True,
+        "blocker_cleared": False,
+        "native_limit_source_sha256": row.get("native_limit_source_sha256") or row.get("source_record_sha256"),
+    }
+
+
+def _load_native_limits(paths: list[Path]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
     by_group: dict[str, dict[str, Any]] = {}
+    unavailable_by_venue: dict[str, dict[str, Any]] = {}
     infos: list[dict[str, Any]] = []
     for raw_path in paths:
         path = _resolve_path(raw_path)
@@ -291,13 +406,20 @@ def _load_native_limits(paths: list[Path]) -> tuple[dict[str, dict[str, Any]], l
         for line_no, row in _iter_jsonl(path):
             _check_safety(row, path, label="native limit source")
             record = _normalize_limit_source(row, path, line_no)
+            if record.get("pressure_state") == pressure_schema.PRESSURE_UNAVAILABLE:
+                venue = str(record.get("venue_id") or "")
+                if venue in unavailable_by_venue:
+                    raise ValueError(f"{path}:{line_no} duplicate pressure_unavailable source for venue_id={venue}")
+                unavailable_by_venue[venue] = record
+                count += 1
+                continue
             group = record["canonical_group_id"]
             if group in by_group:
                 raise ValueError(f"{path}:{line_no} duplicate canonical_group_id={group}")
             by_group[group] = record
             count += 1
         infos.append({"path": str(path), "sha256": _sha256_file(path), "record_count": count})
-    return by_group, infos
+    return by_group, unavailable_by_venue, infos
 
 
 def _base_record(run_id: str, seq: int, timestamp_ns: int, label_type: str) -> dict[str, Any]:
@@ -328,6 +450,8 @@ def _limit_status(venue_id: str, source: dict[str, Any] | None) -> tuple[str, st
         return "NOT_APPLICABLE_NON_LIGHTER", "native_limit_pressure_gate_is_currently_lighter_specific"
     if source is None:
         return "MISSING_NATIVE_LIMIT_PRESSURE_SOURCE", "missing_event_time_native_limit_snapshot"
+    if source.get("pressure_state") == pressure_schema.PRESSURE_UNAVAILABLE:
+        return PRESSURE_UNAVAILABLE_STATUS, PRESSURE_UNAVAILABLE_REASON
     has_active = (
         source.get("active_order_headroom_account") is not None
         and source.get("active_order_headroom_market") is not None
@@ -378,7 +502,7 @@ def build_forward_native_evidence(
 
     observed_summary, labels = _load_observed_pfill(observed_pfill_run)
     role_by_group, role_source_infos = _load_native_roles(native_role_jsonl)
-    limit_by_group, limit_source_infos = _load_native_limits(native_limit_jsonl)
+    limit_by_group, limit_unavailable_by_venue, limit_source_infos = _load_native_limits(native_limit_jsonl)
 
     native_role_evidence: list[dict[str, Any]] = []
     role_labels: list[dict[str, Any]] = []
@@ -465,6 +589,8 @@ def build_forward_native_evidence(
         role_labels.append(role_record)
 
         limit_source = limit_by_group.get(group)
+        if limit_source is None:
+            limit_source = limit_unavailable_by_venue.get(venue_id)
         limit_status, limit_reason = _limit_status(venue_id, limit_source)
         limit_record = _base_record(
             run_id,
@@ -495,6 +621,16 @@ def build_forward_native_evidence(
                 "native_limit_event_time_status",
                 "native_limit_staleness_ms",
                 "native_limit_source_sha256",
+                "pressure_state",
+                "account_limits_probe_status",
+                "passive_sendtx_observation_status",
+                "repo_docs_sdk_audit_status",
+                "websocket_schema_audit_status",
+                "pressure_unavailable_reason",
+                "governance_decision_sha256",
+                "missing_pressure_values_inferred",
+                "volume_quota_substitute_rejected",
+                "blocker_cleared",
             ):
                 limit_record[key] = limit_source.get(key)
         limit_labels.append(limit_record)
@@ -516,9 +652,16 @@ def build_forward_native_evidence(
     partial_role_count = role_status_counts.get("PARTIAL_FORWARD_NATIVE_ROLE_SOURCE", 0)
     missing_limit_count = limit_status_counts.get("MISSING_NATIVE_LIMIT_PRESSURE_SOURCE", 0)
     partial_limit_count = limit_status_counts.get("PARTIAL_NATIVE_LIMIT_PRESSURE_SOURCE", 0)
+    unavailable_limit_count = limit_status_counts.get(PRESSURE_UNAVAILABLE_STATUS, 0)
     gate_reason = (
         "phase51q_forward_native_evidence_complete_nonlive_hold"
-        if missing_role_count == 0 and partial_role_count == 0 and missing_limit_count == 0 and partial_limit_count == 0
+        if (
+            missing_role_count == 0
+            and partial_role_count == 0
+            and missing_limit_count == 0
+            and partial_limit_count == 0
+            and unavailable_limit_count == 0
+        )
         else "phase51q_forward_native_evidence_incomplete"
     )
 
@@ -547,6 +690,9 @@ def build_forward_native_evidence(
         "native_role_capture_status_counts": role_status_counts,
         "native_role_source_counts": _source_counts(native_role_evidence, "maker_taker_attribution_source"),
         "native_limit_pressure_status_counts": limit_status_counts,
+        "native_limit_pressure_unavailable_count": unavailable_limit_count,
+        "revised_pressure_unavailable_contract_observed": bool(limit_unavailable_by_venue),
+        "revised_pressure_unavailable_contract_clears_blocker": False,
         "raw_identifier_redaction_status": "PASS",
         "native_role_source_artifacts": role_source_infos,
         "native_limit_source_artifacts": limit_source_infos,

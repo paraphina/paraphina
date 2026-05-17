@@ -294,6 +294,7 @@ def _decision_rows(
     timestamp_ns: int,
     target_run: Path,
     phase51v_run: Path,
+    phase51v_summary: dict[str, Any],
     target_pack_mode: str,
 ) -> list[dict[str, Any]]:
     role_targets, limit_targets = _load_targets(target_run)
@@ -305,6 +306,8 @@ def _decision_rows(
         _target_id(row)
         for _, row in _iter_jsonl(phase51v_run / "missing_lighter_native_limit_capture_targets.jsonl")
     }
+    unavailable_limit_targets = int(phase51v_summary.get("lighter_native_limit_pressure_unavailable_target_count") or 0)
+    pressure_unavailable_active = unavailable_limit_targets > 0
 
     rows: list[dict[str, Any]] = []
     seq = 0
@@ -315,12 +318,18 @@ def _decision_rows(
         for target in targets:
             target_id = _target_id(target)
             missing = target_id in missing_ids
-            if target_pack_mode == "forward-refresh":
+            if target_type == "lighter_native_limit" and missing and pressure_unavailable_active:
+                decision_status = "PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD"
+                next_required_action = "APPLY_REVISED_PRESSURE_UNAVAILABLE_GOVERNANCE_CONTRACT"
+                forward_refresh_required = False
+            elif target_pack_mode == "forward-refresh":
                 decision_status = "FORWARD_REFRESH_PACK_INCOMPLETE" if missing else "READY_FORWARD_REFRESH_PACK"
                 next_required_action = "FORWARD_REFRESH_SOURCE_TRUTH_REQUIRED" if missing else "NONE"
+                forward_refresh_required = missing
             else:
                 decision_status = "UNRECOVERABLE_FROM_LOCAL_ARTIFACTS" if missing else "RECOVERED_CURRENT_PACK"
                 next_required_action = "FORWARD_REFRESH_REQUIRED" if missing else "NONE"
+                forward_refresh_required = missing
             row = {
                 "schema_version": 1,
                 "label_type": "PHASE51AK_BLOCKER_TARGET_DECISION",
@@ -334,7 +343,10 @@ def _decision_rows(
                 "current_pack_target_ready": not missing,
                 "current_pack_missing_after_final_validation": missing,
                 "next_required_action": next_required_action,
-                "forward_refresh_required": missing,
+                "forward_refresh_required": forward_refresh_required,
+                "pressure_unavailable_governance_hold": (
+                    target_type == "lighter_native_limit" and missing and pressure_unavailable_active
+                ),
                 "target_pack_mode": target_pack_mode,
                 "phase51v_run": str(phase51v_run),
                 "no_live_flag": True,
@@ -476,6 +488,7 @@ def build_blocker_resolution_runner(
         timestamp_ns=timestamp_ns,
         target_run=target_run,
         phase51v_run=phase51v_run,
+        phase51v_summary=phase51v_summary,
         target_pack_mode=target_pack_mode,
     )
     decision_path = out_dir / "phase51ak_blocker_target_decisions.jsonl"
@@ -485,7 +498,12 @@ def build_blocker_resolution_runner(
     _write_jsonl(decision_path, decision_rows)
     missing_role = int(phase51v_summary.get("native_role_capture_target_missing_count") or 0)
     missing_limit = int(phase51v_summary.get("lighter_native_limit_capture_target_missing_count") or 0)
+    pressure_unavailable_targets = int(
+        phase51v_summary.get("lighter_native_limit_pressure_unavailable_target_count") or 0
+    )
     downstream_ready = bool(phase51v_summary.get("downstream_chain_ready"))
+    pressure_unavailable_governance_hold = pressure_unavailable_targets > 0
+    unresolved_without_governance = missing_role > 0 or (missing_limit - pressure_unavailable_targets) > 0
     summary = {
         "schema_version": 1,
         "run_id": run_id,
@@ -500,9 +518,13 @@ def build_blocker_resolution_runner(
             )
             if downstream_ready
             else (
-                "phase51ak_forward_refresh_pack_incomplete_nonlive_hold"
-                if target_pack_mode == "forward-refresh"
-                else "phase51ak_current_pack_incomplete_forward_refresh_required_nonlive_hold"
+                "phase51ak_pressure_unavailable_governance_hold_nonlive"
+                if pressure_unavailable_governance_hold and not unresolved_without_governance
+                else (
+                    "phase51ak_forward_refresh_pack_incomplete_nonlive_hold"
+                    if target_pack_mode == "forward-refresh"
+                    else "phase51ak_current_pack_incomplete_forward_refresh_required_nonlive_hold"
+                )
             )
         ),
         "target_pack_mode": target_pack_mode,
@@ -522,16 +544,25 @@ def build_blocker_resolution_runner(
             "lighter_native_limit_capture_target_ready_count"
         ),
         "lighter_native_limit_capture_target_missing_count": missing_limit,
+        "lighter_native_limit_pressure_unavailable_target_count": pressure_unavailable_targets,
+        "pressure_unavailable_governance_hold": pressure_unavailable_governance_hold,
+        "revised_pressure_unavailable_contract_clears_blocker": False,
         "phase51v_downstream_chain_ready": downstream_ready,
         "decision_row_count": len(decision_rows),
         "decision_status_counts": _status_counts(decision_rows, "decision_status"),
         "decision_status_counts_by_target_type_venue": _decision_counts_by_type_venue(decision_rows),
-        "forward_refresh_required": not downstream_ready,
-        "validated_mapping_required_for_current_pack": not downstream_ready,
+        "forward_refresh_required": bool(unresolved_without_governance if pressure_unavailable_governance_hold else not downstream_ready),
+        "validated_mapping_required_for_current_pack": bool(
+            unresolved_without_governance if pressure_unavailable_governance_hold else not downstream_ready
+        ),
         "next_required_action": (
             "run_phase51s_to_phase51i_nonlive_ladder"
             if downstream_ready
-            else "obtain_validated_mapping_or_forward_refresh_target_pack_with_event_time_sources"
+            else (
+                "apply_revised_pressure_unavailable_governance_contract"
+                if pressure_unavailable_governance_hold and not unresolved_without_governance
+                else "obtain_validated_mapping_or_forward_refresh_target_pack_with_event_time_sources"
+            )
         ),
         "component_runs": component_infos,
         "clears_phase51_blockers": False,
