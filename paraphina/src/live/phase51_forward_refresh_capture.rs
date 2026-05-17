@@ -123,6 +123,7 @@ impl Phase51CaptureExecutionMode {
 pub struct Phase51LiveNativeRoleCanaryContext {
     pub canary_enabled: bool,
     pub native_role_strict_canary_enabled: bool,
+    pub native_role_one_sided_canary_enabled: bool,
     pub venue_ids: Vec<String>,
     pub canary_max_open_orders: Option<usize>,
     pub canary_enforce_post_only: bool,
@@ -800,6 +801,11 @@ fn validate_live_native_role_canary_context(
     if !live_context.native_role_strict_canary_enabled {
         return Err(Phase51CaptureError::new(
             "phase51 live native-role canary capture requires strict native-role canary mode",
+        ));
+    }
+    if !live_context.native_role_one_sided_canary_enabled {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires one-sided native-role canary mode",
         ));
     }
     let venue_ids: Vec<String> = live_context

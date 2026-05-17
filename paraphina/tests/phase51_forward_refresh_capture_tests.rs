@@ -41,6 +41,7 @@ fn lighter_strict_live_context() -> Phase51LiveNativeRoleCanaryContext {
     Phase51LiveNativeRoleCanaryContext {
         canary_enabled: true,
         native_role_strict_canary_enabled: true,
+        native_role_one_sided_canary_enabled: true,
         venue_ids: vec!["lighter".to_string()],
         canary_max_open_orders: Some(1),
         canary_enforce_post_only: true,
@@ -186,6 +187,16 @@ fn live_native_role_canary_requires_all_runtime_guards() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("strict native-role canary"));
+
+    let mut context = lighter_strict_live_context();
+    context.native_role_one_sided_canary_enabled = false;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("one-sided native-role canary"));
 
     let mut context = lighter_strict_live_context();
     context.strict_maker_only_observation_enabled = false;

@@ -1881,6 +1881,77 @@ fn phase51_lighter_native_role_strict_canary_validate_order_intents(
     Ok(())
 }
 
+fn phase51_lighter_native_role_apply_one_sided_canary_filter(
+    intents: &mut Vec<OrderIntent>,
+) -> Result<(), &'static str> {
+    if !phase51_lighter_native_role_one_sided_canary_enabled() {
+        return Ok(());
+    }
+    if intents.is_empty() {
+        return Ok(());
+    }
+    let preferred_side =
+        phase51_lighter_native_role_one_sided_side().ok_or("invalid_one_sided_side")?;
+    let mut place_indices = Vec::new();
+    let mut cancel_count = 0usize;
+    for (idx, intent) in intents.iter().enumerate() {
+        match intent {
+            OrderIntent::Place(place) => {
+                if place.venue_id.as_ref() != "lighter" {
+                    return Err("non_lighter_place");
+                }
+                if place.purpose != OrderPurpose::Mm {
+                    return Err("non_mm_place");
+                }
+                if place.time_in_force != TimeInForce::Gtc {
+                    return Err("non_gtc_place");
+                }
+                if !place.post_only {
+                    return Err("non_post_only_place");
+                }
+                if place.reduce_only {
+                    return Err("reduce_only_place");
+                }
+                if place.phase51_target_key.is_none() {
+                    return Err("missing_phase51_target_key");
+                }
+                place_indices.push(idx);
+            }
+            OrderIntent::Cancel(cancel) => {
+                cancel_count += 1;
+                if cancel.venue_id.as_ref() != "lighter" {
+                    return Err("non_lighter_cancel");
+                }
+            }
+            OrderIntent::CancelAll(cancel_all) => {
+                cancel_count += 1;
+                if let Some(venue_id) = cancel_all.venue_id.as_ref() {
+                    if venue_id.as_ref() != "lighter" {
+                        return Err("non_lighter_cancel_all");
+                    }
+                }
+            }
+            OrderIntent::Replace(_) => return Err("replace_disabled"),
+        }
+    }
+
+    if place_indices.is_empty() {
+        return Ok(());
+    }
+    if cancel_count > 0 {
+        return Err("cancel_and_place_replacement_disabled");
+    }
+    let keep_idx = place_indices
+        .iter()
+        .copied()
+        .find(|idx| matches!(&intents[*idx], OrderIntent::Place(place) if place.side == preferred_side))
+        .ok_or("preferred_side_absent")?;
+    let mut next = Vec::with_capacity(1);
+    next.push(intents[keep_idx].clone());
+    *intents = next;
+    Ok(())
+}
+
 async fn send_order_and_wait_with_status(
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
@@ -2653,6 +2724,10 @@ const KILL_CANCEL_ALL_TIMEOUT_MS_PER_VENUE: u64 = 1_000;
 const KILL_FLATTEN_TIMEOUT_MS: u64 = 2_000;
 const PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY";
+const PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_CANARY_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED";
+const PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_SIDE_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_SIDE";
 const PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS";
 const PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV: &str =
@@ -2780,6 +2855,8 @@ pub async fn run_live_loop(
     let phase51_live_native_role_canary_context = Phase51LiveNativeRoleCanaryContext {
         canary_enabled: phase51_true_env("PARAPHINA_CANARY_MODE"),
         native_role_strict_canary_enabled: phase51_lighter_native_role_strict_canary_enabled(),
+        native_role_one_sided_canary_enabled: phase51_lighter_native_role_one_sided_canary_enabled(
+        ),
         venue_ids: cfg.venues.iter().map(|venue| venue.id.clone()).collect(),
         canary_max_open_orders: phase51_usize_env("PARAPHINA_CANARY_MAX_OPEN_ORDERS"),
         canary_enforce_post_only: phase51_true_env("PARAPHINA_CANARY_ENFORCE_POST_ONLY"),
@@ -5630,6 +5707,14 @@ pub async fn run_live_loop(
                 client_order_id: None,
                 phase51_target_key: None,
             }));
+        }
+        if let Err(reason) = phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents)
+        {
+            eprintln!(
+                "[runner] tick={} phase51_lighter_native_role_one_sided_canary_blocked_request reason={}",
+                tick, reason
+            );
+            intents.clear();
         }
         if !intents.is_empty() {
             normalize_live_client_order_ids(&mut intents, tick);
@@ -10504,6 +10589,19 @@ fn phase51_lighter_native_role_strict_canary_enabled() -> bool {
     phase51_true_env(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV)
 }
 
+fn phase51_lighter_native_role_one_sided_canary_enabled() -> bool {
+    phase51_true_env(PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_CANARY_ENV)
+}
+
+fn phase51_lighter_native_role_one_sided_side() -> Option<Side> {
+    let raw = std::env::var(PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_SIDE_ENV).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "buy" | "bid" => Some(Side::Buy),
+        "sell" | "ask" => Some(Side::Sell),
+        _ => None,
+    }
+}
+
 fn phase51_lighter_native_role_replacements_disabled() -> bool {
     phase51_true_env(PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV)
 }
@@ -14467,8 +14565,9 @@ mod tests {
     use crate::state::{MmOpenOrder, OpenOrderRecord};
     use crate::telemetry::{TelemetryBuilder, TelemetryInputs};
     use crate::types::{
-        CancelAllOrderIntent, CancelOrderIntent, FundingSource, OrderPurpose, PlaceOrderIntent,
-        ReplaceOrderIntent, SettlementPriceKind, Side, TimeInForce,
+        CancelAllOrderIntent, CancelOrderIntent, FundingSource, OrderPurpose,
+        Phase51ForwardRefreshTargetKey, PlaceOrderIntent, ReplaceOrderIntent, SettlementPriceKind,
+        Side, TimeInForce,
     };
     use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
@@ -14518,6 +14617,22 @@ mod tests {
         })
     }
 
+    fn lighter_target_key(label: &str) -> Phase51ForwardRefreshTargetKey {
+        Phase51ForwardRefreshTargetKey {
+            canonical_group_id: format!("cg-{label}"),
+            order_key: format!("ok-{label}"),
+        }
+    }
+
+    fn lighter_targeted_place_intent(side: Side, label: &str) -> OrderIntent {
+        let mut intent = lighter_place_intent();
+        if let OrderIntent::Place(place) = &mut intent {
+            place.side = side;
+            place.phase51_target_key = Some(lighter_target_key(label));
+        }
+        intent
+    }
+
     fn lighter_replace_intent() -> OrderIntent {
         OrderIntent::Replace(ReplaceOrderIntent {
             venue_index: 0,
@@ -14552,6 +14667,24 @@ mod tests {
         let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
         let _guard = EnvGuard::new(&keys);
         std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV, "true");
+        std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV, "true");
+        std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV, "true");
+        f()
+    }
+
+    fn with_phase51_one_sided_native_role_canary_env<R>(side: &str, f: impl FnOnce() -> R) -> R {
+        let keys = [
+            PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV,
+            PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_CANARY_ENV,
+            PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_SIDE_ENV,
+            PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV,
+            PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV,
+        ];
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&keys);
+        std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV, "true");
+        std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_CANARY_ENV, "true");
+        std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_SIDE_ENV, side);
         std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS_ENV, "true");
         std::env::set_var(PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV, "true");
         f()
@@ -14647,6 +14780,69 @@ mod tests {
             assert_eq!(
                 phase51_lighter_native_role_strict_canary_validate_order_intents(&[reduce_only]),
                 Err("reduce_only_place")
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_one_sided_canary_keeps_only_preferred_targeted_side() {
+        with_phase51_one_sided_native_role_canary_env("buy", || {
+            let mut intents = vec![
+                lighter_targeted_place_intent(Side::Buy, "bid"),
+                lighter_targeted_place_intent(Side::Sell, "ask"),
+            ];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Ok(())
+            );
+            assert_eq!(intents.len(), 1);
+            let OrderIntent::Place(place) = &intents[0] else {
+                panic!("expected place");
+            };
+            assert_eq!(place.side, Side::Buy);
+            assert_eq!(place.phase51_target_key, Some(lighter_target_key("bid")));
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&intents),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_one_sided_canary_requires_target_key_and_valid_side() {
+        with_phase51_one_sided_native_role_canary_env("buy", || {
+            let mut intents = vec![lighter_place_intent()];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Err("missing_phase51_target_key")
+            );
+        });
+        with_phase51_one_sided_native_role_canary_env("sideways", || {
+            let mut intents = vec![lighter_targeted_place_intent(Side::Buy, "bid")];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Err("invalid_one_sided_side")
+            );
+        });
+        with_phase51_one_sided_native_role_canary_env("sell", || {
+            let mut intents = vec![lighter_targeted_place_intent(Side::Buy, "bid")];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Err("preferred_side_absent")
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_one_sided_canary_blocks_cancel_place_replacement_shape() {
+        with_phase51_one_sided_native_role_canary_env("buy", || {
+            let mut intents = vec![
+                lighter_cancel_intent(),
+                lighter_targeted_place_intent(Side::Buy, "bid"),
+            ];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Err("cancel_and_place_replacement_disabled")
             );
         });
     }
