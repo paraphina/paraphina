@@ -1,0 +1,33 @@
+# Phase 5.1 Lighter baseline cleanup profile.
+# Use only with --connectors lighter, live execution guardrails, capture disabled,
+# and the Phase 5.1 strict native-role evidence canary disabled.
+
+[venue]
+base_order_size = 0.01
+max_order_size = 0.01
+
+[limits]
+# Trigger the existing canary-breach flatten path when the selected Lighter
+# account is outside the startup baseline tolerance.
+max_position_tao = 0.0025
+max_gross_position_tao = 0.0025
+max_abs_venue_position_tao = 0.0025
+max_open_orders = 0
+
+[rate_limit]
+enabled = true
+rps = 2.0
+burst = 2
+
+[enforcement]
+# Do not mutate arbitrary intents into reduce-only orders. The only intended
+# live order path is the existing canary-breach Exit/IOC/reduce_only flatten
+# intent generated from fresh account state.
+post_only = false
+reduce_only = false
+
+[kill]
+stale_max_ticks = 4
+
+[book]
+max_mid_jump_pct = 0.03

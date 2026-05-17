@@ -320,6 +320,24 @@ fn strict_lighter_native_role_canary_profile_enforces_one_open_order() {
 }
 
 #[test]
+fn lighter_baseline_cleanup_canary_profile_is_reduce_only_cleanup_shaped() {
+    let profile = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("configs/phase51_lighter_baseline_cleanup_canary.toml");
+    let raw = fs::read_to_string(profile).unwrap();
+    assert!(raw.contains("base_order_size = 0.01"));
+    assert!(raw.contains("max_order_size = 0.01"));
+    assert!(raw.contains("max_position_tao = 0.0025"));
+    assert!(raw.contains("max_gross_position_tao = 0.0025"));
+    assert!(raw.contains("max_abs_venue_position_tao = 0.0025"));
+    assert!(raw.contains("max_open_orders = 0"));
+    assert!(raw.contains("post_only = false"));
+    assert!(raw.contains("reduce_only = false"));
+    assert!(raw.contains("max_mid_jump_pct = 0.03"));
+}
+
+#[test]
 fn live_native_role_canary_emits_native_role_only_to_future_output() {
     let dir = tempdir().unwrap();
     let output = dir.path().join("forward_refresh.future_native_role.jsonl");
