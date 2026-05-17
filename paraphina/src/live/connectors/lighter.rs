@@ -33,6 +33,7 @@ static LIGHTER_ACCOUNT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIGHTER_ACCOUNT_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static LIGHTER_ACCOUNT_ERROR_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIGHTER_ACCOUNT_ERROR_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static LIGHTER_PHASE51_PASSIVE_PRESSURE_TAP_ROWS: AtomicU64 = AtomicU64::new(0);
 
 fn mono_now_ns() -> u64 {
     let start = MONO_START.get_or_init(Instant::now);
@@ -220,6 +221,8 @@ impl Freshness {
 }
 
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -351,6 +354,455 @@ fn account_url(cfg: &LighterConfig) -> String {
 
 fn sendtx_url(cfg: &LighterConfig) -> String {
     format!("{}/sendTx", api_base(cfg))
+}
+
+#[derive(Debug, Clone)]
+struct Phase51LighterPassivePressureTapConfig {
+    enabled: bool,
+    output_path: PathBuf,
+    max_rows: u64,
+}
+
+impl Phase51LighterPassivePressureTapConfig {
+    fn from_env() -> Self {
+        let enabled = std::env::var("PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_ENABLED")
+            .ok()
+            .and_then(|raw| parse_lighter_bool_env(&raw))
+            .unwrap_or(false);
+        let output_path =
+            std::env::var("PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_OUTPUT_PATH")
+                .ok()
+                .filter(|raw| !raw.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(
+                        "/home/ubuntu/source_owner_inbox/phase51/lighter_passive_pressure_observations.jsonl",
+                    )
+                });
+        let max_rows =
+            std::env::var("PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_MAX_ROWS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .filter(|rows| *rows > 0)
+                .unwrap_or(5_000);
+        Self {
+            enabled,
+            output_path,
+            max_rows,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Phase51LighterPassivePressureObservation {
+    schema_version: u32,
+    producer: &'static str,
+    venue_id: &'static str,
+    source_endpoint_family: String,
+    observed_at_ms: u64,
+    http_status_success: bool,
+    no_live_flag: bool,
+    approved_for_live: bool,
+    approved_for_canary: bool,
+    approved_for_capital_escalation: bool,
+    live_orders_allowed: bool,
+    capital_change_allowed: bool,
+    risk_limit_relaxation_allowed: bool,
+    phase51_validators_run: bool,
+    blocker_cleared: bool,
+    raw_request_persisted: bool,
+    raw_response_body_persisted: bool,
+    unsanitized_headers_persisted: bool,
+    secret_material_persisted: bool,
+    native_limit_event_time_status: &'static str,
+    pressure_dimensions_complete_from_passive_response: bool,
+    required_missing_dimensions: Vec<&'static str>,
+    active_order_headroom_account: Option<i64>,
+    sendtx_per_minute_limit: Option<i64>,
+    sendtx_per_minute_remaining: Option<i64>,
+    rest_requests_per_minute_limit: Option<i64>,
+    rest_requests_per_minute_remaining: Option<i64>,
+    weighted_requests_per_minute_limit: Option<i64>,
+    weighted_requests_per_minute_remaining: Option<i64>,
+    pressure_field_sources: BTreeMap<&'static str, &'static str>,
+    sanitized_pressure_header_names: Vec<String>,
+    generic_rate_limit_header_present: bool,
+}
+
+fn parse_lighter_bool_env(raw: &str) -> Option<bool> {
+    let text = raw.trim();
+    if text == "1" || text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("yes") {
+        Some(true)
+    } else if text == "0"
+        || text.eq_ignore_ascii_case("false")
+        || text.eq_ignore_ascii_case("no")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn phase51_lighter_normalized_key(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn phase51_lighter_json_i64(value: &serde_json::Value) -> Option<i64> {
+    if value.is_boolean() || value.is_null() {
+        return None;
+    }
+    if let Some(value) = value.as_i64() {
+        return Some(value);
+    }
+    value.as_str()?.trim().parse::<i64>().ok()
+}
+
+fn phase51_lighter_find_i64(
+    value: &serde_json::Value,
+    candidate_keys: &[&str],
+) -> Option<i64> {
+    if let Some(obj) = value.as_object() {
+        for (key, item) in obj {
+            let normalized = phase51_lighter_normalized_key(key);
+            if candidate_keys.iter().any(|candidate| *candidate == normalized) {
+                if let Some(value) = phase51_lighter_json_i64(item) {
+                    return Some(value);
+                }
+            }
+        }
+        for item in obj.values() {
+            if let Some(value) = phase51_lighter_find_i64(item, candidate_keys) {
+                return Some(value);
+            }
+        }
+    } else if let Some(items) = value.as_array() {
+        for item in items {
+            if let Some(value) = phase51_lighter_find_i64(item, candidate_keys) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn phase51_lighter_body_pressure_value(
+    body: Option<&serde_json::Value>,
+    field: &'static str,
+) -> Option<i64> {
+    let body = body?;
+    match field {
+        "active_order_headroom_account" => phase51_lighter_find_i64(
+            body,
+            &[
+                "activeorderheadroomaccount",
+                "activeordersheadroomaccount",
+                "activeorderheadroom",
+                "activeordersheadroom",
+            ],
+        ),
+        "sendtx_per_minute_limit" => phase51_lighter_find_i64(
+            body,
+            &[
+                "sendtxperminutelimit",
+                "sendtxperminute",
+                "sendtxlimit",
+                "sendtxbatchlimit",
+                "sendtxsendtxbatchperminutelimit",
+            ],
+        ),
+        "sendtx_per_minute_remaining" => phase51_lighter_find_i64(
+            body,
+            &[
+                "sendtxperminuteremaining",
+                "sendtxremaining",
+                "sendtxbatchremaining",
+                "sendtxsendtxbatchperminuteremaining",
+            ],
+        ),
+        "rest_requests_per_minute_limit" => phase51_lighter_find_i64(
+            body,
+            &[
+                "restrequestsperminutelimit",
+                "restrequestslimit",
+                "standardrequestsperminute",
+                "standardrequestsperminutelimit",
+                "restlimit",
+            ],
+        ),
+        "rest_requests_per_minute_remaining" => phase51_lighter_find_i64(
+            body,
+            &[
+                "restrequestsperminuteremaining",
+                "restrequestsremaining",
+                "standardrequestsperminuteremaining",
+                "restremaining",
+            ],
+        ),
+        "weighted_requests_per_minute_limit" => phase51_lighter_find_i64(
+            body,
+            &[
+                "weightedrequestsperminutelimit",
+                "premiumweightedrequests",
+                "premiumweightedrequestsperminute",
+                "premiumweightedrequestsperminutelimit",
+                "weightedlimit",
+            ],
+        ),
+        "weighted_requests_per_minute_remaining" => phase51_lighter_find_i64(
+            body,
+            &[
+                "weightedrequestsperminuteremaining",
+                "premiumweightedrequestsremaining",
+                "premiumweightedrequestsperminuteremaining",
+                "weightedremaining",
+            ],
+        ),
+        _ => None,
+    }
+}
+
+fn phase51_lighter_header_i64(value: &reqwest::header::HeaderValue) -> Option<i64> {
+    value.to_str().ok()?.trim().parse::<i64>().ok()
+}
+
+fn phase51_lighter_header_pressure_field(normalized: &str) -> Option<&'static str> {
+    let has_limit = normalized.contains("limit") && !normalized.contains("remaining");
+    let has_remaining = normalized.contains("remaining");
+    if !(has_limit || has_remaining) {
+        return None;
+    }
+    if normalized.contains("sendtx") || normalized.contains("sendtxbatch") {
+        return if has_remaining {
+            Some("sendtx_per_minute_remaining")
+        } else {
+            Some("sendtx_per_minute_limit")
+        };
+    }
+    if normalized.contains("weighted") || normalized.contains("weight") {
+        return if has_remaining {
+            Some("weighted_requests_per_minute_remaining")
+        } else {
+            Some("weighted_requests_per_minute_limit")
+        };
+    }
+    if normalized.contains("rest") {
+        return if has_remaining {
+            Some("rest_requests_per_minute_remaining")
+        } else {
+            Some("rest_requests_per_minute_limit")
+        };
+    }
+    if normalized.contains("active")
+        && normalized.contains("order")
+        && (normalized.contains("headroom") || normalized.contains("remaining"))
+    {
+        return Some("active_order_headroom_account");
+    }
+    None
+}
+
+fn phase51_lighter_build_passive_pressure_observation(
+    source_endpoint_family: &str,
+    http_status_success: bool,
+    headers: &reqwest::header::HeaderMap,
+    body: Option<&serde_json::Value>,
+) -> Phase51LighterPassivePressureObservation {
+    const FIELDS: [&str; 7] = [
+        "active_order_headroom_account",
+        "sendtx_per_minute_limit",
+        "sendtx_per_minute_remaining",
+        "rest_requests_per_minute_limit",
+        "rest_requests_per_minute_remaining",
+        "weighted_requests_per_minute_limit",
+        "weighted_requests_per_minute_remaining",
+    ];
+
+    let mut values: BTreeMap<&'static str, Option<i64>> =
+        FIELDS.into_iter().map(|field| (field, None)).collect();
+    let mut sources: BTreeMap<&'static str, &'static str> = BTreeMap::new();
+    for field in FIELDS {
+        if let Some(value) = phase51_lighter_body_pressure_value(body, field) {
+            values.insert(field, Some(value));
+            sources.insert(field, "response_body_exact_field");
+        }
+    }
+
+    let mut sanitized_header_names = Vec::new();
+    let mut generic_rate_limit_header_present = false;
+    for (name, value) in headers {
+        let raw_name = name.as_str();
+        let normalized = phase51_lighter_normalized_key(raw_name);
+        if normalized.contains("auth")
+            || normalized.contains("cookie")
+            || normalized.contains("credential")
+            || normalized.contains("jwt")
+            || normalized.contains("password")
+            || normalized.contains("secret")
+            || normalized.contains("session")
+            || normalized.contains("signature")
+            || normalized.contains("token")
+        {
+            continue;
+        }
+        if (normalized.contains("rate")
+            || normalized.contains("limit")
+            || normalized.contains("remaining"))
+            && phase51_lighter_header_pressure_field(&normalized).is_none()
+        {
+            generic_rate_limit_header_present = true;
+        }
+        let Some(field) = phase51_lighter_header_pressure_field(&normalized) else {
+            continue;
+        };
+        sanitized_header_names.push(raw_name.to_string());
+        if values.get(field).and_then(|value| *value).is_some() {
+            continue;
+        }
+        if let Some(numeric) = phase51_lighter_header_i64(value) {
+            values.insert(field, Some(numeric));
+            sources.insert(field, "response_header_explicit_pressure_field");
+        }
+    }
+    sanitized_header_names.sort();
+    sanitized_header_names.dedup();
+
+    let has_active = values
+        .get("active_order_headroom_account")
+        .and_then(|value| *value)
+        .is_some();
+    let has_sendtx = values
+        .get("sendtx_per_minute_limit")
+        .and_then(|value| *value)
+        .is_some()
+        && values
+            .get("sendtx_per_minute_remaining")
+            .and_then(|value| *value)
+            .is_some();
+    let has_rest = values
+        .get("rest_requests_per_minute_limit")
+        .and_then(|value| *value)
+        .is_some()
+        && values
+            .get("rest_requests_per_minute_remaining")
+            .and_then(|value| *value)
+            .is_some();
+    let has_weighted = values
+        .get("weighted_requests_per_minute_limit")
+        .and_then(|value| *value)
+        .is_some()
+        && values
+            .get("weighted_requests_per_minute_remaining")
+            .and_then(|value| *value)
+            .is_some();
+    let complete = has_active && has_sendtx && (has_rest || has_weighted);
+    let mut missing = Vec::new();
+    if !has_active {
+        missing.push("active_order_headroom_account");
+    }
+    if !has_sendtx {
+        missing.push("sendtx_per_minute_limit/sendtx_per_minute_remaining");
+    }
+    if !has_rest && !has_weighted {
+        missing.push("rest_requests_per_minute_pair_or_weighted_requests_per_minute_pair");
+    }
+
+    Phase51LighterPassivePressureObservation {
+        schema_version: 1,
+        producer: "paraphina_lighter_passive_sendtx_pressure_tap",
+        venue_id: "lighter",
+        source_endpoint_family: source_endpoint_family.to_string(),
+        observed_at_ms: now_ms(),
+        http_status_success,
+        no_live_flag: true,
+        approved_for_live: false,
+        approved_for_canary: false,
+        approved_for_capital_escalation: false,
+        live_orders_allowed: false,
+        capital_change_allowed: false,
+        risk_limit_relaxation_allowed: false,
+        phase51_validators_run: false,
+        blocker_cleared: false,
+        raw_request_persisted: false,
+        raw_response_body_persisted: false,
+        unsanitized_headers_persisted: false,
+        secret_material_persisted: false,
+        native_limit_event_time_status: "PASSIVE_SENDTX_RESPONSE_OBSERVED",
+        pressure_dimensions_complete_from_passive_response: complete,
+        required_missing_dimensions: missing,
+        active_order_headroom_account: values
+            .get("active_order_headroom_account")
+            .and_then(|value| *value),
+        sendtx_per_minute_limit: values
+            .get("sendtx_per_minute_limit")
+            .and_then(|value| *value),
+        sendtx_per_minute_remaining: values
+            .get("sendtx_per_minute_remaining")
+            .and_then(|value| *value),
+        rest_requests_per_minute_limit: values
+            .get("rest_requests_per_minute_limit")
+            .and_then(|value| *value),
+        rest_requests_per_minute_remaining: values
+            .get("rest_requests_per_minute_remaining")
+            .and_then(|value| *value),
+        weighted_requests_per_minute_limit: values
+            .get("weighted_requests_per_minute_limit")
+            .and_then(|value| *value),
+        weighted_requests_per_minute_remaining: values
+            .get("weighted_requests_per_minute_remaining")
+            .and_then(|value| *value),
+        pressure_field_sources: sources,
+        sanitized_pressure_header_names: sanitized_header_names,
+        generic_rate_limit_header_present,
+    }
+}
+
+fn phase51_lighter_maybe_emit_passive_pressure_observation(
+    source_endpoint_family: &str,
+    http_status_success: bool,
+    headers: &reqwest::header::HeaderMap,
+    body: Option<&serde_json::Value>,
+) -> bool {
+    let cfg = Phase51LighterPassivePressureTapConfig::from_env();
+    if !cfg.enabled {
+        return false;
+    }
+    let row_index = LIGHTER_PHASE51_PASSIVE_PRESSURE_TAP_ROWS.fetch_add(1, Ordering::Relaxed);
+    if row_index >= cfg.max_rows {
+        return false;
+    }
+    if cfg.output_path.is_symlink() {
+        return false;
+    }
+    if let Some(parent) = cfg.output_path.parent() {
+        if parent.is_symlink() || std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let observation = phase51_lighter_build_passive_pressure_observation(
+        source_endpoint_family,
+        http_status_success,
+        headers,
+        body,
+    );
+    let Ok(encoded) = serde_json::to_string(&observation) else {
+        return false;
+    };
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cfg.output_path)
+    else {
+        return false;
+    };
+    writeln!(file, "{encoded}").is_ok()
+}
+
+#[cfg(test)]
+fn phase51_lighter_passive_pressure_tap_reset_for_tests() {
+    LIGHTER_PHASE51_PASSIVE_PRESSURE_TAP_ROWS.store(0, Ordering::Relaxed);
 }
 
 fn now_ms() -> u64 {
@@ -645,12 +1097,23 @@ impl LighterConnector {
             .await
             .map_err(|err| LiveGatewayError::retryable(format!("sendtx_error: {err}")))?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body = resp.text().await.unwrap_or_default();
+        let passive_body = serde_json::from_str::<serde_json::Value>(&body).ok();
+        phase51_lighter_maybe_emit_passive_pressure_observation(
+            "sendTx",
+            status.is_success(),
+            &headers,
+            passive_body.as_ref(),
+        );
         if !status.is_success() {
             return Err(map_rest_error(&body));
         }
-        let value = serde_json::from_str::<serde_json::Value>(&body)
-            .map_err(|err| LiveGatewayError::retryable(format!("sendtx_parse_error: {err}")))?;
+        let value = match passive_body {
+            Some(value) => value,
+            None => serde_json::from_str::<serde_json::Value>(&body)
+                .map_err(|err| LiveGatewayError::retryable(format!("sendtx_parse_error: {err}")))?,
+        };
         let order_id = value
             .get("order_id")
             .or_else(|| value.get("orderId"))
@@ -2327,9 +2790,11 @@ mod tests {
     use crate::types::TimeInForce;
     use httpmock::Method::{GET, POST};
     use httpmock::MockServer;
+    use reqwest::header::{HeaderMap, HeaderValue};
     use std::fs;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -2364,6 +2829,185 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn passive_tap_env_keys() -> [&'static str; 3] {
+        [
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_ENABLED",
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_OUTPUT_PATH",
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_MAX_ROWS",
+        ]
+    }
+
+    fn passive_tap_headers(entries: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (key, value) in entries {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()).expect("header name"),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn phase51_lighter_passive_pressure_tap_disabled_emits_no_file() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let keys = passive_tap_env_keys();
+        let _guard = EnvGuard::new(&keys);
+        for key in keys {
+            unset_env(key);
+        }
+        phase51_lighter_passive_pressure_tap_reset_for_tests();
+        let tmp = tempdir().expect("tempdir");
+        let output = tmp.path().join("pressure.jsonl");
+        set_env(
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_OUTPUT_PATH",
+            output.to_str().expect("path"),
+        );
+
+        let emitted = phase51_lighter_maybe_emit_passive_pressure_observation(
+            "sendTx",
+            true,
+            &HeaderMap::new(),
+            Some(&json!({"sendtx_per_minute_limit": 4000})),
+        );
+
+        assert!(!emitted);
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn phase51_lighter_passive_pressure_tap_writes_complete_sanitized_metadata() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let keys = passive_tap_env_keys();
+        let _guard = EnvGuard::new(&keys);
+        for key in keys {
+            unset_env(key);
+        }
+        phase51_lighter_passive_pressure_tap_reset_for_tests();
+        let tmp = tempdir().expect("tempdir");
+        let output = tmp.path().join("pressure.jsonl");
+        set_env(
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_ENABLED",
+            "true",
+        );
+        set_env(
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_OUTPUT_PATH",
+            output.to_str().expect("path"),
+        );
+        let body = json!({
+            "order_id": "raw-order-value",
+            "api_key": "secret-value",
+            "active_order_headroom_account": 12,
+            "sendtx_per_minute_limit": 4000,
+            "sendtx_per_minute_remaining": 3998,
+            "weighted_requests_per_minute_limit": 24000,
+            "weighted_requests_per_minute_remaining": 23999
+        });
+        let headers = passive_tap_headers(&[
+            ("authorization", "secret"),
+            ("x-sendtx-limit", "9999"),
+        ]);
+
+        let emitted = phase51_lighter_maybe_emit_passive_pressure_observation(
+            "sendTx",
+            true,
+            &headers,
+            Some(&body),
+        );
+
+        assert!(emitted);
+        let content = fs::read_to_string(&output).expect("output");
+        assert!(!content.contains("raw-order-value"));
+        assert!(!content.contains("secret-value"));
+        assert!(!content.contains("authorization"));
+        let row: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("line")).expect("json");
+        assert_eq!(row["venue_id"], "lighter");
+        assert_eq!(row["source_endpoint_family"], "sendTx");
+        assert_eq!(row["active_order_headroom_account"], 12);
+        assert_eq!(row["sendtx_per_minute_limit"], 4000);
+        assert_eq!(row["sendtx_per_minute_remaining"], 3998);
+        assert_eq!(row["weighted_requests_per_minute_limit"], 24000);
+        assert_eq!(row["weighted_requests_per_minute_remaining"], 23999);
+        assert_eq!(
+            row["pressure_dimensions_complete_from_passive_response"],
+            true
+        );
+        assert_eq!(row["blocker_cleared"], false);
+        assert_eq!(row["raw_response_body_persisted"], false);
+        assert_eq!(row["unsanitized_headers_persisted"], false);
+        assert_eq!(row["secret_material_persisted"], false);
+        assert_eq!(row["phase51_validators_run"], false);
+    }
+
+    #[test]
+    fn phase51_lighter_passive_pressure_tap_does_not_treat_generic_rate_limit_as_source_truth() {
+        let headers = passive_tap_headers(&[
+            ("x-ratelimit-limit", "24000"),
+            ("x-ratelimit-remaining", "23999"),
+        ]);
+
+        let observation = phase51_lighter_build_passive_pressure_observation(
+            "sendTx",
+            true,
+            &headers,
+            None,
+        );
+
+        assert!(observation.generic_rate_limit_header_present);
+        assert!(observation.rest_requests_per_minute_limit.is_none());
+        assert!(observation.rest_requests_per_minute_remaining.is_none());
+        assert!(!observation.pressure_dimensions_complete_from_passive_response);
+        assert_eq!(
+            observation.required_missing_dimensions,
+            vec![
+                "active_order_headroom_account",
+                "sendtx_per_minute_limit/sendtx_per_minute_remaining",
+                "rest_requests_per_minute_pair_or_weighted_requests_per_minute_pair",
+            ]
+        );
+    }
+
+    #[test]
+    fn phase51_lighter_passive_pressure_tap_is_bounded() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let keys = passive_tap_env_keys();
+        let _guard = EnvGuard::new(&keys);
+        for key in keys {
+            unset_env(key);
+        }
+        phase51_lighter_passive_pressure_tap_reset_for_tests();
+        let tmp = tempdir().expect("tempdir");
+        let output = tmp.path().join("pressure.jsonl");
+        set_env(
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_ENABLED",
+            "true",
+        );
+        set_env(
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_OUTPUT_PATH",
+            output.to_str().expect("path"),
+        );
+        set_env(
+            "PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_MAX_ROWS",
+            "1",
+        );
+
+        assert!(phase51_lighter_maybe_emit_passive_pressure_observation(
+            "sendTx",
+            true,
+            &HeaderMap::new(),
+            Some(&json!({})),
+        ));
+        assert!(!phase51_lighter_maybe_emit_passive_pressure_observation(
+            "sendTx",
+            true,
+            &HeaderMap::new(),
+            Some(&json!({})),
+        ));
+        let content = fs::read_to_string(&output).expect("output");
+        assert_eq!(content.lines().count(), 1);
     }
 
     fn temp_nonce_path(label: &str) -> PathBuf {
