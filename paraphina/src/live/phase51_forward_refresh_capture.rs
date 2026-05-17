@@ -120,6 +120,15 @@ impl Phase51CaptureExecutionMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phase51LiveNativeRoleCanaryContext {
+    pub canary_enabled: bool,
+    pub venue_ids: Vec<String>,
+    pub canary_enforce_post_only: bool,
+    pub canary_enforce_reduce_only: bool,
+    pub strict_maker_only_observation_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phase51CaptureTargetKey {
     pub canonical_group_id: String,
     pub order_key: String,
@@ -333,12 +342,21 @@ impl Phase51LighterNativeLimitPressure {
 pub struct Phase51ForwardRefreshCapture {
     config: Phase51ForwardRefreshCaptureConfig,
     rows_written: usize,
+    live_native_role_canary_mode: bool,
 }
 
 impl Phase51ForwardRefreshCapture {
     pub fn from_config(
         config: &Phase51ForwardRefreshCaptureConfig,
         execution_mode: Phase51CaptureExecutionMode,
+    ) -> Phase51CaptureResult<Self> {
+        Self::from_config_with_live_native_role_canary_context(config, execution_mode, None)
+    }
+
+    pub fn from_config_with_live_native_role_canary_context(
+        config: &Phase51ForwardRefreshCaptureConfig,
+        execution_mode: Phase51CaptureExecutionMode,
+        live_context: Option<&Phase51LiveNativeRoleCanaryContext>,
     ) -> Phase51CaptureResult<Self> {
         if config.allow_live {
             return Err(Phase51CaptureError::new(
@@ -347,11 +365,19 @@ impl Phase51ForwardRefreshCapture {
         }
 
         let mut rows_written = 0usize;
+        let mut live_native_role_canary_mode = false;
         if config.enabled {
             if !execution_mode.is_non_live_shadow_safe() {
-                return Err(Phase51CaptureError::new(format!(
-                    "phase51 forward-refresh capture requires non-live/shadow-safe mode; got {execution_mode:?}",
-                )));
+                if execution_mode == Phase51CaptureExecutionMode::Live
+                    && config.live_native_role_canary_approved
+                {
+                    validate_live_native_role_canary_context(config, live_context)?;
+                    live_native_role_canary_mode = true;
+                } else {
+                    return Err(Phase51CaptureError::new(format!(
+                        "phase51 forward-refresh capture requires non-live/shadow-safe mode; got {execution_mode:?}",
+                    )));
+                }
             }
             if !config.append_only {
                 return Err(Phase51CaptureError::new(
@@ -360,8 +386,16 @@ impl Phase51ForwardRefreshCapture {
             }
             let output_path = Path::new(&config.output_path);
             validate_output_path(output_path)?;
+            if live_native_role_canary_mode {
+                validate_live_native_role_canary_output_path(output_path)?;
+            }
             if output_path.exists() {
                 rows_written = count_nonempty_lines(output_path)?;
+                if live_native_role_canary_mode && rows_written > 0 {
+                    return Err(Phase51CaptureError::new(
+                        "phase51 live native-role canary capture requires absent or empty future output",
+                    ));
+                }
                 if rows_written > config.max_rows {
                     return Err(Phase51CaptureError::new(format!(
                         "phase51 forward-refresh capture output already exceeds max_rows: {rows_written} > {}",
@@ -374,7 +408,12 @@ impl Phase51ForwardRefreshCapture {
         Ok(Self {
             config: config.clone(),
             rows_written,
+            live_native_role_canary_mode,
         })
+    }
+
+    pub fn live_native_role_canary_mode(&self) -> bool {
+        self.live_native_role_canary_mode
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -417,20 +456,22 @@ impl Phase51ForwardRefreshCapture {
             }
         }
 
-        if let Some(runtime_lighter_pressure) = fill.phase51_lighter_native_limit.as_ref() {
-            audit.lighter_pressure_status = runtime_lighter_pressure
-                .native_limit_event_time_status
-                .clone();
-            let emitted = self.capture_lighter_native_limit(
-                Some(&target_key),
-                Some(lighter_pressure_from_runtime(runtime_lighter_pressure)),
-            )?;
-            if emitted.is_some() {
-                audit.target_type = Some(match audit.target_type.as_deref() {
-                    Some("native_role") => "native_role,lighter_native_limit".to_string(),
-                    _ => "lighter_native_limit".to_string(),
-                });
-                audit.sanitized_row_emitted = true;
+        if !self.live_native_role_canary_mode {
+            if let Some(runtime_lighter_pressure) = fill.phase51_lighter_native_limit.as_ref() {
+                audit.lighter_pressure_status = runtime_lighter_pressure
+                    .native_limit_event_time_status
+                    .clone();
+                let emitted = self.capture_lighter_native_limit(
+                    Some(&target_key),
+                    Some(lighter_pressure_from_runtime(runtime_lighter_pressure)),
+                )?;
+                if emitted.is_some() {
+                    audit.target_type = Some(match audit.target_type.as_deref() {
+                        Some("native_role") => "native_role,lighter_native_limit".to_string(),
+                        _ => "lighter_native_limit".to_string(),
+                    });
+                    audit.sanitized_row_emitted = true;
+                }
             }
         }
 
@@ -469,20 +510,22 @@ impl Phase51ForwardRefreshCapture {
             }
         }
 
-        if let Some(runtime_lighter_pressure) = fill.phase51_lighter_native_limit.as_ref() {
-            audit.lighter_pressure_status = runtime_lighter_pressure
-                .native_limit_event_time_status
-                .clone();
-            let emitted = self.capture_lighter_native_limit(
-                Some(&target_key),
-                Some(lighter_pressure_from_runtime(runtime_lighter_pressure)),
-            )?;
-            if emitted.is_some() {
-                audit.target_type = Some(match audit.target_type.as_deref() {
-                    Some("native_role") => "native_role,lighter_native_limit".to_string(),
-                    _ => "lighter_native_limit".to_string(),
-                });
-                audit.sanitized_row_emitted = true;
+        if !self.live_native_role_canary_mode {
+            if let Some(runtime_lighter_pressure) = fill.phase51_lighter_native_limit.as_ref() {
+                audit.lighter_pressure_status = runtime_lighter_pressure
+                    .native_limit_event_time_status
+                    .clone();
+                let emitted = self.capture_lighter_native_limit(
+                    Some(&target_key),
+                    Some(lighter_pressure_from_runtime(runtime_lighter_pressure)),
+                )?;
+                if emitted.is_some() {
+                    audit.target_type = Some(match audit.target_type.as_deref() {
+                        Some("native_role") => "native_role,lighter_native_limit".to_string(),
+                        _ => "lighter_native_limit".to_string(),
+                    });
+                    audit.sanitized_row_emitted = true;
+                }
             }
         }
 
@@ -507,11 +550,14 @@ impl Phase51ForwardRefreshCapture {
         let Some(native_role) = native_role else {
             return Ok(None);
         };
-        let Some(payload) = native_role.to_payload(venue_id)? else {
+        let venue_id = canonical_venue_id(venue_id);
+        if self.live_native_role_canary_mode && venue_id != "lighter" {
+            return Ok(None);
+        }
+        let Some(payload) = native_role.to_payload(&venue_id)? else {
             return Ok(None);
         };
 
-        let venue_id = canonical_venue_id(venue_id);
         let mut row = base_row("native_role", &venue_id, target_key);
         for (key, value) in payload {
             row.insert(key, value);
@@ -524,7 +570,7 @@ impl Phase51ForwardRefreshCapture {
         target_key: Option<&Phase51CaptureTargetKey>,
         pressure: Option<Phase51LighterNativeLimitPressure>,
     ) -> Phase51CaptureResult<Option<Value>> {
-        if !self.config.enabled {
+        if !self.config.enabled || self.live_native_role_canary_mode {
             return Ok(None);
         }
         let Some(target_key) = target_key else {
@@ -731,6 +777,73 @@ fn base_row(
 
 fn canonical_venue_id(venue_id: &str) -> String {
     venue_id.trim().to_ascii_lowercase()
+}
+
+fn validate_live_native_role_canary_context(
+    config: &Phase51ForwardRefreshCaptureConfig,
+    live_context: Option<&Phase51LiveNativeRoleCanaryContext>,
+) -> Phase51CaptureResult<()> {
+    let Some(live_context) = live_context else {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires explicit runtime context",
+        ));
+    };
+    if !live_context.canary_enabled {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires canary mode",
+        ));
+    }
+    let venue_ids: Vec<String> = live_context
+        .venue_ids
+        .iter()
+        .map(|venue| canonical_venue_id(venue))
+        .filter(|venue| !venue.is_empty())
+        .collect();
+    if venue_ids.as_slice() != ["lighter"] {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires Lighter-only venue selection",
+        ));
+    }
+    if !live_context.strict_maker_only_observation_enabled {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires strict maker-only Lighter observation mode",
+        ));
+    }
+    if !live_context.canary_enforce_post_only {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires canary post-only enforcement",
+        ));
+    }
+    if live_context.canary_enforce_reduce_only {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires non-reduce-only canary enforcement",
+        ));
+    }
+    if config.max_rows == 0 || config.max_rows > 25 {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires max_rows between 1 and 25",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_native_role_canary_output_path(path: &Path) -> Phase51CaptureResult<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if file_name == "forward_refresh.remaining.jsonl" {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture must not write forward_refresh.remaining.jsonl",
+        ));
+    }
+    if !file_name.ends_with(".jsonl") || !file_name.contains("future_native_role") {
+        return Err(Phase51CaptureError::new(
+            "phase51 live native-role canary capture requires a future_native_role .jsonl output path",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_output_path(path: &Path) -> Phase51CaptureResult<()> {

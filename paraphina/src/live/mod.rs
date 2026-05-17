@@ -37,7 +37,7 @@ pub use orderbook_l2::{
 };
 pub use phase51_forward_refresh_capture::{
     Phase51CaptureExecutionMode, Phase51CaptureTargetKey, Phase51ForwardRefreshCapture,
-    Phase51LighterNativeLimitPressure, Phase51VenueNativeRole,
+    Phase51LighterNativeLimitPressure, Phase51LiveNativeRoleCanaryContext, Phase51VenueNativeRole,
 };
 pub use runner::{
     run_live_loop, LiveChannels, LiveOrderRequest, LiveRunMode, LiveRunSummary, LiveTelemetry,

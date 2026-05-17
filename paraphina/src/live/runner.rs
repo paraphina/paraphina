@@ -14,7 +14,9 @@ use super::ops::{
     append_reconcile_drift_audit, default_audit_dir, HealthState, LiveMetrics,
 };
 use super::order_state::{LiveOrder, OrderStatus};
-use super::phase51_forward_refresh_capture::{Phase51CaptureResult, Phase51ForwardRefreshCapture};
+use super::phase51_forward_refresh_capture::{
+    Phase51CaptureResult, Phase51ForwardRefreshCapture, Phase51LiveNativeRoleCanaryContext,
+};
 use super::phase51_target_key_registry::{Phase51TargetKeyRegistry, Phase51TargetKeyRegistryStage};
 use super::venue_health::{VenueHealthErrorSource, VenueHealthManager};
 use crate::actions::{intents_to_actions, ActionBatch, ActionIdGenerator};
@@ -1706,12 +1708,10 @@ fn execution_event_key(event: &super::types::ExecutionEvent) -> Option<String> {
                 ))
             }
         }
-        super::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill) => {
-            Some(format!(
-                "phase51_source_owner_fill:venue:{}:seq:{}",
-                fill.venue_index, fill.seq
-            ))
-        }
+        super::types::ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill) => Some(format!(
+            "phase51_source_owner_fill:venue:{}:seq:{}",
+            fill.venue_index, fill.seq
+        )),
         super::types::ExecutionEvent::CancelAllAccepted(ack) => Some(format!(
             "cancel_all:venue:{}:seq:{}",
             ack.venue_index, ack.seq
@@ -2695,11 +2695,20 @@ pub async fn run_live_loop(
         .ok()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let mut phase51_forward_refresh_capture = match Phase51ForwardRefreshCapture::from_config(
+    let phase51_live_native_role_canary_context = Phase51LiveNativeRoleCanaryContext {
+        canary_enabled: phase51_true_env("PARAPHINA_CANARY_MODE"),
+        venue_ids: cfg.venues.iter().map(|venue| venue.id.clone()).collect(),
+        canary_enforce_post_only: phase51_true_env("PARAPHINA_CANARY_ENFORCE_POST_ONLY"),
+        canary_enforce_reduce_only: phase51_true_env("PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY"),
+        strict_maker_only_observation_enabled:
+            phase51_lighter_strict_maker_only_observation_env_enabled(),
+    };
+    let mut phase51_forward_refresh_capture = match Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
         &cfg.phase51_forward_refresh_capture,
         super::phase51_forward_refresh_capture::Phase51CaptureExecutionMode::from_trade_mode_text(
             &trade_mode,
         ),
+        Some(&phase51_live_native_role_canary_context),
     ) {
         Ok(capture) => capture,
         Err(err) => panic!("phase51 forward-refresh capture failed closed: {err}"),
@@ -10364,6 +10373,21 @@ fn parse_bool_env_default(key: &str, default: bool) -> bool {
     std::env::var(key)
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(default)
+}
+
+fn phase51_true_env(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn phase51_lighter_strict_maker_only_observation_env_enabled() -> bool {
+    phase51_true_env("PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

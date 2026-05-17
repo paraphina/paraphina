@@ -5,7 +5,7 @@ use std::fs;
 use paraphina::config::Phase51ForwardRefreshCaptureConfig;
 use paraphina::live::phase51_forward_refresh_capture::{
     Phase51CaptureExecutionMode, Phase51CaptureTargetKey, Phase51ForwardRefreshCapture,
-    Phase51LighterNativeLimitPressure, Phase51VenueNativeRole,
+    Phase51LighterNativeLimitPressure, Phase51LiveNativeRoleCanaryContext, Phase51VenueNativeRole,
 };
 use paraphina::live::types::{
     Fill, Phase51ForwardRefreshLighterNativeLimit, Phase51ForwardRefreshNativeRole,
@@ -20,8 +20,30 @@ fn enabled_config(path: &std::path::Path) -> Phase51ForwardRefreshCaptureConfig 
         enabled: true,
         output_path: path.display().to_string(),
         allow_live: false,
+        live_native_role_canary_approved: false,
         append_only: true,
         max_rows: 5_000,
+    }
+}
+
+fn approved_live_native_role_config(path: &std::path::Path) -> Phase51ForwardRefreshCaptureConfig {
+    Phase51ForwardRefreshCaptureConfig {
+        enabled: true,
+        output_path: path.display().to_string(),
+        allow_live: false,
+        live_native_role_canary_approved: true,
+        append_only: true,
+        max_rows: 1,
+    }
+}
+
+fn lighter_strict_live_context() -> Phase51LiveNativeRoleCanaryContext {
+    Phase51LiveNativeRoleCanaryContext {
+        canary_enabled: true,
+        venue_ids: vec!["lighter".to_string()],
+        canary_enforce_post_only: true,
+        canary_enforce_reduce_only: false,
+        strict_maker_only_observation_enabled: true,
     }
 }
 
@@ -83,6 +105,7 @@ fn disabled_config_emits_no_file_or_rows() {
         enabled: false,
         output_path: output.display().to_string(),
         allow_live: false,
+        live_native_role_canary_approved: false,
         append_only: true,
         max_rows: 5_000,
     };
@@ -112,6 +135,7 @@ fn fail_closed_for_allow_live_or_live_execution_mode() {
     let mut cfg = enabled_config(&output);
     cfg.enabled = false;
     cfg.allow_live = true;
+    cfg.live_native_role_canary_approved = true;
     let err = Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Shadow)
         .unwrap_err();
     assert!(err.to_string().contains("allow_live=true"));
@@ -127,6 +151,184 @@ fn fail_closed_for_allow_live_or_live_execution_mode() {
     let err = Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Live)
         .unwrap_err();
     assert!(err.to_string().contains("non-live/shadow-safe"));
+}
+
+#[test]
+fn live_native_role_canary_requires_all_runtime_guards() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.future_native_role.jsonl");
+    let cfg = approved_live_native_role_config(&output);
+
+    let err = Phase51ForwardRefreshCapture::from_config(&cfg, Phase51CaptureExecutionMode::Live)
+        .unwrap_err();
+    assert!(err.to_string().contains("explicit runtime context"));
+
+    let mut context = lighter_strict_live_context();
+    context.canary_enabled = false;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("canary mode"));
+
+    let mut context = lighter_strict_live_context();
+    context.strict_maker_only_observation_enabled = false;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("strict maker-only"));
+
+    let mut context = lighter_strict_live_context();
+    context.venue_ids = vec!["lighter".to_string(), "extended".to_string()];
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("Lighter-only"));
+
+    let mut context = lighter_strict_live_context();
+    context.canary_enforce_post_only = false;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("post-only"));
+
+    let mut context = lighter_strict_live_context();
+    context.canary_enforce_reduce_only = true;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("non-reduce-only"));
+
+    let mut high_rows = cfg.clone();
+    high_rows.max_rows = 26;
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &high_rows,
+        Phase51CaptureExecutionMode::Live,
+        Some(&lighter_strict_live_context()),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("max_rows"));
+
+    let default_remaining = dir.path().join("forward_refresh.remaining.jsonl");
+    let cfg = approved_live_native_role_config(&default_remaining);
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&lighter_strict_live_context()),
+    )
+    .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("must not write forward_refresh.remaining"));
+
+    let output = dir
+        .path()
+        .join("forward_refresh.future_native_role_existing.jsonl");
+    fs::write(&output, "{}\n").unwrap();
+    let cfg = approved_live_native_role_config(&output);
+    let err = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg,
+        Phase51CaptureExecutionMode::Live,
+        Some(&lighter_strict_live_context()),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("absent or empty future output"));
+}
+
+#[test]
+fn live_native_role_canary_emits_native_role_only_to_future_output() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.future_native_role.jsonl");
+    let cfg = approved_live_native_role_config(&output);
+    let mut capture =
+        Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+            &cfg,
+            Phase51CaptureExecutionMode::Live,
+            Some(&lighter_strict_live_context()),
+        )
+        .unwrap();
+    assert!(capture.live_native_role_canary_mode());
+
+    let mut fill = runtime_fill();
+    fill.venue_id = "lighter".to_string();
+    fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+        canonical_group_id: "future-cg".to_string(),
+        order_key: "future-ok".to_string(),
+    });
+    fill.phase51_native_role = Some(Phase51ForwardRefreshNativeRole::Lighter {
+        account_index: 7,
+        is_maker_ask: true,
+        ask_account_id: 7,
+        bid_account_id: 42,
+    });
+    fill.phase51_lighter_native_limit = Some(Phase51ForwardRefreshLighterNativeLimit {
+        active_order_headroom_account: Some(10),
+        active_order_sendtx_utilization_account: Some(1),
+        rest_open_orders_count: Some(2),
+        rest_open_orders_cap: Some(100),
+        weighted_open_order_slots_used: None,
+        weighted_open_order_slots_cap: None,
+        native_limit_event_time_status: Some("EVENT_TIME_ALIGNED".to_string()),
+    });
+
+    let audit = capture.capture_fill(&fill).unwrap();
+    assert_eq!(audit.target_type.as_deref(), Some("native_role"));
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(capture.rows_written(), 1);
+
+    let rows = read_rows(&output);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("target_type").and_then(Value::as_str),
+        Some("native_role")
+    );
+    assert_eq!(
+        rows[0].get("venue_id").and_then(Value::as_str),
+        Some("lighter")
+    );
+    assert!(rows[0].get("active_order_headroom_account").is_none());
+    assert_safe_flags(&rows[0]);
+}
+
+#[test]
+fn live_native_role_canary_skips_non_lighter_native_role_rows() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.future_native_role.jsonl");
+    let cfg = approved_live_native_role_config(&output);
+    let mut capture =
+        Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+            &cfg,
+            Phase51CaptureExecutionMode::Live,
+            Some(&lighter_strict_live_context()),
+        )
+        .unwrap();
+    let target = Phase51CaptureTargetKey::new("future-cg", "future-ok");
+
+    let emitted = capture
+        .capture_native_role(
+            Some(&target),
+            "extended",
+            Some(Phase51VenueNativeRole::Extended { is_taker: true }),
+        )
+        .unwrap();
+
+    assert!(emitted.is_none());
+    assert_eq!(capture.rows_written(), 0);
+    assert!(!output.exists());
 }
 
 #[test]

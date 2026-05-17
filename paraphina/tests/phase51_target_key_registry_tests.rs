@@ -131,6 +131,7 @@ fn enabled_capture_config(path: &std::path::Path) -> Phase51ForwardRefreshCaptur
         enabled: true,
         output_path: path.display().to_string(),
         allow_live: false,
+        live_native_role_canary_approved: false,
         append_only: true,
         max_rows: 5_000,
     }

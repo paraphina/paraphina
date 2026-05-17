@@ -61,6 +61,7 @@ pub struct Phase51ForwardRefreshCaptureConfig {
     pub enabled: bool,
     pub output_path: String,
     pub allow_live: bool,
+    pub live_native_role_canary_approved: bool,
     pub append_only: bool,
     pub max_rows: usize,
 }
@@ -72,6 +73,7 @@ impl Default for Phase51ForwardRefreshCaptureConfig {
             output_path: "/home/ubuntu/source_owner_inbox/phase51/forward_refresh.remaining.jsonl"
                 .to_string(),
             allow_live: false,
+            live_native_role_canary_approved: false,
             append_only: true,
             max_rows: 5_000,
         }
@@ -223,8 +225,8 @@ pub fn resolve_effective_profile(
 
 fn parse_bool_env(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => Some(true),
-        "0" | "false" => Some(false),
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
         _ => None,
     }
 }
@@ -1435,10 +1437,12 @@ impl Config {
     ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED (bool)
     ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH (string)
     ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS (positive usize)
+    ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED (bool)
     ///
     /// Phase 5.1 forward-refresh capture intentionally has no env override for
-    /// allow_live or append_only; live/capital enablement and write mode must
-    /// stay fail-closed.
+    /// allow_live or append_only. The live native-role canary approval knob is
+    /// insufficient by itself; the runtime capture layer also requires strict
+    /// Lighter-only, strict maker-only, bounded-row, future-output guards.
     ///
     /// Any variable that fails to parse is ignored with a warning.
     pub fn from_env_or_profile(profile: RiskProfile) -> Self {
@@ -2761,6 +2765,30 @@ impl Config {
             }
         }
 
+        if let Ok(raw) =
+            env::var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED")
+        {
+            match parse_bool_env(&raw) {
+                Some(approved) => {
+                    cfg.phase51_forward_refresh_capture
+                        .live_native_role_canary_approved = approved;
+                    eprintln!(
+                        "[config] PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED = {} (requires runtime safety guards)",
+                        cfg.phase51_forward_refresh_capture
+                            .live_native_role_canary_approved
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED = {:?} as bool; using default {}",
+                        raw,
+                        cfg.phase51_forward_refresh_capture
+                            .live_native_role_canary_approved
+                    );
+                }
+            }
+        }
+
         cfg
     }
 
@@ -2844,6 +2872,8 @@ mod tests {
         const MAX_ROWS_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS";
         const ALLOW_LIVE_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ALLOW_LIVE";
         const APPEND_ONLY_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_APPEND_ONLY";
+        const LIVE_NATIVE_ROLE_APPROVED_KEY: &str =
+            "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED";
 
         let _lock = env_lock().lock().unwrap();
         let _enabled = EnvGuard::new(ENABLED_KEY);
@@ -2851,6 +2881,7 @@ mod tests {
         let _max_rows = EnvGuard::new(MAX_ROWS_KEY);
         let _allow_live = EnvGuard::new(ALLOW_LIVE_KEY);
         let _append_only = EnvGuard::new(APPEND_ONLY_KEY);
+        let _live_native_role_approved = EnvGuard::new(LIVE_NATIVE_ROLE_APPROVED_KEY);
 
         for key in [
             ENABLED_KEY,
@@ -2858,6 +2889,7 @@ mod tests {
             MAX_ROWS_KEY,
             ALLOW_LIVE_KEY,
             APPEND_ONLY_KEY,
+            LIVE_NATIVE_ROLE_APPROVED_KEY,
         ] {
             env::remove_var(key);
         }
@@ -2890,6 +2922,8 @@ mod tests {
         const MAX_ROWS_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS";
         const ALLOW_LIVE_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ALLOW_LIVE";
         const APPEND_ONLY_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_APPEND_ONLY";
+        const LIVE_NATIVE_ROLE_APPROVED_KEY: &str =
+            "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED";
 
         let _lock = env_lock().lock().unwrap();
         let _enabled = EnvGuard::new(ENABLED_KEY);
@@ -2897,6 +2931,7 @@ mod tests {
         let _max_rows = EnvGuard::new(MAX_ROWS_KEY);
         let _allow_live = EnvGuard::new(ALLOW_LIVE_KEY);
         let _append_only = EnvGuard::new(APPEND_ONLY_KEY);
+        let _live_native_role_approved = EnvGuard::new(LIVE_NATIVE_ROLE_APPROVED_KEY);
 
         env::set_var(ENABLED_KEY, "true");
         env::set_var(
@@ -2906,6 +2941,7 @@ mod tests {
         env::set_var(APPEND_ONLY_KEY, "false");
         env::set_var(MAX_ROWS_KEY, "17");
         env::set_var(ALLOW_LIVE_KEY, "true");
+        env::set_var(LIVE_NATIVE_ROLE_APPROVED_KEY, "yes");
 
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
         assert!(cfg.phase51_forward_refresh_capture.enabled);
@@ -2922,6 +2958,11 @@ mod tests {
             !cfg.phase51_forward_refresh_capture.allow_live,
             "Phase 5.1 capture allow_live must stay false even if an env var is present"
         );
+        assert!(
+            cfg.phase51_forward_refresh_capture
+                .live_native_role_canary_approved,
+            "Phase 5.1 live native-role canary approval is a separate guarded opt-in"
+        );
     }
 
     #[test]
@@ -2931,15 +2972,19 @@ mod tests {
         const ENABLED_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED";
         const OUTPUT_PATH_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_OUTPUT_PATH";
         const MAX_ROWS_KEY: &str = "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS";
+        const LIVE_NATIVE_ROLE_APPROVED_KEY: &str =
+            "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED";
 
         let _lock = env_lock().lock().unwrap();
         let _enabled = EnvGuard::new(ENABLED_KEY);
         let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
         let _max_rows = EnvGuard::new(MAX_ROWS_KEY);
+        let _live_native_role_approved = EnvGuard::new(LIVE_NATIVE_ROLE_APPROVED_KEY);
 
         env::set_var(ENABLED_KEY, "maybe");
         env::set_var(OUTPUT_PATH_KEY, "   ");
         env::set_var(MAX_ROWS_KEY, "0");
+        env::set_var(LIVE_NATIVE_ROLE_APPROVED_KEY, "definitely");
 
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
         assert_eq!(
