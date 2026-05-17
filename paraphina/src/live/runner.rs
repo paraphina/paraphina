@@ -1890,7 +1890,7 @@ fn phase51_lighter_native_role_apply_one_sided_canary_filter(
     if intents.is_empty() {
         return Ok(());
     }
-    let preferred_side =
+    let side_selection =
         phase51_lighter_native_role_one_sided_side().ok_or("invalid_one_sided_side")?;
     let mut place_indices = Vec::new();
     let mut cancel_count = 0usize;
@@ -1941,11 +1941,14 @@ fn phase51_lighter_native_role_apply_one_sided_canary_filter(
     if cancel_count > 0 {
         return Err("cancel_and_place_replacement_disabled");
     }
-    let keep_idx = place_indices
-        .iter()
-        .copied()
-        .find(|idx| matches!(&intents[*idx], OrderIntent::Place(place) if place.side == preferred_side))
-        .ok_or("preferred_side_absent")?;
+    let keep_idx = match side_selection {
+        Phase51LighterNativeRoleOneSidedSide::Auto => place_indices[0],
+        Phase51LighterNativeRoleOneSidedSide::Side(preferred_side) => place_indices
+            .iter()
+            .copied()
+            .find(|idx| matches!(&intents[*idx], OrderIntent::Place(place) if place.side == preferred_side))
+            .ok_or("preferred_side_absent")?,
+    };
     let mut next = Vec::with_capacity(1);
     next.push(intents[keep_idx].clone());
     *intents = next;
@@ -10593,11 +10596,18 @@ fn phase51_lighter_native_role_one_sided_canary_enabled() -> bool {
     phase51_true_env(PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_CANARY_ENV)
 }
 
-fn phase51_lighter_native_role_one_sided_side() -> Option<Side> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase51LighterNativeRoleOneSidedSide {
+    Auto,
+    Side(Side),
+}
+
+fn phase51_lighter_native_role_one_sided_side() -> Option<Phase51LighterNativeRoleOneSidedSide> {
     let raw = std::env::var(PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED_SIDE_ENV).ok()?;
     match raw.trim().to_ascii_lowercase().as_str() {
-        "buy" | "bid" => Some(Side::Buy),
-        "sell" | "ask" => Some(Side::Sell),
+        "auto" => Some(Phase51LighterNativeRoleOneSidedSide::Auto),
+        "buy" | "bid" => Some(Phase51LighterNativeRoleOneSidedSide::Side(Side::Buy)),
+        "sell" | "ask" => Some(Phase51LighterNativeRoleOneSidedSide::Side(Side::Sell)),
         _ => None,
     }
 }
@@ -14805,6 +14815,47 @@ mod tests {
                 phase51_lighter_native_role_strict_canary_validate_order_intents(&intents),
                 Ok(())
             );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_one_sided_canary_auto_keeps_one_targeted_side() {
+        with_phase51_one_sided_native_role_canary_env("auto", || {
+            let mut intents = vec![
+                lighter_targeted_place_intent(Side::Sell, "ask"),
+                lighter_targeted_place_intent(Side::Buy, "bid"),
+            ];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Ok(())
+            );
+            assert_eq!(intents.len(), 1);
+            let OrderIntent::Place(place) = &intents[0] else {
+                panic!("expected place");
+            };
+            assert_eq!(place.side, Side::Sell);
+            assert_eq!(place.phase51_target_key, Some(lighter_target_key("ask")));
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&intents),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_one_sided_canary_auto_accepts_single_available_side() {
+        with_phase51_one_sided_native_role_canary_env("auto", || {
+            let mut intents = vec![lighter_targeted_place_intent(Side::Sell, "ask")];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Ok(())
+            );
+            assert_eq!(intents.len(), 1);
+            let OrderIntent::Place(place) = &intents[0] else {
+                panic!("expected place");
+            };
+            assert_eq!(place.side, Side::Sell);
+            assert_eq!(place.phase51_target_key, Some(lighter_target_key("ask")));
         });
     }
 
