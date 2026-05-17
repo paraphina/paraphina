@@ -20,11 +20,53 @@ pub fn roadmap_b_enabled() -> bool {
     }
 }
 
+fn is_canonical_venue_order_subset(venue_ids: &[&str]) -> bool {
+    let mut cursor = 0;
+    for venue_id in venue_ids {
+        let Some(offset) = CANONICAL_VENUE_ORDER[cursor..]
+            .iter()
+            .position(|expected| expected == venue_id)
+        else {
+            return false;
+        };
+        cursor += offset + 1;
+    }
+    true
+}
+
 pub fn warn_if_noncanonical_venue_order(venue_ids: &[&str], context: &str) {
-    if venue_ids != CANONICAL_VENUE_ORDER {
+    if !is_canonical_venue_order_subset(venue_ids) {
         eprintln!(
             "paraphina | warn=noncanonical_venue_order context={} expected={:?} actual={:?}",
             context, CANONICAL_VENUE_ORDER, venue_ids
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_canonical_venue_order_subset;
+
+    #[test]
+    fn canonical_subset_accepts_single_lighter() {
+        assert!(is_canonical_venue_order_subset(&["lighter"]));
+    }
+
+    #[test]
+    fn canonical_subset_accepts_ordered_subsets() {
+        assert!(is_canonical_venue_order_subset(&[
+            "hyperliquid",
+            "lighter",
+            "paradex",
+        ]));
+    }
+
+    #[test]
+    fn canonical_subset_rejects_reordered_or_unknown_venues() {
+        assert!(!is_canonical_venue_order_subset(&[
+            "lighter",
+            "hyperliquid",
+        ]));
+        assert!(!is_canonical_venue_order_subset(&["unknown"]));
     }
 }

@@ -291,6 +291,20 @@ fn connector_venue_id(connector: ConnectorArg) -> &'static str {
     }
 }
 
+fn apply_explicit_connector_selection_to_config(cfg: &mut Config, connectors: &[ConnectorArg]) {
+    let selected: HashSet<&str> = connectors
+        .iter()
+        .map(|connector| connector_venue_id(*connector))
+        .collect();
+    cfg.venues
+        .retain(|venue| selected.contains(venue.id.as_str()));
+
+    let selected_venue_count = cfg.venues.len() as u32;
+    if selected_venue_count > 0 && cfg.book.min_healthy_for_kf > selected_venue_count {
+        cfg.book.min_healthy_for_kf = selected_venue_count;
+    }
+}
+
 fn resolve_venue_index(cfg: &Config, venue_id: &str) -> Option<usize> {
     cfg.venues.iter().position(|venue| venue.id == venue_id)
 }
@@ -2210,12 +2224,7 @@ async fn main() {
         }
     }
     if connector_selection.explicit_list {
-        let selected: HashSet<&str> = connectors
-            .iter()
-            .map(|connector| connector_venue_id(*connector))
-            .collect();
-        cfg.venues
-            .retain(|venue| selected.contains(venue.id.as_str()));
+        apply_explicit_connector_selection_to_config(&mut cfg, &connectors);
     }
     if args.preflight {
         let ok = run_preflight(
@@ -4927,6 +4936,51 @@ mod tests {
         assert_eq!(ROADMAP_B_VENUES.len(), 5);
         let selectable = ConnectorArg::roadmap_b_selectable_venues();
         assert_eq!(selectable, ROADMAP_B_VENUES.to_vec());
+    }
+
+    #[test]
+    fn explicit_lighter_only_selection_clamps_min_healthy_for_kf() {
+        let mut cfg = paraphina::config::Config::default();
+        cfg.book.min_healthy_for_kf = 2;
+
+        super::apply_explicit_connector_selection_to_config(&mut cfg, &[ConnectorArg::Lighter]);
+
+        assert_eq!(cfg.venues.len(), 1);
+        assert_eq!(cfg.venues[0].id, "lighter");
+        assert_eq!(cfg.book.min_healthy_for_kf, 1);
+    }
+
+    #[test]
+    fn explicit_multi_venue_selection_preserves_satisfied_min_healthy_for_kf() {
+        let mut cfg = paraphina::config::Config::default();
+        cfg.book.min_healthy_for_kf = 2;
+
+        super::apply_explicit_connector_selection_to_config(
+            &mut cfg,
+            &[ConnectorArg::Hyperliquid, ConnectorArg::Lighter],
+        );
+
+        assert_eq!(
+            cfg.venues
+                .iter()
+                .map(|venue| venue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hyperliquid", "lighter"]
+        );
+        assert_eq!(cfg.book.min_healthy_for_kf, 2);
+    }
+
+    #[test]
+    fn explicit_selection_does_not_raise_existing_min_healthy_for_kf() {
+        let mut cfg = paraphina::config::Config::default();
+        cfg.book.min_healthy_for_kf = 1;
+
+        super::apply_explicit_connector_selection_to_config(
+            &mut cfg,
+            &[ConnectorArg::Hyperliquid, ConnectorArg::Lighter],
+        );
+
+        assert_eq!(cfg.book.min_healthy_for_kf, 1);
     }
 
     #[test]
