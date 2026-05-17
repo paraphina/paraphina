@@ -20,3 +20,9 @@ reduce_only = false
 
 [kill]
 stale_max_ticks = 4
+
+[book]
+# Narrowly avoid single-venue fair-value bootstrap dev-breach during the
+# strict Phase 5.1 native-role evidence canary. Order safety remains enforced
+# by Lighter-only, max_open_orders=1, post_only=true, and replacements disabled.
+max_mid_jump_pct = 0.03

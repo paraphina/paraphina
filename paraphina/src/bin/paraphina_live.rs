@@ -401,12 +401,18 @@ struct CanaryKillConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct CanaryBookConfig {
+    max_mid_jump_pct: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CanaryConfig {
     venue: Option<CanaryVenueConfig>,
     limits: Option<CanaryLimitsConfig>,
     rate_limit: Option<CanaryRateLimitConfig>,
     enforcement: Option<CanaryEnforcementConfig>,
     kill: Option<CanaryKillConfig>,
+    book: Option<CanaryBookConfig>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -424,6 +430,7 @@ struct CanarySettings {
     rate_limit_enabled: Option<bool>,
     rate_limit_rps: Option<f64>,
     rate_limit_burst: Option<u32>,
+    max_mid_jump_pct: Option<f64>,
 }
 
 const RUNTIME_CANARY_PROFILE_PATH_ENV: &str = "PARAPHINA_RUNTIME_CANARY_PROFILE_PATH";
@@ -554,7 +561,7 @@ fn format_runtime_canary_log(
         .as_ref()
         .map(|settings| {
             format!(
-                " max_position_tao={} max_gross_position_tao={} max_abs_venue_position_tao={} soft_max_position_tao={} soft_max_gross_position_tao={} soft_max_abs_venue_position_tao={} max_open_orders={} stale_max_ticks={} post_only={} reduce_only={} rate_limit_rps={} rate_limit_burst={}",
+                " max_position_tao={} max_gross_position_tao={} max_abs_venue_position_tao={} soft_max_position_tao={} soft_max_gross_position_tao={} soft_max_abs_venue_position_tao={} max_open_orders={} stale_max_ticks={} post_only={} reduce_only={} rate_limit_rps={} rate_limit_burst={} max_mid_jump_pct={}",
                 settings
                     .max_position_tao
                     .map(|val| val.to_string())
@@ -595,6 +602,10 @@ fn format_runtime_canary_log(
                     .unwrap_or_else(|| "none".to_string()),
                 settings
                     .rate_limit_burst
+                    .map(|val| val.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                settings
+                    .max_mid_jump_pct
                     .map(|val| val.to_string())
                     .unwrap_or_else(|| "none".to_string()),
             )
@@ -660,6 +671,9 @@ fn canary_settings_from_config(canary: &CanaryConfig) -> CanarySettings {
     if let Some(kill) = &canary.kill {
         settings.stale_max_ticks = kill.stale_max_ticks;
     }
+    if let Some(book) = &canary.book {
+        settings.max_mid_jump_pct = book.max_mid_jump_pct;
+    }
     settings
 }
 
@@ -673,6 +687,11 @@ fn apply_canary_config(cfg: &mut Config, canary: &CanaryConfig) -> CanarySetting
             if let Some(size) = venue.max_order_size {
                 v.max_order_size = size.max(0.0);
             }
+        }
+    }
+    if let Some(max_mid_jump_pct) = settings.max_mid_jump_pct {
+        if max_mid_jump_pct.is_finite() && max_mid_jump_pct > 0.0 {
+            cfg.book.max_mid_jump_pct = max_mid_jump_pct;
         }
     }
     settings
@@ -4981,6 +5000,27 @@ mod tests {
         );
 
         assert_eq!(cfg.book.min_healthy_for_kf, 1);
+    }
+
+    #[test]
+    fn canary_profile_can_override_book_max_mid_jump_pct() {
+        let mut cfg = paraphina::config::Config::default();
+        cfg.book.max_mid_jump_pct = 0.02;
+        let canary = super::CanaryConfig {
+            venue: None,
+            limits: None,
+            rate_limit: None,
+            enforcement: None,
+            kill: None,
+            book: Some(super::CanaryBookConfig {
+                max_mid_jump_pct: Some(0.03),
+            }),
+        };
+
+        let settings = super::apply_canary_config(&mut cfg, &canary);
+
+        assert_eq!(settings.max_mid_jump_pct, Some(0.03));
+        assert_eq!(cfg.book.max_mid_jump_pct, 0.03);
     }
 
     #[test]

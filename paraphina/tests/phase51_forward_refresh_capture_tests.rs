@@ -316,6 +316,7 @@ fn strict_lighter_native_role_canary_profile_enforces_one_open_order() {
     assert!(raw.contains("max_open_orders = 1"));
     assert!(raw.contains("post_only = true"));
     assert!(raw.contains("reduce_only = false"));
+    assert!(raw.contains("max_mid_jump_pct = 0.03"));
 }
 
 #[test]
