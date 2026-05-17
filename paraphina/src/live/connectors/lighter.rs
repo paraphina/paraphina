@@ -20,6 +20,11 @@ const LIGHTER_ACCOUNT_RATE_LIMIT_MAX_BACKOFF_MS: u64 = 10_000;
 const LIGHTER_EMERGENCY_IOC_TIMEOUT_MS_DEFAULT: u64 = 1_000;
 const PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION";
+const PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY";
+const PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE";
+const PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_DEFAULT: f64 = 0.01;
 /// Maximum consecutive delta decode failures before forcing a reconnect to
 /// obtain a fresh full snapshot.  Protects against book drift from missed deltas.
 const LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES: usize = 10;
@@ -100,6 +105,58 @@ fn phase51_lighter_strict_maker_only_observation_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn phase51_lighter_baseline_cleanup_only_enabled() -> bool {
+    std::env::var(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV)
+        .map(|value| phase51_lighter_strict_maker_only_env_value_enabled(&value))
+        .unwrap_or(false)
+}
+
+fn phase51_lighter_sanitized_live_error_context_enabled() -> bool {
+    phase51_lighter_strict_maker_only_observation_enabled()
+        || phase51_lighter_baseline_cleanup_only_enabled()
+}
+
+fn phase51_lighter_baseline_cleanup_max_size() -> f64 {
+    std::env::var(PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_DEFAULT)
+}
+
+fn phase51_lighter_baseline_cleanup_market_allowed(market: &str) -> bool {
+    market.eq_ignore_ascii_case("ETH-USD") || market.eq_ignore_ascii_case("ETH")
+}
+
+fn phase51_lighter_baseline_cleanup_place_rejection(
+    configured_market: &str,
+    req: &LiveRestPlaceRequest,
+) -> Option<&'static str> {
+    if !phase51_lighter_baseline_cleanup_only_enabled() {
+        return None;
+    }
+    if !phase51_lighter_baseline_cleanup_market_allowed(configured_market) {
+        return Some("lighter: baseline cleanup-only rejects non ETH market");
+    }
+    if !matches!(req.purpose, OrderPurpose::Exit | OrderPurpose::Hedge)
+        || !matches!(req.time_in_force, TimeInForce::Ioc)
+        || req.post_only
+        || !req.reduce_only
+    {
+        return Some(
+            "lighter: baseline cleanup-only rejects order-creating request \
+             (requires purpose=Exit/Hedge, time_in_force=Ioc, post_only=false, reduce_only=true)",
+        );
+    }
+    if !req.size.is_finite()
+        || req.size <= 0.0
+        || req.size > phase51_lighter_baseline_cleanup_max_size() + 1e-12
+    {
+        return Some("lighter: baseline cleanup-only rejects size outside cleanup cap");
+    }
+    None
+}
+
 fn phase51_lighter_strict_maker_only_place_rejection(
     req: &LiveRestPlaceRequest,
 ) -> Option<&'static str> {
@@ -134,6 +191,12 @@ fn phase51_lighter_place_error_context(
             market_id, time_in_force, post_only, reduce_only
         );
     }
+    if phase51_lighter_baseline_cleanup_only_enabled() {
+        return format!(
+            "lighter place context market_id={} tif={:?} post_only={} reduce_only={} baseline_cleanup_only=true",
+            market_id, time_in_force, post_only, reduce_only
+        );
+    }
     format!(
         "lighter place context market_id={} client_order_index={} price={} base_amount={} tif={:?} post_only={} reduce_only={}",
         market_id, client_order_index, price, base_amount, time_in_force, post_only, reduce_only
@@ -154,6 +217,12 @@ fn phase51_lighter_replace_error_context(
             market_id, identity_label
         );
     }
+    if phase51_lighter_baseline_cleanup_only_enabled() {
+        return format!(
+            "lighter replace context market_id={} identity_kind={} baseline_cleanup_only=true",
+            market_id, identity_label
+        );
+    }
     format!(
         "lighter replace context market_id={} {}={} price={} base_amount={} client_order_id={}",
         market_id, identity_label, raw_order_id, price, base_amount, requested_client_order_id
@@ -167,6 +236,11 @@ fn phase51_lighter_strict_maker_only_retryable_error(
     if phase51_lighter_strict_maker_only_observation_enabled() {
         return LiveGatewayError::retryable(format!(
             "lighter: strict maker-only observation {label} failed"
+        ));
+    }
+    if phase51_lighter_baseline_cleanup_only_enabled() {
+        return LiveGatewayError::retryable(format!(
+            "lighter: baseline cleanup-only {label} failed"
         ));
     }
     LiveGatewayError::retryable(format!("{label}: {err}"))
@@ -185,6 +259,15 @@ fn phase51_lighter_strict_maker_only_err_with_context(
             ),
         };
     }
+    if phase51_lighter_baseline_cleanup_only_enabled() {
+        return LiveGatewayError {
+            kind: err.kind,
+            message: format!(
+                "lighter: baseline cleanup-only operation failed [{}]",
+                context
+            ),
+        };
+    }
     err_with_context(err, context)
 }
 
@@ -198,6 +281,15 @@ fn phase51_lighter_strict_maker_only_cancel_err_with_context(
             kind: err.kind,
             message: format!(
                 "lighter: strict maker-only observation {operation} failed [{}]",
+                context
+            ),
+        };
+    }
+    if phase51_lighter_baseline_cleanup_only_enabled() {
+        return LiveGatewayError {
+            kind: err.kind,
+            message: format!(
+                "lighter: baseline cleanup-only {operation} failed [{}]",
                 context
             ),
         };
@@ -566,12 +658,11 @@ impl Phase51LighterPassivePressureTapConfig {
                         "/home/ubuntu/source_owner_inbox/phase51/lighter_passive_pressure_observations.jsonl",
                     )
                 });
-        let max_rows =
-            std::env::var("PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_MAX_ROWS")
-                .ok()
-                .and_then(|raw| raw.parse::<u64>().ok())
-                .filter(|rows| *rows > 0)
-                .unwrap_or(5_000);
+        let max_rows = std::env::var("PARAPHINA_PHASE51_LIGHTER_PASSIVE_PRESSURE_TAP_MAX_ROWS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|rows| *rows > 0)
+            .unwrap_or(5_000);
         Self {
             enabled,
             output_path,
@@ -620,10 +711,7 @@ fn parse_lighter_bool_env(raw: &str) -> Option<bool> {
     let text = raw.trim();
     if text == "1" || text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("yes") {
         Some(true)
-    } else if text == "0"
-        || text.eq_ignore_ascii_case("false")
-        || text.eq_ignore_ascii_case("no")
-    {
+    } else if text == "0" || text.eq_ignore_ascii_case("false") || text.eq_ignore_ascii_case("no") {
         Some(false)
     } else {
         None
@@ -647,14 +735,14 @@ fn phase51_lighter_json_i64(value: &serde_json::Value) -> Option<i64> {
     value.as_str()?.trim().parse::<i64>().ok()
 }
 
-fn phase51_lighter_find_i64(
-    value: &serde_json::Value,
-    candidate_keys: &[&str],
-) -> Option<i64> {
+fn phase51_lighter_find_i64(value: &serde_json::Value, candidate_keys: &[&str]) -> Option<i64> {
     if let Some(obj) = value.as_object() {
         for (key, item) in obj {
             let normalized = phase51_lighter_normalized_key(key);
-            if candidate_keys.iter().any(|candidate| *candidate == normalized) {
+            if candidate_keys
+                .iter()
+                .any(|candidate| *candidate == normalized)
+            {
                 if let Some(value) = phase51_lighter_json_i64(item) {
                     return Some(value);
                 }
@@ -3146,10 +3234,8 @@ mod tests {
             "weighted_requests_per_minute_limit": 24000,
             "weighted_requests_per_minute_remaining": 23999
         });
-        let headers = passive_tap_headers(&[
-            ("authorization", "secret"),
-            ("x-sendtx-limit", "9999"),
-        ]);
+        let headers =
+            passive_tap_headers(&[("authorization", "secret"), ("x-sendtx-limit", "9999")]);
 
         let emitted = phase51_lighter_maybe_emit_passive_pressure_observation(
             "sendTx",
@@ -3190,12 +3276,8 @@ mod tests {
             ("x-ratelimit-remaining", "23999"),
         ]);
 
-        let observation = phase51_lighter_build_passive_pressure_observation(
-            "sendTx",
-            true,
-            &headers,
-            None,
-        );
+        let observation =
+            phase51_lighter_build_passive_pressure_observation("sendTx", true, &headers, None);
 
         assert!(observation.generic_rate_limit_header_present);
         assert!(observation.rest_requests_per_minute_limit.is_none());
@@ -4088,6 +4170,151 @@ mod tests {
 
         unset_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV);
         assert!(phase51_lighter_strict_maker_only_place_rejection(&req).is_none());
+    }
+
+    #[test]
+    fn phase51_lighter_baseline_cleanup_only_env_parser_contract() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV]);
+
+        unset_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV);
+        assert!(!phase51_lighter_baseline_cleanup_only_enabled());
+
+        for value in ["", "false", "0", "no", "invalid"] {
+            set_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV, value);
+            assert!(
+                !phase51_lighter_baseline_cleanup_only_enabled(),
+                "{value:?} must not enable baseline cleanup-only"
+            );
+        }
+
+        for value in ["true", "1", "yes", "TRUE", "YeS"] {
+            set_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV, value);
+            assert!(
+                phase51_lighter_baseline_cleanup_only_enabled(),
+                "{value:?} must enable baseline cleanup-only"
+            );
+        }
+    }
+
+    #[test]
+    fn phase51_lighter_baseline_cleanup_only_rejection_contract() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV,
+            PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV,
+        ]);
+        set_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV, "true");
+        unset_env(PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV);
+
+        let mut req = LiveRestPlaceRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            side: Side::Sell,
+            price: 2150.0,
+            size: 0.01,
+            purpose: OrderPurpose::Exit,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: "42".to_string(),
+        };
+
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("ETH-USD", &req).is_none());
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("ETH", &req).is_none());
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("BTC-USD", &req).is_some());
+
+        req.purpose = OrderPurpose::Mm;
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("ETH-USD", &req).is_some());
+        req.purpose = OrderPurpose::Exit;
+
+        req.time_in_force = TimeInForce::Gtc;
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("ETH-USD", &req).is_some());
+        req.time_in_force = TimeInForce::Ioc;
+
+        req.post_only = true;
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("ETH-USD", &req).is_some());
+        req.post_only = false;
+
+        req.reduce_only = false;
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("ETH-USD", &req).is_some());
+        req.reduce_only = true;
+
+        req.size = 0.010001;
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("ETH-USD", &req).is_some());
+
+        unset_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV);
+        assert!(phase51_lighter_baseline_cleanup_place_rejection("BTC-USD", &req).is_none());
+    }
+
+    #[test]
+    fn phase51_lighter_baseline_cleanup_only_contexts_are_sanitized_when_enabled() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV]);
+        set_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV, "1");
+
+        let place =
+            phase51_lighter_place_error_context(0, 42, 215012, 100, TimeInForce::Ioc, false, true);
+        assert!(place.contains("baseline_cleanup_only=true"));
+        assert!(!place.contains("client_order_index"));
+        assert!(!place.contains("42"));
+        assert!(!place.contains("price"));
+        assert!(!place.contains("base_amount"));
+
+        let replace =
+            phase51_lighter_replace_error_context(0, "order_index", 123456, 215012, 100, "raw");
+        assert!(replace.contains("baseline_cleanup_only=true"));
+        assert!(!replace.contains("123456"));
+        assert!(!replace.contains("raw"));
+        assert!(!replace.contains("client_order_id"));
+        assert!(!replace.contains("price"));
+        assert!(!replace.contains("base_amount"));
+    }
+
+    #[tokio::test]
+    async fn phase51_lighter_baseline_cleanup_only_rejects_mm_before_signing() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV]);
+        set_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV, "yes");
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "http://127.0.0.1:9".to_string(),
+            market: "ETH-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let req = LiveRestPlaceRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            side: Side::Buy,
+            price: 2150.0,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            client_order_id: "42".to_string(),
+        };
+
+        let err = connector
+            .place_order(req)
+            .await
+            .expect_err("baseline cleanup-only gate must reject before signing");
+        assert!(matches!(
+            err.kind,
+            crate::live::gateway::LiveGatewayErrorKind::Fatal
+        ));
+        assert!(err.message.contains("baseline cleanup-only"));
     }
 
     #[tokio::test]
@@ -6501,6 +6728,11 @@ impl LiveRestClient for LighterConnector {
             if let Some(reason) = phase51_lighter_strict_maker_only_place_rejection(&req) {
                 return Err(LiveGatewayError::fatal(reason));
             }
+            if let Some(reason) =
+                phase51_lighter_baseline_cleanup_place_rejection(&self.cfg.market, &req)
+            {
+                return Err(LiveGatewayError::fatal(reason));
+            }
             if !self.has_auth() {
                 return Err(LiveGatewayError::fatal(
                     "lighter: missing auth (set LIGHTER_API_KEY_INDEX, LIGHTER_ACCOUNT_INDEX, LIGHTER_API_PRIVATE_KEY_HEX)",
@@ -6592,11 +6824,18 @@ impl LiveRestClient for LighterConnector {
                 {
                     Ok(result) => result,
                     Err(_) => {
-                        eprintln!(
-                            "WARN: Lighter emergency IOC signer timeout client_order_id={} timeout_ms={}",
-                            req.client_order_id,
-                            timeout_duration.as_millis()
-                        );
+                        if phase51_lighter_sanitized_live_error_context_enabled() {
+                            eprintln!(
+                                "WARN: Lighter emergency IOC signer timeout timeout_ms={} sanitized_context=true",
+                                timeout_duration.as_millis()
+                            );
+                        } else {
+                            eprintln!(
+                                "WARN: Lighter emergency IOC signer timeout client_order_id={} timeout_ms={}",
+                                req.client_order_id,
+                                timeout_duration.as_millis()
+                            );
+                        }
                         return Err(LiveGatewayError::retryable(format!(
                             "lighter emergency_ioc signer_timeout after {}ms",
                             timeout_duration.as_millis()
@@ -6622,11 +6861,18 @@ impl LiveRestClient for LighterConnector {
                 match tokio::time::timeout(timeout_duration, self.submit_sendtx(signed)).await {
                     Ok(result) => result,
                     Err(_) => {
-                        eprintln!(
-                            "WARN: Lighter emergency IOC sendtx timeout client_order_id={} timeout_ms={}",
-                            req.client_order_id,
-                            timeout_duration.as_millis()
-                        );
+                        if phase51_lighter_sanitized_live_error_context_enabled() {
+                            eprintln!(
+                                "WARN: Lighter emergency IOC sendtx timeout timeout_ms={} sanitized_context=true",
+                                timeout_duration.as_millis()
+                            );
+                        } else {
+                            eprintln!(
+                                "WARN: Lighter emergency IOC sendtx timeout client_order_id={} timeout_ms={}",
+                                req.client_order_id,
+                                timeout_duration.as_millis()
+                            );
+                        }
                         return Err(err_with_context(
                             LiveGatewayError::retryable(format!(
                                 "lighter emergency_ioc sendtx_timeout after {}ms",
@@ -6694,10 +6940,17 @@ impl LiveRestClient for LighterConnector {
             } else {
                 "client_order_index"
             };
-            let strict_cancel_context = format!(
-                "lighter cancel context market_id={} identity_kind={} strict_maker_only_observation=true",
-                market_id, identity_label
-            );
+            let sanitized_cancel_context = if phase51_lighter_baseline_cleanup_only_enabled() {
+                format!(
+                    "lighter cancel context market_id={} identity_kind={} baseline_cleanup_only=true",
+                    market_id, identity_label
+                )
+            } else {
+                format!(
+                    "lighter cancel context market_id={} identity_kind={} strict_maker_only_observation=true",
+                    market_id, identity_label
+                )
+            };
             let expired_at = now_ms().saturating_add(60_000);
             let sign_req = SignCancelOrderRequest {
                 op: "cancel_order".to_string(),
@@ -6716,7 +6969,7 @@ impl LiveRestClient for LighterConnector {
                 phase51_lighter_strict_maker_only_cancel_err_with_context(
                     err,
                     "cancel submit_sendtx",
-                    &strict_cancel_context,
+                    &sanitized_cancel_context,
                 )
             })?;
             Ok(resp)
@@ -6744,6 +6997,11 @@ impl LiveRestClient for LighterConnector {
                 return Err(LiveGatewayError::fatal(
                     "lighter: strict maker-only observation rejects replace request \
                      (requires purpose=Mm, time_in_force=Gtc, post_only=true, reduce_only=false)",
+                ));
+            }
+            if phase51_lighter_baseline_cleanup_only_enabled() {
+                return Err(LiveGatewayError::fatal(
+                    "lighter: baseline cleanup-only rejects replace request",
                 ));
             }
             if req.purpose != OrderPurpose::Mm
@@ -6899,10 +7157,15 @@ impl LiveRestClient for LighterConnector {
                 phase51_lighter_strict_maker_only_retryable_error("cancel_all signer_error", err)
             })?;
             let resp = self.submit_sendtx(signed).await.map_err(|err| {
+                let context = if phase51_lighter_baseline_cleanup_only_enabled() {
+                    "lighter cancel_all context baseline_cleanup_only=true"
+                } else {
+                    "lighter cancel_all context strict_maker_only_observation=true"
+                };
                 phase51_lighter_strict_maker_only_cancel_err_with_context(
                     err,
                     "cancel_all submit_sendtx",
-                    "lighter cancel_all context strict_maker_only_observation=true",
+                    context,
                 )
             })?;
             Ok(resp)
