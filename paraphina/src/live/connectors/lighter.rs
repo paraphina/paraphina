@@ -18,6 +18,8 @@ const LIGHTER_ACCOUNT_LOG_INTERVAL_MS: u64 = 30_000;
 const LIGHTER_ACCOUNT_RATE_LIMIT_BASE_BACKOFF_MS: u64 = 2_000;
 const LIGHTER_ACCOUNT_RATE_LIMIT_MAX_BACKOFF_MS: u64 = 10_000;
 const LIGHTER_EMERGENCY_IOC_TIMEOUT_MS_DEFAULT: u64 = 1_000;
+const PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION";
 /// Maximum consecutive delta decode failures before forcing a reconnect to
 /// obtain a fresh full snapshot.  Protects against book drift from missed deltas.
 const LIGHTER_MAX_CONSECUTIVE_DELTA_FAILURES: usize = 10;
@@ -85,6 +87,191 @@ fn lighter_emergency_ioc_request(req: &LiveRestPlaceRequest) -> bool {
     req.reduce_only
         && matches!(req.time_in_force, TimeInForce::Ioc)
         && matches!(req.purpose, OrderPurpose::Exit | OrderPurpose::Hedge)
+}
+
+fn phase51_lighter_strict_maker_only_env_value_enabled(value: &str) -> bool {
+    let value = value.trim();
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+}
+
+fn phase51_lighter_strict_maker_only_observation_enabled() -> bool {
+    std::env::var(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV)
+        .map(|value| phase51_lighter_strict_maker_only_env_value_enabled(&value))
+        .unwrap_or(false)
+}
+
+fn phase51_lighter_strict_maker_only_place_rejection(
+    req: &LiveRestPlaceRequest,
+) -> Option<&'static str> {
+    if !phase51_lighter_strict_maker_only_observation_enabled() {
+        return None;
+    }
+    if req.purpose != OrderPurpose::Mm
+        || !matches!(req.time_in_force, TimeInForce::Gtc)
+        || !req.post_only
+        || req.reduce_only
+    {
+        return Some(
+            "lighter: strict maker-only observation rejects order-creating request \
+             (requires purpose=Mm, time_in_force=Gtc, post_only=true, reduce_only=false)",
+        );
+    }
+    None
+}
+
+fn phase51_lighter_place_error_context(
+    market_id: u64,
+    client_order_index: u64,
+    price: i64,
+    base_amount: i64,
+    time_in_force: TimeInForce,
+    post_only: bool,
+    reduce_only: bool,
+) -> String {
+    if phase51_lighter_strict_maker_only_observation_enabled() {
+        return format!(
+            "lighter place context market_id={} tif={:?} post_only={} reduce_only={} strict_maker_only_observation=true",
+            market_id, time_in_force, post_only, reduce_only
+        );
+    }
+    format!(
+        "lighter place context market_id={} client_order_index={} price={} base_amount={} tif={:?} post_only={} reduce_only={}",
+        market_id, client_order_index, price, base_amount, time_in_force, post_only, reduce_only
+    )
+}
+
+fn phase51_lighter_replace_error_context(
+    market_id: u64,
+    identity_label: &str,
+    raw_order_id: u64,
+    price: i64,
+    base_amount: i64,
+    requested_client_order_id: &str,
+) -> String {
+    if phase51_lighter_strict_maker_only_observation_enabled() {
+        return format!(
+            "lighter replace context market_id={} identity_kind={} strict_maker_only_observation=true",
+            market_id, identity_label
+        );
+    }
+    format!(
+        "lighter replace context market_id={} {}={} price={} base_amount={} client_order_id={}",
+        market_id, identity_label, raw_order_id, price, base_amount, requested_client_order_id
+    )
+}
+
+fn phase51_lighter_strict_maker_only_retryable_error(
+    label: &str,
+    err: impl std::fmt::Display,
+) -> LiveGatewayError {
+    if phase51_lighter_strict_maker_only_observation_enabled() {
+        return LiveGatewayError::retryable(format!(
+            "lighter: strict maker-only observation {label} failed"
+        ));
+    }
+    LiveGatewayError::retryable(format!("{label}: {err}"))
+}
+
+fn phase51_lighter_strict_maker_only_err_with_context(
+    err: LiveGatewayError,
+    context: &str,
+) -> LiveGatewayError {
+    if phase51_lighter_strict_maker_only_observation_enabled() {
+        return LiveGatewayError {
+            kind: err.kind,
+            message: format!(
+                "lighter: strict maker-only observation operation failed [{}]",
+                context
+            ),
+        };
+    }
+    err_with_context(err, context)
+}
+
+fn phase51_lighter_strict_maker_only_cancel_err_with_context(
+    err: LiveGatewayError,
+    operation: &str,
+    context: &str,
+) -> LiveGatewayError {
+    if phase51_lighter_strict_maker_only_observation_enabled() {
+        return LiveGatewayError {
+            kind: err.kind,
+            message: format!(
+                "lighter: strict maker-only observation {operation} failed [{}]",
+                context
+            ),
+        };
+    }
+    err
+}
+
+fn phase51_lighter_orderbooks_endpoint_family(endpoint: &str) -> &'static str {
+    if endpoint.eq_ignore_ascii_case("/api/v1/orderBooks")
+        || endpoint.eq_ignore_ascii_case("/api/v1/orderbooks")
+    {
+        "orderBooks"
+    } else {
+        "unknown"
+    }
+}
+
+fn phase51_lighter_strict_orderbooks_attempt_log(endpoint: &str, attempt_index: usize) -> String {
+    format!(
+        "INFO: Lighter resolving market id attempt endpoint_family={} attempt_index={} strict_maker_only_observation=true",
+        phase51_lighter_orderbooks_endpoint_family(endpoint),
+        attempt_index
+    )
+}
+
+fn phase51_lighter_strict_orderbooks_failure_log(
+    endpoint: &str,
+    attempt_index: usize,
+    status: reqwest::StatusCode,
+    reason: &str,
+) -> String {
+    format!(
+        "WARN: Lighter orderBooks fetch failed endpoint_family={} attempt_index={} status={} reason={} strict_maker_only_observation=true",
+        phase51_lighter_orderbooks_endpoint_family(endpoint),
+        attempt_index,
+        status,
+        reason
+    )
+}
+
+fn phase51_lighter_strict_orderbooks_error_log(endpoint: &str, attempt_index: usize) -> String {
+    format!(
+        "WARN: Lighter orderBooks fetch error endpoint_family={} attempt_index={} reason=request_error strict_maker_only_observation=true",
+        phase51_lighter_orderbooks_endpoint_family(endpoint),
+        attempt_index
+    )
+}
+
+fn phase51_lighter_orderbooks_source_label(source: &str) -> &'static str {
+    if source == "env:LIGHTER_MARKET_ID" {
+        "env_lighter_market_id"
+    } else {
+        "orderbooks_discovery"
+    }
+}
+
+fn phase51_lighter_market_decimals_missing_error(
+    field: &str,
+    market_id: u64,
+    source: &str,
+) -> anyhow::Error {
+    if phase51_lighter_strict_maker_only_observation_enabled() {
+        return anyhow::anyhow!(
+            "Lighter market decimals missing field={} source_label={} strict_maker_only_observation=true",
+            field,
+            phase51_lighter_orderbooks_source_label(source)
+        );
+    }
+    anyhow::anyhow!(
+        "Lighter {} decimals missing for market_id={} source_url={}",
+        field,
+        market_id,
+        source
+    )
 }
 
 fn lighter_ticker_backstop_enabled() -> bool {
@@ -1064,18 +1251,10 @@ impl LighterConnector {
             anyhow::bail!("Lighter market_id not found for decimals: {}", market_id);
         }
         let price = info.price_decimals.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Lighter price decimals missing for market_id={} source_url={}",
-                market_id,
-                info.source
-            )
+            phase51_lighter_market_decimals_missing_error("price", market_id, &info.source)
         })?;
         let size = info.size_decimals.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Lighter size decimals missing for market_id={} source_url={}",
-                market_id,
-                info.source
-            )
+            phase51_lighter_market_decimals_missing_error("size", market_id, &info.source)
         })?;
         Ok((price, size))
     }
@@ -1159,14 +1338,25 @@ impl LighterConnector {
                 .clone()
                 .or_else(|| matched.as_ref().map(|info| info.symbol.clone()))
                 .unwrap_or_else(|| self.cfg.market.clone());
-            eprintln!(
-                "INFO: Lighter resolving market id symbol={} source_url=env:LIGHTER_MARKET_ID",
-                symbol
-            );
-            eprintln!(
-                "INFO: Lighter market id resolved symbol={} market_id={} source_url=env:LIGHTER_MARKET_ID",
-                symbol, market_id
-            );
+            if phase51_lighter_strict_maker_only_observation_enabled() {
+                eprintln!(
+                    "INFO: Lighter resolving market id source_label={} strict_maker_only_observation=true",
+                    phase51_lighter_orderbooks_source_label("env:LIGHTER_MARKET_ID")
+                );
+                eprintln!(
+                    "INFO: Lighter market id resolved source_label={} strict_maker_only_observation=true",
+                    phase51_lighter_orderbooks_source_label("env:LIGHTER_MARKET_ID")
+                );
+            } else {
+                eprintln!(
+                    "INFO: Lighter resolving market id symbol={} source_url=env:LIGHTER_MARKET_ID",
+                    symbol
+                );
+                eprintln!(
+                    "INFO: Lighter market id resolved symbol={} market_id={} source_url=env:LIGHTER_MARKET_ID",
+                    symbol, market_id
+                );
+            }
             let resolved = LighterResolvedMarket {
                 symbol,
                 market_id,
@@ -1181,34 +1371,55 @@ impl LighterConnector {
             resolved
         } else {
             let symbol = market_symbol_env.unwrap_or_else(|| self.cfg.market.clone());
-            eprintln!(
-                "INFO: Lighter resolving market id symbol={} source_url={}",
-                symbol, source_url
-            );
+            if phase51_lighter_strict_maker_only_observation_enabled() {
+                eprintln!(
+                    "INFO: Lighter resolving market id source_label={} strict_maker_only_observation=true",
+                    phase51_lighter_orderbooks_source_label(&source_url)
+                );
+            } else {
+                eprintln!(
+                    "INFO: Lighter resolving market id symbol={} source_url={}",
+                    symbol, source_url
+                );
+            }
             let normalized = normalize_lighter_symbol(&symbol);
             let found = orderbooks
                 .iter()
                 .find(|info| normalize_lighter_symbol(&info.symbol) == normalized)
                 .cloned();
             let Some(info) = found else {
-                let available: Vec<String> = orderbooks
-                    .iter()
-                    .take(15)
-                    .map(|info| info.symbol.clone())
-                    .collect();
-                eprintln!(
-                    "WARN: Lighter market id not found requested={} available_symbols={:?}",
-                    normalized, available
-                );
+                if phase51_lighter_strict_maker_only_observation_enabled() {
+                    eprintln!(
+                        "WARN: Lighter market id not found reason=market_symbol_unmatched source_label={} strict_maker_only_observation=true",
+                        phase51_lighter_orderbooks_source_label(&source_url)
+                    );
+                } else {
+                    let available: Vec<String> = orderbooks
+                        .iter()
+                        .take(15)
+                        .map(|info| info.symbol.clone())
+                        .collect();
+                    eprintln!(
+                        "WARN: Lighter market id not found requested={} available_symbols={:?}",
+                        normalized, available
+                    );
+                }
                 anyhow::bail!(
                     "LIGHTER_MARKET not found in orderBooks response: {}",
                     symbol
                 );
             };
-            eprintln!(
-                "INFO: Lighter market id resolved symbol={} market_id={} source_url={}",
-                info.symbol, info.market_id, source_url
-            );
+            if phase51_lighter_strict_maker_only_observation_enabled() {
+                eprintln!(
+                    "INFO: Lighter market id resolved source_label={} strict_maker_only_observation=true",
+                    phase51_lighter_orderbooks_source_label(&source_url)
+                );
+            } else {
+                eprintln!(
+                    "INFO: Lighter market id resolved symbol={} market_id={} source_url={}",
+                    info.symbol, info.market_id, source_url
+                );
+            }
             let resolved = LighterResolvedMarket {
                 symbol: info.symbol,
                 market_id: info.market_id,
@@ -2599,11 +2810,22 @@ async fn fetch_lighter_orderbooks_with_fallbacks(
     }
     bases.push("https://api.lighter.xyz".to_string());
     let endpoints = ["/api/v1/orderBooks", "/api/v1/orderbooks"];
-    for base in bases {
+    let strict_maker_only = phase51_lighter_strict_maker_only_observation_enabled();
+    for (base_index, base) in bases.into_iter().enumerate() {
         let base = base.trim_end_matches('/').to_string();
-        for endpoint in endpoints {
+        for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
+            let attempt_index = base_index
+                .saturating_mul(endpoints.len())
+                .saturating_add(endpoint_index);
             let url = format!("{base}{endpoint}");
-            eprintln!("INFO: Lighter resolving market id attempt url={}", url);
+            if strict_maker_only {
+                eprintln!(
+                    "{}",
+                    phase51_lighter_strict_orderbooks_attempt_log(endpoint, attempt_index)
+                );
+            } else {
+                eprintln!("INFO: Lighter resolving market id attempt url={}", url);
+            }
             match http.get(url.clone()).send().await {
                 Ok(resp) => {
                     let status = resp.status();
@@ -2617,17 +2839,36 @@ async fn fetch_lighter_orderbooks_with_fallbacks(
                             }
                         }
                     }
-                    let snippet: String = body.chars().take(160).collect();
-                    eprintln!(
-                        "WARN: Lighter orderBooks fetch failed status={} url={} snippet={}",
-                        status, url, snippet
-                    );
+                    if strict_maker_only {
+                        eprintln!(
+                            "{}",
+                            phase51_lighter_strict_orderbooks_failure_log(
+                                endpoint,
+                                attempt_index,
+                                status,
+                                "non_success_or_empty",
+                            )
+                        );
+                    } else {
+                        let snippet: String = body.chars().take(160).collect();
+                        eprintln!(
+                            "WARN: Lighter orderBooks fetch failed status={} url={} snippet={}",
+                            status, url, snippet
+                        );
+                    }
                 }
                 Err(err) => {
-                    eprintln!(
-                        "WARN: Lighter orderBooks fetch error url={} err={}",
-                        url, err
-                    );
+                    if strict_maker_only {
+                        eprintln!(
+                            "{}",
+                            phase51_lighter_strict_orderbooks_error_log(endpoint, attempt_index)
+                        );
+                    } else {
+                        eprintln!(
+                            "WARN: Lighter orderBooks fetch error url={} err={}",
+                            url, err
+                        );
+                    }
                 }
             }
         }
@@ -3504,8 +3745,14 @@ mod tests {
     #[tokio::test]
     async fn lighter_place_order_calls_signer_then_sendtx() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LIGHTER_MARKET_ID");
-        std::env::remove_var("LIGHTER_MARKET");
+        let _env = EnvGuard::new(&[
+            "LIGHTER_MARKET_ID",
+            "LIGHTER_MARKET",
+            PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV,
+        ]);
+        unset_env("LIGHTER_MARKET_ID");
+        unset_env("LIGHTER_MARKET");
+        set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, "true");
         let api = MockServer::start_async().await;
         let signer = MockServer::start_async().await;
         let orderbooks = api
@@ -3588,8 +3835,14 @@ mod tests {
     #[tokio::test]
     async fn lighter_ioc_order_uses_nil_order_expiry() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LIGHTER_MARKET_ID");
-        std::env::remove_var("LIGHTER_MARKET");
+        let _env = EnvGuard::new(&[
+            "LIGHTER_MARKET_ID",
+            "LIGHTER_MARKET",
+            PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV,
+        ]);
+        unset_env("LIGHTER_MARKET_ID");
+        unset_env("LIGHTER_MARKET");
+        unset_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV);
         let api = MockServer::start_async().await;
         let signer = MockServer::start_async().await;
         let orderbooks = api
@@ -3663,6 +3916,224 @@ mod tests {
         orderbooks.assert_hits_async(1).await;
         sign.assert_async().await;
         sendtx.assert_async().await;
+    }
+
+    #[test]
+    fn phase51_lighter_strict_maker_only_env_parser_contract() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV]);
+
+        unset_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV);
+        assert!(!phase51_lighter_strict_maker_only_observation_enabled());
+
+        for value in ["", "false", "0", "no", "invalid"] {
+            set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, value);
+            assert!(
+                !phase51_lighter_strict_maker_only_observation_enabled(),
+                "{value:?} must not enable strict maker-only observation"
+            );
+        }
+
+        for value in ["true", "1", "yes", "TRUE", "YeS"] {
+            set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, value);
+            assert!(
+                phase51_lighter_strict_maker_only_observation_enabled(),
+                "{value:?} must enable strict maker-only observation"
+            );
+        }
+    }
+
+    #[test]
+    fn phase51_lighter_strict_maker_only_contexts_are_sanitized_when_enabled() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV]);
+        set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, "yes");
+
+        let place =
+            phase51_lighter_place_error_context(7, 42, 10012, 1234, TimeInForce::Gtc, true, false);
+        assert!(place.contains("strict_maker_only_observation=true"));
+        assert!(!place.contains("client_order_index"));
+        assert!(!place.contains("42"));
+        assert!(!place.contains("price"));
+        assert!(!place.contains("base_amount"));
+
+        let replace = phase51_lighter_replace_error_context(
+            7,
+            "order_index",
+            123456,
+            10012,
+            1234,
+            "client-raw",
+        );
+        assert!(replace.contains("strict_maker_only_observation=true"));
+        assert!(!replace.contains("123456"));
+        assert!(!replace.contains("client-raw"));
+        assert!(!replace.contains("client_order_id"));
+        assert!(!replace.contains("price"));
+        assert!(!replace.contains("base_amount"));
+
+        unset_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV);
+        let disabled =
+            phase51_lighter_place_error_context(7, 42, 10012, 1234, TimeInForce::Gtc, true, false);
+        assert!(disabled.contains("client_order_index"));
+        assert!(disabled.contains("price"));
+        assert!(disabled.contains("base_amount"));
+    }
+
+    #[test]
+    fn phase51_lighter_strict_maker_only_orderbooks_logs_are_sanitized() {
+        let attempt = phase51_lighter_strict_orderbooks_attempt_log("/api/v1/orderBooks", 3);
+        assert!(attempt.contains("endpoint_family=orderBooks"));
+        assert!(attempt.contains("attempt_index=3"));
+        assert!(attempt.contains("strict_maker_only_observation=true"));
+        assert!(!attempt.contains("/api/v1"));
+        assert!(!attempt.contains("http"));
+        assert!(!attempt.contains("token"));
+
+        let failure = phase51_lighter_strict_orderbooks_failure_log(
+            "/api/v1/orderBooks",
+            4,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "non_success_or_empty",
+        );
+        assert!(failure.contains("status=429"));
+        assert!(failure.contains("reason=non_success_or_empty"));
+        assert!(!failure.contains("snippet"));
+        assert!(!failure.contains("response"));
+        assert!(!failure.contains("body"));
+        assert!(!failure.contains("/api/v1"));
+
+        let request_error = phase51_lighter_strict_orderbooks_error_log("/api/v1/orderBooks", 5);
+        assert!(request_error.contains("reason=request_error"));
+        assert!(!request_error.contains("err="));
+        assert!(!request_error.contains("http"));
+
+        assert_eq!(
+            phase51_lighter_orderbooks_source_label(
+                "https://example.invalid/api/v1/orderBooks?token=secret"
+            ),
+            "orderbooks_discovery"
+        );
+        assert_eq!(
+            phase51_lighter_orderbooks_source_label("env:LIGHTER_MARKET_ID"),
+            "env_lighter_market_id"
+        );
+    }
+
+    #[test]
+    fn phase51_lighter_strict_maker_only_decimal_errors_are_sanitized() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV]);
+        set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, "true");
+
+        let strict = phase51_lighter_market_decimals_missing_error(
+            "price",
+            7,
+            "https://example.invalid/api/v1/orderBooks?token=secret",
+        )
+        .to_string();
+        assert!(strict.contains("strict_maker_only_observation=true"));
+        assert!(strict.contains("source_label=orderbooks_discovery"));
+        assert!(!strict.contains("https://"));
+        assert!(!strict.contains("source_url"));
+        assert!(!strict.contains("token"));
+        assert!(!strict.contains("secret"));
+        assert!(!strict.contains("market_id"));
+
+        unset_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV);
+        let disabled = phase51_lighter_market_decimals_missing_error(
+            "price",
+            7,
+            "https://example.invalid/api/v1/orderBooks",
+        )
+        .to_string();
+        assert!(disabled.contains("source_url=https://example.invalid/api/v1/orderBooks"));
+        assert!(disabled.contains("market_id=7"));
+    }
+
+    #[test]
+    fn phase51_lighter_strict_maker_only_rejection_contract() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV]);
+        set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, "true");
+        let mut req = LiveRestPlaceRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            client_order_id: "42".to_string(),
+        };
+
+        assert!(phase51_lighter_strict_maker_only_place_rejection(&req).is_none());
+
+        req.post_only = false;
+        assert!(phase51_lighter_strict_maker_only_place_rejection(&req).is_some());
+
+        req.post_only = true;
+        req.time_in_force = TimeInForce::Ioc;
+        assert!(phase51_lighter_strict_maker_only_place_rejection(&req).is_some());
+
+        req.time_in_force = TimeInForce::Gtc;
+        req.reduce_only = true;
+        assert!(phase51_lighter_strict_maker_only_place_rejection(&req).is_some());
+
+        req.reduce_only = false;
+        req.purpose = OrderPurpose::Exit;
+        assert!(phase51_lighter_strict_maker_only_place_rejection(&req).is_some());
+
+        unset_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV);
+        assert!(phase51_lighter_strict_maker_only_place_rejection(&req).is_none());
+    }
+
+    #[tokio::test]
+    async fn phase51_lighter_strict_maker_only_rejects_reduce_only_ioc_before_signing() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV]);
+        set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, "true");
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "http://127.0.0.1:9".to_string(),
+            market: "ETH-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let req = LiveRestPlaceRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            side: Side::Buy,
+            price: 2150.0,
+            size: 0.01,
+            purpose: OrderPurpose::Exit,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: "42".to_string(),
+        };
+
+        let err = connector
+            .place_order(req)
+            .await
+            .expect_err("strict maker-only gate must reject before signing");
+        assert!(matches!(
+            err.kind,
+            crate::live::gateway::LiveGatewayErrorKind::Fatal
+        ));
+        assert!(err.message.contains("strict maker-only observation"));
     }
 
     #[test]
@@ -4165,6 +4636,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phase51_lighter_strict_maker_only_sanitizes_cancel_sendtx_failure() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "LIGHTER_MARKET_ID",
+            "LIGHTER_MARKET",
+            PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV,
+        ]);
+        unset_env("LIGHTER_MARKET_ID");
+        unset_env("LIGHTER_MARKET");
+        set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, "yes");
+        let api = MockServer::start_async().await;
+        let signer = MockServer::start_async().await;
+        let orderbooks = api
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "order_books": [
+                        {
+                            "symbol": "BTC-USD",
+                            "market_id": 7,
+                            "price_decimals": 2,
+                            "size_decimals": 3
+                        }
+                    ]
+                }));
+            })
+            .await;
+        let sign = signer
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sign")
+                    .body_contains("\"op\":\"cancel_order\"");
+                then.status(200)
+                    .json_body(serde_json::json!({"tx_type":15,"tx_info":{"signed":true}}));
+            })
+            .await;
+        let sendtx = api
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v1/sendTx");
+                then.status(429).body(
+                    "rate limit response with raw order_id, client_order_id, token, signature",
+                );
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: api.base_url(),
+            market: "BTC-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: Some(signer.base_url()),
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let req = LiveRestCancelRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            order_id: "55".to_string(),
+        };
+
+        let err = connector
+            .cancel_order(req)
+            .await
+            .expect_err("strict-mode cancel sendTx failure should be sanitized");
+        assert_eq!(err.kind, LiveGatewayErrorKind::RateLimited);
+        assert!(err.message.contains("strict maker-only observation"));
+        assert!(err.message.contains("cancel submit_sendtx"));
+        assert!(!err.message.contains("raw order_id"));
+        assert!(!err.message.contains("client_order_id"));
+        assert!(!err.message.contains("token"));
+        assert!(!err.message.contains("signature"));
+        orderbooks.assert_hits_async(1).await;
+        sign.assert_async().await;
+        sendtx.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn lighter_replace_order_calls_signer_then_sendtx() {
         let api = MockServer::start_async().await;
         let signer = MockServer::start_async().await;
@@ -4413,6 +4968,67 @@ mod tests {
         };
         let resp = connector.cancel_all(req).await.expect("cancel_all");
         assert!(resp.order_id.is_none());
+        sign.assert_async().await;
+        sendtx.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn phase51_lighter_strict_maker_only_sanitizes_cancel_all_sendtx_failure() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV]);
+        set_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV, "1");
+        let api = MockServer::start_async().await;
+        let signer = MockServer::start_async().await;
+        let sign = signer
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sign")
+                    .body_contains("\"op\":\"cancel_all\"");
+                then.status(200)
+                    .json_body(serde_json::json!({"tx_type":16,"tx_info":{"signed":true}}));
+            })
+            .await;
+        let sendtx = api
+            .mock_async(|when, then| {
+                when.method(POST).path("/api/v1/sendTx");
+                then.status(500).body(
+                    "temporary response with raw order_id, client_order_id, token, signature",
+                );
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: api.base_url(),
+            market: "BTC-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: Some(signer.base_url()),
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let req = LiveRestCancelAllRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+        };
+
+        let err = connector
+            .cancel_all(req)
+            .await
+            .expect_err("strict-mode cancel-all sendTx failure should be sanitized");
+        assert_eq!(err.kind, LiveGatewayErrorKind::Retryable);
+        assert!(err.message.contains("strict maker-only observation"));
+        assert!(err.message.contains("cancel_all submit_sendtx"));
+        assert!(!err.message.contains("raw order_id"));
+        assert!(!err.message.contains("client_order_id"));
+        assert!(!err.message.contains("token"));
+        assert!(!err.message.contains("signature"));
         sign.assert_async().await;
         sendtx.assert_async().await;
     }
@@ -5882,6 +6498,9 @@ impl LiveRestClient for LighterConnector {
                     client_order_id: None,
                 });
             }
+            if let Some(reason) = phase51_lighter_strict_maker_only_place_rejection(&req) {
+                return Err(LiveGatewayError::fatal(reason));
+            }
             if !self.has_auth() {
                 return Err(LiveGatewayError::fatal(
                     "lighter: missing auth (set LIGHTER_API_KEY_INDEX, LIGHTER_ACCOUNT_INDEX, LIGHTER_API_PRIVATE_KEY_HEX)",
@@ -5909,6 +6528,11 @@ impl LiveRestClient for LighterConnector {
                 )
             })?;
             if client_order_index > LIGHTER_CLIENT_ORDER_INDEX_MAX {
+                if phase51_lighter_strict_maker_only_observation_enabled() {
+                    return Err(LiveGatewayError::fatal(
+                        "lighter: client_order_id exceeds uint48 max",
+                    ));
+                }
                 return Err(LiveGatewayError::fatal(format!(
                     "lighter: client_order_id exceeds uint48 max client_order_id={} max={}",
                     req.client_order_id, LIGHTER_CLIENT_ORDER_INDEX_MAX
@@ -5982,16 +6606,17 @@ impl LiveRestClient for LighterConnector {
             } else {
                 signer.sign_create_order(sign_req).await
             }
-            .map_err(|err| LiveGatewayError::retryable(format!("signer_error: {err}")))?;
-            let context = format!(
-                "lighter place context market_id={} client_order_index={} price={} base_amount={} tif={:?} post_only={} reduce_only={}",
+            .map_err(|err| {
+                phase51_lighter_strict_maker_only_retryable_error("signer_error", err)
+            })?;
+            let context = phase51_lighter_place_error_context(
                 market_id,
                 client_order_index,
                 price,
                 base_amount,
                 req.time_in_force,
                 req.post_only,
-                req.reduce_only
+                req.reduce_only,
             );
             let resp = if let Some(timeout_duration) = emergency_ioc_timeout {
                 match tokio::time::timeout(timeout_duration, self.submit_sendtx(signed)).await {
@@ -6014,7 +6639,7 @@ impl LiveRestClient for LighterConnector {
             } else {
                 self.submit_sendtx(signed).await
             }
-            .map_err(|err| err_with_context(err, &context))?;
+            .map_err(|err| phase51_lighter_strict_maker_only_err_with_context(err, &context))?;
             Ok(resp)
         })
     }
@@ -6064,6 +6689,15 @@ impl LiveRestClient for LighterConnector {
             let (_, market_id) = self.resolve_market_id_and_symbol().await.map_err(|err| {
                 LiveGatewayError::fatal(format!("lighter market_id error: {err}"))
             })?;
+            let identity_label = if order_index.is_some() {
+                "order_index"
+            } else {
+                "client_order_index"
+            };
+            let strict_cancel_context = format!(
+                "lighter cancel context market_id={} identity_kind={} strict_maker_only_observation=true",
+                market_id, identity_label
+            );
             let expired_at = now_ms().saturating_add(60_000);
             let sign_req = SignCancelOrderRequest {
                 op: "cancel_order".to_string(),
@@ -6075,11 +6709,16 @@ impl LiveRestClient for LighterConnector {
                 client_order_index,
                 expired_at,
             };
-            let signed = signer
-                .sign_cancel_order(sign_req)
-                .await
-                .map_err(|err| LiveGatewayError::retryable(format!("signer_error: {err}")))?;
-            let resp = self.submit_sendtx(signed).await?;
+            let signed = signer.sign_cancel_order(sign_req).await.map_err(|err| {
+                phase51_lighter_strict_maker_only_retryable_error("cancel signer_error", err)
+            })?;
+            let resp = self.submit_sendtx(signed).await.map_err(|err| {
+                phase51_lighter_strict_maker_only_cancel_err_with_context(
+                    err,
+                    "cancel submit_sendtx",
+                    &strict_cancel_context,
+                )
+            })?;
             Ok(resp)
         })
     }
@@ -6095,6 +6734,17 @@ impl LiveRestClient for LighterConnector {
                     order_id: None,
                     client_order_id: req.client_order_id.into(),
                 });
+            }
+            if phase51_lighter_strict_maker_only_observation_enabled()
+                && (req.purpose != OrderPurpose::Mm
+                    || !matches!(req.time_in_force, TimeInForce::Gtc)
+                    || !req.post_only
+                    || req.reduce_only)
+            {
+                return Err(LiveGatewayError::fatal(
+                    "lighter: strict maker-only observation rejects replace request \
+                     (requires purpose=Mm, time_in_force=Gtc, post_only=true, reduce_only=false)",
+                ));
             }
             if req.purpose != OrderPurpose::Mm
                 || !matches!(req.time_in_force, TimeInForce::Gtc)
@@ -6167,29 +6817,35 @@ impl LiveRestClient for LighterConnector {
             } else {
                 "client_order_index"
             };
-            let context = format!(
-                "lighter replace context market_id={} {}={} price={} base_amount={} client_order_id={}",
+            let context = phase51_lighter_replace_error_context(
                 market_id,
                 identity_label,
                 raw_order_id,
                 price,
                 base_amount,
-                requested_client_order_id
+                &requested_client_order_id,
             );
             let signed = signer.sign_modify_order(sign_req).await.map_err(|err| {
                 err_with_context(
-                    LiveGatewayError::retryable(format!("signer_error: {err}")),
+                    phase51_lighter_strict_maker_only_retryable_error("signer_error", err),
                     &context,
                 )
             })?;
-            eprintln!(
-                "INFO: Lighter native replace submit market_id={} {}={} client_order_id={} price={} base_amount={}",
-                market_id, identity_label, raw_order_id, requested_client_order_id, price, base_amount
-            );
+            if phase51_lighter_strict_maker_only_observation_enabled() {
+                eprintln!(
+                    "INFO: Lighter native replace submit market_id={} identity_kind={} strict_maker_only_observation=true",
+                    market_id, identity_label
+                );
+            } else {
+                eprintln!(
+                    "INFO: Lighter native replace submit market_id={} {}={} client_order_id={} price={} base_amount={}",
+                    market_id, identity_label, raw_order_id, requested_client_order_id, price, base_amount
+                );
+            }
             let mut resp = self
                 .submit_sendtx(signed)
                 .await
-                .map_err(|err| err_with_context(err, &context))?;
+                .map_err(|err| phase51_lighter_strict_maker_only_err_with_context(err, &context))?;
             resp.order_id = resp.order_id.or(Some(requested_order_id));
             resp.client_order_id = Some(requested_client_order_id);
             Ok(resp)
@@ -6239,11 +6895,16 @@ impl LiveRestClient for LighterConnector {
                 cancel_all_time: 0,
                 expired_at: 0,
             };
-            let signed = signer
-                .sign_cancel_all(sign_req)
-                .await
-                .map_err(|err| LiveGatewayError::retryable(format!("signer_error: {err}")))?;
-            let resp = self.submit_sendtx(signed).await?;
+            let signed = signer.sign_cancel_all(sign_req).await.map_err(|err| {
+                phase51_lighter_strict_maker_only_retryable_error("cancel_all signer_error", err)
+            })?;
+            let resp = self.submit_sendtx(signed).await.map_err(|err| {
+                phase51_lighter_strict_maker_only_cancel_err_with_context(
+                    err,
+                    "cancel_all submit_sendtx",
+                    "lighter cancel_all context strict_maker_only_observation=true",
+                )
+            })?;
             Ok(resp)
         })
     }
