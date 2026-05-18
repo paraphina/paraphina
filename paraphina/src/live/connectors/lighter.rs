@@ -20,6 +20,12 @@ const LIGHTER_ACCOUNT_RATE_LIMIT_MAX_BACKOFF_MS: u64 = 10_000;
 const LIGHTER_EMERGENCY_IOC_TIMEOUT_MS_DEFAULT: u64 = 1_000;
 const PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION";
+const PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED_ENV: &str =
+    "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED";
+const PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED_ENV: &str =
+    "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED";
+const PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV: &str =
+    "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY";
 const PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY";
 const PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV: &str =
@@ -103,6 +109,20 @@ fn phase51_lighter_strict_maker_only_observation_enabled() -> bool {
     std::env::var(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV)
         .map(|value| phase51_lighter_strict_maker_only_env_value_enabled(&value))
         .unwrap_or(false)
+}
+
+fn phase51_lighter_true_env(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| phase51_lighter_strict_maker_only_env_value_enabled(&value))
+        .unwrap_or(false)
+}
+
+fn phase51_lighter_account_all_trades_source_owner_enabled() -> bool {
+    phase51_lighter_true_env(PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED_ENV)
+        && phase51_lighter_true_env(
+            PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED_ENV,
+        )
+        && phase51_lighter_true_env(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV)
 }
 
 fn phase51_lighter_baseline_cleanup_only_enabled() -> bool {
@@ -528,7 +548,7 @@ use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
     LiquidationSnapshot, MarginSnapshot, MarketDataEvent, Phase51ForwardRefreshNativeRole,
-    PositionSnapshot, TopOfBook,
+    Phase51ForwardRefreshSourceOwnerFill, PositionSnapshot, TopOfBook,
 };
 use super::lighter_nonce::{load_last_nonce, store_last_nonce, LighterNonceManager};
 use super::lighter_signer::{
@@ -2302,7 +2322,21 @@ impl LighterConnector {
         )
         .await?
         .map_err(|e| anyhow::anyhow!("Lighter private WS connect error: {e}"))?;
-        let (_write, mut read) = ws_stream.split();
+        let (mut write, mut read) = ws_stream.split();
+        let phase51_account_all_trades_enabled =
+            phase51_lighter_account_all_trades_source_owner_enabled();
+        let phase51_account_index = if phase51_account_all_trades_enabled {
+            self.cfg.account_index
+        } else {
+            None
+        };
+        if let Some(account_index) = phase51_account_index {
+            let sub = json!({
+                "type": "subscribe",
+                "channel": format!("account_all_trades/{account_index}"),
+            });
+            write.send(Message::Text(sub.to_string().into())).await?;
+        }
         loop {
             let msg = match tokio::time::timeout(read_timeout, read.next()).await {
                 Ok(Some(msg)) => msg?,
@@ -2315,9 +2349,12 @@ impl LighterConnector {
                 }
             };
             if let Message::Text(text) = msg {
-                if let Some(event) =
-                    translate_private_event(&text, self.cfg.venue_index, &self.cfg.venue_id)
-                {
+                for event in translate_private_events(
+                    &text,
+                    self.cfg.venue_index,
+                    &self.cfg.venue_id,
+                    phase51_account_index,
+                ) {
                     let _ = self.exec_tx.send(event).await;
                 }
             }
@@ -4026,6 +4063,34 @@ mod tests {
     }
 
     #[test]
+    fn phase51_lighter_account_all_trades_source_owner_gate_is_explicit() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED_ENV,
+            PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED_ENV,
+            PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV,
+        ]);
+
+        unset_env(PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED_ENV);
+        unset_env(PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED_ENV);
+        unset_env(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV);
+        assert!(!phase51_lighter_account_all_trades_source_owner_enabled());
+
+        set_env(PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED_ENV, "true");
+        set_env(
+            PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED_ENV,
+            "true",
+        );
+        assert!(!phase51_lighter_account_all_trades_source_owner_enabled());
+
+        set_env(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV, "false");
+        assert!(!phase51_lighter_account_all_trades_source_owner_enabled());
+
+        set_env(PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV, "yes");
+        assert!(phase51_lighter_account_all_trades_source_owner_enabled());
+    }
+
+    #[test]
     fn phase51_lighter_strict_maker_only_contexts_are_sanitized_when_enabled() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::new(&[PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV]);
@@ -4565,6 +4630,114 @@ mod tests {
                 other => panic!("expected fill event, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn lighter_account_all_trades_emit_target_linkable_source_owner_fill_for_account_side() {
+        for (account_is_ask, is_maker_ask) in [(true, true), (false, false)] {
+            let text = serde_json::json!({
+                "type": "update/account_all_trades",
+                "channel": "account_all_trades/123",
+                "trades": [{
+                    "trade_id": 99_u64,
+                    "timestamp": 1_700_000_123_462i64,
+                    "ask_id_str": "ask-order",
+                    "bid_id_str": "bid-order",
+                    "ask_client_id_str": "ask-client",
+                    "bid_client_id_str": "bid-client",
+                    "ask_account_id": if account_is_ask { 123_i64 } else { 456_i64 },
+                    "bid_account_id": if account_is_ask { 456_i64 } else { 123_i64 },
+                    "is_maker_ask": is_maker_ask,
+                }]
+            })
+            .to_string();
+
+            let events = translate_private_events(&text, 3, "lighter", Some(123));
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill) => {
+                    assert_eq!(fill.venue_index, 3);
+                    assert_eq!(fill.venue_id, "lighter");
+                    assert_eq!(fill.seq, 1_700_000_123_462_000);
+                    assert_eq!(fill.timestamp_ms, 1_700_000_123_462);
+                    assert_eq!(
+                        fill.order_id(),
+                        Some(if account_is_ask {
+                            "ask-order"
+                        } else {
+                            "bid-order"
+                        })
+                    );
+                    assert_eq!(
+                        fill.client_order_id(),
+                        Some(if account_is_ask {
+                            "ask-client"
+                        } else {
+                            "bid-client"
+                        })
+                    );
+                    assert_eq!(
+                        fill.phase51_native_role,
+                        Some(Phase51ForwardRefreshNativeRole::Lighter {
+                            account_index: 123,
+                            is_maker_ask,
+                            ask_account_id: if account_is_ask { 123 } else { 456 },
+                            bid_account_id: if account_is_ask { 456 } else { 123 },
+                        })
+                    );
+                    assert!(fill.phase51_target_key.is_none());
+                    assert!(fill.phase51_lighter_native_limit.is_none());
+                }
+                other => panic!("expected source-owner fill, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lighter_account_all_trades_require_exact_native_role_fields_and_account_side() {
+        let missing_role = serde_json::json!({
+            "type": "update/account_all_trades",
+            "channel": "account_all_trades:123",
+            "trades": [{
+                "trade_id": 100_u64,
+                "timestamp": 1_700_000_123_463i64,
+                "ask_id_str": "ask-order",
+                "ask_client_id_str": "ask-client",
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+            }]
+        })
+        .to_string();
+        assert!(translate_private_events(&missing_role, 3, "lighter", Some(123)).is_empty());
+
+        let unrelated_account = serde_json::json!({
+            "type": "update/account_all_trades",
+            "channel": "account_all_trades:123",
+            "trades": [{
+                "trade_id": 101_u64,
+                "timestamp": 1_700_000_123_464i64,
+                "ask_id_str": "ask-order",
+                "ask_client_id_str": "ask-client",
+                "ask_account_id": 456_i64,
+                "bid_account_id": 789_i64,
+                "is_maker_ask": true,
+            }]
+        })
+        .to_string();
+        assert!(translate_private_events(&unrelated_account, 3, "lighter", Some(123)).is_empty());
+
+        let missing_handle = serde_json::json!({
+            "type": "update/account_all_trades",
+            "channel": "account_all_trades/123",
+            "trades": [{
+                "timestamp": 1_700_000_123_465i64,
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+                "is_maker_ask": true,
+            }]
+        })
+        .to_string();
+        assert!(translate_private_events(&missing_handle, 3, "lighter", Some(123)).is_empty());
     }
 
     #[test]
@@ -6093,6 +6266,21 @@ mod tests {
     }
 }
 
+fn translate_private_events(
+    text: &str,
+    venue_index: usize,
+    venue_id: &str,
+    account_index: Option<u64>,
+) -> Vec<ExecutionEvent> {
+    if let Some(event) = translate_private_event(text, venue_index, venue_id) {
+        return vec![event];
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    translate_account_all_trades_events(&value, venue_index, venue_id, account_index)
+}
+
 pub fn translate_private_event(
     text: &str,
     venue_index: usize,
@@ -6161,6 +6349,154 @@ pub fn translate_private_event(
         }
         _ => None,
     }
+}
+
+fn translate_account_all_trades_events(
+    value: &serde_json::Value,
+    venue_index: usize,
+    venue_id: &str,
+    account_index: Option<u64>,
+) -> Vec<ExecutionEvent> {
+    let account_index = match account_index.and_then(|idx| i64::try_from(idx).ok()) {
+        Some(idx) => idx,
+        None => return Vec::new(),
+    };
+    let msg_type = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let channel = value
+        .get("channel")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let account_all_trades_message = msg_type.contains("account_all_trades")
+        || channel.starts_with("account_all_trades:")
+        || channel.starts_with("account_all_trades/");
+    if !account_all_trades_message {
+        return Vec::new();
+    }
+    let Some(trades) = value.get("trades") else {
+        return Vec::new();
+    };
+    let mut trade_values = Vec::new();
+    collect_lighter_trade_values(trades, &mut trade_values);
+    trade_values
+        .into_iter()
+        .enumerate()
+        .filter_map(|(trade_index, trade)| {
+            translate_account_all_trade(trade, venue_index, venue_id, account_index, trade_index)
+        })
+        .collect()
+}
+
+fn collect_lighter_trade_values<'a>(
+    value: &'a serde_json::Value,
+    out: &mut Vec<&'a serde_json::Value>,
+) {
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_lighter_trade_values(item, out);
+        }
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if object.contains_key("is_maker_ask")
+        && object.contains_key("ask_account_id")
+        && object.contains_key("bid_account_id")
+    {
+        out.push(value);
+        return;
+    }
+    for item in object.values() {
+        collect_lighter_trade_values(item, out);
+    }
+}
+
+fn translate_account_all_trade(
+    trade: &serde_json::Value,
+    venue_index: usize,
+    venue_id: &str,
+    account_index: i64,
+    trade_index: usize,
+) -> Option<ExecutionEvent> {
+    let ask_account_id = phase51_lighter_i64_field(trade, "ask_account_id")?;
+    let bid_account_id = phase51_lighter_i64_field(trade, "bid_account_id")?;
+    let is_maker_ask = trade.get("is_maker_ask")?.as_bool()?;
+    let account_is_ask = ask_account_id == account_index;
+    let account_is_bid = bid_account_id == account_index;
+    if account_is_ask == account_is_bid {
+        return None;
+    }
+    let (order_id, client_order_id) = if account_is_ask {
+        (
+            phase51_lighter_string_handle(trade, "ask_id_str")
+                .or_else(|| phase51_lighter_string_handle(trade, "ask_id")),
+            phase51_lighter_string_handle(trade, "ask_client_id_str")
+                .or_else(|| phase51_lighter_string_handle(trade, "ask_client_id")),
+        )
+    } else {
+        (
+            phase51_lighter_string_handle(trade, "bid_id_str")
+                .or_else(|| phase51_lighter_string_handle(trade, "bid_id")),
+            phase51_lighter_string_handle(trade, "bid_client_id_str")
+                .or_else(|| phase51_lighter_string_handle(trade, "bid_client_id")),
+        )
+    };
+    if order_id.is_none() && client_order_id.is_none() {
+        return None;
+    }
+    let native_role = Phase51ForwardRefreshNativeRole::Lighter {
+        account_index,
+        is_maker_ask,
+        ask_account_id,
+        bid_account_id,
+    };
+    let timestamp_ms = phase51_lighter_i64_field(trade, "timestamp")
+        .or_else(|| phase51_lighter_i64_field(trade, "transaction_time"))
+        .unwrap_or(0);
+    let seq = phase51_lighter_source_owner_seq(timestamp_ms, trade_index);
+    Some(ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+        Phase51ForwardRefreshSourceOwnerFill::new(
+            venue_index,
+            venue_id,
+            seq,
+            timestamp_ms,
+            order_id,
+            client_order_id,
+            Some(native_role),
+        ),
+    ))
+}
+
+fn phase51_lighter_source_owner_seq(timestamp_ms: i64, trade_index: usize) -> u64 {
+    let base = u64::try_from(timestamp_ms.max(0)).unwrap_or(0);
+    base.saturating_mul(1_000)
+        .saturating_add(u64::try_from(trade_index).unwrap_or(u64::MAX).min(999))
+}
+
+fn phase51_lighter_i64_field(value: &serde_json::Value, key: &str) -> Option<i64> {
+    let raw = value.get(key)?;
+    if let Some(val) = raw.as_i64() {
+        return Some(val);
+    }
+    let val = raw.as_u64()?;
+    i64::try_from(val).ok()
+}
+
+fn phase51_lighter_string_handle(value: &serde_json::Value, key: &str) -> Option<String> {
+    let raw = value.get(key)?;
+    if let Some(text) = raw.as_str() {
+        let trimmed = text.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+    if let Some(val) = raw.as_u64() {
+        return Some(val.to_string());
+    }
+    raw.as_i64()
+        .filter(|val| *val >= 0)
+        .map(|val| val.to_string())
 }
 
 fn phase51_lighter_native_role_from_fill(
