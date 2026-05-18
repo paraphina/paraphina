@@ -2103,7 +2103,8 @@ async fn send_order_and_wait_with_status(
         return (OrderWaitOutcomeKind::HandlerDropped, None);
     }
     let (response_tx, response_rx) = oneshot::channel();
-    let phase51_target_key_stage = Phase51TargetKeyRegistryStage::from_intents(&intents);
+    let phase51_target_key_stage =
+        Phase51TargetKeyRegistryStage::from_intents_at_source_tick(&intents, tick);
     let request = LiveOrderRequest {
         intents,
         action_batch,
@@ -2123,7 +2124,7 @@ async fn send_order_and_wait_with_status(
     phase51_target_key_registry.commit_stage(phase51_target_key_stage);
     match tokio::time::timeout(Duration::from_millis(timeout_ms), response_rx).await {
         Ok(Ok(mut events)) => {
-            phase51_target_key_registry.observe_execution_events(&mut events);
+            phase51_target_key_registry.observe_execution_events_at_source_tick(&mut events, tick);
             (OrderWaitOutcomeKind::Events, Some(events))
         }
         Ok(Err(_)) => {
@@ -2161,7 +2162,8 @@ fn send_order_fire_and_forget(
         );
         return false;
     }
-    let phase51_target_key_stage = Phase51TargetKeyRegistryStage::from_intents(&intents);
+    let phase51_target_key_stage =
+        Phase51TargetKeyRegistryStage::from_intents_at_source_tick(&intents, tick);
     let request = LiveOrderRequest {
         intents,
         action_batch,
@@ -3972,6 +3974,7 @@ pub async fn run_live_loop(
                                 &mut phase51_forward_refresh_capture,
                                 &mut phase51_target_key_registry,
                                 &audit_dir,
+                                tick,
                                 std::slice::from_mut(&mut event),
                             )
                             .unwrap_or_else(|err| {
@@ -6289,6 +6292,7 @@ pub async fn run_live_loop(
                                 &mut phase51_forward_refresh_capture,
                                 &mut phase51_target_key_registry,
                                 &audit_dir,
+                                tick,
                                 std::slice::from_mut(&mut event),
                             )
                             .unwrap_or_else(|err| {
@@ -6407,6 +6411,7 @@ pub async fn run_live_loop(
                                     &mut phase51_forward_refresh_capture,
                                     &mut phase51_target_key_registry,
                                     &audit_dir,
+                                    tick,
                                     std::slice::from_mut(&mut event),
                                 )
                                 .unwrap_or_else(|err| {
@@ -14181,9 +14186,10 @@ fn capture_phase51_forward_refresh_from_live_events(
     capture: &mut Phase51ForwardRefreshCapture,
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     audit_dir: &std::path::Path,
+    source_tick: u64,
     events: &mut [LiveExecutionEvent],
 ) -> Phase51CaptureResult<bool> {
-    phase51_target_key_registry.observe_execution_events(events);
+    phase51_target_key_registry.observe_execution_events_at_source_tick(events, source_tick);
     let mut emitted_lighter_native_role_row = false;
     for event in events {
         let audit = match event {

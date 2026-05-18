@@ -751,6 +751,9 @@ fn source_owner_fill_with_explicit_pfill_observation_emits_separate_sanitized_si
         row.get("observed_side_source").and_then(Value::as_str),
         Some("LIGHTER_TRADES_JSON.account_side")
     );
+    assert!(row.get("order_source_tick").is_none());
+    assert!(row.get("fill_source_tick").is_none());
+    assert!(row.get("observed_horizon_source_ticks").is_none());
     assert_eq!(
         row.get("source_link_inference_allowed")
             .and_then(Value::as_bool),
@@ -785,6 +788,126 @@ fn source_owner_fill_with_explicit_pfill_observation_emits_separate_sanitized_si
 }
 
 #[test]
+fn source_owner_pfill_observation_with_exact_source_ticks_emits_horizon_sidecar_fields() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.future_native_role.jsonl");
+    let pfill_output = pfill_observation_path(&output);
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let mut fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        3,
+        "lighter",
+        1_700_000_000_101_000,
+        1_700_000_000_101,
+        Some("raw-order-id-source-owner".to_string()),
+        Some("raw-client-order-id-source-owner".to_string()),
+        Some(Phase51ForwardRefreshNativeRole::Lighter {
+            account_index: 7,
+            is_maker_ask: true,
+            ask_account_id: 7,
+            bid_account_id: 9,
+        }),
+    );
+    fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+        canonical_group_id: "cg-source-owner-pfill-horizon".to_string(),
+        order_key: "ok-source-owner-pfill-horizon".to_string(),
+    });
+    let mut observation =
+        Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+            Side::Sell,
+            2_100.5,
+            0.01,
+            1_700_000_000_101,
+        )
+        .unwrap();
+    assert!(observation.set_exact_source_ticks(17, 21));
+    fill.set_phase51_source_owner_pfill_observation(observation);
+
+    let audit = capture.capture_source_owner_fill(&fill).unwrap();
+
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(capture.source_owner_pfill_observation_rows_written(), 1);
+    let pfill_rows = read_rows(&pfill_output);
+    assert_eq!(pfill_rows.len(), 1);
+    let row = &pfill_rows[0];
+    assert_eq!(
+        row.get("target_type").and_then(Value::as_str),
+        Some("source_owner_pfill_observation")
+    );
+    assert_eq!(row.get("order_source_tick").and_then(Value::as_u64), Some(17));
+    assert_eq!(row.get("fill_source_tick").and_then(Value::as_u64), Some(21));
+    assert_eq!(
+        row.get("observed_horizon_source_ticks")
+            .and_then(Value::as_u64),
+        Some(4)
+    );
+    assert_eq!(
+        row.get("observed_horizon_source_ticks_source")
+            .and_then(Value::as_str),
+        Some("runtime_source_tick")
+    );
+    assert_safe_flags(row);
+    let raw_pfill = fs::read_to_string(&pfill_output).unwrap();
+    assert!(!raw_pfill.contains("raw-order-id-source-owner"));
+    assert!(!raw_pfill.contains("raw-client-order-id-source-owner"));
+}
+
+#[test]
+fn source_owner_pfill_observation_rejects_negative_source_tick_horizon() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.future_native_role.jsonl");
+    let pfill_output = pfill_observation_path(&output);
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let mut fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        3,
+        "lighter",
+        1_700_000_000_101_000,
+        1_700_000_000_101,
+        None,
+        None,
+        Some(Phase51ForwardRefreshNativeRole::Lighter {
+            account_index: 7,
+            is_maker_ask: true,
+            ask_account_id: 7,
+            bid_account_id: 9,
+        }),
+    );
+    fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+        canonical_group_id: "cg-source-owner-pfill-negative".to_string(),
+        order_key: "ok-source-owner-pfill-negative".to_string(),
+    });
+    let mut observation =
+        Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+            Side::Sell,
+            2_100.5,
+            0.01,
+            1_700_000_000_101,
+        )
+        .unwrap();
+    assert!(!observation.set_exact_source_ticks(21, 17));
+    fill.set_phase51_source_owner_pfill_observation(observation);
+
+    let audit = capture.capture_source_owner_fill(&fill).unwrap();
+
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(capture.source_owner_pfill_observation_rows_written(), 1);
+    let pfill_rows = read_rows(&pfill_output);
+    assert_eq!(pfill_rows.len(), 1);
+    let row = &pfill_rows[0];
+    assert!(row.get("order_source_tick").is_none());
+    assert!(row.get("fill_source_tick").is_none());
+    assert!(row.get("observed_horizon_source_ticks").is_none());
+    assert!(row.get("observed_horizon_source_ticks_source").is_none());
+}
+
+#[test]
 fn source_owner_pfill_observation_requires_target_native_role_and_valid_observation() {
     let invalid_observations = [
         Phase51ForwardRefreshSourceOwnerPfillObservation {
@@ -796,6 +919,8 @@ fn source_owner_pfill_observation_requires_target_native_role_and_valid_observat
             fill_count: 1,
             outcome_status: "OBSERVED_FILLED".to_string(),
             p_fill_outcome: 1.0,
+            order_source_tick: None,
+            fill_source_tick: None,
         },
         Phase51ForwardRefreshSourceOwnerPfillObservation {
             source_event_type: "LIGHTER_TRADES_JSON".to_string(),
@@ -806,6 +931,8 @@ fn source_owner_pfill_observation_requires_target_native_role_and_valid_observat
             fill_count: 1,
             outcome_status: "OBSERVED_FILLED".to_string(),
             p_fill_outcome: 1.0,
+            order_source_tick: None,
+            fill_source_tick: None,
         },
         Phase51ForwardRefreshSourceOwnerPfillObservation {
             source_event_type: "LIGHTER_TRADES_JSON".to_string(),
@@ -816,6 +943,8 @@ fn source_owner_pfill_observation_requires_target_native_role_and_valid_observat
             fill_count: 1,
             outcome_status: "OBSERVED_FILLED".to_string(),
             p_fill_outcome: 1.0,
+            order_source_tick: None,
+            fill_source_tick: None,
         },
         Phase51ForwardRefreshSourceOwnerPfillObservation {
             source_event_type: "LIGHTER_TRADES_JSON".to_string(),
@@ -826,6 +955,8 @@ fn source_owner_pfill_observation_requires_target_native_role_and_valid_observat
             fill_count: 0,
             outcome_status: "OBSERVED_FILLED".to_string(),
             p_fill_outcome: 1.0,
+            order_source_tick: None,
+            fill_source_tick: None,
         },
         Phase51ForwardRefreshSourceOwnerPfillObservation {
             source_event_type: "LIGHTER_TRADES_JSON".to_string(),
@@ -836,6 +967,8 @@ fn source_owner_pfill_observation_requires_target_native_role_and_valid_observat
             fill_count: 1,
             outcome_status: "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL".to_string(),
             p_fill_outcome: 0.0,
+            order_source_tick: None,
+            fill_source_tick: None,
         },
     ];
 

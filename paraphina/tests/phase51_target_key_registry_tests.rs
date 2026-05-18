@@ -13,7 +13,7 @@ use paraphina::live::phase51_target_key_registry::{
 };
 use paraphina::live::types::{
     ExecutionEvent, Fill, OrderAccepted, Phase51ForwardRefreshNativeRole,
-    Phase51ForwardRefreshSourceOwnerFill,
+    Phase51ForwardRefreshSourceOwnerFill, Phase51ForwardRefreshSourceOwnerPfillObservation,
 };
 use paraphina::mm::{compute_mm_quotes_with_now_and_identity_authority, MmQuoteIdentityAllocator};
 use paraphina::order_management::plan_mm_order_actions;
@@ -587,4 +587,222 @@ fn mm_intents_without_target_keys_do_not_register_or_emit_forward_refresh_rows()
     assert!(!audit.sanitized_row_emitted);
     assert_eq!(capture.rows_written(), 0);
     assert!(!output.exists());
+}
+
+#[test]
+fn exact_runtime_source_ticks_bridge_to_source_owner_pfill_observation() {
+    let key = target_key("source-tick-bridge");
+    let intent = place_intent(Some("source-tick-client"), Some(key.clone()));
+    let mut registry = Phase51TargetKeyRegistry::default();
+    registry.commit_stage(Phase51TargetKeyRegistryStage::from_intents_at_source_tick(
+        &[intent],
+        11,
+    ));
+    assert!(registry.observe_order_accepted(&accepted(
+        Some("source-tick-client"),
+        "source-tick-order",
+    )));
+
+    let mut source_owner_fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        0,
+        "lighter",
+        3,
+        1_700_000_000_002,
+        Some("source-tick-order".to_string()),
+        None,
+        Some(Phase51ForwardRefreshNativeRole::Lighter {
+            account_index: 7,
+            is_maker_ask: true,
+            ask_account_id: 7,
+            bid_account_id: 9,
+        }),
+    );
+    source_owner_fill.set_phase51_source_owner_pfill_observation(
+        Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+            Side::Sell,
+            2_100.0,
+            0.01,
+            1_700_000_000_002,
+        )
+        .unwrap(),
+    );
+    let mut events = vec![ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+        source_owner_fill,
+    )];
+
+    assert_eq!(
+        registry.observe_execution_events_at_source_tick(&mut events, 17),
+        1
+    );
+
+    let ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(enriched_fill) = &events[0] else {
+        panic!("expected source-owner fill")
+    };
+    assert_eq!(enriched_fill.phase51_target_key, Some(key));
+    let observation = enriched_fill
+        .phase51_source_owner_pfill_observation
+        .as_ref()
+        .expect("pfill observation");
+    assert_eq!(observation.order_source_tick, Some(11));
+    assert_eq!(observation.fill_source_tick, Some(17));
+    assert_eq!(observation.observed_horizon_source_ticks(), Some(6));
+}
+
+#[test]
+fn source_owner_pfill_horizon_fails_closed_without_explicit_order_source_tick() {
+    let key = target_key("source-tick-missing-order");
+    let intent = place_intent(Some("missing-order-tick-client"), Some(key.clone()));
+    let mut registry = Phase51TargetKeyRegistry::default();
+    registry.commit_stage(Phase51TargetKeyRegistryStage::from_intents(&[intent]));
+
+    let mut source_owner_fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        0,
+        "lighter",
+        3,
+        1_700_000_000_002,
+        None,
+        Some("missing-order-tick-client".to_string()),
+        Some(Phase51ForwardRefreshNativeRole::Lighter {
+            account_index: 7,
+            is_maker_ask: true,
+            ask_account_id: 7,
+            bid_account_id: 9,
+        }),
+    );
+    source_owner_fill.set_phase51_source_owner_pfill_observation(
+        Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+            Side::Sell,
+            2_100.0,
+            0.01,
+            1_700_000_000_002,
+        )
+        .unwrap(),
+    );
+    let mut events = vec![ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+        source_owner_fill,
+    )];
+
+    assert_eq!(
+        registry.observe_execution_events_at_source_tick(&mut events, 17),
+        1
+    );
+
+    let ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(enriched_fill) = &events[0] else {
+        panic!("expected source-owner fill")
+    };
+    assert_eq!(enriched_fill.phase51_target_key, Some(key));
+    let observation = enriched_fill
+        .phase51_source_owner_pfill_observation
+        .as_ref()
+        .expect("pfill observation");
+    assert_eq!(observation.order_source_tick, None);
+    assert_eq!(observation.fill_source_tick, None);
+    assert_eq!(observation.observed_horizon_source_ticks(), None);
+}
+
+#[test]
+fn source_owner_pfill_horizon_fails_closed_without_explicit_fill_source_tick() {
+    let key = target_key("source-tick-missing-fill");
+    let intent = place_intent(Some("missing-fill-tick-client"), Some(key.clone()));
+    let mut registry = Phase51TargetKeyRegistry::default();
+    registry.commit_stage(Phase51TargetKeyRegistryStage::from_intents_at_source_tick(
+        &[intent],
+        11,
+    ));
+
+    let mut source_owner_fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        0,
+        "lighter",
+        3,
+        1_700_000_000_002,
+        None,
+        Some("missing-fill-tick-client".to_string()),
+        Some(Phase51ForwardRefreshNativeRole::Lighter {
+            account_index: 7,
+            is_maker_ask: true,
+            ask_account_id: 7,
+            bid_account_id: 9,
+        }),
+    );
+    source_owner_fill.set_phase51_source_owner_pfill_observation(
+        Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+            Side::Sell,
+            2_100.0,
+            0.01,
+            1_700_000_000_002,
+        )
+        .unwrap(),
+    );
+    let mut events = vec![ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+        source_owner_fill,
+    )];
+
+    assert_eq!(registry.observe_execution_events(&mut events), 1);
+
+    let ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(enriched_fill) = &events[0] else {
+        panic!("expected source-owner fill")
+    };
+    assert_eq!(enriched_fill.phase51_target_key, Some(key));
+    let observation = enriched_fill
+        .phase51_source_owner_pfill_observation
+        .as_ref()
+        .expect("pfill observation");
+    assert_eq!(observation.order_source_tick, None);
+    assert_eq!(observation.fill_source_tick, None);
+    assert_eq!(observation.observed_horizon_source_ticks(), None);
+}
+
+#[test]
+fn source_owner_pfill_horizon_fails_closed_when_fill_source_tick_precedes_order_tick() {
+    let key = target_key("source-tick-negative");
+    let intent = place_intent(Some("negative-tick-client"), Some(key.clone()));
+    let mut registry = Phase51TargetKeyRegistry::default();
+    registry.commit_stage(Phase51TargetKeyRegistryStage::from_intents_at_source_tick(
+        &[intent],
+        21,
+    ));
+
+    let mut source_owner_fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        0,
+        "lighter",
+        3,
+        1_700_000_000_002,
+        None,
+        Some("negative-tick-client".to_string()),
+        Some(Phase51ForwardRefreshNativeRole::Lighter {
+            account_index: 7,
+            is_maker_ask: true,
+            ask_account_id: 7,
+            bid_account_id: 9,
+        }),
+    );
+    source_owner_fill.set_phase51_source_owner_pfill_observation(
+        Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+            Side::Sell,
+            2_100.0,
+            0.01,
+            1_700_000_000_002,
+        )
+        .unwrap(),
+    );
+    let mut events = vec![ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
+        source_owner_fill,
+    )];
+
+    assert_eq!(
+        registry.observe_execution_events_at_source_tick(&mut events, 17),
+        1
+    );
+
+    let ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(enriched_fill) = &events[0] else {
+        panic!("expected source-owner fill")
+    };
+    assert_eq!(enriched_fill.phase51_target_key, Some(key));
+    let observation = enriched_fill
+        .phase51_source_owner_pfill_observation
+        .as_ref()
+        .expect("pfill observation");
+    assert_eq!(observation.order_source_tick, None);
+    assert_eq!(observation.fill_source_tick, None);
+    assert_eq!(observation.observed_horizon_source_ticks(), None);
 }

@@ -930,6 +930,22 @@ fn source_owner_pfill_observation_payload(
         "observed_outcome_source".to_string(),
         json!("LIGHTER_TRADES_JSON.trade_event"),
     );
+    if let (Some(order_source_tick), Some(fill_source_tick), Some(observed_horizon_source_ticks)) = (
+        observation.order_source_tick,
+        observation.fill_source_tick,
+        observation.observed_horizon_source_ticks(),
+    ) {
+        payload.insert("order_source_tick".to_string(), json!(order_source_tick));
+        payload.insert("fill_source_tick".to_string(), json!(fill_source_tick));
+        payload.insert(
+            "observed_horizon_source_ticks".to_string(),
+            json!(observed_horizon_source_ticks),
+        );
+        payload.insert(
+            "observed_horizon_source_ticks_source".to_string(),
+            json!("runtime_source_tick"),
+        );
+    }
     Some(payload)
 }
 

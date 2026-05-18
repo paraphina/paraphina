@@ -259,6 +259,17 @@ impl Phase51ForwardRefreshSourceOwnerFill {
     ) {
         self.phase51_source_owner_pfill_observation = Some(observation);
     }
+
+    pub fn set_phase51_source_owner_pfill_observation_source_ticks(
+        &mut self,
+        order_source_tick: u64,
+        fill_source_tick: u64,
+    ) -> bool {
+        let Some(observation) = self.phase51_source_owner_pfill_observation.as_mut() else {
+            return false;
+        };
+        observation.set_exact_source_ticks(order_source_tick, fill_source_tick)
+    }
 }
 
 impl fmt::Debug for Phase51ForwardRefreshSourceOwnerFill {
@@ -297,6 +308,10 @@ pub struct Phase51ForwardRefreshSourceOwnerPfillObservation {
     pub fill_count: u32,
     pub outcome_status: String,
     pub p_fill_outcome: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_source_tick: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_source_tick: Option<u64>,
 }
 
 impl Phase51ForwardRefreshSourceOwnerPfillObservation {
@@ -324,7 +339,26 @@ impl Phase51ForwardRefreshSourceOwnerPfillObservation {
             fill_count: 1,
             outcome_status: "OBSERVED_FILLED".to_string(),
             p_fill_outcome: 1.0,
+            order_source_tick: None,
+            fill_source_tick: None,
         })
+    }
+
+    pub fn set_exact_source_ticks(&mut self, order_source_tick: u64, fill_source_tick: u64) -> bool {
+        if fill_source_tick < order_source_tick {
+            self.order_source_tick = None;
+            self.fill_source_tick = None;
+            return false;
+        }
+        self.order_source_tick = Some(order_source_tick);
+        self.fill_source_tick = Some(fill_source_tick);
+        true
+    }
+
+    pub fn observed_horizon_source_ticks(&self) -> Option<u64> {
+        let order_source_tick = self.order_source_tick?;
+        let fill_source_tick = self.fill_source_tick?;
+        fill_source_tick.checked_sub(order_source_tick)
     }
 }
 
