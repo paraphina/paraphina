@@ -117,7 +117,7 @@ fn phase51_lighter_true_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn phase51_lighter_account_all_trades_source_owner_enabled() -> bool {
+pub fn phase51_lighter_account_all_trades_source_owner_enabled() -> bool {
     phase51_lighter_true_env(PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED_ENV)
         && phase51_lighter_true_env(
             PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED_ENV,
@@ -2311,6 +2311,36 @@ impl LighterConnector {
         }
     }
 
+    pub async fn run_phase51_account_all_trades_ws(&self) {
+        let mut backoff = Duration::from_secs(1);
+        let healthy_threshold = Duration::from_millis(
+            std::env::var("PARAPHINA_WS_HEALTHY_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60_000),
+        );
+
+        loop {
+            let session_start = Instant::now();
+
+            if self.phase51_account_all_trades_ws_once().await.is_err() {
+                eprintln!(
+                    "WARN: Lighter Phase 5.1 account_all_trades WS reconnecting after sanitized transport error"
+                );
+            }
+
+            if session_start.elapsed() >= healthy_threshold {
+                eprintln!(
+                    "INFO: Lighter Phase 5.1 account_all_trades WS session was healthy; resetting backoff"
+                );
+                backoff = Duration::from_secs(1);
+            }
+
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+
     async fn private_ws_once(&self) -> anyhow::Result<()> {
         let connect_timeout = lighter_ws_connect_timeout();
         let read_timeout = lighter_ws_read_timeout();
@@ -2354,6 +2384,60 @@ impl LighterConnector {
                     self.cfg.venue_index,
                     &self.cfg.venue_id,
                     phase51_account_index,
+                ) {
+                    let _ = self.exec_tx.send(event).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn phase51_account_all_trades_ws_once(&self) -> anyhow::Result<()> {
+        let connect_timeout = lighter_ws_connect_timeout();
+        let read_timeout = lighter_ws_read_timeout();
+        let account_index = self
+            .cfg
+            .account_index
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing Lighter account index for Phase 5.1 source-owner stream")
+            })?;
+
+        let (ws_stream, _) = with_timeout(
+            connect_timeout,
+            "Phase 5.1 account_all_trades WS connect",
+            connect_async(self.cfg.ws_url.as_str()),
+        )
+        .await?
+        .map_err(|_| anyhow::anyhow!("Lighter Phase 5.1 account_all_trades WS connect error"))?;
+        let (mut write, mut read) = ws_stream.split();
+        let sub = json!({
+            "type": "subscribe",
+            "channel": format!("account_all_trades/{account_index}"),
+        });
+        write
+            .send(Message::Text(sub.to_string().into()))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("Lighter Phase 5.1 account_all_trades WS subscribe error")
+            })?;
+
+        loop {
+            let msg = match tokio::time::timeout(read_timeout, read.next()).await {
+                Ok(Some(msg)) => msg
+                    .map_err(|_| {
+                        anyhow::anyhow!("Lighter Phase 5.1 account_all_trades WS read error")
+                    })?,
+                Ok(None) => break,
+                Err(_) => {
+                    anyhow::bail!("Lighter Phase 5.1 account_all_trades WS read timeout");
+                }
+            };
+            if let Message::Text(text) = msg {
+                for event in translate_phase51_account_all_trades_source_owner_events(
+                    &text,
+                    self.cfg.venue_index,
+                    &self.cfg.venue_id,
+                    Some(account_index),
                 ) {
                     let _ = self.exec_tx.send(event).await;
                 }
@@ -4694,6 +4778,64 @@ mod tests {
     }
 
     #[test]
+    fn lighter_account_all_trades_source_owner_path_ignores_generic_private_events() {
+        let generic_fill = serde_json::json!({
+            "type": "fill",
+            "seq": 48,
+            "ts": 1_700_000_123_460i64,
+            "order_id": "raw-order",
+            "client_order_id": "raw-client",
+            "fill_id": "raw-fill",
+            "side": "buy",
+            "price": 2200.0,
+            "size": 0.01,
+            "purpose": "mm",
+            "account_index": 123_i64,
+            "is_maker_ask": true,
+            "ask_account_id": 123_i64,
+            "bid_account_id": 456_i64,
+        })
+        .to_string();
+        assert!(matches!(
+            translate_private_events(&generic_fill, 3, "lighter", Some(123)).first(),
+            Some(ExecutionEvent::Filled(_))
+        ));
+        assert!(
+            translate_phase51_account_all_trades_source_owner_events(
+                &generic_fill,
+                3,
+                "lighter",
+                Some(123)
+            )
+            .is_empty()
+        );
+
+        let account_all_trades = serde_json::json!({
+            "type": "update/account_all_trades",
+            "channel": "account_all_trades/123",
+            "trades": [{
+                "timestamp": 1_700_000_123_462i64,
+                "ask_id_str": "ask-order",
+                "ask_client_id_str": "ask-client",
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+                "is_maker_ask": true,
+            }]
+        })
+        .to_string();
+        assert!(matches!(
+            translate_phase51_account_all_trades_source_owner_events(
+                &account_all_trades,
+                3,
+                "lighter",
+                Some(123)
+            )
+            .first(),
+            Some(ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(_))
+        ));
+    }
+
+    #[test]
     fn lighter_account_all_trades_require_exact_native_role_fields_and_account_side() {
         let missing_role = serde_json::json!({
             "type": "update/account_all_trades",
@@ -6275,6 +6417,18 @@ fn translate_private_events(
     if let Some(event) = translate_private_event(text, venue_index, venue_id) {
         return vec![event];
     }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    translate_account_all_trades_events(&value, venue_index, venue_id, account_index)
+}
+
+fn translate_phase51_account_all_trades_source_owner_events(
+    text: &str,
+    venue_index: usize,
+    venue_id: &str,
+    account_index: Option<u64>,
+) -> Vec<ExecutionEvent> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return Vec::new();
     };

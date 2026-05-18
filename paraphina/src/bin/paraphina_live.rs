@@ -18,12 +18,11 @@ use paraphina::live::ops::{
     default_audit_dir, format_startup_log, start_metrics_server, write_audit_files,
     EnvSecretProvider, HealthState, LiveMetrics, SecretProvider,
 };
-use paraphina::live::phase51_forward_refresh_capture::{
-    Phase51CaptureExecutionMode, Phase51ForwardRefreshCapture,
-    Phase51LiveNativeRoleCanaryContext,
-};
 use paraphina::live::orderbook_l2::BookLevel;
 use paraphina::live::paper_adapter::{PaperExecutionAdapter, PaperFillMode, PaperMarketUpdate};
+use paraphina::live::phase51_forward_refresh_capture::{
+    Phase51CaptureExecutionMode, Phase51ForwardRefreshCapture, Phase51LiveNativeRoleCanaryContext,
+};
 use paraphina::live::runner::{
     run_live_loop, LiveAccountRequest, LiveChannels, LiveOrderRequest, LiveRunMode,
     LiveRuntimeHooks, ResponseMode,
@@ -1721,6 +1720,20 @@ fn phase51_live_native_role_canary_preflight_check(
     }
 }
 
+#[cfg(feature = "live_lighter")]
+fn should_spawn_lighter_phase51_private_ws(
+    trade_mode: TradeMode,
+    paper_mode: bool,
+    use_fixture: bool,
+    has_auth: bool,
+) -> bool {
+    trade_mode == TradeMode::Live
+        && !paper_mode
+        && !use_fixture
+        && has_auth
+        && paraphina::live::connectors::lighter::phase51_lighter_account_all_trades_source_owner_enabled()
+}
+
 fn run_preflight(
     args: &Args,
     trade_mode: TradeMode,
@@ -2983,6 +2996,18 @@ send_block_gt_5ms={} send_block_gt_50ms={} send_block_gt_250ms={} emit_since_ms=
                             spawn_supervised("lighter_account_poll", move || {
                                 let l = lighter_poll.clone();
                                 async move { l.run_account_polling(poll_ms).await }
+                            });
+                        }
+                        if should_spawn_lighter_phase51_private_ws(
+                            trade_mode.trade_mode,
+                            lighter_cfg.paper_mode,
+                            use_fixture,
+                            lighter_cfg.has_auth(),
+                        ) {
+                            let lighter_private = lighter_arc.clone();
+                            spawn_supervised("lighter_private_ws", move || {
+                                let l = lighter_private.clone();
+                                async move { l.run_phase51_account_all_trades_ws().await }
                             });
                         }
                         let lighter_public = lighter_arc.clone();
@@ -5129,7 +5154,8 @@ mod tests {
         cfg.phase51_forward_refresh_capture.output_path =
             phase51_test_future_native_role_path(label);
         cfg.phase51_forward_refresh_capture.allow_live = false;
-        cfg.phase51_forward_refresh_capture.live_native_role_canary_approved = true;
+        cfg.phase51_forward_refresh_capture
+            .live_native_role_canary_approved = true;
         cfg.phase51_forward_refresh_capture.append_only = true;
         cfg.phase51_forward_refresh_capture.max_rows = 1;
         cfg
@@ -5161,7 +5187,10 @@ mod tests {
         std::env::remove_var("PARAPHINA_CANARY_MAX_OPEN_ORDERS");
         std::env::remove_var("PARAPHINA_CANARY_ENFORCE_POST_ONLY");
         std::env::remove_var("PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY");
-        std::env::set_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY", "true");
+        std::env::set_var(
+            "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY",
+            "true",
+        );
         std::env::set_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED", "true");
         std::env::set_var(
             "PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION",
@@ -5235,8 +5264,89 @@ mod tests {
             .expect("preflight check should run");
 
             assert!(!check.ok);
-            assert!(check.details.contains("max_open_orders=1"), "{}", check.details);
+            assert!(
+                check.details.contains("max_open_orders=1"),
+                "{}",
+                check.details
+            );
         });
+    }
+
+    #[cfg(feature = "live_lighter")]
+    #[test]
+    fn phase51_lighter_private_ws_spawn_requires_explicit_native_role_canary_gates() {
+        let _lock = env_lock().lock().unwrap();
+        let _capture_enabled = EnvVarGuard::new("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED");
+        let _approved =
+            EnvVarGuard::new("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED");
+        let _strict = EnvVarGuard::new("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY");
+
+        std::env::remove_var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED");
+        std::env::remove_var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED");
+        std::env::remove_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY");
+
+        assert!(!super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Live,
+            false,
+            false,
+            true,
+        ));
+
+        std::env::set_var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED", "true");
+        std::env::set_var(
+            "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED",
+            "true",
+        );
+        assert!(!super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Live,
+            false,
+            false,
+            true,
+        ));
+
+        std::env::set_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY", "true");
+        assert!(super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Live,
+            false,
+            false,
+            true,
+        ));
+        assert!(!super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Shadow,
+            false,
+            false,
+            true,
+        ));
+        assert!(!super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Paper,
+            false,
+            false,
+            true,
+        ));
+        assert!(!super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Testnet,
+            false,
+            false,
+            true,
+        ));
+        assert!(!super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Live,
+            true,
+            false,
+            true,
+        ));
+        assert!(!super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Live,
+            false,
+            true,
+            true,
+        ));
+        assert!(!super::should_spawn_lighter_phase51_private_ws(
+            TradeMode::Live,
+            false,
+            false,
+            false,
+        ));
     }
 
     #[test]
