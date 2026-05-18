@@ -18,6 +18,10 @@ use paraphina::live::ops::{
     default_audit_dir, format_startup_log, start_metrics_server, write_audit_files,
     EnvSecretProvider, HealthState, LiveMetrics, SecretProvider,
 };
+use paraphina::live::phase51_forward_refresh_capture::{
+    Phase51CaptureExecutionMode, Phase51ForwardRefreshCapture,
+    Phase51LiveNativeRoleCanaryContext,
+};
 use paraphina::live::orderbook_l2::BookLevel;
 use paraphina::live::paper_adapter::{PaperExecutionAdapter, PaperFillMode, PaperMarketUpdate};
 use paraphina::live::runner::{
@@ -1638,6 +1642,85 @@ struct PreflightCheck {
     details: String,
 }
 
+fn env_usize_option(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+fn phase51_live_native_role_canary_context_for_preflight(
+    cfg: &Config,
+    canary_settings: Option<&CanarySettings>,
+) -> Phase51LiveNativeRoleCanaryContext {
+    Phase51LiveNativeRoleCanaryContext {
+        canary_enabled: canary_settings.is_some() || env_is_true("PARAPHINA_CANARY_MODE"),
+        native_role_strict_canary_enabled: env_is_true(
+            "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY",
+        ),
+        native_role_one_sided_canary_enabled: env_is_true(
+            "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED",
+        ),
+        venue_ids: cfg.venues.iter().map(|venue| venue.id.clone()).collect(),
+        canary_max_open_orders: canary_settings
+            .and_then(|settings| settings.max_open_orders)
+            .or_else(|| env_usize_option("PARAPHINA_CANARY_MAX_OPEN_ORDERS")),
+        canary_enforce_post_only: canary_settings
+            .map(|settings| settings.enforce_post_only)
+            .unwrap_or_else(|| env_is_true("PARAPHINA_CANARY_ENFORCE_POST_ONLY")),
+        canary_enforce_reduce_only: canary_settings
+            .map(|settings| settings.enforce_reduce_only)
+            .unwrap_or_else(|| env_is_true("PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY")),
+        strict_maker_only_observation_enabled: env_is_true(
+            "PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION",
+        ),
+        replacements_disabled: env_is_true(
+            "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS",
+        ),
+        stop_after_first_row: env_is_true(
+            "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW",
+        ),
+    }
+}
+
+fn phase51_live_native_role_canary_preflight_check(
+    trade_mode: TradeMode,
+    cfg: &Config,
+    canary_settings: Option<&CanarySettings>,
+) -> Option<PreflightCheck> {
+    if trade_mode != TradeMode::Live
+        || !cfg.phase51_forward_refresh_capture.enabled
+        || !cfg
+            .phase51_forward_refresh_capture
+            .live_native_role_canary_approved
+    {
+        return None;
+    }
+
+    let context = phase51_live_native_role_canary_context_for_preflight(cfg, canary_settings);
+    let result = Phase51ForwardRefreshCapture::from_config_with_live_native_role_canary_context(
+        &cfg.phase51_forward_refresh_capture,
+        Phase51CaptureExecutionMode::Live,
+        Some(&context),
+    );
+    match result {
+        Ok(capture) if capture.live_native_role_canary_mode() => Some(PreflightCheck {
+            label: "phase51_live_native_role_canary",
+            ok: true,
+            details: "validated".to_string(),
+        }),
+        Ok(_) => Some(PreflightCheck {
+            label: "phase51_live_native_role_canary",
+            ok: false,
+            details: "not_in_live_native_role_canary_mode".to_string(),
+        }),
+        Err(err) => Some(PreflightCheck {
+            label: "phase51_live_native_role_canary",
+            ok: false,
+            details: err.to_string(),
+        }),
+    }
+}
+
 fn run_preflight(
     args: &Args,
     trade_mode: TradeMode,
@@ -1896,6 +1979,11 @@ fn run_preflight(
             ok: canary_ok,
             details: canary_error.unwrap_or("loaded").to_string(),
         });
+        if let Some(check) =
+            phase51_live_native_role_canary_preflight_check(trade_mode, cfg, canary_settings)
+        {
+            checks.push(check);
+        }
         let reconcile_state = parse_reconcile_env();
         checks.push(PreflightCheck {
             label: "reconciliation",
@@ -4832,6 +4920,7 @@ mod tests {
         parse_paradex_backstop_order_poll_ms, respond_to_order_request,
         should_fail_on_unexpected_live_loop_exit, spawn_account_refresh_router,
         take_priority_request, LiveAccountRequest, LiveOrderRequest, LiveRunMode, ResponseMode,
+        TradeMode,
     };
     use super::{
         connector_has_passive_fill_stream, connector_has_passive_fill_visibility,
@@ -5021,6 +5110,133 @@ mod tests {
 
         assert_eq!(settings.max_mid_jump_pct, Some(0.03));
         assert_eq!(cfg.book.max_mid_jump_pct, 0.03);
+    }
+
+    fn phase51_test_future_native_role_path(label: &str) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "phase51_future_native_role_preflight_{}_{}.jsonl",
+            std::process::id(),
+            label
+        ));
+        let _ = std::fs::remove_file(&path);
+        path.display().to_string()
+    }
+
+    fn phase51_test_live_native_role_capture_config(label: &str) -> paraphina::config::Config {
+        let mut cfg = paraphina::config::Config::default();
+        super::apply_explicit_connector_selection_to_config(&mut cfg, &[ConnectorArg::Lighter]);
+        cfg.phase51_forward_refresh_capture.enabled = true;
+        cfg.phase51_forward_refresh_capture.output_path =
+            phase51_test_future_native_role_path(label);
+        cfg.phase51_forward_refresh_capture.allow_live = false;
+        cfg.phase51_forward_refresh_capture.live_native_role_canary_approved = true;
+        cfg.phase51_forward_refresh_capture.append_only = true;
+        cfg.phase51_forward_refresh_capture.max_rows = 1;
+        cfg
+    }
+
+    fn phase51_test_canary_settings(max_open_orders: Option<usize>) -> super::CanarySettings {
+        super::CanarySettings {
+            max_open_orders,
+            enforce_post_only: true,
+            enforce_reduce_only: false,
+            ..Default::default()
+        }
+    }
+
+    fn with_phase51_live_native_role_preflight_env<R>(f: impl FnOnce() -> R) -> R {
+        let _strict = EnvVarGuard::new("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY");
+        let _one_sided = EnvVarGuard::new("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED");
+        let _strict_maker =
+            EnvVarGuard::new("PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION");
+        let _replacements =
+            EnvVarGuard::new("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS");
+        let _stop = EnvVarGuard::new("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW");
+        let _canary = EnvVarGuard::new("PARAPHINA_CANARY_MODE");
+        let _max_open = EnvVarGuard::new("PARAPHINA_CANARY_MAX_OPEN_ORDERS");
+        let _post_only = EnvVarGuard::new("PARAPHINA_CANARY_ENFORCE_POST_ONLY");
+        let _reduce_only = EnvVarGuard::new("PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY");
+
+        std::env::remove_var("PARAPHINA_CANARY_MODE");
+        std::env::remove_var("PARAPHINA_CANARY_MAX_OPEN_ORDERS");
+        std::env::remove_var("PARAPHINA_CANARY_ENFORCE_POST_ONLY");
+        std::env::remove_var("PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY");
+        std::env::set_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY", "true");
+        std::env::set_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_ONE_SIDED", "true");
+        std::env::set_var(
+            "PARAPHINA_PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION",
+            "true",
+        );
+        std::env::set_var(
+            "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_DISABLE_REPLACEMENTS",
+            "true",
+        );
+        std::env::set_var(
+            "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW",
+            "true",
+        );
+
+        f()
+    }
+
+    #[test]
+    fn phase51_live_native_role_preflight_accepts_profile_settings() {
+        with_phase51_live_native_role_preflight_env(|| {
+            let cfg = phase51_test_live_native_role_capture_config("accepts_profile_settings");
+            let settings = phase51_test_canary_settings(Some(1));
+
+            let check = super::phase51_live_native_role_canary_preflight_check(
+                TradeMode::Live,
+                &cfg,
+                Some(&settings),
+            )
+            .expect("preflight check should run");
+
+            assert!(check.ok, "unexpected preflight failure: {}", check.details);
+            assert_eq!(check.label, "phase51_live_native_role_canary");
+            assert_eq!(check.details, "validated");
+        });
+    }
+
+    #[test]
+    fn phase51_live_native_role_preflight_catches_missing_strict_gate() {
+        with_phase51_live_native_role_preflight_env(|| {
+            std::env::remove_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY");
+            let cfg = phase51_test_live_native_role_capture_config("missing_strict_gate");
+            let settings = phase51_test_canary_settings(Some(1));
+
+            let check = super::phase51_live_native_role_canary_preflight_check(
+                TradeMode::Live,
+                &cfg,
+                Some(&settings),
+            )
+            .expect("preflight check should run");
+
+            assert!(!check.ok);
+            assert!(
+                check.details.contains("strict native-role canary mode"),
+                "{}",
+                check.details
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_live_native_role_preflight_rejects_profile_with_too_many_open_orders() {
+        with_phase51_live_native_role_preflight_env(|| {
+            let cfg = phase51_test_live_native_role_capture_config("too_many_open_orders");
+            let settings = phase51_test_canary_settings(Some(2));
+
+            let check = super::phase51_live_native_role_canary_preflight_check(
+                TradeMode::Live,
+                &cfg,
+                Some(&settings),
+            )
+            .expect("preflight check should run");
+
+            assert!(!check.ok);
+            assert!(check.details.contains("max_open_orders=1"), "{}", check.details);
+        });
     }
 
     #[test]
