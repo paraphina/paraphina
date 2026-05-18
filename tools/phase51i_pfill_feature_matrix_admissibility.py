@@ -261,6 +261,7 @@ def _blocker(
 
 def _build_blockers(summary: dict[str, Any], buckets: list[dict[str, Any]], run_id: str, timestamp_ns: int) -> list[dict[str, Any]]:
     sparse_count = sum(1 for bucket in buckets if "sparse_pfill_feature_bucket" in (bucket.get("gate_reasons") or []))
+    pressure_unavailable_count = int(summary.get("native_limit_pressure_unavailable_count") or 0)
     specs = [
         (
             "raw_identifier_redaction_passed",
@@ -303,6 +304,13 @@ def _build_blockers(summary: dict[str, Any], buckets: list[dict[str, Any]], run_
             "HOLD",
             "HOLD",
             "Lighter native-limit pressure is not fully observed for all Lighter rows",
+        ),
+        (
+            "lighter_native_limit_pressure_unavailable_governance_hold",
+            pressure_unavailable_count,
+            "HOLD",
+            "HOLD",
+            "Lighter native-limit pressure is audited unavailable and held under the revised governance contract",
         ),
         (
             "maker_taker_not_fully_observed_for_filled_orders",
@@ -350,6 +358,7 @@ def _summary_gate_reason(blockers: list[dict[str, Any]]) -> str:
         "missing_observed_horizon_features",
         "filled_horizon_exchange_ms_only_requires_board_review",
         "lighter_native_limit_pressure_not_fully_observed",
+        "lighter_native_limit_pressure_unavailable_governance_hold",
         "maker_taker_not_fully_observed_for_filled_orders",
         "sparse_pfill_feature_buckets",
         "observed_only_selection_bias_not_resolved",
@@ -495,6 +504,7 @@ def build_matrix_admissibility(
                 "native_limit_observed_count",
                 "native_limit_partial_count",
                 "native_limit_unknown_count",
+                "native_limit_pressure_unavailable_count",
                 "native_limit_not_applicable_count",
                 "maker_taker_observed_count",
                 "maker_taker_partial_or_unknown_count",

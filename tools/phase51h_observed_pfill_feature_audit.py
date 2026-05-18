@@ -22,6 +22,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_COMMIT = "18dd09512288a85e440d3977e32432c3aabc1190"
 DEFAULT_OUTPUT_ROOT = ROOT / "runs/phase51h_observed_pfill_feature_audit"
+PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD = "PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD"
 
 UNSAFE_TRUE_FLAGS = {
     "approved_for_model_training",
@@ -447,6 +448,8 @@ def _native_status_class(venue: str, queue_labels: list[dict[str, Any]]) -> str:
         return "OBSERVED"
     if any(status.startswith("PARTIAL") for status in statuses):
         return "PARTIAL"
+    if PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD in statuses:
+        return "UNAVAILABLE_GOVERNANCE_HOLD"
     return "UNKNOWN"
 
 
@@ -573,7 +576,9 @@ def _coverage_label(
         missing_features.append("missing_queue_churn_join")
     elif queue_status == "JOINED_PARTIAL_SOURCE_KEYS":
         missing_features.append("partial_queue_churn_join")
-    if venue == "lighter" and native_status != "OBSERVED":
+    if venue == "lighter" and native_status == "UNAVAILABLE_GOVERNANCE_HOLD":
+        missing_features.append("lighter_native_limit_pressure_unavailable_governance_hold")
+    elif venue == "lighter" and native_status != "OBSERVED":
         missing_features.append("lighter_native_limit_pressure_not_observed")
     if maker_taker_status in {"PARTIAL_OR_UNKNOWN", "MISSING"}:
         missing_features.append("maker_taker_not_fully_observed_for_filled_order")
@@ -684,6 +689,7 @@ def _empty_bucket_counts() -> dict[str, int]:
         "native_limit_observed_count": 0,
         "native_limit_partial_count": 0,
         "native_limit_unknown_count": 0,
+        "native_limit_pressure_unavailable_count": 0,
         "native_limit_not_applicable_count": 0,
         "maker_taker_observed_count": 0,
         "maker_taker_partial_or_unknown_count": 0,
@@ -740,6 +746,8 @@ def _add_to_bucket(counts: dict[str, int], label: dict[str, Any]) -> None:
         counts["native_limit_partial_count"] += 1
     elif native_status == "UNKNOWN":
         counts["native_limit_unknown_count"] += 1
+    elif native_status == "UNAVAILABLE_GOVERNANCE_HOLD":
+        counts["native_limit_pressure_unavailable_count"] += 1
     else:
         counts["native_limit_not_applicable_count"] += 1
     maker_status = label.get("maker_taker_feature_status")
@@ -832,6 +840,8 @@ def _bucket_gate_reasons(
         counts["native_limit_partial_count"] > 0 or counts["native_limit_unknown_count"] > 0
     ):
         reasons.append("lighter_native_limit_pressure_not_fully_observed")
+    if dimensions.get("venue_id") == "lighter" and counts["native_limit_pressure_unavailable_count"] > 0:
+        reasons.append("lighter_native_limit_pressure_unavailable_governance_hold")
     if counts["maker_taker_partial_or_unknown_count"] > 0 or counts["maker_taker_missing_count"] > 0:
         reasons.append("maker_taker_not_fully_observed_for_filled_orders")
     if counts["markout_source_missing_count"] > 0:
@@ -904,6 +914,7 @@ def _summary_gate_reason(bucket_records: list[dict[str, Any]]) -> str:
         "missing_observed_horizon_features",
         "queue_churn_join_incomplete",
         "lighter_native_limit_pressure_not_fully_observed",
+        "lighter_native_limit_pressure_unavailable_governance_hold",
         "maker_taker_not_fully_observed_for_filled_orders",
         "markout_readiness_source_context_missing",
         "sparse_pfill_feature_bucket",
@@ -1157,6 +1168,7 @@ def build_feature_audit(
                 "native_limit_observed_count",
                 "native_limit_partial_count",
                 "native_limit_unknown_count",
+                "native_limit_pressure_unavailable_count",
                 "native_limit_not_applicable_count",
                 "maker_taker_observed_count",
                 "maker_taker_partial_or_unknown_count",
