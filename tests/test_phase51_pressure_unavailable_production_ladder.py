@@ -108,6 +108,52 @@ class Phase51PressureUnavailableProductionLadderTests(unittest.TestCase):
         )
         return target_run
 
+    def _target_run_with_lighter_role_and_limit(self, root: Path) -> Path:
+        target_run = root / "target_run"
+        target_run.mkdir()
+        write_json(
+            target_run / "phase51u_forward_capture_target_manifest_summary.json",
+            {
+                "schema_version": 1,
+                "baseline_commit": BASELINE_COMMIT,
+                "gate_status": "HOLD",
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "live_orders_allowed": False,
+            },
+        )
+        write_jsonl(
+            target_run / "native_role_capture_targets.jsonl",
+            [
+                {
+                    "schema_version": 1,
+                    "baseline_commit": BASELINE_COMMIT,
+                    "venue_id": "lighter",
+                    "canonical_group_id": "lighter-role-target",
+                    "order_key": "lighter-role-order-key",
+                    "no_live_flag": True,
+                    "approved_for_live": False,
+                    "live_orders_allowed": False,
+                }
+            ],
+        )
+        write_jsonl(
+            target_run / "lighter_native_limit_capture_targets.jsonl",
+            [
+                {
+                    "schema_version": 1,
+                    "baseline_commit": BASELINE_COMMIT,
+                    "venue_id": "lighter",
+                    "canonical_group_id": "lighter-limit-target",
+                    "order_key": "lighter-limit-order-key",
+                    "no_live_flag": True,
+                    "approved_for_live": False,
+                    "live_orders_allowed": False,
+                }
+            ],
+        )
+        return target_run
+
     def _observed_pfill_run(self, root: Path) -> Path:
         observed_run = root / "observed_pfill"
         observed_run.mkdir()
@@ -159,6 +205,29 @@ class Phase51PressureUnavailableProductionLadderTests(unittest.TestCase):
                         "venue_id": "lighter",
                         "path": str(source_path),
                     }
+                ],
+                "source_links": [],
+            },
+        )
+        return manifest
+
+    def _candidate_manifest_with_sources(self, root: Path, sources: list[tuple[str, Path]]) -> Path:
+        manifest = root / "candidate_manifest.json"
+        write_json(
+            manifest,
+            {
+                "manifest_version": 1,
+                "baseline_commit": BASELINE_COMMIT,
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "live_orders_allowed": False,
+                "sources": [
+                    {
+                        "source_id": source_id,
+                        "venue_id": "lighter",
+                        "path": str(source_path),
+                    }
+                    for source_id, source_path in sources
                 ],
                 "source_links": [],
             },
@@ -308,6 +377,100 @@ class Phase51PressureUnavailableProductionLadderTests(unittest.TestCase):
             self.assertFalse(decisions[0]["current_pack_target_ready"])
             self.assertFalse(decisions[0]["forward_refresh_required"])
             self.assertTrue(decisions[0]["pressure_unavailable_governance_hold"])
+
+    def test_phase51ak_reports_scoped_source_owner_ready_with_h_i_deferred(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            target_run = self._target_run_with_lighter_role_and_limit(tmp)
+            request_pack = tmp / "request_pack"
+            request_pack.mkdir()
+            write_json(request_pack / "manifest.json", {"schema_version": 1, "baseline_commit": BASELINE_COMMIT})
+            write_jsonl(request_pack / "source_link_request_targets.jsonl", [])
+            write_jsonl(request_pack / "source_link_request_sources.jsonl", [])
+            native_role_source = tmp / "lighter_native_role.jsonl"
+            write_jsonl(
+                native_role_source,
+                [
+                    {
+                        "schema_version": 1,
+                        "baseline_commit": BASELINE_COMMIT,
+                        "venue_id": "lighter",
+                        "canonical_group_id": "lighter-role-target",
+                        "order_key": "lighter-role-order-key",
+                        "account_index": 7,
+                        "is_maker_ask": True,
+                        "ask_account_id": 7,
+                        "bid_account_id": 9,
+                        "no_live_flag": True,
+                        "approved_for_live": False,
+                        "live_orders_allowed": False,
+                    }
+                ],
+            )
+            unavailable_source = tmp / "lighter_pressure_unavailable.jsonl"
+            write_jsonl(unavailable_source, [unavailable_packet()])
+            manifest = self._candidate_manifest_with_sources(
+                tmp,
+                [
+                    ("lighter_native_role", native_role_source),
+                    ("lighter_pressure_unavailable", unavailable_source),
+                ],
+            )
+            output_root = tmp / "phase51ak"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self.repo / "tools" / "phase51ak_blocker_resolution_runner.py"),
+                    "--target-run",
+                    str(target_run),
+                    "--request-pack",
+                    str(request_pack),
+                    "--no-default-current-manifest",
+                    "--candidate-manifest",
+                    str(manifest),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51ak_source_owner_scope_ready",
+                    "--target-pack-mode",
+                    "forward-refresh",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+            run_dir = output_root / "phase51ak_source_owner_scope_ready"
+            summary = json.loads((run_dir / "phase51ak_blocker_resolution_summary.json").read_text())
+            self.assertEqual(
+                summary["gate_reason"],
+                "phase51ak_source_owner_native_role_ready_hi_deferred_nonlive_hold",
+            )
+            self.assertTrue(summary["source_owner_native_role_evidence_ready"])
+            self.assertTrue(summary["source_owner_native_role_ready_without_h_i"])
+            self.assertEqual(
+                summary["phase51_source_owner_blocker_status"],
+                "SOURCE_OWNER_NATIVE_ROLE_READY_HI_DEFERRED",
+            )
+            self.assertTrue(summary["lighter_pressure_unavailable_governance_accepted"])
+            self.assertTrue(summary["h_i_feature_matrix_deferred"])
+            self.assertEqual(summary["phase51_global_blocker_status"], "HOLD")
+            self.assertFalse(summary["phase51v_downstream_chain_ready"])
+            self.assertFalse(summary["clears_phase51_blockers"])
+            self.assertFalse(summary["revised_pressure_unavailable_contract_clears_blocker"])
+            self.assertEqual(
+                summary["next_required_action"],
+                "record_scoped_source_owner_native_role_acceptance_and_defer_h_i_calibration",
+            )
+            self.assertEqual(
+                summary["decision_status_counts"],
+                {
+                    "PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD": 1,
+                    "READY_FORWARD_REFRESH_PACK": 1,
+                },
+            )
 
 
 if __name__ == "__main__":

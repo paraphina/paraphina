@@ -638,6 +638,15 @@ def _extract_current_blocker(phase51ak_record: dict[str, Any] | None) -> dict[st
         "native_role_capture_target_count": summary.get("native_role_capture_target_count"),
         "native_role_capture_target_ready_count": summary.get("native_role_capture_target_ready_count"),
         "native_role_capture_target_missing_count": summary.get("native_role_capture_target_missing_count"),
+        "source_owner_native_role_evidence_ready": summary.get("source_owner_native_role_evidence_ready"),
+        "source_owner_native_role_ready_without_h_i": summary.get("source_owner_native_role_ready_without_h_i"),
+        "phase51_source_owner_blocker_status": summary.get("phase51_source_owner_blocker_status"),
+        "lighter_pressure_unavailable_governance_accepted": summary.get(
+            "lighter_pressure_unavailable_governance_accepted"
+        ),
+        "h_i_feature_matrix_deferred": summary.get("h_i_feature_matrix_deferred"),
+        "h_i_feature_matrix_deferred_reason": summary.get("h_i_feature_matrix_deferred_reason"),
+        "source_owner_scope_next_required_action": summary.get("source_owner_scope_next_required_action"),
         "native_role_missing_by_venue": missing_by_venue,
         "lighter_native_limit_capture_target_count": summary.get("lighter_native_limit_capture_target_count"),
         "lighter_native_limit_capture_target_ready_count": summary.get("lighter_native_limit_capture_target_ready_count"),
@@ -1477,6 +1486,12 @@ def build_nonlive_executive_orchestrator(
         "route_count": len(route_decisions),
         "route_status_counts": _status_counts(route_decisions, "route_status"),
         "current_blocker": current_blocker,
+        "source_owner_native_role_evidence_ready": current_blocker.get("source_owner_native_role_evidence_ready"),
+        "phase51_source_owner_blocker_status": current_blocker.get("phase51_source_owner_blocker_status"),
+        "lighter_pressure_unavailable_governance_accepted": current_blocker.get(
+            "lighter_pressure_unavailable_governance_accepted"
+        ),
+        "h_i_feature_matrix_deferred": current_blocker.get("h_i_feature_matrix_deferred"),
         "decision_ledger_path": str(decision_ledger_path),
         "subagent_work_packet_path": str(work_packet_path),
         "subagent_work_packet_count": len(work_packets),

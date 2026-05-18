@@ -850,6 +850,12 @@ def build_forward_capture_bundle_readiness(
     role_ready_count = len(role_targets) - len(missing_role_targets)
     limit_ready_count = len(limit_targets) - len(missing_limit_targets)
     bundle_ready = bool(role_targets or limit_targets) and not missing_role_targets and not missing_limit_targets
+    source_owner_native_role_evidence_ready = bool(role_targets) and not missing_role_targets
+    source_owner_native_role_evidence_status = (
+        "READY"
+        if source_owner_native_role_evidence_ready
+        else "INCOMPLETE_OR_ABSENT"
+    )
     gate_reason = (
         "phase51v_forward_capture_bundle_ready_for_phase51s_nonlive_hold"
         if bundle_ready
@@ -881,6 +887,8 @@ def build_forward_capture_bundle_readiness(
         "native_role_capture_target_count": len(role_targets),
         "native_role_capture_target_ready_count": role_ready_count,
         "native_role_capture_target_missing_count": len(missing_role_targets),
+        "source_owner_native_role_evidence_ready": source_owner_native_role_evidence_ready,
+        "source_owner_native_role_evidence_status": source_owner_native_role_evidence_status,
         "lighter_native_limit_capture_target_count": len(limit_targets),
         "lighter_native_limit_capture_target_ready_count": limit_ready_count,
         "lighter_native_limit_capture_target_missing_count": len(missing_limit_targets),

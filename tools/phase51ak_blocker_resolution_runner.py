@@ -53,6 +53,9 @@ DEFAULT_CURRENT_CANDIDATE_MANIFEST = (
     / "PHASE51AE-BLOCKER-RECHECK-PLUS-PHASE51AJ-HOLD-20260506T000000Z"
     / "candidate_manifest.composed.json"
 )
+SOURCE_OWNER_NATIVE_ROLE_READY_HI_DEFERRED_STATUS = "SOURCE_OWNER_NATIVE_ROLE_READY_HI_DEFERRED"
+SOURCE_OWNER_NATIVE_ROLE_INCOMPLETE_STATUS = "SOURCE_OWNER_NATIVE_ROLE_INCOMPLETE"
+SOURCE_OWNER_NATIVE_ROLE_READY_PRESSURE_PENDING_STATUS = "SOURCE_OWNER_NATIVE_ROLE_READY_PRESSURE_PENDING"
 UNSAFE_TRUE_FLAGS = {
     "approved_for_model_training",
     "approved_for_live",
@@ -288,6 +291,46 @@ def _decision_counts_by_type_venue(records: list[dict[str, Any]]) -> dict[str, i
     return dict(sorted(counts.items()))
 
 
+def _source_owner_scope(
+    *,
+    native_role_target_count: int,
+    missing_role: int,
+    missing_limit: int,
+    pressure_unavailable_source_count: int,
+    pressure_unavailable_targets: int,
+) -> dict[str, Any]:
+    native_role_ready = native_role_target_count > 0 and missing_role == 0
+    pressure_unavailable_observed = pressure_unavailable_source_count > 0
+    pressure_unavailable_accounts_for_limits = (
+        pressure_unavailable_targets > 0 and missing_limit == pressure_unavailable_targets
+    )
+    limit_dependency_satisfied = missing_limit == 0 or pressure_unavailable_accounts_for_limits
+    source_owner_ready = native_role_ready and limit_dependency_satisfied
+    if source_owner_ready:
+        status = SOURCE_OWNER_NATIVE_ROLE_READY_HI_DEFERRED_STATUS
+        next_required_action = "record_scoped_source_owner_native_role_acceptance_and_defer_h_i_calibration"
+    elif native_role_ready:
+        status = SOURCE_OWNER_NATIVE_ROLE_READY_PRESSURE_PENDING_STATUS
+        next_required_action = "complete_or_govern_lighter_native_limit_pressure_before_scoped_acceptance"
+    else:
+        status = SOURCE_OWNER_NATIVE_ROLE_INCOMPLETE_STATUS
+        next_required_action = "obtain_target_linked_native_role_source_owner_evidence"
+    return {
+        "source_owner_native_role_evidence_ready": source_owner_ready,
+        "source_owner_native_role_ready_without_h_i": source_owner_ready,
+        "phase51_source_owner_blocker_status": status,
+        "lighter_pressure_unavailable_governance_accepted": native_role_ready and pressure_unavailable_observed,
+        "h_i_feature_matrix_deferred": source_owner_ready,
+        "h_i_feature_matrix_deferred_reason": (
+            "source_owner_native_role_scope_does_not_require_pfill_feature_matrix"
+            if source_owner_ready
+            else None
+        ),
+        "phase51_global_blocker_status": "HOLD",
+        "source_owner_scope_next_required_action": next_required_action,
+    }
+
+
 def _decision_rows(
     *,
     run_id: str,
@@ -497,13 +540,24 @@ def build_blocker_resolution_runner(
 
     _write_jsonl(decision_path, decision_rows)
     missing_role = int(phase51v_summary.get("native_role_capture_target_missing_count") or 0)
+    native_role_target_count = int(phase51v_summary.get("native_role_capture_target_count") or 0)
     missing_limit = int(phase51v_summary.get("lighter_native_limit_capture_target_missing_count") or 0)
     pressure_unavailable_targets = int(
         phase51v_summary.get("lighter_native_limit_pressure_unavailable_target_count") or 0
     )
+    pressure_unavailable_source_count = int(
+        phase51v_summary.get("lighter_native_limit_pressure_unavailable_source_count") or 0
+    )
     downstream_ready = bool(phase51v_summary.get("downstream_chain_ready"))
     pressure_unavailable_governance_hold = pressure_unavailable_targets > 0
     unresolved_without_governance = missing_role > 0 or (missing_limit - pressure_unavailable_targets) > 0
+    source_owner_scope = _source_owner_scope(
+        native_role_target_count=native_role_target_count,
+        missing_role=missing_role,
+        missing_limit=missing_limit,
+        pressure_unavailable_source_count=pressure_unavailable_source_count,
+        pressure_unavailable_targets=pressure_unavailable_targets,
+    )
     summary = {
         "schema_version": 1,
         "run_id": run_id,
@@ -511,6 +565,9 @@ def build_blocker_resolution_runner(
         "baseline_commit": BASELINE_COMMIT,
         "gate_status": "HOLD",
         "gate_reason": (
+            "phase51ak_source_owner_native_role_ready_hi_deferred_nonlive_hold"
+            if source_owner_scope["source_owner_native_role_evidence_ready"]
+            else
             (
                 "phase51ak_forward_refresh_pack_ready_nonlive_hold"
                 if target_pack_mode == "forward-refresh"
@@ -539,6 +596,7 @@ def build_blocker_resolution_runner(
         "native_role_capture_target_count": phase51v_summary.get("native_role_capture_target_count"),
         "native_role_capture_target_ready_count": phase51v_summary.get("native_role_capture_target_ready_count"),
         "native_role_capture_target_missing_count": missing_role,
+        **source_owner_scope,
         "lighter_native_limit_capture_target_count": phase51v_summary.get("lighter_native_limit_capture_target_count"),
         "lighter_native_limit_capture_target_ready_count": phase51v_summary.get(
             "lighter_native_limit_capture_target_ready_count"
@@ -556,6 +614,9 @@ def build_blocker_resolution_runner(
             unresolved_without_governance if pressure_unavailable_governance_hold else not downstream_ready
         ),
         "next_required_action": (
+            source_owner_scope["source_owner_scope_next_required_action"]
+            if source_owner_scope["source_owner_native_role_evidence_ready"]
+            else
             "run_phase51s_to_phase51i_nonlive_ladder"
             if downstream_ready
             else (

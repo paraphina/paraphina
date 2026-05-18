@@ -350,6 +350,108 @@ class TestPhase51amNonliveExecutiveOrchestrator(unittest.TestCase):
             self.assertTrue(intake_status["material_change_reason_supplied"])
             self.assertEqual(intake_status["phase51al_summary_count"], 1)
 
+    def test_surfaces_scoped_source_owner_readiness_without_route_or_global_clearance(self):
+        script_dir = Path(__file__).resolve().parents[1]
+        tool_path = script_dir / "tools" / "phase51am_nonlive_executive_orchestrator.py"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            ak_summary = tmp_path / "phase51ak_blocker_resolution_summary.json"
+            write_json(
+                ak_summary,
+                {
+                    "schema_version": 1,
+                    "run_id": "PHASE51AK-FUTURE-LIGHTER-NATIVE-ROLE-VALIDATION",
+                    "generated_at_utc": "2026-05-18T00:00:00+00:00",
+                    "baseline_commit": BASELINE_COMMIT,
+                    "gate_status": "HOLD",
+                    "gate_reason": "phase51ak_source_owner_native_role_ready_hi_deferred_nonlive_hold",
+                    "target_pack_mode": "forward-refresh",
+                    "target_run": str(tmp_path / "target_run"),
+                    "request_pack": str(tmp_path / "request_pack"),
+                    "native_role_capture_target_count": 1,
+                    "native_role_capture_target_ready_count": 1,
+                    "native_role_capture_target_missing_count": 0,
+                    "source_owner_native_role_evidence_ready": True,
+                    "source_owner_native_role_ready_without_h_i": True,
+                    "phase51_source_owner_blocker_status": "SOURCE_OWNER_NATIVE_ROLE_READY_HI_DEFERRED",
+                    "lighter_pressure_unavailable_governance_accepted": True,
+                    "h_i_feature_matrix_deferred": True,
+                    "h_i_feature_matrix_deferred_reason": (
+                        "source_owner_native_role_scope_does_not_require_pfill_feature_matrix"
+                    ),
+                    "source_owner_scope_next_required_action": (
+                        "record_scoped_source_owner_native_role_acceptance_and_defer_h_i_calibration"
+                    ),
+                    "lighter_native_limit_capture_target_count": 1,
+                    "lighter_native_limit_capture_target_ready_count": 0,
+                    "lighter_native_limit_capture_target_missing_count": 1,
+                    "lighter_native_limit_pressure_unavailable_target_count": 1,
+                    "phase51v_downstream_chain_ready": False,
+                    "decision_status_counts": {
+                        "PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD": 1,
+                        "READY_FORWARD_REFRESH_PACK": 1,
+                    },
+                    "decision_status_counts_by_target_type_venue": {
+                        "native_role:lighter:READY_FORWARD_REFRESH_PACK": 1,
+                        "lighter_native_limit:lighter:PRESSURE_UNAVAILABLE_GOVERNANCE_HOLD": 1,
+                    },
+                    "next_required_action": "record_scoped_source_owner_native_role_acceptance_and_defer_h_i_calibration",
+                    "clears_phase51_blockers": False,
+                    "no_live_flag": True,
+                    "approved_for_live": False,
+                    "approved_for_canary": False,
+                    "approved_for_model_training": False,
+                    "approved_for_capital_escalation": False,
+                    "admissible_for_financial_claim": False,
+                    "admissible_for_ev_admission": False,
+                    "live_orders_allowed": False,
+                    "capital_change_allowed": False,
+                    "risk_limit_relaxation_allowed": False,
+                    "raw_identifier_redaction_status": "PASS",
+                },
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(tool_path),
+                    "--repo-root",
+                    str(tmp_path),
+                    "--phase51ak-summary",
+                    str(ak_summary),
+                    "--output-root",
+                    str(tmp_path / "phase51am_runs"),
+                    "--run-id",
+                    "phase51am_source_owner_scope_ready",
+                    "--timestamp-ns",
+                    "1700000000000000000",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, f"stdout={result.stdout}\nstderr={result.stderr}")
+
+            run_dir = tmp_path / "phase51am_runs" / "phase51am_source_owner_scope_ready"
+            summary = json.loads((run_dir / "phase51am_nonlive_executive_orchestrator_summary.json").read_text())
+            self.assertEqual(summary["control_status"], "AWAITING_SOURCE_OWNER_INPUT")
+            self.assertEqual(summary["selected_route"], "none")
+            self.assertTrue(summary["source_owner_native_role_evidence_ready"])
+            self.assertEqual(
+                summary["phase51_source_owner_blocker_status"],
+                "SOURCE_OWNER_NATIVE_ROLE_READY_HI_DEFERRED",
+            )
+            self.assertTrue(summary["lighter_pressure_unavailable_governance_accepted"])
+            self.assertTrue(summary["h_i_feature_matrix_deferred"])
+            self.assertFalse(summary["clears_phase51_blockers"])
+            self.assertFalse(summary["live_orders_allowed"])
+            ledger = [
+                json.loads(line)
+                for line in (run_dir / "phase51am_route_decision_ledger.jsonl").read_text().splitlines()
+                if line.strip()
+            ]
+            self.assertNotIn("source_owner_native_role_scope", {row["route"] for row in ledger})
+
     def test_compares_previous_phase51am_summary_for_continuous_optimization(self):
         script_dir = Path(__file__).resolve().parents[1]
         tool_path = script_dir / "tools" / "phase51am_nonlive_executive_orchestrator.py"
