@@ -305,6 +305,15 @@ def _sum_int(records: list[dict[str, Any]], field: str) -> int:
 
 def _load_pfill_labels(observed_pfill_run: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     summary = _load_hold_summary(observed_pfill_run, "pfill_outcome_summary.json")
+    if summary.get("compatibility_view_only") is True:
+        raise ValueError(
+            f"{observed_pfill_run} is a compatibility view, not an observed P-fill feature input"
+        )
+    compatibility_source = str(summary.get("compatibility_source") or "")
+    if compatibility_source == "PHASE51AL_NATIVE_ROLE_TARGET":
+        raise ValueError(
+            f"{observed_pfill_run} native-role compatibility views are not observed P-fill feature inputs"
+        )
     if int(summary.get("censored_count") or 0) != 0:
         raise ValueError(f"{observed_pfill_run} must be an observed-only pack with censored_count=0")
     labels_path = observed_pfill_run / "pfill_order_labels.jsonl"
@@ -313,6 +322,12 @@ def _load_pfill_labels(observed_pfill_run: Path) -> tuple[dict[str, Any], list[d
         if label.get("label_type") != "ORDER_PFILL_OUTCOME_LABEL":
             continue
         _check_unsafe(label, labels_path, label="label")
+        if label.get("compatibility_view_only") is True or label.get(
+            "source_owner_native_role_compatibility_only"
+        ) is True:
+            raise ValueError("compatibility-view labels are not observed P-fill feature inputs")
+        if label.get("target_type") == "native_role" and label.get("p_fill_outcome") is None:
+            raise ValueError("native-role-only labels are not observed P-fill feature inputs")
         outcome_status = str(label.get("outcome_status") or "")
         if outcome_status not in {"OBSERVED_FILLED", "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL"}:
             raise ValueError(f"{labels_path} contains non-observed outcome_status={outcome_status}")

@@ -10,7 +10,7 @@ use crate::config::Phase51ForwardRefreshCaptureConfig;
 use super::types::{
     Fill, Phase51ForwardRefreshCaptureAudit, Phase51ForwardRefreshLighterNativeLimit,
     Phase51ForwardRefreshNativeRole, Phase51ForwardRefreshSourceOwnerFill,
-    Phase51ForwardRefreshTargetKey,
+    Phase51ForwardRefreshSourceOwnerPfillObservation, Phase51ForwardRefreshTargetKey,
 };
 
 const FORBIDDEN_FIELD_NAMES: &[&str] = &[
@@ -347,6 +347,7 @@ impl Phase51LighterNativeLimitPressure {
 pub struct Phase51ForwardRefreshCapture {
     config: Phase51ForwardRefreshCaptureConfig,
     rows_written: usize,
+    source_owner_pfill_observation_rows_written: usize,
     live_native_role_canary_mode: bool,
 }
 
@@ -370,6 +371,7 @@ impl Phase51ForwardRefreshCapture {
         }
 
         let mut rows_written = 0usize;
+        let mut source_owner_pfill_observation_rows_written = 0usize;
         let mut live_native_role_canary_mode = false;
         if config.enabled {
             if !execution_mode.is_non_live_shadow_safe() {
@@ -408,11 +410,30 @@ impl Phase51ForwardRefreshCapture {
                     )));
                 }
             }
+            let pfill_observation_output_path =
+                source_owner_pfill_observation_output_path(output_path);
+            validate_output_path(&pfill_observation_output_path)?;
+            if pfill_observation_output_path.exists() {
+                source_owner_pfill_observation_rows_written =
+                    count_nonempty_lines(&pfill_observation_output_path)?;
+                if live_native_role_canary_mode && source_owner_pfill_observation_rows_written > 0 {
+                    return Err(Phase51CaptureError::new(
+                        "phase51 live native-role canary capture requires absent or empty source-owner pfill observation output",
+                    ));
+                }
+                if source_owner_pfill_observation_rows_written > config.max_rows {
+                    return Err(Phase51CaptureError::new(format!(
+                        "phase51 source-owner pfill observation output already exceeds max_rows: {source_owner_pfill_observation_rows_written} > {}",
+                        config.max_rows
+                    )));
+                }
+            }
         }
 
         Ok(Self {
             config: config.clone(),
             rows_written,
+            source_owner_pfill_observation_rows_written,
             live_native_role_canary_mode,
         })
     }
@@ -427,6 +448,10 @@ impl Phase51ForwardRefreshCapture {
 
     pub fn rows_written(&self) -> usize {
         self.rows_written
+    }
+
+    pub fn source_owner_pfill_observation_rows_written(&self) -> usize {
+        self.source_owner_pfill_observation_rows_written
     }
 
     pub fn capture_fill(
@@ -483,6 +508,74 @@ impl Phase51ForwardRefreshCapture {
         Ok(audit)
     }
 
+    pub fn capture_source_owner_pfill_observation(
+        &mut self,
+        target_key: Option<&Phase51CaptureTargetKey>,
+        venue_id: &str,
+        native_role: &Phase51ForwardRefreshNativeRole,
+        observation: &Phase51ForwardRefreshSourceOwnerPfillObservation,
+    ) -> Phase51CaptureResult<Option<Value>> {
+        if !self.config.enabled {
+            return Ok(None);
+        }
+        let Some(target_key) = target_key else {
+            return Ok(None);
+        };
+        if !target_key.is_complete() {
+            return Ok(None);
+        }
+        let venue_id = canonical_venue_id(venue_id);
+        if venue_id != "lighter" {
+            return Ok(None);
+        }
+        let native_role = native_role_from_runtime(native_role);
+        let Some(native_payload) = native_role.to_payload(&venue_id)? else {
+            return Ok(None);
+        };
+        let Some(observation_payload) = source_owner_pfill_observation_payload(observation) else {
+            return Ok(None);
+        };
+
+        let mut row = base_row("source_owner_pfill_observation", &venue_id, target_key);
+        row.insert(
+            "phase51_bridge_kind".to_string(),
+            json!("source_owner_pfill_observation"),
+        );
+        row.insert("compatibility_view_only".to_string(), json!(false));
+        row.insert(
+            "source_owner_native_role_compatibility_only".to_string(),
+            json!(false),
+        );
+        row.insert(
+            "source_link_status".to_string(),
+            json!("DIRECT_TARGET_LINKABLE"),
+        );
+        row.insert("source_link_inference_allowed".to_string(), json!(false));
+        row.insert(
+            "time_price_size_inference_allowed".to_string(),
+            json!(false),
+        );
+        row.insert("role_inference_allowed".to_string(), json!(false));
+        row.insert("missing_pressure_values_inferred".to_string(), json!(false));
+        row.insert("blocker_cleared".to_string(), json!(false));
+        row.insert("clears_phase51_blockers".to_string(), json!(false));
+        row.insert(
+            "native_role_source".to_string(),
+            json!(native_role_audit_source_runtime(&native_role)),
+        );
+        row.insert(
+            "native_role_exact_source_available".to_string(),
+            json!(true),
+        );
+        for (key, value) in native_payload {
+            row.insert(key, value);
+        }
+        for (key, value) in observation_payload {
+            row.insert(key, value);
+        }
+        self.write_source_owner_pfill_observation_row(Value::Object(row))
+    }
+
     pub fn capture_source_owner_fill(
         &mut self,
         fill: &Phase51ForwardRefreshSourceOwnerFill,
@@ -502,6 +595,7 @@ impl Phase51ForwardRefreshCapture {
         audit.canonical_group_id = Some(target_key.canonical_group_id.clone());
         audit.order_key = Some(target_key.order_key.clone());
 
+        let mut native_role_emitted = false;
         if let Some(runtime_native_role) = fill.phase51_native_role.as_ref() {
             audit.native_role_source = Some(native_role_audit_source(runtime_native_role));
             let emitted = self.capture_native_role(
@@ -510,8 +604,23 @@ impl Phase51ForwardRefreshCapture {
                 Some(native_role_from_runtime(runtime_native_role)),
             )?;
             if emitted.is_some() {
+                native_role_emitted = true;
                 audit.target_type = Some("native_role".to_string());
                 audit.sanitized_row_emitted = true;
+            }
+        }
+
+        if native_role_emitted {
+            if let (Some(runtime_native_role), Some(observation)) = (
+                fill.phase51_native_role.as_ref(),
+                fill.phase51_source_owner_pfill_observation.as_ref(),
+            ) {
+                self.capture_source_owner_pfill_observation(
+                    Some(&target_key),
+                    &fill.venue_id,
+                    runtime_native_role,
+                    observation,
+                )?;
             }
         }
 
@@ -606,31 +715,31 @@ impl Phase51ForwardRefreshCapture {
         }
 
         let output_path = PathBuf::from(&self.config.output_path);
-        if let Some(parent) = output_path.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                Phase51CaptureError::new(format!(
-                    "failed to create phase51 capture output directory {}: {err}",
-                    parent.display()
-                ))
-            })?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&output_path)
-            .map_err(|err| {
-                Phase51CaptureError::new(format!(
-                    "failed to open phase51 capture output {}: {err}",
-                    output_path.display()
-                ))
-            })?;
-        serde_json::to_writer(&mut file, &row).map_err(|err| {
-            Phase51CaptureError::new(format!("failed to serialize phase51 capture row: {err}"))
-        })?;
-        file.write_all(b"\n").map_err(|err| {
-            Phase51CaptureError::new(format!("failed to append phase51 capture newline: {err}"))
-        })?;
+        append_row_to_path(&output_path, &row, "phase51 capture output")?;
         self.rows_written += 1;
+        Ok(Some(row))
+    }
+
+    fn write_source_owner_pfill_observation_row(
+        &mut self,
+        row: Value,
+    ) -> Phase51CaptureResult<Option<Value>> {
+        enforce_output_safety(&row)?;
+        if self.source_owner_pfill_observation_rows_written >= self.config.max_rows {
+            return Err(Phase51CaptureError::new(format!(
+                "phase51 source-owner pfill observation max_rows reached: {}",
+                self.config.max_rows
+            )));
+        }
+
+        let output_path =
+            source_owner_pfill_observation_output_path(Path::new(&self.config.output_path));
+        append_row_to_path(
+            &output_path,
+            &row,
+            "phase51 source-owner pfill observation output",
+        )?;
+        self.source_owner_pfill_observation_rows_written += 1;
         Ok(Some(row))
     }
 }
@@ -738,6 +847,130 @@ fn native_role_audit_source(native_role: &Phase51ForwardRefreshNativeRole) -> St
         Phase51ForwardRefreshNativeRole::Paradex { .. } => "paradex.liquidity",
     }
     .to_string()
+}
+
+fn native_role_audit_source_runtime(native_role: &Phase51VenueNativeRole) -> String {
+    match native_role {
+        Phase51VenueNativeRole::Aster { .. } => "aster.ORDER_TRADE_UPDATE",
+        Phase51VenueNativeRole::Extended { .. } => "extended.isTaker",
+        Phase51VenueNativeRole::Hyperliquid { .. } => "hyperliquid.crossed",
+        Phase51VenueNativeRole::Lighter { .. } => {
+            "lighter.account_index.is_maker_ask.ask_account_id.bid_account_id"
+        }
+        Phase51VenueNativeRole::Paradex { .. } => "paradex.liquidity",
+    }
+    .to_string()
+}
+
+fn source_owner_pfill_observation_payload(
+    observation: &Phase51ForwardRefreshSourceOwnerPfillObservation,
+) -> Option<Map<String, Value>> {
+    if observation.source_event_type != "LIGHTER_TRADES_JSON" {
+        return None;
+    }
+    if !observation.price.is_finite() || observation.price <= 0.0 {
+        return None;
+    }
+    if !observation.size.is_finite() || observation.size <= 0.0 {
+        return None;
+    }
+    if observation.event_time_ms <= 0 {
+        return None;
+    }
+    if observation.fill_count != 1
+        || observation.outcome_status != "OBSERVED_FILLED"
+        || (observation.p_fill_outcome - 1.0).abs() > f64::EPSILON
+    {
+        return None;
+    }
+
+    let mut payload = Map::new();
+    payload.insert(
+        "source_event_type".to_string(),
+        json!(observation.source_event_type),
+    );
+    payload.insert("side".to_string(), json!(side_text(observation.side)));
+    payload.insert("price".to_string(), json!(observation.price));
+    payload.insert("size".to_string(), json!(observation.size));
+    payload.insert(
+        "event_time_ms".to_string(),
+        json!(observation.event_time_ms),
+    );
+    payload.insert(
+        "first_fill_time_ms".to_string(),
+        json!(observation.event_time_ms),
+    );
+    payload.insert(
+        "last_fill_time_ms".to_string(),
+        json!(observation.event_time_ms),
+    );
+    payload.insert("fill_count".to_string(), json!(observation.fill_count));
+    payload.insert(
+        "outcome_status".to_string(),
+        json!(observation.outcome_status),
+    );
+    payload.insert(
+        "p_fill_outcome".to_string(),
+        json!(observation.p_fill_outcome),
+    );
+    payload.insert("terminal_event_count".to_string(), json!(1));
+    payload.insert(
+        "terminal_action_first".to_string(),
+        json!("source_owner_fill"),
+    );
+    payload.insert(
+        "observed_side_source".to_string(),
+        json!("LIGHTER_TRADES_JSON.side"),
+    );
+    payload.insert(
+        "observed_price_size_source".to_string(),
+        json!("LIGHTER_TRADES_JSON.price_size"),
+    );
+    payload.insert(
+        "observed_outcome_source".to_string(),
+        json!("LIGHTER_TRADES_JSON.trade_event"),
+    );
+    Some(payload)
+}
+
+fn side_text(side: crate::types::Side) -> &'static str {
+    match side {
+        crate::types::Side::Buy => "Buy",
+        crate::types::Side::Sell => "Sell",
+    }
+}
+
+fn source_owner_pfill_observation_output_path(output_path: &Path) -> PathBuf {
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("phase51_forward_refresh");
+    let stem = file_name.strip_suffix(".jsonl").unwrap_or(file_name);
+    let mut path = output_path.to_path_buf();
+    path.set_file_name(format!("{stem}.source_owner_pfill_observation.jsonl"));
+    path
+}
+
+fn append_row_to_path(path: &Path, row: &Value, label: &str) -> Phase51CaptureResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            Phase51CaptureError::new(format!(
+                "failed to create {label} directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| {
+            Phase51CaptureError::new(format!("failed to open {label} {}: {err}", path.display()))
+        })?;
+    serde_json::to_writer(&mut file, row)
+        .map_err(|err| Phase51CaptureError::new(format!("failed to serialize {label}: {err}")))?;
+    file.write_all(b"\n")
+        .map_err(|err| Phase51CaptureError::new(format!("failed to append {label} newline: {err}")))
 }
 
 fn lighter_pressure_from_runtime(

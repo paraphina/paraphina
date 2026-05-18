@@ -4388,6 +4388,85 @@ class TestValidatorSubprocess(unittest.TestCase):
             self.assertEqual(unsafe.returncode, 2)
             self.assertIn("unsafe label flag approved_for_live=true", unsafe.stderr)
 
+    def test_phase51h_rejects_native_role_compatibility_view_as_pfill_input(self):
+        """Native-role compatibility views must not masquerade as observed P-fill labels."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            observed_run = tmp_path / "observed_pfill_compatibility"
+            observed_run.mkdir()
+            output_root = tmp_path / "phase51h"
+            baseline = "18dd09512288a85e440d3977e32432c3aabc1190"
+            (observed_run / "pfill_outcome_summary.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "run_id": "phase51al_native_role_compat",
+                        "baseline_commit": baseline,
+                        "gate_status": "HOLD",
+                        "gate_reason": "native_role_compatibility_view_only",
+                        "compatibility_view_only": True,
+                        "compatibility_source": "PHASE51AL_NATIVE_ROLE_TARGET",
+                        "order_label_count": 1,
+                        "censored_count": 0,
+                        "approved_for_live": False,
+                        "approved_for_model_training": False,
+                        "admissible_for_ev_admission": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (observed_run / "pfill_order_labels.jsonl").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "label_type": "ORDER_PFILL_OUTCOME_LABEL",
+                        "label_seq": 1,
+                        "run_id": "phase51al_native_role_compat",
+                        "baseline_commit": baseline,
+                        "canonical_group_id": "native-role-only-group",
+                        "order_key": "native-role-only-order",
+                        "target_type": "native_role",
+                        "compatibility_view_only": True,
+                        "source_owner_native_role_compatibility_only": True,
+                        "venue_id": "lighter",
+                        "approved_for_live": False,
+                        "approved_for_model_training": False,
+                        "admissible_for_ev_admission": False,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(self._get_phase51h_observed_pfill_feature_audit_path()),
+                    "--observed-pfill-run",
+                    str(observed_run),
+                    "--quarantine-review-run",
+                    str(tmp_path / "quarantine"),
+                    "--canonical-pfill-run",
+                    str(tmp_path / "canonical"),
+                    "--output-root",
+                    str(output_root),
+                    "--run-id",
+                    "phase51h_reject_native_role_compat",
+                ],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("compatibility view", result.stderr)
+            self.assertFalse(
+                (
+                    output_root
+                    / "phase51h_reject_native_role_compat"
+                    / "pfill_feature_audit_summary.json"
+                ).exists()
+            )
+
     def test_phase51j_observed_horizon_recovery_recovers_terminal_horizons_hold_only(self):
         """Observed-horizon recovery should recover terminal source ticks without emitting raw IDs."""
         with tempfile.TemporaryDirectory() as tmpdir:

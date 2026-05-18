@@ -9,7 +9,8 @@ use paraphina::live::phase51_forward_refresh_capture::{
 };
 use paraphina::live::types::{
     Fill, Phase51ForwardRefreshLighterNativeLimit, Phase51ForwardRefreshNativeRole,
-    Phase51ForwardRefreshSourceOwnerFill, Phase51ForwardRefreshTargetKey,
+    Phase51ForwardRefreshSourceOwnerFill, Phase51ForwardRefreshSourceOwnerPfillObservation,
+    Phase51ForwardRefreshTargetKey,
 };
 use paraphina::types::{OrderPurpose, Side};
 use serde_json::Value;
@@ -59,6 +60,12 @@ fn read_rows(path: &std::path::Path) -> Vec<Value> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect()
+}
+
+fn pfill_observation_path(path: &std::path::Path) -> std::path::PathBuf {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap();
+    let stem = file_name.strip_suffix(".jsonl").unwrap_or(file_name);
+    path.with_file_name(format!("{stem}.source_owner_pfill_observation.jsonl"))
 }
 
 fn assert_safe_flags(row: &Value) {
@@ -648,6 +655,261 @@ fn source_owner_fill_with_target_and_native_role_emits_sanitized_row() {
     assert_eq!(rows[0].get("m").and_then(Value::as_bool), Some(true));
     assert_eq!(rows[0].get("l").and_then(Value::as_str), Some("0.01"));
     assert_safe_flags(&rows[0]);
+}
+
+#[test]
+fn source_owner_fill_with_explicit_pfill_observation_emits_separate_sanitized_sidecar() {
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.future_native_role.jsonl");
+    let pfill_output = pfill_observation_path(&output);
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let mut fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        3,
+        "lighter",
+        1_700_000_000_101_000,
+        1_700_000_000_101,
+        Some("raw-order-id-source-owner".to_string()),
+        Some("raw-client-order-id-source-owner".to_string()),
+        Some(Phase51ForwardRefreshNativeRole::Lighter {
+            account_index: 7,
+            is_maker_ask: true,
+            ask_account_id: 7,
+            bid_account_id: 9,
+        }),
+    );
+    fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+        canonical_group_id: "cg-source-owner-pfill".to_string(),
+        order_key: "ok-source-owner-pfill".to_string(),
+    });
+    fill.set_phase51_source_owner_pfill_observation(
+        Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+            Side::Sell,
+            2_100.5,
+            0.01,
+            1_700_000_000_101,
+        )
+        .unwrap(),
+    );
+
+    let audit = capture.capture_source_owner_fill(&fill).unwrap();
+
+    assert!(audit.sanitized_row_emitted);
+    assert_eq!(audit.target_type.as_deref(), Some("native_role"));
+    assert_eq!(capture.rows_written(), 1);
+    assert_eq!(capture.source_owner_pfill_observation_rows_written(), 1);
+
+    let native_rows = read_rows(&output);
+    assert_eq!(native_rows.len(), 1);
+    assert_eq!(
+        native_rows[0].get("target_type").and_then(Value::as_str),
+        Some("native_role")
+    );
+    assert!(native_rows[0].get("p_fill_outcome").is_none());
+    assert_safe_flags(&native_rows[0]);
+
+    let pfill_rows = read_rows(&pfill_output);
+    assert_eq!(pfill_rows.len(), 1);
+    let row = &pfill_rows[0];
+    assert_eq!(
+        row.get("target_type").and_then(Value::as_str),
+        Some("source_owner_pfill_observation")
+    );
+    assert_eq!(
+        row.get("phase51_bridge_kind").and_then(Value::as_str),
+        Some("source_owner_pfill_observation")
+    );
+    assert_eq!(
+        row.get("canonical_group_id").and_then(Value::as_str),
+        Some("cg-source-owner-pfill")
+    );
+    assert_eq!(
+        row.get("order_key").and_then(Value::as_str),
+        Some("ok-source-owner-pfill")
+    );
+    assert_eq!(row.get("side").and_then(Value::as_str), Some("Sell"));
+    assert_eq!(row.get("price").and_then(Value::as_f64), Some(2_100.5));
+    assert_eq!(row.get("size").and_then(Value::as_f64), Some(0.01));
+    assert_eq!(
+        row.get("event_time_ms").and_then(Value::as_i64),
+        Some(1_700_000_000_101)
+    );
+    assert_eq!(
+        row.get("outcome_status").and_then(Value::as_str),
+        Some("OBSERVED_FILLED")
+    );
+    assert_eq!(row.get("p_fill_outcome").and_then(Value::as_f64), Some(1.0));
+    assert_eq!(row.get("fill_count").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        row.get("native_role_source").and_then(Value::as_str),
+        Some("lighter.account_index.is_maker_ask.ask_account_id.bid_account_id")
+    );
+    assert_eq!(
+        row.get("source_link_inference_allowed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        row.get("time_price_size_inference_allowed")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        row.get("role_inference_allowed").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        row.get("blocker_cleared").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        row.get("clears_phase51_blockers").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(row.get("active_order_headroom_account").is_none());
+    assert_safe_flags(row);
+
+    let raw_native = fs::read_to_string(&output).unwrap();
+    let raw_pfill = fs::read_to_string(&pfill_output).unwrap();
+    for raw in [&raw_native, &raw_pfill] {
+        assert!(!raw.contains("raw-order-id-source-owner"));
+        assert!(!raw.contains("raw-client-order-id-source-owner"));
+    }
+}
+
+#[test]
+fn source_owner_pfill_observation_requires_target_native_role_and_valid_observation() {
+    let invalid_observations = [
+        Phase51ForwardRefreshSourceOwnerPfillObservation {
+            source_event_type: "LIGHTER_TRADES_JSON".to_string(),
+            side: Side::Buy,
+            price: 0.0,
+            size: 0.01,
+            event_time_ms: 1_700_000_000_111,
+            fill_count: 1,
+            outcome_status: "OBSERVED_FILLED".to_string(),
+            p_fill_outcome: 1.0,
+        },
+        Phase51ForwardRefreshSourceOwnerPfillObservation {
+            source_event_type: "LIGHTER_TRADES_JSON".to_string(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.0,
+            event_time_ms: 1_700_000_000_111,
+            fill_count: 1,
+            outcome_status: "OBSERVED_FILLED".to_string(),
+            p_fill_outcome: 1.0,
+        },
+        Phase51ForwardRefreshSourceOwnerPfillObservation {
+            source_event_type: "LIGHTER_TRADES_JSON".to_string(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.01,
+            event_time_ms: 0,
+            fill_count: 1,
+            outcome_status: "OBSERVED_FILLED".to_string(),
+            p_fill_outcome: 1.0,
+        },
+        Phase51ForwardRefreshSourceOwnerPfillObservation {
+            source_event_type: "LIGHTER_TRADES_JSON".to_string(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.01,
+            event_time_ms: 1_700_000_000_111,
+            fill_count: 0,
+            outcome_status: "OBSERVED_FILLED".to_string(),
+            p_fill_outcome: 1.0,
+        },
+        Phase51ForwardRefreshSourceOwnerPfillObservation {
+            source_event_type: "LIGHTER_TRADES_JSON".to_string(),
+            side: Side::Buy,
+            price: 2_100.0,
+            size: 0.01,
+            event_time_ms: 1_700_000_000_111,
+            fill_count: 1,
+            outcome_status: "OBSERVED_NOT_FILLED_TO_TERMINAL_CANCEL".to_string(),
+            p_fill_outcome: 0.0,
+        },
+    ];
+
+    for observation in invalid_observations {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("forward_refresh.future_native_role.jsonl");
+        let pfill_output = pfill_observation_path(&output);
+        let mut capture = Phase51ForwardRefreshCapture::from_config(
+            &enabled_config(&output),
+            Phase51CaptureExecutionMode::Shadow,
+        )
+        .unwrap();
+        let mut fill = Phase51ForwardRefreshSourceOwnerFill::new(
+            3,
+            "lighter",
+            1,
+            1_700_000_000_111,
+            None,
+            None,
+            Some(Phase51ForwardRefreshNativeRole::Lighter {
+                account_index: 7,
+                is_maker_ask: false,
+                ask_account_id: 9,
+                bid_account_id: 7,
+            }),
+        );
+        fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+            canonical_group_id: "cg-invalid-pfill".to_string(),
+            order_key: "ok-invalid-pfill".to_string(),
+        });
+        fill.set_phase51_source_owner_pfill_observation(observation);
+
+        let audit = capture.capture_source_owner_fill(&fill).unwrap();
+
+        assert!(audit.sanitized_row_emitted);
+        assert_eq!(capture.rows_written(), 1);
+        assert_eq!(capture.source_owner_pfill_observation_rows_written(), 0);
+        assert!(!pfill_output.exists());
+    }
+
+    let dir = tempdir().unwrap();
+    let output = dir.path().join("forward_refresh.future_native_role.jsonl");
+    let pfill_output = pfill_observation_path(&output);
+    let mut capture = Phase51ForwardRefreshCapture::from_config(
+        &enabled_config(&output),
+        Phase51CaptureExecutionMode::Shadow,
+    )
+    .unwrap();
+    let mut fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        3,
+        "lighter",
+        2,
+        1_700_000_000_222,
+        None,
+        None,
+        None,
+    );
+    fill.phase51_target_key = Some(Phase51ForwardRefreshTargetKey {
+        canonical_group_id: "cg-missing-native".to_string(),
+        order_key: "ok-missing-native".to_string(),
+    });
+    fill.set_phase51_source_owner_pfill_observation(
+        Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+            Side::Buy,
+            2_100.0,
+            0.01,
+            1_700_000_000_222,
+        )
+        .unwrap(),
+    );
+
+    let audit = capture.capture_source_owner_fill(&fill).unwrap();
+
+    assert!(!audit.sanitized_row_emitted);
+    assert_eq!(capture.rows_written(), 0);
+    assert_eq!(capture.source_owner_pfill_observation_rows_written(), 0);
+    assert!(!output.exists());
+    assert!(!pfill_output.exists());
 }
 
 #[test]

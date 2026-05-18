@@ -212,6 +212,9 @@ pub struct Phase51ForwardRefreshSourceOwnerFill {
     pub phase51_native_role: Option<Phase51ForwardRefreshNativeRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase51_lighter_native_limit: Option<Phase51ForwardRefreshLighterNativeLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase51_source_owner_pfill_observation:
+        Option<Phase51ForwardRefreshSourceOwnerPfillObservation>,
 }
 
 impl Phase51ForwardRefreshSourceOwnerFill {
@@ -234,6 +237,7 @@ impl Phase51ForwardRefreshSourceOwnerFill {
             phase51_target_key: None,
             phase51_native_role,
             phase51_lighter_native_limit: None,
+            phase51_source_owner_pfill_observation: None,
         }
     }
 
@@ -247,6 +251,13 @@ impl Phase51ForwardRefreshSourceOwnerFill {
 
     pub fn set_phase51_target_key(&mut self, target_key: Phase51ForwardRefreshTargetKey) {
         self.phase51_target_key = Some(target_key);
+    }
+
+    pub fn set_phase51_source_owner_pfill_observation(
+        &mut self,
+        observation: Phase51ForwardRefreshSourceOwnerPfillObservation,
+    ) {
+        self.phase51_source_owner_pfill_observation = Some(observation);
     }
 }
 
@@ -268,7 +279,52 @@ impl fmt::Debug for Phase51ForwardRefreshSourceOwnerFill {
                 "phase51_lighter_native_limit",
                 &self.phase51_lighter_native_limit,
             )
+            .field(
+                "phase51_source_owner_pfill_observation",
+                &self.phase51_source_owner_pfill_observation,
+            )
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Phase51ForwardRefreshSourceOwnerPfillObservation {
+    pub source_event_type: String,
+    pub side: Side,
+    pub price: f64,
+    pub size: f64,
+    pub event_time_ms: TimestampMs,
+    pub fill_count: u32,
+    pub outcome_status: String,
+    pub p_fill_outcome: f64,
+}
+
+impl Phase51ForwardRefreshSourceOwnerPfillObservation {
+    pub fn lighter_trade_observed_fill(
+        side: Side,
+        price: f64,
+        size: f64,
+        event_time_ms: TimestampMs,
+    ) -> Option<Self> {
+        if !price.is_finite() || price <= 0.0 {
+            return None;
+        }
+        if !size.is_finite() || size <= 0.0 {
+            return None;
+        }
+        if event_time_ms <= 0 {
+            return None;
+        }
+        Some(Self {
+            source_event_type: "LIGHTER_TRADES_JSON".to_string(),
+            side,
+            price,
+            size,
+            event_time_ms,
+            fill_count: 1,
+            outcome_status: "OBSERVED_FILLED".to_string(),
+            p_fill_outcome: 1.0,
+        })
     }
 }
 

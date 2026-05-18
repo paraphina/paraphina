@@ -548,7 +548,8 @@ use super::super::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
 use super::super::types::{
     AccountEvent, AccountSnapshot, BalanceSnapshot, ExecutionEvent, FundingUpdate,
     LiquidationSnapshot, MarginSnapshot, MarketDataEvent, Phase51ForwardRefreshNativeRole,
-    Phase51ForwardRefreshSourceOwnerFill, PositionSnapshot, TopOfBook,
+    Phase51ForwardRefreshSourceOwnerFill, Phase51ForwardRefreshSourceOwnerPfillObservation,
+    PositionSnapshot, TopOfBook,
 };
 use super::lighter_nonce::{load_last_nonce, store_last_nonce, LighterNonceManager};
 use super::lighter_signer::{
@@ -2395,12 +2396,9 @@ impl LighterConnector {
     async fn phase51_account_all_trades_ws_once(&self) -> anyhow::Result<()> {
         let connect_timeout = lighter_ws_connect_timeout();
         let read_timeout = lighter_ws_read_timeout();
-        let account_index = self
-            .cfg
-            .account_index
-            .ok_or_else(|| {
-                anyhow::anyhow!("missing Lighter account index for Phase 5.1 source-owner stream")
-            })?;
+        let account_index = self.cfg.account_index.ok_or_else(|| {
+            anyhow::anyhow!("missing Lighter account index for Phase 5.1 source-owner stream")
+        })?;
 
         let (ws_stream, _) = with_timeout(
             connect_timeout,
@@ -2423,10 +2421,9 @@ impl LighterConnector {
 
         loop {
             let msg = match tokio::time::timeout(read_timeout, read.next()).await {
-                Ok(Some(msg)) => msg
-                    .map_err(|_| {
-                        anyhow::anyhow!("Lighter Phase 5.1 account_all_trades WS read error")
-                    })?,
+                Ok(Some(msg)) => msg.map_err(|_| {
+                    anyhow::anyhow!("Lighter Phase 5.1 account_all_trades WS read error")
+                })?,
                 Ok(None) => break,
                 Err(_) => {
                     anyhow::bail!("Lighter Phase 5.1 account_all_trades WS read timeout");
@@ -4771,6 +4768,124 @@ mod tests {
                     );
                     assert!(fill.phase51_target_key.is_none());
                     assert!(fill.phase51_lighter_native_limit.is_none());
+                    assert!(fill.phase51_source_owner_pfill_observation.is_none());
+                }
+                other => panic!("expected source-owner fill, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lighter_account_all_trades_populates_pfill_observation_only_from_explicit_fields() {
+        let text = serde_json::json!({
+            "type": "update/account_all_trades",
+            "channel": "account_all_trades/123",
+            "trades": [{
+                "timestamp": 1_700_000_123_466i64,
+                "side": "sell",
+                "price": "2100.50",
+                "size": "0.01",
+                "ask_id_str": "ask-order",
+                "ask_client_id_str": "ask-client",
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+                "is_maker_ask": true,
+            }]
+        })
+        .to_string();
+
+        let events = translate_phase51_account_all_trades_source_owner_events(
+            &text,
+            3,
+            "lighter",
+            Some(123),
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill) => {
+                let observation = fill
+                    .phase51_source_owner_pfill_observation
+                    .as_ref()
+                    .expect("explicit pfill observation");
+                assert_eq!(observation.source_event_type, "LIGHTER_TRADES_JSON");
+                assert_eq!(observation.side, Side::Sell);
+                assert!((observation.price - 2_100.5).abs() < 1e-9);
+                assert!((observation.size - 0.01).abs() < 1e-12);
+                assert_eq!(observation.event_time_ms, 1_700_000_123_466);
+                assert_eq!(observation.fill_count, 1);
+                assert_eq!(observation.outcome_status, "OBSERVED_FILLED");
+                assert_eq!(observation.p_fill_outcome, 1.0);
+            }
+            other => panic!("expected source-owner fill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lighter_account_all_trades_missing_or_mismatched_pfill_fields_leave_observation_none() {
+        for trade in [
+            serde_json::json!({
+                "timestamp": 1_700_000_123_467i64,
+                "price": "2100.50",
+                "size": "0.01",
+                "ask_id_str": "ask-order",
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+                "is_maker_ask": true,
+            }),
+            serde_json::json!({
+                "timestamp": 1_700_000_123_467i64,
+                "side": "sell",
+                "size": "0.01",
+                "ask_id_str": "ask-order",
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+                "is_maker_ask": true,
+            }),
+            serde_json::json!({
+                "timestamp": 1_700_000_123_467i64,
+                "side": "sell",
+                "price": "2100.50",
+                "ask_id_str": "ask-order",
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+                "is_maker_ask": true,
+            }),
+            serde_json::json!({
+                "side": "sell",
+                "price": "2100.50",
+                "size": "0.01",
+                "ask_id_str": "ask-order",
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+                "is_maker_ask": true,
+            }),
+            serde_json::json!({
+                "timestamp": 1_700_000_123_467i64,
+                "side": "buy",
+                "price": "2100.50",
+                "size": "0.01",
+                "ask_id_str": "ask-order",
+                "ask_account_id": 123_i64,
+                "bid_account_id": 456_i64,
+                "is_maker_ask": true,
+            }),
+        ] {
+            let text = serde_json::json!({
+                "type": "update/account_all_trades",
+                "channel": "account_all_trades/123",
+                "trades": [trade],
+            })
+            .to_string();
+            let events = translate_phase51_account_all_trades_source_owner_events(
+                &text,
+                3,
+                "lighter",
+                Some(123),
+            );
+            assert_eq!(events.len(), 1);
+            match &events[0] {
+                ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(fill) => {
+                    assert!(fill.phase51_source_owner_pfill_observation.is_none());
                 }
                 other => panic!("expected source-owner fill, got {other:?}"),
             }
@@ -4800,15 +4915,13 @@ mod tests {
             translate_private_events(&generic_fill, 3, "lighter", Some(123)).first(),
             Some(ExecutionEvent::Filled(_))
         ));
-        assert!(
-            translate_phase51_account_all_trades_source_owner_events(
-                &generic_fill,
-                3,
-                "lighter",
-                Some(123)
-            )
-            .is_empty()
-        );
+        assert!(translate_phase51_account_all_trades_source_owner_events(
+            &generic_fill,
+            3,
+            "lighter",
+            Some(123)
+        )
+        .is_empty());
 
         let account_all_trades = serde_json::json!({
             "type": "update/account_all_trades",
@@ -6607,20 +6720,29 @@ fn translate_account_all_trade(
         ask_account_id,
         bid_account_id,
     };
-    let timestamp_ms = phase51_lighter_i64_field(trade, "timestamp")
-        .or_else(|| phase51_lighter_i64_field(trade, "transaction_time"))
-        .unwrap_or(0);
+    let explicit_timestamp_ms = phase51_lighter_i64_field(trade, "timestamp")
+        .or_else(|| phase51_lighter_i64_field(trade, "transaction_time"));
+    let timestamp_ms = explicit_timestamp_ms.unwrap_or(0);
     let seq = phase51_lighter_source_owner_seq(timestamp_ms, trade_index);
+    let pfill_observation = phase51_lighter_source_owner_pfill_observation(
+        trade,
+        account_is_ask,
+        explicit_timestamp_ms,
+    );
+    let mut source_owner_fill = Phase51ForwardRefreshSourceOwnerFill::new(
+        venue_index,
+        venue_id,
+        seq,
+        timestamp_ms,
+        order_id,
+        client_order_id,
+        Some(native_role),
+    );
+    if let Some(observation) = pfill_observation {
+        source_owner_fill.set_phase51_source_owner_pfill_observation(observation);
+    }
     Some(ExecutionEvent::Phase51ForwardRefreshSourceOwnerFill(
-        Phase51ForwardRefreshSourceOwnerFill::new(
-            venue_index,
-            venue_id,
-            seq,
-            timestamp_ms,
-            order_id,
-            client_order_id,
-            Some(native_role),
-        ),
+        source_owner_fill,
     ))
 }
 
@@ -6651,6 +6773,38 @@ fn phase51_lighter_string_handle(value: &serde_json::Value, key: &str) -> Option
     raw.as_i64()
         .filter(|val| *val >= 0)
         .map(|val| val.to_string())
+}
+
+fn phase51_lighter_source_owner_pfill_observation(
+    trade: &serde_json::Value,
+    account_is_ask: bool,
+    explicit_timestamp_ms: Option<i64>,
+) -> Option<Phase51ForwardRefreshSourceOwnerPfillObservation> {
+    let side = parse_side(trade.get("side")?)?;
+    let expected_side = if account_is_ask {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    if side != expected_side {
+        return None;
+    }
+    let price = phase51_lighter_positive_f64_field(trade, "price")?;
+    let size = phase51_lighter_positive_f64_field(trade, "size")?;
+    Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
+        side,
+        price,
+        size,
+        explicit_timestamp_ms?,
+    )
+}
+
+fn phase51_lighter_positive_f64_field(value: &serde_json::Value, key: &str) -> Option<f64> {
+    let parsed = parse_f64_value(value.get(key)?)?;
+    parsed
+        .is_finite()
+        .then_some(parsed)
+        .filter(|val| *val > 0.0)
 }
 
 fn phase51_lighter_native_role_from_fill(
