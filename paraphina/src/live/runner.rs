@@ -1977,6 +1977,8 @@ fn phase51_lighter_native_role_apply_one_sided_canary_filter(
     let side_selection =
         phase51_lighter_native_role_one_sided_side().ok_or("invalid_one_sided_side")?;
     let mut place_indices = Vec::new();
+    let mut replace_count = 0usize;
+    let mut cancel_count = 0usize;
     for (idx, intent) in intents.iter().enumerate() {
         match intent {
             OrderIntent::Place(place) => {
@@ -2001,11 +2003,13 @@ fn phase51_lighter_native_role_apply_one_sided_canary_filter(
                 place_indices.push(idx);
             }
             OrderIntent::Cancel(cancel) => {
+                cancel_count = cancel_count.saturating_add(1);
                 if cancel.venue_id.as_ref() != "lighter" {
                     return Err("non_lighter_cancel");
                 }
             }
             OrderIntent::CancelAll(cancel_all) => {
+                cancel_count = cancel_count.saturating_add(1);
                 let Some(venue_id) = cancel_all.venue_id.as_ref() else {
                     return Err("broad_cancel_all_disabled");
                 };
@@ -2016,8 +2020,47 @@ fn phase51_lighter_native_role_apply_one_sided_canary_filter(
                     return Err("broad_cancel_all_disabled");
                 }
             }
-            OrderIntent::Replace(_) => return Err("replace_disabled"),
+            OrderIntent::Replace(replace) => {
+                replace_count = replace_count.saturating_add(1);
+                if replace.venue_id.as_ref() != "lighter" {
+                    return Err("non_lighter_replace");
+                }
+                if replace.purpose != OrderPurpose::Mm {
+                    return Err("non_mm_replace");
+                }
+                if replace.time_in_force != TimeInForce::Gtc {
+                    return Err("non_gtc_replace");
+                }
+                if !replace.post_only {
+                    return Err("non_post_only_replace");
+                }
+                if replace.reduce_only {
+                    return Err("reduce_only_replace");
+                }
+                if replace.phase51_target_key.is_none() {
+                    return Err("missing_phase51_target_key");
+                }
+                if let Phase51LighterNativeRoleOneSidedSide::Side(preferred_side) = side_selection {
+                    if replace.side != preferred_side {
+                        return Err("preferred_side_absent");
+                    }
+                }
+            }
         }
+    }
+
+    if replace_count > 0 {
+        if replace_count > 1 {
+            return Err("multiple_replaces_disabled");
+        }
+        if !place_indices.is_empty() {
+            return Err("replace_and_place_disabled");
+        }
+        if cancel_count > 0 {
+            return Err("cancel_and_replace_disabled");
+        }
+        intents.clear();
+        return Ok(());
     }
 
     if place_indices.is_empty() {
@@ -14774,6 +14817,23 @@ mod tests {
         })
     }
 
+    fn lighter_targeted_replace_intent(side: Side, suffix: &str) -> OrderIntent {
+        OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 0,
+            venue_id: "lighter".into(),
+            side,
+            price: 100.0,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "redacted-test-order".to_string(),
+            client_order_id: None,
+            phase51_target_key: Some(lighter_target_key(suffix)),
+        })
+    }
+
     fn lighter_cancel_intent() -> OrderIntent {
         OrderIntent::Cancel(CancelOrderIntent {
             venue_index: 0,
@@ -15255,7 +15315,69 @@ mod tests {
             ];
             assert_eq!(
                 phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
-                Err("replace_disabled")
+                Err("missing_phase51_target_key")
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_one_sided_canary_suppresses_safe_replace_as_noop() {
+        with_phase51_one_sided_native_role_canary_env("buy", || {
+            let mut intents = vec![lighter_targeted_replace_intent(Side::Buy, "bid")];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Ok(())
+            );
+            assert!(intents.is_empty());
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&intents),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_one_sided_canary_rejects_unsafe_replace_shapes() {
+        with_phase51_one_sided_native_role_canary_env("buy", || {
+            let mut intents = vec![lighter_replace_intent()];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Err("missing_phase51_target_key")
+            );
+
+            let mut wrong_side = vec![lighter_targeted_replace_intent(Side::Sell, "ask")];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut wrong_side),
+                Err("preferred_side_absent")
+            );
+
+            let mut non_lighter = lighter_targeted_replace_intent(Side::Buy, "bid");
+            if let OrderIntent::Replace(replace) = &mut non_lighter {
+                replace.venue_id = "aster".into();
+            }
+            let mut intents = vec![non_lighter];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Err("non_lighter_replace")
+            );
+
+            let mut non_post_only = lighter_targeted_replace_intent(Side::Buy, "bid");
+            if let OrderIntent::Replace(replace) = &mut non_post_only {
+                replace.post_only = false;
+            }
+            let mut intents = vec![non_post_only];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents),
+                Err("non_post_only_replace")
+            );
+
+            let mut mixed = vec![
+                lighter_targeted_replace_intent(Side::Buy, "bid"),
+                lighter_targeted_place_intent(Side::Buy, "bid-new"),
+            ];
+            assert_eq!(
+                phase51_lighter_native_role_apply_one_sided_canary_filter(&mut mixed),
+                Err("replace_and_place_disabled")
             );
         });
     }
