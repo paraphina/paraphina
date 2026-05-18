@@ -169,7 +169,18 @@ class TestPhase51amNonliveExecutiveOrchestrator(unittest.TestCase):
                 for line in (run_dir / "phase51am_route_decision_ledger.jsonl").read_text().splitlines()
                 if line.strip()
             ]
-            self.assertEqual({row["route"] for row in ledger}, {"forward_refresh", "validated_mapping", "direct_private_rows", "lighter_pressure"})
+            self.assertEqual(
+                {row["route"] for row in ledger},
+                {
+                    "scoped_source_owner_acceptance",
+                    "forward_refresh",
+                    "validated_mapping",
+                    "direct_private_rows",
+                    "lighter_pressure",
+                },
+            )
+            scoped_route = next(row for row in ledger if row["route"] == "scoped_source_owner_acceptance")
+            self.assertEqual(scoped_route["route_status"], "BLOCKED")
             forward_route = next(row for row in ledger if row["route"] == "forward_refresh")
             self.assertEqual(forward_route["route_status"], "BLOCKED")
             self.assertEqual(forward_route["fixture_candidate_count"], 1)
@@ -434,8 +445,9 @@ class TestPhase51amNonliveExecutiveOrchestrator(unittest.TestCase):
 
             run_dir = tmp_path / "phase51am_runs" / "phase51am_source_owner_scope_ready"
             summary = json.loads((run_dir / "phase51am_nonlive_executive_orchestrator_summary.json").read_text())
-            self.assertEqual(summary["control_status"], "AWAITING_SOURCE_OWNER_INPUT")
-            self.assertEqual(summary["selected_route"], "none")
+            self.assertEqual(summary["control_status"], "SCOPED_SOURCE_OWNER_ACCEPTANCE_READY")
+            self.assertEqual(summary["selected_route"], "scoped_source_owner_acceptance")
+            self.assertEqual(summary["ready_route_count"], 1)
             self.assertTrue(summary["source_owner_native_role_evidence_ready"])
             self.assertEqual(
                 summary["phase51_source_owner_blocker_status"],
@@ -450,7 +462,9 @@ class TestPhase51amNonliveExecutiveOrchestrator(unittest.TestCase):
                 for line in (run_dir / "phase51am_route_decision_ledger.jsonl").read_text().splitlines()
                 if line.strip()
             ]
-            self.assertNotIn("source_owner_native_role_scope", {row["route"] for row in ledger})
+            scoped_route = next(row for row in ledger if row["route"] == "scoped_source_owner_acceptance")
+            self.assertEqual(scoped_route["route_status"], "READY_TO_RECORD")
+            self.assertFalse(scoped_route["clears_phase51_blockers"])
 
     def test_compares_previous_phase51am_summary_for_continuous_optimization(self):
         script_dir = Path(__file__).resolve().parents[1]

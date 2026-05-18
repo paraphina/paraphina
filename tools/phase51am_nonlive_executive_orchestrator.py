@@ -85,6 +85,7 @@ RAW_IDENTIFIER_FIELDS = {
 }
 
 ROUTE_PRIORITY = [
+    "scoped_source_owner_acceptance",
     "forward_refresh",
     "validated_mapping",
     "direct_private_rows",
@@ -758,6 +759,45 @@ def _classify_forward_refresh(
     }
 
 
+def _classify_scoped_source_owner_acceptance(current_blocker: dict[str, Any]) -> dict[str, Any]:
+    if (
+        current_blocker.get("source_owner_native_role_evidence_ready") is True
+        and current_blocker.get("source_owner_native_role_ready_without_h_i") is True
+        and current_blocker.get("phase51_source_owner_blocker_status") == "SOURCE_OWNER_NATIVE_ROLE_READY_HI_DEFERRED"
+    ):
+        return {
+            "route": "scoped_source_owner_acceptance",
+            "route_status": "READY_TO_RECORD",
+            "rationale": (
+                "Phase 5.1ak already reports scoped source-owner/native-role readiness with H/I "
+                "deferred; record the scoped HOLD state instead of requesting more source-owner input"
+            ),
+            "next_required_action": (
+                current_blocker.get("source_owner_scope_next_required_action")
+                or "record_scoped_source_owner_native_role_acceptance_and_defer_h_i_calibration"
+            ),
+            "source_owner_native_role_evidence_ready": True,
+            "source_owner_native_role_ready_without_h_i": True,
+            "phase51_source_owner_blocker_status": current_blocker.get("phase51_source_owner_blocker_status"),
+            "lighter_pressure_unavailable_governance_accepted": current_blocker.get(
+                "lighter_pressure_unavailable_governance_accepted"
+            ),
+            "h_i_feature_matrix_deferred": current_blocker.get("h_i_feature_matrix_deferred"),
+            "phase51ak_summary_path": current_blocker.get("phase51ak_summary_path"),
+            "phase51ak_summary_sha256": current_blocker.get("phase51ak_summary_sha256"),
+            "clears_phase51_blockers": False,
+        }
+    return {
+        "route": "scoped_source_owner_acceptance",
+        "route_status": "BLOCKED",
+        "blocked_reason": "scoped_source_owner_acceptance_not_ready",
+        "rationale": "Phase 5.1ak has not reported scoped source-owner/native-role readiness",
+        "next_required_action": "continue_highest_priority_admissible_source_owner_route",
+        "source_owner_native_role_evidence_ready": current_blocker.get("source_owner_native_role_evidence_ready"),
+        "phase51_source_owner_blocker_status": current_blocker.get("phase51_source_owner_blocker_status"),
+    }
+
+
 def _classify_validated_mapping(
     repo_root: Path,
     mapping_paths: list[Path],
@@ -1090,6 +1130,53 @@ def _build_no_route_work_packets(current_blocker: dict[str, Any]) -> list[dict[s
 
 
 def _build_ready_route_packets(selected_route: dict[str, Any], current_blocker: dict[str, Any]) -> list[dict[str, Any]]:
+    if selected_route.get("route") == "scoped_source_owner_acceptance":
+        return [
+            {
+                "packet": "phase51am_record_scoped_source_owner_acceptance",
+                "lane": "Systems Implementer",
+                "priority": 1,
+                "status": "READY_TO_DISPATCH",
+                "mission": "Record the selected HOLD-only scoped source-owner acceptance route.",
+                "prompt": (
+                    f"{_current_counts_text(current_blocker)} Record scoped source-owner/native-role "
+                    "readiness with H/I deferred. Do not request more source-owner rows for this scoped "
+                    "lane, and do not claim global Phase 5.1 clearance."
+                ),
+                "command_template": None,
+                "acceptance_checks": [
+                    "source_owner_native_role_evidence_ready is true",
+                    "phase51_source_owner_blocker_status is SOURCE_OWNER_NATIVE_ROLE_READY_HI_DEFERRED",
+                    "clears_phase51_blockers remains false",
+                    "all live/canary/capital/risk flags remain false",
+                ],
+                "stop_conditions": [
+                    "global clearance is claimed",
+                    "pressure_unavailable is treated as pressure_complete",
+                    "H/I model-training or live/capital approval is implied",
+                ],
+            },
+            {
+                "packet": "phase51am_scoped_acceptance_audit",
+                "lane": "Independent Auditor",
+                "priority": 2,
+                "status": "READY_TO_DISPATCH",
+                "mission": "Audit that scoped source-owner acceptance is not global clearance.",
+                "prompt": (
+                    "Confirm the Phase 5.1am scoped source-owner route records readiness without "
+                    "setting blocker-cleared, live, model, EV, capital, or pressure-complete claims."
+                ),
+                "acceptance_checks": [
+                    "selected route is scoped_source_owner_acceptance",
+                    "H/I remains deferred or HOLD-only",
+                    "global Phase 5.1 status remains HOLD",
+                ],
+                "stop_conditions": [
+                    "artifact contains blocker_cleared=true or clears_phase51_blockers=true",
+                    "artifact requests additional historical backfill",
+                ],
+            },
+        ]
     return [
         {
             "packet": "phase51am_execute_selected_route",
@@ -1413,6 +1500,7 @@ def build_nonlive_executive_orchestrator(
         label="Phase 5.1al summary",
     )
     route_decisions = [
+        _classify_scoped_source_owner_acceptance(current_blocker),
         _classify_forward_refresh(repo_root, phase51al_records),
         _classify_validated_mapping(repo_root, validated_mappings, current_blocker),
         _classify_direct_private_rows(repo_root, phase51aj_source_specs, current_blocker),
@@ -1462,7 +1550,13 @@ def build_nonlive_executive_orchestrator(
 
     ready_route_count = len([decision for decision in route_decisions if str(decision.get("route_status", "")).startswith("READY")])
     selected_route_name = selected_route["route"] if selected_route is not None else "none"
-    control_status = "READY_TO_EXECUTE_SELECTED_ROUTE" if selected_route is not None else "AWAITING_SOURCE_OWNER_INPUT"
+    control_status = (
+        "SCOPED_SOURCE_OWNER_ACCEPTANCE_READY"
+        if selected_route_name == "scoped_source_owner_acceptance"
+        else "READY_TO_EXECUTE_SELECTED_ROUTE"
+        if selected_route is not None
+        else "AWAITING_SOURCE_OWNER_INPUT"
+    )
     gate_reason = (
         f"phase51am_{selected_route_name}_route_ready_nonlive_hold"
         if selected_route is not None
