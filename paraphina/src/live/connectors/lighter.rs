@@ -4782,7 +4782,6 @@ mod tests {
             "channel": "account_all_trades/123",
             "trades": [{
                 "timestamp": 1_700_000_123_466i64,
-                "side": "sell",
                 "price": "2100.50",
                 "size": "0.01",
                 "ask_id_str": "ask-order",
@@ -4823,15 +4822,6 @@ mod tests {
     #[test]
     fn lighter_account_all_trades_missing_or_mismatched_pfill_fields_leave_observation_none() {
         for trade in [
-            serde_json::json!({
-                "timestamp": 1_700_000_123_467i64,
-                "price": "2100.50",
-                "size": "0.01",
-                "ask_id_str": "ask-order",
-                "ask_account_id": 123_i64,
-                "bid_account_id": 456_i64,
-                "is_maker_ask": true,
-            }),
             serde_json::json!({
                 "timestamp": 1_700_000_123_467i64,
                 "side": "sell",
@@ -6780,19 +6770,20 @@ fn phase51_lighter_source_owner_pfill_observation(
     account_is_ask: bool,
     explicit_timestamp_ms: Option<i64>,
 ) -> Option<Phase51ForwardRefreshSourceOwnerPfillObservation> {
-    let side = parse_side(trade.get("side")?)?;
     let expected_side = if account_is_ask {
         Side::Sell
     } else {
         Side::Buy
     };
-    if side != expected_side {
-        return None;
+    if let Some(side_value) = trade.get("side") {
+        if parse_side(side_value)? != expected_side {
+            return None;
+        }
     }
     let price = phase51_lighter_positive_f64_field(trade, "price")?;
     let size = phase51_lighter_positive_f64_field(trade, "size")?;
     Phase51ForwardRefreshSourceOwnerPfillObservation::lighter_trade_observed_fill(
-        side,
+        expected_side,
         price,
         size,
         explicit_timestamp_ms?,

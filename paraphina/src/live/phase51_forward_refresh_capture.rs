@@ -920,7 +920,7 @@ fn source_owner_pfill_observation_payload(
     );
     payload.insert(
         "observed_side_source".to_string(),
-        json!("LIGHTER_TRADES_JSON.side"),
+        json!("LIGHTER_TRADES_JSON.account_side"),
     );
     payload.insert(
         "observed_price_size_source".to_string(),

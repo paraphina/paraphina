@@ -748,6 +748,10 @@ fn source_owner_fill_with_explicit_pfill_observation_emits_separate_sanitized_si
         Some("lighter.account_index.is_maker_ask.ask_account_id.bid_account_id")
     );
     assert_eq!(
+        row.get("observed_side_source").and_then(Value::as_str),
+        Some("LIGHTER_TRADES_JSON.account_side")
+    );
+    assert_eq!(
         row.get("source_link_inference_allowed")
             .and_then(Value::as_bool),
         Some(false)
