@@ -1,9 +1,9 @@
-//! Shadow-only V2 arbitrage-aware decision skeleton.
+//! V2 arbitrage-aware decision evidence and paper-only admission skeleton.
 //!
-//! This module is intentionally read-only with respect to order flow. It
-//! extracts deterministic candidates from baseline MM quotes, records pair-edge
-//! features, and emits HOLD-only shadow evidence. It must not construct or
-//! mutate order intents.
+//! Shadow mode is intentionally read-only with respect to order flow. The
+//! paper-admission tranche may only filter existing baseline MM order-creating
+//! intents behind explicit gates. It must not construct prices, sizes, client
+//! IDs, raw order IDs, venue handles, or live transport requests.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -16,6 +16,7 @@ use crate::mm::{MmLevel, MmQuote};
 use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs};
 
 const V2_SHADOW_SCHEMA_VERSION: u32 = 1;
+const V2_ADMISSION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum V2ShadowAdmissionStatus {
@@ -99,6 +100,73 @@ pub struct V2ShadowDecision {
     pub pair_edges: Vec<V2PairEdgeSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct V2AdmissionGateState {
+    pub enabled: bool,
+    pub decision_mode_is_paper_admission: bool,
+    pub execution_mode_is_paper: bool,
+    pub pair_edge_enabled: bool,
+    pub pair_conditioned_admission_enabled: bool,
+    pub order_intent_enabled: bool,
+    pub fast_hedge_disabled: bool,
+    pub require_phase51_gate: bool,
+}
+
+impl V2AdmissionGateState {
+    fn satisfied(&self) -> bool {
+        self.enabled
+            && self.decision_mode_is_paper_admission
+            && self.execution_mode_is_paper
+            && self.pair_edge_enabled
+            && self.pair_conditioned_admission_enabled
+            && self.order_intent_enabled
+            && self.fast_hedge_disabled
+            && self.require_phase51_gate
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct V2AdmittedCandidate {
+    pub candidate_id: String,
+    pub venue_index: usize,
+    pub venue_id: String,
+    pub side: Side,
+    pub rank_index: usize,
+    pub rank_score_microusd: i64,
+    pub pair_edge_feature_usd: Option<f64>,
+    pub pair_edge_feature_bps: Option<f64>,
+    pub reference_candidate_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct V2AdmissionDecision {
+    pub event_type: &'static str,
+    pub schema_version: u32,
+    pub telemetry_schema_version: u32,
+    pub now_ms: TimestampMs,
+    pub decision_mode: &'static str,
+    pub execution_mode: String,
+    pub authority_scope: &'static str,
+    pub admission_status: &'static str,
+    pub admission_reason: &'static str,
+    pub can_filter_existing_intents: bool,
+    pub can_create_new_intents: bool,
+    pub can_mutate_live_orders: bool,
+    pub order_intent_output_count: usize,
+    pub baseline_plan_intent_count: usize,
+    pub baseline_mm_order_creating_intent_count: usize,
+    pub suppressed_mm_order_creating_intent_count: usize,
+    pub pair_edge_is_admission: bool,
+    pub pressure_complete_claim: bool,
+    pub blocker_cleared: bool,
+    pub gate_state: V2AdmissionGateState,
+    pub ranking_schema_version: u32,
+    pub ranking_feature_only: bool,
+    pub ranking_is_admission: bool,
+    pub pair_edges: Vec<V2PairEdgeSnapshot>,
+    pub admitted_candidates: Vec<V2AdmittedCandidate>,
+}
+
 #[derive(Debug)]
 pub struct V2ShadowError {
     reason: String,
@@ -128,6 +196,26 @@ pub fn v2_shadow_active(config: &V2ShadowConfig) -> bool {
     config.enabled && matches!(config.decision_mode, V2DecisionMode::Shadow)
 }
 
+pub fn v2_paper_admission_mode_requested(config: &V2ShadowConfig) -> bool {
+    config.enabled && matches!(config.decision_mode, V2DecisionMode::PaperAdmission)
+}
+
+fn admission_gate_state(config: &V2ShadowConfig, execution_mode: &str) -> V2AdmissionGateState {
+    V2AdmissionGateState {
+        enabled: config.enabled,
+        decision_mode_is_paper_admission: matches!(
+            config.decision_mode,
+            V2DecisionMode::PaperAdmission
+        ),
+        execution_mode_is_paper: execution_mode == "paper",
+        pair_edge_enabled: config.pair_edge_enabled,
+        pair_conditioned_admission_enabled: config.pair_conditioned_admission_enabled,
+        order_intent_enabled: config.order_intent_enabled,
+        fast_hedge_disabled: !config.fast_hedge_enabled,
+        require_phase51_gate: config.require_phase51_gate,
+    }
+}
+
 pub fn evaluate_shadow_decision(
     config: &V2ShadowConfig,
     now_ms: TimestampMs,
@@ -143,7 +231,7 @@ pub fn evaluate_shadow_decision(
     }
     let candidate_rankings = rank_shadow_candidates(&candidates);
     let pair_edges = if config.pair_edge_enabled {
-        vec![build_pair_edge_snapshot(&candidates)]
+        vec![build_pair_edge_snapshot(&candidates, true)]
     } else {
         Vec::new()
     };
@@ -175,6 +263,169 @@ pub fn evaluate_shadow_decision(
         candidate_rankings,
         pair_edges,
     })
+}
+
+pub fn evaluate_paper_admission_decision(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    baseline_plan_intents: &[OrderIntent],
+) -> Option<V2AdmissionDecision> {
+    if !v2_paper_admission_mode_requested(config) {
+        return None;
+    }
+
+    let gate_state = admission_gate_state(config, execution_mode);
+    let candidates = extract_shadow_candidates_from_intents(baseline_plan_intents);
+    let rankings = rank_shadow_candidates(&candidates);
+    let pair_edges = if config.pair_edge_enabled {
+        vec![build_pair_edge_snapshot(&candidates, false)]
+    } else {
+        Vec::new()
+    };
+    let positive_pair_edge = pair_edges
+        .first()
+        .and_then(|edge| edge.edge_usd)
+        .is_some_and(|edge| edge > 0.0);
+
+    let admitted_candidates = if gate_state.satisfied() && positive_pair_edge {
+        rankings
+            .iter()
+            .filter(|ranking| ranking.rank_status == "scored" && ranking.rank_score_microusd > 0)
+            .filter_map(|ranking| {
+                let candidate = candidates
+                    .iter()
+                    .find(|candidate| candidate.candidate_id == ranking.candidate_id)?;
+                Some(V2AdmittedCandidate {
+                    candidate_id: ranking.candidate_id.clone(),
+                    venue_index: candidate.venue_index,
+                    venue_id: candidate.venue_id.clone(),
+                    side: candidate.side,
+                    rank_index: ranking.rank_index,
+                    rank_score_microusd: ranking.rank_score_microusd,
+                    pair_edge_feature_usd: ranking.pair_edge_feature_usd,
+                    pair_edge_feature_bps: ranking.pair_edge_feature_bps,
+                    reference_candidate_id: ranking.reference_candidate_id.clone(),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let baseline_mm_count = count_baseline_mm_order_creating_intents(baseline_plan_intents);
+    let gate_satisfied = gate_state.satisfied();
+    let admission_reason = if !gate_satisfied {
+        "paper_admission_gate_not_satisfied"
+    } else if !positive_pair_edge {
+        "no_positive_pair_edge"
+    } else if admitted_candidates.is_empty() {
+        "no_admitted_candidates"
+    } else {
+        "paper_positive_pair_edge_ranked_admission"
+    };
+    let output_count = admitted_candidates.len();
+    let suppressed_count = if gate_satisfied {
+        baseline_mm_count.saturating_sub(output_count)
+    } else {
+        0
+    };
+    Some(V2AdmissionDecision {
+        event_type: "V2_ADMISSION_DECISION",
+        schema_version: V2_ADMISSION_SCHEMA_VERSION,
+        telemetry_schema_version: config.telemetry_schema_version,
+        now_ms,
+        decision_mode: config.decision_mode.as_str(),
+        execution_mode: execution_mode.to_string(),
+        authority_scope: "paper_only",
+        admission_status: if output_count > 0 { "ADMITTED" } else { "HOLD" },
+        admission_reason,
+        can_filter_existing_intents: gate_satisfied,
+        can_create_new_intents: false,
+        can_mutate_live_orders: false,
+        order_intent_output_count: output_count,
+        baseline_plan_intent_count: baseline_plan_intents.len(),
+        baseline_mm_order_creating_intent_count: baseline_mm_count,
+        suppressed_mm_order_creating_intent_count: suppressed_count,
+        pair_edge_is_admission: gate_satisfied && positive_pair_edge,
+        pressure_complete_claim: false,
+        blocker_cleared: false,
+        gate_state,
+        ranking_schema_version: 1,
+        ranking_feature_only: false,
+        ranking_is_admission: gate_satisfied && positive_pair_edge,
+        pair_edges,
+        admitted_candidates,
+    })
+}
+
+pub fn emit_paper_admission_decision(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    baseline_plan_intents: &[OrderIntent],
+) -> Result<Option<V2AdmissionDecision>, V2ShadowError> {
+    let Some(decision) =
+        evaluate_paper_admission_decision(config, execution_mode, now_ms, baseline_plan_intents)
+    else {
+        return Ok(None);
+    };
+    append_json_line(Path::new(&config.output_path), &decision)?;
+    Ok(Some(decision))
+}
+
+pub fn apply_paper_admission_filter(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    intents: &mut Vec<OrderIntent>,
+) -> Result<Option<V2AdmissionDecision>, V2ShadowError> {
+    let Some(decision) = emit_paper_admission_decision(config, execution_mode, now_ms, intents)?
+    else {
+        return Ok(None);
+    };
+    if !decision.gate_state.satisfied() {
+        return Ok(Some(decision));
+    }
+
+    let admitted = decision
+        .admitted_candidates
+        .iter()
+        .map(|candidate| candidate.candidate_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut idx = 0usize;
+    intents.retain(|intent| {
+        let keep = match intent {
+            OrderIntent::Place(place) if place.purpose == OrderPurpose::Mm => admitted.contains(
+                format!(
+                    "v2_shadow_intent_v1:{}:{}:{}:{}",
+                    place.venue_index,
+                    place.venue_id,
+                    place.side.as_v2_str(),
+                    idx
+                )
+                .as_str(),
+            ),
+            OrderIntent::Replace(replace) if replace.purpose == OrderPurpose::Mm => admitted
+                .contains(
+                    format!(
+                        "v2_shadow_intent_v1:{}:{}:{}:{}",
+                        replace.venue_index,
+                        replace.venue_id,
+                        replace.side.as_v2_str(),
+                        idx
+                    )
+                    .as_str(),
+                ),
+            OrderIntent::Place(_)
+            | OrderIntent::Replace(_)
+            | OrderIntent::Cancel(_)
+            | OrderIntent::CancelAll(_) => true,
+        };
+        idx += 1;
+        keep
+    });
+    Ok(Some(decision))
 }
 
 pub fn emit_shadow_decision(
@@ -390,10 +641,17 @@ fn best_same_side_reference<'a>(
 }
 
 fn status_sort_key(status: &str) -> u8 {
-    if status == "scored" { 0 } else { 1 }
+    if status == "scored" {
+        0
+    } else {
+        1
+    }
 }
 
-fn build_pair_edge_snapshot(candidates: &[V2ShadowCandidate]) -> V2PairEdgeSnapshot {
+fn build_pair_edge_snapshot(
+    candidates: &[V2ShadowCandidate],
+    feature_only: bool,
+) -> V2PairEdgeSnapshot {
     let best_bid = candidates
         .iter()
         .filter(|candidate| candidate.side == Side::Buy && candidate.price.is_finite())
@@ -410,7 +668,7 @@ fn build_pair_edge_snapshot(candidates: &[V2ShadowCandidate]) -> V2PairEdgeSnaps
             ask_candidate_id: best_ask.map(|candidate| candidate.candidate_id.clone()),
             edge_usd: None,
             edge_bps: None,
-            feature_only: true,
+            feature_only,
             invalid_reason: Some("missing_bid"),
         };
     };
@@ -421,7 +679,7 @@ fn build_pair_edge_snapshot(candidates: &[V2ShadowCandidate]) -> V2PairEdgeSnaps
             ask_candidate_id: None,
             edge_usd: None,
             edge_bps: None,
-            feature_only: true,
+            feature_only,
             invalid_reason: Some("missing_ask"),
         };
     };
@@ -436,12 +694,16 @@ fn build_pair_edge_snapshot(candidates: &[V2ShadowCandidate]) -> V2PairEdgeSnaps
         ask_candidate_id: Some(ask.candidate_id.clone()),
         edge_usd: Some(edge_usd),
         edge_bps,
-        feature_only: true,
+        feature_only,
         invalid_reason: None,
     }
 }
 
 fn append_shadow_decision(path: &Path, decision: &V2ShadowDecision) -> Result<(), V2ShadowError> {
+    append_json_line(path, decision)
+}
+
+fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), V2ShadowError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             V2ShadowError::new(format!("failed_to_create_v2_shadow_parent: {err}"))
@@ -452,7 +714,7 @@ fn append_shadow_decision(path: &Path, decision: &V2ShadowDecision) -> Result<()
         .append(true)
         .open(path)
         .map_err(|err| V2ShadowError::new(format!("failed_to_open_v2_shadow_output: {err}")))?;
-    serde_json::to_writer(&mut file, decision)
+    serde_json::to_writer(&mut file, value)
         .map_err(|err| V2ShadowError::new(format!("failed_to_serialize_v2_shadow: {err}")))?;
     file.write_all(b"\n")
         .map_err(|err| V2ShadowError::new(format!("failed_to_append_v2_shadow_newline: {err}")))?;
@@ -547,6 +809,37 @@ mod tests {
         }
     }
 
+    fn paper_admission_config() -> V2ShadowConfig {
+        V2ShadowConfig {
+            enabled: true,
+            decision_mode: V2DecisionMode::PaperAdmission,
+            pair_edge_enabled: true,
+            pair_conditioned_admission_enabled: true,
+            order_intent_enabled: true,
+            require_phase51_gate: true,
+            ..V2ShadowConfig::default()
+        }
+    }
+
+    fn mm_place(venue_index: usize, venue_id: &'static str, side: Side, price: f64) -> OrderIntent {
+        OrderIntent::Place(crate::types::PlaceOrderIntent {
+            venue_index,
+            venue_id: Arc::from(venue_id),
+            side,
+            price,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            client_order_id: Some("raw-client-id-must-not-emit".to_string()),
+            phase51_target_key: Some(crate::types::Phase51ForwardRefreshTargetKey {
+                canonical_group_id: "raw-group-must-not-emit".to_string(),
+                order_key: "raw-order-must-not-emit".to_string(),
+            }),
+        })
+    }
+
     #[test]
     fn v2_shadow_inactive_by_default() {
         let config = V2ShadowConfig::default();
@@ -613,9 +906,14 @@ mod tests {
         );
         assert_eq!(decision.candidate_rankings[0].rank_index, 1);
         assert_eq!(decision.candidate_rankings[0].rank_status, "scored");
-        assert_eq!(decision.candidate_rankings[0].rank_score_microusd, 10_000_000);
         assert_eq!(
-            decision.candidate_rankings[0].reference_candidate_id.as_deref(),
+            decision.candidate_rankings[0].rank_score_microusd,
+            10_000_000
+        );
+        assert_eq!(
+            decision.candidate_rankings[0]
+                .reference_candidate_id
+                .as_deref(),
             Some("v2_shadow_v1:1:hyperliquid:buy")
         );
         assert!(decision.candidate_rankings[0].feature_only);
@@ -726,5 +1024,114 @@ mod tests {
         assert!(!serialized.contains("raw-order-id-must-not-emit"));
         assert!(!serialized.contains("raw-group-must-not-emit"));
         assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_paper_admission_filters_existing_mm_intents_only() {
+        let config = paper_admission_config();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+            mm_place(2, "aster", Side::Sell, 98.0),
+            mm_place(3, "lighter", Side::Sell, 105.0),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 4,
+                venue_id: Arc::from("paradex"),
+                order_id: "raw-cancel-order-id-must-not-emit".to_string(),
+            }),
+        ];
+
+        let decision =
+            apply_paper_admission_filter(&config, "paper", 4_000, &mut intents).expect("filter");
+        let decision = decision.expect("decision");
+
+        assert_eq!(decision.event_type, "V2_ADMISSION_DECISION");
+        assert_eq!(decision.authority_scope, "paper_only");
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert!(decision.can_filter_existing_intents);
+        assert!(!decision.can_create_new_intents);
+        assert!(!decision.can_mutate_live_orders);
+        assert!(decision.pair_edge_is_admission);
+        assert!(decision.ranking_is_admission);
+        assert!(!decision.ranking_feature_only);
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+        assert_eq!(decision.baseline_mm_order_creating_intent_count, 4);
+        assert_eq!(decision.order_intent_output_count, 2);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 2);
+        assert_eq!(intents.len(), 3, "two MM intents plus cancel retained");
+        assert!(
+            matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "extended" && place.side == Side::Buy)
+        );
+        assert!(
+            matches!(&intents[1], OrderIntent::Place(place) if place.venue_id.as_ref() == "lighter" && place.side == Side::Sell)
+        );
+        assert!(matches!(&intents[2], OrderIntent::Cancel(_)));
+
+        let serialized = serde_json::to_string(&decision).expect("serialize");
+        assert!(!serialized.contains("raw-client-id-must-not-emit"));
+        assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
+        assert!(!serialized.contains("raw-group-must-not-emit"));
+        assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_paper_admission_missing_gate_holds_without_filtering() {
+        let mut config = paper_admission_config();
+        config.order_intent_enabled = false;
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+        ];
+
+        let decision =
+            apply_paper_admission_filter(&config, "paper", 4_000, &mut intents).expect("filter");
+        let decision = decision.expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(
+            decision.admission_reason,
+            "paper_admission_gate_not_satisfied"
+        );
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 0);
+        assert!(!decision.gate_state.satisfied());
+        assert_eq!(
+            intents.len(),
+            2,
+            "missing gate must not grant filtering authority"
+        );
+    }
+
+    #[test]
+    fn v2_paper_admission_negative_pair_edge_suppresses_mm_intents() {
+        let config = paper_admission_config();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Sell, 101.0),
+        ];
+
+        let decision =
+            apply_paper_admission_filter(&config, "paper", 4_000, &mut intents).expect("filter");
+        let decision = decision.expect("decision");
+
+        assert!(decision.gate_state.satisfied());
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.admission_reason, "no_positive_pair_edge");
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 2);
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn v2_paper_admission_inactive_outside_paper_admission_mode() {
+        let config = shadow_config();
+        let mut intents = vec![mm_place(0, "extended", Side::Buy, 99.0)];
+
+        let decision =
+            apply_paper_admission_filter(&config, "paper", 4_000, &mut intents).expect("filter");
+
+        assert!(decision.is_none());
+        assert_eq!(intents.len(), 1);
     }
 }

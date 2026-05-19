@@ -5865,6 +5865,23 @@ pub async fn run_live_loop(
                 intents.clear();
             }
         }
+        let v2_execution_mode = hooks
+            .as_ref()
+            .and_then(|hooks| hooks.telemetry.as_ref())
+            .map(|telemetry| telemetry.execution_mode)
+            .unwrap_or("unknown");
+        if let Err(err) = crate::v2::apply_paper_admission_filter(
+            &cfg.v2_shadow,
+            v2_execution_mode,
+            now_ms,
+            &mut intents,
+        ) {
+            eprintln!(
+                "[v2] paper admission filter failed reason={}",
+                err.sanitized_reason()
+            );
+            intents.clear();
+        }
         if let Err(err) =
             crate::v2::emit_shadow_decision(&cfg.v2_shadow, now_ms, &mm_quotes, &intents)
         {
