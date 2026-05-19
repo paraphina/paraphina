@@ -163,13 +163,14 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             with self.assertRaises(validator.V2AuthorityValidationError):
                 validator.validate_v2_authority_decisions(evidence)
 
-    def test_rejects_admitted_row_without_positive_pair_edge(self):
+    def test_accepts_ranked_admission_without_positive_pair_edge(self):
         with tempfile.TemporaryDirectory() as tmp:
             row = admitted_row()
             row["pair_edges"][0]["edge_usd"] = 0.0
+            row["pair_edge_is_admission"] = False
             evidence = write_rows(Path(tmp), [row])
-            with self.assertRaises(validator.V2AuthorityValidationError):
-                validator.validate_v2_authority_decisions(evidence)
+            summary = validator.validate_v2_authority_decisions(evidence)
+            self.assertEqual(summary.admitted_rows, 1)
 
     def test_rejects_manifest_artifact_outside_manifest_root(self):
         with tempfile.TemporaryDirectory() as tmp:

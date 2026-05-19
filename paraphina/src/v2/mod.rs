@@ -288,7 +288,7 @@ pub fn evaluate_paper_admission_decision(
         .and_then(|edge| edge.edge_usd)
         .is_some_and(|edge| edge > 0.0);
 
-    let admitted_candidates = if gate_state.satisfied() && positive_pair_edge {
+    let admitted_candidates = if gate_state.satisfied() {
         rankings
             .iter()
             .filter(|ranking| ranking.rank_status == "scored" && ranking.rank_score_microusd > 0)
@@ -315,14 +315,15 @@ pub fn evaluate_paper_admission_decision(
 
     let baseline_mm_count = count_baseline_mm_order_creating_intents(baseline_plan_intents);
     let gate_satisfied = gate_state.satisfied();
+    let has_admitted_candidates = !admitted_candidates.is_empty();
     let admission_reason = if !gate_satisfied {
         "paper_admission_gate_not_satisfied"
-    } else if !positive_pair_edge {
-        "no_positive_pair_edge"
-    } else if admitted_candidates.is_empty() {
-        "no_admitted_candidates"
-    } else {
+    } else if !has_admitted_candidates {
+        "no_positive_ranked_candidates"
+    } else if positive_pair_edge {
         "paper_positive_pair_edge_ranked_admission"
+    } else {
+        "paper_positive_ranked_admission"
     };
     let output_count = admitted_candidates.len();
     let admitted = output_count > 0;
@@ -348,7 +349,7 @@ pub fn evaluate_paper_admission_decision(
         baseline_plan_intent_count: baseline_plan_intents.len(),
         baseline_mm_order_creating_intent_count: baseline_mm_count,
         suppressed_mm_order_creating_intent_count: suppressed_count,
-        pair_edge_is_admission: admitted,
+        pair_edge_is_admission: admitted && positive_pair_edge,
         pressure_complete_claim: false,
         blocker_cleared: false,
         gate_state,
@@ -1130,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_paper_admission_negative_pair_edge_suppresses_mm_intents() {
+    fn v2_paper_admission_without_positive_ranked_candidates_suppresses_mm_intents() {
         let config = paper_admission_config();
         let mut intents = vec![
             mm_place(0, "extended", Side::Buy, 99.0),
@@ -1143,10 +1144,35 @@ mod tests {
 
         assert!(decision.gate_state.satisfied());
         assert_eq!(decision.admission_status, "HOLD");
-        assert_eq!(decision.admission_reason, "no_positive_pair_edge");
+        assert_eq!(decision.admission_reason, "no_positive_ranked_candidates");
         assert_eq!(decision.order_intent_output_count, 0);
         assert_eq!(decision.suppressed_mm_order_creating_intent_count, 2);
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn v2_paper_admission_allows_ranked_admission_without_positive_pair_edge() {
+        let config = paper_admission_config();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+        ];
+
+        let decision =
+            apply_paper_admission_filter(&config, "paper", 4_000, &mut intents).expect("filter");
+        let decision = decision.expect("decision");
+
+        assert!(decision.gate_state.satisfied());
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert_eq!(decision.admission_reason, "paper_positive_ranked_admission");
+        assert!(!decision.pair_edge_is_admission);
+        assert!(decision.ranking_is_admission);
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 1);
+        assert_eq!(intents.len(), 1);
+        assert!(
+            matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "extended" && place.side == Side::Buy)
+        );
     }
 
     #[test]

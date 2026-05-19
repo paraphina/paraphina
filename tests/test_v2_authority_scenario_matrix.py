@@ -18,10 +18,29 @@ class TestV2AuthorityScenarioMatrix(unittest.TestCase):
         )
         hold_reasons = {row["admission_reason"] for row in rows[1:]}
         self.assertIn("paper_admission_gate_not_satisfied", hold_reasons)
-        self.assertIn("no_positive_pair_edge", hold_reasons)
         self.assertIn("missing_bid", hold_reasons)
         self.assertIn("missing_ask", hold_reasons)
-        self.assertIn("no_admitted_candidates", hold_reasons)
+        self.assertIn("no_positive_ranked_candidates", hold_reasons)
+        ranked_admission_rows = [
+            row
+            for row in rows
+            if row["admission_reason"] == "paper_positive_ranked_admission"
+        ]
+        self.assertEqual(len(ranked_admission_rows), 1)
+        self.assertEqual(ranked_admission_rows[0]["admission_status"], "ADMITTED")
+        self.assertFalse(ranked_admission_rows[0]["pair_edge_is_admission"])
+        self.assertTrue(ranked_admission_rows[0]["ranking_is_admission"])
+        no_positive_rank_rows = [
+            row
+            for row in rows
+            if row["admission_reason"] == "no_positive_ranked_candidates"
+        ]
+        self.assertEqual(len(no_positive_rank_rows), 1)
+        self.assertEqual(no_positive_rank_rows[0]["admission_status"], "HOLD")
+        self.assertEqual(no_positive_rank_rows[0]["order_intent_output_count"], 0)
+        self.assertFalse(no_positive_rank_rows[0]["pair_edge_is_admission"])
+        self.assertFalse(no_positive_rank_rows[0]["ranking_is_admission"])
+        self.assertEqual(no_positive_rank_rows[0]["admitted_candidates"], [])
 
     def test_matrix_output_validates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -32,7 +51,7 @@ class TestV2AuthorityScenarioMatrix(unittest.TestCase):
             summary = validator.validate_v2_authority_decisions(evidence)
             validator.write_manifest(evidence, manifest, summary)
             self.assertTrue(manifest.exists())
-            self.assertEqual(summary.admitted_rows, 1)
+            self.assertEqual(summary.admitted_rows, 2)
             self.assertGreater(summary.hold_rows, 0)
 
 

@@ -176,18 +176,18 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
         "can_filter_existing_intents must match satisfied gate state",
     )
     if row.get("admission_status") == "ADMITTED":
-        _require(row.get("pair_edge_is_admission") is True, line, "ADMITTED row must use pair edge as admission")
         _require(row.get("ranking_is_admission") is True, line, "ADMITTED row must use ranking as admission")
-        _require(
-            any(
-                isinstance(edge, dict)
-                and isinstance(edge.get("edge_usd"), (int, float))
-                and edge["edge_usd"] > 0
-                for edge in row.get("pair_edges", [])
-            ),
-            line,
-            "ADMITTED row must include a positive pair edge",
-        )
+        if row.get("pair_edge_is_admission") is True:
+            _require(
+                any(
+                    isinstance(edge, dict)
+                    and isinstance(edge.get("edge_usd"), (int, float))
+                    and edge["edge_usd"] > 0
+                    for edge in row.get("pair_edges", [])
+                ),
+                line,
+                "pair_edge_is_admission requires a positive pair edge",
+            )
     else:
         _require(row.get("order_intent_output_count") == 0, line, "HOLD row must output zero intents")
         _require(row.get("pair_edge_is_admission") is False, line, "HOLD row must not use pair edge as admission")

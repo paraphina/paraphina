@@ -103,15 +103,10 @@ def build_matrix() -> list[dict[str, Any]]:
         row["admitted_candidates"] = []
         rows.append(row)
     row = _admitted_row()
-    row["scenario_id"] = "negative_pair_edge"
-    row["admission_status"] = "HOLD"
-    row["admission_reason"] = "no_positive_pair_edge"
-    row["order_intent_output_count"] = 0
-    row["suppressed_mm_order_creating_intent_count"] = row["baseline_mm_order_creating_intent_count"]
+    row["scenario_id"] = "negative_pair_edge_positive_ranked_admission"
+    row["admission_reason"] = "paper_positive_ranked_admission"
     row["pair_edge_is_admission"] = False
-    row["ranking_is_admission"] = False
     row["pair_edges"][0]["edge_usd"] = -1.0
-    row["admitted_candidates"] = []
     rows.append(row)
     for scenario_id, invalid_reason, bid, ask in [
         ("missing_bid", "missing_bid", None, "v2_shadow_intent_v1:1:lighter:sell:1"),
@@ -139,9 +134,9 @@ def build_matrix() -> list[dict[str, Any]]:
         row["admitted_candidates"] = []
         rows.append(row)
     row = _admitted_row()
-    row["scenario_id"] = "positive_pair_edge_no_admitted_candidates"
+    row["scenario_id"] = "no_positive_ranked_candidates"
     row["admission_status"] = "HOLD"
-    row["admission_reason"] = "no_admitted_candidates"
+    row["admission_reason"] = "no_positive_ranked_candidates"
     row["order_intent_output_count"] = 0
     row["suppressed_mm_order_creating_intent_count"] = row["baseline_mm_order_creating_intent_count"]
     row["pair_edge_is_admission"] = False
