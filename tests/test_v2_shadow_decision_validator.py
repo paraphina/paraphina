@@ -26,6 +26,9 @@ def valid_row() -> dict:
         "pair_conditioned_admission_enabled": False,
         "fast_hedge_enabled": False,
         "order_intent_enabled": False,
+        "ranking_schema_version": 1,
+        "ranking_feature_only": True,
+        "ranking_is_admission": False,
         "candidates": [
             {
                 "candidate_id": "v2_shadow_intent_v1:0:lighter:Buy:0",
@@ -35,6 +38,23 @@ def valid_row() -> dict:
                 "price": 250.0,
                 "size": 0.01,
                 "target_linkage_state": "present_redacted",
+                "admission_status": "HOLD",
+                "admission_reason": "shadow_only_no_order_authority",
+            }
+        ],
+        "candidate_rankings": [
+            {
+                "rank_index": 1,
+                "candidate_id": "v2_shadow_intent_v1:0:lighter:Buy:0",
+                "rank_status": "missing_cross_venue_reference",
+                "rank_score_microusd": 0,
+                "pair_edge_feature_usd": None,
+                "pair_edge_feature_bps": None,
+                "reference_candidate_id": None,
+                "reference_venue_index": None,
+                "reference_venue_id": None,
+                "rank_tiebreak_key": "0:0000:buy:v2_shadow_intent_v1:0:lighter:Buy:0",
+                "feature_only": True,
                 "admission_status": "HOLD",
                 "admission_reason": "shadow_only_no_order_authority",
             }
@@ -88,6 +108,7 @@ class TestV2ShadowDecisionValidator(unittest.TestCase):
             self.assertEqual(manifest["decision_validation_status"], "pass")
             self.assertEqual(manifest["validation"]["row_count"], 1)
             self.assertEqual(manifest["validation"]["candidate_count_total"], 1)
+            self.assertEqual(manifest["validation"]["candidate_ranking_count_total"], 1)
             self.assertFalse(manifest["validation"]["can_mutate_orders_any"])
             self.assertFalse(manifest["validation"]["blocker_cleared_any"])
             self.assertFalse(manifest["validation"]["pressure_complete_claim_any"])
@@ -114,6 +135,8 @@ class TestV2ShadowDecisionValidator(unittest.TestCase):
             ("pair_conditioned_admission_enabled", True),
             ("fast_hedge_enabled", True),
             ("order_intent_enabled", True),
+            ("ranking_feature_only", False),
+            ("ranking_is_admission", True),
         ]:
             with self.subTest(field_name=field_name):
                 row = valid_row()
@@ -174,6 +197,40 @@ class TestV2ShadowDecisionValidator(unittest.TestCase):
             with self.assertRaises(validator.ContractViolation):
                 validator.validate_v2_shadow_decisions(evidence)
 
+    def test_rejects_ranking_admission_or_unknown_candidate_reference(self):
+        row = valid_row()
+        row["candidate_rankings"][0]["feature_only"] = False
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "evidence.jsonl"
+            write_jsonl(evidence, [row])
+            with self.assertRaises(validator.ContractViolation):
+                validator.validate_v2_shadow_decisions(evidence)
+
+        row = valid_row()
+        row["candidate_rankings"][0]["candidate_id"] = "v2_shadow_intent_v1:0:lighter:Sell:99"
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "evidence.jsonl"
+            write_jsonl(evidence, [row])
+            with self.assertRaises(validator.ContractViolation):
+                validator.validate_v2_shadow_decisions(evidence)
+
+        row = valid_row()
+        row["candidate_rankings"][0]["selected"] = True
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "evidence.jsonl"
+            write_jsonl(evidence, [row])
+            with self.assertRaises(validator.ContractViolation):
+                validator.validate_v2_shadow_decisions(evidence)
+
+        row = valid_row()
+        row["candidate_rankings"].append(dict(row["candidate_rankings"][0]))
+        row["candidate_rankings"][1]["rank_index"] = 2
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "evidence.jsonl"
+            write_jsonl(evidence, [row])
+            with self.assertRaises(validator.ContractViolation):
+                validator.validate_v2_shadow_decisions(evidence)
+
     def test_rejects_pair_edge_references_not_emitted_by_row(self):
         row = valid_row()
         row["pair_edges"][0]["bid_candidate_id"] = "v2_shadow_intent_v1:0:lighter:Sell:99"
@@ -186,6 +243,7 @@ class TestV2ShadowDecisionValidator(unittest.TestCase):
     def test_default_requires_at_least_one_candidate_and_mm_creating_intent(self):
         row = valid_row()
         row["candidates"] = []
+        row["candidate_rankings"] = []
         row["baseline_mm_order_creating_intent_count"] = 0
         row["pair_edges"] = [
             {

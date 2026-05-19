@@ -111,6 +111,81 @@ def _pair_edge(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _candidate_rankings(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pending: list[dict[str, Any]] = []
+    for candidate in candidates:
+        reference = _best_same_side_reference(candidate, candidates)
+        if reference is None:
+            rank_status = "missing_cross_venue_reference"
+            rank_score_microusd = 0
+            feature_usd = None
+            feature_bps = None
+            reference_candidate_id = None
+            reference_venue_index = None
+            reference_venue_id = None
+        else:
+            rank_status = "scored"
+            feature_usd = (
+                reference["price"] - candidate["price"]
+                if candidate["side"] == "Buy"
+                else candidate["price"] - reference["price"]
+            )
+            midpoint = (reference["price"] + candidate["price"]) / 2.0
+            feature_bps = feature_usd / midpoint * 10_000.0 if midpoint > 0 else None
+            rank_score_microusd = round(feature_usd * 1_000_000)
+            reference_candidate_id = reference["candidate_id"]
+            reference_venue_index = reference["venue_index"]
+            reference_venue_id = reference["venue_id"]
+        linkage_tiebreak = 0 if candidate["target_linkage_state"] == "present_redacted" else 1
+        pending.append(
+            {
+                "rank_index": 0,
+                "candidate_id": candidate["candidate_id"],
+                "rank_status": rank_status,
+                "rank_score_microusd": rank_score_microusd,
+                "pair_edge_feature_usd": feature_usd,
+                "pair_edge_feature_bps": feature_bps,
+                "reference_candidate_id": reference_candidate_id,
+                "reference_venue_index": reference_venue_index,
+                "reference_venue_id": reference_venue_id,
+                "rank_tiebreak_key": (
+                    f"{linkage_tiebreak}:{candidate['venue_index']:04d}:"
+                    f"{candidate['side'].lower()}:{candidate['candidate_id']}"
+                ),
+                "feature_only": True,
+                "admission_status": "HOLD",
+                "admission_reason": EXPECTED_ADMISSION_REASON,
+            }
+        )
+    pending.sort(
+        key=lambda ranking: (
+            0 if ranking["rank_status"] == "scored" else 1,
+            -ranking["rank_score_microusd"],
+            ranking["rank_tiebreak_key"],
+        )
+    )
+    for idx, ranking in enumerate(pending, start=1):
+        ranking["rank_index"] = idx
+    return pending
+
+
+def _best_same_side_reference(
+    candidate: dict[str, Any], candidates: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    references = [
+        reference
+        for reference in candidates
+        if reference["side"] == candidate["side"]
+        and reference["venue_id"] != candidate["venue_id"]
+        and reference["candidate_id"] != candidate["candidate_id"]
+    ]
+    if not references:
+        return None
+    if candidate["side"] == "Buy":
+        return max(references, key=lambda reference: (reference["price"], reference["candidate_id"]))
+    return min(references, key=lambda reference: (reference["price"], reference["candidate_id"]))
+
+
 def _decision(
     *,
     scenario_id: str,
@@ -139,7 +214,11 @@ def _decision(
         "pair_conditioned_admission_enabled": False,
         "fast_hedge_enabled": False,
         "order_intent_enabled": False,
+        "ranking_schema_version": 1,
+        "ranking_feature_only": True,
+        "ranking_is_admission": False,
         "candidates": candidates,
+        "candidate_rankings": _candidate_rankings(candidates),
         "pair_edges": [_pair_edge(candidates)],
     }
 
@@ -278,6 +357,7 @@ def _write_summary(path: Path, rows: list[dict[str, Any]], validation: validator
         "venue_candidate_counts": venue_counts,
         "row_count": validation.row_count,
         "candidate_count_total": validation.candidate_count_total,
+        "candidate_ranking_count_total": validation.candidate_ranking_count_total,
         "pair_edge_count_total": validation.pair_edge_count_total,
         "gate_status": "HOLD",
         "shadow_only": True,

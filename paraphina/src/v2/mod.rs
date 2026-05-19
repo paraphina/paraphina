@@ -55,6 +55,23 @@ pub struct V2PairEdgeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct V2ShadowCandidateRanking {
+    pub rank_index: usize,
+    pub candidate_id: String,
+    pub rank_status: &'static str,
+    pub rank_score_microusd: i64,
+    pub pair_edge_feature_usd: Option<f64>,
+    pub pair_edge_feature_bps: Option<f64>,
+    pub reference_candidate_id: Option<String>,
+    pub reference_venue_index: Option<usize>,
+    pub reference_venue_id: Option<String>,
+    pub rank_tiebreak_key: String,
+    pub feature_only: bool,
+    pub admission_status: &'static str,
+    pub admission_reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct V2ShadowDecision {
     pub event_type: &'static str,
     pub schema_version: u32,
@@ -74,7 +91,11 @@ pub struct V2ShadowDecision {
     pub pair_conditioned_admission_enabled: bool,
     pub fast_hedge_enabled: bool,
     pub order_intent_enabled: bool,
+    pub ranking_schema_version: u32,
+    pub ranking_feature_only: bool,
+    pub ranking_is_admission: bool,
     pub candidates: Vec<V2ShadowCandidate>,
+    pub candidate_rankings: Vec<V2ShadowCandidateRanking>,
     pub pair_edges: Vec<V2PairEdgeSnapshot>,
 }
 
@@ -120,6 +141,7 @@ pub fn evaluate_shadow_decision(
     if candidates.is_empty() {
         candidates = extract_shadow_candidates_from_intents(baseline_plan_intents);
     }
+    let candidate_rankings = rank_shadow_candidates(&candidates);
     let pair_edges = if config.pair_edge_enabled {
         vec![build_pair_edge_snapshot(&candidates)]
     } else {
@@ -146,7 +168,11 @@ pub fn evaluate_shadow_decision(
         pair_conditioned_admission_enabled: config.pair_conditioned_admission_enabled,
         fast_hedge_enabled: config.fast_hedge_enabled,
         order_intent_enabled: config.order_intent_enabled,
+        ranking_schema_version: 1,
+        ranking_feature_only: true,
+        ranking_is_admission: false,
         candidates,
+        candidate_rankings,
         pair_edges,
     })
 }
@@ -269,6 +295,102 @@ fn candidate_from_level(quote: &MmQuote, side: Side, level: &MmLevel) -> V2Shado
         admission_status: V2ShadowAdmissionStatus::Hold.as_str(),
         admission_reason: "shadow_only_no_order_authority",
     }
+}
+
+fn rank_shadow_candidates(candidates: &[V2ShadowCandidate]) -> Vec<V2ShadowCandidateRanking> {
+    let mut ranked = candidates
+        .iter()
+        .filter(|candidate| candidate.price.is_finite())
+        .map(|candidate| {
+            let reference = best_same_side_reference(candidate, candidates);
+            let (rank_status, rank_score_microusd, pair_edge_feature_usd, pair_edge_feature_bps) =
+                match reference {
+                    Some(reference) => {
+                        let feature_usd = match candidate.side {
+                            Side::Buy => reference.price - candidate.price,
+                            Side::Sell => candidate.price - reference.price,
+                        };
+                        let midpoint = (candidate.price + reference.price) / 2.0;
+                        let feature_bps = (midpoint.is_finite() && midpoint > 0.0)
+                            .then_some(feature_usd / midpoint * 10_000.0);
+                        (
+                            "scored",
+                            (feature_usd * 1_000_000.0).round() as i64,
+                            Some(feature_usd),
+                            feature_bps,
+                        )
+                    }
+                    None => ("missing_cross_venue_reference", 0, None, None),
+                };
+            let reference_candidate_id = reference.map(|reference| reference.candidate_id.clone());
+            let reference_venue_index = reference.map(|reference| reference.venue_index);
+            let reference_venue_id = reference.map(|reference| reference.venue_id.clone());
+            let linkage_tiebreak = if candidate.target_linkage_state == "present_redacted" {
+                0
+            } else {
+                1
+            };
+            V2ShadowCandidateRanking {
+                rank_index: 0,
+                candidate_id: candidate.candidate_id.clone(),
+                rank_status,
+                rank_score_microusd,
+                pair_edge_feature_usd,
+                pair_edge_feature_bps,
+                reference_candidate_id,
+                reference_venue_index,
+                reference_venue_id,
+                rank_tiebreak_key: format!(
+                    "{}:{:04}:{}:{}",
+                    linkage_tiebreak,
+                    candidate.venue_index,
+                    candidate.side.as_v2_str(),
+                    candidate.candidate_id
+                ),
+                feature_only: true,
+                admission_status: V2ShadowAdmissionStatus::Hold.as_str(),
+                admission_reason: "shadow_only_no_order_authority",
+            }
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|lhs, rhs| {
+        status_sort_key(lhs.rank_status)
+            .cmp(&status_sort_key(rhs.rank_status))
+            .then_with(|| rhs.rank_score_microusd.cmp(&lhs.rank_score_microusd))
+            .then_with(|| lhs.rank_tiebreak_key.cmp(&rhs.rank_tiebreak_key))
+    });
+    for (idx, ranking) in ranked.iter_mut().enumerate() {
+        ranking.rank_index = idx + 1;
+    }
+    ranked
+}
+
+fn best_same_side_reference<'a>(
+    candidate: &V2ShadowCandidate,
+    candidates: &'a [V2ShadowCandidate],
+) -> Option<&'a V2ShadowCandidate> {
+    candidates
+        .iter()
+        .filter(|reference| {
+            reference.side == candidate.side
+                && reference.venue_id != candidate.venue_id
+                && reference.candidate_id != candidate.candidate_id
+                && reference.price.is_finite()
+        })
+        .max_by(|lhs, rhs| match candidate.side {
+            Side::Buy => lhs
+                .price
+                .total_cmp(&rhs.price)
+                .then_with(|| rhs.candidate_id.cmp(&lhs.candidate_id)),
+            Side::Sell => rhs
+                .price
+                .total_cmp(&lhs.price)
+                .then_with(|| rhs.candidate_id.cmp(&lhs.candidate_id)),
+        })
+}
+
+fn status_sort_key(status: &str) -> u8 {
+    if status == "scored" { 0 } else { 1 }
 }
 
 fn build_pair_edge_snapshot(candidates: &[V2ShadowCandidate]) -> V2PairEdgeSnapshot {
@@ -443,6 +565,10 @@ mod tests {
         assert!(!decision.pressure_complete_claim);
         assert!(!decision.blocker_cleared);
         assert_eq!(decision.candidates.len(), 2);
+        assert_eq!(decision.candidate_rankings.len(), 2);
+        assert_eq!(decision.ranking_schema_version, 1);
+        assert!(decision.ranking_feature_only);
+        assert!(!decision.ranking_is_admission);
         assert_eq!(
             decision.candidates[0].target_linkage_state,
             "present_redacted"
@@ -477,6 +603,23 @@ mod tests {
         let decision = evaluate_shadow_decision(&config, 3_000, &quotes, &[]).expect("decision");
 
         assert_eq!(decision.candidates.len(), 10);
+        assert_eq!(decision.candidate_rankings.len(), 10);
+        assert_eq!(decision.ranking_schema_version, 1);
+        assert!(decision.ranking_feature_only);
+        assert!(!decision.ranking_is_admission);
+        assert_eq!(
+            decision.candidate_rankings[0].candidate_id,
+            "v2_shadow_v1:0:extended:buy"
+        );
+        assert_eq!(decision.candidate_rankings[0].rank_index, 1);
+        assert_eq!(decision.candidate_rankings[0].rank_status, "scored");
+        assert_eq!(decision.candidate_rankings[0].rank_score_microusd, 10_000_000);
+        assert_eq!(
+            decision.candidate_rankings[0].reference_candidate_id.as_deref(),
+            Some("v2_shadow_v1:1:hyperliquid:buy")
+        );
+        assert!(decision.candidate_rankings[0].feature_only);
+        assert_eq!(decision.candidate_rankings[0].admission_status, "HOLD");
         assert_eq!(decision.pair_edges.len(), 1);
         let pair_edge = &decision.pair_edges[0];
         assert!(pair_edge.feature_only);
@@ -517,6 +660,7 @@ mod tests {
             decision.baseline_mm_order_creating_intent_count,
             before.len()
         );
+        assert_eq!(decision.candidate_rankings.len(), before.len());
     }
 
     #[test]
@@ -562,6 +706,11 @@ mod tests {
         assert_eq!(
             decision.baseline_mm_order_creating_intent_count,
             intents.len()
+        );
+        assert_eq!(decision.candidate_rankings.len(), intents.len());
+        assert_eq!(
+            decision.candidate_rankings[0].candidate_id,
+            "v2_shadow_intent_v1:2:lighter:buy:0"
         );
         assert_eq!(
             decision.candidates[0].target_linkage_state,

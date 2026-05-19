@@ -30,6 +30,10 @@ class TestV2ShadowScenarioMatrix(unittest.TestCase):
             self.assertEqual(row["order_intent_output_count"], 0)
             self.assertFalse(row["blocker_cleared"])
             self.assertFalse(row["pressure_complete_claim"])
+            self.assertEqual(row["ranking_schema_version"], 1)
+            self.assertTrue(row["ranking_feature_only"])
+            self.assertFalse(row["ranking_is_admission"])
+            self.assertEqual(len(row["candidate_rankings"]), len(row["candidates"]))
             venues.update(candidate["venue_id"] for candidate in row["candidates"])
             invalid_reasons.add(row["pair_edges"][0]["invalid_reason"])
 
@@ -42,6 +46,12 @@ class TestV2ShadowScenarioMatrix(unittest.TestCase):
         self.assertEqual(pair_edge["ask_candidate_id"], "v2_shadow_v1:2:aster:sell")
         self.assertTrue(pair_edge["feature_only"])
         self.assertGreater(pair_edge["edge_usd"], 0)
+        self.assertEqual(crossed["candidate_rankings"][0]["candidate_id"], "v2_shadow_v1:0:extended:buy")
+        self.assertEqual(crossed["candidate_rankings"][0]["reference_candidate_id"], pair_edge["bid_candidate_id"])
+        self.assertEqual(crossed["candidate_rankings"][0]["rank_index"], 1)
+        self.assertEqual(crossed["candidate_rankings"][0]["rank_status"], "scored")
+        self.assertEqual(crossed["candidate_rankings"][0]["rank_score_microusd"], 10_000_000)
+        self.assertTrue(crossed["candidate_rankings"][0]["feature_only"])
 
         intent_fallback = next(
             row for row in rows if row["scenario_id"] == "intent_fallback_place_replace_candidates"
@@ -65,6 +75,7 @@ class TestV2ShadowScenarioMatrix(unittest.TestCase):
             validation = validator.validate_v2_shadow_decisions(paths["decision_path"])
             self.assertEqual(validation.row_count, 4)
             self.assertEqual(validation.candidate_count_total, 22)
+            self.assertEqual(validation.candidate_ranking_count_total, 22)
             self.assertEqual(validation.pair_edge_count_total, 4)
 
             summary = json.loads(paths["summary_path"].read_text(encoding="utf-8"))
@@ -72,6 +83,7 @@ class TestV2ShadowScenarioMatrix(unittest.TestCase):
             self.assertEqual(summary["gate_status"], "HOLD")
             self.assertFalse(summary["blocker_cleared"])
             self.assertFalse(summary["live_orders_allowed"])
+            self.assertEqual(summary["candidate_ranking_count_total"], 22)
 
             manifest = json.loads(paths["manifest_path"].read_text(encoding="utf-8"))
             self.assertEqual(manifest["decision_validation_status"], "pass")

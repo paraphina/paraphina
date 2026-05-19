@@ -29,33 +29,46 @@ EXPECTED_ADMISSION_REASON = "shadow_only_no_order_authority"
 ALLOWED_TARGET_LINKAGE_STATES = {"missing", "present_redacted"}
 ALLOWED_SIDES = {"Buy", "Sell"}
 ALLOWED_PAIR_EDGE_INVALID_REASONS = {None, "missing_bid", "missing_ask"}
+ALLOWED_RANKING_STATUSES = {"scored", "missing_cross_venue_reference"}
 CANDIDATE_ID_PREFIXES = ("v2_shadow_v1:", "v2_shadow_intent_v1:")
 PAIR_EDGE_ID_PREFIX = "v2_pair_edge_v1:"
 
 FORBIDDEN_KEY_NAMES = {
     "account_id",
     "account_l1_address",
+    "approved",
+    "approved_for_canary",
+    "approved_for_capital_escalation",
+    "approved_for_live",
     "api_key",
     "auth_token",
+    "capital_change_allowed",
     "canonical_group_id",
     "cloid",
     "client_order_id",
+    "execution_priority",
     "fill_id",
     "headers",
+    "live_orders_allowed",
     "oid",
+    "order_intent",
     "order_id",
     "order_key",
     "private_key",
     "raw_payload",
     "raw_request",
     "raw_response",
+    "ranked_order_intents",
     "secret",
+    "selected",
+    "selected_candidate_id",
     "signature",
     "tid",
     "token",
     "trade_id",
     "venue_order_id",
     "wallet_address",
+    "winner",
     "volume_quota_remaining",
 }
 FORBIDDEN_KEY_PREFIXES = ("raw_",)
@@ -64,13 +77,16 @@ FORBIDDEN_STRING_FRAGMENTS = (
     "auth_token",
     "canonical_group_id",
     "client_order_id",
+    "execution_priority",
     "order_id",
     "order_key",
+    "ranked_order_intents",
     "private_key",
     "raw-client",
     "raw-group",
     "raw-order",
     "secret",
+    "selected_candidate",
     "signature",
     "token",
     "venue_order_id",
@@ -90,6 +106,8 @@ class ValidationSummary:
     rows_with_baseline_mm_order_creating_intents: int = 0
     candidate_count_total: int = 0
     rows_with_candidates: int = 0
+    candidate_ranking_count_total: int = 0
+    rows_with_candidate_rankings: int = 0
     pair_edge_count_total: int = 0
     rows_with_pair_edges: int = 0
     can_mutate_orders_any: bool = False
@@ -110,6 +128,8 @@ class ValidationSummary:
             ),
             "candidate_count_total": self.candidate_count_total,
             "rows_with_candidates": self.rows_with_candidates,
+            "candidate_ranking_count_total": self.candidate_ranking_count_total,
+            "rows_with_candidate_rankings": self.rows_with_candidate_rankings,
             "pair_edge_count_total": self.pair_edge_count_total,
             "rows_with_pair_edges": self.rows_with_pair_edges,
             "can_mutate_orders_any": self.can_mutate_orders_any,
@@ -267,6 +287,88 @@ def _validate_pair_edge(pair_edge: Any, line: int, index: int, candidate_ids: se
     )
 
 
+def _validate_candidate_ranking(
+    ranking: Any,
+    line: int,
+    index: int,
+    candidate_ids: set[str],
+    seen_rank_indexes: set[int],
+    seen_ranked_candidate_ids: set[str],
+) -> None:
+    _require(isinstance(ranking, dict), line, f"candidate_rankings[{index}] must be object")
+    _require(_is_int(ranking.get("rank_index")), line, f"candidate_rankings[{index}] rank_index invalid")
+    _require(ranking["rank_index"] > 0, line, f"candidate_rankings[{index}] rank_index must be positive")
+    _require(
+        ranking["rank_index"] not in seen_rank_indexes,
+        line,
+        f"candidate_rankings[{index}] duplicate rank_index: {ranking['rank_index']}",
+    )
+    seen_rank_indexes.add(ranking["rank_index"])
+    candidate_id = ranking.get("candidate_id")
+    _require(
+        isinstance(candidate_id, str) and candidate_id in candidate_ids,
+        line,
+        f"candidate_rankings[{index}] candidate_id does not reference emitted candidate",
+    )
+    _require(
+        candidate_id not in seen_ranked_candidate_ids,
+        line,
+        f"candidate_rankings[{index}] duplicate candidate_id: {candidate_id}",
+    )
+    seen_ranked_candidate_ids.add(candidate_id)
+    _require(
+        ranking.get("rank_status") in ALLOWED_RANKING_STATUSES,
+        line,
+        f"candidate_rankings[{index}] rank_status invalid",
+    )
+    _require(
+        _is_int(ranking.get("rank_score_microusd")),
+        line,
+        f"candidate_rankings[{index}] rank_score_microusd invalid",
+    )
+    feature_usd = ranking.get("pair_edge_feature_usd")
+    feature_bps = ranking.get("pair_edge_feature_bps")
+    _require(
+        feature_usd is None or _is_finite_number(feature_usd),
+        line,
+        f"candidate_rankings[{index}] pair_edge_feature_usd invalid",
+    )
+    _require(
+        feature_bps is None or _is_finite_number(feature_bps),
+        line,
+        f"candidate_rankings[{index}] pair_edge_feature_bps invalid",
+    )
+    for field_name in ("reference_candidate_id", "reference_venue_id"):
+        value = ranking.get(field_name)
+        _require(value is None or isinstance(value, str), line, f"candidate_rankings[{index}] {field_name} invalid")
+    reference_candidate_id = ranking.get("reference_candidate_id")
+    _require(
+        reference_candidate_id is None or reference_candidate_id in candidate_ids,
+        line,
+        f"candidate_rankings[{index}] reference_candidate_id does not reference emitted candidate",
+    )
+    reference_venue_index = ranking.get("reference_venue_index")
+    _require(
+        reference_venue_index is None or (_is_int(reference_venue_index) and reference_venue_index >= 0),
+        line,
+        f"candidate_rankings[{index}] reference_venue_index invalid",
+    )
+    _require(
+        isinstance(ranking.get("rank_tiebreak_key"), str) and ranking["rank_tiebreak_key"],
+        line,
+        f"candidate_rankings[{index}] rank_tiebreak_key invalid",
+    )
+    if ranking["rank_status"] == "scored":
+        _require(reference_candidate_id is not None, line, f"candidate_rankings[{index}] scored rank missing reference")
+        _require(feature_usd is not None, line, f"candidate_rankings[{index}] scored rank missing feature")
+    else:
+        _require(reference_candidate_id is None, line, f"candidate_rankings[{index}] missing-reference rank has reference")
+        _require(feature_usd is None, line, f"candidate_rankings[{index}] missing-reference rank has feature")
+    _require(ranking.get("feature_only") is True, line, f"candidate_rankings[{index}] not feature_only")
+    _require_exact(ranking, "admission_status", EXPECTED_ADMISSION_STATUS, line)
+    _require_exact(ranking, "admission_reason", EXPECTED_ADMISSION_REASON, line)
+
+
 def _validate_row(row: Any, line: int, summary: ValidationSummary) -> None:
     _require(isinstance(row, dict), line, "row must be object")
     _scan_for_forbidden_material(row, line)
@@ -313,10 +415,21 @@ def _validate_row(row: Any, line: int, summary: ValidationSummary) -> None:
     )
     _require(row.get("fast_hedge_enabled") is False, line, "fast_hedge_enabled must be false")
     _require(row.get("order_intent_enabled") is False, line, "order_intent_enabled must be false")
+    if (
+        "ranking_schema_version" in row
+        or "ranking_feature_only" in row
+        or "candidate_rankings" in row
+        or "ranking_is_admission" in row
+    ):
+        _require_exact(row, "ranking_schema_version", 1, line)
+        _require(row.get("ranking_feature_only") is True, line, "ranking_feature_only must be true")
+        _require(row.get("ranking_is_admission") is False, line, "ranking_is_admission must be false")
 
     candidates = row.get("candidates")
+    candidate_rankings = row.get("candidate_rankings", [])
     pair_edges = row.get("pair_edges")
     _require(isinstance(candidates, list), line, "candidates must be list")
+    _require(isinstance(candidate_rankings, list), line, "candidate_rankings must be list")
     _require(isinstance(pair_edges, list), line, "pair_edges must be list")
 
     summary.row_count += 1
@@ -343,6 +456,28 @@ def _validate_row(row: Any, line: int, summary: ValidationSummary) -> None:
         candidate_ids.add(candidate_id)
         summary.candidate_target_linkage_states[linkage_state] = (
             summary.candidate_target_linkage_states.get(linkage_state, 0) + 1
+        )
+
+    summary.candidate_ranking_count_total += len(candidate_rankings)
+    if candidate_rankings:
+        summary.rows_with_candidate_rankings += 1
+        _require(
+            len(candidate_rankings) == len(candidates),
+            line,
+            "candidate_rankings count must equal candidates count",
+        )
+    seen_rank_indexes: set[int] = set()
+    seen_ranked_candidate_ids: set[str] = set()
+    for idx, ranking in enumerate(candidate_rankings):
+        _validate_candidate_ranking(
+            ranking, line, idx, candidate_ids, seen_rank_indexes, seen_ranked_candidate_ids
+        )
+    if candidate_rankings:
+        expected_rank_indexes = set(range(1, len(candidate_rankings) + 1))
+        _require(
+            seen_rank_indexes == expected_rank_indexes,
+            line,
+            "candidate_rankings rank_index values must be dense from 1",
         )
 
     summary.pair_edge_count_total += len(pair_edges)
@@ -420,6 +555,9 @@ def build_manifest(
             "admission_reason": EXPECTED_ADMISSION_REASON,
             "can_mutate_orders": False,
             "order_intent_output_count": 0,
+            "ranking_schema_version": 1,
+            "ranking_feature_only": True,
+            "ranking_is_admission": False,
             "pair_edge_is_admission": False,
             "pressure_complete_claim": False,
             "blocker_cleared": False,

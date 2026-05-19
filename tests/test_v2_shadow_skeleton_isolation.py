@@ -44,6 +44,8 @@ class TestV2ShadowSkeletonIsolation(unittest.TestCase):
         self.assertIn('admission_reason: "shadow_only_no_order_authority"', source)
         self.assertIn("can_mutate_orders: false", source)
         self.assertIn("order_intent_output_count: 0", source)
+        self.assertIn("ranking_feature_only: true", source)
+        self.assertIn("ranking_is_admission: false", source)
         self.assertIn("pair_edge_is_admission: false", source)
         self.assertIn("pressure_complete_claim: false", source)
         self.assertIn("blocker_cleared: false", source)
