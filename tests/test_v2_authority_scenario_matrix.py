@@ -12,9 +12,16 @@ class TestV2AuthorityScenarioMatrix(unittest.TestCase):
         self.assertGreaterEqual(len(rows), 3)
         self.assertEqual(rows[0]["admission_status"], "ADMITTED")
         self.assertTrue(rows[0]["pair_edge_is_admission"])
+        self.assertEqual(
+            {candidate["venue_id"] for candidate in rows[0]["admitted_candidates"]},
+            {"extended", "hyperliquid", "aster", "lighter", "paradex"},
+        )
         hold_reasons = {row["admission_reason"] for row in rows[1:]}
         self.assertIn("paper_admission_gate_not_satisfied", hold_reasons)
         self.assertIn("no_positive_pair_edge", hold_reasons)
+        self.assertIn("missing_bid", hold_reasons)
+        self.assertIn("missing_ask", hold_reasons)
+        self.assertIn("no_admitted_candidates", hold_reasons)
 
     def test_matrix_output_validates(self):
         with tempfile.TemporaryDirectory() as tmp:

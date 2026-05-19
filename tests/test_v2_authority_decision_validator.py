@@ -140,6 +140,49 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             with self.assertRaises(validator.V2AuthorityValidationError):
                 validator.validate_v2_authority_decisions(evidence)
 
+    def test_rejects_count_mismatch(self):
+        for field, value in [
+            ("order_intent_output_count", 2),
+            ("suppressed_mm_order_creating_intent_count", 0),
+        ]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                row = admitted_row()
+                row[field] = value
+                evidence = write_rows(Path(tmp), [row])
+                with self.assertRaises(validator.V2AuthorityValidationError):
+                    validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_duplicate_admitted_candidate_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = admitted_row()
+            row["admitted_candidates"].append(dict(row["admitted_candidates"][0]))
+            row["order_intent_output_count"] = 2
+            row["baseline_mm_order_creating_intent_count"] = 3
+            row["suppressed_mm_order_creating_intent_count"] = 1
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_admitted_row_without_positive_pair_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = admitted_row()
+            row["pair_edges"][0]["edge_usd"] = 0.0
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_manifest_artifact_outside_manifest_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            manifest_root = root / "manifest_root"
+            outside.mkdir()
+            manifest_root.mkdir()
+            evidence = write_rows(outside, [admitted_row()])
+            summary = validator.validate_v2_authority_decisions(evidence)
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.write_manifest(evidence, manifest_root / "manifest.json", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

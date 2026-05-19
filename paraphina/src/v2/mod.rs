@@ -325,6 +325,7 @@ pub fn evaluate_paper_admission_decision(
         "paper_positive_pair_edge_ranked_admission"
     };
     let output_count = admitted_candidates.len();
+    let admitted = output_count > 0;
     let suppressed_count = if gate_satisfied {
         baseline_mm_count.saturating_sub(output_count)
     } else {
@@ -338,7 +339,7 @@ pub fn evaluate_paper_admission_decision(
         decision_mode: config.decision_mode.as_str(),
         execution_mode: execution_mode.to_string(),
         authority_scope: "paper_only",
-        admission_status: if output_count > 0 { "ADMITTED" } else { "HOLD" },
+        admission_status: if admitted { "ADMITTED" } else { "HOLD" },
         admission_reason,
         can_filter_existing_intents: gate_satisfied,
         can_create_new_intents: false,
@@ -347,13 +348,13 @@ pub fn evaluate_paper_admission_decision(
         baseline_plan_intent_count: baseline_plan_intents.len(),
         baseline_mm_order_creating_intent_count: baseline_mm_count,
         suppressed_mm_order_creating_intent_count: suppressed_count,
-        pair_edge_is_admission: gate_satisfied && positive_pair_edge,
+        pair_edge_is_admission: admitted,
         pressure_complete_claim: false,
         blocker_cleared: false,
         gate_state,
         ranking_schema_version: 1,
         ranking_feature_only: false,
-        ranking_is_admission: gate_satisfied && positive_pair_edge,
+        ranking_is_admission: admitted,
         pair_edges,
         admitted_candidates,
     })
@@ -840,6 +841,31 @@ mod tests {
         })
     }
 
+    fn mm_replace(
+        venue_index: usize,
+        venue_id: &'static str,
+        side: Side,
+        price: f64,
+    ) -> OrderIntent {
+        OrderIntent::Replace(crate::types::ReplaceOrderIntent {
+            venue_index,
+            venue_id: Arc::from(venue_id),
+            side,
+            price,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: crate::types::TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "raw-replace-order-id-must-not-emit".to_string(),
+            client_order_id: Some("raw-replace-client-id-must-not-emit".to_string()),
+            phase51_target_key: Some(crate::types::Phase51ForwardRefreshTargetKey {
+                canonical_group_id: "raw-replace-group-must-not-emit".to_string(),
+                order_key: "raw-replace-order-must-not-emit".to_string(),
+            }),
+        })
+    }
+
     #[test]
     fn v2_shadow_inactive_by_default() {
         let config = V2ShadowConfig::default();
@@ -1121,6 +1147,58 @@ mod tests {
         assert_eq!(decision.order_intent_output_count, 0);
         assert_eq!(decision.suppressed_mm_order_creating_intent_count, 2);
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn v2_paper_admission_filters_mm_replace_and_leaves_non_mm_intents() {
+        let config = paper_admission_config();
+        let mut intents = vec![
+            mm_replace(0, "extended", Side::Buy, 99.0),
+            mm_replace(1, "hyperliquid", Side::Buy, 100.0),
+            mm_place(2, "aster", Side::Sell, 98.0),
+            mm_replace(3, "lighter", Side::Sell, 105.0),
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: 4,
+                venue_id: Arc::from("paradex"),
+                side: Side::Buy,
+                price: 97.0,
+                size: 0.01,
+                purpose: OrderPurpose::Hedge,
+                time_in_force: crate::types::TimeInForce::Ioc,
+                post_only: false,
+                reduce_only: true,
+                client_order_id: Some("raw-hedge-client-id-must-not-emit".to_string()),
+                phase51_target_key: None,
+            }),
+        ];
+
+        let decision =
+            apply_paper_admission_filter(&config, "paper", 4_000, &mut intents).expect("filter");
+        let decision = decision.expect("decision");
+
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert_eq!(decision.order_intent_output_count, 2);
+        assert_eq!(
+            intents.len(),
+            3,
+            "two admitted MM intents plus non-MM retained"
+        );
+        assert!(
+            matches!(&intents[0], OrderIntent::Replace(replace) if replace.venue_id.as_ref() == "extended" && replace.side == Side::Buy)
+        );
+        assert!(
+            matches!(&intents[1], OrderIntent::Replace(replace) if replace.venue_id.as_ref() == "lighter" && replace.side == Side::Sell)
+        );
+        assert!(
+            matches!(&intents[2], OrderIntent::Place(place) if place.purpose == OrderPurpose::Hedge)
+        );
+
+        let serialized = serde_json::to_string(&decision).expect("serialize");
+        assert!(!serialized.contains("raw-replace-order-id-must-not-emit"));
+        assert!(!serialized.contains("raw-replace-client-id-must-not-emit"));
+        assert!(!serialized.contains("raw-hedge-client-id-must-not-emit"));
+        assert!(!serialized.contains("raw-replace-group-must-not-emit"));
+        assert!(!serialized.contains("raw-replace-order-must-not-emit"));
     }
 
     #[test]

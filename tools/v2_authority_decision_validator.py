@@ -74,7 +74,7 @@ def _file_info(path: Path, artifact_root: Path) -> dict[str, Any]:
     try:
         rel = path.resolve().relative_to(artifact_root.resolve()).as_posix()
     except ValueError:
-        rel = path.name
+        raise V2AuthorityValidationError(f"artifact must be under manifest root: {path}") from None
     return {
         "path": rel,
         "bytes": len(data),
@@ -121,6 +121,7 @@ def _validate_pair_edges(row: dict[str, Any], line: int) -> None:
 def _validate_admitted_candidates(row: dict[str, Any], line: int, gate_satisfied: bool) -> None:
     candidates = row.get("admitted_candidates")
     _require(isinstance(candidates, list), line, "admitted_candidates must be list")
+    candidate_ids: set[str] = set()
     if row.get("admission_status") == "ADMITTED":
         _require(gate_satisfied, line, "ADMITTED row without satisfied gate")
         _require(candidates, line, "ADMITTED row without candidates")
@@ -134,6 +135,8 @@ def _validate_admitted_candidates(row: dict[str, Any], line: int, gate_satisfied
             line,
             f"admitted_candidates[{idx}] candidate_id invalid",
         )
+        _require(candidate_id not in candidate_ids, line, f"admitted_candidates[{idx}] duplicate candidate_id")
+        candidate_ids.add(candidate_id)
         _require(isinstance(candidate.get("venue_index"), int), line, f"admitted_candidates[{idx}] venue_index invalid")
         _require(isinstance(candidate.get("venue_id"), str), line, f"admitted_candidates[{idx}] venue_id invalid")
         _require(candidate.get("side") in {"Buy", "Sell"}, line, f"admitted_candidates[{idx}] side invalid")
@@ -175,10 +178,35 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
     if row.get("admission_status") == "ADMITTED":
         _require(row.get("pair_edge_is_admission") is True, line, "ADMITTED row must use pair edge as admission")
         _require(row.get("ranking_is_admission") is True, line, "ADMITTED row must use ranking as admission")
+        _require(
+            any(
+                isinstance(edge, dict)
+                and isinstance(edge.get("edge_usd"), (int, float))
+                and edge["edge_usd"] > 0
+                for edge in row.get("pair_edges", [])
+            ),
+            line,
+            "ADMITTED row must include a positive pair edge",
+        )
     else:
         _require(row.get("order_intent_output_count") == 0, line, "HOLD row must output zero intents")
+        _require(row.get("pair_edge_is_admission") is False, line, "HOLD row must not use pair edge as admission")
+        _require(row.get("ranking_is_admission") is False, line, "HOLD row must not use ranking as admission")
     _validate_pair_edges(row, line)
     _validate_admitted_candidates(row, line, gate_satisfied)
+    admitted_count = len(row.get("admitted_candidates", []))
+    _require(
+        row["order_intent_output_count"] == admitted_count,
+        line,
+        "order_intent_output_count must equal admitted_candidates length",
+    )
+    if gate_satisfied:
+        _require(
+            row["order_intent_output_count"] + row.get("suppressed_mm_order_creating_intent_count", -1)
+            == row.get("baseline_mm_order_creating_intent_count"),
+            line,
+            "output plus suppressed count must equal baseline MM order-creating intent count",
+        )
 
     summary.row_count += 1
     if row["admission_status"] == "ADMITTED":
