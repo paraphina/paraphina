@@ -116,7 +116,10 @@ pub fn evaluate_shadow_decision(
     if !v2_shadow_active(config) {
         return None;
     }
-    let candidates = extract_shadow_candidates(quotes);
+    let mut candidates = extract_shadow_candidates(quotes);
+    if candidates.is_empty() {
+        candidates = extract_shadow_candidates_from_intents(baseline_plan_intents);
+    }
     let pair_edges = if config.pair_edge_enabled {
         vec![build_pair_edge_snapshot(&candidates)]
     } else {
@@ -181,6 +184,65 @@ pub fn extract_shadow_candidates(quotes: &[MmQuote]) -> Vec<V2ShadowCandidate> {
         }
         if let Some(level) = &quote.ask {
             candidates.push(candidate_from_level(quote, Side::Sell, level));
+        }
+    }
+    candidates
+}
+
+pub fn extract_shadow_candidates_from_intents(intents: &[OrderIntent]) -> Vec<V2ShadowCandidate> {
+    let mut candidates = Vec::new();
+    for (idx, intent) in intents.iter().enumerate() {
+        match intent {
+            OrderIntent::Place(place) if place.purpose == OrderPurpose::Mm => {
+                candidates.push(V2ShadowCandidate {
+                    candidate_id: format!(
+                        "v2_shadow_intent_v1:{}:{}:{}:{}",
+                        place.venue_index,
+                        place.venue_id,
+                        place.side.as_v2_str(),
+                        idx
+                    ),
+                    venue_index: place.venue_index,
+                    venue_id: place.venue_id.to_string(),
+                    side: place.side,
+                    price: place.price,
+                    size: place.size,
+                    target_linkage_state: if place.phase51_target_key.is_some() {
+                        "present_redacted"
+                    } else {
+                        "missing"
+                    },
+                    admission_status: V2ShadowAdmissionStatus::Hold.as_str(),
+                    admission_reason: "shadow_only_no_order_authority",
+                });
+            }
+            OrderIntent::Replace(replace) if replace.purpose == OrderPurpose::Mm => {
+                candidates.push(V2ShadowCandidate {
+                    candidate_id: format!(
+                        "v2_shadow_intent_v1:{}:{}:{}:{}",
+                        replace.venue_index,
+                        replace.venue_id,
+                        replace.side.as_v2_str(),
+                        idx
+                    ),
+                    venue_index: replace.venue_index,
+                    venue_id: replace.venue_id.to_string(),
+                    side: replace.side,
+                    price: replace.price,
+                    size: replace.size,
+                    target_linkage_state: if replace.phase51_target_key.is_some() {
+                        "present_redacted"
+                    } else {
+                        "missing"
+                    },
+                    admission_status: V2ShadowAdmissionStatus::Hold.as_str(),
+                    admission_reason: "shadow_only_no_order_authority",
+                });
+            }
+            OrderIntent::Place(_)
+            | OrderIntent::Replace(_)
+            | OrderIntent::Cancel(_)
+            | OrderIntent::CancelAll(_) => {}
         }
     }
     candidates
@@ -386,5 +448,65 @@ mod tests {
             decision.baseline_mm_order_creating_intent_count,
             before.len()
         );
+    }
+
+    #[test]
+    fn v2_shadow_falls_back_to_sanitized_intent_candidates_when_quotes_absent() {
+        use std::sync::Arc;
+
+        let config = shadow_config();
+        let intents = vec![
+            OrderIntent::Place(crate::types::PlaceOrderIntent {
+                venue_index: 2,
+                venue_id: Arc::from("lighter"),
+                side: Side::Buy,
+                price: 100.5,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: crate::types::TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: Some("raw-client-id-must-not-emit".to_string()),
+                phase51_target_key: Some(crate::types::Phase51ForwardRefreshTargetKey {
+                    canonical_group_id: "raw-group-must-not-emit".to_string(),
+                    order_key: "raw-order-must-not-emit".to_string(),
+                }),
+            }),
+            OrderIntent::Replace(crate::types::ReplaceOrderIntent {
+                venue_index: 3,
+                venue_id: Arc::from("paradex"),
+                side: Side::Sell,
+                price: 101.5,
+                size: 0.02,
+                purpose: OrderPurpose::Mm,
+                time_in_force: crate::types::TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                order_id: "raw-order-id-must-not-emit".to_string(),
+                client_order_id: Some("raw-replace-client-id-must-not-emit".to_string()),
+                phase51_target_key: None,
+            }),
+        ];
+
+        let decision = evaluate_shadow_decision(&config, 2_000, &[], &intents).expect("decision");
+        assert_eq!(decision.candidates.len(), 2);
+        assert_eq!(
+            decision.baseline_mm_order_creating_intent_count,
+            intents.len()
+        );
+        assert_eq!(
+            decision.candidates[0].target_linkage_state,
+            "present_redacted"
+        );
+        assert_eq!(decision.candidates[1].target_linkage_state, "missing");
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert!(!decision.can_mutate_orders);
+
+        let serialized = serde_json::to_string(&decision).expect("serialize");
+        assert!(!serialized.contains("raw-client-id-must-not-emit"));
+        assert!(!serialized.contains("raw-replace-client-id-must-not-emit"));
+        assert!(!serialized.contains("raw-order-id-must-not-emit"));
+        assert!(!serialized.contains("raw-group-must-not-emit"));
+        assert!(!serialized.contains("raw-order-must-not-emit"));
     }
 }

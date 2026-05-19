@@ -48,17 +48,19 @@ class TestV2ShadowSkeletonIsolation(unittest.TestCase):
         self.assertIn("pressure_complete_claim: false", source)
         self.assertIn("blocker_cleared: false", source)
 
-    def test_runner_hook_observes_final_mm_plan_before_submission(self):
+    def test_runner_hook_observes_final_pre_normalization_intents_before_submission(self):
         source = RUNNER.read_text()
         plan_pos = source.index("let mut mm_plan =")
-        hook_pos = source.index("crate::v2::emit_shadow_decision")
         submission_pos = source.index("let mut intents = mm_submission_intents_for_quote_gate")
+        cleanup_filter_pos = source.index("match phase51_lighter_baseline_cleanup_only_filter_intents")
+        hook_pos = source.index("crate::v2::emit_shadow_decision")
         normalize_pos = source.index("normalize_live_client_order_ids(&mut intents")
         lineage_pos = source.index("register_mm_decision_lineage(&mut state")
         order_tx_pos = source.index("send_order_fire_and_forget(", hook_pos)
 
         self.assertGreater(hook_pos, plan_pos)
-        self.assertLess(hook_pos, submission_pos)
+        self.assertGreater(hook_pos, submission_pos)
+        self.assertGreater(hook_pos, cleanup_filter_pos)
         self.assertLess(hook_pos, normalize_pos)
         self.assertLess(hook_pos, lineage_pos)
         self.assertLess(hook_pos, order_tx_pos)
