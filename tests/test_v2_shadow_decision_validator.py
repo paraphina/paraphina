@@ -213,6 +213,28 @@ class TestV2ShadowDecisionValidator(unittest.TestCase):
             self.assertEqual(summary.rows_with_candidates, 0)
             self.assertEqual(summary.rows_with_baseline_mm_order_creating_intents, 0)
 
+    def test_manifest_output_rejects_artifacts_outside_manifest_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            outside = root / "outside"
+            inside = root / "inside"
+            outside.mkdir()
+            inside.mkdir()
+            evidence = outside / "v2_shadow_decisions.jsonl"
+            write_jsonl(evidence, [valid_row()])
+
+            exit_code = validator.main(
+                [
+                    "--v2-shadow-decisions",
+                    str(evidence),
+                    "--manifest-output",
+                    str(inside / "manifest.json"),
+                ]
+            )
+
+            self.assertEqual(exit_code, 2)
+            self.assertFalse((inside / "manifest.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

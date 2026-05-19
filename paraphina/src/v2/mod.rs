@@ -385,6 +385,37 @@ mod tests {
         }
     }
 
+    fn quote_for(
+        venue_index: usize,
+        venue_id: &'static str,
+        bid_price: Option<f64>,
+        ask_price: Option<f64>,
+    ) -> MmQuote {
+        MmQuote {
+            venue_index,
+            venue_id: Arc::from(venue_id),
+            bid: bid_price.map(|price| MmLevel {
+                price,
+                size: 0.01,
+                canonical_target_identity: CanonicalTargetIdentity::from_explicit(
+                    "raw-group-must-not-emit",
+                    "raw-order-must-not-emit",
+                ),
+            }),
+            ask: ask_price.map(|price| MmLevel {
+                price,
+                size: 0.01,
+                canonical_target_identity: None,
+            }),
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "quoted",
+            ask_terminal_reason: "quoted",
+        }
+    }
+
     fn shadow_config() -> V2ShadowConfig {
         V2ShadowConfig {
             enabled: true,
@@ -431,6 +462,44 @@ mod tests {
         assert!(decision.pair_edges[0].feature_only);
         assert_eq!(decision.pair_edges[0].edge_usd, Some(-2.0));
         assert_eq!(decision.admission_reason, "shadow_only_no_order_authority");
+    }
+
+    #[test]
+    fn v2_shadow_all_five_quote_matrix_uses_feature_only_pair_edge() {
+        let config = shadow_config();
+        let quotes = vec![
+            quote_for(0, "extended", Some(100.0), Some(105.0)),
+            quote_for(1, "hyperliquid", Some(110.0), Some(104.0)),
+            quote_for(2, "aster", Some(102.0), Some(99.0)),
+            quote_for(3, "lighter", Some(103.0), Some(102.0)),
+            quote_for(4, "paradex", Some(104.0), Some(101.0)),
+        ];
+        let decision = evaluate_shadow_decision(&config, 3_000, &quotes, &[]).expect("decision");
+
+        assert_eq!(decision.candidates.len(), 10);
+        assert_eq!(decision.pair_edges.len(), 1);
+        let pair_edge = &decision.pair_edges[0];
+        assert!(pair_edge.feature_only);
+        assert_eq!(
+            pair_edge.bid_candidate_id.as_deref(),
+            Some("v2_shadow_v1:1:hyperliquid:buy")
+        );
+        assert_eq!(
+            pair_edge.ask_candidate_id.as_deref(),
+            Some("v2_shadow_v1:2:aster:sell")
+        );
+        assert_eq!(pair_edge.edge_usd, Some(11.0));
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.admission_reason, "shadow_only_no_order_authority");
+        assert!(!decision.can_mutate_orders);
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert!(!decision.pair_edge_is_admission);
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+
+        let serialized = serde_json::to_string(&decision).expect("serialize");
+        assert!(!serialized.contains("raw-group-must-not-emit"));
+        assert!(!serialized.contains("raw-order-must-not-emit"));
     }
 
     #[test]
