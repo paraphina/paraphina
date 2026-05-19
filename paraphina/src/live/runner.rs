@@ -5709,6 +5709,14 @@ pub async fn run_live_loop(
                 .extend(projected_budget_cleanup_intents.iter().cloned());
         }
         mm_plan.decision_summary.cancel_count += appended_budget_cancels as u64;
+        if let Err(err) =
+            crate::v2::emit_shadow_decision(&cfg.v2_shadow, now_ms, &mm_quotes, &mm_plan.intents)
+        {
+            eprintln!(
+                "[v2] shadow decision emit failed reason={}",
+                err.sanitized_reason()
+            );
+        }
         let effective_projection = if should_quote && !pause_mm_quotes {
             effective_projected_exposure_from_mm_intents(&state, &mm_plan.intents)
         } else if !pause_mm_quotes {

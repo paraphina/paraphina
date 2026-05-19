@@ -65,6 +65,7 @@ pub mod telemetry;
 pub mod toxicity;
 pub mod treasury;
 pub mod types;
+pub mod v2;
 
 // --- Re-exports for ergonomic external use ---------------------------------
 
