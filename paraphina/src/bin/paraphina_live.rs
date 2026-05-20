@@ -5184,7 +5184,9 @@ mod tests {
         assert_eq!(settings.max_position_tao, Some(0.05));
         assert_eq!(settings.max_gross_position_tao, Some(0.05));
         assert_eq!(settings.max_abs_venue_position_tao, Some(0.02));
-        assert_eq!(settings.max_open_orders, Some(5));
+        assert_eq!(canary.venue.as_ref().and_then(|venue| venue.base_order_size), Some(0.005));
+        assert_eq!(canary.venue.as_ref().and_then(|venue| venue.max_order_size), Some(0.005));
+        assert_eq!(settings.max_open_orders, Some(1));
         assert_eq!(settings.stale_max_ticks, Some(4));
         assert!(settings.enforce_post_only);
         assert!(!settings.enforce_reduce_only);

@@ -3,8 +3,9 @@
 # PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED=true.
 
 [venue]
-base_order_size = 0.01
-max_order_size = 0.01
+# ETH minimum observed in the Lighter order-books surface is 0.0050.
+base_order_size = 0.005
+max_order_size = 0.005
 
 [limits]
 max_position_tao = 0.05
@@ -13,7 +14,7 @@ max_abs_venue_position_tao = 0.02
 soft_max_position_tao = 0.03
 soft_max_gross_position_tao = 0.03
 soft_max_abs_venue_position_tao = 0.01
-max_open_orders = 5
+max_open_orders = 1
 
 [rate_limit]
 enabled = true
