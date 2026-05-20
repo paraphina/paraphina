@@ -372,6 +372,7 @@ fn resolve_out_dir(cli: Option<String>) -> Option<std::path::PathBuf> {
 struct CanaryVenueConfig {
     base_order_size: Option<f64>,
     max_order_size: Option<f64>,
+    lot_size_tao: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -689,6 +690,9 @@ fn apply_canary_config(cfg: &mut Config, canary: &CanaryConfig) -> CanarySetting
             }
             if let Some(size) = venue.max_order_size {
                 v.max_order_size = size.max(0.0);
+            }
+            if let Some(size) = venue.lot_size_tao {
+                v.lot_size_tao = size.max(1e-9);
             }
         }
     }
@@ -5186,6 +5190,7 @@ mod tests {
         assert_eq!(settings.max_abs_venue_position_tao, Some(0.02));
         assert_eq!(canary.venue.as_ref().and_then(|venue| venue.base_order_size), Some(0.005));
         assert_eq!(canary.venue.as_ref().and_then(|venue| venue.max_order_size), Some(0.005));
+        assert_eq!(canary.venue.as_ref().and_then(|venue| venue.lot_size_tao), Some(0.005));
         assert_eq!(settings.max_open_orders, Some(1));
         assert_eq!(settings.stale_max_ticks, Some(4));
         assert!(settings.enforce_post_only);

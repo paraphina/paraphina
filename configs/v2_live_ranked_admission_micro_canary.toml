@@ -6,6 +6,7 @@
 # ETH minimum observed in the Lighter order-books surface is 0.0050.
 base_order_size = 0.005
 max_order_size = 0.005
+lot_size_tao = 0.005
 
 [limits]
 max_position_tao = 0.05
