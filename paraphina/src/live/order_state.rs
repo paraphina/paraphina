@@ -759,6 +759,13 @@ fn supports_supported_replace_snapshot_gap_grace(venue_id: &str, order: &LiveOrd
         && order.side.is_some()
 }
 
+fn supported_replace_snapshot_gap_id_state(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some(value) if !value.trim().is_empty() => "present_redacted",
+        _ => "absent",
+    }
+}
+
 fn emit_supported_replace_snapshot_gap_grace(
     venue_id: &str,
     side: Option<Side>,
@@ -766,12 +773,12 @@ fn emit_supported_replace_snapshot_gap_grace(
     client_order_id: Option<&str>,
 ) {
     eprintln!(
-        "SUPPORTED_REPLACE_SNAPSHOT_GAP_GRACE venue={} side={} order_id={} client_id={}",
+        "SUPPORTED_REPLACE_SNAPSHOT_GAP_GRACE venue={} side={} order_id_state={} client_id_state={}",
         venue_id,
         side.map(|value| format!("{value:?}"))
             .unwrap_or_else(|| "unknown".to_string()),
-        order_id,
-        client_order_id.unwrap_or("none"),
+        supported_replace_snapshot_gap_id_state(Some(order_id)),
+        supported_replace_snapshot_gap_id_state(client_order_id),
     );
 }
 
@@ -782,12 +789,12 @@ fn emit_supported_replace_snapshot_gap_cleared(
     client_order_id: Option<&str>,
 ) {
     eprintln!(
-        "SUPPORTED_REPLACE_SNAPSHOT_GAP_CLEARED venue={} side={} order_id={} client_id={}",
+        "SUPPORTED_REPLACE_SNAPSHOT_GAP_CLEARED venue={} side={} order_id_state={} client_id_state={}",
         venue_id,
         side.map(|value| format!("{value:?}"))
             .unwrap_or_else(|| "unknown".to_string()),
-        order_id,
-        client_order_id.unwrap_or("none"),
+        supported_replace_snapshot_gap_id_state(Some(order_id)),
+        supported_replace_snapshot_gap_id_state(client_order_id),
     );
 }
 
@@ -798,12 +805,12 @@ fn emit_supported_replace_snapshot_gap_expired(
     client_order_id: Option<&str>,
 ) {
     eprintln!(
-        "SUPPORTED_REPLACE_SNAPSHOT_GAP_EXPIRED venue={} side={} order_id={} client_id={}",
+        "SUPPORTED_REPLACE_SNAPSHOT_GAP_EXPIRED venue={} side={} order_id_state={} client_id_state={}",
         venue_id,
         side.map(|value| format!("{value:?}"))
             .unwrap_or_else(|| "unknown".to_string()),
-        order_id,
-        client_order_id.unwrap_or("none"),
+        supported_replace_snapshot_gap_id_state(Some(order_id)),
+        supported_replace_snapshot_gap_id_state(client_order_id),
     );
 }
 
@@ -843,6 +850,24 @@ mod tests {
             timestamp_ms: 2_000,
             open_orders,
         }
+    }
+
+    #[test]
+    fn supported_replace_snapshot_gap_log_id_state_redacts_raw_identifiers() {
+        assert_eq!(
+            supported_replace_snapshot_gap_id_state(Some("raw-order-id")),
+            "present_redacted"
+        );
+        assert_eq!(
+            supported_replace_snapshot_gap_id_state(Some("raw-client-id")),
+            "present_redacted"
+        );
+        assert_eq!(supported_replace_snapshot_gap_id_state(Some("")), "absent");
+        assert_eq!(
+            supported_replace_snapshot_gap_id_state(Some("  ")),
+            "absent"
+        );
+        assert_eq!(supported_replace_snapshot_gap_id_state(None), "absent");
     }
 
     #[test]

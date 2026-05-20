@@ -689,30 +689,76 @@ fn paradex_emit_fill_flags_audit(token_usage: ParadexTokenUsage, flags: &[String
 
 fn paradex_emit_replace_identity_resolve_audit(source: &str, client_id: &str, order_id: &str) {
     eprintln!(
-        "PARADEX_REPLACE_IDENTITY_RESOLVE source={} client_id={} order_id={}",
-        source, client_id, order_id
+        "PARADEX_REPLACE_IDENTITY_RESOLVE source={} client_id_state={} order_id_state={}",
+        paradex_sanitized_audit_status(source),
+        paradex_audit_id_state(Some(client_id)),
+        paradex_audit_id_state(Some(order_id))
     );
 }
 
 fn paradex_emit_replace_identity_resolve_failed_audit(reason: &str, client_id: &str) {
     eprintln!(
-        "PARADEX_REPLACE_IDENTITY_RESOLVE_FAILED reason={} client_id={}",
-        reason, client_id
+        "PARADEX_REPLACE_IDENTITY_RESOLVE_FAILED reason={} client_id_state={}",
+        paradex_sanitized_audit_status(reason),
+        paradex_audit_id_state(Some(client_id))
     );
 }
 
 fn paradex_emit_open_identity_normalized_audit(source: &str, client_id: &str, order_id: &str) {
     eprintln!(
-        "PARADEX_OPEN_IDENTITY_NORMALIZED source={} client_id={} order_id={}",
-        source, client_id, order_id
+        "PARADEX_OPEN_IDENTITY_NORMALIZED source={} client_id_state={} order_id_state={}",
+        paradex_sanitized_audit_status(source),
+        paradex_audit_id_state(Some(client_id)),
+        paradex_audit_id_state(Some(order_id))
     );
+}
+
+fn paradex_audit_id_state(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some(value) if !value.trim().is_empty() => "present_redacted",
+        _ => "absent",
+    }
+}
+
+fn paradex_sanitized_audit_status(raw: &str) -> &str {
+    if raw.is_empty()
+        || raw.len() > 32
+        || raw
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'))
+    {
+        "other"
+    } else {
+        raw
+    }
+}
+
+fn paradex_open_identity_unresolved_audit_line(reason: &str, client_id: &str) -> String {
+    format!(
+        "PARADEX_OPEN_IDENTITY_UNRESOLVED reason={} client_id_state={}",
+        paradex_sanitized_audit_status(reason),
+        paradex_audit_id_state(Some(client_id)),
+    )
 }
 
 fn paradex_emit_open_identity_unresolved_audit(reason: &str, client_id: &str) {
     eprintln!(
-        "PARADEX_OPEN_IDENTITY_UNRESOLVED reason={} client_id={}",
-        reason, client_id
+        "{}",
+        paradex_open_identity_unresolved_audit_line(reason, client_id)
     );
+}
+
+fn paradex_native_replace_audit_line(
+    submit_source: &str,
+    order_id: &str,
+    client_order_id: Option<&str>,
+) -> String {
+    format!(
+        "PARADEX_NATIVE_REPLACE submit_source={} order_id_state={} client_id_state={}",
+        paradex_sanitized_audit_status(submit_source),
+        paradex_audit_id_state(Some(order_id)),
+        paradex_audit_id_state(client_order_id),
+    )
 }
 
 fn paradex_emit_native_replace_audit(
@@ -721,11 +767,25 @@ fn paradex_emit_native_replace_audit(
     client_order_id: Option<&str>,
 ) {
     eprintln!(
-        "PARADEX_NATIVE_REPLACE submit_source={} order_id={} client_id={}",
-        submit_source,
-        order_id,
-        client_order_id.unwrap_or("none"),
+        "{}",
+        paradex_native_replace_audit_line(submit_source, order_id, client_order_id)
     );
+}
+
+fn paradex_private_order_truth_audit_line(
+    count: u64,
+    status: &str,
+    order_id: &str,
+    client_order_id: Option<&str>,
+    _seq_no: u64,
+) -> String {
+    format!(
+        "PARADEX_PRIVATE_ORDER_TRUTH count={} status={} order_id_state={} client_id_state={} seq_no_state=present_redacted",
+        count,
+        paradex_sanitized_audit_status(status),
+        paradex_audit_id_state(Some(order_id)),
+        paradex_audit_id_state(client_order_id),
+    )
 }
 
 fn paradex_emit_private_order_truth_audit(
@@ -739,12 +799,8 @@ fn paradex_emit_private_order_truth_audit(
         return;
     }
     eprintln!(
-        "PARADEX_PRIVATE_ORDER_TRUTH count={} status={} order_id={} client_id={} seq_no={}",
-        count,
-        status,
-        order_id,
-        client_order_id.unwrap_or("none"),
-        seq_no,
+        "{}",
+        paradex_private_order_truth_audit_line(count, status, order_id, client_order_id, seq_no)
     );
 }
 
@@ -2536,16 +2592,16 @@ impl LiveRestClient for ParadexRestClient {
                                     })
                                 }
                                 Some(item) => Err(LiveGatewayError::retryable(format!(
-                                    "paradex cancel batch unresolved status={} order_id={} detail={}",
+                                    "paradex cancel batch unresolved status={} order_id_state={} detail_state={}",
                                     paradex_batch_cancel_status_label(&item),
-                                    entry.original_order_id,
-                                    item.detail.unwrap_or_default(),
+                                    paradex_audit_id_state(Some(entry.original_order_id.as_str())),
+                                    paradex_audit_id_state(item.detail.as_deref()),
                                 ))),
                                 None => {
                                     *status_counts.entry("missing_result".to_string()).or_insert(0) += 1;
                                     Err(LiveGatewayError::retryable(format!(
-                                        "paradex cancel batch missing result for {}",
-                                        entry.original_order_id
+                                        "paradex cancel batch missing result order_id_state={}",
+                                        paradex_audit_id_state(Some(entry.original_order_id.as_str()))
                                     )))
                                 }
                             };
@@ -2882,8 +2938,8 @@ impl ParadexRestClient {
             paradex_emit_replace_identity_resolve_failed_audit(reason, client_order_id);
             if reason == "not_found" {
                 return Err(LiveGatewayError::retryable(format!(
-                    "paradex replace identity unresolved client_id={} reason=not_found",
-                    client_order_id
+                    "paradex replace identity unresolved client_id_state={} reason=not_found",
+                    paradex_audit_id_state(Some(client_order_id))
                 )));
             }
             return Err(err);
@@ -2893,17 +2949,17 @@ impl ParadexRestClient {
         if resolved.market.as_deref() != Some(self.cfg.market.as_str()) {
             paradex_emit_replace_identity_resolve_failed_audit("wrong_market", client_order_id);
             return Err(LiveGatewayError::retryable(format!(
-                "paradex replace identity unresolved client_id={} reason=wrong_market market={}",
-                client_order_id,
+                "paradex replace identity unresolved client_id_state={} reason=wrong_market market={}",
+                paradex_audit_id_state(Some(client_order_id)),
                 resolved.market.unwrap_or_else(|| "unknown".to_string()),
             )));
         }
         if !paradex_status_allows_replace(resolved.status.as_deref()) {
             paradex_emit_replace_identity_resolve_failed_audit("closed", client_order_id);
             return Err(LiveGatewayError::retryable(format!(
-                "paradex replace identity unresolved client_id={} reason=closed status={}",
-                client_order_id,
-                resolved.status.unwrap_or_else(|| "unknown".to_string()),
+                "paradex replace identity unresolved client_id_state={} reason=closed status={}",
+                paradex_audit_id_state(Some(client_order_id)),
+                paradex_sanitized_audit_status(resolved.status.as_deref().unwrap_or("unknown")),
             )));
         }
         if is_client_order_id(&resolved.order_id) {
@@ -2912,8 +2968,8 @@ impl ParadexRestClient {
                 client_order_id,
             );
             return Err(LiveGatewayError::retryable(format!(
-                "paradex replace identity unresolved client_id={} reason=unresolved_identity",
-                client_order_id
+                "paradex replace identity unresolved client_id_state={} reason=unresolved_identity",
+                paradex_audit_id_state(Some(client_order_id))
             )));
         }
 
@@ -3191,15 +3247,18 @@ fn paradex_emit_cancel_batch_canonicalize_audit(
 
 fn paradex_emit_cancel_batch_resolve_audit(source: &str, client_order_id: &str, order_id: &str) {
     eprintln!(
-        "PARADEX_CANCEL_BATCH_RESOLVE source={} client_id={} order_id={}",
-        source, client_order_id, order_id
+        "PARADEX_CANCEL_BATCH_RESOLVE source={} client_id_state={} order_id_state={}",
+        paradex_sanitized_audit_status(source),
+        paradex_audit_id_state(Some(client_order_id)),
+        paradex_audit_id_state(Some(order_id))
     );
 }
 
 fn paradex_emit_cancel_batch_resolve_failed_audit(reason: &str, client_order_id: &str) {
     eprintln!(
-        "PARADEX_CANCEL_BATCH_RESOLVE_FAILED reason={} client_id={}",
-        reason, client_order_id
+        "PARADEX_CANCEL_BATCH_RESOLVE_FAILED reason={} client_id_state={}",
+        paradex_sanitized_audit_status(reason),
+        paradex_audit_id_state(Some(client_order_id))
     );
 }
 
@@ -5152,6 +5211,59 @@ mod tests {
         let feed = ParadexFixtureFeed::from_dir(&fixture_dir).expect("fixture feed");
         assert!(!feed.snapshot.bids.is_empty());
         assert!(!feed.snapshot.asks.is_empty());
+    }
+
+    #[test]
+    fn private_order_truth_audit_line_redacts_raw_identifiers() {
+        let line = paradex_private_order_truth_audit_line(
+            1,
+            "OPEN",
+            "raw-order-id-123",
+            Some("raw-client-id-456"),
+            9_999,
+        );
+
+        assert!(line.contains("PARADEX_PRIVATE_ORDER_TRUTH"));
+        assert!(line.contains("status=OPEN"));
+        assert!(line.contains("order_id_state=present_redacted"));
+        assert!(line.contains("client_id_state=present_redacted"));
+        assert!(line.contains("seq_no_state=present_redacted"));
+        assert!(!line.contains("raw-order-id-123"));
+        assert!(!line.contains("raw-client-id-456"));
+        assert!(!line.contains("9999"));
+
+        let sanitized_status =
+            paradex_private_order_truth_audit_line(2, "OPEN raw payload", "", None, 1);
+        assert!(sanitized_status.contains("status=other"));
+        assert!(sanitized_status.contains("order_id_state=absent"));
+        assert!(sanitized_status.contains("client_id_state=absent"));
+    }
+
+    #[test]
+    fn paradex_identity_audit_lines_redact_raw_identifiers() {
+        let unresolved =
+            paradex_open_identity_unresolved_audit_line("missing_native_id", "raw-client-id-789");
+        assert!(unresolved.contains("PARADEX_OPEN_IDENTITY_UNRESOLVED"));
+        assert!(unresolved.contains("reason=missing_native_id"));
+        assert!(unresolved.contains("client_id_state=present_redacted"));
+        assert!(!unresolved.contains("raw-client-id-789"));
+
+        let native_replace = paradex_native_replace_audit_line(
+            "private_ws",
+            "raw-order-id-abc",
+            Some("raw-client-id-def"),
+        );
+        assert!(native_replace.contains("PARADEX_NATIVE_REPLACE"));
+        assert!(native_replace.contains("submit_source=private_ws"));
+        assert!(native_replace.contains("order_id_state=present_redacted"));
+        assert!(native_replace.contains("client_id_state=present_redacted"));
+        assert!(!native_replace.contains("raw-order-id-abc"));
+        assert!(!native_replace.contains("raw-client-id-def"));
+
+        let sanitized_source =
+            paradex_native_replace_audit_line("private ws raw", "raw-order-id", None);
+        assert!(sanitized_source.contains("submit_source=other"));
+        assert!(sanitized_source.contains("client_id_state=absent"));
     }
 
     #[test]

@@ -218,8 +218,14 @@ fn phase51_lighter_place_error_context(
         );
     }
     format!(
-        "lighter place context market_id={} client_order_index={} price={} base_amount={} tif={:?} post_only={} reduce_only={}",
-        market_id, client_order_index, price, base_amount, time_in_force, post_only, reduce_only
+        "lighter place context market_id={} client_order_index_state={} price={} base_amount={} tif={:?} post_only={} reduce_only={}",
+        market_id,
+        if client_order_index > 0 { "present_redacted" } else { "absent" },
+        price,
+        base_amount,
+        time_in_force,
+        post_only,
+        reduce_only
     )
 }
 
@@ -244,8 +250,17 @@ fn phase51_lighter_replace_error_context(
         );
     }
     format!(
-        "lighter replace context market_id={} {}={} price={} base_amount={} client_order_id={}",
-        market_id, identity_label, raw_order_id, price, base_amount, requested_client_order_id
+        "lighter replace context market_id={} identity_kind={} identity_state={} price={} base_amount={} client_order_id_state={}",
+        market_id,
+        identity_label,
+        if raw_order_id > 0 { "present_redacted" } else { "absent" },
+        price,
+        base_amount,
+        if requested_client_order_id.trim().is_empty() {
+            "absent"
+        } else {
+            "present_redacted"
+        }
     )
 }
 
@@ -4209,6 +4224,40 @@ mod tests {
     }
 
     #[test]
+    fn phase51_lighter_default_live_contexts_redact_order_identifiers() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV,
+            PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV,
+        ]);
+
+        let place = phase51_lighter_place_error_context(
+            7,
+            4_242_424,
+            10012,
+            1234,
+            TimeInForce::Gtc,
+            true,
+            false,
+        );
+        assert!(place.contains("client_order_index_state=present_redacted"));
+        assert!(!place.contains("4242424"));
+
+        let replace = phase51_lighter_replace_error_context(
+            7,
+            "order_index",
+            123_456_789,
+            10012,
+            1234,
+            "client-raw",
+        );
+        assert!(replace.contains("identity_state=present_redacted"));
+        assert!(replace.contains("client_order_id_state=present_redacted"));
+        assert!(!replace.contains("123456789"));
+        assert!(!replace.contains("client-raw"));
+    }
+
+    #[test]
     fn phase51_lighter_strict_maker_only_orderbooks_logs_are_sanitized() {
         let attempt = phase51_lighter_strict_orderbooks_attempt_log("/api/v1/orderBooks", 3);
         assert!(attempt.contains("endpoint_family=orderBooks"));
@@ -7401,8 +7450,8 @@ impl LiveRestClient for LighterConnector {
                     ));
                 }
                 return Err(LiveGatewayError::fatal(format!(
-                    "lighter: client_order_id exceeds uint48 max client_order_id={} max={}",
-                    req.client_order_id, LIGHTER_CLIENT_ORDER_INDEX_MAX
+                    "lighter: client_order_id exceeds uint48 max client_order_id_state=present_redacted max={}",
+                    LIGHTER_CLIENT_ORDER_INDEX_MAX
                 )));
             }
             let (_, market_id) = self.resolve_market_id_and_symbol().await.map_err(|err| {
@@ -7466,8 +7515,7 @@ impl LiveRestClient for LighterConnector {
                             );
                         } else {
                             eprintln!(
-                                "WARN: Lighter emergency IOC signer timeout client_order_id={} timeout_ms={}",
-                                req.client_order_id,
+                                "WARN: Lighter emergency IOC signer timeout client_order_id_state=present_redacted timeout_ms={}",
                                 timeout_duration.as_millis()
                             );
                         }
@@ -7503,8 +7551,7 @@ impl LiveRestClient for LighterConnector {
                             );
                         } else {
                             eprintln!(
-                                "WARN: Lighter emergency IOC sendtx timeout client_order_id={} timeout_ms={}",
-                                req.client_order_id,
+                                "WARN: Lighter emergency IOC sendtx timeout client_order_id_state=present_redacted timeout_ms={}",
                                 timeout_duration.as_millis()
                             );
                         }
@@ -7731,8 +7778,8 @@ impl LiveRestClient for LighterConnector {
                 );
             } else {
                 eprintln!(
-                    "INFO: Lighter native replace submit market_id={} {}={} client_order_id={} price={} base_amount={}",
-                    market_id, identity_label, raw_order_id, requested_client_order_id, price, base_amount
+                    "INFO: Lighter native replace submit market_id={} identity_kind={} identity_state=present_redacted client_order_id_state=present_redacted price={} base_amount={}",
+                    market_id, identity_label, price, base_amount
                 );
             }
             let mut resp = self

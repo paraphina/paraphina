@@ -7252,6 +7252,13 @@ fn pending_place_guard_matches_order_id(
         || candidate.exchange_order_id.as_deref() == Some(order_id)
 }
 
+fn pending_place_guard_id_state(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some(value) if !value.trim().is_empty() => "present_redacted",
+        _ => "absent",
+    }
+}
+
 fn apply_pending_place_guard(
     cfg: &Config,
     state: &GlobalState,
@@ -7276,12 +7283,12 @@ fn apply_pending_place_guard(
             {
                 place_suppressed += 1;
                 eprintln!(
-                    "PENDING_PLACE_GUARD action=drop_place venue={} side={:?} pending_client_id={} pending_exchange_id={} desired_client_id={} age_ms={} grace_ms={}",
+                    "PENDING_PLACE_GUARD action=drop_place venue={} side={:?} pending_client_id_state={} pending_exchange_id_state={} desired_client_id_state={} age_ms={} grace_ms={}",
                     candidate.venue_id,
                     place.side,
-                    candidate.client_order_id.as_deref().unwrap_or("-"),
-                    candidate.exchange_order_id.as_deref().unwrap_or("-"),
-                    place.client_order_id.as_deref().unwrap_or("-"),
+                    pending_place_guard_id_state(candidate.client_order_id.as_deref()),
+                    pending_place_guard_id_state(candidate.exchange_order_id.as_deref()),
+                    pending_place_guard_id_state(place.client_order_id.as_deref()),
                     candidate.age_ms,
                     candidate.grace_ms
                 );
@@ -7300,12 +7307,12 @@ fn apply_pending_place_guard(
             {
                 cancel_suppressed += 1;
                 eprintln!(
-                    "PENDING_PLACE_GUARD action=drop_cancel venue={} side={:?} order_id={} pending_client_id={} pending_exchange_id={} age_ms={} grace_ms={}",
+                    "PENDING_PLACE_GUARD action=drop_cancel venue={} side={:?} order_id_state={} pending_client_id_state={} pending_exchange_id_state={} age_ms={} grace_ms={}",
                     candidate.venue_id,
                     candidate.side,
-                    cancel.order_id,
-                    candidate.client_order_id.as_deref().unwrap_or("-"),
-                    candidate.exchange_order_id.as_deref().unwrap_or("-"),
+                    pending_place_guard_id_state(Some(cancel.order_id.as_str())),
+                    pending_place_guard_id_state(candidate.client_order_id.as_deref()),
+                    pending_place_guard_id_state(candidate.exchange_order_id.as_deref()),
                     candidate.age_ms,
                     candidate.grace_ms
                 );
@@ -7325,12 +7332,12 @@ fn apply_pending_place_guard(
             {
                 replace_suppressed += 1;
                 eprintln!(
-                    "PENDING_PLACE_GUARD action=drop_replace venue={} side={:?} order_id={} pending_client_id={} pending_exchange_id={} age_ms={} grace_ms={}",
+                    "PENDING_PLACE_GUARD action=drop_replace venue={} side={:?} order_id_state={} pending_client_id_state={} pending_exchange_id_state={} age_ms={} grace_ms={}",
                     candidate.venue_id,
                     candidate.side,
-                    replace.order_id,
-                    candidate.client_order_id.as_deref().unwrap_or("-"),
-                    candidate.exchange_order_id.as_deref().unwrap_or("-"),
+                    pending_place_guard_id_state(Some(replace.order_id.as_str())),
+                    pending_place_guard_id_state(candidate.client_order_id.as_deref()),
+                    pending_place_guard_id_state(candidate.exchange_order_id.as_deref()),
                     candidate.age_ms,
                     candidate.grace_ms
                 );
@@ -17342,6 +17349,20 @@ mod tests {
 
         assert_eq!(suppressed, (1, 1, 0));
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn pending_place_guard_log_id_state_redacts_raw_identifiers() {
+        assert_eq!(
+            pending_place_guard_id_state(Some("co_pending_pdx_bid")),
+            "present_redacted"
+        );
+        assert_eq!(
+            pending_place_guard_id_state(Some("venue-order-123")),
+            "present_redacted"
+        );
+        assert_eq!(pending_place_guard_id_state(Some("  ")), "absent");
+        assert_eq!(pending_place_guard_id_state(None), "absent");
     }
 
     #[test]
