@@ -1923,6 +1923,71 @@ fn v2_remove_non_mm_order_creating_probe_intents(intents: &mut Vec<OrderIntent>)
     before.saturating_sub(intents.len())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2LiveCanaryOpenOrderCapEnforcement {
+    max_open_orders: usize,
+    outstanding_orders: usize,
+    allowed_new_order_creating: usize,
+    removed_order_creating: usize,
+}
+
+fn v2_live_canary_admission_authorized(cfg: &Config) -> bool {
+    cfg.v2_shadow.enabled
+        && cfg.v2_shadow.decision_mode == crate::config::V2DecisionMode::LiveCanaryAdmission
+        && cfg.v2_shadow.live_canary_admission_approved
+}
+
+fn v2_is_mm_order_creating_intent(intent: &OrderIntent) -> bool {
+    match intent {
+        OrderIntent::Place(place) => place.purpose == OrderPurpose::Mm,
+        OrderIntent::Replace(replace) => replace.purpose == OrderPurpose::Mm,
+        OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => false,
+    }
+}
+
+fn v2_enforce_live_canary_open_order_cap(
+    cfg: &Config,
+    state: &GlobalState,
+    max_open_orders: Option<usize>,
+    order_tx_pending: usize,
+    intents: &mut Vec<OrderIntent>,
+) -> Option<V2LiveCanaryOpenOrderCapEnforcement> {
+    if !v2_live_canary_admission_authorized(cfg) {
+        return None;
+    }
+    let max_open_orders = max_open_orders?;
+    let outstanding_orders = tracked_mm_open_order_count(state)
+        .max(live_mm_active_order_count(state))
+        .saturating_add(order_tx_pending);
+    let allowed_new_order_creating = max_open_orders.saturating_sub(outstanding_orders);
+    let before_order_creating = intents
+        .iter()
+        .filter(|intent| v2_is_mm_order_creating_intent(intent))
+        .count();
+    let mut remaining = allowed_new_order_creating;
+    intents.retain(|intent| {
+        if !v2_is_mm_order_creating_intent(intent) {
+            return true;
+        }
+        if remaining > 0 {
+            remaining -= 1;
+            true
+        } else {
+            false
+        }
+    });
+    let after_order_creating = intents
+        .iter()
+        .filter(|intent| v2_is_mm_order_creating_intent(intent))
+        .count();
+    Some(V2LiveCanaryOpenOrderCapEnforcement {
+        max_open_orders,
+        outstanding_orders,
+        allowed_new_order_creating,
+        removed_order_creating: before_order_creating.saturating_sub(after_order_creating),
+    })
+}
+
 fn v2_seed_single_lighter_mm_order_path_probe_intent(
     intents: &mut Vec<OrderIntent>,
     mm_plan_intents: &[OrderIntent],
@@ -6023,6 +6088,23 @@ pub async fn run_live_loop(
                 && v2_has_order_creating_probe_intent(&intents)
             {
                 v2_live_order_path_probe_attempted = true;
+            }
+        }
+        if let Some(enforcement) = v2_enforce_live_canary_open_order_cap(
+            cfg,
+            &state,
+            canary_max_open_orders,
+            tick_timing.order_tx_pending,
+            &mut intents,
+        ) {
+            if enforcement.removed_order_creating > 0 {
+                eprintln!(
+                    "[v2] live_canary_open_order_cap_suppressed_order_creating_intents count={} max_open_orders={} outstanding_orders={} allowed_new_order_creating={}",
+                    enforcement.removed_order_creating,
+                    enforcement.max_open_orders,
+                    enforcement.outstanding_orders,
+                    enforcement.allowed_new_order_creating
+                );
             }
         }
         if let Err(err) =
@@ -15686,6 +15768,106 @@ mod tests {
         assert!(
             matches!(&intents[1], OrderIntent::Place(place) if place.venue_id.as_ref() == "aster")
         );
+    }
+
+    fn v2_live_canary_admission_runner_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.v2_shadow.enabled = true;
+        cfg.v2_shadow.decision_mode = crate::config::V2DecisionMode::LiveCanaryAdmission;
+        cfg.v2_shadow.live_canary_admission_approved = true;
+        cfg
+    }
+
+    #[test]
+    fn v2_live_canary_open_order_cap_allows_only_remaining_capacity() {
+        let cfg = v2_live_canary_admission_runner_config();
+        let state = GlobalState::new(&cfg);
+        let mut intents = vec![
+            lighter_targeted_place_intent(Side::Buy, "bid"),
+            lighter_cancel_intent(),
+            lighter_targeted_place_intent(Side::Sell, "ask"),
+        ];
+
+        let enforcement =
+            v2_enforce_live_canary_open_order_cap(&cfg, &state, Some(1), 0, &mut intents)
+                .expect("v2 live-canary cap applies");
+
+        assert_eq!(
+            enforcement,
+            V2LiveCanaryOpenOrderCapEnforcement {
+                max_open_orders: 1,
+                outstanding_orders: 0,
+                allowed_new_order_creating: 1,
+                removed_order_creating: 1,
+            }
+        );
+        assert_eq!(intents.len(), 2);
+        assert!(matches!(intents[0], OrderIntent::Place(_)));
+        assert!(matches!(intents[1], OrderIntent::Cancel(_)));
+    }
+
+    #[test]
+    fn v2_live_canary_open_order_cap_blocks_new_orders_when_send_pending() {
+        let cfg = v2_live_canary_admission_runner_config();
+        let state = GlobalState::new(&cfg);
+        let mut intents = vec![
+            lighter_targeted_place_intent(Side::Buy, "bid"),
+            lighter_cancel_intent(),
+            lighter_targeted_replace_intent(Side::Sell, "replace"),
+        ];
+
+        let enforcement =
+            v2_enforce_live_canary_open_order_cap(&cfg, &state, Some(1), 1, &mut intents)
+                .expect("v2 live-canary cap applies");
+
+        assert_eq!(enforcement.outstanding_orders, 1);
+        assert_eq!(enforcement.allowed_new_order_creating, 0);
+        assert_eq!(enforcement.removed_order_creating, 2);
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(intents[0], OrderIntent::Cancel(_)));
+    }
+
+    #[test]
+    fn v2_live_canary_open_order_cap_blocks_new_orders_when_mm_order_tracked_open() {
+        let cfg = v2_live_canary_admission_runner_config();
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].mm_open_bid = Some(MmOpenOrder {
+            price: 100.0,
+            size: 0.01,
+            timestamp_ms: 1_700_000_000_000,
+            order_id: "redacted-test-order".to_string(),
+            client_order_id: None,
+            tracking_source: MmOpenTrackingSource::OpenSnapshot,
+        });
+        let mut intents = vec![
+            lighter_targeted_place_intent(Side::Buy, "bid"),
+            lighter_targeted_replace_intent(Side::Sell, "replace"),
+        ];
+
+        let enforcement =
+            v2_enforce_live_canary_open_order_cap(&cfg, &state, Some(1), 0, &mut intents)
+                .expect("v2 live-canary cap applies");
+
+        assert_eq!(enforcement.outstanding_orders, 1);
+        assert_eq!(enforcement.allowed_new_order_creating, 0);
+        assert_eq!(enforcement.removed_order_creating, 2);
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn v2_live_canary_open_order_cap_is_disabled_without_authorized_live_canary() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let mut intents = vec![
+            lighter_targeted_place_intent(Side::Buy, "bid"),
+            lighter_targeted_place_intent(Side::Sell, "ask"),
+        ];
+
+        assert_eq!(
+            v2_enforce_live_canary_open_order_cap(&cfg, &state, Some(1), 1, &mut intents),
+            None
+        );
+        assert_eq!(intents.len(), 2);
     }
 
     #[test]
