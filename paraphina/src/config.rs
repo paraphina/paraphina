@@ -87,6 +87,7 @@ pub enum V2DecisionMode {
     Off,
     Shadow,
     PaperAdmission,
+    LiveCanaryAdmission,
 }
 
 impl V2DecisionMode {
@@ -95,6 +96,7 @@ impl V2DecisionMode {
             V2DecisionMode::Off => "off",
             V2DecisionMode::Shadow => "shadow",
             V2DecisionMode::PaperAdmission => "paper_admission",
+            V2DecisionMode::LiveCanaryAdmission => "live_canary_admission",
         }
     }
 
@@ -103,6 +105,9 @@ impl V2DecisionMode {
             "off" => Some(V2DecisionMode::Off),
             "shadow" => Some(V2DecisionMode::Shadow),
             "paper_admission" | "paper-admission" => Some(V2DecisionMode::PaperAdmission),
+            "live_canary_admission" | "live-canary-admission" => {
+                Some(V2DecisionMode::LiveCanaryAdmission)
+            }
             _ => None,
         }
     }
@@ -115,6 +120,7 @@ pub struct V2ShadowConfig {
     pub output_path: String,
     pub pair_edge_enabled: bool,
     pub pair_conditioned_admission_enabled: bool,
+    pub live_canary_admission_approved: bool,
     pub fast_hedge_enabled: bool,
     pub order_intent_enabled: bool,
     pub require_phase51_gate: bool,
@@ -130,6 +136,7 @@ impl Default for V2ShadowConfig {
                 .to_string(),
             pair_edge_enabled: false,
             pair_conditioned_admission_enabled: false,
+            live_canary_admission_approved: false,
             fast_hedge_enabled: false,
             order_intent_enabled: false,
             require_phase51_gate: true,
@@ -1498,7 +1505,7 @@ impl Config {
     ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_MAX_ROWS (positive usize)
     ///   - PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED (bool)
     ///   - PARAPHINA_V2_ENABLE (bool)
-    ///   - PARAPHINA_V2_DECISION_MODE (off|shadow)
+    ///   - PARAPHINA_V2_DECISION_MODE (off|shadow|paper_admission|live_canary_admission)
     ///   - PARAPHINA_V2_PAIR_EDGE_ENABLE (bool)
     ///   - PARAPHINA_V2_OUTPUT_PATH (string)
     ///
@@ -2914,23 +2921,54 @@ impl Config {
         if let Ok(raw) = env::var("PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE") {
             match parse_bool_env(&raw) {
                 Some(enabled)
-                    if matches!(cfg.v2_shadow.decision_mode, V2DecisionMode::PaperAdmission) =>
+                    if matches!(
+                        cfg.v2_shadow.decision_mode,
+                        V2DecisionMode::PaperAdmission | V2DecisionMode::LiveCanaryAdmission
+                    ) =>
                 {
                     cfg.v2_shadow.pair_conditioned_admission_enabled = enabled;
                     eprintln!(
-                        "[config] PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE = {} (paper-only authority gate)",
+                        "[config] PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE = {} (V2 admission authority gate)",
                         cfg.v2_shadow.pair_conditioned_admission_enabled
                     );
                 }
                 Some(_) => {
                     eprintln!(
-                        "[config] PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE ignored outside paper_admission mode"
+                        "[config] PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE ignored outside admission authority modes"
                     );
                 }
                 None => {
                     eprintln!(
                         "[config] WARN: could not parse PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE = {:?} as bool; using default {}",
                         raw, cfg.v2_shadow.pair_conditioned_admission_enabled
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED") {
+            match parse_bool_env(&raw) {
+                Some(enabled)
+                    if matches!(
+                        cfg.v2_shadow.decision_mode,
+                        V2DecisionMode::LiveCanaryAdmission
+                    ) =>
+                {
+                    cfg.v2_shadow.live_canary_admission_approved = enabled;
+                    eprintln!(
+                        "[config] PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED = {} (live canary authority gate)",
+                        cfg.v2_shadow.live_canary_admission_approved
+                    );
+                }
+                Some(_) => {
+                    eprintln!(
+                        "[config] PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED ignored outside live_canary_admission mode"
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED = {:?} as bool; using default {}",
+                        raw, cfg.v2_shadow.live_canary_admission_approved
                     );
                 }
             }
@@ -2962,17 +3000,20 @@ impl Config {
         if let Ok(raw) = env::var("PARAPHINA_V2_ORDER_INTENT_ENABLE") {
             match parse_bool_env(&raw) {
                 Some(enabled)
-                    if matches!(cfg.v2_shadow.decision_mode, V2DecisionMode::PaperAdmission) =>
+                    if matches!(
+                        cfg.v2_shadow.decision_mode,
+                        V2DecisionMode::PaperAdmission | V2DecisionMode::LiveCanaryAdmission
+                    ) =>
                 {
                     cfg.v2_shadow.order_intent_enabled = enabled;
                     eprintln!(
-                        "[config] PARAPHINA_V2_ORDER_INTENT_ENABLE = {} (paper-only baseline-intent filter)",
+                        "[config] PARAPHINA_V2_ORDER_INTENT_ENABLE = {} (baseline-intent filter)",
                         cfg.v2_shadow.order_intent_enabled
                     );
                 }
                 Some(_) => {
                     eprintln!(
-                        "[config] PARAPHINA_V2_ORDER_INTENT_ENABLE ignored outside paper_admission mode"
+                        "[config] PARAPHINA_V2_ORDER_INTENT_ENABLE ignored outside admission authority modes"
                     );
                 }
                 None => {
@@ -3010,7 +3051,7 @@ impl Config {
                 eprintln!("[config] WARN: PARAPHINA_V2_OUTPUT_PATH was empty; using default");
             } else {
                 cfg.v2_shadow.output_path = raw.trim().to_string();
-                eprintln!("[config] PARAPHINA_V2_OUTPUT_PATH set (shadow evidence only)");
+                eprintln!("[config] PARAPHINA_V2_OUTPUT_PATH set (V2 evidence output)");
             }
         }
 
@@ -3234,6 +3275,7 @@ mod tests {
         const PAIR_EDGE_KEY: &str = "PARAPHINA_V2_PAIR_EDGE_ENABLE";
         const OUTPUT_PATH_KEY: &str = "PARAPHINA_V2_OUTPUT_PATH";
         const ADMISSION_KEY: &str = "PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE";
+        const LIVE_CANARY_APPROVAL_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED";
         const FAST_HEDGE_KEY: &str = "PARAPHINA_V2_FAST_HEDGE_ENABLE";
         const ORDER_INTENT_KEY: &str = "PARAPHINA_V2_ORDER_INTENT_ENABLE";
         const REQUIRE_PHASE51_KEY: &str = "PARAPHINA_V2_REQUIRE_PHASE51_GATE";
@@ -3244,6 +3286,7 @@ mod tests {
         let _pair_edge = EnvGuard::new(PAIR_EDGE_KEY);
         let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
         let _admission = EnvGuard::new(ADMISSION_KEY);
+        let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
         let _fast_hedge = EnvGuard::new(FAST_HEDGE_KEY);
         let _order_intent = EnvGuard::new(ORDER_INTENT_KEY);
         let _require_phase51 = EnvGuard::new(REQUIRE_PHASE51_KEY);
@@ -3254,6 +3297,7 @@ mod tests {
             PAIR_EDGE_KEY,
             OUTPUT_PATH_KEY,
             ADMISSION_KEY,
+            LIVE_CANARY_APPROVAL_KEY,
             FAST_HEDGE_KEY,
             ORDER_INTENT_KEY,
             REQUIRE_PHASE51_KEY,
@@ -3265,6 +3309,7 @@ mod tests {
         assert_eq!(cfg.v2_shadow, V2ShadowConfig::default());
 
         env::set_var(ADMISSION_KEY, "true");
+        env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
         env::set_var(FAST_HEDGE_KEY, "true");
         env::set_var(ORDER_INTENT_KEY, "true");
         env::set_var(REQUIRE_PHASE51_KEY, "false");
@@ -3272,6 +3317,10 @@ mod tests {
         assert!(
             !cfg.v2_shadow.pair_conditioned_admission_enabled,
             "V2 pair-conditioned admission must stay hard-disabled in the shadow skeleton"
+        );
+        assert!(
+            !cfg.v2_shadow.live_canary_admission_approved,
+            "V2 live-canary admission approval must stay disabled outside live_canary_admission"
         );
         assert!(
             !cfg.v2_shadow.fast_hedge_enabled,
@@ -3296,6 +3345,7 @@ mod tests {
         const PAIR_EDGE_KEY: &str = "PARAPHINA_V2_PAIR_EDGE_ENABLE";
         const OUTPUT_PATH_KEY: &str = "PARAPHINA_V2_OUTPUT_PATH";
         const ADMISSION_KEY: &str = "PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE";
+        const LIVE_CANARY_APPROVAL_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED";
         const ORDER_INTENT_KEY: &str = "PARAPHINA_V2_ORDER_INTENT_ENABLE";
 
         let _lock = env_lock().lock().unwrap();
@@ -3304,6 +3354,7 @@ mod tests {
         let _pair_edge = EnvGuard::new(PAIR_EDGE_KEY);
         let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
         let _admission = EnvGuard::new(ADMISSION_KEY);
+        let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
         let _order_intent = EnvGuard::new(ORDER_INTENT_KEY);
 
         env::set_var(ENABLED_KEY, "yes");
@@ -3311,6 +3362,7 @@ mod tests {
         env::set_var(PAIR_EDGE_KEY, "true");
         env::set_var(OUTPUT_PATH_KEY, "/tmp/paraphina_v2_shadow_test.jsonl");
         env::set_var(ADMISSION_KEY, "true");
+        env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
         env::set_var(ORDER_INTENT_KEY, "true");
 
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
@@ -3320,6 +3372,10 @@ mod tests {
         assert!(
             !cfg.v2_shadow.pair_conditioned_admission_enabled,
             "shadow mode must ignore paper authority gates"
+        );
+        assert!(
+            !cfg.v2_shadow.live_canary_admission_approved,
+            "shadow mode must ignore live-canary authority gates"
         );
         assert!(
             !cfg.v2_shadow.order_intent_enabled,
@@ -3364,6 +3420,7 @@ mod tests {
         const MODE_KEY: &str = "PARAPHINA_V2_DECISION_MODE";
         const PAIR_EDGE_KEY: &str = "PARAPHINA_V2_PAIR_EDGE_ENABLE";
         const ADMISSION_KEY: &str = "PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE";
+        const LIVE_CANARY_APPROVAL_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED";
         const FAST_HEDGE_KEY: &str = "PARAPHINA_V2_FAST_HEDGE_ENABLE";
         const ORDER_INTENT_KEY: &str = "PARAPHINA_V2_ORDER_INTENT_ENABLE";
         const REQUIRE_PHASE51_KEY: &str = "PARAPHINA_V2_REQUIRE_PHASE51_GATE";
@@ -3373,6 +3430,7 @@ mod tests {
         let _mode = EnvGuard::new(MODE_KEY);
         let _pair_edge = EnvGuard::new(PAIR_EDGE_KEY);
         let _admission = EnvGuard::new(ADMISSION_KEY);
+        let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
         let _fast_hedge = EnvGuard::new(FAST_HEDGE_KEY);
         let _order_intent = EnvGuard::new(ORDER_INTENT_KEY);
         let _require_phase51 = EnvGuard::new(REQUIRE_PHASE51_KEY);
@@ -3381,6 +3439,7 @@ mod tests {
         env::set_var(MODE_KEY, "paper_admission");
         env::set_var(PAIR_EDGE_KEY, "true");
         env::set_var(ADMISSION_KEY, "true");
+        env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
         env::set_var(FAST_HEDGE_KEY, "false");
         env::set_var(ORDER_INTENT_KEY, "true");
         env::set_var(REQUIRE_PHASE51_KEY, "true");
@@ -3390,6 +3449,10 @@ mod tests {
         assert_eq!(cfg.v2_shadow.decision_mode, V2DecisionMode::PaperAdmission);
         assert!(cfg.v2_shadow.pair_edge_enabled);
         assert!(cfg.v2_shadow.pair_conditioned_admission_enabled);
+        assert!(
+            !cfg.v2_shadow.live_canary_admission_approved,
+            "paper_admission mode must ignore live-canary approval"
+        );
         assert!(!cfg.v2_shadow.fast_hedge_enabled);
         assert!(cfg.v2_shadow.order_intent_enabled);
         assert!(cfg.v2_shadow.require_phase51_gate);
@@ -3404,6 +3467,58 @@ mod tests {
         assert!(
             !cfg.v2_shadow.fast_hedge_enabled,
             "fast hedge remains out of scope for the first authority tranche"
+        );
+    }
+
+    #[test]
+    fn v2_live_canary_admission_env_requires_explicit_gates() {
+        use std::env;
+
+        const ENABLED_KEY: &str = "PARAPHINA_V2_ENABLE";
+        const MODE_KEY: &str = "PARAPHINA_V2_DECISION_MODE";
+        const PAIR_EDGE_KEY: &str = "PARAPHINA_V2_PAIR_EDGE_ENABLE";
+        const ADMISSION_KEY: &str = "PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE";
+        const LIVE_CANARY_APPROVAL_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED";
+        const FAST_HEDGE_KEY: &str = "PARAPHINA_V2_FAST_HEDGE_ENABLE";
+        const ORDER_INTENT_KEY: &str = "PARAPHINA_V2_ORDER_INTENT_ENABLE";
+        const REQUIRE_PHASE51_KEY: &str = "PARAPHINA_V2_REQUIRE_PHASE51_GATE";
+
+        let _lock = env_lock().lock().unwrap();
+        let _enabled = EnvGuard::new(ENABLED_KEY);
+        let _mode = EnvGuard::new(MODE_KEY);
+        let _pair_edge = EnvGuard::new(PAIR_EDGE_KEY);
+        let _admission = EnvGuard::new(ADMISSION_KEY);
+        let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
+        let _fast_hedge = EnvGuard::new(FAST_HEDGE_KEY);
+        let _order_intent = EnvGuard::new(ORDER_INTENT_KEY);
+        let _require_phase51 = EnvGuard::new(REQUIRE_PHASE51_KEY);
+
+        env::set_var(ENABLED_KEY, "true");
+        env::set_var(MODE_KEY, "live_canary_admission");
+        env::set_var(PAIR_EDGE_KEY, "true");
+        env::set_var(ADMISSION_KEY, "true");
+        env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
+        env::set_var(FAST_HEDGE_KEY, "true");
+        env::set_var(ORDER_INTENT_KEY, "true");
+        env::set_var(REQUIRE_PHASE51_KEY, "false");
+
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert!(cfg.v2_shadow.enabled);
+        assert_eq!(
+            cfg.v2_shadow.decision_mode,
+            V2DecisionMode::LiveCanaryAdmission
+        );
+        assert!(cfg.v2_shadow.pair_edge_enabled);
+        assert!(cfg.v2_shadow.pair_conditioned_admission_enabled);
+        assert!(cfg.v2_shadow.live_canary_admission_approved);
+        assert!(cfg.v2_shadow.order_intent_enabled);
+        assert!(
+            cfg.v2_shadow.require_phase51_gate,
+            "Phase 5.1 gate cannot be disabled by env"
+        );
+        assert!(
+            !cfg.v2_shadow.fast_hedge_enabled,
+            "fast hedge remains disabled for live-canary admission"
         );
     }
 

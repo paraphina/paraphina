@@ -5870,14 +5870,14 @@ pub async fn run_live_loop(
             .and_then(|hooks| hooks.telemetry.as_ref())
             .map(|telemetry| telemetry.execution_mode)
             .unwrap_or("unknown");
-        if let Err(err) = crate::v2::apply_paper_admission_filter(
+        if let Err(err) = crate::v2::apply_admission_filter(
             &cfg.v2_shadow,
             v2_execution_mode,
             now_ms,
             &mut intents,
         ) {
             eprintln!(
-                "[v2] paper admission filter failed reason={}",
+                "[v2] admission filter failed reason={}",
                 err.sanitized_reason()
             );
             intents.clear();
@@ -14905,7 +14905,10 @@ mod tests {
         f()
     }
 
-    fn with_phase51_lighter_baseline_cleanup_only_env<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    fn with_phase51_lighter_baseline_cleanup_only_env<R>(
+        enabled: bool,
+        f: impl FnOnce() -> R,
+    ) -> R {
         let keys = [PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV];
         let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
         let _guard = EnvGuard::new(&keys);
@@ -15083,7 +15086,11 @@ mod tests {
                 place.post_only = false;
                 place.reduce_only = true;
             }
-            let mut intents = vec![lighter_place_intent(), cleanup_exit, lighter_cancel_intent()];
+            let mut intents = vec![
+                lighter_place_intent(),
+                cleanup_exit,
+                lighter_cancel_intent(),
+            ];
             assert_eq!(
                 phase51_lighter_baseline_cleanup_only_filter_intents(&cfg, &mut intents),
                 Ok(1)

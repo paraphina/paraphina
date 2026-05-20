@@ -13,12 +13,23 @@ def _gate_state(**overrides: bool) -> dict[str, bool]:
     state = {
         "enabled": True,
         "decision_mode_is_paper_admission": True,
+        "decision_mode_is_live_canary_admission": False,
         "execution_mode_is_paper": True,
+        "execution_mode_is_live": False,
         "pair_edge_enabled": True,
         "pair_conditioned_admission_enabled": True,
         "order_intent_enabled": True,
         "fast_hedge_disabled": True,
         "require_phase51_gate": True,
+        "live_canary_admission_approved": False,
+        "live_canary_mode_enabled": False,
+        "live_canary_profile_metadata_present": False,
+        "live_canary_max_position_present": False,
+        "live_canary_max_gross_position_present": False,
+        "live_canary_max_abs_venue_position_present": False,
+        "live_canary_max_open_orders_present": False,
+        "live_canary_post_only_enforced": False,
+        "live_canary_reduce_only_not_enforced": False,
     }
     state.update(overrides)
     return state

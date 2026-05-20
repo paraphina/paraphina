@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Validate V2 paper-only admission decision evidence.
+"""Validate V2 admission decision evidence.
 
 This validator is intentionally separate from the strict shadow validator.
-It accepts only the first authority tranche: paper-only filtering of existing
-baseline MM intents. It rejects live/capital authority, synthesized intent
-authority, false blocker clearance, and raw identifier leakage.
+It accepts paper-only filtering of existing baseline MM intents and the explicit
+live-canary ranked-admission tranche. It rejects synthesized intent authority,
+false blocker clearance, pressure-complete claims, and raw identifier leakage.
 """
 
 from __future__ import annotations
@@ -49,6 +49,8 @@ class V2AuthoritySummary:
     pressure_complete_claim_any: bool = False
     can_create_new_intents_any: bool = False
     can_mutate_live_orders_any: bool = False
+    paper_only_rows: int = 0
+    live_canary_rows: int = 0
 
     def to_manifest_validation(self) -> dict[str, Any]:
         return {
@@ -61,6 +63,8 @@ class V2AuthoritySummary:
             "pressure_complete_claim_any": self.pressure_complete_claim_any,
             "can_create_new_intents_any": self.can_create_new_intents_any,
             "can_mutate_live_orders_any": self.can_mutate_live_orders_any,
+            "paper_only_rows": self.paper_only_rows,
+            "live_canary_rows": self.live_canary_rows,
         }
 
 
@@ -87,22 +91,75 @@ def _contains_raw_marker(value: Any) -> bool:
     return any(marker in text for marker in RAW_MARKERS)
 
 
-def _validate_gate_state(row: dict[str, Any], line: int) -> bool:
+def _validate_gate_state(row: dict[str, Any], line: int, live_canary: bool) -> bool:
     gate_state = row.get("gate_state")
     _require(isinstance(gate_state, dict), line, "gate_state must be object")
     expected_bool_fields = [
         "enabled",
         "decision_mode_is_paper_admission",
+        "decision_mode_is_live_canary_admission",
         "execution_mode_is_paper",
+        "execution_mode_is_live",
         "pair_edge_enabled",
         "pair_conditioned_admission_enabled",
         "order_intent_enabled",
         "fast_hedge_disabled",
         "require_phase51_gate",
+        "live_canary_admission_approved",
+        "live_canary_mode_enabled",
+        "live_canary_profile_metadata_present",
+        "live_canary_max_position_present",
+        "live_canary_max_gross_position_present",
+        "live_canary_max_abs_venue_position_present",
+        "live_canary_max_open_orders_present",
+        "live_canary_post_only_enforced",
+        "live_canary_reduce_only_not_enforced",
     ]
     for field in expected_bool_fields:
         _require(isinstance(gate_state.get(field), bool), line, f"gate_state.{field} must be bool")
-    return all(gate_state[field] for field in expected_bool_fields)
+    common = (
+        gate_state["enabled"]
+        and gate_state["pair_edge_enabled"]
+        and gate_state["pair_conditioned_admission_enabled"]
+        and gate_state["order_intent_enabled"]
+        and gate_state["fast_hedge_disabled"]
+        and gate_state["require_phase51_gate"]
+    )
+    paper_authority = (
+        gate_state["decision_mode_is_paper_admission"]
+        and gate_state["execution_mode_is_paper"]
+    )
+    live_canary_authority = (
+        gate_state["decision_mode_is_live_canary_admission"]
+        and gate_state["execution_mode_is_live"]
+        and gate_state["live_canary_admission_approved"]
+        and gate_state["live_canary_mode_enabled"]
+        and gate_state["live_canary_profile_metadata_present"]
+        and gate_state["live_canary_max_position_present"]
+        and gate_state["live_canary_max_gross_position_present"]
+        and gate_state["live_canary_max_abs_venue_position_present"]
+        and gate_state["live_canary_max_open_orders_present"]
+        and gate_state["live_canary_post_only_enforced"]
+        and gate_state["live_canary_reduce_only_not_enforced"]
+    )
+    _require(
+        not (paper_authority and live_canary_authority),
+        line,
+        "gate_state cannot satisfy paper and live-canary authority at once",
+    )
+    if live_canary:
+        _require(
+            gate_state["decision_mode_is_live_canary_admission"],
+            line,
+            "live-canary row must use live-canary decision gate field",
+        )
+    else:
+        _require(
+            gate_state["decision_mode_is_paper_admission"],
+            line,
+            "paper row must use paper decision gate field",
+        )
+    return common and (paper_authority or live_canary_authority)
 
 
 def _validate_pair_edges(row: dict[str, Any], line: int) -> None:
@@ -152,12 +209,25 @@ def _validate_admitted_candidates(row: dict[str, Any], line: int, gate_satisfied
 def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -> None:
     _require(row.get("event_type") == EXPECTED_EVENT_TYPE, line, "event_type invalid")
     _require(row.get("schema_version") == 1, line, "schema_version must be 1")
-    _require(row.get("decision_mode") == "paper_admission", line, "decision_mode must be paper_admission")
-    _require(row.get("execution_mode") == "paper", line, "execution_mode must be paper")
-    _require(row.get("authority_scope") == "paper_only", line, "authority_scope must be paper_only")
+    decision_mode = row.get("decision_mode")
+    _require(
+        decision_mode in {"paper_admission", "live_canary_admission"},
+        line,
+        "decision_mode must be paper_admission or live_canary_admission",
+    )
+    live_canary = decision_mode == "live_canary_admission"
+    if live_canary:
+        _require(row.get("execution_mode") == "live", line, "live_canary_admission requires execution_mode live")
+        _require(
+            row.get("authority_scope") == "live_canary_ranked_admission",
+            line,
+            "live_canary_admission requires live_canary_ranked_admission authority_scope",
+        )
+    else:
+        _require(row.get("execution_mode") == "paper", line, "paper_admission requires execution_mode paper")
+        _require(row.get("authority_scope") == "paper_only", line, "paper_admission requires authority_scope paper_only")
     _require(row.get("admission_status") in ALLOWED_STATUS, line, "admission_status invalid")
     _require(row.get("can_create_new_intents") is False, line, "can_create_new_intents must be false")
-    _require(row.get("can_mutate_live_orders") is False, line, "can_mutate_live_orders must be false")
     _require(row.get("ranking_feature_only") is False, line, "ranking_feature_only must be false")
     _require(row.get("pressure_complete_claim") is False, line, "pressure_complete_claim must be false")
     _require(row.get("blocker_cleared") is False, line, "blocker_cleared must be false")
@@ -169,12 +239,13 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
     )
     _require(not _contains_raw_marker(row), line, "raw identifier or secret marker present")
 
-    gate_satisfied = _validate_gate_state(row, line)
+    gate_satisfied = _validate_gate_state(row, line, live_canary)
     _require(
         row.get("can_filter_existing_intents") is gate_satisfied,
         line,
         "can_filter_existing_intents must match satisfied gate state",
     )
+    _require(row.get("can_mutate_live_orders") is False, line, "can_mutate_live_orders must be false")
     if row.get("admission_status") == "ADMITTED":
         _require(row.get("ranking_is_admission") is True, line, "ADMITTED row must use ranking as admission")
         if row.get("pair_edge_is_admission") is True:
@@ -219,6 +290,10 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
     summary.pressure_complete_claim_any = summary.pressure_complete_claim_any or row["pressure_complete_claim"]
     summary.can_create_new_intents_any = summary.can_create_new_intents_any or row["can_create_new_intents"]
     summary.can_mutate_live_orders_any = summary.can_mutate_live_orders_any or row["can_mutate_live_orders"]
+    if live_canary:
+        summary.live_canary_rows += 1
+    else:
+        summary.paper_only_rows += 1
 
 
 def validate_v2_authority_decisions(path: Path) -> V2AuthoritySummary:
@@ -241,29 +316,32 @@ def validate_v2_authority_decisions(path: Path) -> V2AuthoritySummary:
 
 def write_manifest(decision_path: Path, manifest_path: Path, summary: V2AuthoritySummary) -> None:
     artifact_root = manifest_path.parent
+    live_canary = summary.live_canary_rows > 0
     manifest = {
         "artifact_type": "v2_authority_decision_evidence_manifest",
         "schema_version": 1,
         "decision_validation_status": "pass",
         "files": [_file_info(decision_path, artifact_root)],
         "governance": {
-            "gate_status": "PAPER_ONLY",
+            "gate_status": "LIVE_CANARY" if live_canary else "PAPER_ONLY",
             "shadow_only": False,
-            "paper_only": True,
+            "paper_only": summary.paper_only_rows > 0 and not live_canary,
             "approved_for_live": False,
-            "approved_for_canary": False,
+            "approved_for_canary": live_canary,
             "approved_for_capital_escalation": False,
-            "live_orders_allowed": False,
-            "capital_change_allowed": False,
+            "live_orders_allowed": live_canary,
+            "capital_change_allowed": live_canary,
             "blocker_cleared": False,
             "pressure_complete_claim": False,
         },
         "v2_authority_contract": {
-            "authority_scope": "paper_only",
+            "authority_scope": "live_canary_ranked_admission" if live_canary else "paper_only",
             "can_filter_existing_intents": True,
             "can_create_new_intents": False,
             "can_mutate_live_orders": False,
             "baseline_intent_filter_only": True,
+            "full_live_promotion": False,
+            "fast_hedge_enabled": False,
         },
         "validation": summary.to_manifest_validation(),
     }

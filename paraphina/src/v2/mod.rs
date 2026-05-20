@@ -1,9 +1,11 @@
-//! V2 arbitrage-aware decision evidence and paper-only admission skeleton.
+//! V2 arbitrage-aware decision evidence and gated admission skeleton.
 //!
 //! Shadow mode is intentionally read-only with respect to order flow. The
 //! paper-admission tranche may only filter existing baseline MM order-creating
-//! intents behind explicit gates. It must not construct prices, sizes, client
-//! IDs, raw order IDs, venue handles, or live transport requests.
+//! intents behind explicit gates. The live-canary admission tranche uses the
+//! same baseline-intent filter only after live/canary profile gates are present.
+//! It must not construct prices, sizes, client IDs, raw order IDs, venue handles,
+//! or live transport requests.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -104,25 +106,60 @@ pub struct V2ShadowDecision {
 pub struct V2AdmissionGateState {
     pub enabled: bool,
     pub decision_mode_is_paper_admission: bool,
+    pub decision_mode_is_live_canary_admission: bool,
     pub execution_mode_is_paper: bool,
+    pub execution_mode_is_live: bool,
     pub pair_edge_enabled: bool,
     pub pair_conditioned_admission_enabled: bool,
     pub order_intent_enabled: bool,
     pub fast_hedge_disabled: bool,
     pub require_phase51_gate: bool,
+    pub live_canary_admission_approved: bool,
+    pub live_canary_mode_enabled: bool,
+    pub live_canary_profile_metadata_present: bool,
+    pub live_canary_max_position_present: bool,
+    pub live_canary_max_gross_position_present: bool,
+    pub live_canary_max_abs_venue_position_present: bool,
+    pub live_canary_max_open_orders_present: bool,
+    pub live_canary_post_only_enforced: bool,
+    pub live_canary_reduce_only_not_enforced: bool,
 }
 
 impl V2AdmissionGateState {
-    fn satisfied(&self) -> bool {
+    pub fn satisfied(&self) -> bool {
+        let paper_authority = self.decision_mode_is_paper_admission && self.execution_mode_is_paper;
+        let live_canary_authority = self.decision_mode_is_live_canary_admission
+            && self.execution_mode_is_live
+            && self.live_canary_admission_approved
+            && self.live_canary_mode_enabled
+            && self.live_canary_profile_metadata_present
+            && self.live_canary_max_position_present
+            && self.live_canary_max_gross_position_present
+            && self.live_canary_max_abs_venue_position_present
+            && self.live_canary_max_open_orders_present
+            && self.live_canary_post_only_enforced
+            && self.live_canary_reduce_only_not_enforced;
+
         self.enabled
-            && self.decision_mode_is_paper_admission
-            && self.execution_mode_is_paper
+            && (paper_authority || live_canary_authority)
             && self.pair_edge_enabled
             && self.pair_conditioned_admission_enabled
             && self.order_intent_enabled
             && self.fast_hedge_disabled
             && self.require_phase51_gate
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct V2AdmissionRuntimeContext {
+    pub live_canary_mode_enabled: bool,
+    pub live_canary_profile_metadata_present: bool,
+    pub live_canary_max_position_present: bool,
+    pub live_canary_max_gross_position_present: bool,
+    pub live_canary_max_abs_venue_position_present: bool,
+    pub live_canary_max_open_orders_present: bool,
+    pub live_canary_post_only_enforced: bool,
+    pub live_canary_reduce_only_not_enforced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -200,19 +237,105 @@ pub fn v2_paper_admission_mode_requested(config: &V2ShadowConfig) -> bool {
     config.enabled && matches!(config.decision_mode, V2DecisionMode::PaperAdmission)
 }
 
-fn admission_gate_state(config: &V2ShadowConfig, execution_mode: &str) -> V2AdmissionGateState {
+pub fn v2_live_canary_admission_mode_requested(config: &V2ShadowConfig) -> bool {
+    config.enabled && matches!(config.decision_mode, V2DecisionMode::LiveCanaryAdmission)
+}
+
+pub fn v2_admission_mode_requested(config: &V2ShadowConfig) -> bool {
+    v2_paper_admission_mode_requested(config) || v2_live_canary_admission_mode_requested(config)
+}
+
+fn env_flag_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_present(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| !raw.trim().is_empty())
+        .unwrap_or(false)
+}
+
+impl V2AdmissionRuntimeContext {
+    pub fn from_env() -> Self {
+        let live_canary_profile_metadata_present =
+            env_present("PARAPHINA_RUNTIME_CANARY_PROFILE_PATH")
+                && env_present("PARAPHINA_RUNTIME_CANARY_PROFILE_SHA256");
+        Self {
+            live_canary_mode_enabled: env_flag_true("PARAPHINA_CANARY_MODE")
+                || live_canary_profile_metadata_present,
+            live_canary_profile_metadata_present,
+            live_canary_max_position_present: env_present(
+                "PARAPHINA_RUNTIME_CANARY_MAX_POSITION_TAO",
+            ) || env_present("PARAPHINA_CANARY_MAX_POSITION_TAO"),
+            live_canary_max_gross_position_present: env_present(
+                "PARAPHINA_RUNTIME_CANARY_MAX_GROSS_POSITION_TAO",
+            ) || env_present(
+                "PARAPHINA_CANARY_MAX_GROSS_POSITION_TAO",
+            ),
+            live_canary_max_abs_venue_position_present: env_present(
+                "PARAPHINA_RUNTIME_CANARY_MAX_ABS_VENUE_POSITION_TAO",
+            ) || env_present(
+                "PARAPHINA_CANARY_MAX_ABS_VENUE_POSITION_TAO",
+            ),
+            live_canary_max_open_orders_present: env_present(
+                "PARAPHINA_RUNTIME_CANARY_MAX_OPEN_ORDERS",
+            ) || env_present(
+                "PARAPHINA_CANARY_MAX_OPEN_ORDERS",
+            ),
+            live_canary_post_only_enforced: env_flag_true(
+                "PARAPHINA_RUNTIME_CANARY_ENFORCE_POST_ONLY",
+            ) || env_flag_true(
+                "PARAPHINA_CANARY_ENFORCE_POST_ONLY",
+            ),
+            live_canary_reduce_only_not_enforced: !env_flag_true(
+                "PARAPHINA_RUNTIME_CANARY_ENFORCE_REDUCE_ONLY",
+            ) && !env_flag_true(
+                "PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY",
+            ),
+        }
+    }
+}
+
+pub fn admission_gate_state(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    runtime_context: &V2AdmissionRuntimeContext,
+) -> V2AdmissionGateState {
     V2AdmissionGateState {
         enabled: config.enabled,
         decision_mode_is_paper_admission: matches!(
             config.decision_mode,
             V2DecisionMode::PaperAdmission
         ),
+        decision_mode_is_live_canary_admission: matches!(
+            config.decision_mode,
+            V2DecisionMode::LiveCanaryAdmission
+        ),
         execution_mode_is_paper: execution_mode == "paper",
+        execution_mode_is_live: execution_mode == "live",
         pair_edge_enabled: config.pair_edge_enabled,
         pair_conditioned_admission_enabled: config.pair_conditioned_admission_enabled,
         order_intent_enabled: config.order_intent_enabled,
         fast_hedge_disabled: !config.fast_hedge_enabled,
         require_phase51_gate: config.require_phase51_gate,
+        live_canary_admission_approved: config.live_canary_admission_approved,
+        live_canary_mode_enabled: runtime_context.live_canary_mode_enabled,
+        live_canary_profile_metadata_present: runtime_context.live_canary_profile_metadata_present,
+        live_canary_max_position_present: runtime_context.live_canary_max_position_present,
+        live_canary_max_gross_position_present: runtime_context
+            .live_canary_max_gross_position_present,
+        live_canary_max_abs_venue_position_present: runtime_context
+            .live_canary_max_abs_venue_position_present,
+        live_canary_max_open_orders_present: runtime_context.live_canary_max_open_orders_present,
+        live_canary_post_only_enforced: runtime_context.live_canary_post_only_enforced,
+        live_canary_reduce_only_not_enforced: runtime_context.live_canary_reduce_only_not_enforced,
     }
 }
 
@@ -265,17 +388,18 @@ pub fn evaluate_shadow_decision(
     })
 }
 
-pub fn evaluate_paper_admission_decision(
+pub fn evaluate_admission_decision_with_context(
     config: &V2ShadowConfig,
     execution_mode: &str,
     now_ms: TimestampMs,
     baseline_plan_intents: &[OrderIntent],
+    runtime_context: &V2AdmissionRuntimeContext,
 ) -> Option<V2AdmissionDecision> {
-    if !v2_paper_admission_mode_requested(config) {
+    if !v2_admission_mode_requested(config) {
         return None;
     }
 
-    let gate_state = admission_gate_state(config, execution_mode);
+    let gate_state = admission_gate_state(config, execution_mode, runtime_context);
     let candidates = extract_shadow_candidates_from_intents(baseline_plan_intents);
     let rankings = rank_shadow_candidates(&candidates);
     let pair_edges = if config.pair_edge_enabled {
@@ -316,14 +440,20 @@ pub fn evaluate_paper_admission_decision(
     let baseline_mm_count = count_baseline_mm_order_creating_intents(baseline_plan_intents);
     let gate_satisfied = gate_state.satisfied();
     let has_admitted_candidates = !admitted_candidates.is_empty();
-    let admission_reason = if !gate_satisfied {
-        "paper_admission_gate_not_satisfied"
-    } else if !has_admitted_candidates {
-        "no_positive_ranked_candidates"
-    } else if positive_pair_edge {
-        "paper_positive_pair_edge_ranked_admission"
-    } else {
-        "paper_positive_ranked_admission"
+    let live_canary_mode = matches!(config.decision_mode, V2DecisionMode::LiveCanaryAdmission);
+    let admission_reason = match (
+        live_canary_mode,
+        gate_satisfied,
+        has_admitted_candidates,
+        positive_pair_edge,
+    ) {
+        (true, false, _, _) => "live_canary_admission_gate_not_satisfied",
+        (false, false, _, _) => "paper_admission_gate_not_satisfied",
+        (_, true, false, _) => "no_positive_ranked_candidates",
+        (true, true, true, true) => "live_canary_positive_pair_edge_ranked_admission",
+        (false, true, true, true) => "paper_positive_pair_edge_ranked_admission",
+        (true, true, true, false) => "live_canary_positive_ranked_admission",
+        (false, true, true, false) => "paper_positive_ranked_admission",
     };
     let output_count = admitted_candidates.len();
     let admitted = output_count > 0;
@@ -339,7 +469,11 @@ pub fn evaluate_paper_admission_decision(
         now_ms,
         decision_mode: config.decision_mode.as_str(),
         execution_mode: execution_mode.to_string(),
-        authority_scope: "paper_only",
+        authority_scope: if live_canary_mode {
+            "live_canary_ranked_admission"
+        } else {
+            "paper_only"
+        },
         admission_status: if admitted { "ADMITTED" } else { "HOLD" },
         admission_reason,
         can_filter_existing_intents: gate_satisfied,
@@ -361,6 +495,39 @@ pub fn evaluate_paper_admission_decision(
     })
 }
 
+pub fn evaluate_paper_admission_decision(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    baseline_plan_intents: &[OrderIntent],
+) -> Option<V2AdmissionDecision> {
+    if !v2_paper_admission_mode_requested(config) {
+        return None;
+    }
+    evaluate_admission_decision_with_context(
+        config,
+        execution_mode,
+        now_ms,
+        baseline_plan_intents,
+        &V2AdmissionRuntimeContext::default(),
+    )
+}
+
+pub fn evaluate_admission_decision(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    baseline_plan_intents: &[OrderIntent],
+) -> Option<V2AdmissionDecision> {
+    evaluate_admission_decision_with_context(
+        config,
+        execution_mode,
+        now_ms,
+        baseline_plan_intents,
+        &V2AdmissionRuntimeContext::from_env(),
+    )
+}
+
 pub fn emit_paper_admission_decision(
     config: &V2ShadowConfig,
     execution_mode: &str,
@@ -376,12 +543,126 @@ pub fn emit_paper_admission_decision(
     Ok(Some(decision))
 }
 
+pub fn emit_admission_decision(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    baseline_plan_intents: &[OrderIntent],
+) -> Result<Option<V2AdmissionDecision>, V2ShadowError> {
+    emit_admission_decision_with_context(
+        config,
+        execution_mode,
+        now_ms,
+        baseline_plan_intents,
+        &V2AdmissionRuntimeContext::from_env(),
+    )
+}
+
+pub fn emit_admission_decision_with_context(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    baseline_plan_intents: &[OrderIntent],
+    runtime_context: &V2AdmissionRuntimeContext,
+) -> Result<Option<V2AdmissionDecision>, V2ShadowError> {
+    let Some(decision) = evaluate_admission_decision_with_context(
+        config,
+        execution_mode,
+        now_ms,
+        baseline_plan_intents,
+        runtime_context,
+    ) else {
+        return Ok(None);
+    };
+    append_json_line(Path::new(&config.output_path), &decision)?;
+    Ok(Some(decision))
+}
+
+pub fn apply_admission_filter(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    intents: &mut Vec<OrderIntent>,
+) -> Result<Option<V2AdmissionDecision>, V2ShadowError> {
+    apply_admission_filter_with_context(
+        config,
+        execution_mode,
+        now_ms,
+        intents,
+        &V2AdmissionRuntimeContext::from_env(),
+    )
+}
+
+pub fn apply_admission_filter_with_context(
+    config: &V2ShadowConfig,
+    execution_mode: &str,
+    now_ms: TimestampMs,
+    intents: &mut Vec<OrderIntent>,
+    runtime_context: &V2AdmissionRuntimeContext,
+) -> Result<Option<V2AdmissionDecision>, V2ShadowError> {
+    let Some(decision) = emit_admission_decision_with_context(
+        config,
+        execution_mode,
+        now_ms,
+        intents,
+        runtime_context,
+    )?
+    else {
+        return Ok(None);
+    };
+    if !decision.gate_state.satisfied() {
+        return Ok(Some(decision));
+    }
+
+    let admitted = decision
+        .admitted_candidates
+        .iter()
+        .map(|candidate| candidate.candidate_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut idx = 0usize;
+    intents.retain(|intent| {
+        let keep = match intent {
+            OrderIntent::Place(place) if place.purpose == OrderPurpose::Mm => admitted.contains(
+                format!(
+                    "v2_shadow_intent_v1:{}:{}:{}:{}",
+                    place.venue_index,
+                    place.venue_id,
+                    place.side.as_v2_str(),
+                    idx
+                )
+                .as_str(),
+            ),
+            OrderIntent::Replace(replace) if replace.purpose == OrderPurpose::Mm => admitted
+                .contains(
+                    format!(
+                        "v2_shadow_intent_v1:{}:{}:{}:{}",
+                        replace.venue_index,
+                        replace.venue_id,
+                        replace.side.as_v2_str(),
+                        idx
+                    )
+                    .as_str(),
+                ),
+            OrderIntent::Place(_)
+            | OrderIntent::Replace(_)
+            | OrderIntent::Cancel(_)
+            | OrderIntent::CancelAll(_) => true,
+        };
+        idx += 1;
+        keep
+    });
+    Ok(Some(decision))
+}
+
 pub fn apply_paper_admission_filter(
     config: &V2ShadowConfig,
     execution_mode: &str,
     now_ms: TimestampMs,
     intents: &mut Vec<OrderIntent>,
 ) -> Result<Option<V2AdmissionDecision>, V2ShadowError> {
+    if !v2_paper_admission_mode_requested(config) {
+        return Ok(None);
+    }
     let Some(decision) = emit_paper_admission_decision(config, execution_mode, now_ms, intents)?
     else {
         return Ok(None);
@@ -823,6 +1104,38 @@ mod tests {
         }
     }
 
+    fn live_canary_admission_config() -> V2ShadowConfig {
+        let output_path = std::env::temp_dir().join(format!(
+            "paraphina_v2_live_canary_admission_test_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output_path);
+        V2ShadowConfig {
+            enabled: true,
+            decision_mode: V2DecisionMode::LiveCanaryAdmission,
+            output_path: output_path.display().to_string(),
+            pair_edge_enabled: true,
+            pair_conditioned_admission_enabled: true,
+            live_canary_admission_approved: true,
+            order_intent_enabled: true,
+            require_phase51_gate: true,
+            ..V2ShadowConfig::default()
+        }
+    }
+
+    fn live_canary_runtime_context() -> V2AdmissionRuntimeContext {
+        V2AdmissionRuntimeContext {
+            live_canary_mode_enabled: true,
+            live_canary_profile_metadata_present: true,
+            live_canary_max_position_present: true,
+            live_canary_max_gross_position_present: true,
+            live_canary_max_abs_venue_position_present: true,
+            live_canary_max_open_orders_present: true,
+            live_canary_post_only_enforced: true,
+            live_canary_reduce_only_not_enforced: true,
+        }
+    }
+
     fn mm_place(venue_index: usize, venue_id: &'static str, side: Side, price: f64) -> OrderIntent {
         OrderIntent::Place(crate::types::PlaceOrderIntent {
             venue_index,
@@ -1100,6 +1413,138 @@ mod tests {
         assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
         assert!(!serialized.contains("raw-group-must-not-emit"));
         assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_admission_filters_existing_mm_intents_only_under_all_gates() {
+        let config = live_canary_admission_config();
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+            mm_place(2, "aster", Side::Sell, 98.0),
+            mm_place(3, "lighter", Side::Sell, 105.0),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 4,
+                venue_id: Arc::from("paradex"),
+                order_id: "raw-cancel-order-id-must-not-emit".to_string(),
+            }),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.event_type, "V2_ADMISSION_DECISION");
+        assert_eq!(decision.decision_mode, "live_canary_admission");
+        assert_eq!(decision.execution_mode, "live");
+        assert_eq!(decision.authority_scope, "live_canary_ranked_admission");
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert!(decision.can_filter_existing_intents);
+        assert!(!decision.can_create_new_intents);
+        assert!(!decision.can_mutate_live_orders);
+        assert!(decision.gate_state.satisfied());
+        assert!(decision.gate_state.live_canary_admission_approved);
+        assert!(decision.gate_state.live_canary_profile_metadata_present);
+        assert!(decision.gate_state.live_canary_post_only_enforced);
+        assert!(decision.gate_state.live_canary_reduce_only_not_enforced);
+        assert_eq!(decision.baseline_mm_order_creating_intent_count, 4);
+        assert_eq!(decision.order_intent_output_count, 2);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 2);
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+        assert_eq!(intents.len(), 3, "two MM intents plus cancel retained");
+        assert!(
+            matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "extended" && place.side == Side::Buy)
+        );
+        assert!(
+            matches!(&intents[1], OrderIntent::Place(place) if place.venue_id.as_ref() == "lighter" && place.side == Side::Sell)
+        );
+        assert!(matches!(&intents[2], OrderIntent::Cancel(_)));
+
+        let serialized = serde_json::to_string(&decision).expect("serialize");
+        assert!(!serialized.contains("raw-client-id-must-not-emit"));
+        assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
+        assert!(!serialized.contains("raw-group-must-not-emit"));
+        assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_admission_missing_runtime_gate_holds_without_filtering() {
+        let config = live_canary_admission_config();
+        let mut context = live_canary_runtime_context();
+        context.live_canary_profile_metadata_present = false;
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(
+            decision.admission_reason,
+            "live_canary_admission_gate_not_satisfied"
+        );
+        assert!(!decision.gate_state.satisfied());
+        assert!(!decision.can_filter_existing_intents);
+        assert!(!decision.can_create_new_intents);
+        assert!(!decision.can_mutate_live_orders);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 0);
+        assert_eq!(intents.len(), 2);
+    }
+
+    #[test]
+    fn v2_live_canary_admission_rejects_fast_hedge_authority() {
+        let mut config = live_canary_admission_config();
+        config.fast_hedge_enabled = true;
+        let context = live_canary_runtime_context();
+        let decision = evaluate_admission_decision_with_context(
+            &config,
+            "live",
+            4_500,
+            &[mm_place(0, "extended", Side::Buy, 99.0)],
+            &context,
+        )
+        .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(
+            decision.admission_reason,
+            "live_canary_admission_gate_not_satisfied"
+        );
+        assert!(!decision.gate_state.fast_hedge_disabled);
+        assert!(!decision.gate_state.satisfied());
+        assert!(!decision.can_create_new_intents);
+        assert!(!decision.blocker_cleared);
+    }
+
+    #[test]
+    fn v2_live_canary_admission_does_not_filter_outside_live_execution_mode() {
+        let config = live_canary_admission_config();
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "paper", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(
+            decision.admission_reason,
+            "live_canary_admission_gate_not_satisfied"
+        );
+        assert!(!decision.gate_state.execution_mode_is_live);
+        assert!(!decision.gate_state.satisfied());
+        assert_eq!(intents.len(), 2);
     }
 
     #[test]

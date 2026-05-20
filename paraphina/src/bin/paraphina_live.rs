@@ -1720,6 +1720,38 @@ fn phase51_live_native_role_canary_preflight_check(
     }
 }
 
+fn v2_live_canary_admission_preflight_check(
+    trade_mode: TradeMode,
+    cfg: &Config,
+) -> Option<PreflightCheck> {
+    if !paraphina::v2::v2_live_canary_admission_mode_requested(&cfg.v2_shadow) {
+        return None;
+    }
+    let context = paraphina::v2::V2AdmissionRuntimeContext::from_env();
+    let gate_state =
+        paraphina::v2::admission_gate_state(&cfg.v2_shadow, trade_mode.as_str(), &context);
+    Some(PreflightCheck {
+        label: "v2_live_canary_admission",
+        ok: gate_state.satisfied(),
+        details: format!(
+            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
+            gate_state.live_canary_admission_approved,
+            gate_state.live_canary_mode_enabled,
+            gate_state.live_canary_profile_metadata_present,
+            gate_state.live_canary_max_position_present,
+            gate_state.live_canary_max_gross_position_present,
+            gate_state.live_canary_max_abs_venue_position_present,
+            gate_state.live_canary_max_open_orders_present,
+            gate_state.live_canary_post_only_enforced,
+            gate_state.live_canary_reduce_only_not_enforced,
+            gate_state.pair_edge_enabled,
+            gate_state.order_intent_enabled,
+            gate_state.fast_hedge_disabled,
+            gate_state.require_phase51_gate
+        ),
+    })
+}
+
 #[cfg(feature = "live_lighter")]
 fn should_spawn_lighter_phase51_private_ws(
     trade_mode: TradeMode,
@@ -1995,6 +2027,9 @@ fn run_preflight(
         if let Some(check) =
             phase51_live_native_role_canary_preflight_check(trade_mode, cfg, canary_settings)
         {
+            checks.push(check);
+        }
+        if let Some(check) = v2_live_canary_admission_preflight_check(trade_mode, cfg) {
             checks.push(check);
         }
         let reconcile_state = parse_reconcile_env();
@@ -5137,6 +5172,95 @@ mod tests {
         assert_eq!(cfg.book.max_mid_jump_pct, 0.03);
     }
 
+    #[test]
+    fn v2_live_ranked_admission_micro_canary_profile_has_required_caps() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root")
+            .join("configs/v2_live_ranked_admission_micro_canary.toml");
+        let canary = super::load_canary_config(&path).expect("load v2 canary profile");
+        let settings = super::canary_settings_from_config(&canary);
+
+        assert_eq!(settings.max_position_tao, Some(0.05));
+        assert_eq!(settings.max_gross_position_tao, Some(0.05));
+        assert_eq!(settings.max_abs_venue_position_tao, Some(0.02));
+        assert_eq!(settings.max_open_orders, Some(5));
+        assert_eq!(settings.stale_max_ticks, Some(4));
+        assert!(settings.enforce_post_only);
+        assert!(!settings.enforce_reduce_only);
+        assert_eq!(settings.max_mid_jump_pct, Some(0.03));
+    }
+
+    fn v2_live_canary_admission_config() -> paraphina::config::Config {
+        let mut cfg = paraphina::config::Config::default();
+        cfg.v2_shadow.enabled = true;
+        cfg.v2_shadow.decision_mode = paraphina::config::V2DecisionMode::LiveCanaryAdmission;
+        cfg.v2_shadow.pair_edge_enabled = true;
+        cfg.v2_shadow.pair_conditioned_admission_enabled = true;
+        cfg.v2_shadow.live_canary_admission_approved = true;
+        cfg.v2_shadow.order_intent_enabled = true;
+        cfg.v2_shadow.fast_hedge_enabled = false;
+        cfg.v2_shadow.require_phase51_gate = true;
+        cfg
+    }
+
+    fn with_v2_live_canary_preflight_env<R>(f: impl FnOnce() -> R) -> R {
+        let _lock = env_lock().lock().unwrap();
+        let _canary = EnvVarGuard::new("PARAPHINA_CANARY_MODE");
+        let _profile = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_PROFILE_PATH");
+        let _profile_sha = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_PROFILE_SHA256");
+        let _max_position = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_MAX_POSITION_TAO");
+        let _max_gross = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_MAX_GROSS_POSITION_TAO");
+        let _max_abs = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_MAX_ABS_VENUE_POSITION_TAO");
+        let _max_open = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_MAX_OPEN_ORDERS");
+        let _post_only = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_ENFORCE_POST_ONLY");
+        let _reduce_only = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_ENFORCE_REDUCE_ONLY");
+
+        std::env::set_var("PARAPHINA_RUNTIME_CANARY_PROFILE_PATH", "configs/v2.toml");
+        std::env::set_var("PARAPHINA_RUNTIME_CANARY_PROFILE_SHA256", "sanitized-sha");
+        std::env::set_var("PARAPHINA_RUNTIME_CANARY_MAX_POSITION_TAO", "0.05");
+        std::env::set_var("PARAPHINA_RUNTIME_CANARY_MAX_GROSS_POSITION_TAO", "0.05");
+        std::env::set_var(
+            "PARAPHINA_RUNTIME_CANARY_MAX_ABS_VENUE_POSITION_TAO",
+            "0.02",
+        );
+        std::env::set_var("PARAPHINA_RUNTIME_CANARY_MAX_OPEN_ORDERS", "5");
+        std::env::set_var("PARAPHINA_RUNTIME_CANARY_ENFORCE_POST_ONLY", "1");
+        std::env::set_var("PARAPHINA_RUNTIME_CANARY_ENFORCE_REDUCE_ONLY", "0");
+
+        f()
+    }
+
+    #[test]
+    fn v2_live_canary_admission_preflight_accepts_required_runtime_gates() {
+        with_v2_live_canary_preflight_env(|| {
+            let cfg = v2_live_canary_admission_config();
+            let check = super::v2_live_canary_admission_preflight_check(TradeMode::Live, &cfg)
+                .expect("preflight check should run");
+
+            assert!(check.ok, "unexpected preflight failure: {}", check.details);
+            assert_eq!(check.label, "v2_live_canary_admission");
+            assert!(check.details.contains("approved=true"));
+            assert!(check.details.contains("profile_metadata=true"));
+            assert!(check.details.contains("max_gross_position=true"));
+            assert!(check.details.contains("post_only=true"));
+            assert!(check.details.contains("reduce_only_not_enforced=true"));
+        });
+    }
+
+    #[test]
+    fn v2_live_canary_admission_preflight_rejects_missing_profile_cap() {
+        with_v2_live_canary_preflight_env(|| {
+            std::env::remove_var("PARAPHINA_RUNTIME_CANARY_MAX_GROSS_POSITION_TAO");
+            let cfg = v2_live_canary_admission_config();
+            let check = super::v2_live_canary_admission_preflight_check(TradeMode::Live, &cfg)
+                .expect("preflight check should run");
+
+            assert!(!check.ok);
+            assert!(check.details.contains("max_gross_position=false"));
+        });
+    }
+
     fn phase51_test_future_native_role_path(label: &str) -> String {
         let path = std::env::temp_dir().join(format!(
             "phase51_future_native_role_preflight_{}_{}.jsonl",
@@ -5276,13 +5400,17 @@ mod tests {
     #[test]
     fn phase51_lighter_private_ws_spawn_requires_explicit_native_role_canary_gates() {
         let _lock = env_lock().lock().unwrap();
-        let _capture_enabled = EnvVarGuard::new("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED");
-        let _approved =
-            EnvVarGuard::new("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED");
+        let _capture_enabled =
+            EnvVarGuard::new("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED");
+        let _approved = EnvVarGuard::new(
+            "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED",
+        );
         let _strict = EnvVarGuard::new("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY");
 
         std::env::remove_var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_ENABLED");
-        std::env::remove_var("PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED");
+        std::env::remove_var(
+            "PARAPHINA_PHASE51_FORWARD_REFRESH_CAPTURE_LIVE_NATIVE_ROLE_CANARY_APPROVED",
+        );
         std::env::remove_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY");
 
         assert!(!super::should_spawn_lighter_phase51_private_ws(
@@ -5304,7 +5432,10 @@ mod tests {
             true,
         ));
 
-        std::env::set_var("PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY", "true");
+        std::env::set_var(
+            "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY",
+            "true",
+        );
         assert!(super::should_spawn_lighter_phase51_private_ws(
             TradeMode::Live,
             false,

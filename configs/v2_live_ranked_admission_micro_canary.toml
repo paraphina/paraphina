@@ -1,0 +1,31 @@
+# V2 ranked-admission live micro-canary profile.
+# Use only with PARAPHINA_V2_DECISION_MODE=live_canary_admission and
+# PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED=true.
+
+[venue]
+base_order_size = 0.01
+max_order_size = 0.01
+
+[limits]
+max_position_tao = 0.05
+max_gross_position_tao = 0.05
+max_abs_venue_position_tao = 0.02
+soft_max_position_tao = 0.03
+soft_max_gross_position_tao = 0.03
+soft_max_abs_venue_position_tao = 0.01
+max_open_orders = 5
+
+[rate_limit]
+enabled = true
+rps = 4.0
+burst = 6
+
+[enforcement]
+post_only = true
+reduce_only = false
+
+[kill]
+stale_max_ticks = 4
+
+[book]
+max_mid_jump_pct = 0.03

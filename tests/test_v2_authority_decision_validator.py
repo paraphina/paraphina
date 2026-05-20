@@ -6,6 +6,52 @@ from pathlib import Path
 from tools import v2_authority_decision_validator as validator
 
 
+def paper_gate_state():
+    return {
+        "enabled": True,
+        "decision_mode_is_paper_admission": True,
+        "decision_mode_is_live_canary_admission": False,
+        "execution_mode_is_paper": True,
+        "execution_mode_is_live": False,
+        "pair_edge_enabled": True,
+        "pair_conditioned_admission_enabled": True,
+        "order_intent_enabled": True,
+        "fast_hedge_disabled": True,
+        "require_phase51_gate": True,
+        "live_canary_admission_approved": False,
+        "live_canary_mode_enabled": False,
+        "live_canary_profile_metadata_present": False,
+        "live_canary_max_position_present": False,
+        "live_canary_max_gross_position_present": False,
+        "live_canary_max_abs_venue_position_present": False,
+        "live_canary_max_open_orders_present": False,
+        "live_canary_post_only_enforced": False,
+        "live_canary_reduce_only_not_enforced": False,
+    }
+
+
+def live_canary_gate_state():
+    gate = paper_gate_state()
+    gate.update(
+        {
+            "decision_mode_is_paper_admission": False,
+            "decision_mode_is_live_canary_admission": True,
+            "execution_mode_is_paper": False,
+            "execution_mode_is_live": True,
+            "live_canary_admission_approved": True,
+            "live_canary_mode_enabled": True,
+            "live_canary_profile_metadata_present": True,
+            "live_canary_max_position_present": True,
+            "live_canary_max_gross_position_present": True,
+            "live_canary_max_abs_venue_position_present": True,
+            "live_canary_max_open_orders_present": True,
+            "live_canary_post_only_enforced": True,
+            "live_canary_reduce_only_not_enforced": True,
+        }
+    )
+    return gate
+
+
 def admitted_row():
     return {
         "event_type": "V2_ADMISSION_DECISION",
@@ -27,16 +73,7 @@ def admitted_row():
         "pair_edge_is_admission": True,
         "pressure_complete_claim": False,
         "blocker_cleared": False,
-        "gate_state": {
-            "enabled": True,
-            "decision_mode_is_paper_admission": True,
-            "execution_mode_is_paper": True,
-            "pair_edge_enabled": True,
-            "pair_conditioned_admission_enabled": True,
-            "order_intent_enabled": True,
-            "fast_hedge_disabled": True,
-            "require_phase51_gate": True,
-        },
+        "gate_state": paper_gate_state(),
         "ranking_schema_version": 1,
         "ranking_feature_only": False,
         "ranking_is_admission": True,
@@ -67,6 +104,16 @@ def admitted_row():
     }
 
 
+def live_canary_admitted_row():
+    row = admitted_row()
+    row["decision_mode"] = "live_canary_admission"
+    row["execution_mode"] = "live"
+    row["authority_scope"] = "live_canary_ranked_admission"
+    row["admission_reason"] = "live_canary_positive_pair_edge_ranked_admission"
+    row["gate_state"] = live_canary_gate_state()
+    return row
+
+
 def write_rows(root: Path, rows):
     path = root / "v2_authority_decisions.jsonl"
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
@@ -90,14 +137,48 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             self.assertFalse(data["governance"]["approved_for_live"])
             self.assertFalse(data["governance"]["blocker_cleared"])
 
-    def test_rejects_live_or_capital_authority(self):
-        for field in ["can_create_new_intents", "can_mutate_live_orders", "blocker_cleared", "pressure_complete_claim"]:
+    def test_accepts_live_canary_ranked_admission_row_and_writes_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence = write_rows(root, [live_canary_admitted_row()])
+            manifest = root / "manifest.json"
+
+            summary = validator.validate_v2_authority_decisions(evidence)
+            validator.write_manifest(evidence, manifest, summary)
+
+            self.assertEqual(summary.row_count, 1)
+            self.assertEqual(summary.admitted_rows, 1)
+            self.assertEqual(summary.live_canary_rows, 1)
+            self.assertFalse(summary.can_mutate_live_orders_any)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(data["governance"]["gate_status"], "LIVE_CANARY")
+            self.assertTrue(data["governance"]["approved_for_canary"])
+            self.assertTrue(data["governance"]["live_orders_allowed"])
+            self.assertFalse(data["governance"]["approved_for_live"])
+            self.assertFalse(data["governance"]["blocker_cleared"])
+            self.assertEqual(
+                data["v2_authority_contract"]["authority_scope"],
+                "live_canary_ranked_admission",
+            )
+            self.assertFalse(data["v2_authority_contract"]["can_create_new_intents"])
+            self.assertFalse(data["v2_authority_contract"]["fast_hedge_enabled"])
+
+    def test_rejects_synthesized_or_false_clearance_authority(self):
+        for field in ["can_create_new_intents", "blocker_cleared", "pressure_complete_claim"]:
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 row = admitted_row()
                 row[field] = True
                 evidence = write_rows(Path(tmp), [row])
                 with self.assertRaises(validator.V2AuthorityValidationError):
                     validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_paper_row_with_live_mutation_authority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = admitted_row()
+            row["can_mutate_live_orders"] = True
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
 
     def test_rejects_admitted_row_with_missing_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,6 +217,15 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             row = admitted_row()
             row["execution_mode"] = "live"
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_live_canary_row_with_missing_profile_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = live_canary_admitted_row()
+            row["gate_state"]["live_canary_profile_metadata_present"] = False
+            row["can_filter_existing_intents"] = False
             evidence = write_rows(Path(tmp), [row])
             with self.assertRaises(validator.V2AuthorityValidationError):
                 validator.validate_v2_authority_decisions(evidence)
