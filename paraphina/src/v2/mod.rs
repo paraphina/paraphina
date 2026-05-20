@@ -500,6 +500,9 @@ pub fn evaluate_admission_decision_with_context(
     } else {
         Vec::new()
     };
+    if live_canary_mode && admitted_candidates.len() > 1 {
+        admitted_candidates.truncate(1);
+    }
 
     if admitted_candidates.is_empty()
         && live_canary_mode
@@ -1764,18 +1767,15 @@ mod tests {
         assert!(decision.gate_state.live_canary_post_only_enforced);
         assert!(decision.gate_state.live_canary_reduce_only_not_enforced);
         assert_eq!(decision.baseline_mm_order_creating_intent_count, 4);
-        assert_eq!(decision.order_intent_output_count, 2);
-        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 2);
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 3);
         assert!(!decision.pressure_complete_claim);
         assert!(!decision.blocker_cleared);
-        assert_eq!(intents.len(), 3, "two MM intents plus cancel retained");
+        assert_eq!(intents.len(), 2, "one MM intent plus cancel retained");
         assert!(
-            matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "extended" && place.side == Side::Buy)
+            matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "lighter" && place.side == Side::Sell)
         );
-        assert!(
-            matches!(&intents[1], OrderIntent::Place(place) if place.venue_id.as_ref() == "lighter" && place.side == Side::Sell)
-        );
-        assert!(matches!(&intents[2], OrderIntent::Cancel(_)));
+        assert!(matches!(&intents[1], OrderIntent::Cancel(_)));
 
         let serialized = serde_json::to_string(&decision).expect("serialize");
         assert!(!serialized.contains("raw-client-id-must-not-emit"));
