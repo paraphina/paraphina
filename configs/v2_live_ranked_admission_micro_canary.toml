@@ -15,7 +15,7 @@ max_gross_position_tao = 0.05
 max_abs_venue_position_tao = 0.02
 soft_max_position_tao = 0.03
 soft_max_gross_position_tao = 0.03
-soft_max_abs_venue_position_tao = 0.01
+soft_max_abs_venue_position_tao = 0.02
 max_open_orders = 1
 
 [rate_limit]

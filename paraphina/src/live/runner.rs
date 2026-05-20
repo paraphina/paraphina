@@ -1909,6 +1909,80 @@ fn v2_remove_order_creating_probe_intents(intents: &mut Vec<OrderIntent>) -> usi
     before.saturating_sub(intents.len())
 }
 
+fn v2_remove_non_mm_order_creating_probe_intents(intents: &mut Vec<OrderIntent>) -> usize {
+    let before = intents.len();
+    intents.retain(|intent| match intent {
+        OrderIntent::Place(place) => {
+            place.venue_id.as_ref() == "lighter" && place.purpose == OrderPurpose::Mm
+        }
+        OrderIntent::Replace(replace) => {
+            replace.venue_id.as_ref() == "lighter" && replace.purpose == OrderPurpose::Mm
+        }
+        OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => true,
+    });
+    before.saturating_sub(intents.len())
+}
+
+fn v2_seed_single_lighter_mm_order_path_probe_intent(
+    intents: &mut Vec<OrderIntent>,
+    mm_plan_intents: &[OrderIntent],
+) -> Result<bool, &'static str> {
+    if !phase51_lighter_native_role_strict_canary_enabled()
+        || !phase51_lighter_native_role_one_sided_canary_enabled()
+        || !phase51_lighter_native_role_replacements_disabled()
+    {
+        return Ok(false);
+    }
+
+    let mut candidate_intents = Vec::new();
+    for intent in mm_plan_intents {
+        match intent {
+            OrderIntent::Place(place) => {
+                if place.venue_id.as_ref() != "lighter" {
+                    return Err("non_lighter_place");
+                }
+                if place.purpose != OrderPurpose::Mm {
+                    return Err("non_mm_place");
+                }
+                if place.time_in_force != TimeInForce::Gtc {
+                    return Err("non_gtc_place");
+                }
+                if !place.post_only {
+                    return Err("non_post_only_place");
+                }
+                if place.reduce_only {
+                    return Err("reduce_only_place");
+                }
+                if place.phase51_target_key.is_none() {
+                    return Err("missing_phase51_target_key");
+                }
+                if !place.price.is_finite() || place.price <= 0.0 {
+                    return Err("invalid_price");
+                }
+                if !place.size.is_finite() || place.size <= 0.0 {
+                    return Err("invalid_size");
+                }
+                candidate_intents.push(OrderIntent::Place(place.clone()));
+            }
+            OrderIntent::Replace(_) => return Err("replace_disabled"),
+            OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => {
+                return Err("cleanup_or_cancel_present");
+            }
+        }
+    }
+
+    if candidate_intents.is_empty() {
+        return Ok(false);
+    }
+    phase51_lighter_native_role_apply_one_sided_canary_filter(&mut candidate_intents)?;
+    if candidate_intents.is_empty() {
+        return Ok(false);
+    }
+    phase51_lighter_native_role_strict_canary_validate_order_intents(&candidate_intents)?;
+    *intents = candidate_intents;
+    Ok(true)
+}
+
 fn phase51_lighter_baseline_cleanup_only_is_lighter_venue(
     cfg: &Config,
     venue_index: usize,
@@ -5865,6 +5939,35 @@ pub async fn run_live_loop(
                 client_order_id: None,
                 phase51_target_key: None,
             }));
+        }
+        if v2_live_order_path_probe_latch_enabled(cfg)
+            && !v2_live_order_path_probe_attempted
+            && should_quote
+            && !pause_mm_quotes
+            && !inventory_brake_cancel_only_mode
+        {
+            match v2_seed_single_lighter_mm_order_path_probe_intent(&mut intents, &mm_plan.intents)
+            {
+                Ok(true) => {
+                    eprintln!("[v2] live_canary_order_path_probe_seeded_single_lighter_mm_intent");
+                }
+                Ok(false) => {
+                    let removed = v2_remove_non_mm_order_creating_probe_intents(&mut intents);
+                    if removed > 0 {
+                        eprintln!(
+                            "[v2] live_canary_order_path_probe_suppressed_non_mm_intents count={}",
+                            removed
+                        );
+                    }
+                }
+                Err(reason) => {
+                    eprintln!(
+                        "[v2] live_canary_order_path_probe_seed_blocked reason={}",
+                        reason
+                    );
+                    intents.clear();
+                }
+            }
         }
         if let Err(reason) = phase51_lighter_native_role_apply_one_sided_canary_filter(&mut intents)
         {
@@ -15084,31 +15187,32 @@ mod tests {
     #[test]
     fn mm_order_management_telemetry_redacts_order_identifiers() {
         let mut summary = MmOrderDecisionSummary::default();
-        summary.decision_records.push(crate::order_management::MmDecisionRecord {
-            decision_id: "d1".to_string(),
-            venue_index: 0,
-            venue_id: "lighter".to_string(),
-            side: "Buy".to_string(),
-            purpose: "Mm".to_string(),
-            outcome: "place".to_string(),
-            reason: "new_quote".to_string(),
-            fair_value: Some(100.0),
-            q_global_tao: 0.0,
-            current_order_id: Some("raw-current-order-id".to_string()),
-            current_price: None,
-            current_size: None,
-            desired_price: Some(99.0),
-            desired_size: Some(0.01),
-            client_order_id: Some("raw-client-order-id".to_string()),
-            utility_tier: Some("full".to_string()),
-            utility_reason: Some("healthy".to_string()),
-            venue_role: Some("fill".to_string()),
-            role_cap_applied: Some(false),
-            inventory_reducing: Some(false),
-        });
         summary
-            .supported_replace_visibility_records
-            .push(crate::order_management::SupportedReplaceVisibilityRecord {
+            .decision_records
+            .push(crate::order_management::MmDecisionRecord {
+                decision_id: "d1".to_string(),
+                venue_index: 0,
+                venue_id: "lighter".to_string(),
+                side: "Buy".to_string(),
+                purpose: "Mm".to_string(),
+                outcome: "place".to_string(),
+                reason: "new_quote".to_string(),
+                fair_value: Some(100.0),
+                q_global_tao: 0.0,
+                current_order_id: Some("raw-current-order-id".to_string()),
+                current_price: None,
+                current_size: None,
+                desired_price: Some(99.0),
+                desired_size: Some(0.01),
+                client_order_id: Some("raw-client-order-id".to_string()),
+                utility_tier: Some("full".to_string()),
+                utility_reason: Some("healthy".to_string()),
+                venue_role: Some("fill".to_string()),
+                role_cap_applied: Some(false),
+                inventory_reducing: Some(false),
+            });
+        summary.supported_replace_visibility_records.push(
+            crate::order_management::SupportedReplaceVisibilityRecord {
                 decision_id: "d1".to_string(),
                 venue_index: 0,
                 venue_id: "lighter".to_string(),
@@ -15125,7 +15229,8 @@ mod tests {
                 current_client_order_id: Some("raw-visible-client-order-id".to_string()),
                 post_control_absence_reason: None,
                 suppression_grace_applied: false,
-            });
+            },
+        );
 
         let value = sanitized_mm_order_management_value(&summary);
         let text = serde_json::to_string(&value).expect("serialize");
@@ -15581,6 +15686,96 @@ mod tests {
         assert!(
             matches!(&intents[1], OrderIntent::Place(place) if place.venue_id.as_ref() == "aster")
         );
+    }
+
+    #[test]
+    fn v2_live_order_path_probe_seed_selects_one_targeted_lighter_mm_intent() {
+        with_phase51_one_sided_native_role_canary_env("buy", || {
+            let mm_plan_intents = vec![
+                lighter_targeted_place_intent(Side::Buy, "bid"),
+                lighter_targeted_place_intent(Side::Sell, "ask"),
+            ];
+            let mut existing = vec![{
+                let mut hedge = lighter_targeted_place_intent(Side::Buy, "hedge");
+                if let OrderIntent::Place(place) = &mut hedge {
+                    place.purpose = OrderPurpose::Hedge;
+                    place.time_in_force = TimeInForce::Ioc;
+                    place.post_only = false;
+                    place.reduce_only = true;
+                }
+                hedge
+            }];
+
+            assert_eq!(
+                v2_seed_single_lighter_mm_order_path_probe_intent(&mut existing, &mm_plan_intents),
+                Ok(true)
+            );
+            assert_eq!(existing.len(), 1);
+            let OrderIntent::Place(place) = &existing[0] else {
+                panic!("expected place");
+            };
+            assert_eq!(place.venue_id.as_ref(), "lighter");
+            assert_eq!(place.side, Side::Buy);
+            assert_eq!(place.purpose, OrderPurpose::Mm);
+            assert_eq!(place.time_in_force, TimeInForce::Gtc);
+            assert!(place.post_only);
+            assert!(!place.reduce_only);
+            assert_eq!(place.phase51_target_key, Some(lighter_target_key("bid")));
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&existing),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn v2_live_order_path_probe_seed_fails_closed_on_cleanup_or_unsafe_mm_plan() {
+        with_phase51_one_sided_native_role_canary_env("buy", || {
+            let mut intents = Vec::new();
+            assert_eq!(
+                v2_seed_single_lighter_mm_order_path_probe_intent(
+                    &mut intents,
+                    &[lighter_cancel_intent()]
+                ),
+                Err("cleanup_or_cancel_present")
+            );
+
+            let mut unlinked = lighter_targeted_place_intent(Side::Buy, "bid");
+            if let OrderIntent::Place(place) = &mut unlinked {
+                place.phase51_target_key = None;
+            }
+            assert_eq!(
+                v2_seed_single_lighter_mm_order_path_probe_intent(&mut intents, &[unlinked]),
+                Err("missing_phase51_target_key")
+            );
+
+            let mut non_post_only = lighter_targeted_place_intent(Side::Buy, "bid");
+            if let OrderIntent::Place(place) = &mut non_post_only {
+                place.post_only = false;
+            }
+            assert_eq!(
+                v2_seed_single_lighter_mm_order_path_probe_intent(&mut intents, &[non_post_only]),
+                Err("non_post_only_place")
+            );
+        });
+    }
+
+    #[test]
+    fn v2_live_order_path_probe_suppresses_non_mm_order_creating_intents() {
+        let mut hedge = lighter_targeted_place_intent(Side::Buy, "hedge");
+        if let OrderIntent::Place(place) = &mut hedge {
+            place.purpose = OrderPurpose::Hedge;
+            place.time_in_force = TimeInForce::Ioc;
+            place.post_only = false;
+            place.reduce_only = true;
+        }
+        let mut intents = vec![hedge, lighter_cancel_intent()];
+        assert_eq!(
+            v2_remove_non_mm_order_creating_probe_intents(&mut intents),
+            1
+        );
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(intents[0], OrderIntent::Cancel(_)));
     }
 
     #[test]
