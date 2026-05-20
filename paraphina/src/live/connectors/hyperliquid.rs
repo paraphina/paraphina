@@ -2054,13 +2054,20 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Hyperliquid {action_label} failed: {status} {body}");
+            anyhow::bail!(
+                "Hyperliquid {action_label} failed status_code={} sanitized_body=true",
+                status.as_u16()
+            );
         }
         let body = resp.text().await.unwrap_or_default();
-        let value = serde_json::from_str(&body).unwrap_or_else(|_| json!({ "raw": body }));
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+            anyhow::anyhow!("Hyperliquid {action_label} invalid_json_response sanitized_body=true")
+        })?;
         if let Some(error) = hyperliquid_exchange_response_error(&value) {
-            anyhow::bail!("Hyperliquid {action_label} rejected: {error}");
+            anyhow::bail!(
+                "Hyperliquid {action_label} rejected sanitized_reason={}",
+                ws_post_exchange_error_reason(&error)
+            );
         }
         Ok(value)
     }
@@ -2778,19 +2785,40 @@ impl LiveRestClient for HyperliquidConnector {
 fn map_rest_error(err: anyhow::Error) -> LiveGatewayError {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
+    let sanitized = || {
+        format!(
+            "Hyperliquid live gateway error sanitized_reason={}",
+            hyperliquid_rest_error_reason(&msg)
+        )
+    };
     if lower.contains("post") && lower.contains("only") {
-        return LiveGatewayError::post_only_reject(msg);
+        return LiveGatewayError::post_only_reject(sanitized());
     }
     if lower.contains("reduce") && lower.contains("only") {
-        return LiveGatewayError::reduce_only_violation(msg);
+        return LiveGatewayError::reduce_only_violation(sanitized());
     }
     if lower.contains("rate") && lower.contains("limit") {
-        return LiveGatewayError::rate_limited(msg);
+        return LiveGatewayError::rate_limited(sanitized());
     }
     if lower.contains("timeout") || lower.contains("tempor") || lower.contains("retry") {
-        return LiveGatewayError::retryable(msg);
+        return LiveGatewayError::retryable(sanitized());
     }
-    LiveGatewayError::fatal(msg)
+    LiveGatewayError::fatal(sanitized())
+}
+
+fn hyperliquid_rest_error_reason(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("invalid") && lower.contains("order id") {
+        "invalid_order_id"
+    } else if lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("tempor") || lower.contains("retry") {
+        "retryable"
+    } else if lower.contains("reduce") && lower.contains("only") {
+        "reduce_only_violation"
+    } else {
+        ws_post_exchange_error_reason(raw)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4015,9 +4043,9 @@ enum HyperliquidCancelBatchKind {
 }
 
 fn parse_hl_oid(order_id: &str) -> anyhow::Result<u64> {
-    order_id
-        .parse::<u64>()
-        .map_err(|err| anyhow::anyhow!("invalid Hyperliquid numeric order id '{order_id}': {err}"))
+    order_id.parse::<u64>().map_err(|_err| {
+        anyhow::anyhow!("invalid Hyperliquid numeric order id sanitized_reason=invalid_order_id")
+    })
 }
 
 /// Build a batch cancel action with N cancels in a single API call.
@@ -4191,6 +4219,7 @@ fn exchange_response_detail(value: Option<&serde_json::Value>) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::LiveGatewayErrorKind;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
@@ -4579,6 +4608,32 @@ mod tests {
     }
 
     #[test]
+    fn map_rest_error_sanitizes_raw_exchange_payloads() {
+        let err = map_rest_error(anyhow::anyhow!(
+            "Hyperliquid ws_post action exchange_errors=Post only order would have immediately matched, bbo was 2124.4@2124.5 payload={{\"order_id\":\"123\"}}"
+        ));
+        assert_eq!(err.kind, LiveGatewayErrorKind::PostOnlyReject);
+        assert!(err
+            .message
+            .contains("sanitized_reason=post_only_would_match"));
+        assert!(!err.message.contains("2124.4"));
+        assert!(!err.message.contains("payload"));
+        assert!(!err.message.contains("order_id"));
+    }
+
+    #[test]
+    fn parse_hl_oid_rejects_invalid_ids_without_echoing_raw_value() {
+        let err = parse_hl_oid("raw_order_id=123 client_order_id=abc")
+            .expect_err("invalid order id must fail")
+            .to_string();
+        assert!(err.contains("sanitized_reason=invalid_order_id"));
+        assert!(!err.contains("raw_order_id"));
+        assert!(!err.contains("client_order_id"));
+        assert!(!err.contains("123"));
+        assert!(!err.contains("abc"));
+    }
+
+    #[test]
     fn reserve_request_weight_signature_recovers_signer() {
         let wallet = test_signing_key();
         let verifying_key = wallet.verifying_key();
@@ -4673,7 +4728,10 @@ mod tests {
         assert_eq!(id, 42);
         assert_eq!(response_type, "error");
         let err = result.expect_err("error response");
-        assert!(err.to_string().contains("429 Too Many Requests"));
+        let err = err.to_string();
+        assert!(err.contains("sanitized_reason=rate_limited"));
+        assert!(!err.contains("429 Too Many Requests"));
+        assert!(!err.contains("payload"));
     }
 
     #[test]
@@ -4696,9 +4754,53 @@ mod tests {
         assert_eq!(id, 7);
         assert_eq!(response_type, "action");
         let err = result.expect_err("top level err response");
-        assert!(err
-            .to_string()
-            .contains("User or API Wallet does not exist"));
+        let err = err.to_string();
+        assert!(err.contains("top_level_err sanitized_reason=exchange_error"));
+        assert!(!err.contains("User or API Wallet does not exist"));
+        assert!(!err.contains("payload"));
+    }
+
+    #[test]
+    fn parse_ws_post_response_sanitizes_action_decode_failures() {
+        let value = json!({
+            "channel": "post",
+            "data": {
+                "id": 11,
+                "response": {
+                    "type": "action",
+                    "payload": "raw_order_id=123 client_order_id=abc"
+                }
+            }
+        });
+        let (id, response_type, result) =
+            parse_ws_post_response(&value).expect("parse ws post response");
+        assert_eq!(id, 11);
+        assert_eq!(response_type, "action");
+        let err = result.expect_err("decode failure").to_string();
+        assert!(err.contains("action decode_failed sanitized_context=true"));
+        assert!(!err.contains("raw_order_id"));
+        assert!(!err.contains("client_order_id"));
+        assert!(!err.contains("123"));
+        assert!(!err.contains("abc"));
+    }
+
+    #[test]
+    fn parse_ws_post_response_sanitizes_logged_response_type() {
+        let value = json!({
+            "channel": "post",
+            "data": {
+                "id": 12,
+                "response": {
+                    "type": "raw_order_id=123 client_order_id=abc",
+                    "payload": null
+                }
+            }
+        });
+        let (id, response_type, result) =
+            parse_ws_post_response(&value).expect("parse ws post response");
+        assert_eq!(id, 12);
+        assert_eq!(response_type, "other");
+        result.expect("non-action unknown response type should not fail");
     }
 
     #[test]
@@ -4757,8 +4859,45 @@ mod tests {
         assert_eq!(id, 9);
         assert_eq!(response_type, "action");
         let err = result.expect_err("nested exchange error");
-        assert!(err.to_string().contains("BadAloPx"));
-        assert!(err.to_string().contains("\"statuses\""));
+        let msg = err.to_string();
+        assert!(msg.contains("exchange_errors_count=1"));
+        assert!(msg.contains("exchange_reasons=bad_alo_px:1"));
+        assert!(msg.contains("response_type=order"));
+        assert!(!msg.contains("BadAloPx"));
+        assert!(!msg.contains("\"statuses\""));
+        assert!(!msg.contains("payload"));
+    }
+
+    #[test]
+    fn parse_ws_post_response_sanitizes_post_only_reject_payload() {
+        let value = json!({
+            "channel": "post",
+            "data": {
+                "id": 10,
+                "response": {
+                    "type": "action",
+                    "payload": {
+                        "status": "ok",
+                        "response": {
+                            "type": "order",
+                            "data": {
+                                "statuses": [
+                                    { "error": "Post only order would have immediately matched, bbo was 2124.4@2124.5. asset=1" }
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let (_id, _response_type, result) =
+            parse_ws_post_response(&value).expect("parse ws post response");
+        let msg = result.expect_err("post-only exchange error").to_string();
+        assert!(msg.contains("exchange_errors_count=1"));
+        assert!(msg.contains("exchange_reasons=post_only_would_match:1"));
+        assert!(!msg.contains("bbo"));
+        assert!(!msg.contains("2124.4"));
+        assert!(!msg.contains("payload"));
     }
 
     #[tokio::test]
@@ -6297,32 +6436,34 @@ fn recover_action_signer_address(
 fn parse_ws_post_response(value: &serde_json::Value) -> Option<(u64, String, anyhow::Result<()>)> {
     let envelope: HyperliquidWsPostEnvelope = serde_json::from_value(value.clone()).ok()?;
     let id = envelope.data.id;
-    let response_type = envelope.data.response.response_type;
+    let raw_response_type = envelope.data.response.response_type;
+    let response_type = ws_post_sanitized_label(&raw_response_type).to_string();
     let payload = envelope.data.response.payload;
 
-    if response_type.eq_ignore_ascii_case("error") {
-        let detail = ws_post_json_detail(&payload);
+    if raw_response_type.eq_ignore_ascii_case("error") {
         return Some((
             id,
             response_type,
-            Err(anyhow::anyhow!("Hyperliquid ws_post failed: {detail}")),
+            Err(anyhow::anyhow!(
+                "Hyperliquid ws_post failed sanitized_reason={}",
+                ws_post_sanitized_payload_reason(&payload)
+            )),
         ));
     }
 
-    if !response_type.eq_ignore_ascii_case("action") {
+    if !raw_response_type.eq_ignore_ascii_case("action") {
         return Some((id, response_type, Ok(())));
     }
 
     let action_status: HyperliquidExchangeResponseStatus =
         match serde_json::from_value(payload.clone()) {
             Ok(parsed) => parsed,
-            Err(err) => {
+            Err(_err) => {
                 return Some((
                     id,
                     response_type,
                     Err(anyhow::anyhow!(
-                        "Hyperliquid ws_post action payload decode failed: {err}; payload={}",
-                        ws_post_json_detail(&payload)
+                        "Hyperliquid ws_post action decode_failed sanitized_context=true"
                     )),
                 ));
             }
@@ -6330,8 +6471,8 @@ fn parse_ws_post_response(value: &serde_json::Value) -> Option<(u64, String, any
 
     let result = match action_status {
         HyperliquidExchangeResponseStatus::Err(detail) => Err(anyhow::anyhow!(
-            "Hyperliquid ws_post action top_level_err={}",
-            ws_post_json_detail(&detail)
+            "Hyperliquid ws_post action top_level_err sanitized_reason={}",
+            ws_post_sanitized_payload_reason(&detail)
         )),
         HyperliquidExchangeResponseStatus::Ok(exchange_response) => {
             if let Some(exchange_data) = exchange_response.data {
@@ -6349,11 +6490,12 @@ fn parse_ws_post_response(value: &serde_json::Value) -> Option<(u64, String, any
                 if errors.is_empty() {
                     Ok(())
                 } else {
+                    let reason_counts = ws_post_exchange_error_reason_counts(&errors);
                     Err(anyhow::anyhow!(
-                        "Hyperliquid ws_post action exchange_errors={} response_type={} payload={}",
-                        errors.join(" | "),
-                        exchange_response.response_type,
-                        ws_post_json_detail(&payload)
+                        "Hyperliquid ws_post action exchange_errors_count={} exchange_reasons={} response_type={}",
+                        errors.len(),
+                        reason_counts,
+                        ws_post_sanitized_label(&exchange_response.response_type)
                     ))
                 }
             } else {
@@ -6365,11 +6507,59 @@ fn parse_ws_post_response(value: &serde_json::Value) -> Option<(u64, String, any
     Some((id, response_type, result))
 }
 
-fn ws_post_json_detail(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        _ => value.to_string(),
+fn ws_post_sanitized_label(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    match lower.as_str() {
+        "order" => "order",
+        "action" => "action",
+        "error" => "error",
+        "ok" => "ok",
+        "err" => "err",
+        _ => "other",
     }
+}
+
+fn ws_post_sanitized_payload_reason(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::String(raw) => ws_post_exchange_error_reason(raw),
+        serde_json::Value::Object(_) => "object_payload",
+        serde_json::Value::Array(_) => "array_payload",
+        serde_json::Value::Null => "null_payload",
+        serde_json::Value::Bool(_) => "bool_payload",
+        serde_json::Value::Number(_) => "number_payload",
+    }
+}
+
+fn ws_post_exchange_error_reason(raw: &str) -> &'static str {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("post only") && lower.contains("immediately matched") {
+        "post_only_would_match"
+    } else if lower.contains("badalopx") {
+        "bad_alo_px"
+    } else if lower.contains("insufficient") && lower.contains("margin") {
+        "insufficient_margin"
+    } else if lower.contains("rate") && lower.contains("limit")
+        || lower.contains("too many requests")
+        || lower.contains("429")
+    {
+        "rate_limited"
+    } else {
+        "exchange_error"
+    }
+}
+
+fn ws_post_exchange_error_reason_counts(errors: &[String]) -> String {
+    let mut counts = std::collections::BTreeMap::<&'static str, usize>::new();
+    for err in errors {
+        *counts
+            .entry(ws_post_exchange_error_reason(err))
+            .or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(reason, count)| format!("{reason}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn translate_private_events(msg: &serde_json::Value) -> Vec<ExecutionEvent> {
