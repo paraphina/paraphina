@@ -22,6 +22,7 @@ def _gate_state(**overrides: bool) -> dict[str, bool]:
         "fast_hedge_disabled": True,
         "require_phase51_gate": True,
         "live_canary_admission_approved": False,
+        "live_canary_order_path_probe_approved": False,
         "live_canary_mode_enabled": False,
         "live_canary_profile_metadata_present": False,
         "live_canary_max_position_present": False,
@@ -69,6 +70,7 @@ def _admitted_row() -> dict[str, Any]:
         "baseline_mm_order_creating_intent_count": 10,
         "suppressed_mm_order_creating_intent_count": 10 - len(admitted_candidates),
         "pair_edge_is_admission": True,
+        "order_path_probe_is_admission": False,
         "pressure_complete_claim": False,
         "blocker_cleared": False,
         "gate_state": _gate_state(),
@@ -108,6 +110,7 @@ def build_matrix() -> list[dict[str, Any]]:
         row["order_intent_output_count"] = 0
         row["suppressed_mm_order_creating_intent_count"] = 0
         row["pair_edge_is_admission"] = False
+        row["order_path_probe_is_admission"] = False
         row["ranking_is_admission"] = False
         row["can_filter_existing_intents"] = False
         row["gate_state"] = _gate_state(**{field: False})
@@ -117,6 +120,7 @@ def build_matrix() -> list[dict[str, Any]]:
     row["scenario_id"] = "negative_pair_edge_positive_ranked_admission"
     row["admission_reason"] = "paper_positive_ranked_admission"
     row["pair_edge_is_admission"] = False
+    row["order_path_probe_is_admission"] = False
     row["pair_edges"][0]["edge_usd"] = -1.0
     rows.append(row)
     for scenario_id, invalid_reason, bid, ask in [
@@ -130,6 +134,7 @@ def build_matrix() -> list[dict[str, Any]]:
         row["order_intent_output_count"] = 0
         row["suppressed_mm_order_creating_intent_count"] = row["baseline_mm_order_creating_intent_count"]
         row["pair_edge_is_admission"] = False
+        row["order_path_probe_is_admission"] = False
         row["ranking_is_admission"] = False
         row["pair_edges"] = [
             {
@@ -151,6 +156,7 @@ def build_matrix() -> list[dict[str, Any]]:
     row["order_intent_output_count"] = 0
     row["suppressed_mm_order_creating_intent_count"] = row["baseline_mm_order_creating_intent_count"]
     row["pair_edge_is_admission"] = False
+    row["order_path_probe_is_admission"] = False
     row["ranking_is_admission"] = False
     row["admitted_candidates"] = []
     rows.append(row)

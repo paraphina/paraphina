@@ -57,7 +57,7 @@ use super::orderbook_l2::OrderBookL2;
 use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache, VenueAccountSnapshot};
 use super::types::ExecutionEvent as LiveExecutionEvent;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -13905,7 +13905,7 @@ fn emit_live_telemetry(
         if telemetry.execution_mode != "replay" {
             map.insert(
                 "mm_order_management".to_string(),
-                serde_json::to_value(mm_order_management).unwrap_or_default(),
+                sanitized_mm_order_management_value(mm_order_management),
             );
         }
     }
@@ -13948,6 +13948,33 @@ fn emit_live_telemetry(
         }
     }
     telemetry.sink.log_json(&record);
+}
+
+fn sanitized_mm_order_management_value(summary: &MmOrderDecisionSummary) -> Value {
+    let mut value = serde_json::to_value(summary).unwrap_or_default();
+    let Some(map) = value.as_object_mut() else {
+        return value;
+    };
+
+    redact_mm_order_records(map.get_mut("decision_records"));
+    redact_mm_order_records(map.get_mut("replace_decisions"));
+    redact_mm_order_records(map.get_mut("supported_replace_visibility_records"));
+    value
+}
+
+fn redact_mm_order_records(records: Option<&mut Value>) {
+    let Some(records) = records.and_then(Value::as_array_mut) else {
+        return;
+    };
+    for record in records {
+        let Some(record) = record.as_object_mut() else {
+            continue;
+        };
+        record.remove("current_order_id");
+        record.remove("client_order_id");
+        record.remove("current_client_order_id");
+        record.remove("identity_kind");
+    }
 }
 
 fn current_hedge_band_tao(cfg: &Config, state: &GlobalState) -> f64 {
@@ -15012,6 +15039,67 @@ mod tests {
                 Err("reduce_only_place")
             );
         });
+    }
+
+    #[test]
+    fn mm_order_management_telemetry_redacts_order_identifiers() {
+        let mut summary = MmOrderDecisionSummary::default();
+        summary.decision_records.push(crate::order_management::MmDecisionRecord {
+            decision_id: "d1".to_string(),
+            venue_index: 0,
+            venue_id: "lighter".to_string(),
+            side: "Buy".to_string(),
+            purpose: "Mm".to_string(),
+            outcome: "place".to_string(),
+            reason: "new_quote".to_string(),
+            fair_value: Some(100.0),
+            q_global_tao: 0.0,
+            current_order_id: Some("raw-current-order-id".to_string()),
+            current_price: None,
+            current_size: None,
+            desired_price: Some(99.0),
+            desired_size: Some(0.01),
+            client_order_id: Some("raw-client-order-id".to_string()),
+            utility_tier: Some("full".to_string()),
+            utility_reason: Some("healthy".to_string()),
+            venue_role: Some("fill".to_string()),
+            role_cap_applied: Some(false),
+            inventory_reducing: Some(false),
+        });
+        summary
+            .supported_replace_visibility_records
+            .push(crate::order_management::SupportedReplaceVisibilityRecord {
+                decision_id: "d1".to_string(),
+                venue_index: 0,
+                venue_id: "lighter".to_string(),
+                side: "Buy".to_string(),
+                desired_present: true,
+                current_present: true,
+                current_source: Some("active_order".to_string()),
+                identity_kind: Some("client_order_id".to_string()),
+                current_age_ms: Some(1),
+                native_replace_supported: true,
+                action: "place".to_string(),
+                blocked_by: None,
+                current_order_id: Some("raw-visible-order-id".to_string()),
+                current_client_order_id: Some("raw-visible-client-order-id".to_string()),
+                post_control_absence_reason: None,
+                suppression_grace_applied: false,
+            });
+
+        let value = sanitized_mm_order_management_value(&summary);
+        let text = serde_json::to_string(&value).expect("serialize");
+
+        assert!(text.contains("decision_records"));
+        assert!(text.contains("supported_replace_visibility_records"));
+        assert!(!text.contains("client_order_id"));
+        assert!(!text.contains("current_order_id"));
+        assert!(!text.contains("current_client_order_id"));
+        assert!(!text.contains("identity_kind"));
+        assert!(!text.contains("raw-client-order-id"));
+        assert!(!text.contains("raw-current-order-id"));
+        assert!(!text.contains("raw-visible-order-id"));
+        assert!(!text.contains("raw-visible-client-order-id"));
     }
 
     #[test]

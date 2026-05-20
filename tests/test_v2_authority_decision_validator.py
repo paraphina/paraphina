@@ -19,6 +19,7 @@ def paper_gate_state():
         "fast_hedge_disabled": True,
         "require_phase51_gate": True,
         "live_canary_admission_approved": False,
+        "live_canary_order_path_probe_approved": False,
         "live_canary_mode_enabled": False,
         "live_canary_profile_metadata_present": False,
         "live_canary_max_position_present": False,
@@ -71,6 +72,7 @@ def admitted_row():
         "baseline_mm_order_creating_intent_count": 2,
         "suppressed_mm_order_creating_intent_count": 1,
         "pair_edge_is_admission": True,
+        "order_path_probe_is_admission": False,
         "pressure_complete_claim": False,
         "blocker_cleared": False,
         "gate_state": paper_gate_state(),
@@ -111,6 +113,44 @@ def live_canary_admitted_row():
     row["authority_scope"] = "live_canary_ranked_admission"
     row["admission_reason"] = "live_canary_positive_pair_edge_ranked_admission"
     row["gate_state"] = live_canary_gate_state()
+    return row
+
+
+def live_canary_order_path_probe_row():
+    row = live_canary_admitted_row()
+    row["authority_scope"] = "live_canary_single_venue_order_path_probe"
+    row["admission_reason"] = "live_canary_single_venue_order_path_probe"
+    row["baseline_plan_intent_count"] = 1
+    row["baseline_mm_order_creating_intent_count"] = 1
+    row["suppressed_mm_order_creating_intent_count"] = 0
+    row["pair_edge_is_admission"] = False
+    row["order_path_probe_is_admission"] = True
+    row["ranking_is_admission"] = False
+    row["gate_state"]["live_canary_order_path_probe_approved"] = True
+    row["pair_edges"] = [
+        {
+            "snapshot_id": "v2_pair_edge_v1:missing_ask",
+            "bid_candidate_id": "v2_shadow_intent_v1:0:lighter:buy:0",
+            "ask_candidate_id": None,
+            "edge_usd": None,
+            "edge_bps": None,
+            "feature_only": False,
+            "invalid_reason": "missing_ask",
+        }
+    ]
+    row["admitted_candidates"] = [
+        {
+            "candidate_id": "v2_shadow_intent_v1:0:lighter:buy:0",
+            "venue_index": 0,
+            "venue_id": "lighter",
+            "side": "Buy",
+            "rank_index": 1,
+            "rank_score_microusd": 0,
+            "pair_edge_feature_usd": None,
+            "pair_edge_feature_bps": None,
+            "reference_candidate_id": None,
+        }
+    ]
     return row
 
 
@@ -162,6 +202,38 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             )
             self.assertFalse(data["v2_authority_contract"]["can_create_new_intents"])
             self.assertFalse(data["v2_authority_contract"]["fast_hedge_enabled"])
+
+    def test_accepts_live_canary_order_path_probe_as_non_promotion_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence = write_rows(root, [live_canary_order_path_probe_row()])
+            manifest = root / "manifest.json"
+
+            summary = validator.validate_v2_authority_decisions(evidence)
+            validator.write_manifest(evidence, manifest, summary)
+
+            self.assertEqual(summary.row_count, 1)
+            self.assertEqual(summary.admitted_rows, 1)
+            self.assertEqual(summary.live_canary_order_path_probe_rows, 1)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(data["governance"]["gate_status"], "LIVE_CANARY_ORDER_PATH_PROBE")
+            self.assertTrue(data["governance"]["probe_only"])
+            self.assertFalse(data["governance"]["approved_for_promotion"])
+            self.assertFalse(data["governance"]["approved_for_live"])
+            self.assertFalse(data["governance"]["blocker_cleared"])
+            self.assertEqual(
+                data["v2_authority_contract"]["authority_scope"],
+                "live_canary_single_venue_order_path_probe",
+            )
+            self.assertTrue(data["v2_authority_contract"]["order_path_probe_only"])
+
+    def test_rejects_order_path_probe_if_mislabeled_as_ranking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = live_canary_order_path_probe_row()
+            row["ranking_is_admission"] = True
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
 
     def test_rejects_synthesized_or_false_clearance_authority(self):
         for field in ["can_create_new_intents", "blocker_cleared", "pressure_complete_claim"]:

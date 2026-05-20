@@ -123,6 +123,7 @@ pub struct V2AdmissionGateState {
     pub live_canary_max_open_orders_present: bool,
     pub live_canary_post_only_enforced: bool,
     pub live_canary_reduce_only_not_enforced: bool,
+    pub live_canary_order_path_probe_approved: bool,
 }
 
 impl V2AdmissionGateState {
@@ -194,6 +195,7 @@ pub struct V2AdmissionDecision {
     pub baseline_mm_order_creating_intent_count: usize,
     pub suppressed_mm_order_creating_intent_count: usize,
     pub pair_edge_is_admission: bool,
+    pub order_path_probe_is_admission: bool,
     pub pressure_complete_claim: bool,
     pub blocker_cleared: bool,
     pub gate_state: V2AdmissionGateState,
@@ -326,6 +328,7 @@ pub fn admission_gate_state(
         fast_hedge_disabled: !config.fast_hedge_enabled,
         require_phase51_gate: config.require_phase51_gate,
         live_canary_admission_approved: config.live_canary_admission_approved,
+        live_canary_order_path_probe_approved: config.live_canary_order_path_probe_approved,
         live_canary_mode_enabled: runtime_context.live_canary_mode_enabled,
         live_canary_profile_metadata_present: runtime_context.live_canary_profile_metadata_present,
         live_canary_max_position_present: runtime_context.live_canary_max_position_present,
@@ -412,7 +415,11 @@ pub fn evaluate_admission_decision_with_context(
         .and_then(|edge| edge.edge_usd)
         .is_some_and(|edge| edge > 0.0);
 
-    let admitted_candidates = if gate_state.satisfied() {
+    let baseline_mm_count = count_baseline_mm_order_creating_intents(baseline_plan_intents);
+    let gate_satisfied = gate_state.satisfied();
+    let live_canary_mode = matches!(config.decision_mode, V2DecisionMode::LiveCanaryAdmission);
+    let mut order_path_probe_is_admission = false;
+    let mut admitted_candidates = if gate_satisfied {
         rankings
             .iter()
             .filter(|ranking| ranking.rank_status == "scored" && ranking.rank_score_microusd > 0)
@@ -437,23 +444,35 @@ pub fn evaluate_admission_decision_with_context(
         Vec::new()
     };
 
-    let baseline_mm_count = count_baseline_mm_order_creating_intents(baseline_plan_intents);
-    let gate_satisfied = gate_state.satisfied();
+    if admitted_candidates.is_empty()
+        && live_canary_mode
+        && config.live_canary_order_path_probe_approved
+        && gate_satisfied
+        && baseline_mm_count == 1
+    {
+        if let Some(candidate) = select_single_venue_order_path_probe_candidate(&candidates, &rankings)
+        {
+            admitted_candidates.push(candidate);
+            order_path_probe_is_admission = true;
+        }
+    }
+
     let has_admitted_candidates = !admitted_candidates.is_empty();
-    let live_canary_mode = matches!(config.decision_mode, V2DecisionMode::LiveCanaryAdmission);
     let admission_reason = match (
         live_canary_mode,
         gate_satisfied,
         has_admitted_candidates,
         positive_pair_edge,
+        order_path_probe_is_admission,
     ) {
-        (true, false, _, _) => "live_canary_admission_gate_not_satisfied",
-        (false, false, _, _) => "paper_admission_gate_not_satisfied",
-        (_, true, false, _) => "no_positive_ranked_candidates",
-        (true, true, true, true) => "live_canary_positive_pair_edge_ranked_admission",
-        (false, true, true, true) => "paper_positive_pair_edge_ranked_admission",
-        (true, true, true, false) => "live_canary_positive_ranked_admission",
-        (false, true, true, false) => "paper_positive_ranked_admission",
+        (true, false, _, _, _) => "live_canary_admission_gate_not_satisfied",
+        (false, false, _, _, _) => "paper_admission_gate_not_satisfied",
+        (_, true, false, _, _) => "no_positive_ranked_candidates",
+        (true, true, true, _, true) => "live_canary_single_venue_order_path_probe",
+        (true, true, true, true, false) => "live_canary_positive_pair_edge_ranked_admission",
+        (false, true, true, true, _) => "paper_positive_pair_edge_ranked_admission",
+        (true, true, true, false, false) => "live_canary_positive_ranked_admission",
+        (false, true, true, false, _) => "paper_positive_ranked_admission",
     };
     let output_count = admitted_candidates.len();
     let admitted = output_count > 0;
@@ -469,7 +488,9 @@ pub fn evaluate_admission_decision_with_context(
         now_ms,
         decision_mode: config.decision_mode.as_str(),
         execution_mode: execution_mode.to_string(),
-        authority_scope: if live_canary_mode {
+        authority_scope: if live_canary_mode && order_path_probe_is_admission {
+            "live_canary_single_venue_order_path_probe"
+        } else if live_canary_mode {
             "live_canary_ranked_admission"
         } else {
             "paper_only"
@@ -483,15 +504,49 @@ pub fn evaluate_admission_decision_with_context(
         baseline_plan_intent_count: baseline_plan_intents.len(),
         baseline_mm_order_creating_intent_count: baseline_mm_count,
         suppressed_mm_order_creating_intent_count: suppressed_count,
-        pair_edge_is_admission: admitted && positive_pair_edge,
+        pair_edge_is_admission: admitted && positive_pair_edge && !order_path_probe_is_admission,
+        order_path_probe_is_admission,
         pressure_complete_claim: false,
         blocker_cleared: false,
         gate_state,
         ranking_schema_version: 1,
         ranking_feature_only: false,
-        ranking_is_admission: admitted,
+        ranking_is_admission: admitted && !order_path_probe_is_admission,
         pair_edges,
         admitted_candidates,
+    })
+}
+
+fn select_single_venue_order_path_probe_candidate(
+    candidates: &[V2ShadowCandidate],
+    rankings: &[V2ShadowCandidateRanking],
+) -> Option<V2AdmittedCandidate> {
+    if candidates.len() != 1 {
+        return None;
+    }
+    let candidate = candidates.first()?;
+    if candidate.venue_id != "lighter"
+        || candidate.target_linkage_state != "present_redacted"
+        || !candidate.price.is_finite()
+        || candidate.price <= 0.0
+        || !candidate.size.is_finite()
+        || candidate.size <= 0.0
+    {
+        return None;
+    }
+    let ranking = rankings
+        .iter()
+        .find(|ranking| ranking.candidate_id == candidate.candidate_id);
+    Some(V2AdmittedCandidate {
+        candidate_id: candidate.candidate_id.clone(),
+        venue_index: candidate.venue_index,
+        venue_id: candidate.venue_id.clone(),
+        side: candidate.side,
+        rank_index: ranking.map(|ranking| ranking.rank_index).unwrap_or(1),
+        rank_score_microusd: 0,
+        pair_edge_feature_usd: None,
+        pair_edge_feature_bps: None,
+        reference_candidate_id: None,
     })
 }
 
@@ -1468,6 +1523,82 @@ mod tests {
         assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
         assert!(!serialized.contains("raw-group-must-not-emit"));
         assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_order_path_probe_admits_single_target_linked_lighter_intent() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_order_path_probe_approved = true;
+        let context = live_canary_runtime_context();
+        let mut intents = vec![mm_place(0, "lighter", Side::Buy, 100.0)];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert_eq!(
+            decision.admission_reason,
+            "live_canary_single_venue_order_path_probe"
+        );
+        assert_eq!(
+            decision.authority_scope,
+            "live_canary_single_venue_order_path_probe"
+        );
+        assert!(decision.gate_state.satisfied());
+        assert!(decision.gate_state.live_canary_order_path_probe_approved);
+        assert!(decision.order_path_probe_is_admission);
+        assert!(!decision.ranking_is_admission);
+        assert!(!decision.pair_edge_is_admission);
+        assert!(!decision.can_create_new_intents);
+        assert!(!decision.can_mutate_live_orders);
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+        assert_eq!(decision.baseline_mm_order_creating_intent_count, 1);
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 0);
+        assert_eq!(decision.admitted_candidates.len(), 1);
+        assert_eq!(decision.admitted_candidates[0].venue_id, "lighter");
+        assert_eq!(decision.admitted_candidates[0].rank_score_microusd, 0);
+        assert_eq!(intents.len(), 1);
+
+        let serialized = serde_json::to_string(&decision).expect("serialize");
+        assert!(!serialized.contains("raw-client-id-must-not-emit"));
+        assert!(!serialized.contains("raw-group-must-not-emit"));
+        assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_order_path_probe_rejects_unlinked_or_multi_intent_inputs() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_order_path_probe_approved = true;
+        let context = live_canary_runtime_context();
+
+        let mut unlinked = vec![mm_place(0, "lighter", Side::Buy, 100.0)];
+        if let OrderIntent::Place(place) = &mut unlinked[0] {
+            place.phase51_target_key = None;
+        }
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut unlinked, &context)
+                .expect("filter")
+                .expect("decision");
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.admission_reason, "no_positive_ranked_candidates");
+        assert!(!decision.order_path_probe_is_admission);
+        assert!(unlinked.is_empty());
+
+        let mut multi = vec![
+            mm_place(0, "lighter", Side::Buy, 100.0),
+            mm_place(0, "lighter", Side::Sell, 101.0),
+        ];
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut multi, &context)
+                .expect("filter")
+                .expect("decision");
+        assert_eq!(decision.admission_status, "HOLD");
+        assert!(!decision.order_path_probe_is_admission);
+        assert!(multi.is_empty());
     }
 
     #[test]

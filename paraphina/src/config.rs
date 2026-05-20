@@ -121,6 +121,7 @@ pub struct V2ShadowConfig {
     pub pair_edge_enabled: bool,
     pub pair_conditioned_admission_enabled: bool,
     pub live_canary_admission_approved: bool,
+    pub live_canary_order_path_probe_approved: bool,
     pub fast_hedge_enabled: bool,
     pub order_intent_enabled: bool,
     pub require_phase51_gate: bool,
@@ -137,6 +138,7 @@ impl Default for V2ShadowConfig {
             pair_edge_enabled: false,
             pair_conditioned_admission_enabled: false,
             live_canary_admission_approved: false,
+            live_canary_order_path_probe_approved: false,
             fast_hedge_enabled: false,
             order_intent_enabled: false,
             require_phase51_gate: true,
@@ -2969,6 +2971,34 @@ impl Config {
                     eprintln!(
                         "[config] WARN: could not parse PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED = {:?} as bool; using default {}",
                         raw, cfg.v2_shadow.live_canary_admission_approved
+                    );
+                }
+            }
+        }
+
+        if let Ok(raw) = env::var("PARAPHINA_V2_LIVE_CANARY_ORDER_PATH_PROBE_APPROVED") {
+            match parse_bool_env(&raw) {
+                Some(enabled)
+                    if matches!(
+                        cfg.v2_shadow.decision_mode,
+                        V2DecisionMode::LiveCanaryAdmission
+                    ) =>
+                {
+                    cfg.v2_shadow.live_canary_order_path_probe_approved = enabled;
+                    eprintln!(
+                        "[config] PARAPHINA_V2_LIVE_CANARY_ORDER_PATH_PROBE_APPROVED = {} (single-venue order-path probe; not promotion evidence)",
+                        cfg.v2_shadow.live_canary_order_path_probe_approved
+                    );
+                }
+                Some(_) => {
+                    eprintln!(
+                        "[config] PARAPHINA_V2_LIVE_CANARY_ORDER_PATH_PROBE_APPROVED ignored outside live_canary_admission mode"
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_V2_LIVE_CANARY_ORDER_PATH_PROBE_APPROVED = {:?} as bool; using default {}",
+                        raw, cfg.v2_shadow.live_canary_order_path_probe_approved
                     );
                 }
             }
