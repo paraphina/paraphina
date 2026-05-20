@@ -5227,11 +5227,8 @@ fn phase51_extended_source_owner_fills_from_trade_message(
                 return None;
             }
             let is_taker = trade.get("isTaker")?.as_bool()?;
-            let order_id = parse_extended_stringish(
-                trade
-                    .get("orderId")
-                    .or_else(|| trade.get("order_id")),
-            );
+            let order_id =
+                parse_extended_stringish(trade.get("orderId").or_else(|| trade.get("order_id")));
             let client_order_id = parse_extended_stringish(
                 trade
                     .get("externalId")
@@ -6469,7 +6466,12 @@ mod tests {
             });
 
             assert!(phase51_extended_source_owner_fills_from_trade_message(
-                &trade_msg, 2, "extended", 32, 1_700_000_000_666_i64, "ETH-USD",
+                &trade_msg,
+                2,
+                "extended",
+                32,
+                1_700_000_000_666_i64,
+                "ETH-USD",
             )
             .is_empty());
         }
@@ -6500,7 +6502,12 @@ mod tests {
             });
 
             assert!(phase51_extended_source_owner_fills_from_trade_message(
-                &trade_msg, 2, "extended", 33, 1_700_000_000_777_i64, "ETH-USD",
+                &trade_msg,
+                2,
+                "extended",
+                33,
+                1_700_000_000_777_i64,
+                "ETH-USD",
             )
             .is_empty());
         }

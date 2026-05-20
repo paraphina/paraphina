@@ -344,7 +344,11 @@ impl Phase51ForwardRefreshSourceOwnerPfillObservation {
         })
     }
 
-    pub fn set_exact_source_ticks(&mut self, order_source_tick: u64, fill_source_tick: u64) -> bool {
+    pub fn set_exact_source_ticks(
+        &mut self,
+        order_source_tick: u64,
+        fill_source_tick: u64,
+    ) -> bool {
         if fill_source_tick < order_source_tick {
             self.order_source_tick = None;
             self.fill_source_tick = None;

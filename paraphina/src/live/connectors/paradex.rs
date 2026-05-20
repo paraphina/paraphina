@@ -3445,9 +3445,8 @@ fn phase51_paradex_source_owner_fills_from_subscription_message(
                 return None;
             }
             let timestamp_ms = fill.get("created_at").and_then(parse_i64_value)?;
-            let order_id = parse_nonempty_stringish(
-                fill.get("order_id").or_else(|| fill.get("orderId")),
-            );
+            let order_id =
+                parse_nonempty_stringish(fill.get("order_id").or_else(|| fill.get("orderId")));
             let client_order_id = parse_nonempty_stringish(
                 fill.get("client_id")
                     .or_else(|| fill.get("client_order_id"))
@@ -7495,13 +7494,15 @@ mod tests {
                 }
             });
 
-            assert!(phase51_paradex_source_owner_fills_from_subscription_message(
-                &message,
-                4,
-                "paradex",
-                "ETH-USD-PERP",
-            )
-            .is_empty());
+            assert!(
+                phase51_paradex_source_owner_fills_from_subscription_message(
+                    &message,
+                    4,
+                    "paradex",
+                    "ETH-USD-PERP",
+                )
+                .is_empty()
+            );
         }
     }
 
@@ -7548,13 +7549,15 @@ mod tests {
                 }
             });
 
-            assert!(phase51_paradex_source_owner_fills_from_subscription_message(
-                &message,
-                4,
-                "paradex",
-                "ETH-USD-PERP",
-            )
-            .is_empty());
+            assert!(
+                phase51_paradex_source_owner_fills_from_subscription_message(
+                    &message,
+                    4,
+                    "paradex",
+                    "ETH-USD-PERP",
+                )
+                .is_empty()
+            );
         }
     }
 
@@ -7573,13 +7576,15 @@ mod tests {
             }
         });
 
-        assert!(phase51_paradex_source_owner_fills_from_subscription_message(
-            &message,
-            4,
-            "paradex",
-            "ETH-USD-PERP",
-        )
-        .is_empty());
+        assert!(
+            phase51_paradex_source_owner_fills_from_subscription_message(
+                &message,
+                4,
+                "paradex",
+                "ETH-USD-PERP",
+            )
+            .is_empty()
+        );
     }
 
     #[test]

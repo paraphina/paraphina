@@ -837,8 +837,14 @@ fn source_owner_pfill_observation_with_exact_source_ticks_emits_horizon_sidecar_
         row.get("target_type").and_then(Value::as_str),
         Some("source_owner_pfill_observation")
     );
-    assert_eq!(row.get("order_source_tick").and_then(Value::as_u64), Some(17));
-    assert_eq!(row.get("fill_source_tick").and_then(Value::as_u64), Some(21));
+    assert_eq!(
+        row.get("order_source_tick").and_then(Value::as_u64),
+        Some(17)
+    );
+    assert_eq!(
+        row.get("fill_source_tick").and_then(Value::as_u64),
+        Some(21)
+    );
     assert_eq!(
         row.get("observed_horizon_source_ticks")
             .and_then(Value::as_u64),

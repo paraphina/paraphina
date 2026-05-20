@@ -329,11 +329,7 @@ impl Phase51TargetKeyRegistry {
         true
     }
 
-    fn insert_order_binding(
-        &mut self,
-        order_id: &str,
-        binding: Phase51RegistryBinding,
-    ) -> bool {
+    fn insert_order_binding(&mut self, order_id: &str, binding: Phase51RegistryBinding) -> bool {
         let Some(order_id) = valid_handle(Some(order_id)) else {
             return false;
         };

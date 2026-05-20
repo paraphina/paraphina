@@ -6550,10 +6550,10 @@ fn parse_user_fill(
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.0);
     let purpose = parse_purpose(fill.get("purpose")).unwrap_or(OrderPurpose::Mm);
-    let phase51_native_role =
-        fill.get("crossed")
-            .and_then(|v| v.as_bool())
-            .map(|crossed| Phase51ForwardRefreshNativeRole::Hyperliquid { crossed });
+    let phase51_native_role = fill
+        .get("crossed")
+        .and_then(|v| v.as_bool())
+        .map(|crossed| Phase51ForwardRefreshNativeRole::Hyperliquid { crossed });
 
     Some(ExecutionEvent::Filled(super::super::types::Fill {
         venue_index,

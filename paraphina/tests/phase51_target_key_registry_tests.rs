@@ -598,10 +598,8 @@ fn exact_runtime_source_ticks_bridge_to_source_owner_pfill_observation() {
         &[intent],
         11,
     ));
-    assert!(registry.observe_order_accepted(&accepted(
-        Some("source-tick-client"),
-        "source-tick-order",
-    )));
+    assert!(registry
+        .observe_order_accepted(&accepted(Some("source-tick-client"), "source-tick-order",)));
 
     let mut source_owner_fill = Phase51ForwardRefreshSourceOwnerFill::new(
         0,

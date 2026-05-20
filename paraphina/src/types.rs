@@ -259,9 +259,8 @@ mod tests {
 
     #[test]
     fn canonical_target_identity_debug_redacts_values() {
-        let identity =
-            CanonicalTargetIdentity::from_explicit("sensitive-group", "sensitive-order")
-                .expect("complete identity");
+        let identity = CanonicalTargetIdentity::from_explicit("sensitive-group", "sensitive-order")
+            .expect("complete identity");
         let debug = format!("{identity:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("sensitive-group"));
@@ -270,9 +269,8 @@ mod tests {
 
     #[test]
     fn canonical_target_identity_converts_to_phase51_key() {
-        let identity =
-            CanonicalTargetIdentity::from_explicit("canonical-group", "canonical-order")
-                .expect("complete identity");
+        let identity = CanonicalTargetIdentity::from_explicit("canonical-group", "canonical-order")
+            .expect("complete identity");
         let target_key = identity.to_phase51_target_key();
         assert_eq!(target_key.canonical_group_id, identity.canonical_group_id());
         assert_eq!(target_key.order_key, identity.order_key());
