@@ -389,6 +389,96 @@ class TestValidateTelemetryRecord(unittest.TestCase):
         self.assertGreater(len(errors), 0)
         self.assertTrue(any("not finite" in e.message or "NaN" in e.message for e in errors))
 
+    def test_order_telemetry_raw_identifier_fields_fail(self):
+        """Order/fill telemetry must not contain raw venue or client identifiers."""
+        record = self._make_valid_record(
+            orders=[
+                {
+                    "action": "place",
+                    "action_id": "place:0:Buy:4636737291354636288:4576918229304087675",
+                    "client_order_id": "raw-client-order",
+                }
+            ],
+            would_send_orders=[
+                {
+                    "action": "place",
+                    "action_id": "place:0:Buy:4636737291354636288:4576918229304087675",
+                    "order_id": "raw-order",
+                }
+            ],
+            fills=[
+                {
+                    "fill_seq": 1,
+                    "action_id": "place:0:Buy:4636737291354636288:4576918229304087675",
+                    "trade_id": "raw-trade",
+                }
+            ],
+        )
+
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
+
+        messages = "\n".join(error.message for error in errors)
+        self.assertIn("raw identifier field 'client_order_id' is prohibited", messages)
+        self.assertIn("raw identifier field 'order_id' is prohibited", messages)
+        self.assertIn("raw identifier field 'trade_id' is prohibited", messages)
+
+    def test_action_id_must_not_be_raw_identifier(self):
+        """action_id must use the non-identifier shape emitted by telemetry.rs."""
+        record = self._make_valid_record(
+            orders=[
+                {
+                    "action": "place",
+                    "action_id": "raw-client-order-id",
+                }
+            ],
+        )
+
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
+
+        self.assertTrue(any("action_id" in error.message for error in errors), errors)
+
+    def test_sanitized_order_telemetry_shape_passes(self):
+        """Sanitized order/fill telemetry can still carry shape and decision linkage."""
+        record = self._make_valid_record(
+            orders=[
+                {
+                    "action": "place",
+                    "status": "intent",
+                    "venue_index": 0,
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "action_id": "place:0:Buy:4636737291354636288:4576918229304087675",
+                    "decision_id": "decision-safe",
+                }
+            ],
+            would_send_orders=[
+                {
+                    "action": "cancel_all",
+                    "status": "intent",
+                    "venue_index": -1,
+                    "venue_id": "ALL",
+                    "action_id": "cancel_all:-1:NA:0:0",
+                }
+            ],
+            fills=[
+                {
+                    "fill_seq": 1,
+                    "venue_index": 0,
+                    "venue_id": "lighter",
+                    "side": "Buy",
+                    "price": 100.0,
+                    "size": 0.01,
+                    "decision_id": "decision-safe",
+                }
+            ],
+        )
+
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
+
+        self.assertEqual(errors, [])
+
 
 class TestValidateMcRunsRecord(unittest.TestCase):
     """Test the validate_record function for mc_runs.jsonl schema."""
@@ -602,6 +692,61 @@ class TestValidatorSubprocess(unittest.TestCase):
         """Get path to the validator script."""
         script_dir = Path(__file__).parent.parent
         return script_dir / "tools" / "check_telemetry_contract.py"
+
+    def test_telemetry_contract_rejects_raw_order_identifiers(self):
+        """Subprocess gate must reject raw IDs even when the base schema passes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telemetry_path = Path(tmpdir) / "telemetry.jsonl"
+            telemetry_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "t": 0,
+                    "pnl_realised": 0.0,
+                    "pnl_unrealised": 0.0,
+                    "pnl_total": 0.0,
+                    "risk_regime": "Normal",
+                    "kill_switch": False,
+                    "kill_reason": "None",
+                    "q_global_tao": 0.0,
+                    "dollar_delta_usd": 0.0,
+                    "basis_usd": 0.0,
+                    "orders": [
+                        {
+                            "action": "place",
+                            "status": "intent",
+                            "action_id": "raw-client-order-id",
+                            "client_order_id": "raw-client-order-id",
+                        }
+                    ],
+                    "would_send_orders": [
+                        {
+                            "action": "replace",
+                            "status": "intent",
+                            "action_id": "replace:0:Sell:4636737291354636288:4576918229304087675",
+                            "order_id": "raw-order-id",
+                        }
+                    ],
+                    "fills": [
+                        {
+                            "fill_seq": 1,
+                            "venue_id": "lighter",
+                            "trade_id": "raw-trade-id",
+                        }
+                    ],
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(self._get_validator_path()), str(telemetry_path)],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("raw identifier field", result.stdout)
+        self.assertIn("action_id", result.stdout)
 
     def _get_phase51_shadow_path(self) -> Path:
         """Get path to the Phase 5.1 shadow harness."""

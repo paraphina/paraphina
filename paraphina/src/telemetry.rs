@@ -2436,8 +2436,6 @@ fn build_order_records(
             "reduce_only": reduce_only,
             "purpose": purpose,
             "risk_regime": format!("{:?}", state.risk_regime),
-            "order_id": order_id,
-            "client_order_id": client_order_id,
             "action_id": action_id,
             "decision_id": decision_id,
         });
@@ -2481,8 +2479,6 @@ fn build_order_records(
                     "reduce_only": Option::<bool>::None,
                     "purpose": ack.purpose.map(|p| format!("{p:?}")),
                     "risk_regime": format!("{:?}", state.risk_regime),
-                    "order_id": ack.order_id,
-                    "client_order_id": ack.client_order_id,
                     "action_id": action_id,
                     "decision_id": decision_id,
                 }));
@@ -2515,8 +2511,6 @@ fn build_order_records(
                     "reduce_only": Option::<bool>::None,
                     "purpose": Option::<String>::None,
                     "risk_regime": format!("{:?}", state.risk_regime),
-                    "order_id": rej.order_id,
-                    "client_order_id": rej.client_order_id,
                     "reason": rej.reason,
                     "action_id": action_id,
                     "decision_id": decision_id,
@@ -2544,19 +2538,9 @@ fn build_order_action_id(
     side: Option<&String>,
     price: Option<f64>,
     size: Option<f64>,
-    client_order_id: Option<&String>,
-    order_id: Option<&String>,
+    _client_order_id: Option<&String>,
+    _order_id: Option<&String>,
 ) -> String {
-    if let Some(id) = client_order_id {
-        if !id.is_empty() {
-            return id.to_string();
-        }
-    }
-    if let Some(id) = order_id {
-        if !id.is_empty() {
-            return id.to_string();
-        }
-    }
     let side_str = side.map(|s| s.as_str()).unwrap_or("NA");
     let price_bits = price.unwrap_or(0.0).to_bits();
     let size_bits = size.unwrap_or(0.0).to_bits();
@@ -2624,8 +2608,6 @@ fn build_fill_records(
             "fill_seq": record.as_ref().map(|r| r.fill_seq),
             "venue_index": fill.venue_index as i64,
             "venue_id": fill.venue_id.as_ref(),
-            "order_id": fill.order_id,
-            "client_order_id": fill.client_order_id,
             "side": format!("{:?}", fill.side),
             "price": fill.price,
             "size": fill.size,
@@ -3548,7 +3530,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, MmVenueRole};
     use crate::state::GlobalState;
-    use crate::types::{PlaceOrderIntent, TimeInForce};
+    use crate::types::{OrderAck, OrderReject, PlaceOrderIntent, TimeInForce};
     use serde_json::json;
 
     #[test]
@@ -3775,6 +3757,118 @@ mod tests {
         let indices: Vec<u64> = used.iter().filter_map(|v| v.as_u64()).collect();
         assert_eq!(indices, vec![1, 2, 4]);
         assert_eq!(used_count, 3);
+    }
+
+    #[test]
+    fn order_telemetry_redacts_raw_order_identifiers() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let venue_id = cfg.venues[0].id_arc.clone();
+        let intent = OrderIntent::Place(PlaceOrderIntent {
+            venue_index: 0,
+            venue_id: venue_id.clone(),
+            side: Side::Buy,
+            price: 101.25,
+            size: 0.01,
+            purpose: OrderPurpose::Hedge,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: Some("raw-client-intent".to_string()),
+            phase51_target_key: None,
+        });
+        let ack = ExecutionEvent::OrderAck(OrderAck {
+            venue_index: 0,
+            venue_id: venue_id.clone(),
+            order_id: "raw-order-ack".to_string(),
+            client_order_id: Some("raw-client-ack".to_string()),
+            seq: Some(1),
+            side: Some(Side::Buy),
+            price: Some(101.25),
+            size: Some(0.01),
+            purpose: Some(OrderPurpose::Hedge),
+        });
+        let reject = ExecutionEvent::OrderReject(OrderReject {
+            venue_index: 0,
+            venue_id,
+            order_id: Some("raw-order-reject".to_string()),
+            client_order_id: Some("raw-client-reject".to_string()),
+            seq: Some(2),
+            purpose: Some(OrderPurpose::Hedge),
+            reduce_only: Some(true),
+            reason: "synthetic_test_reject".to_string(),
+        });
+        let fill = FillEvent {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            order_id: Some("raw-order-fill".to_string()),
+            client_order_id: Some("raw-client-fill".to_string()),
+            seq: Some(3),
+            side: Side::Buy,
+            price: 101.25,
+            size: 0.01,
+            purpose: OrderPurpose::Hedge,
+            fee_bps: 0.0,
+        };
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms: 1_000,
+            intents: &[intent],
+            exec_events: &[ack, reject],
+            fills: &[fill],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: false,
+            execution_mode: "live",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let text = serde_json::to_string(&record).expect("serialize");
+        for raw in [
+            "raw-client-intent",
+            "raw-order-ack",
+            "raw-client-ack",
+            "raw-order-reject",
+            "raw-client-reject",
+            "raw-order-fill",
+            "raw-client-fill",
+        ] {
+            assert!(!text.contains(raw), "telemetry leaked {raw}");
+        }
+        for key in ["orders", "would_send_orders", "fills"] {
+            let records = record
+                .get(key)
+                .and_then(|value| value.as_array())
+                .expect(key);
+            assert!(!records.is_empty());
+            for item in records {
+                let object = item.as_object().expect("order record object");
+                assert!(!object.contains_key("order_id"));
+                assert!(!object.contains_key("client_order_id"));
+            }
+        }
+        for key in ["orders", "would_send_orders"] {
+            let records = record
+                .get(key)
+                .and_then(|value| value.as_array())
+                .expect(key);
+            for item in records {
+                let object = item.as_object().expect("order record object");
+                let action_id = object
+                    .get("action_id")
+                    .and_then(|value| value.as_str())
+                    .expect("sanitized action_id");
+                assert!(!action_id.contains("raw-"));
+            }
+        }
     }
 
     #[test]

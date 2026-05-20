@@ -73,6 +73,116 @@ class ValidationError(NamedTuple):
     message: str
 
 
+RAW_IDENTIFIER_FIELD_NAMES: set[str] = {
+    "account_id",
+    "auth_header",
+    "auth_token",
+    "authorization",
+    "client_id",
+    "client_order_id",
+    "current_client_order_id",
+    "current_order_id",
+    "external_order_id",
+    "fill_id",
+    "headers",
+    "order_id",
+    "payload",
+    "private_key",
+    "raw_client_order_id",
+    "raw_order_id",
+    "raw_payload",
+    "request_body",
+    "response_body",
+    "signature",
+    "token",
+    "trade_id",
+    "venue_order_id",
+}
+
+RAW_IDENTIFIER_VALUE_FRAGMENTS: tuple[str, ...] = (
+    "auth_token",
+    "authorization:",
+    "bearer ",
+    "client_order_id",
+    "order_id",
+    "private_key",
+    "raw-client",
+    "raw-order",
+    "request_body",
+    "response_body",
+    "signature",
+)
+
+SANITIZED_ACTIONS: set[str] = {"place", "cancel", "replace", "cancel_all"}
+SANITIZED_ACTION_SIDES: set[str] = {"Buy", "Sell", "NA"}
+
+
+def is_sanitized_action_id(value: Any) -> bool:
+    """Return True when action_id is derived only from non-identifier order shape."""
+    if not isinstance(value, str):
+        return False
+    parts = value.split(":")
+    if len(parts) != 5:
+        return False
+    action, venue_index, side, price_bits, size_bits = parts
+    if action not in SANITIZED_ACTIONS:
+        return False
+    if side not in SANITIZED_ACTION_SIDES:
+        return False
+    try:
+        int(venue_index)
+        int(price_bits)
+        int(size_bits)
+    except ValueError:
+        return False
+    return True
+
+
+def scan_raw_identifier_fields(value: Any, line_num: int, path: str = "$") -> list[ValidationError]:
+    """
+    Recursively reject raw identifier/secrets fields in telemetry artifacts.
+
+    Hash-only fields such as order_id_hash or order_id_sha256 remain allowed; raw
+    fields are not acceptable even when nested under arrays like orders,
+    would_send_orders, fills, hedges, exits, or diagnostics.
+    """
+    errors: list[ValidationError] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            key_lc = key.lower()
+            if key_lc in RAW_IDENTIFIER_FIELD_NAMES:
+                errors.append(
+                    ValidationError(
+                        line_num,
+                        f"raw identifier field '{key}' is prohibited at {child_path}",
+                    )
+                )
+            if key_lc == "action_id" and not is_sanitized_action_id(child):
+                errors.append(
+                    ValidationError(
+                        line_num,
+                        f"field 'action_id' must use sanitized non-identifier shape at {child_path}",
+                    )
+                )
+            errors.extend(scan_raw_identifier_fields(child, line_num, child_path))
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            errors.extend(scan_raw_identifier_fields(child, line_num, f"{path}[{idx}]"))
+    elif isinstance(value, str):
+        value_lc = value.lower()
+        for fragment in RAW_IDENTIFIER_VALUE_FRAGMENTS:
+            if fragment in value_lc:
+                errors.append(
+                    ValidationError(
+                        line_num,
+                        f"raw identifier-like string fragment '{fragment}' is prohibited at {path}",
+                    )
+                )
+                break
+    return errors
+
+
 def load_schema(schema_path: Path) -> dict[str, Any] | None:
     """
     Load the machine-readable schema from JSON file.
@@ -245,6 +355,8 @@ def validate_record(
                 line_num,
                 f"field '{field}' must be {str(expected_value).lower()}, got {record[field]}"
             ))
+
+    errors.extend(scan_raw_identifier_fields(record, line_num))
     
     # Check index monotonicity if applicable
     current_index = None
