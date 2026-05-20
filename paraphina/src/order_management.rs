@@ -21,6 +21,13 @@ use serde::Serialize;
 
 const EXTENDED_NATIVE_REPLACE_ENABLED_ENV: &str = "PARAPHINA_EXTENDED_NATIVE_REPLACE_ENABLED";
 
+fn diagnostic_order_id_state(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some(value) if !value.trim().is_empty() => "present_redacted",
+        _ => "absent",
+    }
+}
+
 /// Output of MM order management planner.
 #[derive(Debug, Clone)]
 pub struct MmOrderManagementPlan {
@@ -967,12 +974,12 @@ fn plan_side(
             if suppression_grace_applied {
                 let keep_reason = if paradex_queue_preservation_applied {
                     eprintln!(
-                        "PARADEX_QUEUE_PRESERVATION_KEEP age_ms={} grace_ms={} base_lifetime_ms={} order_id={} client_id={}",
+                        "PARADEX_QUEUE_PRESERVATION_KEEP age_ms={} grace_ms={} base_lifetime_ms={} order_id_state={} client_id_state={}",
                         current_age_ms,
                         post_control_suppression_grace_ms,
                         base_min_quote_lifetime_ms,
-                        cur.order_id,
-                        cur.client_order_id.as_deref().unwrap_or("-"),
+                        diagnostic_order_id_state(Some(cur.order_id.as_str())),
+                        diagnostic_order_id_state(cur.client_order_id.as_deref()),
                     );
                     "paradex_queue_preservation_grace"
                 } else if let Some(edge_floor_keep_reason) = edge_floor_queue_grace_keep_reason {
@@ -993,14 +1000,14 @@ fn plan_side(
                             "PARADEX_EDGE_FLOOR_QUEUE_KEEP"
                         };
                         eprintln!(
-                            "{log_label} age_ms={} deficit_usd={:.6} band_usd={:.6} edge_local_usd={:.6} edge_threshold_usd={:.6} order_id={} client_id={}",
+                            "{log_label} age_ms={} deficit_usd={:.6} band_usd={:.6} edge_local_usd={:.6} edge_threshold_usd={:.6} order_id_state={} client_id_state={}",
                             current_age_ms,
                             deficit_usd,
                             edge_under_min_band_usd.unwrap_or(0.0),
                             edge_local_usd,
                             edge_threshold_usd,
-                            cur.order_id,
-                            cur.client_order_id.as_deref().unwrap_or("-"),
+                            diagnostic_order_id_state(Some(cur.order_id.as_str())),
+                            diagnostic_order_id_state(cur.client_order_id.as_deref()),
                         );
                     }
                     edge_floor_keep_reason
@@ -1317,6 +1324,21 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    #[test]
+    fn diagnostic_order_id_state_redacts_raw_identifiers() {
+        assert_eq!(
+            diagnostic_order_id_state(Some("raw-order-id")),
+            "present_redacted"
+        );
+        assert_eq!(
+            diagnostic_order_id_state(Some("raw-client-id")),
+            "present_redacted"
+        );
+        assert_eq!(diagnostic_order_id_state(Some("")), "absent");
+        assert_eq!(diagnostic_order_id_state(Some("  ")), "absent");
+        assert_eq!(diagnostic_order_id_state(None), "absent");
     }
 
     fn mk_state_with_quote(cfg: &Config) -> GlobalState {
