@@ -789,6 +789,7 @@ struct StartupPnlBaselineConfig {
     pnl_abs_limit_usd: f64,
     position_tol_tao: f64,
     max_wait_ticks: u64,
+    require_full_account_coverage: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -804,6 +805,7 @@ struct StartupPnlBaselineStatus {
     required_account_count: usize,
     waited_ticks: u64,
     max_wait_ticks: u64,
+    require_full_account_coverage: bool,
     pnl_abs_limit_usd: f64,
     position_tol_tao: f64,
     daily_realised_pnl: f64,
@@ -11183,6 +11185,11 @@ fn startup_pnl_baseline_config_from_env(canary_enabled: bool) -> StartupPnlBasel
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(40),
+        require_full_account_coverage: std::env::var(
+            "PARAPHINA_CANARY_STARTUP_REQUIRE_FULL_ACCOUNT_COVERAGE",
+        )
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false),
     }
 }
 
@@ -11542,6 +11549,7 @@ fn evaluate_startup_pnl_baseline(
         enabled: guard_cfg.enabled,
         waited_ticks,
         max_wait_ticks: guard_cfg.max_wait_ticks,
+        require_full_account_coverage: guard_cfg.require_full_account_coverage,
         pnl_abs_limit_usd: guard_cfg.pnl_abs_limit_usd,
         position_tol_tao: guard_cfg.position_tol_tao,
         daily_realised_pnl: state.daily_realised_pnl,
@@ -11601,7 +11609,8 @@ fn evaluate_startup_pnl_baseline(
     status.violating_venues = violating_venues;
 
     let full_account_coverage = fresh_account_count >= status.required_account_count;
-    let partial_account_coverage_timed_out = !full_account_coverage
+    let partial_account_coverage_timed_out = !guard_cfg.require_full_account_coverage
+        && !full_account_coverage
         && waited_ticks >= guard_cfg.max_wait_ticks
         && fresh_account_count > 0;
     if !full_account_coverage && !partial_account_coverage_timed_out {
@@ -24811,6 +24820,7 @@ mod tests {
                 pnl_abs_limit_usd: 1.0,
                 position_tol_tao: 0.0025,
                 max_wait_ticks: 40,
+                require_full_account_coverage: false,
             },
         );
 
@@ -24869,6 +24879,7 @@ mod tests {
                 pnl_abs_limit_usd: 1.0,
                 position_tol_tao: 0.0025,
                 max_wait_ticks: 40,
+                require_full_account_coverage: false,
             },
         );
 
@@ -24927,6 +24938,7 @@ mod tests {
                 pnl_abs_limit_usd: 1.0,
                 position_tol_tao: 0.0025,
                 max_wait_ticks: 40,
+                require_full_account_coverage: false,
             },
         );
 
@@ -24983,6 +24995,7 @@ mod tests {
                 pnl_abs_limit_usd: 1.0,
                 position_tol_tao: 0.0025,
                 max_wait_ticks: 40,
+                require_full_account_coverage: false,
             },
         );
 
@@ -24993,6 +25006,68 @@ mod tests {
             status.reason.as_deref(),
             Some("startup_baseline_partial_account_coverage_ok")
         );
+    }
+
+    #[test]
+    fn startup_pnl_baseline_rejects_partial_account_coverage_when_full_required() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 5_000;
+        state.fair_value = Some(2_095.0);
+        state.fair_value_prev = 2_095.0;
+        state.recompute_after_fills(&cfg);
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: if venue_index < 2 { 1 } else { 0 },
+                    timestamp_ms: if venue_index < 2 { Some(now_ms) } else { None },
+                    position_tao: 0.0,
+                    avg_entry_price: 0.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut initialized = vec![false; cfg.venues.len()];
+        initialized[0] = true;
+        initialized[1] = true;
+        let status = evaluate_startup_pnl_baseline(
+            &cfg,
+            &state,
+            &snapshot,
+            &initialized,
+            now_ms,
+            40,
+            StartupPnlBaselineConfig {
+                enabled: true,
+                pnl_abs_limit_usd: 1.0,
+                position_tol_tao: 0.0025,
+                max_wait_ticks: 40,
+                require_full_account_coverage: true,
+            },
+        );
+
+        assert!(status.triggered);
+        assert!(status.timed_out);
+        assert!(!status.passed);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("awaiting_account_snapshots_timeout")
+        );
+        assert!(status.require_full_account_coverage);
     }
 
     #[test]

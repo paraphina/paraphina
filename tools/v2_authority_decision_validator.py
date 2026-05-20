@@ -117,6 +117,7 @@ def _validate_gate_state(row: dict[str, Any], line: int, live_canary: bool) -> b
         "live_canary_max_open_orders_present",
         "live_canary_post_only_enforced",
         "live_canary_reduce_only_not_enforced",
+        "live_canary_baseline_hedge_authority_acknowledged",
     ]
     for field in expected_bool_fields:
         _require(isinstance(gate_state.get(field), bool), line, f"gate_state.{field} must be bool")
@@ -144,6 +145,7 @@ def _validate_gate_state(row: dict[str, Any], line: int, live_canary: bool) -> b
         and gate_state["live_canary_max_open_orders_present"]
         and gate_state["live_canary_post_only_enforced"]
         and gate_state["live_canary_reduce_only_not_enforced"]
+        and gate_state["live_canary_baseline_hedge_authority_acknowledged"]
     )
     _require(
         not (paper_authority and live_canary_authority),

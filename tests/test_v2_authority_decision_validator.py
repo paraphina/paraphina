@@ -28,6 +28,7 @@ def paper_gate_state():
         "live_canary_max_open_orders_present": False,
         "live_canary_post_only_enforced": False,
         "live_canary_reduce_only_not_enforced": False,
+        "live_canary_baseline_hedge_authority_acknowledged": False,
     }
 
 
@@ -48,6 +49,7 @@ def live_canary_gate_state():
             "live_canary_max_open_orders_present": True,
             "live_canary_post_only_enforced": True,
             "live_canary_reduce_only_not_enforced": True,
+            "live_canary_baseline_hedge_authority_acknowledged": True,
         }
     )
     return gate
@@ -296,6 +298,14 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             row = admitted_row()
             row["gate_state"]["order_intent_enabled"] = False
             row["can_filter_existing_intents"] = False
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_live_canary_without_baseline_hedge_authority_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = live_canary_admitted_row()
+            row["gate_state"]["live_canary_baseline_hedge_authority_acknowledged"] = False
             evidence = write_rows(Path(tmp), [row])
             with self.assertRaises(validator.V2AuthorityValidationError):
                 validator.validate_v2_authority_decisions(evidence)

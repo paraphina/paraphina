@@ -1738,7 +1738,7 @@ fn v2_live_canary_admission_preflight_check(
         label: "v2_live_canary_admission",
         ok: gate_state.satisfied(),
         details: format!(
-            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
+            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
             gate_state.live_canary_admission_approved,
             gate_state.live_canary_mode_enabled,
             gate_state.live_canary_profile_metadata_present,
@@ -1748,6 +1748,7 @@ fn v2_live_canary_admission_preflight_check(
             gate_state.live_canary_max_open_orders_present,
             gate_state.live_canary_post_only_enforced,
             gate_state.live_canary_reduce_only_not_enforced,
+            gate_state.live_canary_baseline_hedge_authority_acknowledged,
             gate_state.pair_edge_enabled,
             gate_state.order_intent_enabled,
             gate_state.fast_hedge_disabled,
@@ -5235,6 +5236,8 @@ mod tests {
         let _max_open = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_MAX_OPEN_ORDERS");
         let _post_only = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_ENFORCE_POST_ONLY");
         let _reduce_only = EnvVarGuard::new("PARAPHINA_RUNTIME_CANARY_ENFORCE_REDUCE_ONLY");
+        let _baseline_hedge_ack =
+            EnvVarGuard::new("PARAPHINA_V2_LIVE_CANARY_BASELINE_HEDGE_AUTHORITY_ACK");
 
         std::env::set_var("PARAPHINA_RUNTIME_CANARY_PROFILE_PATH", "configs/v2.toml");
         std::env::set_var("PARAPHINA_RUNTIME_CANARY_PROFILE_SHA256", "sanitized-sha");
@@ -5247,6 +5250,7 @@ mod tests {
         std::env::set_var("PARAPHINA_RUNTIME_CANARY_MAX_OPEN_ORDERS", "5");
         std::env::set_var("PARAPHINA_RUNTIME_CANARY_ENFORCE_POST_ONLY", "1");
         std::env::set_var("PARAPHINA_RUNTIME_CANARY_ENFORCE_REDUCE_ONLY", "0");
+        std::env::set_var("PARAPHINA_V2_LIVE_CANARY_BASELINE_HEDGE_AUTHORITY_ACK", "1");
 
         f()
     }
@@ -5265,6 +5269,20 @@ mod tests {
             assert!(check.details.contains("max_gross_position=true"));
             assert!(check.details.contains("post_only=true"));
             assert!(check.details.contains("reduce_only_not_enforced=true"));
+            assert!(check.details.contains("baseline_hedge_authority_ack=true"));
+        });
+    }
+
+    #[test]
+    fn v2_live_canary_admission_preflight_rejects_missing_baseline_hedge_ack() {
+        with_v2_live_canary_preflight_env(|| {
+            std::env::remove_var("PARAPHINA_V2_LIVE_CANARY_BASELINE_HEDGE_AUTHORITY_ACK");
+            let cfg = v2_live_canary_admission_config();
+            let check = super::v2_live_canary_admission_preflight_check(TradeMode::Live, &cfg)
+                .expect("preflight check should run");
+
+            assert!(!check.ok);
+            assert!(check.details.contains("baseline_hedge_authority_ack=false"));
         });
     }
 

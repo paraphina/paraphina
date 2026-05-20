@@ -28,6 +28,7 @@ def gate_state():
         "live_canary_max_open_orders_present": True,
         "live_canary_post_only_enforced": True,
         "live_canary_reduce_only_not_enforced": True,
+        "live_canary_baseline_hedge_authority_acknowledged": True,
     }
 
 

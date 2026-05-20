@@ -180,6 +180,7 @@ pub struct V2AdmissionGateState {
     pub live_canary_max_open_orders_present: bool,
     pub live_canary_post_only_enforced: bool,
     pub live_canary_reduce_only_not_enforced: bool,
+    pub live_canary_baseline_hedge_authority_acknowledged: bool,
     pub live_canary_order_path_probe_approved: bool,
 }
 
@@ -196,7 +197,8 @@ impl V2AdmissionGateState {
             && self.live_canary_max_abs_venue_position_present
             && self.live_canary_max_open_orders_present
             && self.live_canary_post_only_enforced
-            && self.live_canary_reduce_only_not_enforced;
+            && self.live_canary_reduce_only_not_enforced
+            && self.live_canary_baseline_hedge_authority_acknowledged;
 
         self.enabled
             && (paper_authority || live_canary_authority)
@@ -218,6 +220,7 @@ pub struct V2AdmissionRuntimeContext {
     pub live_canary_max_open_orders_present: bool,
     pub live_canary_post_only_enforced: bool,
     pub live_canary_reduce_only_not_enforced: bool,
+    pub live_canary_baseline_hedge_authority_acknowledged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -358,6 +361,11 @@ impl V2AdmissionRuntimeContext {
             ) && !env_flag_true(
                 "PARAPHINA_CANARY_ENFORCE_REDUCE_ONLY",
             ),
+            live_canary_baseline_hedge_authority_acknowledged: env_flag_true(
+                "PARAPHINA_V2_LIVE_CANARY_BASELINE_HEDGE_AUTHORITY_ACK",
+            ) || env_flag_true(
+                "PARAPHINA_V2_LIVE_CANARY_BASELINE_HEDGE_AUTHORITY_ACKNOWLEDGED",
+            ),
         }
     }
 }
@@ -396,6 +404,8 @@ pub fn admission_gate_state(
         live_canary_max_open_orders_present: runtime_context.live_canary_max_open_orders_present,
         live_canary_post_only_enforced: runtime_context.live_canary_post_only_enforced,
         live_canary_reduce_only_not_enforced: runtime_context.live_canary_reduce_only_not_enforced,
+        live_canary_baseline_hedge_authority_acknowledged: runtime_context
+            .live_canary_baseline_hedge_authority_acknowledged,
     }
 }
 
@@ -1346,6 +1356,7 @@ mod tests {
             live_canary_max_open_orders_present: true,
             live_canary_post_only_enforced: true,
             live_canary_reduce_only_not_enforced: true,
+            live_canary_baseline_hedge_authority_acknowledged: true,
         }
     }
 
@@ -1908,6 +1919,35 @@ mod tests {
             "live_canary_admission_gate_not_satisfied"
         );
         assert!(!decision.gate_state.fast_hedge_disabled);
+        assert!(!decision.gate_state.satisfied());
+        assert!(!decision.can_create_new_intents);
+        assert!(!decision.blocker_cleared);
+    }
+
+    #[test]
+    fn v2_live_canary_admission_requires_baseline_hedge_authority_ack() {
+        let config = live_canary_admission_config();
+        let mut context = live_canary_runtime_context();
+        context.live_canary_baseline_hedge_authority_acknowledged = false;
+        let decision = evaluate_admission_decision_with_context(
+            &config,
+            "live",
+            4_500,
+            &[mm_place(0, "extended", Side::Buy, 99.0)],
+            &context,
+        )
+        .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(
+            decision.admission_reason,
+            "live_canary_admission_gate_not_satisfied"
+        );
+        assert!(
+            !decision
+                .gate_state
+                .live_canary_baseline_hedge_authority_acknowledged
+        );
         assert!(!decision.gate_state.satisfied());
         assert!(!decision.can_create_new_intents);
         assert!(!decision.blocker_cleared);

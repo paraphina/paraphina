@@ -31,6 +31,7 @@ def _gate_state(**overrides: bool) -> dict[str, bool]:
         "live_canary_max_open_orders_present": False,
         "live_canary_post_only_enforced": False,
         "live_canary_reduce_only_not_enforced": False,
+        "live_canary_baseline_hedge_authority_acknowledged": False,
     }
     state.update(overrides)
     return state
