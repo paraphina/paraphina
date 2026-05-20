@@ -21,7 +21,9 @@ from typing import Any
 
 
 EXPECTED_EVENT_TYPE = "V2_SHADOW_DECISION"
+EXPECTED_EV_EVENT_TYPE = "V2_EV_EVALUATED"
 EXPECTED_SCHEMA_VERSION = 1
+EXPECTED_EV_SCHEMA_VERSION = 1
 EXPECTED_TELEMETRY_SCHEMA_VERSION = 2
 EXPECTED_DECISION_MODE = "shadow"
 EXPECTED_ADMISSION_STATUS = "HOLD"
@@ -30,6 +32,11 @@ ALLOWED_TARGET_LINKAGE_STATES = {"missing", "present_redacted"}
 ALLOWED_SIDES = {"Buy", "Sell"}
 ALLOWED_PAIR_EDGE_INVALID_REASONS = {None, "missing_bid", "missing_ask"}
 ALLOWED_RANKING_STATUSES = {"scored", "missing_cross_venue_reference"}
+ALLOWED_CANDIDATE_SOURCES = {"mm_quote", "baseline_plan"}
+ALLOWED_REPLAY_LINEAGE_STATES = {"shadow_candidate"}
+ALLOWED_PRICE_SIZE_SOURCES = {"quote_level", "baseline_plan_sanitized"}
+ALLOWED_EV_STATUSES = {"HOLD"}
+ALLOWED_EV_REASONS = {"shadow_ev_components_unavailable"}
 CANDIDATE_ID_PREFIXES = ("v2_shadow_v1:", "v2_shadow_intent_v1:")
 PAIR_EDGE_ID_PREFIX = "v2_pair_edge_v1:"
 
@@ -92,6 +99,16 @@ FORBIDDEN_STRING_FRAGMENTS = (
     "venue_order_id",
     "volume_quota_remaining",
 )
+ALLOWED_FALSE_AUTHORITY_FIELDS = {
+    "admissible_for_financial_claim",
+    "admissible_for_model_training",
+    "approved_for_canary",
+    "approved_for_capital_escalation",
+    "approved_for_live",
+    "capital_change_allowed",
+    "live_orders_allowed",
+    "risk_limit_relaxation_allowed",
+}
 
 
 class ContractViolation(Exception):
@@ -101,6 +118,8 @@ class ContractViolation(Exception):
 @dataclass
 class ValidationSummary:
     row_count: int = 0
+    shadow_decision_row_count: int = 0
+    ev_evaluation_count_total: int = 0
     baseline_plan_intent_count_total: int = 0
     baseline_mm_order_creating_intent_count_total: int = 0
     rows_with_baseline_mm_order_creating_intents: int = 0
@@ -115,10 +134,15 @@ class ValidationSummary:
     pressure_complete_claim_any: bool = False
     order_intent_output_count_total: int = 0
     candidate_target_linkage_states: dict[str, int] = field(default_factory=dict)
+    ev_status_counts: dict[str, int] = field(default_factory=dict)
+    candidate_ids_seen: set[str] = field(default_factory=set, repr=False)
+    ev_candidate_ids_seen: set[str] = field(default_factory=set, repr=False)
 
     def as_manifest_payload(self) -> dict[str, Any]:
         return {
             "row_count": self.row_count,
+            "shadow_decision_row_count": self.shadow_decision_row_count,
+            "ev_evaluation_count_total": self.ev_evaluation_count_total,
             "baseline_plan_intent_count_total": self.baseline_plan_intent_count_total,
             "baseline_mm_order_creating_intent_count_total": (
                 self.baseline_mm_order_creating_intent_count_total
@@ -138,6 +162,13 @@ class ValidationSummary:
             "order_intent_output_count_total": self.order_intent_output_count_total,
             "candidate_target_linkage_states": dict(
                 sorted(self.candidate_target_linkage_states.items())
+            ),
+            "ev_status_counts": dict(sorted(self.ev_status_counts.items())),
+            "candidate_ids_without_ev_evaluation": sorted(
+                self.candidate_ids_seen - self.ev_candidate_ids_seen
+            ),
+            "ev_candidate_ids_without_shadow_candidate": sorted(
+                self.ev_candidate_ids_seen - self.candidate_ids_seen
             ),
         }
 
@@ -196,11 +227,18 @@ def _scan_for_forbidden_material(value: Any, line: int, path: str = "$") -> None
     if isinstance(value, dict):
         for key, child in value.items():
             lowered = str(key).lower()
-            _require(
-                lowered not in FORBIDDEN_KEY_NAMES,
-                line,
-                f"forbidden field name at {path}.{key}: {key}",
-            )
+            if lowered in ALLOWED_FALSE_AUTHORITY_FIELDS:
+                _require(
+                    child is False,
+                    line,
+                    f"authority field must be false at {path}.{key}: {key}",
+                )
+            else:
+                _require(
+                    lowered not in FORBIDDEN_KEY_NAMES,
+                    line,
+                    f"forbidden field name at {path}.{key}: {key}",
+                )
             _require(
                 not any(lowered.startswith(prefix) for prefix in FORBIDDEN_KEY_PREFIXES),
                 line,
@@ -246,6 +284,24 @@ def _validate_candidate(candidate: Any, line: int, index: int) -> str:
         line,
         f"candidate[{index}] target_linkage_state invalid",
     )
+    if "candidate_source" in candidate:
+        _require(
+            candidate.get("candidate_source") in ALLOWED_CANDIDATE_SOURCES,
+            line,
+            f"candidate[{index}] candidate_source invalid",
+        )
+    if "replay_lineage_state" in candidate:
+        _require(
+            candidate.get("replay_lineage_state") in ALLOWED_REPLAY_LINEAGE_STATES,
+            line,
+            f"candidate[{index}] replay_lineage_state invalid",
+        )
+    if "price_size_source" in candidate:
+        _require(
+            candidate.get("price_size_source") in ALLOWED_PRICE_SIZE_SOURCES,
+            line,
+            f"candidate[{index}] price_size_source invalid",
+        )
     _require_exact(candidate, "admission_status", EXPECTED_ADMISSION_STATUS, line)
     _require_exact(candidate, "admission_reason", EXPECTED_ADMISSION_REASON, line)
     return str(linkage_state)
@@ -369,7 +425,7 @@ def _validate_candidate_ranking(
     _require_exact(ranking, "admission_reason", EXPECTED_ADMISSION_REASON, line)
 
 
-def _validate_row(row: Any, line: int, summary: ValidationSummary) -> None:
+def _validate_shadow_decision_row(row: Any, line: int, summary: ValidationSummary) -> None:
     _require(isinstance(row, dict), line, "row must be object")
     _scan_for_forbidden_material(row, line)
 
@@ -433,6 +489,7 @@ def _validate_row(row: Any, line: int, summary: ValidationSummary) -> None:
     _require(isinstance(pair_edges, list), line, "pair_edges must be list")
 
     summary.row_count += 1
+    summary.shadow_decision_row_count += 1
     summary.baseline_plan_intent_count_total += row["baseline_plan_intent_count"]
     mm_creating_count = row["baseline_mm_order_creating_intent_count"]
     summary.baseline_mm_order_creating_intent_count_total += mm_creating_count
@@ -454,6 +511,7 @@ def _validate_row(row: Any, line: int, summary: ValidationSummary) -> None:
         candidate_id = candidate["candidate_id"]
         _require(candidate_id not in candidate_ids, line, f"duplicate candidate_id: {candidate_id}")
         candidate_ids.add(candidate_id)
+        summary.candidate_ids_seen.add(candidate_id)
         summary.candidate_target_linkage_states[linkage_state] = (
             summary.candidate_target_linkage_states.get(linkage_state, 0) + 1
         )
@@ -487,11 +545,115 @@ def _validate_row(row: Any, line: int, summary: ValidationSummary) -> None:
         _validate_pair_edge(pair_edge, line, idx, candidate_ids)
 
 
+def _validate_ev_evaluation_row(row: Any, line: int, summary: ValidationSummary) -> None:
+    _require(isinstance(row, dict), line, "row must be object")
+    _scan_for_forbidden_material(row, line)
+
+    _require_exact(row, "event_type", EXPECTED_EV_EVENT_TYPE, line)
+    _require_exact(row, "schema_version", EXPECTED_EV_SCHEMA_VERSION, line)
+    _require_exact(row, "telemetry_schema_version", EXPECTED_TELEMETRY_SCHEMA_VERSION, line)
+    _require(_is_int(row.get("now_ms")), line, "now_ms must be integer")
+    _require(row["now_ms"] >= 0, line, "now_ms must be nonnegative")
+    _require_exact(row, "decision_mode", EXPECTED_DECISION_MODE, line)
+
+    candidate_id = row.get("candidate_id")
+    _require(
+        isinstance(candidate_id, str) and candidate_id.startswith(CANDIDATE_ID_PREFIXES),
+        line,
+        "ev candidate_id invalid",
+    )
+    _require(row.get("candidate_source") in ALLOWED_CANDIDATE_SOURCES, line, "candidate_source invalid")
+    _require(
+        row.get("replay_lineage_state") in ALLOWED_REPLAY_LINEAGE_STATES,
+        line,
+        "replay_lineage_state invalid",
+    )
+    _require(row.get("price_size_source") in ALLOWED_PRICE_SIZE_SOURCES, line, "price_size_source invalid")
+    _require(_is_int(row.get("venue_index")), line, "venue_index invalid")
+    _require(row["venue_index"] >= 0, line, "venue_index negative")
+    _require(isinstance(row.get("venue_id"), str) and row["venue_id"], line, "venue_id invalid")
+    _require(row.get("side") in ALLOWED_SIDES, line, "side invalid")
+    _require(_is_finite_number(row.get("price")), line, "price invalid")
+    _require(_is_finite_number(row.get("size")), line, "size invalid")
+    _require(row["size"] > 0, line, "size must be positive")
+    _require(
+        row.get("target_linkage_state") in ALLOWED_TARGET_LINKAGE_STATES,
+        line,
+        "target_linkage_state invalid",
+    )
+    _require(row.get("rank_status") in ALLOWED_RANKING_STATUSES, line, "rank_status invalid")
+    _require(_is_int(row.get("rank_score_microusd")), line, "rank_score_microusd invalid")
+    for field_name in ("pair_edge_feature_usd", "pair_edge_feature_bps"):
+        value = row.get(field_name)
+        _require(value is None or _is_finite_number(value), line, f"{field_name} invalid")
+    reference_candidate_id = row.get("reference_candidate_id")
+    _require(
+        reference_candidate_id is None
+        or (isinstance(reference_candidate_id, str) and reference_candidate_id.startswith(CANDIDATE_ID_PREFIXES)),
+        line,
+        "reference_candidate_id invalid",
+    )
+    reference_venue_index = row.get("reference_venue_index")
+    _require(
+        reference_venue_index is None or (_is_int(reference_venue_index) and reference_venue_index >= 0),
+        line,
+        "reference_venue_index invalid",
+    )
+    reference_venue_id = row.get("reference_venue_id")
+    _require(reference_venue_id is None or isinstance(reference_venue_id, str), line, "reference_venue_id invalid")
+    _require(row.get("feature_only") is True, line, "feature_only must be true")
+
+    _require(row.get("ev_status") in ALLOWED_EV_STATUSES, line, "ev_status invalid")
+    _require(row.get("ev_reason") in ALLOWED_EV_REASONS, line, "ev_reason invalid")
+    _require_exact(row, "ev_model_version", "v2_shadow_ev_v1", line)
+    _require_exact(row, "decision", "HOLD", line)
+    _require_exact(row, "decision_reason_primary", "shadow_ev_components_unavailable", line)
+    secondary = row.get("decision_reason_secondary_list")
+    _require(isinstance(secondary, list), line, "decision_reason_secondary_list must be list")
+    _require(
+        all(isinstance(item, str) for item in secondary),
+        line,
+        "decision_reason_secondary_list must contain strings",
+    )
+    _require(row.get("calibration_bucket_id") is None, line, "calibration_bucket_id must be null")
+    _require_exact(row, "calibration_status", "MISSING", line)
+    _require(row.get("expected_value_lcb_microusd") is None, line, "expected_value_lcb_microusd must be null")
+    _require_exact(row, "expected_value_source_state", "unavailable_shadow", line)
+    _require_exact(row, "p_fill_source_state", "unavailable_shadow", line)
+    _require_exact(row, "hedgeability_state", "not_evaluated_shadow", line)
+    _require(row.get("ev_is_admission") is False, line, "ev_is_admission must be false")
+    _require(row.get("can_create_new_intents") is False, line, "can_create_new_intents must be false")
+    _require(row.get("can_mutate_live_orders") is False, line, "can_mutate_live_orders must be false")
+    _require(row.get("pressure_complete_claim") is False, line, "pressure_complete_claim must be false")
+    _require(row.get("blocker_cleared") is False, line, "blocker_cleared must be false")
+    _require(row.get("no_live_flag") is True, line, "no_live_flag must be true")
+    for field_name in sorted(ALLOWED_FALSE_AUTHORITY_FIELDS):
+        _require(row.get(field_name) is False, line, f"{field_name} must be false")
+
+    summary.row_count += 1
+    summary.ev_evaluation_count_total += 1
+    summary.ev_candidate_ids_seen.add(candidate_id)
+    status = row["ev_status"]
+    summary.ev_status_counts[status] = summary.ev_status_counts.get(status, 0) + 1
+
+
+def _validate_row(row: Any, line: int, summary: ValidationSummary) -> None:
+    _require(isinstance(row, dict), line, "row must be object")
+    event_type = row.get("event_type")
+    if event_type == EXPECTED_EVENT_TYPE:
+        _validate_shadow_decision_row(row, line, summary)
+    elif event_type == EXPECTED_EV_EVENT_TYPE:
+        _validate_ev_evaluation_row(row, line, summary)
+    else:
+        raise ContractViolation(f"line {line}: unsupported event_type {event_type!r}")
+
+
 def validate_v2_shadow_decisions(
     path: Path,
     *,
     require_candidate: bool = True,
     require_mm_creating_intent: bool = True,
+    require_ev_evaluations: bool = False,
 ) -> ValidationSummary:
     if not path.exists():
         raise FileNotFoundError(path)
@@ -509,10 +671,27 @@ def validate_v2_shadow_decisions(
 
     if summary.row_count == 0:
         raise ContractViolation("no V2 shadow decision rows found")
+    if summary.shadow_decision_row_count == 0:
+        raise ContractViolation("no V2_SHADOW_DECISION rows found")
     if require_candidate and summary.rows_with_candidates == 0:
         raise ContractViolation("no V2 shadow candidate rows found")
     if require_mm_creating_intent and summary.rows_with_baseline_mm_order_creating_intents == 0:
         raise ContractViolation("no baseline MM order-creating intent observation found")
+    extra_ev = summary.ev_candidate_ids_seen - summary.candidate_ids_seen
+    if extra_ev:
+        raise ContractViolation(
+            "V2 EV evaluation references candidate not emitted by a shadow decision: "
+            + ", ".join(sorted(extra_ev))
+        )
+    if require_ev_evaluations:
+        if summary.ev_evaluation_count_total == 0:
+            raise ContractViolation("no V2 EV evaluation rows found")
+        missing_ev = summary.candidate_ids_seen - summary.ev_candidate_ids_seen
+        if missing_ev:
+            raise ContractViolation(
+                "V2 shadow candidates missing EV evaluation rows: "
+                + ", ".join(sorted(missing_ev))
+            )
     return summary
 
 
@@ -562,6 +741,20 @@ def build_manifest(
             "pressure_complete_claim": False,
             "blocker_cleared": False,
             "require_phase51_gate": True,
+            "ev_event_type": EXPECTED_EV_EVENT_TYPE,
+            "ev_status": "HOLD",
+            "ev_reason": "shadow_ev_components_unavailable",
+            "ev_is_admission": False,
+            "can_create_new_intents": False,
+            "no_live_flag": True,
+            "approved_for_live": False,
+            "approved_for_canary": False,
+            "approved_for_capital_escalation": False,
+            "live_orders_allowed": False,
+            "capital_change_allowed": False,
+            "risk_limit_relaxation_allowed": False,
+            "admissible_for_financial_claim": False,
+            "admissible_for_model_training": False,
         },
         "validation": validation.as_manifest_payload(),
         "files": files,
@@ -590,6 +783,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Permit a valid but MM-intent-empty shadow run.",
     )
+    parser.add_argument(
+        "--require-ev-evaluations",
+        action="store_true",
+        help="Require one V2_EV_EVALUATED row for every emitted shadow candidate.",
+    )
     return parser.parse_args(argv)
 
 
@@ -600,6 +798,7 @@ def main(argv: list[str] | None = None) -> int:
             args.v2_shadow_decisions,
             require_candidate=not args.allow_no_candidates,
             require_mm_creating_intent=not args.allow_no_mm_creating_intents,
+            require_ev_evaluations=args.require_ev_evaluations,
         )
         if args.manifest_output is not None:
             manifest = build_manifest(
@@ -624,7 +823,8 @@ def main(argv: list[str] | None = None) -> int:
         "rows_with_mm_order_creating_intents="
         f"{validation.rows_with_baseline_mm_order_creating_intents} "
         f"candidate_count={validation.candidate_count_total} "
-        f"pair_edge_count={validation.pair_edge_count_total}"
+        f"pair_edge_count={validation.pair_edge_count_total} "
+        f"ev_evaluation_count={validation.ev_evaluation_count_total}"
     )
     if args.manifest_output is not None:
         print(f"V2_SHADOW_DECISION_MANIFEST_WRITTEN path={args.manifest_output}")

@@ -18,6 +18,7 @@ use crate::mm::{MmLevel, MmQuote};
 use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs};
 
 const V2_SHADOW_SCHEMA_VERSION: u32 = 1;
+const V2_SHADOW_EV_EVALUATION_SCHEMA_VERSION: u32 = 1;
 const V2_ADMISSION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -36,6 +37,9 @@ impl V2ShadowAdmissionStatus {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct V2ShadowCandidate {
     pub candidate_id: String,
+    pub candidate_source: &'static str,
+    pub replay_lineage_state: &'static str,
+    pub price_size_source: &'static str,
     pub venue_index: usize,
     pub venue_id: String,
     pub side: Side,
@@ -44,6 +48,59 @@ pub struct V2ShadowCandidate {
     pub target_linkage_state: &'static str,
     pub admission_status: &'static str,
     pub admission_reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct V2ShadowEvEvaluation {
+    pub event_type: &'static str,
+    pub schema_version: u32,
+    pub telemetry_schema_version: u32,
+    pub now_ms: TimestampMs,
+    pub decision_mode: &'static str,
+    pub candidate_id: String,
+    pub candidate_source: &'static str,
+    pub replay_lineage_state: &'static str,
+    pub price_size_source: &'static str,
+    pub venue_index: usize,
+    pub venue_id: String,
+    pub side: Side,
+    pub price: f64,
+    pub size: f64,
+    pub target_linkage_state: &'static str,
+    pub rank_status: &'static str,
+    pub rank_score_microusd: i64,
+    pub pair_edge_feature_usd: Option<f64>,
+    pub pair_edge_feature_bps: Option<f64>,
+    pub reference_candidate_id: Option<String>,
+    pub reference_venue_index: Option<usize>,
+    pub reference_venue_id: Option<String>,
+    pub feature_only: bool,
+    pub ev_status: &'static str,
+    pub ev_reason: &'static str,
+    pub ev_model_version: &'static str,
+    pub decision: &'static str,
+    pub decision_reason_primary: &'static str,
+    pub decision_reason_secondary_list: Vec<&'static str>,
+    pub calibration_bucket_id: Option<&'static str>,
+    pub calibration_status: &'static str,
+    pub expected_value_lcb_microusd: Option<i64>,
+    pub expected_value_source_state: &'static str,
+    pub p_fill_source_state: &'static str,
+    pub hedgeability_state: &'static str,
+    pub ev_is_admission: bool,
+    pub can_create_new_intents: bool,
+    pub can_mutate_live_orders: bool,
+    pub pressure_complete_claim: bool,
+    pub blocker_cleared: bool,
+    pub no_live_flag: bool,
+    pub approved_for_live: bool,
+    pub approved_for_canary: bool,
+    pub approved_for_capital_escalation: bool,
+    pub live_orders_allowed: bool,
+    pub capital_change_allowed: bool,
+    pub risk_limit_relaxation_allowed: bool,
+    pub admissible_for_financial_claim: bool,
+    pub admissible_for_model_training: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -450,7 +507,8 @@ pub fn evaluate_admission_decision_with_context(
         && gate_satisfied
         && baseline_mm_count == 1
     {
-        if let Some(candidate) = select_single_venue_order_path_probe_candidate(&candidates, &rankings)
+        if let Some(candidate) =
+            select_single_venue_order_path_probe_candidate(&candidates, &rankings)
         {
             admitted_candidates.push(candidate);
             order_path_probe_is_admission = true;
@@ -776,7 +834,16 @@ pub fn emit_shadow_decision(
     else {
         return Ok(None);
     };
-    append_shadow_decision(Path::new(&config.output_path), &decision)?;
+    let path = Path::new(&config.output_path);
+    append_shadow_decision(path, &decision)?;
+    for ev_evaluation in evaluate_shadow_ev_evaluations(
+        config.telemetry_schema_version,
+        now_ms,
+        &decision.candidates,
+        &decision.candidate_rankings,
+    ) {
+        append_shadow_ev_evaluation(path, &ev_evaluation)?;
+    }
     Ok(Some(decision.candidates.len()))
 }
 
@@ -817,6 +884,9 @@ pub fn extract_shadow_candidates_from_intents(intents: &[OrderIntent]) -> Vec<V2
                         place.side.as_v2_str(),
                         idx
                     ),
+                    candidate_source: "baseline_plan",
+                    replay_lineage_state: "shadow_candidate",
+                    price_size_source: "baseline_plan_sanitized",
                     venue_index: place.venue_index,
                     venue_id: place.venue_id.to_string(),
                     side: place.side,
@@ -840,6 +910,9 @@ pub fn extract_shadow_candidates_from_intents(intents: &[OrderIntent]) -> Vec<V2
                         replace.side.as_v2_str(),
                         idx
                     ),
+                    candidate_source: "baseline_plan",
+                    replay_lineage_state: "shadow_candidate",
+                    price_size_source: "baseline_plan_sanitized",
                     venue_index: replace.venue_index,
                     venue_id: replace.venue_id.to_string(),
                     side: replace.side,
@@ -871,6 +944,9 @@ fn candidate_from_level(quote: &MmQuote, side: Side, level: &MmLevel) -> V2Shado
             quote.venue_id,
             side.as_v2_str()
         ),
+        candidate_source: "mm_quote",
+        replay_lineage_state: "shadow_candidate",
+        price_size_source: "quote_level",
         venue_index: quote.venue_index,
         venue_id: quote.venue_id.to_string(),
         side,
@@ -884,6 +960,78 @@ fn candidate_from_level(quote: &MmQuote, side: Side, level: &MmLevel) -> V2Shado
         admission_status: V2ShadowAdmissionStatus::Hold.as_str(),
         admission_reason: "shadow_only_no_order_authority",
     }
+}
+
+pub fn evaluate_shadow_ev_evaluations(
+    telemetry_schema_version: u32,
+    now_ms: TimestampMs,
+    candidates: &[V2ShadowCandidate],
+    rankings: &[V2ShadowCandidateRanking],
+) -> Vec<V2ShadowEvEvaluation> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let ranking = rankings
+                .iter()
+                .find(|ranking| ranking.candidate_id == candidate.candidate_id);
+            V2ShadowEvEvaluation {
+                event_type: "V2_EV_EVALUATED",
+                schema_version: V2_SHADOW_EV_EVALUATION_SCHEMA_VERSION,
+                telemetry_schema_version,
+                now_ms,
+                decision_mode: "shadow",
+                candidate_id: candidate.candidate_id.clone(),
+                candidate_source: candidate.candidate_source,
+                replay_lineage_state: candidate.replay_lineage_state,
+                price_size_source: candidate.price_size_source,
+                venue_index: candidate.venue_index,
+                venue_id: candidate.venue_id.clone(),
+                side: candidate.side,
+                price: candidate.price,
+                size: candidate.size,
+                target_linkage_state: candidate.target_linkage_state,
+                rank_status: ranking
+                    .map(|ranking| ranking.rank_status)
+                    .unwrap_or("missing_cross_venue_reference"),
+                rank_score_microusd: ranking
+                    .map(|ranking| ranking.rank_score_microusd)
+                    .unwrap_or(0),
+                pair_edge_feature_usd: ranking.and_then(|ranking| ranking.pair_edge_feature_usd),
+                pair_edge_feature_bps: ranking.and_then(|ranking| ranking.pair_edge_feature_bps),
+                reference_candidate_id: ranking
+                    .and_then(|ranking| ranking.reference_candidate_id.clone()),
+                reference_venue_index: ranking.and_then(|ranking| ranking.reference_venue_index),
+                reference_venue_id: ranking.and_then(|ranking| ranking.reference_venue_id.clone()),
+                feature_only: true,
+                ev_status: "HOLD",
+                ev_reason: "shadow_ev_components_unavailable",
+                ev_model_version: "v2_shadow_ev_v1",
+                decision: "HOLD",
+                decision_reason_primary: "shadow_ev_components_unavailable",
+                decision_reason_secondary_list: vec!["calibration_unavailable_shadow"],
+                calibration_bucket_id: None,
+                calibration_status: "MISSING",
+                expected_value_lcb_microusd: None,
+                expected_value_source_state: "unavailable_shadow",
+                p_fill_source_state: "unavailable_shadow",
+                hedgeability_state: "not_evaluated_shadow",
+                ev_is_admission: false,
+                can_create_new_intents: false,
+                can_mutate_live_orders: false,
+                pressure_complete_claim: false,
+                blocker_cleared: false,
+                no_live_flag: true,
+                approved_for_live: false,
+                approved_for_canary: false,
+                approved_for_capital_escalation: false,
+                live_orders_allowed: false,
+                capital_change_allowed: false,
+                risk_limit_relaxation_allowed: false,
+                admissible_for_financial_claim: false,
+                admissible_for_model_training: false,
+            }
+        })
+        .collect()
 }
 
 fn rank_shadow_candidates(candidates: &[V2ShadowCandidate]) -> Vec<V2ShadowCandidateRanking> {
@@ -1039,6 +1187,13 @@ fn build_pair_edge_snapshot(
 
 fn append_shadow_decision(path: &Path, decision: &V2ShadowDecision) -> Result<(), V2ShadowError> {
     append_json_line(path, decision)
+}
+
+fn append_shadow_ev_evaluation(
+    path: &Path,
+    ev_evaluation: &V2ShadowEvEvaluation,
+) -> Result<(), V2ShadowError> {
+    append_json_line(path, ev_evaluation)
 }
 
 fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), V2ShadowError> {
@@ -1261,11 +1416,110 @@ mod tests {
             decision.candidates[0].target_linkage_state,
             "present_redacted"
         );
+        assert_eq!(decision.candidates[0].candidate_source, "mm_quote");
+        assert_eq!(
+            decision.candidates[0].replay_lineage_state,
+            "shadow_candidate"
+        );
+        assert_eq!(decision.candidates[0].price_size_source, "quote_level");
         assert_eq!(decision.candidates[1].target_linkage_state, "missing");
 
         let serialized = serde_json::to_string(&decision).expect("serialize");
         assert!(!serialized.contains("raw-group-must-not-emit"));
         assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_shadow_ev_evaluations_are_hold_only_and_candidate_linked() {
+        let config = shadow_config();
+        let decision = evaluate_shadow_decision(&config, 1_000, &[quote()], &[]).expect("decision");
+        let ev_evaluations = evaluate_shadow_ev_evaluations(
+            config.telemetry_schema_version,
+            1_000,
+            &decision.candidates,
+            &decision.candidate_rankings,
+        );
+
+        assert_eq!(ev_evaluations.len(), decision.candidates.len());
+        for ev in &ev_evaluations {
+            assert_eq!(ev.event_type, "V2_EV_EVALUATED");
+            assert_eq!(ev.decision_mode, "shadow");
+            assert_eq!(ev.ev_status, "HOLD");
+            assert_eq!(ev.ev_reason, "shadow_ev_components_unavailable");
+            assert_eq!(ev.ev_model_version, "v2_shadow_ev_v1");
+            assert_eq!(ev.decision, "HOLD");
+            assert_eq!(
+                ev.decision_reason_primary,
+                "shadow_ev_components_unavailable"
+            );
+            assert_eq!(ev.calibration_status, "MISSING");
+            assert!(ev.expected_value_lcb_microusd.is_none());
+            assert_eq!(ev.expected_value_source_state, "unavailable_shadow");
+            assert_eq!(ev.p_fill_source_state, "unavailable_shadow");
+            assert_eq!(ev.hedgeability_state, "not_evaluated_shadow");
+            assert!(ev.feature_only);
+            assert!(!ev.ev_is_admission);
+            assert!(!ev.can_create_new_intents);
+            assert!(!ev.can_mutate_live_orders);
+            assert!(!ev.pressure_complete_claim);
+            assert!(!ev.blocker_cleared);
+            assert!(ev.no_live_flag);
+            assert!(!ev.approved_for_live);
+            assert!(!ev.approved_for_canary);
+            assert!(!ev.approved_for_capital_escalation);
+            assert!(!ev.live_orders_allowed);
+            assert!(!ev.capital_change_allowed);
+            assert!(!ev.risk_limit_relaxation_allowed);
+            assert!(!ev.admissible_for_financial_claim);
+            assert!(!ev.admissible_for_model_training);
+            assert!(decision
+                .candidates
+                .iter()
+                .any(|candidate| candidate.candidate_id == ev.candidate_id));
+        }
+
+        let serialized = serde_json::to_string(&ev_evaluations).expect("serialize");
+        assert!(!serialized.contains("raw-group-must-not-emit"));
+        assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_shadow_emit_writes_decision_then_ev_rows_without_order_authority() {
+        let output_path = std::env::temp_dir().join(format!(
+            "paraphina_v2_shadow_ev_test_{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&output_path);
+        let config = V2ShadowConfig {
+            output_path: output_path.display().to_string(),
+            ..shadow_config()
+        };
+
+        let emitted = emit_shadow_decision(&config, 1_250, &[quote()], &[])
+            .expect("emit")
+            .expect("rows");
+
+        assert_eq!(emitted, 2);
+        let raw = std::fs::read_to_string(&output_path).expect("read output");
+        let rows = raw
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["event_type"], "V2_SHADOW_DECISION");
+        assert_eq!(rows[1]["event_type"], "V2_EV_EVALUATED");
+        assert_eq!(rows[2]["event_type"], "V2_EV_EVALUATED");
+        for row in rows.iter().skip(1) {
+            assert_eq!(row["ev_status"], "HOLD");
+            assert_eq!(row["ev_is_admission"], false);
+            assert_eq!(row["can_create_new_intents"], false);
+            assert_eq!(row["can_mutate_live_orders"], false);
+            assert_eq!(row["blocker_cleared"], false);
+            assert_eq!(row["pressure_complete_claim"], false);
+        }
+        assert!(!raw.contains("raw-group-must-not-emit"));
+        assert!(!raw.contains("raw-order-must-not-emit"));
+        let _ = std::fs::remove_file(&output_path);
     }
 
     #[test]
@@ -1408,6 +1662,11 @@ mod tests {
         assert_eq!(
             decision.candidates[0].target_linkage_state,
             "present_redacted"
+        );
+        assert_eq!(decision.candidates[0].candidate_source, "baseline_plan");
+        assert_eq!(
+            decision.candidates[0].price_size_source,
+            "baseline_plan_sanitized"
         );
         assert_eq!(decision.candidates[1].target_linkage_state, "missing");
         assert_eq!(decision.order_intent_output_count, 0);

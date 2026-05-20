@@ -73,7 +73,9 @@ class TestV2ShadowScenarioMatrix(unittest.TestCase):
             self.assertTrue(paths["manifest_path"].exists())
 
             validation = validator.validate_v2_shadow_decisions(paths["decision_path"])
-            self.assertEqual(validation.row_count, 4)
+            self.assertEqual(validation.row_count, 26)
+            self.assertEqual(validation.shadow_decision_row_count, 4)
+            self.assertEqual(validation.ev_evaluation_count_total, 22)
             self.assertEqual(validation.candidate_count_total, 22)
             self.assertEqual(validation.candidate_ranking_count_total, 22)
             self.assertEqual(validation.pair_edge_count_total, 4)
@@ -83,10 +85,13 @@ class TestV2ShadowScenarioMatrix(unittest.TestCase):
             self.assertEqual(summary["gate_status"], "HOLD")
             self.assertFalse(summary["blocker_cleared"])
             self.assertFalse(summary["live_orders_allowed"])
+            self.assertEqual(summary["shadow_decision_row_count"], 4)
+            self.assertEqual(summary["ev_evaluation_count_total"], 22)
             self.assertEqual(summary["candidate_ranking_count_total"], 22)
 
             manifest = json.loads(paths["manifest_path"].read_text(encoding="utf-8"))
             self.assertEqual(manifest["decision_validation_status"], "pass")
+            self.assertEqual(manifest["validation"]["ev_evaluation_count_total"], 22)
             self.assertEqual(manifest["governance"]["gate_status"], "HOLD")
             self.assertFalse(manifest["governance"]["approved_for_live"])
             self.assertEqual(

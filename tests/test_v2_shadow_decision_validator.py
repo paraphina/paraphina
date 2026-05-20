@@ -73,6 +73,60 @@ def valid_row() -> dict:
     }
 
 
+def valid_ev_row() -> dict:
+    return {
+        "event_type": "V2_EV_EVALUATED",
+        "schema_version": 1,
+        "telemetry_schema_version": 2,
+        "now_ms": 1779218759993,
+        "decision_mode": "shadow",
+        "candidate_id": "v2_shadow_intent_v1:0:lighter:Buy:0",
+        "candidate_source": "baseline_plan",
+        "replay_lineage_state": "shadow_candidate",
+        "price_size_source": "baseline_plan_sanitized",
+        "venue_index": 0,
+        "venue_id": "lighter",
+        "side": "Buy",
+        "price": 250.0,
+        "size": 0.01,
+        "target_linkage_state": "present_redacted",
+        "rank_status": "missing_cross_venue_reference",
+        "rank_score_microusd": 0,
+        "pair_edge_feature_usd": None,
+        "pair_edge_feature_bps": None,
+        "reference_candidate_id": None,
+        "reference_venue_index": None,
+        "reference_venue_id": None,
+        "feature_only": True,
+        "ev_status": "HOLD",
+        "ev_reason": "shadow_ev_components_unavailable",
+        "ev_model_version": "v2_shadow_ev_v1",
+        "decision": "HOLD",
+        "decision_reason_primary": "shadow_ev_components_unavailable",
+        "decision_reason_secondary_list": ["calibration_unavailable_shadow"],
+        "calibration_bucket_id": None,
+        "calibration_status": "MISSING",
+        "expected_value_lcb_microusd": None,
+        "expected_value_source_state": "unavailable_shadow",
+        "p_fill_source_state": "unavailable_shadow",
+        "hedgeability_state": "not_evaluated_shadow",
+        "ev_is_admission": False,
+        "can_create_new_intents": False,
+        "can_mutate_live_orders": False,
+        "pressure_complete_claim": False,
+        "blocker_cleared": False,
+        "no_live_flag": True,
+        "approved_for_live": False,
+        "approved_for_canary": False,
+        "approved_for_capital_escalation": False,
+        "live_orders_allowed": False,
+        "capital_change_allowed": False,
+        "risk_limit_relaxation_allowed": False,
+        "admissible_for_financial_claim": False,
+        "admissible_for_model_training": False,
+    }
+
+
 def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
@@ -107,6 +161,8 @@ class TestV2ShadowDecisionValidator(unittest.TestCase):
             self.assertEqual(manifest["artifact_type"], "v2_shadow_decision_evidence_manifest")
             self.assertEqual(manifest["decision_validation_status"], "pass")
             self.assertEqual(manifest["validation"]["row_count"], 1)
+            self.assertEqual(manifest["validation"]["shadow_decision_row_count"], 1)
+            self.assertEqual(manifest["validation"]["ev_evaluation_count_total"], 0)
             self.assertEqual(manifest["validation"]["candidate_count_total"], 1)
             self.assertEqual(manifest["validation"]["candidate_ranking_count_total"], 1)
             self.assertFalse(manifest["validation"]["can_mutate_orders_any"])
@@ -122,6 +178,79 @@ class TestV2ShadowDecisionValidator(unittest.TestCase):
             for file_info in manifest["files"]:
                 self.assertFalse(Path(file_info["path"]).is_absolute())
                 self.assertNotIn("..", Path(file_info["path"]).parts)
+
+    def test_ev_evaluation_rows_pass_when_required_and_remain_hold_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "evidence.jsonl"
+            write_jsonl(evidence, [valid_row(), valid_ev_row()])
+
+            summary = validator.validate_v2_shadow_decisions(
+                evidence,
+                require_ev_evaluations=True,
+            )
+
+            self.assertEqual(summary.row_count, 2)
+            self.assertEqual(summary.shadow_decision_row_count, 1)
+            self.assertEqual(summary.ev_evaluation_count_total, 1)
+            self.assertEqual(summary.ev_status_counts, {"HOLD": 1})
+            self.assertFalse(summary.blocker_cleared_any)
+            self.assertFalse(summary.pressure_complete_claim_any)
+
+    def test_require_ev_evaluations_rejects_missing_candidate_ev(self):
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "evidence.jsonl"
+            write_jsonl(evidence, [valid_row()])
+            with self.assertRaises(validator.ContractViolation):
+                validator.validate_v2_shadow_decisions(
+                    evidence,
+                    require_ev_evaluations=True,
+                )
+
+    def test_rejects_ev_evaluation_authority_or_false_clearance(self):
+        for field_name, bad_value in [
+            ("expected_value_lcb_microusd", 1),
+            ("decision", "ADMIT"),
+            ("decision_reason_primary", "ready"),
+            ("calibration_bucket_id", "bucket"),
+            ("calibration_status", "READY"),
+            ("expected_value_source_state", "observed"),
+            ("p_fill_source_state", "observed"),
+            ("hedgeability_state", "ready"),
+            ("ev_is_admission", True),
+            ("can_create_new_intents", True),
+            ("can_mutate_live_orders", True),
+            ("pressure_complete_claim", True),
+            ("blocker_cleared", True),
+            ("no_live_flag", False),
+            ("approved_for_live", True),
+            ("approved_for_canary", True),
+            ("approved_for_capital_escalation", True),
+            ("live_orders_allowed", True),
+            ("capital_change_allowed", True),
+            ("risk_limit_relaxation_allowed", True),
+            ("admissible_for_financial_claim", True),
+            ("admissible_for_model_training", True),
+        ]:
+            with self.subTest(field_name=field_name):
+                ev_row = valid_ev_row()
+                ev_row[field_name] = bad_value
+                with tempfile.TemporaryDirectory() as td:
+                    evidence = Path(td) / "evidence.jsonl"
+                    write_jsonl(evidence, [valid_row(), ev_row])
+                    with self.assertRaises(validator.ContractViolation):
+                        validator.validate_v2_shadow_decisions(
+                            evidence,
+                            require_ev_evaluations=True,
+                        )
+
+    def test_rejects_ev_rows_without_shadow_candidate(self):
+        ev_row = valid_ev_row()
+        ev_row["candidate_id"] = "v2_shadow_intent_v1:9:lighter:Buy:99"
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "evidence.jsonl"
+            write_jsonl(evidence, [valid_row(), ev_row])
+            with self.assertRaises(validator.ContractViolation):
+                validator.validate_v2_shadow_decisions(evidence)
 
     def test_rejects_any_order_authority_or_false_clearance(self):
         for field_name, bad_value in [

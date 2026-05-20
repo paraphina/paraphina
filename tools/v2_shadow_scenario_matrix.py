@@ -3,8 +3,9 @@
 
 The matrix is an offline evidence pack for exercising V2 shadow candidates and
 pair-edge feature snapshots across all configured venue families. It produces
-only HOLD/no-order-authority `V2_SHADOW_DECISION` rows and validates the output
-with `tools.v2_shadow_decision_validator`.
+HOLD/no-order-authority `V2_SHADOW_DECISION` rows plus one `V2_EV_EVALUATED`
+row per candidate and validates the output with
+`tools.v2_shadow_decision_validator`.
 """
 
 from __future__ import annotations
@@ -36,6 +37,9 @@ def _candidate(
 ) -> dict[str, Any]:
     return {
         "candidate_id": f"v2_shadow_v1:{venue_index}:{venue_id}:{side.lower()}",
+        "candidate_source": "mm_quote",
+        "replay_lineage_state": "shadow_candidate",
+        "price_size_source": "quote_level",
         "venue_index": venue_index,
         "venue_id": venue_id,
         "side": side,
@@ -59,6 +63,9 @@ def _intent_candidate(
 ) -> dict[str, Any]:
     return {
         "candidate_id": f"v2_shadow_intent_v1:{venue_index}:{venue_id}:{side}:{intent_index}",
+        "candidate_source": "baseline_plan",
+        "replay_lineage_state": "shadow_candidate",
+        "price_size_source": "baseline_plan_sanitized",
         "venue_index": venue_index,
         "venue_id": venue_id,
         "side": side,
@@ -223,6 +230,76 @@ def _decision(
     }
 
 
+def _ev_evaluations(row: dict[str, Any]) -> list[dict[str, Any]]:
+    rankings = {ranking["candidate_id"]: ranking for ranking in row["candidate_rankings"]}
+    ev_rows: list[dict[str, Any]] = []
+    for candidate in row["candidates"]:
+        ranking = rankings.get(candidate["candidate_id"], {})
+        ev_rows.append(
+            {
+                "event_type": "V2_EV_EVALUATED",
+                "schema_version": 1,
+                "telemetry_schema_version": row["telemetry_schema_version"],
+                "scenario_id": row["scenario_id"],
+                "now_ms": row["now_ms"],
+                "decision_mode": "shadow",
+                "candidate_id": candidate["candidate_id"],
+                "candidate_source": candidate["candidate_source"],
+                "replay_lineage_state": candidate["replay_lineage_state"],
+                "price_size_source": candidate["price_size_source"],
+                "venue_index": candidate["venue_index"],
+                "venue_id": candidate["venue_id"],
+                "side": candidate["side"],
+                "price": candidate["price"],
+                "size": candidate["size"],
+                "target_linkage_state": candidate["target_linkage_state"],
+                "rank_status": ranking.get("rank_status", "missing_cross_venue_reference"),
+                "rank_score_microusd": ranking.get("rank_score_microusd", 0),
+                "pair_edge_feature_usd": ranking.get("pair_edge_feature_usd"),
+                "pair_edge_feature_bps": ranking.get("pair_edge_feature_bps"),
+                "reference_candidate_id": ranking.get("reference_candidate_id"),
+                "reference_venue_index": ranking.get("reference_venue_index"),
+                "reference_venue_id": ranking.get("reference_venue_id"),
+                "feature_only": True,
+                "ev_status": "HOLD",
+                "ev_reason": "shadow_ev_components_unavailable",
+                "ev_model_version": "v2_shadow_ev_v1",
+                "decision": "HOLD",
+                "decision_reason_primary": "shadow_ev_components_unavailable",
+                "decision_reason_secondary_list": ["calibration_unavailable_shadow"],
+                "calibration_bucket_id": None,
+                "calibration_status": "MISSING",
+                "expected_value_lcb_microusd": None,
+                "expected_value_source_state": "unavailable_shadow",
+                "p_fill_source_state": "unavailable_shadow",
+                "hedgeability_state": "not_evaluated_shadow",
+                "ev_is_admission": False,
+                "can_create_new_intents": False,
+                "can_mutate_live_orders": False,
+                "pressure_complete_claim": False,
+                "blocker_cleared": False,
+                "no_live_flag": True,
+                "approved_for_live": False,
+                "approved_for_canary": False,
+                "approved_for_capital_escalation": False,
+                "live_orders_allowed": False,
+                "capital_change_allowed": False,
+                "risk_limit_relaxation_allowed": False,
+                "admissible_for_financial_claim": False,
+                "admissible_for_model_training": False,
+            }
+        )
+    return ev_rows
+
+
+def _evidence_rows(decision_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence_rows: list[dict[str, Any]] = []
+    for row in decision_rows:
+        evidence_rows.append(row)
+        evidence_rows.extend(_ev_evaluations(row))
+    return evidence_rows
+
+
 def build_scenarios() -> list[dict[str, Any]]:
     crossed_candidates: list[dict[str, Any]] = []
     bid_prices = {
@@ -356,6 +433,8 @@ def _write_summary(path: Path, rows: list[dict[str, Any]], validation: validator
         "venues": list(VENUES),
         "venue_candidate_counts": venue_counts,
         "row_count": validation.row_count,
+        "shadow_decision_row_count": validation.shadow_decision_row_count,
+        "ev_evaluation_count_total": validation.ev_evaluation_count_total,
         "candidate_count_total": validation.candidate_count_total,
         "candidate_ranking_count_total": validation.candidate_ranking_count_total,
         "pair_edge_count_total": validation.pair_edge_count_total,
@@ -374,8 +453,11 @@ def generate_matrix(output_root: Path) -> dict[str, Path]:
     summary_path = output_root / "scenario_summary.json"
     manifest_path = output_root / "manifest.json"
     rows = build_scenarios()
-    _write_jsonl(decision_path, rows)
-    validation = validator.validate_v2_shadow_decisions(decision_path)
+    _write_jsonl(decision_path, _evidence_rows(rows))
+    validation = validator.validate_v2_shadow_decisions(
+        decision_path,
+        require_ev_evaluations=True,
+    )
     _write_summary(summary_path, rows, validation)
     manifest = validator.build_manifest(
         v2_shadow_decisions=decision_path,
