@@ -350,6 +350,19 @@ def validate_v2_authority_decisions(path: Path) -> V2AuthoritySummary:
             _validate_row(row, line_no, summary)
     if summary.row_count == 0:
         raise V2AuthorityValidationError("no V2 authority decision rows found")
+    if summary.live_canary_order_path_probe_rows > 0:
+        if summary.live_canary_order_path_probe_rows > 1:
+            raise V2AuthorityValidationError(
+                "live canary order-path probe must emit at most one admitted probe row"
+            )
+        if summary.row_count != 1:
+            raise V2AuthorityValidationError(
+                "live canary order-path probe manifest must contain only the single probe row"
+            )
+        if summary.output_intent_count_total != 1:
+            raise V2AuthorityValidationError(
+                "live canary order-path probe must output exactly one probe intent"
+            )
     return summary
 
 
@@ -372,7 +385,7 @@ def write_manifest(decision_path: Path, manifest_path: Path, summary: V2Authorit
             "probe_only": probe_only,
             "approved_for_capital_escalation": False,
             "live_orders_allowed": live_canary,
-            "capital_change_allowed": live_canary,
+            "capital_change_allowed": live_canary and not probe_only,
             "blocker_cleared": False,
             "pressure_complete_claim": False,
         },

@@ -1885,6 +1885,30 @@ fn phase51_lighter_baseline_cleanup_only_enabled() -> bool {
     phase51_true_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV)
 }
 
+fn v2_live_order_path_probe_latch_enabled(cfg: &Config) -> bool {
+    cfg.v2_shadow.enabled
+        && cfg.v2_shadow.decision_mode == crate::config::V2DecisionMode::LiveCanaryAdmission
+        && cfg.v2_shadow.live_canary_order_path_probe_approved
+}
+
+fn v2_has_order_creating_probe_intent(intents: &[OrderIntent]) -> bool {
+    intents.iter().any(|intent| match intent {
+        OrderIntent::Place(place) => {
+            place.venue_id.as_ref() == "lighter" && place.purpose == OrderPurpose::Mm
+        }
+        OrderIntent::Replace(replace) => {
+            replace.venue_id.as_ref() == "lighter" && replace.purpose == OrderPurpose::Mm
+        }
+        OrderIntent::Cancel(_) | OrderIntent::CancelAll(_) => false,
+    })
+}
+
+fn v2_remove_order_creating_probe_intents(intents: &mut Vec<OrderIntent>) -> usize {
+    let before = intents.len();
+    intents.retain(|intent| !v2_has_order_creating_probe_intent(std::slice::from_ref(intent)));
+    before.saturating_sub(intents.len())
+}
+
 fn phase51_lighter_baseline_cleanup_only_is_lighter_venue(
     cfg: &Config,
     venue_index: usize,
@@ -3311,6 +3335,7 @@ pub async fn run_live_loop(
     let mut last_ext_prev_mid: Option<f64> = None;
     let mut last_ext_prev_spread: Option<f64> = None;
     let mut last_runner_apply_audit = Instant::now();
+    let mut v2_live_order_path_probe_attempted = false;
 
     let min_inter_tick = Duration::from_millis(
         std::env::var("PARAPHINA_MIN_INTER_TICK_MS")
@@ -5870,17 +5895,32 @@ pub async fn run_live_loop(
             .and_then(|hooks| hooks.telemetry.as_ref())
             .map(|telemetry| telemetry.execution_mode)
             .unwrap_or("unknown");
-        if let Err(err) = crate::v2::apply_admission_filter(
-            &cfg.v2_shadow,
-            v2_execution_mode,
-            now_ms,
-            &mut intents,
-        ) {
-            eprintln!(
-                "[v2] admission filter failed reason={}",
-                err.sanitized_reason()
-            );
-            intents.clear();
+        if v2_live_order_path_probe_latch_enabled(cfg) && v2_live_order_path_probe_attempted {
+            let removed = v2_remove_order_creating_probe_intents(&mut intents);
+            if removed > 0 {
+                eprintln!(
+                    "[v2] live_canary_order_path_probe_suppressed_after_first_attempt count={}",
+                    removed
+                );
+            }
+        } else {
+            if let Err(err) = crate::v2::apply_admission_filter(
+                &cfg.v2_shadow,
+                v2_execution_mode,
+                now_ms,
+                &mut intents,
+            ) {
+                eprintln!(
+                    "[v2] admission filter failed reason={}",
+                    err.sanitized_reason()
+                );
+                intents.clear();
+            }
+            if v2_live_order_path_probe_latch_enabled(cfg)
+                && v2_has_order_creating_probe_intent(&intents)
+            {
+                v2_live_order_path_probe_attempted = true;
+            }
         }
         if let Err(err) =
             crate::v2::emit_shadow_decision(&cfg.v2_shadow, now_ms, &mm_quotes, &intents)
@@ -15506,6 +15546,41 @@ mod tests {
                 Err("replace_and_place_disabled")
             );
         });
+    }
+
+    #[test]
+    fn v2_live_order_path_probe_latch_requires_explicit_live_probe_mode() {
+        let mut cfg = Config::default();
+        assert!(!v2_live_order_path_probe_latch_enabled(&cfg));
+
+        cfg.v2_shadow.enabled = true;
+        cfg.v2_shadow.decision_mode = crate::config::V2DecisionMode::LiveCanaryAdmission;
+        assert!(!v2_live_order_path_probe_latch_enabled(&cfg));
+
+        cfg.v2_shadow.live_canary_order_path_probe_approved = true;
+        assert!(v2_live_order_path_probe_latch_enabled(&cfg));
+    }
+
+    #[test]
+    fn v2_live_order_path_probe_latch_removes_only_lighter_mm_order_creating_intents() {
+        let mut non_lighter = lighter_targeted_place_intent(Side::Buy, "aster");
+        if let OrderIntent::Place(place) = &mut non_lighter {
+            place.venue_id = "aster".into();
+        }
+        let mut intents = vec![
+            lighter_targeted_place_intent(Side::Buy, "bid"),
+            lighter_cancel_intent(),
+            lighter_targeted_replace_intent(Side::Buy, "replace"),
+            non_lighter,
+        ];
+
+        assert!(v2_has_order_creating_probe_intent(&intents));
+        assert_eq!(v2_remove_order_creating_probe_intents(&mut intents), 2);
+        assert_eq!(intents.len(), 2);
+        assert!(matches!(intents[0], OrderIntent::Cancel(_)));
+        assert!(
+            matches!(&intents[1], OrderIntent::Place(place) if place.venue_id.as_ref() == "aster")
+        );
     }
 
     #[test]

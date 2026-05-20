@@ -220,12 +220,51 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             self.assertTrue(data["governance"]["probe_only"])
             self.assertFalse(data["governance"]["approved_for_promotion"])
             self.assertFalse(data["governance"]["approved_for_live"])
+            self.assertFalse(data["governance"]["capital_change_allowed"])
             self.assertFalse(data["governance"]["blocker_cleared"])
             self.assertEqual(
                 data["v2_authority_contract"]["authority_scope"],
                 "live_canary_single_venue_order_path_probe",
             )
             self.assertTrue(data["v2_authority_contract"]["order_path_probe_only"])
+
+    def test_rejects_multiple_order_path_probe_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = write_rows(
+                Path(tmp),
+                [
+                    live_canary_order_path_probe_row(),
+                    live_canary_order_path_probe_row(),
+                ],
+            )
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_mixed_order_path_probe_and_ranked_admission_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = write_rows(
+                Path(tmp),
+                [
+                    live_canary_order_path_probe_row(),
+                    live_canary_admitted_row(),
+                ],
+            )
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_mixed_order_path_probe_and_ranked_hold_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hold = live_canary_admitted_row()
+            hold["admission_status"] = "HOLD"
+            hold["admission_reason"] = "no_positive_ranked_candidates"
+            hold["order_intent_output_count"] = 0
+            hold["suppressed_mm_order_creating_intent_count"] = 1
+            hold["pair_edge_is_admission"] = False
+            hold["ranking_is_admission"] = False
+            hold["admitted_candidates"] = []
+            evidence = write_rows(Path(tmp), [live_canary_order_path_probe_row(), hold])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
 
     def test_rejects_order_path_probe_if_mislabeled_as_ranking(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,6 +340,23 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             evidence = write_rows(Path(tmp), [row])
             with self.assertRaises(validator.V2AuthorityValidationError):
                 validator.validate_v2_authority_decisions(evidence)
+
+    def test_accepts_live_canary_hold_without_order_path_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = live_canary_admitted_row()
+            row["admission_status"] = "HOLD"
+            row["admission_reason"] = "no_positive_ranked_candidates"
+            row["order_intent_output_count"] = 0
+            row["suppressed_mm_order_creating_intent_count"] = row[
+                "baseline_mm_order_creating_intent_count"
+            ]
+            row["pair_edge_is_admission"] = False
+            row["ranking_is_admission"] = False
+            row["admitted_candidates"] = []
+            evidence = write_rows(Path(tmp), [row])
+            summary = validator.validate_v2_authority_decisions(evidence)
+            self.assertEqual(summary.live_canary_rows, 1)
+            self.assertEqual(summary.live_canary_order_path_probe_rows, 0)
 
     def test_rejects_count_mismatch(self):
         for field, value in [
