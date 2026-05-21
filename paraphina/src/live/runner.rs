@@ -5934,6 +5934,7 @@ pub async fn run_live_loop(
                         aster_cancel_intents,
                         now_ms,
                         tick,
+                        1_000,
                     )
                     .await;
                     if matches!(outcome, OrderWaitOutcomeKind::ChannelFull) {
@@ -8418,6 +8419,7 @@ async fn send_terminal_exit_cancel_intents_sync(
     mut cancel_intents: Vec<OrderIntent>,
     now_ms: TimestampMs,
     tick: u64,
+    timeout_ms: u64,
 ) -> (
     OrderWaitOutcomeKind,
     Option<Vec<LiveExecutionEvent>>,
@@ -8437,7 +8439,7 @@ async fn send_terminal_exit_cancel_intents_sync(
         cancel_intents,
         action_batch,
         now_ms,
-        1_000,
+        timeout_ms,
         TransportHint::Default,
         "terminal_exit_cancel",
         tick,
@@ -8472,6 +8474,7 @@ async fn run_canary_exit_cancel_all_cleanup(
 ) {
     let attempts = canary_exit_cancel_all_attempts();
     let settle_ms = canary_exit_cancel_all_settle_ms();
+    let timeout_ms = canary_exit_cancel_all_timeout_ms(cfg.venues.len());
     let sweep_all_venues = canary_exit_cancel_all_sweep_all_venues_enabled();
     for attempt in 1..=attempts {
         let tracked_open_orders = live_open_order_count_total(state);
@@ -8506,6 +8509,7 @@ async fn run_canary_exit_cancel_all_cleanup(
             intents,
             dispatch_now_ms,
             dispatch_tick,
+            timeout_ms,
         )
         .await;
         eprintln!(
@@ -11321,6 +11325,13 @@ fn canary_exit_cancel_all_settle_ms() -> u64 {
     parse_optional_positive_i64_env("PARAPHINA_CANARY_EXIT_CANCEL_ALL_SETTLE_MS")
         .unwrap_or(1_000)
         .clamp(0, 10_000) as u64
+}
+
+fn canary_exit_cancel_all_timeout_ms(venue_count: usize) -> u64 {
+    parse_optional_positive_i64_env("PARAPHINA_CANARY_EXIT_CANCEL_ALL_TIMEOUT_MS")
+        .map(|value| value as u64)
+        .unwrap_or_else(|| kill_cancel_all_timeout_ms(venue_count))
+        .clamp(1_000, 30_000)
 }
 
 fn canary_exit_cancel_all_sweep_all_venues_enabled() -> bool {
@@ -26413,12 +26424,15 @@ mod tests {
             "PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED",
             "PARAPHINA_CANARY_EXIT_CANCEL_ALL_ATTEMPTS",
             "PARAPHINA_CANARY_EXIT_CANCEL_ALL_SETTLE_MS",
+            "PARAPHINA_CANARY_EXIT_CANCEL_ALL_TIMEOUT_MS",
             "PARAPHINA_CANARY_EXIT_CANCEL_ALL_SWEEP_ALL_VENUES",
         ]);
 
         std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED");
+        std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_TIMEOUT_MS");
         std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_SWEEP_ALL_VENUES");
         assert!(!canary_exit_cancel_all_enabled(true));
+        assert_eq!(canary_exit_cancel_all_timeout_ms(5), 5_000);
         assert!(!canary_exit_cancel_all_sweep_all_venues_enabled());
 
         std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED", "true");
@@ -26435,8 +26449,12 @@ mod tests {
 
         std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ATTEMPTS", "0");
         std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_SETTLE_MS", "20000");
+        std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_TIMEOUT_MS", "40000");
         assert_eq!(canary_exit_cancel_all_attempts(), 3);
         assert_eq!(canary_exit_cancel_all_settle_ms(), 10_000);
+        assert_eq!(canary_exit_cancel_all_timeout_ms(5), 30_000);
+        std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_TIMEOUT_MS", "250");
+        assert_eq!(canary_exit_cancel_all_timeout_ms(5), 1_000);
     }
 
     #[test]
