@@ -1755,6 +1755,17 @@ fn quote_diagnostics(
 }
 
 #[inline]
+fn telemetry_quote_size_step(vcfg: &crate::config::VenueConfig) -> f64 {
+    vcfg.size_step_tao.max(vcfg.lot_size_tao).max(1e-9)
+}
+
+#[inline]
+fn telemetry_floor_to_quote_size_step(size: f64, vcfg: &crate::config::VenueConfig) -> f64 {
+    let step = telemetry_quote_size_step(vcfg);
+    (size / step).floor() * step
+}
+
+#[inline]
 fn telemetry_scale_size(
     size: f64,
     factor: f64,
@@ -1765,10 +1776,11 @@ fn telemetry_scale_size(
         return Some(size);
     }
     let scaled = (size * factor).min(vcfg.max_order_size).max(0.0);
-    if scaled < vcfg.lot_size_tao || scaled * price < vcfg.min_notional_usd {
+    let rounded = telemetry_floor_to_quote_size_step(scaled, vcfg);
+    if rounded < telemetry_quote_size_step(vcfg) || rounded * price < vcfg.min_notional_usd {
         None
     } else {
-        Some(scaled)
+        Some(rounded)
     }
 }
 
@@ -2146,9 +2158,8 @@ fn quote_prune_details(
     }
     size_bid = size_bid.min(vcfg.max_order_size);
     size_ask = size_ask.min(vcfg.max_order_size);
-    let lot = vcfg.lot_size_tao.max(1e-9);
-    size_bid = (size_bid / lot).floor() * lot;
-    size_ask = (size_ask / lot).floor() * lot;
+    size_bid = telemetry_floor_to_quote_size_step(size_bid, vcfg);
+    size_ask = telemetry_floor_to_quote_size_step(size_ask, vcfg);
     let generated_spread_cap_side_suppressed = match side {
         Side::Buy => generated_spread_cap_bid_suppressed,
         Side::Sell => generated_spread_cap_ask_suppressed,
@@ -2175,7 +2186,7 @@ fn quote_prune_details(
             ..blank
         };
     }
-    if candidate_size_pre_utility < lot_size_tao
+    if candidate_size_pre_utility < telemetry_quote_size_step(vcfg)
         || candidate_size_pre_utility * candidate_price < vcfg.min_notional_usd
     {
         return QuotePruneDetails {
@@ -2235,7 +2246,7 @@ fn quote_prune_details(
         }
         VenueUtilityTier::Suppressed => {}
     }
-    if candidate_size_post_utility < lot_size_tao {
+    if candidate_size_post_utility < telemetry_quote_size_step(vcfg) {
         return QuotePruneDetails {
             suppression_reason: Some("size_or_passivity_gated"),
             prune_stage: "utility_scale_below_lot",
@@ -2282,7 +2293,7 @@ fn quote_prune_details(
     } else {
         candidate_size_post_utility
     };
-    if candidate_size_post_taper < lot_size_tao {
+    if candidate_size_post_taper < telemetry_quote_size_step(vcfg) {
         return QuotePruneDetails {
             suppression_reason: Some("size_or_passivity_gated"),
             prune_stage: "pre_soft_taper_below_lot",
@@ -4479,6 +4490,25 @@ mod tests {
         assert_eq!(
             hyperliquid_ask["candidate_size_post_utility"].as_f64(),
             Some(0.0)
+        );
+    }
+
+    #[test]
+    fn quote_levels_treat_sub_step_reject_pressure_size_as_pruned() {
+        let mut cfg = Config::default();
+        cfg.venues[0].lot_size_tao = 0.005;
+        cfg.venues[0].size_step_tao = 0.01;
+        cfg.venues[0].min_notional_usd = 1.0;
+        cfg.venues[0].max_order_size = 0.01;
+
+        assert_eq!(telemetry_scale_size(0.01, 0.5, 300.0, &cfg.venues[0]), None);
+        assert_eq!(
+            telemetry_floor_to_quote_size_step(0.005, &cfg.venues[0]),
+            0.0
+        );
+        assert_eq!(
+            telemetry_floor_to_quote_size_step(0.019, &cfg.venues[0]),
+            0.01
         );
     }
 

@@ -881,6 +881,17 @@ pub(crate) fn venue_utility_conversion_penalties_enabled() -> bool {
 }
 
 #[inline]
+fn quote_size_step(venue: &VenueConfig) -> f64 {
+    venue.size_step_tao.max(venue.lot_size_tao).max(1e-9)
+}
+
+#[inline]
+fn floor_to_quote_size_step(size: f64, venue: &VenueConfig) -> f64 {
+    let step = quote_size_step(venue);
+    (size / step).floor() * step
+}
+
+#[inline]
 fn scale_level(
     level: &mut Option<MmLevel>,
     factor: f64,
@@ -896,8 +907,9 @@ fn scale_level(
         return;
     };
     let scaled = (current.size * factor).min(venue.max_order_size).max(0.0);
-    if scaled < venue.lot_size_tao || scaled * current.price < venue.min_notional_usd {
-        *terminal_reason = if scaled < venue.lot_size_tao {
+    let rounded = floor_to_quote_size_step(scaled, venue);
+    if rounded < quote_size_step(venue) || rounded * current.price < venue.min_notional_usd {
+        *terminal_reason = if rounded < quote_size_step(venue) {
             below_lot_reason
         } else {
             below_min_notional_reason
@@ -905,7 +917,7 @@ fn scale_level(
         *level = None;
         return;
     }
-    current.size = scaled;
+    current.size = rounded;
 }
 
 #[inline]
@@ -2390,10 +2402,11 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     size_bid = size_bid.min(vcfg.max_order_size);
     size_ask = size_ask.min(vcfg.max_order_size);
 
-    // Apply lot size rounding.
-    let lot = vcfg.lot_size_tao.max(1e-9);
-    size_bid = (size_bid / lot).floor() * lot;
-    size_ask = (size_ask / lot).floor() * lot;
+    // Apply tradable size-step rounding. The live gateway floors to
+    // `size_step_tao`; using only lot size here can emit quotes that are
+    // active in MM but deterministically rejected before submit.
+    size_bid = floor_to_quote_size_step(size_bid, vcfg);
+    size_ask = floor_to_quote_size_step(size_ask, vcfg);
 
     if suppress_bid_from_generated_spread_cap {
         size_bid = 0.0;
@@ -2405,7 +2418,7 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     }
 
     // Check minimum size.
-    let min_size = vcfg.lot_size_tao.max(0.0);
+    let min_size = quote_size_step(vcfg).max(0.0);
 
     let bid = if size_bid >= min_size && bid_edge_ok {
         Some(MmLevel {
@@ -2811,13 +2824,13 @@ fn compute_single_venue_quotes(
     size_bid = size_bid.min(vcfg.max_order_size);
     size_ask = size_ask.min(vcfg.max_order_size);
 
-    // Apply lot size rounding.
-    let lot = vcfg.lot_size_tao.max(1e-9);
-    size_bid = (size_bid / lot).floor() * lot;
-    size_ask = (size_ask / lot).floor() * lot;
+    // Apply tradable size-step rounding. This mirrors the live gateway and
+    // prevents pre-submit min-notional rejects from sub-step quote sizes.
+    size_bid = floor_to_quote_size_step(size_bid, vcfg);
+    size_ask = floor_to_quote_size_step(size_ask, vcfg);
 
     // Check minimum size.
-    let min_size = vcfg.lot_size_tao.max(0.0);
+    let min_size = quote_size_step(vcfg).max(0.0);
 
     let bid = if size_bid >= min_size && bid_edge_ok {
         Some(MmLevel {
@@ -5047,6 +5060,38 @@ mod tests {
         );
         assert_eq!(decision.tier, VenueUtilityTier::Reduced);
         assert_eq!(decision.reason, VenueUtilityReason::RejectPressure);
+    }
+
+    #[test]
+    fn venue_utility_reduced_size_below_size_step_is_suppressed_before_gateway() {
+        let (mut cfg, mut state) = setup_test();
+        let venue_id = cfg.venues[0].id.clone();
+        cfg.venues[0].lot_size_tao = 0.005;
+        cfg.venues[0].size_step_tao = 0.01;
+        cfg.venues[0].min_notional_usd = 1.0;
+        cfg.venues[0].max_order_size = 0.01;
+        cfg.mm.max_quote_size_tao_by_venue.insert(venue_id, 0.01);
+        cfg.mm.max_generated_quote_spread_bps_by_venue.clear();
+
+        let baseline = compute_mm_quotes(&cfg, &state);
+        assert!(
+            baseline[0].bid.is_some() || baseline[0].ask.is_some(),
+            "fixture should produce at least one active quote before reject-pressure scaling"
+        );
+
+        state.venues[0].utility.mm_reject_ewma = 4.0;
+        state.venues[0].utility.mm_fill_credit_ewma = 0.0;
+        state.venues[0].utility.mm_fillless_ack_pressure = 80.0;
+
+        let reduced = compute_mm_quotes(&cfg, &state);
+        if baseline[0].bid.is_some() {
+            assert!(reduced[0].bid.is_none());
+            assert_eq!(reduced[0].bid_terminal_reason, "utility_scale_below_lot");
+        }
+        if baseline[0].ask.is_some() {
+            assert!(reduced[0].ask.is_none());
+            assert_eq!(reduced[0].ask_terminal_reason, "utility_scale_below_lot");
+        }
     }
 
     #[test]
