@@ -501,15 +501,17 @@ impl LiveOrderState {
             if venue_index.is_some_and(|idx| order.venue_index != idx) {
                 continue;
             }
-            if let Some(prev) = order.last_update_seq {
-                if seq.is_some_and(|s| s <= prev) {
-                    continue;
-                }
-            }
+            // REST cancel-all acknowledgements can arrive on a sequence stream
+            // independent from private order updates. Treat them as terminal
+            // just like individual cancel acknowledgements.
             order.status = OrderStatus::Cancelled;
             order.updated_ms = now_ms;
             order.gap_grace_started_ms = None;
-            order.last_update_seq = seq;
+            order.last_update_seq = match (order.last_update_seq, seq) {
+                (Some(prev), Some(next)) => Some(prev.max(next)),
+                (Some(prev), None) => Some(prev),
+                (None, next) => next,
+            };
         }
     }
 
@@ -1174,6 +1176,44 @@ mod tests {
 
         assert!(state.open_order_ids_by_venue(0).is_empty());
         assert_eq!(state.open_order_ids_by_venue(1), vec!["oid_hl".to_string()]);
+    }
+
+    #[test]
+    fn lower_seq_cancel_all_ack_clears_live_orders_for_that_venue() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                1,
+                "oid_lighter",
+                "co_lighter",
+                Side::Buy,
+                100.0,
+                1.0,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 1,
+                venue_id: "lighter".into(),
+                order_id: "cancel_all".to_string(),
+                client_order_id: None,
+                seq: Some(3),
+                side: None,
+                price: None,
+                size: None,
+                purpose: None,
+            }),
+            1_100,
+        );
+
+        let order = state.orders.get("co_lighter").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_order_ids_by_venue(1).is_empty());
     }
 
     #[test]
