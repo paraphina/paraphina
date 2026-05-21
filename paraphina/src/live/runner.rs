@@ -8934,9 +8934,14 @@ fn build_canary_breach_flatten_intents(
         if venue.status != VenueStatus::Healthy {
             continue;
         }
-        let min_order_size = venue_min_executable_order_size_tao(venue_cfg);
+        let min_order_size = if venue_cfg.id.eq_ignore_ascii_case("aster") {
+            venue_min_executable_order_size_tao(venue_cfg)
+        } else {
+            venue_cfg.lot_size_tao.max(1e-9)
+        };
         let max_order_size = venue_cfg.max_order_size.max(min_order_size);
-        let size = venue.position_tao.abs().min(max_order_size);
+        let size =
+            snap_size_down_to_lot(venue.position_tao.abs().min(max_order_size), min_order_size);
         if size < min_order_size {
             continue;
         }
@@ -26864,6 +26869,32 @@ mod tests {
         let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
 
         assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_snap_aster_to_size_step() {
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = 2;
+
+        cfg.venues[aster].lot_size_tao = 0.005;
+        cfg.venues[aster].size_step_tao = 0.01;
+        cfg.venues[aster].max_order_size = 0.02;
+        state.fair_value = Some(2_000.0);
+        state.venues[aster].position_tao = -0.015;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
+
+        assert_eq!(intents.len(), 1);
+        let OrderIntent::Place(place) = &intents[0] else {
+            panic!("expected flatten place intent");
+        };
+        assert_eq!(place.venue_index, aster);
+        assert_eq!(place.side, Side::Buy);
+        assert_eq!(place.purpose, OrderPurpose::Exit);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!((place.size - 0.01).abs() < 1e-12);
     }
 
     #[test]
