@@ -8934,10 +8934,10 @@ fn build_canary_breach_flatten_intents(
         if venue.status != VenueStatus::Healthy {
             continue;
         }
-        let lot_size = venue_cfg.lot_size_tao.max(1e-9);
-        let max_order_size = venue_cfg.max_order_size.max(lot_size);
+        let min_order_size = venue_min_executable_order_size_tao(venue_cfg);
+        let max_order_size = venue_cfg.max_order_size.max(min_order_size);
         let size = venue.position_tao.abs().min(max_order_size);
-        if size < lot_size {
+        if size < min_order_size {
             continue;
         }
         let side = if venue.position_tao > 0.0 {
@@ -11821,6 +11821,11 @@ fn clamp_confirmed_reduce_only_target_position_tao(
 ) -> Option<f64> {
     let venue = cfg.venues.get(venue_index)?;
     let lot_size = venue.lot_size_tao.max(1e-9);
+    let min_order_size = if venue.id.eq_ignore_ascii_case("aster") {
+        venue_min_executable_order_size_tao(venue)
+    } else {
+        lot_size
+    };
     let live_open_order_count = live_open_order_count_for_venue(state, venue_index);
     let has_live_orders = live_open_order_count > 0 && !treat_live_orders_as_cancelling;
     let mut used_state_fallback = false;
@@ -11849,13 +11854,25 @@ fn clamp_confirmed_reduce_only_target_position_tao(
             venue_index,
             target_position_tao,
             live_open_order_count,
-            lot_size,
+            min_order_size,
             treat_live_orders_as_cancelling,
             class,
             residual_fallback.as_mut().map(|status| &mut **status),
         )
     }?;
-    if account_position_tao.abs() < lot_size {
+    if account_position_tao.abs() < min_order_size {
+        if venue.id.eq_ignore_ascii_case("aster") && account_position_tao.abs() >= lot_size {
+            push_emergency_residual_fallback_record(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                class,
+                venue_index,
+                venue.id.as_str(),
+                EmergencyResidualFallbackDecision::Rejected,
+                EmergencyResidualFallbackReason::BelowSizeStep,
+                account_position_tao,
+                account_position_tao.abs(),
+            );
+        }
         return None;
     }
     if target_position_tao.signum() == 0.0
@@ -11863,8 +11880,8 @@ fn clamp_confirmed_reduce_only_target_position_tao(
     {
         return None;
     }
-    let confirmed_abs = snap_size_down_to_lot(account_position_tao.abs(), lot_size);
-    if confirmed_abs < lot_size {
+    let confirmed_abs = snap_size_down_to_lot(account_position_tao.abs(), min_order_size);
+    if confirmed_abs < min_order_size {
         return None;
     }
     // Reduce-only emergency hedges must only target confirmed same-side inventory.
@@ -11875,15 +11892,15 @@ fn clamp_confirmed_reduce_only_target_position_tao(
     // orders are already gone.
     let max_send_abs = if venue.id.eq_ignore_ascii_case("aster") {
         let max_full_target_abs = snap_size_down_to_lot(
-            lot_size * aster_soft_unwind_full_target_max_lots(),
-            lot_size,
+            min_order_size * aster_soft_unwind_full_target_max_lots(),
+            min_order_size,
         );
-        if (confirmed_abs <= lot_size + 1e-9 && !has_live_orders)
+        if (confirmed_abs <= min_order_size + 1e-9 && !has_live_orders)
             || (live_open_order_count == 0 && confirmed_abs <= max_full_target_abs + 1e-9)
         {
             confirmed_abs
         } else {
-            snap_size_down_to_lot((confirmed_abs - lot_size).max(0.0), lot_size)
+            snap_size_down_to_lot((confirmed_abs - min_order_size).max(0.0), min_order_size)
         }
     } else if treat_live_orders_as_cancelling
         && !(used_state_fallback
@@ -11899,11 +11916,23 @@ fn clamp_confirmed_reduce_only_target_position_tao(
     } else {
         confirmed_abs
     };
-    if max_send_abs < lot_size {
+    if max_send_abs < min_order_size {
         return None;
     }
     let clamped_abs = target_position_tao.abs().min(max_send_abs);
-    if clamped_abs < lot_size {
+    if clamped_abs < min_order_size {
+        if venue.id.eq_ignore_ascii_case("aster") && clamped_abs >= lot_size {
+            push_emergency_residual_fallback_record(
+                residual_fallback.as_mut().map(|status| &mut **status),
+                class,
+                venue_index,
+                venue.id.as_str(),
+                EmergencyResidualFallbackDecision::Rejected,
+                EmergencyResidualFallbackReason::BelowSizeStep,
+                account_position_tao,
+                clamped_abs,
+            );
+        }
         return None;
     }
     Some(target_position_tao.signum() * clamped_abs)
@@ -21402,6 +21431,68 @@ mod tests {
     }
 
     #[test]
+    fn aster_reduce_only_clamp_rejects_projected_target_below_size_step() {
+        let mut cfg = Config::default();
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+            .expect("aster venue");
+        cfg.venues[aster].lot_size_tao = 0.005;
+        cfg.venues[aster].size_step_tao = 0.01;
+
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        state.venues[aster].position_tao = -0.005;
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { -0.005 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let clamped = clamp_confirmed_reduce_only_target_position_tao(
+            &cfg,
+            &state,
+            &snapshot,
+            aster,
+            now_ms,
+            -0.01,
+            false,
+            EmergencyRequestClass::InventoryBrake,
+            Some(&mut residual_fallback),
+        );
+
+        assert!(clamped.is_none());
+        assert!(residual_fallback.records.iter().any(|record| {
+            record.venue_index == aster
+                && record.class == EmergencyRequestClass::InventoryBrake
+                && record.status == EmergencyResidualFallbackDecision::Rejected
+                && record.reason == EmergencyResidualFallbackReason::BelowSizeStep
+        }));
+    }
+
+    #[test]
     fn soft_unwind_markout_guard_suppresses_benign_aster_residual() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -26757,6 +26848,22 @@ mod tests {
         assert!(place.reduce_only);
         assert!(!place.post_only);
         assert!((place.size - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_suppress_aster_below_size_step() {
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = 2;
+
+        cfg.venues[aster].lot_size_tao = 0.005;
+        cfg.venues[aster].size_step_tao = 0.01;
+        state.fair_value = Some(2_000.0);
+        state.venues[aster].position_tao = -0.005;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
+
+        assert!(intents.is_empty());
     }
 
     #[test]
