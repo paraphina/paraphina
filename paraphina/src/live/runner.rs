@@ -196,6 +196,7 @@ enum EmergencyResidualFallbackReason {
     NoFreshAccount,
     LiveOrdersPresent,
     NotExactOneLot,
+    BelowSizeStep,
     FallbackSizeTooLarge,
     SignMismatch,
     FeeGuardSuppressed,
@@ -11592,6 +11593,10 @@ fn snap_size_down_to_lot(size: f64, lot_size: f64) -> f64 {
     }
 }
 
+fn venue_min_executable_order_size_tao(venue: &crate::config::VenueConfig) -> f64 {
+    venue.size_step_tao.max(venue.lot_size_tao).max(1e-9)
+}
+
 fn fresh_account_or_state_position_tao(
     cfg: &Config,
     state: &GlobalState,
@@ -12083,15 +12088,15 @@ fn soft_unwind_target_position_tao(
     venue_index: usize,
     now_ms: TimestampMs,
 ) -> f64 {
-    let lot_size = cfg
+    let min_order_size = cfg
         .venues
         .get(venue_index)
-        .map(|venue| venue.lot_size_tao.max(1e-9))
+        .map(venue_min_executable_order_size_tao)
         .unwrap_or(1e-9);
     let position_source =
         fresh_account_or_state_position_tao(cfg, state, snapshot, venue_index, now_ms);
-    let snapped_abs = snap_size_down_to_lot(position_source.abs(), lot_size);
-    if snapped_abs < lot_size {
+    let snapped_abs = snap_size_down_to_lot(position_source.abs(), min_order_size);
+    if snapped_abs < min_order_size {
         return 0.0;
     }
     if cfg
@@ -12101,8 +12106,8 @@ fn soft_unwind_target_position_tao(
         .unwrap_or(false)
     {
         let max_full_target_abs = snap_size_down_to_lot(
-            lot_size * extended_soft_unwind_state_fallback_max_lots(),
-            lot_size,
+            min_order_size * extended_soft_unwind_state_fallback_max_lots(),
+            min_order_size,
         );
         if snapped_abs <= max_full_target_abs + 1e-9 {
             return position_source.signum() * snapped_abs;
@@ -12115,15 +12120,15 @@ fn soft_unwind_target_position_tao(
         .unwrap_or(false)
     {
         let max_full_target_abs = snap_size_down_to_lot(
-            lot_size * aster_soft_unwind_full_target_max_lots(),
-            lot_size,
+            min_order_size * aster_soft_unwind_full_target_max_lots(),
+            min_order_size,
         );
         if snapped_abs <= max_full_target_abs + 1e-9 {
             return position_source.signum() * snapped_abs;
         }
     }
-    let conservative_abs = if snapped_abs > lot_size {
-        snap_size_down_to_lot(snapped_abs - lot_size, lot_size).max(lot_size)
+    let conservative_abs = if snapped_abs > min_order_size {
+        snap_size_down_to_lot(snapped_abs - min_order_size, min_order_size).max(min_order_size)
     } else {
         snapped_abs
     };
@@ -12137,10 +12142,10 @@ fn inventory_brake_target_position_tao(
     venue_index: usize,
     now_ms: TimestampMs,
 ) -> f64 {
-    let lot_size = cfg
+    let min_order_size = cfg
         .venues
         .get(venue_index)
-        .map(|venue| venue.lot_size_tao.max(1e-9))
+        .map(venue_min_executable_order_size_tao)
         .unwrap_or(1e-9);
     let position_source =
         fresh_account_or_state_position_tao(cfg, state, snapshot, venue_index, now_ms);
@@ -12155,8 +12160,8 @@ fn inventory_brake_target_position_tao(
     } else {
         position_source
     };
-    let snapped_abs = snap_size_down_to_lot(target_position_source.abs(), lot_size);
-    if snapped_abs < lot_size {
+    let snapped_abs = snap_size_down_to_lot(target_position_source.abs(), min_order_size);
+    if snapped_abs < min_order_size {
         return 0.0;
     }
     target_position_source.signum() * snapped_abs
@@ -12840,7 +12845,21 @@ fn build_aster_terminal_sub_lot_residual_convergence_intents(
     let residual_abs = residual_position_tao.abs();
     let min_abs = aster_terminal_sub_lot_reduce_min_abs_tao();
     let configured_lot = venue.lot_size_tao.max(1e-9);
+    let min_order_size = venue.size_step_tao.max(1e-9);
     if residual_abs <= min_abs + 1e-9 {
+        return intents;
+    }
+    if residual_abs < min_order_size - 1e-9 {
+        push_emergency_residual_fallback_record(
+            residual_fallback.as_mut().map(|status| &mut **status),
+            EmergencyRequestClass::SoftUnwind,
+            venue_index,
+            venue.id.as_str(),
+            EmergencyResidualFallbackDecision::Rejected,
+            EmergencyResidualFallbackReason::BelowSizeStep,
+            residual_position_tao,
+            residual_abs,
+        );
         return intents;
     }
     if residual_abs >= configured_lot - 1e-9
@@ -21116,10 +21135,10 @@ mod tests {
 
     #[test]
     fn soft_unwind_allows_exact_one_lot_aster_without_live_orders() {
-        let cfg = Config::default();
-        let mut state = GlobalState::new(&cfg);
         let now_ms = 12_000;
         let aster = 2;
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
 
         state.fair_value = Some(2_350.0);
         state.fair_value_prev = 2_350.0;
@@ -21323,6 +21342,63 @@ mod tests {
             residual_fallback.aster_soft_unwind_fee_guard_skipped_orders,
             0
         );
+    }
+
+    #[test]
+    fn soft_unwind_suppresses_aster_reduce_below_size_step() {
+        let mut cfg = Config::default();
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+            .expect("aster venue");
+        cfg.venues[aster].lot_size_tao = 0.005;
+        cfg.venues[aster].size_step_tao = 0.01;
+        cfg.venues[aster].min_notional_usd = 10.0;
+
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = -0.005;
+        state.venues[aster].mid = Some(2_350.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { -0.005 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        assert_eq!(
+            soft_unwind_target_position_tao(&cfg, &state, &snapshot, aster, now_ms),
+            0.0
+        );
+        let intents =
+            build_soft_unwind_intents_with_fallback_status(&cfg, &state, &snapshot, now_ms, None);
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == aster)
+        }));
     }
 
     #[test]
@@ -21870,10 +21946,12 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED"]);
         std::env::set_var("PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED", "1");
-        let cfg = Config::default();
-        let mut state = GlobalState::new(&cfg);
         let now_ms = 12_000;
         let aster = 2;
+        let mut cfg = Config::default();
+        cfg.venues[aster].lot_size_tao = 0.01;
+        cfg.venues[aster].size_step_tao = 0.001;
+        let mut state = GlobalState::new(&cfg);
 
         state.fair_value = Some(2_350.0);
         state.fair_value_prev = 2_350.0;
@@ -21951,6 +22029,90 @@ mod tests {
                 .as_deref(),
             Some("allowed_terminal_sub_lot")
         );
+    }
+
+    #[test]
+    fn aster_terminal_sub_lot_residual_suppresses_below_size_step() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED"]);
+        std::env::set_var("PARAPHINA_ASTER_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED", "1");
+        let mut cfg = Config::default();
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("aster"))
+            .expect("aster venue");
+        cfg.venues[aster].lot_size_tao = 0.005;
+        cfg.venues[aster].size_step_tao = 0.01;
+        cfg.venues[aster].min_notional_usd = 10.0;
+
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[aster].position_tao = -0.008;
+        state.venues[aster].mid = Some(2_351.0);
+        state.venues[aster].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == aster { -0.008 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let mut residual_fallback = EmergencyResidualFallbackStatus::default();
+        let intents = build_aster_terminal_sub_lot_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            now_ms,
+            AsterSoftUnwindFeeGuardConfig {
+                enabled: true,
+                max_abs_position_tao: 0.02,
+                residual_markout_guard_enabled: true,
+                residual_markout_guard_terminal_refresh_enabled: true,
+                residual_markout_guard_taker_fee_rate: 0.0004,
+                residual_markout_guard_force_flat_max_fee_usd: 0.05,
+                ..AsterSoftUnwindFeeGuardConfig::default()
+            },
+            Some(&mut residual_fallback),
+        );
+
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == aster)
+        }));
+        let record = residual_fallback
+            .records
+            .iter()
+            .find(|record| {
+                record.venue_id == "aster"
+                    && record.reason == EmergencyResidualFallbackReason::BelowSizeStep
+            })
+            .expect("below size-step rejection record");
+        assert_eq!(record.status, EmergencyResidualFallbackDecision::Rejected);
+        assert!((record.clamped_size_tao - 0.008).abs() < 1e-12);
     }
 
     #[test]
