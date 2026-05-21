@@ -216,6 +216,7 @@ impl LiveOrderState {
                     rej.venue_index,
                     now_ms,
                     rej.seq,
+                    rej.purpose.is_none() && rej.reduce_only.is_none(),
                 );
             }
             ExecutionEvent::Fill(fill) => {
@@ -530,6 +531,7 @@ impl LiveOrderState {
         let key = client_order_id
             .clone()
             .unwrap_or_else(|| exchange_order_id.clone());
+        let existing_order = self.orders.contains_key(&key);
         let entry = self.orders.entry(key.clone()).or_insert_with(|| LiveOrder {
             decision_id: None,
             client_order_id: client_order_id.clone(),
@@ -546,9 +548,11 @@ impl LiveOrderState {
             gap_grace_started_ms: None,
             last_update_seq: seq,
         });
-        if let Some(prev) = entry.last_update_seq {
-            if seq.is_some_and(|s| s <= prev) {
-                return;
+        if existing_order {
+            if let Some(prev) = entry.last_update_seq {
+                if seq.is_some_and(|s| s <= prev) {
+                    return;
+                }
             }
         }
         entry.exchange_order_id = Some(exchange_order_id.clone());
@@ -605,9 +609,15 @@ impl LiveOrderState {
         venue_index: usize,
         now_ms: TimestampMs,
         seq: Option<u64>,
+        force_terminal_reject: bool,
     ) {
         let key = client_order_id
             .clone()
+            .or_else(|| {
+                exchange_order_id
+                    .as_ref()
+                    .and_then(|id| self.exchange_to_key.get(id).cloned())
+            })
             .or_else(|| exchange_order_id.clone())
             .unwrap_or_else(|| format!("rejected_{}_{}", venue_index, now_ms));
         let entry = self.orders.entry(key).or_insert_with(|| LiveOrder {
@@ -626,9 +636,11 @@ impl LiveOrderState {
             gap_grace_started_ms: None,
             last_update_seq: seq,
         });
-        if let Some(prev) = entry.last_update_seq {
-            if seq.is_some_and(|s| s <= prev) {
-                return;
+        if !force_terminal_reject {
+            if let Some(prev) = entry.last_update_seq {
+                if seq.is_some_and(|s| s <= prev) {
+                    return;
+                }
             }
         }
         entry.status = OrderStatus::Rejected;
@@ -819,7 +831,7 @@ fn emit_supported_replace_snapshot_gap_expired(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExecutionEvent, OrderAck};
+    use crate::types::{ExecutionEvent, OrderAck, OrderReject};
 
     fn ack(
         venue_index: usize,
@@ -1127,6 +1139,82 @@ mod tests {
         assert_eq!(order.gap_grace_started_ms, None);
         assert_eq!(order.last_update_seq, Some(20_000));
         assert!(state.active_orders().is_empty());
+    }
+
+    #[test]
+    fn lower_seq_cancel_reject_clears_exchange_keyed_live_order() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                1,
+                "oid_hl_1",
+                "co_hl_1",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        state.apply_execution_event(
+            &ExecutionEvent::OrderReject(OrderReject {
+                venue_index: 1,
+                venue_id: "hyperliquid".into(),
+                order_id: Some("oid_hl_1".to_string()),
+                client_order_id: None,
+                seq: Some(2),
+                purpose: None,
+                reduce_only: None,
+                reason: "sanitized_cancel_reject".to_string(),
+            }),
+            1_100,
+        );
+
+        let order = state.orders.get("co_hl_1").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Rejected);
+        assert_eq!(order.remaining_qty, Some(0.0));
+        assert_eq!(order.last_update_seq, Some(2));
+        assert!(state.active_orders().is_empty());
+    }
+
+    #[test]
+    fn lower_seq_place_reject_does_not_clear_accepted_live_order() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                1,
+                "oid_hl_1",
+                "co_hl_1",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        state.apply_execution_event(
+            &ExecutionEvent::OrderReject(OrderReject {
+                venue_index: 1,
+                venue_id: "hyperliquid".into(),
+                order_id: Some("oid_hl_1".to_string()),
+                client_order_id: None,
+                seq: Some(2),
+                purpose: Some(OrderPurpose::Mm),
+                reduce_only: Some(false),
+                reason: "sanitized_place_reject".to_string(),
+            }),
+            1_100,
+        );
+
+        let order = state.orders.get("co_hl_1").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Accepted);
+        assert_eq!(order.remaining_qty, Some(0.01));
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert_eq!(state.active_orders().len(), 1);
     }
 
     #[test]
