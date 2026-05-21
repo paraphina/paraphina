@@ -6863,6 +6863,20 @@ pub async fn run_live_loop(
         }
     }
 
+    if canary_exit_cancel_all_enabled(canary_enabled && trade_mode == "live") {
+        run_canary_exit_cancel_all_cleanup(
+            cfg,
+            &mut state,
+            &priority_order_tx,
+            &mut phase51_target_key_registry,
+            &mut deduper,
+            order_snapshot_fill_inference_enabled,
+            &mut order_state_initialized,
+            tick,
+        )
+        .await;
+    }
+
     if let Some(hooks) = hooks.as_ref() {
         hooks.health.set_ready(hooks.health.is_ready());
     }
@@ -8251,6 +8265,21 @@ fn build_terminal_exit_quiesce_cancel_intents(
     cancel_intents
 }
 
+fn build_canary_exit_cancel_all_intents(cfg: &Config, state: &GlobalState) -> Vec<OrderIntent> {
+    let mut cancel_intents = Vec::new();
+    for venue_index in 0..cfg.venues.len() {
+        if live_open_order_count_for_venue(state, venue_index) == 0 {
+            continue;
+        }
+        cancel_intents.extend(build_disabled_cancel_intents_for_venue(
+            cfg,
+            state,
+            venue_index,
+        ));
+    }
+    cancel_intents
+}
+
 fn terminal_stale_order_reduce_ready_venues(
     cfg: &Config,
     state: &GlobalState,
@@ -8401,6 +8430,110 @@ async fn send_terminal_exit_cancel_intents_sync(
     )
     .await;
     (outcome, events, venues)
+}
+
+fn live_open_order_count_total(state: &GlobalState) -> usize {
+    state.live_order_state.open_orders().len()
+}
+
+fn live_open_order_venue_labels(cfg: &Config, state: &GlobalState) -> Vec<String> {
+    cfg.venues
+        .iter()
+        .enumerate()
+        .filter_map(|(venue_index, venue)| {
+            (live_open_order_count_for_venue(state, venue_index) > 0).then(|| venue.id.clone())
+        })
+        .collect()
+}
+
+async fn run_canary_exit_cancel_all_cleanup(
+    cfg: &Config,
+    state: &mut GlobalState,
+    priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
+    deduper: &mut ExecutionEventDeduper,
+    order_snapshot_fill_inference_enabled: bool,
+    order_state_initialized: &mut [bool],
+    tick: u64,
+) {
+    let attempts = canary_exit_cancel_all_attempts();
+    let settle_ms = canary_exit_cancel_all_settle_ms();
+    for attempt in 1..=attempts {
+        let tracked_open_orders = live_open_order_count_total(state);
+        if tracked_open_orders == 0 {
+            eprintln!(
+                "[runner] canary_exit_cancel_all_cleanup clean attempt={} tracked_open_orders=0",
+                attempt
+            );
+            return;
+        }
+        let venues = live_open_order_venue_labels(cfg, state);
+        eprintln!(
+            "[runner] canary_exit_cancel_all_cleanup attempt={} tracked_open_orders={} venues={}",
+            attempt,
+            tracked_open_orders,
+            venues.join(",")
+        );
+        let intents = build_canary_exit_cancel_all_intents(cfg, state);
+        if intents.is_empty() {
+            eprintln!(
+                "[runner] canary_exit_cancel_all_cleanup no_cancel_intents tracked_open_orders={}",
+                tracked_open_orders
+            );
+            return;
+        }
+        let dispatch_now_ms = now_ms();
+        let dispatch_tick = tick.saturating_add(attempt as u64);
+        let (outcome, events, venues) = send_terminal_exit_cancel_intents_sync(
+            cfg,
+            priority_order_tx,
+            phase51_target_key_registry,
+            intents,
+            dispatch_now_ms,
+            dispatch_tick,
+        )
+        .await;
+        eprintln!(
+            "[runner] canary_exit_cancel_all_cleanup dispatched attempt={} outcome={:?} venue_count={}",
+            attempt,
+            outcome,
+            venues.len()
+        );
+        if let Some(events) = events {
+            let mut tick_exec_events = Vec::new();
+            let mut tick_fills = Vec::new();
+            let fills = apply_priority_response_events(
+                cfg,
+                state,
+                deduper,
+                events,
+                dispatch_now_ms,
+                order_snapshot_fill_inference_enabled,
+                &mut tick_exec_events,
+                &mut tick_fills,
+                order_state_initialized,
+            );
+            if !fills.is_empty() {
+                apply_live_fills(cfg, state, &fills, dispatch_now_ms);
+                state.recompute_after_fills(cfg);
+            }
+        }
+        if live_open_order_count_total(state) == 0 {
+            eprintln!(
+                "[runner] canary_exit_cancel_all_cleanup clean_after_dispatch attempt={}",
+                attempt
+            );
+            return;
+        }
+        if settle_ms > 0 && attempt < attempts {
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+        }
+    }
+    eprintln!(
+        "[runner] canary_exit_cancel_all_cleanup incomplete tracked_open_orders={} venues={}",
+        live_open_order_count_total(state),
+        live_open_order_venue_labels(cfg, state).join(",")
+    );
 }
 
 fn build_unlatched_disabled_cancel_intents_for_venues(
@@ -11150,6 +11283,22 @@ fn terminal_residual_convergence_config_from_env(
         )
         .unwrap_or(0),
     }
+}
+
+fn canary_exit_cancel_all_enabled(canary_live_enabled: bool) -> bool {
+    canary_live_enabled && parse_bool_env_default("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED", false)
+}
+
+fn canary_exit_cancel_all_attempts() -> u32 {
+    parse_optional_positive_i64_env("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ATTEMPTS")
+        .unwrap_or(3)
+        .clamp(1, 10) as u32
+}
+
+fn canary_exit_cancel_all_settle_ms() -> u64 {
+    parse_optional_positive_i64_env("PARAPHINA_CANARY_EXIT_CANCEL_ALL_SETTLE_MS")
+        .unwrap_or(1_000)
+        .clamp(0, 10_000) as u64
 }
 
 fn terminal_residual_convergence_venue_indices(
@@ -25977,6 +26126,65 @@ mod tests {
         );
         assert!(!resent.is_empty());
         assert_eq!(cancel_state[lighter].first_sent_ms, Some(now_ms + 3_000));
+    }
+
+    #[test]
+    fn canary_exit_cancel_all_enabled_requires_live_canary_opt_in() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED",
+            "PARAPHINA_CANARY_EXIT_CANCEL_ALL_ATTEMPTS",
+            "PARAPHINA_CANARY_EXIT_CANCEL_ALL_SETTLE_MS",
+        ]);
+
+        std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED");
+        assert!(!canary_exit_cancel_all_enabled(true));
+
+        std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED", "true");
+        assert!(canary_exit_cancel_all_enabled(true));
+        assert!(!canary_exit_cancel_all_enabled(false));
+
+        std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED", "0");
+        assert!(!canary_exit_cancel_all_enabled(true));
+
+        std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ATTEMPTS", "0");
+        std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_SETTLE_MS", "20000");
+        assert_eq!(canary_exit_cancel_all_attempts(), 3);
+        assert_eq!(canary_exit_cancel_all_settle_ms(), 10_000);
+    }
+
+    #[test]
+    fn canary_exit_cancel_all_builds_cancel_intents_only_for_tracked_open_orders() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = 0;
+        let lighter = 3;
+        let now_ms = 45_000;
+
+        seed_open_orders(&mut state, extended, 1, now_ms);
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+
+        let intents = build_canary_exit_cancel_all_intents(&cfg, &state);
+        assert_eq!(intents.len(), 2);
+        assert!(intents.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all)
+                    if cancel_all.venue_index == Some(extended)
+                        && cancel_all.venue_id.as_deref() == Some("extended")
+            )
+        }));
+        assert!(intents.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all)
+                    if cancel_all.venue_index == Some(lighter)
+                        && cancel_all.venue_id.as_deref() == Some("lighter")
+            )
+        }));
+
+        let clean_state = GlobalState::new(&cfg);
+        assert!(build_canary_exit_cancel_all_intents(&cfg, &clean_state).is_empty());
     }
 
     #[test]
