@@ -271,6 +271,50 @@ impl LiveOrderState {
             });
             if let Some(prev) = entry.last_update_seq {
                 if snapshot.seq <= prev {
+                    if supports_present_snapshot_lower_seq_reconcile(&snapshot.venue_id, entry)
+                        && matches!(
+                            entry.status,
+                            OrderStatus::SnapshotGapGrace | OrderStatus::Cancelled
+                        )
+                    {
+                        let was_snapshot_gap_grace =
+                            matches!(entry.status, OrderStatus::SnapshotGapGrace);
+                        entry.exchange_order_id = exchange_order_id.clone();
+                        entry.client_order_id = order
+                            .client_order_id
+                            .clone()
+                            .or_else(|| entry.client_order_id.clone());
+                        entry.side = Some(order.side);
+                        entry.price = Some(order.price);
+                        entry.total_qty =
+                            Some(entry.total_qty.unwrap_or(order.size).max(order.size));
+                        entry.remaining_qty = Some(order.size);
+                        entry.purpose = order.purpose.or(entry.purpose);
+                        let total_qty = entry.total_qty.unwrap_or(order.size);
+                        let remaining_qty = entry.remaining_qty.unwrap_or(total_qty);
+                        entry.status = if total_qty > remaining_qty + EPS {
+                            OrderStatus::PartiallyFilled
+                        } else {
+                            OrderStatus::Accepted
+                        };
+                        entry.updated_ms = now_ms;
+                        if was_snapshot_gap_grace {
+                            emit_supported_replace_snapshot_gap_cleared(
+                                &snapshot.venue_id,
+                                entry.side,
+                                entry
+                                    .exchange_order_id
+                                    .as_deref()
+                                    .unwrap_or(&order.order_id),
+                                entry.client_order_id.as_deref(),
+                            );
+                        }
+                        entry.gap_grace_started_ms = None;
+                        entry.last_update_seq = Some(prev.max(snapshot.seq));
+                        if let Some(exchange_order_id) = exchange_order_id {
+                            self.exchange_to_key.insert(exchange_order_id, key.clone());
+                        }
+                    }
                     seen.insert(key, true);
                     continue;
                 }
@@ -314,7 +358,9 @@ impl LiveOrderState {
         for (key, order) in self.orders.iter_mut() {
             if order.venue_index == snapshot.venue_index && !seen.contains_key(key) {
                 if let Some(prev) = order.last_update_seq {
-                    if snapshot.seq <= prev {
+                    if snapshot.seq <= prev
+                        && !supports_missing_snapshot_lower_seq_reconcile(&snapshot.venue_id, order)
+                    {
                         continue;
                     }
                 }
@@ -340,7 +386,10 @@ impl LiveOrderState {
                         order.status = OrderStatus::SnapshotGapGrace;
                         order.updated_ms = now_ms;
                         order.gap_grace_started_ms = Some(gap_start_ms);
-                        order.last_update_seq = Some(snapshot.seq);
+                        order.last_update_seq = match order.last_update_seq {
+                            Some(prev) => Some(prev.max(snapshot.seq)),
+                            None => Some(snapshot.seq),
+                        };
                         continue;
                     }
                     emit_supported_replace_snapshot_gap_expired(
@@ -354,7 +403,10 @@ impl LiveOrderState {
                 order.remaining_qty = Some(0.0);
                 order.updated_ms = now_ms;
                 order.gap_grace_started_ms = None;
-                order.last_update_seq = Some(snapshot.seq);
+                order.last_update_seq = match order.last_update_seq {
+                    Some(prev) => Some(prev.max(snapshot.seq)),
+                    None => Some(snapshot.seq),
+                };
             }
         }
     }
@@ -661,12 +713,12 @@ impl LiveOrderState {
     ) {
         let key = client_order_id
             .clone()
-            .or_else(|| exchange_order_id.clone())
             .or_else(|| {
                 exchange_order_id
                     .as_ref()
                     .and_then(|id| self.exchange_to_key.get(id).cloned())
-            });
+            })
+            .or_else(|| exchange_order_id.clone());
         let Some(key) = key else {
             return;
         };
@@ -767,10 +819,21 @@ fn snapshot_exchange_order_id(order: &OpenOrderSnapshot) -> Option<String> {
 
 fn supports_supported_replace_snapshot_gap_grace(venue_id: &str, order: &LiveOrder) -> bool {
     (venue_id.eq_ignore_ascii_case("hyperliquid")
+        || venue_id.eq_ignore_ascii_case("lighter")
         || venue_id.eq_ignore_ascii_case("paradex")
         || venue_id.eq_ignore_ascii_case("extended"))
         && order.purpose == Some(OrderPurpose::Mm)
         && order.side.is_some()
+}
+
+fn supports_missing_snapshot_lower_seq_reconcile(venue_id: &str, order: &LiveOrder) -> bool {
+    venue_id.eq_ignore_ascii_case("lighter")
+        && supports_supported_replace_snapshot_gap_grace(venue_id, order)
+}
+
+fn supports_present_snapshot_lower_seq_reconcile(venue_id: &str, order: &LiveOrder) -> bool {
+    venue_id.eq_ignore_ascii_case("lighter")
+        && supports_supported_replace_snapshot_gap_grace(venue_id, order)
 }
 
 fn supported_replace_snapshot_gap_id_state(raw: Option<&str>) -> &'static str {
@@ -831,7 +894,7 @@ fn emit_supported_replace_snapshot_gap_expired(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExecutionEvent, OrderAck, OrderReject};
+    use crate::types::{ExecutionEvent, FillEvent, OrderAck, OrderReject};
 
     fn ack(
         venue_index: usize,
@@ -1042,6 +1105,224 @@ mod tests {
     }
 
     #[test]
+    fn lower_seq_lighter_missing_snapshot_reconciles_after_gap_grace() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                1,
+                "oid_lighter",
+                "co_lighter",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        let empty_lighter_snapshot = OrderSnapshot {
+            venue_index: 1,
+            venue_id: "lighter".to_string(),
+            seq: 3,
+            timestamp_ms: 2_000,
+            open_orders: Vec::new(),
+        };
+        state.reconcile(&empty_lighter_snapshot, 2_000);
+
+        let order = state.orders.get("co_lighter").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::SnapshotGapGrace);
+        assert_eq!(order.gap_grace_started_ms, Some(2_000));
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_orders().is_empty());
+        assert_eq!(state.active_orders().len(), 1);
+
+        state.reconcile(
+            &OrderSnapshot {
+                timestamp_ms: 4_001,
+                ..empty_lighter_snapshot
+            },
+            4_001,
+        );
+
+        let order = state.orders.get("co_lighter").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.gap_grace_started_ms, None);
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_order_ids_by_venue(1).is_empty());
+    }
+
+    #[test]
+    fn lower_seq_lighter_present_snapshot_clears_gap_grace() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                1,
+                "oid_lighter",
+                "co_lighter",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        state.reconcile(
+            &OrderSnapshot {
+                venue_index: 1,
+                venue_id: "lighter".to_string(),
+                seq: 3,
+                timestamp_ms: 2_000,
+                open_orders: Vec::new(),
+            },
+            2_000,
+        );
+
+        let order = state.orders.get("co_lighter").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::SnapshotGapGrace);
+        assert_eq!(order.gap_grace_started_ms, Some(2_000));
+        assert!(state.open_orders().is_empty());
+
+        state.reconcile(
+            &OrderSnapshot {
+                venue_index: 1,
+                venue_id: "lighter".to_string(),
+                seq: 3,
+                timestamp_ms: 2_500,
+                open_orders: vec![OpenOrderSnapshot {
+                    order_id: "oid_lighter".to_string(),
+                    client_order_id: Some("co_lighter".to_string()),
+                    exchange_order_id: None,
+                    side: Side::Buy,
+                    price: 100.0,
+                    size: 0.01,
+                    purpose: Some(OrderPurpose::Mm),
+                }],
+            },
+            2_500,
+        );
+
+        let order = state.orders.get("co_lighter").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Accepted);
+        assert_eq!(order.gap_grace_started_ms, None);
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert_eq!(
+            state.open_order_ids_by_venue(1),
+            vec!["oid_lighter".to_string()]
+        );
+    }
+
+    #[test]
+    fn lower_seq_lighter_present_snapshot_restores_after_gap_expiry() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                1,
+                "oid_lighter",
+                "co_lighter",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        let empty_lighter_snapshot = OrderSnapshot {
+            venue_index: 1,
+            venue_id: "lighter".to_string(),
+            seq: 3,
+            timestamp_ms: 2_000,
+            open_orders: Vec::new(),
+        };
+        state.reconcile_with_supported_replace_gap_grace_ms(&empty_lighter_snapshot, 2_000, 500);
+        state.reconcile_with_supported_replace_gap_grace_ms(
+            &OrderSnapshot {
+                timestamp_ms: 2_501,
+                ..empty_lighter_snapshot
+            },
+            2_501,
+            500,
+        );
+
+        let order = state.orders.get("co_lighter").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.remaining_qty, Some(0.0));
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_order_ids_by_venue(1).is_empty());
+
+        state.reconcile_with_supported_replace_gap_grace_ms(
+            &OrderSnapshot {
+                venue_index: 1,
+                venue_id: "lighter".to_string(),
+                seq: 3,
+                timestamp_ms: 3_000,
+                open_orders: vec![OpenOrderSnapshot {
+                    order_id: "oid_lighter".to_string(),
+                    client_order_id: Some("co_lighter".to_string()),
+                    exchange_order_id: None,
+                    side: Side::Buy,
+                    price: 100.0,
+                    size: 0.01,
+                    purpose: Some(OrderPurpose::Mm),
+                }],
+            },
+            3_000,
+            500,
+        );
+
+        let order = state.orders.get("co_lighter").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Accepted);
+        assert_eq!(order.remaining_qty, Some(0.01));
+        assert_eq!(order.gap_grace_started_ms, None);
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert_eq!(
+            state.open_order_ids_by_venue(1),
+            vec!["oid_lighter".to_string()]
+        );
+    }
+
+    #[test]
+    fn lower_seq_unsupported_missing_snapshot_does_not_clear_live_order() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                2,
+                "oid_unknown",
+                "co_unknown",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        state.reconcile(
+            &OrderSnapshot {
+                venue_index: 2,
+                venue_id: "unknown_venue".to_string(),
+                seq: 3,
+                timestamp_ms: 2_000,
+                open_orders: Vec::new(),
+            },
+            2_000,
+        );
+
+        let order = state.orders.get("co_unknown").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Accepted);
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert_eq!(
+            state.open_order_ids_by_venue(2),
+            vec!["oid_unknown".to_string()]
+        );
+    }
+
+    #[test]
     fn reconcile_supported_mm_order_honors_custom_snapshot_gap_grace() {
         let mut state = LiveOrderState::new();
         state.apply_execution_event(
@@ -1176,6 +1457,46 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Rejected);
         assert_eq!(order.remaining_qty, Some(0.0));
         assert_eq!(order.last_update_seq, Some(2));
+        assert!(state.active_orders().is_empty());
+    }
+
+    #[test]
+    fn exchange_order_id_fill_updates_client_keyed_live_order() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                1,
+                "oid_hl_1",
+                "co_hl_1",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        state.apply_execution_event(
+            &ExecutionEvent::Fill(FillEvent {
+                venue_index: 1,
+                venue_id: "hyperliquid".into(),
+                order_id: Some("oid_hl_1".to_string()),
+                client_order_id: None,
+                seq: Some(20_001),
+                side: Side::Buy,
+                price: 100.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                fee_bps: 0.0,
+            }),
+            1_100,
+        );
+
+        let order = state.orders.get("co_hl_1").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.remaining_qty, Some(0.0));
+        assert_eq!(order.last_update_seq, Some(20_001));
         assert!(state.active_orders().is_empty());
     }
 
