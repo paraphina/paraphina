@@ -2495,8 +2495,13 @@ fn build_order_records(
                 }));
             }
             ExecutionEvent::OrderReject(rej) => {
+                let action = if rej.purpose.is_none() && rej.reduce_only.is_none() {
+                    "cancel"
+                } else {
+                    "place"
+                };
                 let action_id = build_order_action_id(
-                    "place",
+                    action,
                     rej.venue_index as i64,
                     None,
                     None,
@@ -2510,7 +2515,7 @@ fn build_order_records(
                     rej.client_order_id.as_deref(),
                 );
                 orders.push(serde_json::json!({
-                    "action": "place",
+                    "action": action,
                     "status": "reject",
                     "venue_index": rej.venue_index as i64,
                     "venue_id": rej.venue_id.as_ref(),
@@ -3880,6 +3885,119 @@ mod tests {
                 assert!(!action_id.contains("raw-"));
             }
         }
+    }
+
+    #[test]
+    fn cancel_reject_telemetry_uses_cancel_action() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let reject = ExecutionEvent::OrderReject(OrderReject {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            order_id: Some("raw-order-cancel-reject".to_string()),
+            client_order_id: None,
+            seq: Some(7),
+            purpose: None,
+            reduce_only: None,
+            reason: "synthetic_cancel_reject".to_string(),
+        });
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms: 1_000,
+            intents: &[],
+            exec_events: &[reject],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: false,
+            execution_mode: "live",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let orders = record
+            .get("orders")
+            .and_then(|value| value.as_array())
+            .expect("orders");
+        let cancel_reject = orders
+            .iter()
+            .find(|order| {
+                order.get("status").and_then(|value| value.as_str()) == Some("reject")
+                    && order.get("reason").and_then(|value| value.as_str())
+                        == Some("synthetic_cancel_reject")
+            })
+            .expect("cancel reject order telemetry");
+        assert_eq!(
+            cancel_reject.get("action").and_then(|value| value.as_str()),
+            Some("cancel")
+        );
+
+        let text = serde_json::to_string(&record).expect("serialize");
+        assert!(!text.contains("raw-order-cancel-reject"));
+    }
+
+    #[test]
+    fn place_reject_telemetry_keeps_place_action() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let reject = ExecutionEvent::OrderReject(OrderReject {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            order_id: Some("raw-order-place-reject".to_string()),
+            client_order_id: Some("raw-client-place-reject".to_string()),
+            seq: Some(8),
+            purpose: Some(OrderPurpose::Hedge),
+            reduce_only: Some(true),
+            reason: "synthetic_place_reject".to_string(),
+        });
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms: 1_000,
+            intents: &[],
+            exec_events: &[reject],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: false,
+            execution_mode: "live",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let orders = record
+            .get("orders")
+            .and_then(|value| value.as_array())
+            .expect("orders");
+        let place_reject = orders
+            .iter()
+            .find(|order| {
+                order.get("status").and_then(|value| value.as_str()) == Some("reject")
+                    && order.get("reason").and_then(|value| value.as_str())
+                        == Some("synthetic_place_reject")
+            })
+            .expect("place reject order telemetry");
+        assert_eq!(
+            place_reject.get("action").and_then(|value| value.as_str()),
+            Some("place")
+        );
+
+        let text = serde_json::to_string(&record).expect("serialize");
+        assert!(!text.contains("raw-order-place-reject"));
+        assert!(!text.contains("raw-client-place-reject"));
     }
 
     #[test]
