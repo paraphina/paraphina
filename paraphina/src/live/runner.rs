@@ -8478,7 +8478,7 @@ async fn run_canary_exit_cancel_all_cleanup(
     let sweep_all_venues = canary_exit_cancel_all_sweep_all_venues_enabled();
     for attempt in 1..=attempts {
         let tracked_open_orders = live_open_order_count_total(state);
-        if tracked_open_orders == 0 && !sweep_all_venues {
+        if tracked_open_orders == 0 {
             eprintln!(
                 "[runner] canary_exit_cancel_all_cleanup clean attempt={} tracked_open_orders=0",
                 attempt
