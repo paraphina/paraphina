@@ -1824,8 +1824,9 @@ async fn send_order_and_wait(
     }
 }
 
-fn phase51_lighter_native_role_strict_canary_validate_order_intents(
+fn phase51_lighter_native_role_strict_canary_validate_order_intents_with_terminal_exit(
     intents: &[OrderIntent],
+    allow_terminal_reduce_only_exit: bool,
 ) -> Result<(), &'static str> {
     if !phase51_lighter_native_role_strict_canary_enabled() {
         return Ok(());
@@ -1840,6 +1841,11 @@ fn phase51_lighter_native_role_strict_canary_validate_order_intents(
         match intent {
             OrderIntent::Place(place) => {
                 place_count += 1;
+                if allow_terminal_reduce_only_exit
+                    && v2_live_canary_ranked_execution_terminal_reduce_only_exit_place(place)
+                {
+                    continue;
+                }
                 if place.venue_id.as_ref() != "lighter" {
                     return Err("non_lighter_place");
                 }
@@ -1882,6 +1888,14 @@ fn phase51_lighter_native_role_strict_canary_validate_order_intents(
         return Err("cancel_and_place_replacement_disabled");
     }
     Ok(())
+}
+
+fn phase51_lighter_native_role_strict_canary_validate_order_intents(
+    intents: &[OrderIntent],
+) -> Result<(), &'static str> {
+    phase51_lighter_native_role_strict_canary_validate_order_intents_with_terminal_exit(
+        intents, false,
+    )
 }
 
 fn v2_live_canary_ranked_execution_allowed_venues_from_env(
@@ -2488,7 +2502,12 @@ async fn send_order_and_wait_with_status(
     OrderWaitOutcomeKind,
     Option<Vec<super::types::ExecutionEvent>>,
 ) {
-    if let Err(reason) = phase51_lighter_native_role_strict_canary_validate_order_intents(&intents)
+    let allow_terminal_reduce_only_exit = label == "canary_exit_position_flatten";
+    if let Err(reason) =
+        phase51_lighter_native_role_strict_canary_validate_order_intents_with_terminal_exit(
+            &intents,
+            allow_terminal_reduce_only_exit,
+        )
     {
         eprintln!(
             "[runner] tick={} phase51_lighter_native_role_strict_canary_blocked_request reason={}",
@@ -2496,7 +2515,6 @@ async fn send_order_and_wait_with_status(
         );
         return (OrderWaitOutcomeKind::HandlerDropped, None);
     }
-    let allow_terminal_reduce_only_exit = label == "canary_exit_position_flatten";
     if let Err(reason) = v2_live_canary_ranked_execution_validate_order_intents(
         &intents,
         allow_terminal_reduce_only_exit,
@@ -2559,7 +2577,10 @@ fn send_order_fire_and_forget(
     label: &str,
     tick: u64,
 ) -> bool {
-    if let Err(reason) = phase51_lighter_native_role_strict_canary_validate_order_intents(&intents)
+    if let Err(reason) =
+        phase51_lighter_native_role_strict_canary_validate_order_intents_with_terminal_exit(
+            &intents, false,
+        )
     {
         eprintln!(
             "[runner] tick={} phase51_lighter_native_role_strict_canary_blocked_request reason={}",
@@ -9344,7 +9365,8 @@ fn build_canary_breach_flatten_intents(
         } else {
             Side::Buy
         };
-        let Some(price) = inventory_brake_unwind_price(cfg, state, venue_index, side) else {
+        let Some(price) = canary_exit_position_flatten_unwind_price(cfg, state, venue_index, side)
+        else {
             continue;
         };
         intents.push(OrderIntent::Place(crate::types::PlaceOrderIntent {
@@ -12351,10 +12373,13 @@ fn evaluate_startup_pnl_baseline(
         return status;
     }
 
-    let fair_value = state.fair_value.unwrap_or(state.fair_value_prev).max(1.0);
+    let fair_value = state
+        .fair_value
+        .filter(|value| value.is_finite() && *value > 0.0);
     let mut pending_venues = Vec::new();
     let mut fresh_account_count = 0usize;
     let mut violating_venues = Vec::new();
+    let mut positioned_without_fair_value = Vec::new();
 
     for (venue_index, venue_cfg) in cfg.venues.iter().enumerate() {
         if required_venue_ids
@@ -12384,6 +12409,11 @@ fn evaluate_startup_pnl_baseline(
         if !fresh {
             continue;
         }
+        if fair_value.is_none() && acct.position_tao.abs() > 1e-12 {
+            positioned_without_fair_value.push(venue_cfg.id.clone());
+            continue;
+        }
+        let fair_value = fair_value.unwrap_or(acct.avg_entry_price.max(1.0));
         let unrealised_pnl_usd = acct.position_tao * (fair_value - acct.avg_entry_price);
         let position_breach = acct.position_tao.abs() > guard_cfg.position_tol_tao;
         if position_breach || unrealised_pnl_usd <= -guard_cfg.pnl_abs_limit_usd {
@@ -12404,6 +12434,18 @@ fn evaluate_startup_pnl_baseline(
     status.violating_venues = violating_venues;
 
     let full_account_coverage = fresh_account_count >= status.required_account_count;
+    if !positioned_without_fair_value.is_empty() {
+        status.waiting_for_accounts = true;
+        status.pending_venues = positioned_without_fair_value;
+        if waited_ticks >= guard_cfg.max_wait_ticks {
+            status.triggered = true;
+            status.timed_out = true;
+            status.reason = Some("awaiting_fair_value_timeout".to_string());
+        } else {
+            status.reason = Some("awaiting_fair_value".to_string());
+        }
+        return status;
+    }
     let partial_account_coverage_timed_out = !guard_cfg.require_full_account_coverage
         && !full_account_coverage
         && waited_ticks >= guard_cfg.max_wait_ticks
@@ -13034,6 +13076,24 @@ fn aggressive_unwind_price(
         Side::Buy => best_ask + cushion,
         Side::Sell => (best_bid - cushion).max(venue_cfg.tick_size.max(1e-9)),
     })
+}
+
+fn canary_exit_position_flatten_unwind_price(
+    cfg: &Config,
+    state: &GlobalState,
+    venue_index: usize,
+    side: Side,
+) -> Option<f64> {
+    let venue_cfg = cfg.venues.get(venue_index)?;
+    let venue = state.venues.get(venue_index)?;
+    let tick_size = venue_cfg.tick_size.max(1e-9);
+    venue
+        .mid
+        .filter(|mid| mid.is_finite() && *mid >= tick_size)?;
+    venue
+        .spread
+        .filter(|spread| spread.is_finite() && *spread > 0.0)?;
+    aggressive_unwind_price(cfg, state, venue_index, side)
 }
 
 fn inventory_brake_slippage_bps_for_venue(venue_id: &str) -> f64 {
@@ -15972,6 +16032,14 @@ mod tests {
         })
     }
 
+    fn seed_terminal_flatten_market(state: &mut GlobalState, venue_indices: &[usize]) {
+        state.fair_value = Some(2_000.0);
+        for &venue_index in venue_indices {
+            state.venues[venue_index].mid = Some(2_000.0);
+            state.venues[venue_index].spread = Some(0.10);
+        }
+    }
+
     fn with_phase51_strict_native_role_canary_env<R>(f: impl FnOnce() -> R) -> R {
         let keys = [
             PHASE51_LIGHTER_NATIVE_ROLE_STRICT_CANARY_ENV,
@@ -16109,6 +16177,35 @@ mod tests {
             assert_eq!(
                 phase51_lighter_native_role_strict_canary_validate_order_intents(&[reduce_only]),
                 Err("reduce_only_place")
+            );
+        });
+    }
+
+    #[test]
+    fn phase51_lighter_native_role_strict_canary_allows_terminal_reduce_only_exit_only_when_explicit(
+    ) {
+        with_phase51_strict_native_role_canary_env(|| {
+            let mut terminal_exit = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut terminal_exit {
+                place.purpose = OrderPurpose::Exit;
+                place.time_in_force = TimeInForce::Ioc;
+                place.post_only = false;
+                place.reduce_only = true;
+                place.phase51_target_key = None;
+            }
+
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents(&[
+                    terminal_exit.clone()
+                ]),
+                Err("non_mm_place")
+            );
+            assert_eq!(
+                phase51_lighter_native_role_strict_canary_validate_order_intents_with_terminal_exit(
+                    &[terminal_exit],
+                    true,
+                ),
+                Ok(())
             );
         });
     }
@@ -26303,6 +26400,64 @@ mod tests {
     }
 
     #[test]
+    fn startup_pnl_baseline_waits_for_fair_value_before_valuing_positions() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 5_000;
+        state.fair_value = None;
+        state.fair_value_prev = 250.0;
+        state.venues[3].position_tao = 0.01;
+        state.venues[3].avg_entry_price = 2_074.51;
+        state.recompute_after_fills(&cfg);
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == 3 { 0.01 } else { 0.0 },
+                    avg_entry_price: if venue_index == 3 { 2_074.51 } else { 0.0 },
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let status = evaluate_startup_pnl_baseline(
+            &cfg,
+            &state,
+            &snapshot,
+            &vec![true; cfg.venues.len()],
+            now_ms,
+            0,
+            StartupPnlBaselineConfig {
+                enabled: true,
+                pnl_abs_limit_usd: 1.0,
+                position_tol_tao: 0.0025,
+                max_wait_ticks: 40,
+                require_full_account_coverage: false,
+            },
+        );
+
+        assert!(status.waiting_for_accounts);
+        assert!(!status.triggered);
+        assert_eq!(status.reason.as_deref(), Some("awaiting_fair_value"));
+        assert_eq!(status.pending_venues, vec!["lighter".to_string()]);
+        assert!(status.violating_venues.is_empty());
+    }
+
+    #[test]
     fn startup_pnl_baseline_passes_clean_flat_state() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -27758,6 +27913,8 @@ mod tests {
         state.venues[lighter].position_tao = -0.01;
         state.venues[paradex].position_tao = 0.02;
         seed_open_orders(&mut state, paradex, 1, 45_000);
+        seed_terminal_flatten_market(&mut state, &[lighter]);
+        seed_terminal_flatten_market(&mut state, &[hyperliquid, lighter]);
 
         let targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0025);
         assert_eq!(targets, vec![hyperliquid, lighter]);
@@ -27803,7 +27960,7 @@ mod tests {
         let lighter = 3;
 
         cfg.venues[lighter].max_order_size = 0.01;
-        state.fair_value = Some(2_000.0);
+        seed_terminal_flatten_market(&mut state, &[lighter]);
         state.venues[lighter].position_tao = -0.02;
 
         let first_targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0025);
@@ -27876,6 +28033,7 @@ mod tests {
         state.venues[lighter].position_tao = -0.01;
         state.venues[paradex].position_tao = 0.02;
         seed_open_orders(&mut state, paradex, 1, 45_000);
+        seed_terminal_flatten_market(&mut state, &[lighter]);
 
         let targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0025);
         assert_eq!(targets, vec![lighter]);
@@ -28266,7 +28424,7 @@ mod tests {
         let hyperliquid = 1;
         let aster = 2;
 
-        state.fair_value = Some(2_000.0);
+        seed_terminal_flatten_market(&mut state, &[hyperliquid, aster]);
         state.venues[hyperliquid].position_tao = 0.02;
         state.venues[aster].position_tao = -0.03;
 
@@ -28295,7 +28453,7 @@ mod tests {
         let lighter = 3;
 
         cfg.venues[lighter].max_order_size = 0.01;
-        state.fair_value = Some(2_000.0);
+        seed_terminal_flatten_market(&mut state, &[lighter]);
         state.venues[lighter].position_tao = 0.024;
 
         let intents = build_canary_breach_flatten_intents(&cfg, &state, &[lighter], 78);
@@ -28311,6 +28469,24 @@ mod tests {
     }
 
     #[test]
+    fn canary_breach_flatten_intents_require_fresh_market_reference() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+
+        state.fair_value = Some(250.0);
+        state.fair_value_prev = 250.0;
+        state.venues[lighter].position_tao = 0.01;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[lighter], 78);
+
+        assert!(
+            intents.is_empty(),
+            "terminal flatten must not send reduce-only IOC from stale/default fair value"
+        );
+    }
+
+    #[test]
     fn canary_breach_flatten_intents_suppress_aster_below_size_step() {
         let mut cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -28318,7 +28494,7 @@ mod tests {
 
         cfg.venues[aster].lot_size_tao = 0.005;
         cfg.venues[aster].size_step_tao = 0.01;
-        state.fair_value = Some(2_000.0);
+        seed_terminal_flatten_market(&mut state, &[aster]);
         state.venues[aster].position_tao = -0.005;
 
         let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
@@ -28335,7 +28511,7 @@ mod tests {
         cfg.venues[aster].lot_size_tao = 0.005;
         cfg.venues[aster].size_step_tao = 0.01;
         cfg.venues[aster].max_order_size = 0.02;
-        state.fair_value = Some(2_000.0);
+        seed_terminal_flatten_market(&mut state, &[aster]);
         state.venues[aster].position_tao = -0.015;
 
         let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
@@ -28359,7 +28535,7 @@ mod tests {
         let hyperliquid = 1;
         let aster = 2;
 
-        state.fair_value = Some(2_000.0);
+        seed_terminal_flatten_market(&mut state, &[hyperliquid, aster]);
         state.venues[hyperliquid].position_tao = 0.02;
         state.venues[hyperliquid].status = VenueStatus::Disabled;
         state.venues[aster].position_tao = 0.0;
@@ -28375,7 +28551,7 @@ mod tests {
         let hyperliquid = 1;
         let aster = 2;
 
-        state.fair_value = Some(2_000.0);
+        seed_terminal_flatten_market(&mut state, &[hyperliquid, aster]);
         state.venues[hyperliquid].position_tao = 0.02;
         state.venues[aster].position_tao = -0.03;
 
