@@ -7225,6 +7225,12 @@ pub async fn run_live_loop(
             cfg,
             &mut state,
             &priority_order_tx,
+            account_reconcile_tx.as_ref(),
+            &mut cache,
+            &audit_dir,
+            &mut last_account_snapshot_ms,
+            &mut account_state_initialized,
+            &mut applied_account_position_baselines,
             &mut phase51_target_key_registry,
             tick.saturating_add(100),
         )
@@ -11814,10 +11820,154 @@ fn mark_canary_exit_position_flatten_incomplete(state: &mut GlobalState) {
     }
 }
 
+struct CanaryExitPositionFlattenAccountTruthApply {
+    fresh_requested_venues: Vec<usize>,
+    position_changed: bool,
+}
+
+fn apply_canary_exit_position_flatten_account_truth_snapshot(
+    cfg: &Config,
+    state: &mut GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    requested_venues: &[usize],
+    now_ms: TimestampMs,
+    account_state_initialized: &mut [bool],
+    applied_account_position_baselines: &mut [Option<f64>],
+) -> CanaryExitPositionFlattenAccountTruthApply {
+    let requested = requested_venues.iter().copied().collect::<HashSet<_>>();
+    let fresh_requested_venues = snapshot
+        .account
+        .iter()
+        .filter_map(|acct| {
+            (requested.contains(&acct.venue_index)
+                && account_cache_snapshot_fresh(
+                    acct,
+                    now_ms,
+                    account_snapshot_max_age_ms_for_venue(cfg, acct.venue_id.as_ref()),
+                ))
+            .then_some(acct.venue_index)
+        })
+        .collect::<Vec<_>>();
+
+    if fresh_requested_venues.is_empty() {
+        return CanaryExitPositionFlattenAccountTruthApply {
+            fresh_requested_venues,
+            position_changed: false,
+        };
+    }
+
+    let account_apply = apply_account_snapshot_to_state(cfg, snapshot, state, now_ms);
+    mark_initialized_account_venues(cfg, snapshot, account_state_initialized, now_ms);
+    update_applied_account_position_baselines(
+        cfg,
+        snapshot,
+        applied_account_position_baselines,
+        now_ms,
+    );
+
+    CanaryExitPositionFlattenAccountTruthApply {
+        fresh_requested_venues,
+        position_changed: account_apply.position_changed,
+    }
+}
+
+async fn refresh_canary_exit_position_flatten_account_truth(
+    cfg: &Config,
+    state: &mut GlobalState,
+    account_tx: Option<&mpsc::Sender<LiveAccountRequest>>,
+    cache: &mut LiveStateCache,
+    audit_dir: &std::path::Path,
+    last_account_snapshot_ms: &mut [Option<TimestampMs>],
+    account_state_initialized: &mut [bool],
+    applied_account_position_baselines: &mut [Option<f64>],
+    venue_indices: &[usize],
+    position_tol_tao: f64,
+    tick: u64,
+    phase: &str,
+) -> bool {
+    let Some(account_tx) = account_tx else {
+        return false;
+    };
+    if venue_indices.is_empty() {
+        return false;
+    }
+
+    let now_ms = now_ms();
+    let mut refreshed_venues = Vec::new();
+    for venue_index in venue_indices.iter().copied() {
+        let Some(venue) = cfg.venues.get(venue_index) else {
+            continue;
+        };
+        let timeout_ms = parse_optional_positive_i64_env(
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ACCOUNT_REFRESH_TIMEOUT_MS",
+        )
+        .unwrap_or(500)
+        .clamp(100, 5_000) as u64;
+        let account_snapshot =
+            send_account_and_wait(account_tx, venue_index, now_ms, timeout_ms, tick).await;
+        let Some(account_snapshot) = account_snapshot else {
+            continue;
+        };
+        if account_snapshot.timestamp_ms > 0 {
+            if let Some(last) = last_account_snapshot_ms.get_mut(account_snapshot.venue_index) {
+                *last = Some(account_snapshot.timestamp_ms);
+            }
+        }
+        let account_available = account_snapshot_available(cfg, &account_snapshot, now_ms);
+        let (report, diff) = cache.reconcile_account_snapshot_with_diff(&account_snapshot);
+        if let Some(diff) = diff {
+            let _ = append_account_reconcile_audit(audit_dir, now_ms, diff);
+        }
+        if report.account_ok && account_available {
+            refreshed_venues.push(venue_index);
+        } else {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh phase={} venue={} account_ok={} account_available={}",
+                phase, venue.id, report.account_ok, account_available
+            );
+        }
+    }
+
+    if refreshed_venues.is_empty() {
+        return false;
+    }
+
+    let refreshed_snapshot = cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
+    let apply = apply_canary_exit_position_flatten_account_truth_snapshot(
+        cfg,
+        state,
+        &refreshed_snapshot,
+        &refreshed_venues,
+        now_ms,
+        account_state_initialized,
+        applied_account_position_baselines,
+    );
+    if apply.fresh_requested_venues.is_empty() {
+        return false;
+    }
+
+    let remaining_venues =
+        canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+    eprintln!(
+        "[runner] canary_exit_position_flatten_cleanup account_refresh_applied phase={} fresh_venues={} position_changed={} remaining_venues={}",
+        phase,
+        venue_ids_for_indices(cfg, &apply.fresh_requested_venues).join(","),
+        apply.position_changed,
+        venue_ids_for_indices(cfg, &remaining_venues).join(",")
+    );
+    true
+}
+
 async fn run_canary_exit_position_flatten_cleanup(
     cfg: &Config,
     state: &mut GlobalState,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    account_tx: Option<&mpsc::Sender<LiveAccountRequest>>,
+    cache: &mut LiveStateCache,
+    audit_dir: &std::path::Path,
+    last_account_snapshot_ms: &mut [Option<TimestampMs>],
+    account_state_initialized: &mut [bool],
+    applied_account_position_baselines: &mut [Option<f64>],
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     tick: u64,
 ) {
@@ -11831,6 +11981,30 @@ async fn run_canary_exit_position_flatten_cleanup(
             eprintln!(
                 "[runner] canary_exit_position_flatten_cleanup clean attempt={} position_tol_tao={:.6}",
                 attempt, position_tol_tao
+            );
+            return;
+        }
+        let _ = refresh_canary_exit_position_flatten_account_truth(
+            cfg,
+            state,
+            account_tx,
+            cache,
+            audit_dir,
+            last_account_snapshot_ms,
+            account_state_initialized,
+            applied_account_position_baselines,
+            &residual_venues,
+            position_tol_tao,
+            tick.saturating_add(attempt as u64),
+            "pre_dispatch",
+        )
+        .await;
+        let residual_venues =
+            canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+        if residual_venues.is_empty() {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup clean_after_account_refresh attempt={}",
+                attempt
             );
             return;
         }
@@ -11918,12 +12092,58 @@ async fn run_canary_exit_position_flatten_cleanup(
             );
             return;
         }
+        let _ = refresh_canary_exit_position_flatten_account_truth(
+            cfg,
+            state,
+            account_tx,
+            cache,
+            audit_dir,
+            last_account_snapshot_ms,
+            account_state_initialized,
+            applied_account_position_baselines,
+            &remaining_venues,
+            position_tol_tao,
+            tick.saturating_add(50).saturating_add(attempt as u64),
+            "post_dispatch",
+        )
+        .await;
+        let remaining_venues =
+            canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+        if remaining_venues.is_empty() {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup clean_after_account_refresh attempt={}",
+                attempt
+            );
+            return;
+        }
         if settle_ms > 0 && attempt < attempts {
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
         }
     }
-    let remaining_venues =
+    let mut remaining_venues =
         canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+    let _ = refresh_canary_exit_position_flatten_account_truth(
+        cfg,
+        state,
+        account_tx,
+        cache,
+        audit_dir,
+        last_account_snapshot_ms,
+        account_state_initialized,
+        applied_account_position_baselines,
+        &remaining_venues,
+        position_tol_tao,
+        tick.saturating_add(500),
+        "final_check",
+    )
+    .await;
+    remaining_venues = canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+    if remaining_venues.is_empty() {
+        eprintln!(
+            "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh"
+        );
+        return;
+    }
     eprintln!(
         "[runner] canary_exit_position_flatten_cleanup incomplete residual_venues={} position_tol_tao={:.6}",
         venue_ids_for_indices(cfg, &remaining_venues).join(","),
@@ -27951,6 +28171,143 @@ mod tests {
             canary_exit_position_flatten_venues(&cfg, &state, 0.0025).is_empty(),
             "open orders must block reduce-only flatten dispatch without hiding residual exposure"
         );
+    }
+
+    fn account_truth_snapshot_for_venue(
+        cfg: &Config,
+        venue_index: usize,
+        position_tao: f64,
+        now_ms: TimestampMs,
+        timestamp_ms: Option<TimestampMs>,
+    ) -> CanonicalCacheSnapshot {
+        CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(index, venue)| VenueAccountSnapshot {
+                    venue_index: index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms,
+                    position_tao: if index == venue_index {
+                        position_tao
+                    } else {
+                        0.0
+                    },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_account_truth_clears_stale_internal_residual() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        let now_ms = 120_000;
+        let mut initialized = vec![false; cfg.venues.len()];
+        let mut baselines = vec![None; cfg.venues.len()];
+
+        state.venues[lighter].position_tao = -0.01;
+        let snapshot = account_truth_snapshot_for_venue(&cfg, lighter, 0.0, now_ms, Some(now_ms));
+        let apply = apply_canary_exit_position_flatten_account_truth_snapshot(
+            &cfg,
+            &mut state,
+            &snapshot,
+            &[lighter],
+            now_ms,
+            &mut initialized,
+            &mut baselines,
+        );
+
+        assert_eq!(apply.fresh_requested_venues, vec![lighter]);
+        assert!(apply.position_changed);
+        assert_eq!(state.venues[lighter].position_tao, 0.0);
+        assert!(
+            canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025).is_empty(),
+            "fresh venue account truth must clear stale internal residual accounting"
+        );
+        assert!(initialized[lighter]);
+        assert_eq!(baselines[lighter], Some(0.0));
+        assert!(!state.kill_switch);
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_account_truth_keeps_fresh_nonflat_residual() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        let now_ms = 120_000;
+        let mut initialized = vec![false; cfg.venues.len()];
+        let mut baselines = vec![None; cfg.venues.len()];
+
+        state.venues[lighter].position_tao = -0.02;
+        let snapshot = account_truth_snapshot_for_venue(&cfg, lighter, -0.01, now_ms, Some(now_ms));
+        let apply = apply_canary_exit_position_flatten_account_truth_snapshot(
+            &cfg,
+            &mut state,
+            &snapshot,
+            &[lighter],
+            now_ms,
+            &mut initialized,
+            &mut baselines,
+        );
+
+        assert_eq!(apply.fresh_requested_venues, vec![lighter]);
+        assert!(apply.position_changed);
+        assert_eq!(state.venues[lighter].position_tao, -0.01);
+        assert_eq!(
+            canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025),
+            vec![lighter],
+            "fresh non-flat venue truth must keep terminal cleanup incomplete/eligible"
+        );
+        assert!(initialized[lighter]);
+        assert_eq!(baselines[lighter], Some(-0.01));
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_account_truth_rejects_stale_snapshot() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        let now_ms = 120_000;
+        let mut initialized = vec![false; cfg.venues.len()];
+        let mut baselines = vec![None; cfg.venues.len()];
+
+        state.venues[lighter].position_tao = -0.01;
+        let snapshot =
+            account_truth_snapshot_for_venue(&cfg, lighter, 0.0, now_ms, Some(now_ms - 60_000));
+        let apply = apply_canary_exit_position_flatten_account_truth_snapshot(
+            &cfg,
+            &mut state,
+            &snapshot,
+            &[lighter],
+            now_ms,
+            &mut initialized,
+            &mut baselines,
+        );
+
+        assert!(apply.fresh_requested_venues.is_empty());
+        assert!(!apply.position_changed);
+        assert_eq!(state.venues[lighter].position_tao, -0.01);
+        assert_eq!(
+            canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025),
+            vec![lighter],
+            "stale venue account truth must not falsely clear terminal residual accounting"
+        );
+        assert!(!initialized[lighter]);
+        assert_eq!(baselines[lighter], None);
     }
 
     #[test]
