@@ -853,7 +853,52 @@ pub fn apply_admission_filter_with_context(
         idx += 1;
         keep
     });
+    suppress_live_canary_venue_coverage_cancel_only_churn(config, &decision, intents);
     Ok(Some(decision))
+}
+
+fn live_canary_venue_coverage_sticky_resting_enabled(
+    config: &V2ShadowConfig,
+    decision: &V2AdmissionDecision,
+) -> bool {
+    matches!(config.decision_mode, V2DecisionMode::LiveCanaryAdmission)
+        && config.live_canary_admission_approved
+        && config.live_canary_venue_coverage_probe_approved
+        && config.live_canary_venue_coverage_sticky_resting
+        && config.live_canary_venue_coverage_probe_venues.len() == 1
+        && decision.gate_state.satisfied()
+        && decision.admitted_candidates.is_empty()
+}
+
+fn live_canary_venue_coverage_cancel_is_allowed(
+    config: &V2ShadowConfig,
+    cancel: &crate::types::CancelOrderIntent,
+) -> bool {
+    config
+        .live_canary_venue_coverage_probe_venues
+        .iter()
+        .any(|venue| venue.as_str() == cancel.venue_id.as_ref())
+}
+
+fn suppress_live_canary_venue_coverage_cancel_only_churn(
+    config: &V2ShadowConfig,
+    decision: &V2AdmissionDecision,
+    intents: &mut Vec<OrderIntent>,
+) {
+    if !live_canary_venue_coverage_sticky_resting_enabled(config, decision) {
+        return;
+    }
+    if intents.len() != 1 {
+        return;
+    }
+    let should_suppress = matches!(
+        intents.first(),
+        Some(OrderIntent::Cancel(cancel))
+            if live_canary_venue_coverage_cancel_is_allowed(config, cancel)
+    );
+    if should_suppress {
+        intents.clear();
+    }
 }
 
 pub fn apply_paper_admission_filter(
@@ -1989,6 +2034,179 @@ mod tests {
         assert!(
             matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "extended")
         );
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_sticky_resting_defaults_disabled() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec!["paradex".to_string()];
+        let context = live_canary_runtime_context();
+        let mut intents = vec![OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index: 3,
+            venue_id: Arc::from("paradex"),
+            order_id: "raw-cancel-order-id-must-not-emit".to_string(),
+        })];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.admission_reason, "no_positive_ranked_candidates");
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert_eq!(intents.len(), 1, "default behavior keeps cancel intents");
+        assert!(!decision.blocker_cleared);
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_sticky_resting_suppresses_allowed_cancel_only_hold() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec!["paradex".to_string()];
+        config.live_canary_venue_coverage_sticky_resting = true;
+        let context = live_canary_runtime_context();
+        let mut intents = vec![OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index: 3,
+            venue_id: Arc::from("paradex"),
+            order_id: "raw-cancel-order-id-must-not-emit".to_string(),
+        })];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.admission_reason, "no_positive_ranked_candidates");
+        assert!(decision.gate_state.satisfied());
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert_eq!(
+            decision.suppressed_mm_order_creating_intent_count, 0,
+            "sticky resting does not change order-creating admission accounting"
+        );
+        assert!(
+            intents.is_empty(),
+            "allowed venue cancel-only churn is suppressed"
+        );
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+
+        let serialized = serde_json::to_string(&decision).expect("serialize");
+        assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_sticky_resting_keeps_paired_cancel_place() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec!["paradex".to_string()];
+        config.live_canary_venue_coverage_sticky_resting = true;
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 3,
+                venue_id: Arc::from("paradex"),
+                order_id: "raw-cancel-order-id-must-not-emit".to_string(),
+            }),
+            mm_place(3, "paradex", Side::Buy, 100.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert_eq!(decision.authority_scope, "live_canary_venue_coverage_probe");
+        assert!(decision.venue_coverage_probe_is_admission);
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(
+            intents.len(),
+            2,
+            "paired cancel plus admitted place remains intact"
+        );
+        assert!(matches!(&intents[0], OrderIntent::Cancel(_)));
+        assert!(
+            matches!(&intents[1], OrderIntent::Place(place) if place.venue_id.as_ref() == "paradex")
+        );
+        assert!(!decision.blocker_cleared);
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_sticky_resting_keeps_mixed_cancel_batches() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec!["paradex".to_string()];
+        config.live_canary_venue_coverage_sticky_resting = true;
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 2,
+                venue_id: Arc::from("aster"),
+                order_id: "raw-aster-cancel-order-id-must-not-emit".to_string(),
+            }),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 3,
+                venue_id: Arc::from("paradex"),
+                order_id: "raw-paradex-cancel-order-id-must-not-emit".to_string(),
+            }),
+            OrderIntent::CancelAll(crate::types::CancelAllOrderIntent {
+                venue_index: Some(3),
+                venue_id: Some(Arc::from("paradex")),
+            }),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert_eq!(
+            intents.len(),
+            3,
+            "mixed cancel and cancel-all batches must bypass sticky suppression"
+        );
+        assert!(
+            matches!(&intents[0], OrderIntent::Cancel(cancel) if cancel.venue_id.as_ref() == "aster")
+        );
+        assert!(
+            matches!(&intents[1], OrderIntent::Cancel(cancel) if cancel.venue_id.as_ref() == "paradex")
+        );
+        assert!(matches!(&intents[2], OrderIntent::CancelAll(_)));
+        assert!(!decision.blocker_cleared);
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_sticky_resting_requires_single_venue_allowlist() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues =
+            vec!["paradex".to_string(), "aster".to_string()];
+        config.live_canary_venue_coverage_sticky_resting = true;
+        let context = live_canary_runtime_context();
+        let mut intents = vec![OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index: 3,
+            venue_id: Arc::from("paradex"),
+            order_id: "raw-paradex-cancel-order-id-must-not-emit".to_string(),
+        })];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert_eq!(
+            intents.len(),
+            1,
+            "multi-venue sticky allowlists must fail closed to existing cancel behavior"
+        );
+        assert!(!decision.blocker_cleared);
     }
 
     #[test]
