@@ -323,6 +323,11 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
                 line,
                 "venue-coverage probe requires non-empty venue allowlist gate",
             )
+            _require(
+                row.get("order_intent_output_count") == 1,
+                line,
+                "venue-coverage probe must output at most one intent per decision",
+            )
         else:
             _require(row.get("venue_coverage_probe_is_admission") is not True, line, "ranked ADMITTED row must not claim venue coverage")
             _require(row.get("ranking_is_admission") is True, line, "ranked ADMITTED row must use ranking as admission")

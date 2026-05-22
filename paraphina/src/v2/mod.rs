@@ -628,7 +628,6 @@ fn select_live_canary_venue_coverage_probe_candidates(
     allowed_venues: &[String],
 ) -> Vec<V2AdmittedCandidate> {
     let mut selected = Vec::new();
-    let mut seen_venues = std::collections::HashSet::new();
     let allowed = allowed_venues
         .iter()
         .map(|venue| venue.as_str())
@@ -646,7 +645,6 @@ fn select_live_canary_venue_coverage_probe_candidates(
             || candidate.price <= 0.0
             || !candidate.size.is_finite()
             || candidate.size <= 0.0
-            || !seen_venues.insert(candidate.venue_id.clone())
         {
             continue;
         }
@@ -661,6 +659,7 @@ fn select_live_canary_venue_coverage_probe_candidates(
             pair_edge_feature_bps: ranking.pair_edge_feature_bps,
             reference_candidate_id: ranking.reference_candidate_id.clone(),
         });
+        break;
     }
     selected
 }
@@ -1873,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_live_canary_venue_coverage_probe_admits_one_target_linked_intent_per_venue() {
+    fn v2_live_canary_venue_coverage_probe_admits_one_target_linked_intent_total() {
         let mut config = live_canary_admission_config();
         config.live_canary_venue_coverage_probe_approved = true;
         config.live_canary_venue_coverage_probe_venues = vec![
@@ -1917,21 +1916,16 @@ mod tests {
         assert!(!decision.pressure_complete_claim);
         assert!(!decision.blocker_cleared);
         assert_eq!(decision.baseline_mm_order_creating_intent_count, 4);
-        assert_eq!(decision.order_intent_output_count, 4);
-        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 0);
-        assert_eq!(decision.admitted_candidates.len(), 4);
-        assert_eq!(intents.len(), 5, "four MM intents plus cancel retained");
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 3);
+        assert_eq!(decision.admitted_candidates.len(), 1);
+        assert_eq!(intents.len(), 2, "one MM intent plus cancel retained");
 
-        let admitted_venues = decision
-            .admitted_candidates
-            .iter()
-            .map(|candidate| candidate.venue_id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(admitted_venues.len(), 4);
-        assert!(admitted_venues.contains("extended"));
-        assert!(admitted_venues.contains("hyperliquid"));
-        assert!(admitted_venues.contains("aster"));
-        assert!(admitted_venues.contains("lighter"));
+        let admitted_venue = decision.admitted_candidates[0].venue_id.as_str();
+        assert!(matches!(
+            admitted_venue,
+            "extended" | "hyperliquid" | "aster" | "lighter"
+        ));
 
         let serialized = serde_json::to_string(&decision).expect("serialize");
         assert!(!serialized.contains("raw-client-id-must-not-emit"));

@@ -344,6 +344,29 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             with self.assertRaises(validator.V2AuthorityValidationError):
                 validator.validate_v2_authority_decisions(evidence)
 
+    def test_rejects_venue_coverage_probe_multiple_outputs_per_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = live_canary_venue_coverage_probe_row()
+            row["baseline_mm_order_creating_intent_count"] = 3
+            row["suppressed_mm_order_creating_intent_count"] = 1
+            row["order_intent_output_count"] = 2
+            row["admitted_candidates"].append(
+                {
+                    "candidate_id": "v2_shadow_intent_v1:1:paradex:buy:1",
+                    "venue_index": 1,
+                    "venue_id": "paradex",
+                    "side": "Buy",
+                    "rank_index": 2,
+                    "rank_score_microusd": 0,
+                    "pair_edge_feature_usd": None,
+                    "pair_edge_feature_bps": None,
+                    "reference_candidate_id": None,
+                }
+            )
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
     def test_rejects_multiple_order_path_probe_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             evidence = write_rows(
