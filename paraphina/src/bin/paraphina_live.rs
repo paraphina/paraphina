@@ -3003,6 +3003,16 @@ send_block_gt_5ms={} send_block_gt_50ms={} send_block_gt_250ms={} emit_since_ms=
                         }
                     }
                     let lighter_arc = Arc::new(lighter);
+                    register_lighter_account_refresh_handler_if_available(
+                        &mut account_refresh_handlers,
+                        trade_mode.trade_mode,
+                        lighter_cfg.paper_mode,
+                        use_fixture,
+                        lighter_cfg.has_auth(),
+                        lighter_arc.clone(),
+                        venue_id.clone(),
+                        venue_index,
+                    );
                     if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
                         if use_fixture {
                             eprintln!("paraphina_live | exec_disabled=true reason=lighter_fixture_mode connector=lighter");
@@ -4938,6 +4948,32 @@ fn register_account_refresh_handler(
     }
 }
 
+#[cfg(feature = "live_lighter")]
+fn register_lighter_account_refresh_handler_if_available(
+    handlers: &mut HashMap<usize, AccountRefreshHandler>,
+    trade_mode: TradeMode,
+    paper_mode: bool,
+    use_fixture: bool,
+    has_auth: bool,
+    client: Arc<paraphina::live::connectors::lighter::LighterConnector>,
+    venue_id: String,
+    venue_index: usize,
+) {
+    if trade_mode == TradeMode::Shadow || paper_mode || use_fixture || !has_auth {
+        return;
+    }
+    register_account_refresh_handler(
+        handlers,
+        "lighter",
+        venue_id,
+        venue_index,
+        Arc::new(move || {
+            let client = client.clone();
+            Box::pin(async move { client.fetch_account_snapshot_once().await })
+        }),
+    );
+}
+
 fn spawn_account_refresh_router(
     mut request_rx: mpsc::Receiver<LiveAccountRequest>,
     handlers: HashMap<usize, AccountRefreshHandler>,
@@ -5027,6 +5063,8 @@ fn write_summary(
 #[cfg(test)]
 mod tests {
     use super::register_account_refresh_handler;
+    #[cfg(feature = "live_lighter")]
+    use super::register_lighter_account_refresh_handler_if_available;
     use super::{
         coalesce_fire_and_forget_request, coalesce_hyperliquid_fire_and_forget_request,
         connector_market_channel_cap, dedup_hyperliquid_mm_same_side_places, market_channel_cap,
@@ -5152,6 +5190,71 @@ mod tests {
         assert_eq!(snapshot.venue_index, 2);
         assert_eq!(snapshot.venue_id, "extended");
         assert_eq!(snapshot.positions[0].size, 0.01);
+    }
+
+    #[cfg(feature = "live_lighter")]
+    fn test_lighter_connector_for_account_refresh(
+    ) -> Arc<paraphina::live::connectors::lighter::LighterConnector> {
+        let cfg = paraphina::live::connectors::lighter::LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: "https://example.invalid".to_string(),
+            market: "ETH-USD".to_string(),
+            venue_id: "lighter".to_string(),
+            venue_index: 3,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("redacted".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        Arc::new(paraphina::live::connectors::lighter::LighterConnector::new(
+            cfg, market_tx, exec_tx,
+        ))
+    }
+
+    #[cfg(feature = "live_lighter")]
+    #[tokio::test]
+    async fn lighter_account_refresh_handler_registers_only_for_live_authenticated_runtime() {
+        let mut handlers = HashMap::new();
+        register_lighter_account_refresh_handler_if_available(
+            &mut handlers,
+            TradeMode::Live,
+            false,
+            false,
+            true,
+            test_lighter_connector_for_account_refresh(),
+            "lighter".to_string(),
+            3,
+        );
+        assert!(handlers.contains_key(&3));
+
+        for (trade_mode, paper_mode, use_fixture, has_auth) in [
+            (TradeMode::Shadow, false, false, true),
+            (TradeMode::Live, true, false, true),
+            (TradeMode::Live, false, true, true),
+            (TradeMode::Live, false, false, false),
+        ] {
+            let mut blocked = HashMap::new();
+            register_lighter_account_refresh_handler_if_available(
+                &mut blocked,
+                trade_mode,
+                paper_mode,
+                use_fixture,
+                has_auth,
+                test_lighter_connector_for_account_refresh(),
+                "lighter".to_string(),
+                3,
+            );
+            assert!(
+                !blocked.contains_key(&3),
+                "unexpected lighter refresh handler for {:?} paper={paper_mode} fixture={use_fixture} auth={has_auth}",
+                trade_mode
+            );
+        }
     }
 
     #[test]

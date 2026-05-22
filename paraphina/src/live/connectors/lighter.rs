@@ -1348,6 +1348,15 @@ impl LighterConnector {
         self.cfg.has_signer()
     }
 
+    pub async fn fetch_account_snapshot_once(
+        &self,
+    ) -> super::super::gateway::LiveResult<AccountSnapshot> {
+        match fetch_account_snapshot(&self.http, &self.cfg).await {
+            Ok(AccountEvent::Snapshot(snapshot)) => Ok(snapshot),
+            Err(err) => Err(lighter_account_snapshot_gateway_error(&err.to_string())),
+        }
+    }
+
     fn next_nonce(&self) -> u64 {
         let now_ms = now_ms();
         let nonce = self.nonce.next(now_ms);
@@ -2194,6 +2203,7 @@ impl LighterConnector {
                 }
                 Err(err) => {
                     let err_text = err.to_string();
+                    let sanitized_reason = lighter_account_snapshot_error_reason(&err_text);
                     if err_text.contains("http 429") {
                         rate_limit_backoff_ms = if rate_limit_backoff_ms == 0 {
                             interval_ms.max(LIGHTER_ACCOUNT_RATE_LIMIT_BASE_BACKOFF_MS)
@@ -2204,7 +2214,11 @@ impl LighterConnector {
                     } else {
                         rate_limit_backoff_ms = 0;
                     }
-                    maybe_log_lighter_account_error(&err_text, interval_ms, rate_limit_backoff_ms);
+                    maybe_log_lighter_account_error(
+                        sanitized_reason,
+                        interval_ms,
+                        rate_limit_backoff_ms,
+                    );
                 }
             }
         }
@@ -3955,6 +3969,50 @@ mod tests {
                 assert_ne!(snapshot.timestamp_ms, 1_700_000_000_123i64);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn lighter_fetch_account_snapshot_once_sanitizes_http_error_body() {
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/api/v1/account")
+                    .query_param("by", "index")
+                    .query_param("value", "123");
+                then.status(500).body("raw-account-payload-secret");
+            })
+            .await;
+
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: server.base_url(),
+            market: "ETH-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 3,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: None,
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+
+        let err = connector
+            .fetch_account_snapshot_once()
+            .await
+            .expect_err("http error should be sanitized");
+        assert_eq!(err.kind, LiveGatewayErrorKind::Retryable);
+        assert_eq!(
+            err.message,
+            "lighter account snapshot error reason=http_error"
+        );
+        assert!(!err.message.contains("raw-account-payload-secret"));
+        assert!(!err.message.contains("123"));
     }
 
     #[tokio::test]
@@ -6903,7 +6961,7 @@ async fn fetch_account_snapshot(
     let status = resp.status();
     let body = resp.text().await?;
     if !status.is_success() {
-        anyhow::bail!("lighter account snapshot http {}: {}", status, body);
+        anyhow::bail!("lighter account snapshot http {}", status);
     }
     let value: serde_json::Value = serde_json::from_str(&body)?;
     let mut snapshot = parse_account_snapshot_with_meta(&value, &cfg.venue_id, cfg.venue_index)
@@ -6920,6 +6978,33 @@ async fn fetch_account_snapshot(
     snapshot.timestamp_ms = now_timestamp_ms_nonzero();
     maybe_log_lighter_account_snapshot(&snapshot, &value);
     Ok(AccountEvent::Snapshot(snapshot))
+}
+
+fn lighter_account_snapshot_error_reason(err: &str) -> &'static str {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("missing auth") {
+        "missing_auth"
+    } else if lower.contains("http 429") {
+        "rate_limited"
+    } else if lower.contains("http") {
+        "http_error"
+    } else if lower.contains("invalid account snapshot") {
+        "invalid_snapshot"
+    } else if lower.contains("json") || lower.contains("parse") || lower.contains("expected") {
+        "parse_error"
+    } else {
+        "request_error"
+    }
+}
+
+fn lighter_account_snapshot_gateway_error(err: &str) -> LiveGatewayError {
+    let reason = lighter_account_snapshot_error_reason(err);
+    let message = format!("lighter account snapshot error reason={reason}");
+    match reason {
+        "missing_auth" => LiveGatewayError::fatal(message),
+        "rate_limited" => LiveGatewayError::rate_limited(message),
+        _ => LiveGatewayError::retryable(message),
+    }
 }
 
 /// Rate-limit log state for funding fetch errors.
