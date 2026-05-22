@@ -6878,6 +6878,29 @@ pub async fn run_live_loop(
         )
         .await;
     }
+    if canary_exit_position_flatten_enabled(canary_enabled && trade_mode == "live") {
+        run_canary_exit_position_flatten_cleanup(
+            cfg,
+            &mut state,
+            &priority_order_tx,
+            &mut phase51_target_key_registry,
+            tick.saturating_add(100),
+        )
+        .await;
+        if canary_exit_cancel_all_enabled(canary_enabled && trade_mode == "live") {
+            run_canary_exit_cancel_all_cleanup(
+                cfg,
+                &mut state,
+                &priority_order_tx,
+                &mut phase51_target_key_registry,
+                &mut deduper,
+                order_snapshot_fill_inference_enabled,
+                &mut order_state_initialized,
+                tick.saturating_add(200),
+            )
+            .await;
+        }
+    }
 
     if let Some(hooks) = hooks.as_ref() {
         hooks.health.set_ready(hooks.health.is_ready());
@@ -11332,6 +11355,94 @@ fn canary_exit_cancel_all_timeout_ms(venue_count: usize) -> u64 {
         .map(|value| value as u64)
         .unwrap_or_else(|| kill_cancel_all_timeout_ms(venue_count))
         .clamp(1_000, 30_000)
+}
+
+fn canary_exit_position_flatten_enabled(canary_live_enabled: bool) -> bool {
+    canary_live_enabled
+        && parse_bool_env_default("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED", false)
+}
+
+fn canary_exit_position_flatten_tol_tao() -> f64 {
+    parse_optional_positive_f64_env("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TOL_TAO")
+        .unwrap_or(0.0025)
+        .clamp(0.0001, 0.01)
+}
+
+fn canary_exit_position_flatten_venues(
+    cfg: &Config,
+    state: &GlobalState,
+    position_tol_tao: f64,
+) -> Vec<usize> {
+    cfg.venues
+        .iter()
+        .enumerate()
+        .filter_map(|(venue_index, _)| {
+            let venue = state.venues.get(venue_index)?;
+            if venue.status != VenueStatus::Healthy {
+                return None;
+            }
+            if live_open_order_count_for_venue(state, venue_index) != 0 {
+                return None;
+            }
+            (venue.position_tao.is_finite() && venue.position_tao.abs() > position_tol_tao + 1e-9)
+                .then_some(venue_index)
+        })
+        .collect()
+}
+
+async fn run_canary_exit_position_flatten_cleanup(
+    cfg: &Config,
+    state: &mut GlobalState,
+    priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
+    phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
+    tick: u64,
+) {
+    let position_tol_tao = canary_exit_position_flatten_tol_tao();
+    let target_venues = canary_exit_position_flatten_venues(cfg, state, position_tol_tao);
+    if target_venues.is_empty() {
+        eprintln!(
+            "[runner] canary_exit_position_flatten_cleanup clean position_tol_tao={:.6}",
+            position_tol_tao
+        );
+        return;
+    }
+    eprintln!(
+        "[runner] canary_exit_position_flatten_cleanup attempt target_venues={} position_tol_tao={:.6}",
+        venue_ids_for_indices(cfg, &target_venues).join(","),
+        position_tol_tao
+    );
+    let now_ms = now_ms();
+    let flatten_intents = build_canary_breach_flatten_intents(cfg, state, &target_venues, tick);
+    if flatten_intents.is_empty() {
+        eprintln!(
+            "[runner] canary_exit_position_flatten_cleanup no_flatten_intents target_venues={}",
+            venue_ids_for_indices(cfg, &target_venues).join(",")
+        );
+        return;
+    }
+    let mut would_send_intents = Vec::new();
+    let mut last_exit_intent = None;
+    let dispatch = dispatch_canary_breach_flatten_intents_sync_wait(
+        cfg,
+        state,
+        priority_order_tx,
+        phase51_target_key_registry,
+        flatten_intents,
+        now_ms,
+        tick.saturating_mul(32).saturating_add(63),
+        tick,
+        "canary_exit_position_flatten",
+        None,
+        &mut would_send_intents,
+        &mut last_exit_intent,
+    )
+    .await;
+    eprintln!(
+        "[runner] canary_exit_position_flatten_cleanup dispatched submitted={} submitted_venues={} accepted_venues={}",
+        dispatch.submitted,
+        venue_ids_for_indices(cfg, &dispatch.submitted_venues).join(","),
+        venue_ids_for_indices(cfg, &dispatch.accepted_venues).join(",")
+    );
 }
 
 fn canary_exit_cancel_all_sweep_all_venues_enabled() -> bool {
@@ -26426,6 +26537,8 @@ mod tests {
             "PARAPHINA_CANARY_EXIT_CANCEL_ALL_SETTLE_MS",
             "PARAPHINA_CANARY_EXIT_CANCEL_ALL_TIMEOUT_MS",
             "PARAPHINA_CANARY_EXIT_CANCEL_ALL_SWEEP_ALL_VENUES",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TOL_TAO",
         ]);
 
         std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED");
@@ -26455,6 +26568,16 @@ mod tests {
         assert_eq!(canary_exit_cancel_all_timeout_ms(5), 30_000);
         std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_TIMEOUT_MS", "250");
         assert_eq!(canary_exit_cancel_all_timeout_ms(5), 1_000);
+
+        std::env::remove_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED");
+        assert!(!canary_exit_position_flatten_enabled(true));
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED", "true");
+        assert!(canary_exit_position_flatten_enabled(true));
+        assert!(!canary_exit_position_flatten_enabled(false));
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TOL_TAO", "0.001");
+        assert_eq!(canary_exit_position_flatten_tol_tao(), 0.001);
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TOL_TAO", "0.1");
+        assert_eq!(canary_exit_position_flatten_tol_tao(), 0.01);
     }
 
     #[test]
@@ -26508,6 +26631,39 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_targets_only_flat_order_residual_positions() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = 0;
+        let hyperliquid = 1;
+        let lighter = 3;
+        let paradex = 4;
+
+        state.venues[extended].position_tao = 0.001;
+        state.venues[hyperliquid].position_tao = 0.02;
+        state.venues[lighter].position_tao = -0.01;
+        state.venues[paradex].position_tao = 0.02;
+        seed_open_orders(&mut state, paradex, 1, 45_000);
+
+        let targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0025);
+        assert_eq!(targets, vec![hyperliquid, lighter]);
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &targets, 91);
+        assert_eq!(intents.len(), 2);
+        assert!(intents.iter().all(|intent| {
+            matches!(
+                intent,
+                OrderIntent::Place(place)
+                    if place.time_in_force == TimeInForce::Ioc
+                        && !place.post_only
+                        && place.reduce_only
+                        && place.purpose == OrderPurpose::Exit
+                        && place.phase51_target_key.is_none()
+            )
+        }));
     }
 
     #[test]
