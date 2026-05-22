@@ -11420,28 +11420,50 @@ async fn run_canary_exit_position_flatten_cleanup(
         );
         return;
     }
-    let mut would_send_intents = Vec::new();
-    let mut last_exit_intent = None;
-    let dispatch = dispatch_canary_breach_flatten_intents_sync_wait(
+    let mut flatten_intents = flatten_intents;
+    normalize_live_client_order_ids(&mut flatten_intents, tick);
+    let submitted_venues = venue_indices_for_order_intents(&flatten_intents);
+    let action_batch = build_live_action_batch(
         cfg,
-        state,
+        &flatten_intents,
+        now_ms,
+        tick.saturating_mul(32).saturating_add(63),
+    );
+    let (outcome, events) = send_order_and_wait_with_status(
         priority_order_tx,
         phase51_target_key_registry,
         flatten_intents,
+        action_batch,
         now_ms,
-        tick.saturating_mul(32).saturating_add(63),
-        tick,
+        KILL_FLATTEN_TIMEOUT_MS,
+        TransportHint::Default,
         "canary_exit_position_flatten",
-        None,
-        &mut would_send_intents,
-        &mut last_exit_intent,
+        tick,
     )
     .await;
+    let submitted = !matches!(outcome, OrderWaitOutcomeKind::ChannelFull);
+    let mut accepted_venues = Vec::new();
+    if let Some(events) = events {
+        for event in &events {
+            if let super::types::ExecutionEvent::OrderAccepted(ack) = event {
+                if !accepted_venues.contains(&ack.venue_index) {
+                    accepted_venues.push(ack.venue_index);
+                }
+            }
+        }
+        let core_events = live_events_to_core(&events);
+        let fills = apply_execution_events(state, &core_events, now_ms);
+        if !fills.is_empty() {
+            apply_live_fills(cfg, state, &fills, now_ms);
+            state.recompute_after_fills(cfg);
+        }
+    }
     eprintln!(
-        "[runner] canary_exit_position_flatten_cleanup dispatched submitted={} submitted_venues={} accepted_venues={}",
-        dispatch.submitted,
-        venue_ids_for_indices(cfg, &dispatch.submitted_venues).join(","),
-        venue_ids_for_indices(cfg, &dispatch.accepted_venues).join(",")
+        "[runner] canary_exit_position_flatten_cleanup dispatched outcome={:?} submitted={} submitted_venues={} accepted_venues={}",
+        outcome,
+        submitted,
+        venue_ids_for_indices(cfg, &submitted_venues).join(","),
+        venue_ids_for_indices(cfg, &accepted_venues).join(",")
     );
 }
 
