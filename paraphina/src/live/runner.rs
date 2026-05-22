@@ -11719,6 +11719,43 @@ fn canary_exit_position_flatten_tol_tao() -> f64 {
         .clamp(0.0001, 0.01)
 }
 
+fn canary_exit_position_flatten_attempts() -> u32 {
+    parse_optional_positive_i64_env("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS")
+        .map(|value| value as u32)
+        .unwrap_or(3)
+        .clamp(1, 5)
+}
+
+fn canary_exit_position_flatten_settle_ms() -> u64 {
+    parse_optional_positive_i64_env("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS")
+        .map(|value| value as u64)
+        .unwrap_or(1_000)
+        .clamp(0, 10_000)
+}
+
+fn canary_exit_position_flatten_residual_venues(
+    cfg: &Config,
+    state: &GlobalState,
+    position_tol_tao: f64,
+) -> Vec<usize> {
+    let ranked_execution_venues = v2_live_canary_ranked_execution_allowed_venue_indices(cfg);
+    cfg.venues
+        .iter()
+        .enumerate()
+        .filter_map(|(venue_index, _)| {
+            if ranked_execution_venues
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&venue_index))
+            {
+                return None;
+            }
+            let venue = state.venues.get(venue_index)?;
+            (venue.position_tao.is_finite() && venue.position_tao.abs() > position_tol_tao + 1e-9)
+                .then_some(venue_index)
+        })
+        .collect()
+}
+
 fn canary_exit_position_flatten_venues(
     cfg: &Config,
     state: &GlobalState,
@@ -11748,6 +11785,13 @@ fn canary_exit_position_flatten_venues(
         .collect()
 }
 
+fn mark_canary_exit_position_flatten_incomplete(state: &mut GlobalState) {
+    state.kill_switch = true;
+    if state.kill_reason == crate::state::KillReason::None {
+        state.kill_reason = crate::state::KillReason::CanaryLimitBreach;
+    }
+}
+
 async fn run_canary_exit_position_flatten_cleanup(
     cfg: &Config,
     state: &mut GlobalState,
@@ -11756,73 +11800,114 @@ async fn run_canary_exit_position_flatten_cleanup(
     tick: u64,
 ) {
     let position_tol_tao = canary_exit_position_flatten_tol_tao();
-    let target_venues = canary_exit_position_flatten_venues(cfg, state, position_tol_tao);
-    if target_venues.is_empty() {
-        eprintln!(
-            "[runner] canary_exit_position_flatten_cleanup clean position_tol_tao={:.6}",
-            position_tol_tao
-        );
-        return;
-    }
-    eprintln!(
-        "[runner] canary_exit_position_flatten_cleanup attempt target_venues={} position_tol_tao={:.6}",
-        venue_ids_for_indices(cfg, &target_venues).join(","),
-        position_tol_tao
-    );
-    let now_ms = now_ms();
-    let flatten_intents = build_canary_breach_flatten_intents(cfg, state, &target_venues, tick);
-    if flatten_intents.is_empty() {
-        eprintln!(
-            "[runner] canary_exit_position_flatten_cleanup no_flatten_intents target_venues={}",
-            venue_ids_for_indices(cfg, &target_venues).join(",")
-        );
-        return;
-    }
-    let mut flatten_intents = flatten_intents;
-    normalize_live_client_order_ids(&mut flatten_intents, tick);
-    let submitted_venues = venue_indices_for_order_intents(&flatten_intents);
-    let action_batch = build_live_action_batch(
-        cfg,
-        &flatten_intents,
-        now_ms,
-        tick.saturating_mul(32).saturating_add(63),
-    );
-    let (outcome, events) = send_order_and_wait_with_status(
-        priority_order_tx,
-        phase51_target_key_registry,
-        flatten_intents,
-        action_batch,
-        now_ms,
-        KILL_FLATTEN_TIMEOUT_MS,
-        TransportHint::Default,
-        "canary_exit_position_flatten",
-        tick,
-    )
-    .await;
-    let submitted = !matches!(outcome, OrderWaitOutcomeKind::ChannelFull);
-    let mut accepted_venues = Vec::new();
-    if let Some(events) = events {
-        for event in &events {
-            if let super::types::ExecutionEvent::OrderAccepted(ack) = event {
-                if !accepted_venues.contains(&ack.venue_index) {
-                    accepted_venues.push(ack.venue_index);
+    let attempts = canary_exit_position_flatten_attempts();
+    let settle_ms = canary_exit_position_flatten_settle_ms();
+    for attempt in 1..=attempts {
+        let residual_venues =
+            canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+        if residual_venues.is_empty() {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup clean attempt={} position_tol_tao={:.6}",
+                attempt, position_tol_tao
+            );
+            return;
+        }
+        let target_venues = canary_exit_position_flatten_venues(cfg, state, position_tol_tao);
+        if target_venues.is_empty() {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup blocked attempt={} residual_venues={} position_tol_tao={:.6}",
+                attempt,
+                venue_ids_for_indices(cfg, &residual_venues).join(","),
+                position_tol_tao
+            );
+        } else {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup attempt={} target_venues={} residual_venues={} position_tol_tao={:.6}",
+                attempt,
+                venue_ids_for_indices(cfg, &target_venues).join(","),
+                venue_ids_for_indices(cfg, &residual_venues).join(","),
+                position_tol_tao
+            );
+            let dispatch_tick = tick.saturating_add(attempt as u64);
+            let now_ms = now_ms();
+            let flatten_intents =
+                build_canary_breach_flatten_intents(cfg, state, &target_venues, dispatch_tick);
+            if flatten_intents.is_empty() {
+                eprintln!(
+                    "[runner] canary_exit_position_flatten_cleanup no_flatten_intents attempt={} target_venues={}",
+                    attempt,
+                    venue_ids_for_indices(cfg, &target_venues).join(",")
+                );
+            } else {
+                let mut flatten_intents = flatten_intents;
+                normalize_live_client_order_ids(&mut flatten_intents, dispatch_tick);
+                let submitted_venues = venue_indices_for_order_intents(&flatten_intents);
+                let action_batch = build_live_action_batch(
+                    cfg,
+                    &flatten_intents,
+                    now_ms,
+                    dispatch_tick.saturating_mul(32).saturating_add(63),
+                );
+                let (outcome, events) = send_order_and_wait_with_status(
+                    priority_order_tx,
+                    phase51_target_key_registry,
+                    flatten_intents,
+                    action_batch,
+                    now_ms,
+                    KILL_FLATTEN_TIMEOUT_MS,
+                    TransportHint::Default,
+                    "canary_exit_position_flatten",
+                    dispatch_tick,
+                )
+                .await;
+                let submitted = !matches!(outcome, OrderWaitOutcomeKind::ChannelFull);
+                let mut accepted_venues = Vec::new();
+                if let Some(events) = events {
+                    for event in &events {
+                        if let super::types::ExecutionEvent::OrderAccepted(ack) = event {
+                            if !accepted_venues.contains(&ack.venue_index) {
+                                accepted_venues.push(ack.venue_index);
+                            }
+                        }
+                    }
+                    let core_events = live_events_to_core(&events);
+                    let fills = apply_execution_events(state, &core_events, now_ms);
+                    if !fills.is_empty() {
+                        apply_live_fills(cfg, state, &fills, now_ms);
+                        state.recompute_after_fills(cfg);
+                    }
                 }
+                eprintln!(
+                    "[runner] canary_exit_position_flatten_cleanup dispatched attempt={} outcome={:?} submitted={} submitted_venues={} accepted_venues={}",
+                    attempt,
+                    outcome,
+                    submitted,
+                    venue_ids_for_indices(cfg, &submitted_venues).join(","),
+                    venue_ids_for_indices(cfg, &accepted_venues).join(",")
+                );
             }
         }
-        let core_events = live_events_to_core(&events);
-        let fills = apply_execution_events(state, &core_events, now_ms);
-        if !fills.is_empty() {
-            apply_live_fills(cfg, state, &fills, now_ms);
-            state.recompute_after_fills(cfg);
+        let remaining_venues =
+            canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+        if remaining_venues.is_empty() {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup clean_after_dispatch attempt={}",
+                attempt
+            );
+            return;
+        }
+        if settle_ms > 0 && attempt < attempts {
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
         }
     }
+    let remaining_venues =
+        canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
     eprintln!(
-        "[runner] canary_exit_position_flatten_cleanup dispatched outcome={:?} submitted={} submitted_venues={} accepted_venues={}",
-        outcome,
-        submitted,
-        venue_ids_for_indices(cfg, &submitted_venues).join(","),
-        venue_ids_for_indices(cfg, &accepted_venues).join(",")
+        "[runner] canary_exit_position_flatten_cleanup incomplete residual_venues={} position_tol_tao={:.6}",
+        venue_ids_for_indices(cfg, &remaining_venues).join(","),
+        position_tol_tao
     );
+    mark_canary_exit_position_flatten_incomplete(state);
 }
 
 fn canary_exit_cancel_all_sweep_all_venues_enabled() -> bool {
@@ -27522,6 +27607,8 @@ mod tests {
             "PARAPHINA_CANARY_EXIT_CANCEL_ALL_SWEEP_ALL_VENUES",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TOL_TAO",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS",
         ]);
 
         std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED");
@@ -27561,6 +27648,16 @@ mod tests {
         assert_eq!(canary_exit_position_flatten_tol_tao(), 0.001);
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TOL_TAO", "0.1");
         assert_eq!(canary_exit_position_flatten_tol_tao(), 0.01);
+        assert_eq!(canary_exit_position_flatten_attempts(), 3);
+        assert_eq!(canary_exit_position_flatten_settle_ms(), 1_000);
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "0");
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS", "20000");
+        assert_eq!(canary_exit_position_flatten_attempts(), 3);
+        assert_eq!(canary_exit_position_flatten_settle_ms(), 10_000);
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "9");
+        assert_eq!(canary_exit_position_flatten_attempts(), 5);
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "1");
+        assert_eq!(canary_exit_position_flatten_attempts(), 1);
     }
 
     #[test]
@@ -27678,6 +27775,90 @@ mod tests {
                         && place.phase51_target_key.is_none()
             )
         }));
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_residuals_survive_open_order_blocking() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+
+        state.venues[lighter].position_tao = -0.01;
+        seed_open_orders(&mut state, lighter, 1, 45_000);
+
+        assert_eq!(
+            canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025),
+            vec![lighter]
+        );
+        assert!(
+            canary_exit_position_flatten_venues(&cfg, &state, 0.0025).is_empty(),
+            "open orders must block reduce-only flatten dispatch without hiding residual exposure"
+        );
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_recomputes_after_partial_flatten() {
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+
+        cfg.venues[lighter].max_order_size = 0.01;
+        state.fair_value = Some(2_000.0);
+        state.venues[lighter].position_tao = -0.02;
+
+        let first_targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0025);
+        assert_eq!(first_targets, vec![lighter]);
+        let first_intents = build_canary_breach_flatten_intents(&cfg, &state, &first_targets, 91);
+        assert_eq!(first_intents.len(), 1);
+        assert!(matches!(
+            &first_intents[0],
+            OrderIntent::Place(place)
+                if place.venue_index == lighter
+                    && place.side == Side::Buy
+                    && place.reduce_only
+                    && (place.size - 0.01).abs() < 1e-12
+        ));
+
+        state.venues[lighter].position_tao = -0.01;
+        assert_eq!(
+            canary_exit_position_flatten_venues(&cfg, &state, 0.0025),
+            vec![lighter],
+            "a partial reduce-only fill must keep the venue eligible for a bounded retry"
+        );
+
+        state.venues[lighter].position_tao = 0.0;
+        assert!(canary_exit_position_flatten_venues(&cfg, &state, 0.0025).is_empty());
+        assert!(canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025).is_empty());
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_incomplete_latches_canary_breach() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        mark_canary_exit_position_flatten_incomplete(&mut state);
+
+        assert!(state.kill_switch);
+        assert_eq!(
+            state.kill_reason,
+            crate::state::KillReason::CanaryLimitBreach
+        );
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_incomplete_preserves_existing_kill_reason() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        state.kill_switch = true;
+        state.kill_reason = crate::state::KillReason::ReconciliationDrift;
+
+        mark_canary_exit_position_flatten_incomplete(&mut state);
+
+        assert!(state.kill_switch);
+        assert_eq!(
+            state.kill_reason,
+            crate::state::KillReason::ReconciliationDrift
+        );
     }
 
     #[test]
