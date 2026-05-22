@@ -1884,39 +1884,75 @@ fn phase51_lighter_native_role_strict_canary_validate_order_intents(
     Ok(())
 }
 
-fn v2_live_canary_ranked_execution_allowed_venues_from_env() -> Option<Vec<String>> {
-    let decision_mode = std::env::var(V2_DECISION_MODE_ENV).ok()?;
+fn v2_live_canary_ranked_execution_allowed_venues_from_env(
+) -> Result<Option<Vec<String>>, &'static str> {
+    let decision_mode = match std::env::var(V2_DECISION_MODE_ENV) {
+        Ok(decision_mode) => decision_mode,
+        Err(_) => return Ok(None),
+    };
     if !decision_mode
         .trim()
         .eq_ignore_ascii_case("live_canary_admission")
     {
-        return None;
-    }
-    if !phase51_true_env(V2_LIVE_CANARY_ADMISSION_APPROVED_ENV) {
-        return None;
+        return Ok(None);
     }
     let venues = std::env::var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV)
-        .ok()?
+        .map_err(|_| "v2_ranked_execution_allowlist_missing")?
         .split(',')
         .map(|venue| venue.trim().to_ascii_lowercase())
         .filter(|venue| !venue.is_empty())
         .collect::<Vec<_>>();
-    (!venues.is_empty()).then_some(venues)
+    if venues.is_empty() {
+        return Err("v2_ranked_execution_allowlist_empty");
+    }
+    Ok(Some(venues))
+}
+
+fn v2_live_canary_ranked_execution_known_venue_id(venue_index: usize) -> Option<&'static str> {
+    match venue_index {
+        0 => Some("extended"),
+        1 => Some("hyperliquid"),
+        2 => Some("aster"),
+        3 => Some("lighter"),
+        4 => Some("paradex"),
+        _ => None,
+    }
+}
+
+fn v2_live_canary_ranked_execution_validate_venue(
+    allowed_venues: &[String],
+    venue_id: &str,
+    venue_index: usize,
+    non_execution_reason: &'static str,
+    venue_index_reason: &'static str,
+) -> Result<(), &'static str> {
+    let normalized = venue_id.to_ascii_lowercase();
+    if !allowed_venues.iter().any(|venue| venue == &normalized) {
+        return Err(non_execution_reason);
+    }
+    match v2_live_canary_ranked_execution_known_venue_id(venue_index) {
+        Some(index_venue) if index_venue == normalized => Ok(()),
+        _ => Err(venue_index_reason),
+    }
 }
 
 fn v2_live_canary_ranked_execution_validate_order_intents(
     intents: &[OrderIntent],
 ) -> Result<(), &'static str> {
-    let Some(allowed_venues) = v2_live_canary_ranked_execution_allowed_venues_from_env() else {
-        return Ok(());
+    let allowed_venues = match v2_live_canary_ranked_execution_allowed_venues_from_env()? {
+        Some(allowed_venues) => allowed_venues,
+        None => return Ok(()),
     };
-    let allowed = |venue_id: &str| allowed_venues.iter().any(|venue| venue == venue_id);
     for intent in intents {
         match intent {
             OrderIntent::Place(place) => {
-                if !allowed(place.venue_id.as_ref()) {
-                    return Err("v2_ranked_non_execution_place");
-                }
+                v2_live_canary_ranked_execution_validate_venue(
+                    &allowed_venues,
+                    place.venue_id.as_ref(),
+                    place.venue_index,
+                    "v2_ranked_non_execution_place",
+                    "v2_ranked_place_venue_index_mismatch",
+                )?;
                 if place.purpose != OrderPurpose::Mm {
                     return Err("v2_ranked_non_mm_place");
                 }
@@ -1931,9 +1967,13 @@ fn v2_live_canary_ranked_execution_validate_order_intents(
                 }
             }
             OrderIntent::Replace(replace) => {
-                if !allowed(replace.venue_id.as_ref()) {
-                    return Err("v2_ranked_non_execution_replace");
-                }
+                v2_live_canary_ranked_execution_validate_venue(
+                    &allowed_venues,
+                    replace.venue_id.as_ref(),
+                    replace.venue_index,
+                    "v2_ranked_non_execution_replace",
+                    "v2_ranked_replace_venue_index_mismatch",
+                )?;
                 if replace.purpose != OrderPurpose::Mm {
                     return Err("v2_ranked_non_mm_replace");
                 }
@@ -1948,17 +1988,28 @@ fn v2_live_canary_ranked_execution_validate_order_intents(
                 }
             }
             OrderIntent::Cancel(cancel) => {
-                if !allowed(cancel.venue_id.as_ref()) {
-                    return Err("v2_ranked_non_execution_cancel");
-                }
+                v2_live_canary_ranked_execution_validate_venue(
+                    &allowed_venues,
+                    cancel.venue_id.as_ref(),
+                    cancel.venue_index,
+                    "v2_ranked_non_execution_cancel",
+                    "v2_ranked_cancel_venue_index_mismatch",
+                )?;
             }
             OrderIntent::CancelAll(cancel_all) => {
                 let Some(venue_id) = cancel_all.venue_id.as_ref() else {
                     return Err("v2_ranked_unscoped_cancel_all");
                 };
-                if !allowed(venue_id.as_ref()) {
-                    return Err("v2_ranked_non_execution_cancel_all");
-                }
+                let Some(venue_index) = cancel_all.venue_index else {
+                    return Err("v2_ranked_cancel_all_missing_venue_index");
+                };
+                v2_live_canary_ranked_execution_validate_venue(
+                    &allowed_venues,
+                    venue_id.as_ref(),
+                    venue_index,
+                    "v2_ranked_non_execution_cancel_all",
+                    "v2_ranked_cancel_all_venue_index_mismatch",
+                )?;
             }
         }
     }
@@ -3177,7 +3228,6 @@ const V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV: &str =
 const V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES";
 const V2_DECISION_MODE_ENV: &str = "PARAPHINA_V2_DECISION_MODE";
-const V2_LIVE_CANARY_ADMISSION_APPROVED_ENV: &str = "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED";
 
 fn realtime_tick_interval(interval_ms: u64) -> tokio::time::Interval {
     let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
@@ -16405,19 +16455,43 @@ mod tests {
         let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
         let _guard = EnvGuard::new(&[
             V2_DECISION_MODE_ENV,
-            V2_LIVE_CANARY_ADMISSION_APPROVED_ENV,
+            "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED",
             V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV,
         ]);
         std::env::set_var(V2_DECISION_MODE_ENV, "live_canary_admission");
-        std::env::set_var(V2_LIVE_CANARY_ADMISSION_APPROVED_ENV, "true");
+        std::env::set_var("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "true");
         std::env::set_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV, "lighter");
         f()
+    }
+
+    fn v2_lighter_targeted_place_intent(side: Side, label: &str) -> OrderIntent {
+        let mut intent = lighter_targeted_place_intent(side, label);
+        if let OrderIntent::Place(place) = &mut intent {
+            place.venue_index = 3;
+        }
+        intent
+    }
+
+    fn v2_lighter_targeted_replace_intent(side: Side, suffix: &str) -> OrderIntent {
+        let mut intent = lighter_targeted_replace_intent(side, suffix);
+        if let OrderIntent::Replace(replace) = &mut intent {
+            replace.venue_index = 3;
+        }
+        intent
+    }
+
+    fn v2_lighter_cancel_intent() -> OrderIntent {
+        let mut intent = lighter_cancel_intent();
+        if let OrderIntent::Cancel(cancel) = &mut intent {
+            cancel.venue_index = 3;
+        }
+        intent
     }
 
     #[test]
     fn v2_ranked_execution_dispatch_guard_allows_lighter_mm_post_only() {
         with_v2_ranked_execution_env(|| {
-            let intents = vec![lighter_targeted_place_intent(Side::Buy, "bid")];
+            let intents = vec![v2_lighter_targeted_place_intent(Side::Buy, "bid")];
             assert_eq!(
                 v2_live_canary_ranked_execution_validate_order_intents(&intents),
                 Ok(())
@@ -16428,9 +16502,9 @@ mod tests {
     #[test]
     fn v2_ranked_execution_dispatch_guard_rejects_non_lighter_order_creating() {
         with_v2_ranked_execution_env(|| {
-            let mut intent = lighter_targeted_place_intent(Side::Buy, "bid");
+            let mut intent = v2_lighter_targeted_place_intent(Side::Buy, "bid");
             if let OrderIntent::Place(place) = &mut intent {
-                place.venue_index = 1;
+                place.venue_index = 0;
                 place.venue_id = "extended".into();
             }
             assert_eq!(
@@ -16443,7 +16517,7 @@ mod tests {
     #[test]
     fn v2_ranked_execution_dispatch_guard_rejects_non_post_only_or_reduce_only() {
         with_v2_ranked_execution_env(|| {
-            let mut not_post_only = lighter_targeted_place_intent(Side::Buy, "bid");
+            let mut not_post_only = v2_lighter_targeted_place_intent(Side::Buy, "bid");
             if let OrderIntent::Place(place) = &mut not_post_only {
                 place.post_only = false;
             }
@@ -16452,13 +16526,86 @@ mod tests {
                 Err("v2_ranked_non_post_only_place")
             );
 
-            let mut reduce_only = lighter_targeted_replace_intent(Side::Sell, "ask");
+            let mut reduce_only = v2_lighter_targeted_replace_intent(Side::Sell, "ask");
             if let OrderIntent::Replace(replace) = &mut reduce_only {
                 replace.reduce_only = true;
             }
             assert_eq!(
                 v2_live_canary_ranked_execution_validate_order_intents(&[reduce_only]),
                 Err("v2_ranked_reduce_only_replace")
+            );
+        });
+    }
+
+    #[test]
+    fn v2_ranked_execution_dispatch_guard_rejects_missing_or_empty_allowlist() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            V2_DECISION_MODE_ENV,
+            "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED",
+            V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV,
+        ]);
+        std::env::set_var(V2_DECISION_MODE_ENV, "live_canary_admission");
+        std::env::set_var("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "true");
+        std::env::remove_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV);
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(&[
+                v2_lighter_targeted_place_intent(Side::Buy, "bid")
+            ]),
+            Err("v2_ranked_execution_allowlist_missing")
+        );
+
+        std::env::set_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV, " , ");
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(&[
+                v2_lighter_targeted_place_intent(Side::Buy, "bid")
+            ]),
+            Err("v2_ranked_execution_allowlist_empty")
+        );
+    }
+
+    #[test]
+    fn v2_ranked_execution_dispatch_guard_does_not_depend_on_approval_flag() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            V2_DECISION_MODE_ENV,
+            "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED",
+            V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV,
+        ]);
+        std::env::set_var(V2_DECISION_MODE_ENV, "live_canary_admission");
+        std::env::set_var("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "false");
+        std::env::set_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV, "lighter");
+
+        let mut intent = v2_lighter_targeted_place_intent(Side::Buy, "bid");
+        if let OrderIntent::Place(place) = &mut intent {
+            place.venue_index = 0;
+            place.venue_id = "extended".into();
+        }
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(&[intent]),
+            Err("v2_ranked_non_execution_place")
+        );
+    }
+
+    #[test]
+    fn v2_ranked_execution_dispatch_guard_rejects_venue_index_mismatch() {
+        with_v2_ranked_execution_env(|| {
+            let mut place_mismatch = v2_lighter_targeted_place_intent(Side::Buy, "bid");
+            if let OrderIntent::Place(place) = &mut place_mismatch {
+                place.venue_index = 0;
+            }
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents(&[place_mismatch]),
+                Err("v2_ranked_place_venue_index_mismatch")
+            );
+
+            let mut cancel_mismatch = v2_lighter_cancel_intent();
+            if let OrderIntent::Cancel(cancel) = &mut cancel_mismatch {
+                cancel.venue_index = 0;
+            }
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents(&[cancel_mismatch]),
+                Err("v2_ranked_cancel_venue_index_mismatch")
             );
         });
     }
@@ -16473,6 +16620,24 @@ mod tests {
             assert_eq!(
                 v2_live_canary_ranked_execution_validate_order_intents(&[intent]),
                 Err("v2_ranked_unscoped_cancel_all")
+            );
+
+            let intent = OrderIntent::CancelAll(CancelAllOrderIntent {
+                venue_index: None,
+                venue_id: Some("lighter".into()),
+            });
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents(&[intent]),
+                Err("v2_ranked_cancel_all_missing_venue_index")
+            );
+
+            let intent = OrderIntent::CancelAll(CancelAllOrderIntent {
+                venue_index: Some(0),
+                venue_id: Some("lighter".into()),
+            });
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents(&[intent]),
+                Err("v2_ranked_cancel_all_venue_index_mismatch")
             );
         });
     }

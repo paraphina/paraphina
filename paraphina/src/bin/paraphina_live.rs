@@ -309,9 +309,7 @@ fn apply_explicit_connector_selection_to_config(cfg: &mut Config, connectors: &[
 }
 
 fn v2_live_canary_ranked_execution_venue_allowed(cfg: &Config, venue_id: &str) -> bool {
-    if cfg.v2_shadow.decision_mode != paraphina::config::V2DecisionMode::LiveCanaryAdmission
-        || cfg.v2_shadow.live_canary_ranked_execution_venues.is_empty()
-    {
+    if cfg.v2_shadow.decision_mode != paraphina::config::V2DecisionMode::LiveCanaryAdmission {
         return true;
     }
     cfg.v2_shadow
@@ -5299,6 +5297,12 @@ mod tests {
         assert!(!super::v2_live_canary_ranked_execution_venue_allowed(
             &cfg, "extended"
         ));
+
+        cfg.v2_shadow.live_canary_ranked_execution_venues.clear();
+        assert!(
+            !super::v2_live_canary_ranked_execution_venue_allowed(&cfg, "lighter"),
+            "live canary admission must fail closed when ranked execution allowlist is empty"
+        );
     }
 
     fn with_v2_live_canary_preflight_env<R>(f: impl FnOnce() -> R) -> R {
