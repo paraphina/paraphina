@@ -1738,7 +1738,7 @@ fn v2_live_canary_admission_preflight_check(
         label: "v2_live_canary_admission",
         ok: gate_state.satisfied(),
         details: format!(
-            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
+            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} venue_coverage_probe_approved={} venue_coverage_probe_venues_present={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
             gate_state.live_canary_admission_approved,
             gate_state.live_canary_mode_enabled,
             gate_state.live_canary_profile_metadata_present,
@@ -1749,6 +1749,8 @@ fn v2_live_canary_admission_preflight_check(
             gate_state.live_canary_post_only_enforced,
             gate_state.live_canary_reduce_only_not_enforced,
             gate_state.live_canary_baseline_hedge_authority_acknowledged,
+            gate_state.live_canary_venue_coverage_probe_approved,
+            gate_state.live_canary_venue_coverage_probe_venues_present,
             gate_state.pair_edge_enabled,
             gate_state.order_intent_enabled,
             gate_state.fast_hedge_disabled,

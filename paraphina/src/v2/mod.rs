@@ -182,6 +182,8 @@ pub struct V2AdmissionGateState {
     pub live_canary_reduce_only_not_enforced: bool,
     pub live_canary_baseline_hedge_authority_acknowledged: bool,
     pub live_canary_order_path_probe_approved: bool,
+    pub live_canary_venue_coverage_probe_approved: bool,
+    pub live_canary_venue_coverage_probe_venues_present: bool,
 }
 
 impl V2AdmissionGateState {
@@ -256,6 +258,7 @@ pub struct V2AdmissionDecision {
     pub suppressed_mm_order_creating_intent_count: usize,
     pub pair_edge_is_admission: bool,
     pub order_path_probe_is_admission: bool,
+    pub venue_coverage_probe_is_admission: bool,
     pub pressure_complete_claim: bool,
     pub blocker_cleared: bool,
     pub gate_state: V2AdmissionGateState,
@@ -394,6 +397,10 @@ pub fn admission_gate_state(
         require_phase51_gate: config.require_phase51_gate,
         live_canary_admission_approved: config.live_canary_admission_approved,
         live_canary_order_path_probe_approved: config.live_canary_order_path_probe_approved,
+        live_canary_venue_coverage_probe_approved: config.live_canary_venue_coverage_probe_approved,
+        live_canary_venue_coverage_probe_venues_present: !config
+            .live_canary_venue_coverage_probe_venues
+            .is_empty(),
         live_canary_mode_enabled: runtime_context.live_canary_mode_enabled,
         live_canary_profile_metadata_present: runtime_context.live_canary_profile_metadata_present,
         live_canary_max_position_present: runtime_context.live_canary_max_position_present,
@@ -486,31 +493,47 @@ pub fn evaluate_admission_decision_with_context(
     let gate_satisfied = gate_state.satisfied();
     let live_canary_mode = matches!(config.decision_mode, V2DecisionMode::LiveCanaryAdmission);
     let mut order_path_probe_is_admission = false;
+    let mut venue_coverage_probe_is_admission = false;
     let mut admitted_candidates = if gate_satisfied {
-        rankings
-            .iter()
-            .filter(|ranking| ranking.rank_status == "scored" && ranking.rank_score_microusd > 0)
-            .filter_map(|ranking| {
-                let candidate = candidates
-                    .iter()
-                    .find(|candidate| candidate.candidate_id == ranking.candidate_id)?;
-                Some(V2AdmittedCandidate {
-                    candidate_id: ranking.candidate_id.clone(),
-                    venue_index: candidate.venue_index,
-                    venue_id: candidate.venue_id.clone(),
-                    side: candidate.side,
-                    rank_index: ranking.rank_index,
-                    rank_score_microusd: ranking.rank_score_microusd,
-                    pair_edge_feature_usd: ranking.pair_edge_feature_usd,
-                    pair_edge_feature_bps: ranking.pair_edge_feature_bps,
-                    reference_candidate_id: ranking.reference_candidate_id.clone(),
+        if live_canary_mode
+            && config.live_canary_venue_coverage_probe_approved
+            && !config.live_canary_venue_coverage_probe_venues.is_empty()
+        {
+            let selected = select_live_canary_venue_coverage_probe_candidates(
+                &candidates,
+                &rankings,
+                &config.live_canary_venue_coverage_probe_venues,
+            );
+            venue_coverage_probe_is_admission = !selected.is_empty();
+            selected
+        } else {
+            rankings
+                .iter()
+                .filter(|ranking| {
+                    ranking.rank_status == "scored" && ranking.rank_score_microusd > 0
                 })
-            })
-            .collect::<Vec<_>>()
+                .filter_map(|ranking| {
+                    let candidate = candidates
+                        .iter()
+                        .find(|candidate| candidate.candidate_id == ranking.candidate_id)?;
+                    Some(V2AdmittedCandidate {
+                        candidate_id: ranking.candidate_id.clone(),
+                        venue_index: candidate.venue_index,
+                        venue_id: candidate.venue_id.clone(),
+                        side: candidate.side,
+                        rank_index: ranking.rank_index,
+                        rank_score_microusd: ranking.rank_score_microusd,
+                        pair_edge_feature_usd: ranking.pair_edge_feature_usd,
+                        pair_edge_feature_bps: ranking.pair_edge_feature_bps,
+                        reference_candidate_id: ranking.reference_candidate_id.clone(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        }
     } else {
         Vec::new()
     };
-    if live_canary_mode && admitted_candidates.len() > 1 {
+    if live_canary_mode && !venue_coverage_probe_is_admission && admitted_candidates.len() > 1 {
         admitted_candidates.truncate(1);
     }
 
@@ -540,6 +563,9 @@ pub fn evaluate_admission_decision_with_context(
         (false, false, _, _, _) => "paper_admission_gate_not_satisfied",
         (_, true, false, _, _) => "no_positive_ranked_candidates",
         (true, true, true, _, true) => "live_canary_single_venue_order_path_probe",
+        (true, true, true, _, false) if venue_coverage_probe_is_admission => {
+            "live_canary_venue_coverage_probe"
+        }
         (true, true, true, true, false) => "live_canary_positive_pair_edge_ranked_admission",
         (false, true, true, true, _) => "paper_positive_pair_edge_ranked_admission",
         (true, true, true, false, false) => "live_canary_positive_ranked_admission",
@@ -561,6 +587,8 @@ pub fn evaluate_admission_decision_with_context(
         execution_mode: execution_mode.to_string(),
         authority_scope: if live_canary_mode && order_path_probe_is_admission {
             "live_canary_single_venue_order_path_probe"
+        } else if live_canary_mode && venue_coverage_probe_is_admission {
+            "live_canary_venue_coverage_probe"
         } else if live_canary_mode {
             "live_canary_ranked_admission"
         } else {
@@ -575,17 +603,66 @@ pub fn evaluate_admission_decision_with_context(
         baseline_plan_intent_count: baseline_plan_intents.len(),
         baseline_mm_order_creating_intent_count: baseline_mm_count,
         suppressed_mm_order_creating_intent_count: suppressed_count,
-        pair_edge_is_admission: admitted && positive_pair_edge && !order_path_probe_is_admission,
+        pair_edge_is_admission: admitted
+            && positive_pair_edge
+            && !order_path_probe_is_admission
+            && !venue_coverage_probe_is_admission,
         order_path_probe_is_admission,
+        venue_coverage_probe_is_admission,
         pressure_complete_claim: false,
         blocker_cleared: false,
         gate_state,
         ranking_schema_version: 1,
         ranking_feature_only: false,
-        ranking_is_admission: admitted && !order_path_probe_is_admission,
+        ranking_is_admission: admitted
+            && !order_path_probe_is_admission
+            && !venue_coverage_probe_is_admission,
         pair_edges,
         admitted_candidates,
     })
+}
+
+fn select_live_canary_venue_coverage_probe_candidates(
+    candidates: &[V2ShadowCandidate],
+    rankings: &[V2ShadowCandidateRanking],
+    allowed_venues: &[String],
+) -> Vec<V2AdmittedCandidate> {
+    let mut selected = Vec::new();
+    let mut seen_venues = std::collections::HashSet::new();
+    let allowed = allowed_venues
+        .iter()
+        .map(|venue| venue.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for ranking in rankings {
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == ranking.candidate_id)
+        else {
+            continue;
+        };
+        if candidate.target_linkage_state != "present_redacted"
+            || !allowed.contains(candidate.venue_id.as_str())
+            || !candidate.price.is_finite()
+            || candidate.price <= 0.0
+            || !candidate.size.is_finite()
+            || candidate.size <= 0.0
+            || !seen_venues.insert(candidate.venue_id.clone())
+        {
+            continue;
+        }
+        selected.push(V2AdmittedCandidate {
+            candidate_id: ranking.candidate_id.clone(),
+            venue_index: candidate.venue_index,
+            venue_id: candidate.venue_id.clone(),
+            side: candidate.side,
+            rank_index: ranking.rank_index,
+            rank_score_microusd: ranking.rank_score_microusd,
+            pair_edge_feature_usd: ranking.pair_edge_feature_usd,
+            pair_edge_feature_bps: ranking.pair_edge_feature_bps,
+            reference_candidate_id: ranking.reference_candidate_id.clone(),
+        });
+    }
+    selected
 }
 
 fn select_single_venue_order_path_probe_candidate(
@@ -1793,6 +1870,131 @@ mod tests {
         assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
         assert!(!serialized.contains("raw-group-must-not-emit"));
         assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_probe_admits_one_target_linked_intent_per_venue() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec![
+            "extended".to_string(),
+            "hyperliquid".to_string(),
+            "aster".to_string(),
+            "lighter".to_string(),
+        ];
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+            mm_place(2, "aster", Side::Sell, 98.0),
+            mm_place(3, "lighter", Side::Sell, 105.0),
+            OrderIntent::Cancel(crate::types::CancelOrderIntent {
+                venue_index: 4,
+                venue_id: Arc::from("paradex"),
+                order_id: "raw-cancel-order-id-must-not-emit".to_string(),
+            }),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.event_type, "V2_ADMISSION_DECISION");
+        assert_eq!(decision.authority_scope, "live_canary_venue_coverage_probe");
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert_eq!(
+            decision.admission_reason,
+            "live_canary_venue_coverage_probe"
+        );
+        assert!(decision.can_filter_existing_intents);
+        assert!(!decision.can_create_new_intents);
+        assert!(!decision.can_mutate_live_orders);
+        assert!(decision.venue_coverage_probe_is_admission);
+        assert!(!decision.order_path_probe_is_admission);
+        assert!(!decision.ranking_is_admission);
+        assert!(!decision.pair_edge_is_admission);
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+        assert_eq!(decision.baseline_mm_order_creating_intent_count, 4);
+        assert_eq!(decision.order_intent_output_count, 4);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 0);
+        assert_eq!(decision.admitted_candidates.len(), 4);
+        assert_eq!(intents.len(), 5, "four MM intents plus cancel retained");
+
+        let admitted_venues = decision
+            .admitted_candidates
+            .iter()
+            .map(|candidate| candidate.venue_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(admitted_venues.len(), 4);
+        assert!(admitted_venues.contains("extended"));
+        assert!(admitted_venues.contains("hyperliquid"));
+        assert!(admitted_venues.contains("aster"));
+        assert!(admitted_venues.contains("lighter"));
+
+        let serialized = serde_json::to_string(&decision).expect("serialize");
+        assert!(!serialized.contains("raw-client-id-must-not-emit"));
+        assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
+        assert!(!serialized.contains("raw-group-must-not-emit"));
+        assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_probe_rejects_unlinked_candidates() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues =
+            vec!["extended".to_string(), "hyperliquid".to_string()];
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+        ];
+        if let OrderIntent::Place(place) = &mut intents[1] {
+            place.phase51_target_key = None;
+        }
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert!(decision.venue_coverage_probe_is_admission);
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 1);
+        assert_eq!(decision.admitted_candidates.len(), 1);
+        assert_eq!(decision.admitted_candidates[0].venue_id, "extended");
+        assert_eq!(intents.len(), 1);
+        assert!(
+            matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "extended")
+        );
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_probe_requires_explicit_venue_allowlist() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(1, "hyperliquid", Side::Buy, 100.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert_eq!(decision.authority_scope, "live_canary_ranked_admission");
+        assert!(!decision.venue_coverage_probe_is_admission);
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(intents.len(), 1);
+        assert!(
+            matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "extended")
+        );
     }
 
     #[test]
