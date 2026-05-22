@@ -1,0 +1,37 @@
+# V2 ranked-admission all-five live micro-soak profile.
+# Use only with PARAPHINA_V2_DECISION_MODE=live_canary_admission and
+# PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED=true.
+#
+# This profile is the next rung after the one-open-order micro-canary:
+# it preserves the same 0.01 ETH order size and tight position caps, but
+# allows up to one open order per configured venue so all-five participation
+# can be validated without widening capital exposure beyond 0.05 ETH gross.
+
+[venue]
+base_order_size = 0.01
+max_order_size = 0.01
+lot_size_tao = 0.005
+
+[limits]
+max_position_tao = 0.05
+max_gross_position_tao = 0.05
+max_abs_venue_position_tao = 0.02
+soft_max_position_tao = 0.03
+soft_max_gross_position_tao = 0.03
+soft_max_abs_venue_position_tao = 0.02
+max_open_orders = 5
+
+[rate_limit]
+enabled = true
+rps = 4.0
+burst = 6
+
+[enforcement]
+post_only = true
+reduce_only = false
+
+[kill]
+stale_max_ticks = 4
+
+[book]
+max_mid_jump_pct = 0.03
