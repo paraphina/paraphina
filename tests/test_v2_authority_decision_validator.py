@@ -55,6 +55,17 @@ def live_canary_gate_state():
     return gate
 
 
+def live_canary_venue_coverage_gate_state():
+    gate = live_canary_gate_state()
+    gate.update(
+        {
+            "live_canary_venue_coverage_probe_approved": True,
+            "live_canary_venue_coverage_probe_venues_present": True,
+        }
+    )
+    return gate
+
+
 def admitted_row():
     return {
         "event_type": "V2_ADMISSION_DECISION",
@@ -156,6 +167,45 @@ def live_canary_order_path_probe_row():
     return row
 
 
+def live_canary_venue_coverage_probe_row(venue_id: str = "extended", rank_score: int = -210_000):
+    row = live_canary_admitted_row()
+    row["authority_scope"] = "live_canary_venue_coverage_probe"
+    row["admission_reason"] = "live_canary_venue_coverage_probe"
+    row["baseline_plan_intent_count"] = 2
+    row["baseline_mm_order_creating_intent_count"] = 2
+    row["suppressed_mm_order_creating_intent_count"] = 1
+    row["pair_edge_is_admission"] = False
+    row["order_path_probe_is_admission"] = False
+    row["venue_coverage_probe_is_admission"] = True
+    row["ranking_is_admission"] = False
+    row["gate_state"] = live_canary_venue_coverage_gate_state()
+    row["pair_edges"] = [
+        {
+            "snapshot_id": "v2_pair_edge_v1:missing_ask",
+            "bid_candidate_id": f"v2_shadow_intent_v1:0:{venue_id}:buy:0",
+            "ask_candidate_id": None,
+            "edge_usd": None,
+            "edge_bps": None,
+            "feature_only": False,
+            "invalid_reason": "missing_ask",
+        }
+    ]
+    row["admitted_candidates"] = [
+        {
+            "candidate_id": f"v2_shadow_intent_v1:0:{venue_id}:buy:0",
+            "venue_index": 0,
+            "venue_id": venue_id,
+            "side": "Buy",
+            "rank_index": 1,
+            "rank_score_microusd": rank_score,
+            "pair_edge_feature_usd": None,
+            "pair_edge_feature_bps": None,
+            "reference_candidate_id": None,
+        }
+    ]
+    return row
+
+
 def write_rows(root: Path, rows):
     path = root / "v2_authority_decisions.jsonl"
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
@@ -229,6 +279,70 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
                 "live_canary_single_venue_order_path_probe",
             )
             self.assertTrue(data["v2_authority_contract"]["order_path_probe_only"])
+
+    def test_accepts_live_canary_venue_coverage_probe_as_non_promotion_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hold = live_canary_admitted_row()
+            hold["admission_status"] = "HOLD"
+            hold["admission_reason"] = "no_positive_ranked_candidates"
+            hold["order_intent_output_count"] = 0
+            hold["suppressed_mm_order_creating_intent_count"] = hold[
+                "baseline_mm_order_creating_intent_count"
+            ]
+            hold["pair_edge_is_admission"] = False
+            hold["ranking_is_admission"] = False
+            hold["admitted_candidates"] = []
+            hold["venue_coverage_probe_is_admission"] = False
+            evidence = write_rows(root, [live_canary_venue_coverage_probe_row(), hold])
+            manifest = root / "manifest.json"
+
+            summary = validator.validate_v2_authority_decisions(evidence)
+            validator.write_manifest(evidence, manifest, summary)
+
+            self.assertEqual(summary.row_count, 2)
+            self.assertEqual(summary.admitted_rows, 1)
+            self.assertEqual(summary.live_canary_venue_coverage_probe_rows, 1)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(data["governance"]["gate_status"], "LIVE_CANARY_VENUE_COVERAGE_PROBE")
+            self.assertTrue(data["governance"]["probe_only"])
+            self.assertFalse(data["governance"]["approved_for_promotion"])
+            self.assertFalse(data["governance"]["approved_for_live"])
+            self.assertFalse(data["governance"]["blocker_cleared"])
+            self.assertEqual(
+                data["v2_authority_contract"]["authority_scope"],
+                "live_canary_venue_coverage_probe",
+            )
+            self.assertTrue(data["v2_authority_contract"]["venue_coverage_probe_only"])
+            self.assertFalse(data["v2_authority_contract"]["order_path_probe_only"])
+
+    def test_rejects_venue_coverage_probe_without_explicit_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = live_canary_venue_coverage_probe_row()
+            row["gate_state"]["live_canary_venue_coverage_probe_approved"] = False
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_venue_coverage_probe_if_mislabeled_as_ranking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = live_canary_venue_coverage_probe_row()
+            row["ranking_is_admission"] = True
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_mixed_venue_coverage_and_ranked_admitted_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = write_rows(
+                Path(tmp),
+                [
+                    live_canary_venue_coverage_probe_row(),
+                    live_canary_admitted_row(),
+                ],
+            )
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
 
     def test_rejects_multiple_order_path_probe_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

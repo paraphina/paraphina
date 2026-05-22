@@ -52,6 +52,8 @@ class V2AuthoritySummary:
     paper_only_rows: int = 0
     live_canary_rows: int = 0
     live_canary_order_path_probe_rows: int = 0
+    live_canary_venue_coverage_probe_rows: int = 0
+    live_canary_venue_coverage_probe_admitted_rows: int = 0
 
     def to_manifest_validation(self) -> dict[str, Any]:
         return {
@@ -67,6 +69,8 @@ class V2AuthoritySummary:
             "paper_only_rows": self.paper_only_rows,
             "live_canary_rows": self.live_canary_rows,
             "live_canary_order_path_probe_rows": self.live_canary_order_path_probe_rows,
+            "live_canary_venue_coverage_probe_rows": self.live_canary_venue_coverage_probe_rows,
+            "live_canary_venue_coverage_probe_admitted_rows": self.live_canary_venue_coverage_probe_admitted_rows,
         }
 
 
@@ -185,6 +189,7 @@ def _validate_admitted_candidates(
     line: int,
     gate_satisfied: bool,
     order_path_probe: bool,
+    venue_coverage_probe: bool,
 ) -> None:
     candidates = row.get("admitted_candidates")
     _require(isinstance(candidates, list), line, "admitted_candidates must be list")
@@ -213,6 +218,8 @@ def _validate_admitted_candidates(
         if order_path_probe:
             _require(rank_score == 0, line, f"admitted_candidates[{idx}] probe rank_score_microusd must be zero")
             _require(candidate.get("venue_id") == "lighter", line, f"admitted_candidates[{idx}] probe venue must be lighter")
+        elif venue_coverage_probe:
+            pass
         else:
             _require(rank_score > 0, line, f"admitted_candidates[{idx}] rank_score_microusd must be positive")
 
@@ -234,6 +241,7 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
             authority_scope in {
                 "live_canary_ranked_admission",
                 "live_canary_single_venue_order_path_probe",
+                "live_canary_venue_coverage_probe",
             },
             line,
             "live_canary_admission requires a known live-canary authority_scope",
@@ -262,11 +270,17 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
     )
     _require(row.get("can_mutate_live_orders") is False, line, "can_mutate_live_orders must be false")
     order_path_probe = row.get("order_path_probe_is_admission") is True
+    venue_coverage_probe = row.get("venue_coverage_probe_is_admission") is True
+    _require(
+        not (order_path_probe and venue_coverage_probe),
+        line,
+        "row cannot be both order-path probe and venue-coverage probe",
+    )
     if row.get("admission_status") == "ADMITTED":
         _require(
-            row.get("ranking_is_admission") is True or order_path_probe,
+            row.get("ranking_is_admission") is True or order_path_probe or venue_coverage_probe,
             line,
-            "ADMITTED row must use ranking or explicit order-path probe as admission",
+            "ADMITTED row must use ranking or explicit probe authority as admission",
         )
         if order_path_probe:
             _require(live_canary, line, "order-path probe is live-canary only")
@@ -284,7 +298,33 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
             _require(row.get("pair_edge_is_admission") is False, line, "order-path probe must not claim pair-edge admission")
             _require(row.get("baseline_mm_order_creating_intent_count") == 1, line, "order-path probe requires one baseline MM intent")
             _require(row.get("order_intent_output_count") == 1, line, "order-path probe must output one intent")
+        elif venue_coverage_probe:
+            _require(live_canary, line, "venue-coverage probe is live-canary only")
+            _require(
+                authority_scope == "live_canary_venue_coverage_probe",
+                line,
+                "venue-coverage probe requires probe authority_scope",
+            )
+            _require(
+                row.get("admission_reason") == "live_canary_venue_coverage_probe",
+                line,
+                "venue-coverage probe admission_reason invalid",
+            )
+            _require(row.get("ranking_is_admission") is False, line, "venue-coverage probe must not claim ranking admission")
+            _require(row.get("pair_edge_is_admission") is False, line, "venue-coverage probe must not claim pair-edge admission")
+            _require(row.get("order_path_probe_is_admission") is False, line, "venue-coverage probe must not claim order-path admission")
+            _require(
+                row.get("gate_state", {}).get("live_canary_venue_coverage_probe_approved") is True,
+                line,
+                "venue-coverage probe requires explicit approval gate",
+            )
+            _require(
+                row.get("gate_state", {}).get("live_canary_venue_coverage_probe_venues_present") is True,
+                line,
+                "venue-coverage probe requires non-empty venue allowlist gate",
+            )
         else:
+            _require(row.get("venue_coverage_probe_is_admission") is not True, line, "ranked ADMITTED row must not claim venue coverage")
             _require(row.get("ranking_is_admission") is True, line, "ranked ADMITTED row must use ranking as admission")
         if row.get("pair_edge_is_admission") is True:
             _require(
@@ -302,8 +342,9 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
         _require(row.get("pair_edge_is_admission") is False, line, "HOLD row must not use pair edge as admission")
         _require(row.get("ranking_is_admission") is False, line, "HOLD row must not use ranking as admission")
         _require(row.get("order_path_probe_is_admission") is False, line, "HOLD row must not use order-path probe as admission")
+        _require(row.get("venue_coverage_probe_is_admission") is not True, line, "HOLD row must not use venue coverage as admission")
     _validate_pair_edges(row, line)
-    _validate_admitted_candidates(row, line, gate_satisfied, order_path_probe)
+    _validate_admitted_candidates(row, line, gate_satisfied, order_path_probe, venue_coverage_probe)
     admitted_count = len(row.get("admitted_candidates", []))
     _require(
         row["order_intent_output_count"] == admitted_count,
@@ -333,6 +374,10 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
         summary.live_canary_rows += 1
         if order_path_probe:
             summary.live_canary_order_path_probe_rows += 1
+        if venue_coverage_probe:
+            summary.live_canary_venue_coverage_probe_rows += 1
+            if row["admission_status"] == "ADMITTED":
+                summary.live_canary_venue_coverage_probe_admitted_rows += 1
     else:
         summary.paper_only_rows += 1
 
@@ -365,20 +410,43 @@ def validate_v2_authority_decisions(path: Path) -> V2AuthoritySummary:
             raise V2AuthorityValidationError(
                 "live canary order-path probe must output exactly one probe intent"
             )
+    if summary.live_canary_venue_coverage_probe_rows > 0:
+        if summary.live_canary_order_path_probe_rows > 0:
+            raise V2AuthorityValidationError(
+                "live canary venue-coverage probe cannot be mixed with order-path probe rows"
+            )
+        if summary.live_canary_venue_coverage_probe_admitted_rows != summary.admitted_rows:
+            raise V2AuthorityValidationError(
+                "live canary venue-coverage probe cannot be mixed with ranked admitted rows"
+            )
     return summary
 
 
 def write_manifest(decision_path: Path, manifest_path: Path, summary: V2AuthoritySummary) -> None:
     artifact_root = manifest_path.parent
     live_canary = summary.live_canary_rows > 0
-    probe_only = summary.live_canary_order_path_probe_rows > 0
+    order_path_probe_only = summary.live_canary_order_path_probe_rows > 0
+    venue_coverage_probe_only = summary.live_canary_venue_coverage_probe_rows > 0
+    probe_only = order_path_probe_only or venue_coverage_probe_only
+    if order_path_probe_only:
+        gate_status = "LIVE_CANARY_ORDER_PATH_PROBE"
+        authority_scope = "live_canary_single_venue_order_path_probe"
+    elif venue_coverage_probe_only:
+        gate_status = "LIVE_CANARY_VENUE_COVERAGE_PROBE"
+        authority_scope = "live_canary_venue_coverage_probe"
+    elif live_canary:
+        gate_status = "LIVE_CANARY"
+        authority_scope = "live_canary_ranked_admission"
+    else:
+        gate_status = "PAPER_ONLY"
+        authority_scope = "paper_only"
     manifest = {
         "artifact_type": "v2_authority_decision_evidence_manifest",
         "schema_version": 1,
         "decision_validation_status": "pass",
         "files": [_file_info(decision_path, artifact_root)],
         "governance": {
-            "gate_status": "LIVE_CANARY_ORDER_PATH_PROBE" if probe_only else ("LIVE_CANARY" if live_canary else "PAPER_ONLY"),
+            "gate_status": gate_status,
             "shadow_only": False,
             "paper_only": summary.paper_only_rows > 0 and not live_canary,
             "approved_for_live": False,
@@ -392,12 +460,13 @@ def write_manifest(decision_path: Path, manifest_path: Path, summary: V2Authorit
             "pressure_complete_claim": False,
         },
         "v2_authority_contract": {
-            "authority_scope": "live_canary_single_venue_order_path_probe" if probe_only else ("live_canary_ranked_admission" if live_canary else "paper_only"),
+            "authority_scope": authority_scope,
             "can_filter_existing_intents": True,
             "can_create_new_intents": False,
             "can_mutate_live_orders": False,
             "baseline_intent_filter_only": True,
-            "order_path_probe_only": probe_only,
+            "order_path_probe_only": order_path_probe_only,
+            "venue_coverage_probe_only": venue_coverage_probe_only,
             "full_live_promotion": False,
             "fast_hedge_enabled": False,
         },
