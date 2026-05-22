@@ -549,6 +549,8 @@ pub struct MmConfig {
     pub max_quote_spread_bps_by_venue: BTreeMap<String, f64>,
     /// Optional per-venue max generated two-sided quote spread in basis points.
     pub max_generated_quote_spread_bps_by_venue: BTreeMap<String, f64>,
+    /// Optional Paradex fill-role clip that keeps generated quotes near passive touch.
+    pub paradex_touch_clip_max_ticks: Option<f64>,
     /// Optional per-venue hard cap on MM quote size in TAO.
     pub max_quote_size_tao_by_venue: BTreeMap<String, f64>,
     /// Optional per-venue economic role overrides keyed by venue id.
@@ -686,6 +688,12 @@ impl MmConfig {
         self.max_generated_quote_spread_bps_by_venue
             .get(venue_id)
             .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
+    pub fn paradex_touch_clip_max_ticks(&self) -> Option<f64> {
+        self.paradex_touch_clip_max_ticks
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
@@ -1275,6 +1283,7 @@ impl Default for Config {
             max_quote_spread_abs_usd_by_venue: BTreeMap::new(),
             max_quote_spread_bps_by_venue: BTreeMap::new(),
             max_generated_quote_spread_bps_by_venue: BTreeMap::new(),
+            paradex_touch_clip_max_ticks: None,
             max_quote_size_tao_by_venue: BTreeMap::new(),
             venue_role_by_venue: BTreeMap::new(),
             pre_soft_taper_global_position_tao_by_venue: BTreeMap::new(),
@@ -1500,6 +1509,7 @@ impl Config {
     ///   - PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_<VENUE> (f64, USD)
     ///   - PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_<VENUE> (f64, bps)
     ///   - PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_<VENUE> (f64, bps)
+    ///   - PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS (f64, ticks; default off)
     ///   - PARAPHINA_MM_VENUE_ROLE_<VENUE> (fill|probationary|anchor|noise)
     ///   - PARAPHINA_VOL_REF           (f64)
     ///   - PARAPHINA_DAILY_LOSS_LIMIT  (f64, USD; positive threshold)
@@ -2094,6 +2104,26 @@ impl Config {
                             "[config] WARN: could not parse {} = {:?} as positive f64; leaving {} max quote size cap disabled",
                             max_quote_size_key, raw, venue.id
                         );
+                    }
+                }
+            }
+
+            if venue.id.eq_ignore_ascii_case("paradex") {
+                if let Ok(raw) = env::var("PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS") {
+                    match raw.parse::<f64>() {
+                        Ok(v) if v.is_finite() && v > 0.0 => {
+                            cfg.mm.paradex_touch_clip_max_ticks = Some(v);
+                            eprintln!(
+                                "[config] PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS = {} (enabled Paradex passive touch clip)",
+                                v
+                            );
+                        }
+                        _ => {
+                            eprintln!(
+                                "[config] WARN: could not parse PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS = {:?} as positive f64; leaving Paradex touch clip disabled",
+                                raw
+                            );
+                        }
                     }
                 }
             }
@@ -4091,6 +4121,7 @@ mod tests {
         const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
         const ASTER_GEN_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_ASTER";
         const ASTER_MAX_QUOTE_SIZE_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_ASTER";
+        const PARADEX_TOUCH_CLIP_KEY: &str = "PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS";
         const HL_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID";
         const EXT_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_EXTENDED";
 
@@ -4117,6 +4148,7 @@ mod tests {
         let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
         let _aster_gen_spread_bps = EnvGuard::new(ASTER_GEN_SPREAD_BPS_KEY);
         let _aster_max_quote_size = EnvGuard::new(ASTER_MAX_QUOTE_SIZE_KEY);
+        let _paradex_touch_clip = EnvGuard::new(PARADEX_TOUCH_CLIP_KEY);
         let _hl_role = EnvGuard::new(HL_ROLE_KEY);
         let _ext_role = EnvGuard::new(EXT_ROLE_KEY);
 
@@ -4141,6 +4173,7 @@ mod tests {
         env::set_var(EXT_SPREAD_BPS_KEY, "15");
         env::set_var(ASTER_GEN_SPREAD_BPS_KEY, "10");
         env::set_var(ASTER_MAX_QUOTE_SIZE_KEY, "0.01");
+        env::set_var(PARADEX_TOUCH_CLIP_KEY, "1");
         env::set_var(HL_ROLE_KEY, "probationary");
         env::set_var(EXT_ROLE_KEY, "noise");
 
@@ -4190,6 +4223,7 @@ mod tests {
             Some(10.0)
         );
         assert_eq!(cfg.mm.max_quote_size_tao_for("aster"), Some(0.01));
+        assert_eq!(cfg.mm.paradex_touch_clip_max_ticks(), Some(1.0));
         assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("hyperliquid"), None);
         assert_eq!(
             cfg.mm.venue_role_for("hyperliquid"),
@@ -4221,6 +4255,7 @@ mod tests {
         const EXT_SPREAD_USD_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_EXTENDED";
         const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
         const ASTER_MAX_QUOTE_SIZE_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_ASTER";
+        const PARADEX_TOUCH_CLIP_KEY: &str = "PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS";
         const HL_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID";
 
         let _lock = env_lock().lock().unwrap();
@@ -4239,6 +4274,7 @@ mod tests {
         let _ext_spread_usd = EnvGuard::new(EXT_SPREAD_USD_KEY);
         let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
         let _aster_max_quote_size = EnvGuard::new(ASTER_MAX_QUOTE_SIZE_KEY);
+        let _paradex_touch_clip = EnvGuard::new(PARADEX_TOUCH_CLIP_KEY);
         let _hl_role = EnvGuard::new(HL_ROLE_KEY);
 
         env::set_var(LAMBDA_KEY, "not_a_number");
@@ -4257,6 +4293,7 @@ mod tests {
         env::set_var(EXT_SPREAD_USD_KEY, "not_a_number");
         env::set_var(EXT_SPREAD_BPS_KEY, "0");
         env::set_var(ASTER_MAX_QUOTE_SIZE_KEY, "0");
+        env::set_var(PARADEX_TOUCH_CLIP_KEY, "0");
         env::set_var(HL_ROLE_KEY, "not_a_role");
 
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
@@ -4284,7 +4321,16 @@ mod tests {
         assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("extended"), None);
         assert_eq!(cfg.mm.max_quote_spread_bps_for("extended"), None);
         assert_eq!(cfg.mm.max_quote_size_tao_for("aster"), None);
+        assert_eq!(cfg.mm.paradex_touch_clip_max_ticks(), None);
         assert_eq!(cfg.mm.venue_role_for("hyperliquid"), MmVenueRole::Fill);
+
+        env::set_var(PARADEX_TOUCH_CLIP_KEY, "not_a_number");
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(cfg.mm.paradex_touch_clip_max_ticks(), None);
+
+        env::set_var(PARADEX_TOUCH_CLIP_KEY, "-1");
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(cfg.mm.paradex_touch_clip_max_ticks(), None);
     }
 
     #[test]

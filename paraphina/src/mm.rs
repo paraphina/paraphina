@@ -339,6 +339,7 @@ pub const HYPERLIQUID_TOUCH_CLIP_MAX_TICKS: f64 = 8.0;
 const HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS: f64 = 2.0;
 pub const TOUCH_MODE_ASTER_FILL: &str = "aster_fill";
 pub const TOUCH_MODE_HYPERLIQUID_CLIP: &str = "hyperliquid_clip";
+pub const TOUCH_MODE_PARADEX_CLIP: &str = "paradex_clip";
 
 #[inline]
 fn aster_touch_delta_ticks(side: Side, price: f64, best_bid: f64, best_ask: f64, tick: f64) -> f64 {
@@ -417,6 +418,21 @@ fn hyperliquid_touch_clip_eligible(
         && quote_spread_gate_reason(mm_cfg, &vcfg.id, Some(mid), Some(spread)).is_none()
 }
 
+#[inline]
+fn paradex_touch_clip_eligible(
+    mm_cfg: &MmConfig,
+    vcfg: &VenueConfig,
+    vstate: &VenueState,
+    mid: f64,
+    spread: f64,
+) -> bool {
+    vcfg.id == "paradex"
+        && mm_cfg.paradex_touch_clip_max_ticks().is_some()
+        && mm_cfg.venue_role_for(&vcfg.id) == MmVenueRole::Fill
+        && matches!(vstate.status, VenueStatus::Healthy)
+        && quote_spread_gate_reason(mm_cfg, &vcfg.id, Some(mid), Some(spread)).is_none()
+}
+
 fn passive_touch_buffer_ticks(vcfg: &VenueConfig) -> f64 {
     if vcfg.id == "hyperliquid" {
         HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS
@@ -451,6 +467,54 @@ fn apply_hyperliquid_touch_clip(
     }
 
     let max_offset = HYPERLIQUID_TOUCH_CLIP_MAX_TICKS * tick;
+    let clipped_bid = bid_price.max(best_bid - max_offset).min(passive_bid_limit);
+    let clipped_ask = ask_price.min(best_ask + max_offset).max(passive_ask_limit);
+
+    let mut snapped_bid = ((clipped_bid / tick) - 1e-9).ceil() * tick;
+    if snapped_bid > passive_bid_limit {
+        snapped_bid = (passive_bid_limit / tick).floor() * tick;
+    }
+    let mut snapped_ask = ((clipped_ask / tick) + 1e-9).floor() * tick;
+    if snapped_ask < passive_ask_limit {
+        snapped_ask = (passive_ask_limit / tick).ceil() * tick;
+    }
+
+    result.applied =
+        (snapped_bid - bid_price).abs() > 1e-9 || (snapped_ask - ask_price).abs() > 1e-9;
+    result.bid_price = snapped_bid.min(passive_bid_limit);
+    result.ask_price = snapped_ask.max(passive_ask_limit);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn apply_paradex_touch_clip(
+    mm_cfg: &MmConfig,
+    vcfg: &VenueConfig,
+    vstate: &VenueState,
+    mid: f64,
+    spread: f64,
+    tick: f64,
+    best_bid: f64,
+    best_ask: f64,
+    passive_bid_limit: f64,
+    passive_ask_limit: f64,
+    bid_price: f64,
+    ask_price: f64,
+) -> HyperliquidTouchClipResult {
+    let mut result = HyperliquidTouchClipResult {
+        bid_price,
+        ask_price,
+        applied: false,
+    };
+    if !paradex_touch_clip_eligible(mm_cfg, vcfg, vstate, mid, spread) {
+        return result;
+    }
+    let Some(max_ticks) = mm_cfg.paradex_touch_clip_max_ticks() else {
+        return result;
+    };
+
+    let max_offset = max_ticks * tick;
     let clipped_bid = bid_price.max(best_bid - max_offset).min(passive_bid_limit);
     let clipped_ask = ask_price.min(best_ask + max_offset).max(passive_ask_limit);
 
@@ -2262,6 +2326,26 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
         touch_mode_kind = Some(TOUCH_MODE_HYPERLIQUID_CLIP);
     }
 
+    let paradex_touch_clip = apply_paradex_touch_clip(
+        mm_cfg,
+        vcfg,
+        vstate,
+        mid,
+        spread,
+        tick,
+        best_bid,
+        best_ask,
+        passive_bid_limit,
+        passive_ask_limit,
+        bid_price,
+        ask_price,
+    );
+    bid_price = paradex_touch_clip.bid_price;
+    ask_price = paradex_touch_clip.ask_price;
+    if paradex_touch_clip.applied {
+        touch_mode_kind = Some(TOUCH_MODE_PARADEX_CLIP);
+    }
+
     // ---------------------------------------------------------------------
     // 4) Per-unit edge calculation and gating (Section 9.2)
     // ---------------------------------------------------------------------
@@ -2690,6 +2774,23 @@ fn compute_single_venue_quotes(
     );
     bid_price = aster_touch_local.bid_price;
     ask_price = aster_touch_local.ask_price;
+
+    let paradex_touch_clip = apply_paradex_touch_clip(
+        mm_cfg,
+        vcfg,
+        vstate,
+        mid,
+        spread,
+        tick,
+        best_bid,
+        best_ask,
+        passive_bid_limit,
+        passive_ask_limit,
+        bid_price,
+        ask_price,
+    );
+    bid_price = paradex_touch_clip.bid_price;
+    ask_price = paradex_touch_clip.ask_price;
 
     // Sanity checks.
     if bid_price <= 0.0 || ask_price <= bid_price {
@@ -6094,6 +6195,170 @@ mod tests {
         assert_eq!(touch_mode_kind, Some(TOUCH_MODE_HYPERLIQUID_CLIP));
         assert!((best_bid - result.bid_price) / tick <= HYPERLIQUID_TOUCH_CLIP_MAX_TICKS + 1e-9);
         assert!((result.ask_price - best_ask) / tick <= HYPERLIQUID_TOUCH_CLIP_MAX_TICKS + 1e-9);
+    }
+
+    fn apply_paradex_touch_clip_test_case(
+        cfg: &Config,
+        state: &GlobalState,
+        venue_index: usize,
+    ) -> HyperliquidTouchClipResult {
+        let best_bid = 299.95;
+        let best_ask = 300.05;
+        let tick = cfg.venues[venue_index].tick_size;
+        apply_paradex_touch_clip(
+            &cfg.mm,
+            &cfg.venues[venue_index],
+            &state.venues[venue_index],
+            300.0,
+            0.10,
+            tick,
+            best_bid,
+            best_ask,
+            best_bid - tick,
+            best_ask + tick,
+            best_bid - (40.0 * tick),
+            best_ask + (40.0 * tick),
+        )
+    }
+
+    #[test]
+    fn paradex_touch_clip_defaults_off() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .venue_role_by_venue
+            .insert("paradex".to_string(), MmVenueRole::Fill);
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue in config");
+        state.venues[venue_index].status = VenueStatus::Healthy;
+        let best_bid = 299.95;
+        let best_ask = 300.05;
+        let tick = cfg.venues[venue_index].tick_size;
+        let bid_price = best_bid - (40.0 * tick);
+        let ask_price = best_ask + (40.0 * tick);
+
+        let result = apply_paradex_touch_clip(
+            &cfg.mm,
+            &cfg.venues[venue_index],
+            &state.venues[venue_index],
+            300.0,
+            0.10,
+            tick,
+            best_bid,
+            best_ask,
+            best_bid - tick,
+            best_ask + tick,
+            bid_price,
+            ask_price,
+        );
+
+        assert!(!result.applied, "Paradex touch clip must default off");
+        assert_eq!(result.bid_price, bid_price);
+        assert_eq!(result.ask_price, ask_price);
+    }
+
+    #[test]
+    fn paradex_touch_clip_limits_quotes_to_configured_passive_offset() {
+        let mut cfg = Config::default();
+        cfg.mm.paradex_touch_clip_max_ticks = Some(1.0);
+        cfg.mm
+            .venue_role_by_venue
+            .insert("paradex".to_string(), MmVenueRole::Fill);
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue in config");
+        state.venues[venue_index].status = VenueStatus::Healthy;
+        state.venues[venue_index].toxicity = 0.0;
+        let best_bid = 299.95;
+        let best_ask = 300.05;
+        let tick = cfg.venues[venue_index].tick_size;
+
+        let result = apply_paradex_touch_clip(
+            &cfg.mm,
+            &cfg.venues[venue_index],
+            &state.venues[venue_index],
+            300.0,
+            0.10,
+            tick,
+            best_bid,
+            best_ask,
+            best_bid - tick,
+            best_ask + tick,
+            best_bid - (40.0 * tick),
+            best_ask + (40.0 * tick),
+        );
+
+        assert!(result.applied, "expected Paradex touch clip to bind");
+        let bid_offset_ticks = (best_bid - result.bid_price) / tick;
+        let ask_offset_ticks = (result.ask_price - best_ask) / tick;
+        assert!(
+            bid_offset_ticks <= 1.0 + 1e-9,
+            "bid offset {} should be clipped to <= 1 tick",
+            bid_offset_ticks
+        );
+        assert!(
+            ask_offset_ticks <= 1.0 + 1e-9,
+            "ask offset {} should be clipped to <= 1 tick",
+            ask_offset_ticks
+        );
+        assert!(
+            result.bid_price <= best_bid - tick && result.ask_price >= best_ask + tick,
+            "clip must preserve passive placement"
+        );
+    }
+
+    #[test]
+    fn paradex_touch_clip_requires_fill_role_healthy_venue_and_clear_spread_gate() {
+        let mut cfg = Config::default();
+        cfg.mm.paradex_touch_clip_max_ticks = Some(1.0);
+        cfg.mm
+            .venue_role_by_venue
+            .insert("paradex".to_string(), MmVenueRole::Fill);
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue in config");
+        state.venues[venue_index].status = VenueStatus::Healthy;
+        state.venues[venue_index].toxicity = 0.0;
+
+        assert!(
+            apply_paradex_touch_clip_test_case(&cfg, &state, venue_index).applied,
+            "baseline should apply before testing negative gates"
+        );
+
+        cfg.mm
+            .venue_role_by_venue
+            .insert("paradex".to_string(), MmVenueRole::Probationary);
+        assert!(
+            !apply_paradex_touch_clip_test_case(&cfg, &state, venue_index).applied,
+            "Paradex clip must require fill role"
+        );
+
+        cfg.mm
+            .venue_role_by_venue
+            .insert("paradex".to_string(), MmVenueRole::Fill);
+        state.venues[venue_index].status = VenueStatus::Disabled;
+        assert!(
+            !apply_paradex_touch_clip_test_case(&cfg, &state, venue_index).applied,
+            "Paradex clip must require a healthy venue"
+        );
+
+        state.venues[venue_index].status = VenueStatus::Healthy;
+        cfg.mm
+            .max_quote_spread_bps_by_venue
+            .insert("paradex".to_string(), 1.0);
+        assert!(
+            !apply_paradex_touch_clip_test_case(&cfg, &state, venue_index).applied,
+            "Paradex clip must not bypass configured spread gates"
+        );
     }
 
     #[test]
