@@ -32,6 +32,9 @@ def _gate_state(**overrides: bool) -> dict[str, bool]:
         "live_canary_post_only_enforced": False,
         "live_canary_reduce_only_not_enforced": False,
         "live_canary_baseline_hedge_authority_acknowledged": False,
+        "live_canary_venue_coverage_probe_approved": False,
+        "live_canary_venue_coverage_probe_venues_present": False,
+        "live_canary_ranked_execution_venues_present": False,
     }
     state.update(overrides)
     return state
@@ -78,6 +81,7 @@ def _admitted_row() -> dict[str, Any]:
         "ranking_schema_version": 1,
         "ranking_feature_only": False,
         "ranking_is_admission": True,
+        "live_canary_ranked_execution_venues": [],
         "pair_edges": [
             {
                 "snapshot_id": "v2_pair_edge_v1:v2_shadow_intent_v1:0:extended:buy:0:v2_shadow_intent_v1:1:lighter:sell:1",

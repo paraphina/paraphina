@@ -29,6 +29,9 @@ def gate_state():
         "live_canary_post_only_enforced": True,
         "live_canary_reduce_only_not_enforced": True,
         "live_canary_baseline_hedge_authority_acknowledged": True,
+        "live_canary_venue_coverage_probe_approved": False,
+        "live_canary_venue_coverage_probe_venues_present": False,
+        "live_canary_ranked_execution_venues_present": True,
     }
 
 
@@ -58,6 +61,7 @@ def probe_row():
         "ranking_schema_version": 1,
         "ranking_feature_only": False,
         "ranking_is_admission": False,
+        "live_canary_ranked_execution_venues": ["lighter"],
         "pair_edges": [
             {
                 "snapshot_id": "v2_pair_edge_v1:missing_ask",

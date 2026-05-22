@@ -308,6 +308,18 @@ fn apply_explicit_connector_selection_to_config(cfg: &mut Config, connectors: &[
     }
 }
 
+fn v2_live_canary_ranked_execution_venue_allowed(cfg: &Config, venue_id: &str) -> bool {
+    if cfg.v2_shadow.decision_mode != paraphina::config::V2DecisionMode::LiveCanaryAdmission
+        || cfg.v2_shadow.live_canary_ranked_execution_venues.is_empty()
+    {
+        return true;
+    }
+    cfg.v2_shadow
+        .live_canary_ranked_execution_venues
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(venue_id))
+}
+
 fn resolve_venue_index(cfg: &Config, venue_id: &str) -> Option<usize> {
     cfg.venues.iter().position(|venue| venue.id == venue_id)
 }
@@ -1738,7 +1750,7 @@ fn v2_live_canary_admission_preflight_check(
         label: "v2_live_canary_admission",
         ok: gate_state.satisfied(),
         details: format!(
-            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} venue_coverage_probe_approved={} venue_coverage_probe_venues_present={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
+            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} venue_coverage_probe_approved={} venue_coverage_probe_venues_present={} ranked_execution_venues_present={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
             gate_state.live_canary_admission_approved,
             gate_state.live_canary_mode_enabled,
             gate_state.live_canary_profile_metadata_present,
@@ -1751,6 +1763,7 @@ fn v2_live_canary_admission_preflight_check(
             gate_state.live_canary_baseline_hedge_authority_acknowledged,
             gate_state.live_canary_venue_coverage_probe_approved,
             gate_state.live_canary_venue_coverage_probe_venues_present,
+            gate_state.live_canary_ranked_execution_venues_present,
             gate_state.pair_edge_enabled,
             gate_state.order_intent_enabled,
             gate_state.fast_hedge_disabled,
@@ -2096,14 +2109,19 @@ fn run_preflight(
     for connector in connectors {
         match connector {
             ConnectorArg::Hyperliquid | ConnectorArg::HyperliquidFixture => {
+                let (venue_id, _) = resolve_connector_venue(cfg, *connector)
+                    .unwrap_or_else(|_| (connector_venue_id(*connector).to_string(), 0));
+                let needs_live_auth = trade_mode == TradeMode::Live
+                    && v2_live_canary_ranked_execution_venue_allowed(cfg, &venue_id);
                 let key_present = env_present("HL_PRIVATE_KEY");
                 let vault_present = env_present("HL_VAULT_ADDRESS");
-                if trade_mode == TradeMode::Live {
+                if needs_live_auth {
                     creds_ok = creds_ok && key_present && vault_present;
                 }
                 let mut detail = format!(
-                    "{}:hl_private_key={} hl_vault_address={}",
+                    "{}:auth_required={} hl_private_key={} hl_vault_address={}",
                     connector.as_str(),
+                    needs_live_auth,
                     key_present,
                     vault_present
                 );
@@ -2120,6 +2138,8 @@ fn run_preflight(
                 creds_detail.push_str(&detail);
             }
             ConnectorArg::Lighter => {
+                let (venue_id, _) = resolve_connector_venue(cfg, *connector)
+                    .unwrap_or_else(|_| (connector_venue_id(*connector).to_string(), 0));
                 let fixture_dir = std::env::var("LIGHTER_FIXTURE_DIR").ok();
                 let fixture_ok = fixture_dir
                     .as_ref()
@@ -2130,7 +2150,8 @@ fn run_preflight(
                 let priv_present = env_present("LIGHTER_API_PRIVATE_KEY_HEX");
                 let token_present = env_present("LIGHTER_AUTH_TOKEN");
                 let signer_present = env_present("LIGHTER_SIGNER_URL");
-                let needs_auth = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
+                let needs_auth = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet)
+                    && v2_live_canary_ranked_execution_venue_allowed(cfg, &venue_id);
                 if needs_auth {
                     creds_ok = creds_ok
                         && api_key_index_present
@@ -2172,12 +2193,15 @@ fn run_preflight(
                     );
                     creds_detail.push_str(&detail);
                 } else {
+                    let (venue_id, _) = resolve_connector_venue(cfg, *connector)
+                        .unwrap_or_else(|_| (connector_venue_id(*connector).to_string(), 0));
                     let ws_ok = is_valid_ws_url(&paradex_ws_url());
                     let market_ok = is_valid_symbol(&paradex_market_symbol());
                     let jwt_present = env_present("PARADEX_JWT");
                     let jwt_cmd_present = env_present("PARADEX_JWT_CMD");
                     let payload_present = env_present("PARADEX_AUTH_PAYLOAD_JSON");
-                    let needs_auth = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
+                    let needs_auth = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet)
+                        && v2_live_canary_ranked_execution_venue_allowed(cfg, &venue_id);
                     if needs_auth {
                         creds_ok = creds_ok && (jwt_present || jwt_cmd_present || payload_present);
                     }
@@ -2210,6 +2234,8 @@ fn run_preflight(
                     );
                     creds_detail.push_str(&detail);
                 } else {
+                    let (venue_id, _) = resolve_connector_venue(cfg, *connector)
+                        .unwrap_or_else(|_| (connector_venue_id(*connector).to_string(), 0));
                     let ws_ok = is_valid_ws_url(&extended_ws_url());
                     let market_ok = is_valid_symbol(&extended_market_symbol());
                     let key_present = env_present("EXTENDED_API_KEY");
@@ -2217,7 +2243,8 @@ fn run_preflight(
                     let stark_private_present = env_present("EXTENDED_STARK_PRIVATE_KEY");
                     let stark_public_present = env_present("EXTENDED_STARK_PUBLIC_KEY");
                     let l2_vault_present = env_present("EXTENDED_L2_VAULT");
-                    let needs_keys = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
+                    let needs_keys = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet)
+                        && v2_live_canary_ranked_execution_venue_allowed(cfg, &venue_id);
                     if needs_keys {
                         creds_ok = creds_ok
                             && key_present
@@ -2257,11 +2284,14 @@ fn run_preflight(
                     );
                     creds_detail.push_str(&detail);
                 } else {
+                    let (venue_id, _) = resolve_connector_venue(cfg, *connector)
+                        .unwrap_or_else(|_| (connector_venue_id(*connector).to_string(), 0));
                     let ws_ok = is_valid_ws_url(&aster_ws_url());
                     let market_ok = is_valid_symbol(&aster_market_symbol());
                     let key_present = env_present("ASTER_API_KEY");
                     let secret_present = env_present("ASTER_API_SECRET");
-                    let needs_keys = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet);
+                    let needs_keys = matches!(trade_mode, TradeMode::Live | TradeMode::Testnet)
+                        && v2_live_canary_ranked_execution_venue_allowed(cfg, &venue_id);
                     if needs_keys {
                         creds_ok = creds_ok && key_present && secret_present;
                     }
@@ -2785,6 +2815,10 @@ send_block_gt_5ms={} send_block_gt_50ms={} send_block_gt_250ms={} emit_since_ms=
                             eprintln!(
                                 "paraphina_live | exec_disabled=true reason=hl_paper_mode connector=hyperliquid"
                             );
+                        } else if !v2_live_canary_ranked_execution_venue_allowed(&cfg, &venue_id) {
+                            eprintln!(
+                                "paraphina_live | exec_disabled=true reason=v2_ranked_execution_venue_not_allowed connector=hyperliquid"
+                            );
                         } else if hl_cfg.private_key_hex.is_some() {
                             exec_clients.insert(venue_id.clone(), hl_arc.clone());
                         } else {
@@ -2976,6 +3010,10 @@ send_block_gt_5ms={} send_block_gt_50ms={} send_block_gt_250ms={} emit_since_ms=
                             eprintln!("paraphina_live | exec_disabled=true reason=lighter_fixture_mode connector=lighter");
                         } else if lighter_cfg.paper_mode {
                             eprintln!("paraphina_live | exec_disabled=true reason=lighter_paper_mode connector=lighter");
+                        } else if !v2_live_canary_ranked_execution_venue_allowed(&cfg, &venue_id) {
+                            eprintln!(
+                                "paraphina_live | exec_disabled=true reason=v2_ranked_execution_venue_not_allowed connector=lighter"
+                            );
                         } else if lighter_cfg.has_auth()
                             && lighter_cfg
                                 .signer_url
@@ -3331,7 +3369,11 @@ send_block_gt_5ms={} send_block_gt_50ms={} send_block_gt_250ms={} emit_since_ms=
                             }
                         }
                         if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
-                            if rest_client.has_execution_auth() {
+                            if !v2_live_canary_ranked_execution_venue_allowed(&cfg, &venue_id) {
+                                eprintln!(
+                                    "paraphina_live | exec_disabled=true reason=v2_ranked_execution_venue_not_allowed connector=extended"
+                                );
+                            } else if rest_client.has_execution_auth() {
                                 exec_clients.insert(venue_id.clone(), rest_client.clone());
                             } else {
                                 eprintln!(
@@ -3567,7 +3609,11 @@ send_block_gt_5ms={} send_block_gt_50ms={} send_block_gt_250ms={} emit_since_ms=
                             }
                         }
                         if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
-                            if rest_client.has_auth() {
+                            if !v2_live_canary_ranked_execution_venue_allowed(&cfg, &venue_id) {
+                                eprintln!(
+                                    "paraphina_live | exec_disabled=true reason=v2_ranked_execution_venue_not_allowed connector=aster"
+                                );
+                            } else if rest_client.has_auth() {
                                 exec_clients.insert(venue_id.clone(), rest_client.clone());
                             } else {
                                 eprintln!(
@@ -3802,7 +3848,11 @@ send_block_gt_5ms={} send_block_gt_50ms={} send_block_gt_250ms={} emit_since_ms=
                             }
                         }
                         if allow_live_gateway && trade_mode.trade_mode != TradeMode::Shadow {
-                            if rest_client.has_auth() {
+                            if !v2_live_canary_ranked_execution_venue_allowed(&cfg, &venue_id) {
+                                eprintln!(
+                                    "paraphina_live | exec_disabled=true reason=v2_ranked_execution_venue_not_allowed connector=paradex"
+                                );
+                            } else if rest_client.has_auth() {
                                 exec_clients.insert(venue_id.clone(), rest_client.clone());
                             } else {
                                 eprintln!(
@@ -5221,10 +5271,34 @@ mod tests {
         cfg.v2_shadow.pair_edge_enabled = true;
         cfg.v2_shadow.pair_conditioned_admission_enabled = true;
         cfg.v2_shadow.live_canary_admission_approved = true;
+        cfg.v2_shadow.live_canary_ranked_execution_venues = vec!["lighter".to_string()];
         cfg.v2_shadow.order_intent_enabled = true;
         cfg.v2_shadow.fast_hedge_enabled = false;
         cfg.v2_shadow.require_phase51_gate = true;
         cfg
+    }
+
+    #[test]
+    fn v2_live_canary_ranked_execution_venue_allowlist_is_live_canary_only() {
+        let mut cfg = paraphina::config::Config::default();
+        assert!(super::v2_live_canary_ranked_execution_venue_allowed(
+            &cfg, "extended"
+        ));
+
+        cfg.v2_shadow.enabled = true;
+        cfg.v2_shadow.decision_mode = paraphina::config::V2DecisionMode::PaperAdmission;
+        cfg.v2_shadow.live_canary_ranked_execution_venues = vec!["lighter".to_string()];
+        assert!(super::v2_live_canary_ranked_execution_venue_allowed(
+            &cfg, "extended"
+        ));
+
+        cfg.v2_shadow.decision_mode = paraphina::config::V2DecisionMode::LiveCanaryAdmission;
+        assert!(super::v2_live_canary_ranked_execution_venue_allowed(
+            &cfg, "lighter"
+        ));
+        assert!(!super::v2_live_canary_ranked_execution_venue_allowed(
+            &cfg, "extended"
+        ));
     }
 
     fn with_v2_live_canary_preflight_env<R>(f: impl FnOnce() -> R) -> R {
@@ -5272,6 +5346,24 @@ mod tests {
             assert!(check.details.contains("post_only=true"));
             assert!(check.details.contains("reduce_only_not_enforced=true"));
             assert!(check.details.contains("baseline_hedge_authority_ack=true"));
+            assert!(check
+                .details
+                .contains("ranked_execution_venues_present=true"));
+        });
+    }
+
+    #[test]
+    fn v2_live_canary_admission_preflight_rejects_missing_ranked_execution_allowlist() {
+        with_v2_live_canary_preflight_env(|| {
+            let mut cfg = v2_live_canary_admission_config();
+            cfg.v2_shadow.live_canary_ranked_execution_venues.clear();
+            let check = super::v2_live_canary_admission_preflight_check(TradeMode::Live, &cfg)
+                .expect("preflight check should run");
+
+            assert!(!check.ok);
+            assert!(check
+                .details
+                .contains("ranked_execution_venues_present=false"));
         });
     }
 

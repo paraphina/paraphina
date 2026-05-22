@@ -185,6 +185,7 @@ pub struct V2AdmissionGateState {
     pub live_canary_order_path_probe_approved: bool,
     pub live_canary_venue_coverage_probe_approved: bool,
     pub live_canary_venue_coverage_probe_venues_present: bool,
+    pub live_canary_ranked_execution_venues_present: bool,
 }
 
 impl V2AdmissionGateState {
@@ -201,7 +202,8 @@ impl V2AdmissionGateState {
             && self.live_canary_max_open_orders_present
             && self.live_canary_post_only_enforced
             && self.live_canary_reduce_only_not_enforced
-            && self.live_canary_baseline_hedge_authority_acknowledged;
+            && self.live_canary_baseline_hedge_authority_acknowledged
+            && self.live_canary_ranked_execution_venues_present;
 
         self.enabled
             && (paper_authority || live_canary_authority)
@@ -266,6 +268,7 @@ pub struct V2AdmissionDecision {
     pub ranking_schema_version: u32,
     pub ranking_feature_only: bool,
     pub ranking_is_admission: bool,
+    pub live_canary_ranked_execution_venues: Vec<String>,
     pub pair_edges: Vec<V2PairEdgeSnapshot>,
     pub admitted_candidates: Vec<V2AdmittedCandidate>,
 }
@@ -402,6 +405,9 @@ pub fn admission_gate_state(
         live_canary_venue_coverage_probe_venues_present: !config
             .live_canary_venue_coverage_probe_venues
             .is_empty(),
+        live_canary_ranked_execution_venues_present: !config
+            .live_canary_ranked_execution_venues
+            .is_empty(),
         live_canary_mode_enabled: runtime_context.live_canary_mode_enabled,
         live_canary_profile_metadata_present: runtime_context.live_canary_profile_metadata_present,
         live_canary_max_position_present: runtime_context.live_canary_max_position_present,
@@ -518,6 +524,7 @@ pub fn evaluate_admission_decision_with_context(
     let live_canary_mode = matches!(config.decision_mode, V2DecisionMode::LiveCanaryAdmission);
     let mut order_path_probe_is_admission = false;
     let mut venue_coverage_probe_is_admission = false;
+    let ranked_execution_venues = live_canary_ranked_execution_venue_set(config, live_canary_mode);
     let mut admitted_candidates = if gate_satisfied {
         if live_canary_mode
             && config.live_canary_venue_coverage_probe_approved
@@ -540,6 +547,12 @@ pub fn evaluate_admission_decision_with_context(
                     let candidate = candidates
                         .iter()
                         .find(|candidate| candidate.candidate_id == ranking.candidate_id)?;
+                    if !live_canary_candidate_execution_allowed(
+                        &ranked_execution_venues,
+                        &candidate.venue_id,
+                    ) {
+                        return None;
+                    }
                     Some(V2AdmittedCandidate {
                         candidate_id: ranking.candidate_id.clone(),
                         venue_index: candidate.venue_index,
@@ -570,8 +583,13 @@ pub fn evaluate_admission_decision_with_context(
         if let Some(candidate) =
             select_single_venue_order_path_probe_candidate(&candidates, &rankings)
         {
-            admitted_candidates.push(candidate);
-            order_path_probe_is_admission = true;
+            if live_canary_candidate_execution_allowed(
+                &ranked_execution_venues,
+                &candidate.venue_id,
+            ) {
+                admitted_candidates.push(candidate);
+                order_path_probe_is_admission = true;
+            }
         }
     }
 
@@ -641,9 +659,37 @@ pub fn evaluate_admission_decision_with_context(
         ranking_is_admission: admitted
             && !order_path_probe_is_admission
             && !venue_coverage_probe_is_admission,
+        live_canary_ranked_execution_venues: config.live_canary_ranked_execution_venues.clone(),
         pair_edges,
         admitted_candidates,
     })
+}
+
+fn live_canary_ranked_execution_venue_set(
+    config: &V2ShadowConfig,
+    live_canary_mode: bool,
+) -> Option<std::collections::HashSet<String>> {
+    if !live_canary_mode || config.live_canary_ranked_execution_venues.is_empty() {
+        return None;
+    }
+    Some(
+        config
+            .live_canary_ranked_execution_venues
+            .iter()
+            .map(|venue| venue.trim().to_ascii_lowercase())
+            .filter(|venue| !venue.is_empty())
+            .collect(),
+    )
+}
+
+fn live_canary_candidate_execution_allowed(
+    allowed: &Option<std::collections::HashSet<String>>,
+    venue_id: &str,
+) -> bool {
+    allowed
+        .as_ref()
+        .map(|venues| venues.contains(&venue_id.to_ascii_lowercase()))
+        .unwrap_or(true)
 }
 
 fn select_live_canary_venue_coverage_probe_candidates(
@@ -877,8 +923,36 @@ pub fn apply_admission_filter_with_context(
         idx += 1;
         keep
     });
+    retain_live_canary_ranked_execution_venues(config, &decision, intents);
     suppress_live_canary_venue_coverage_cancel_only_churn(config, &decision, intents);
     Ok(Some(decision))
+}
+
+fn retain_live_canary_ranked_execution_venues(
+    config: &V2ShadowConfig,
+    decision: &V2AdmissionDecision,
+    intents: &mut Vec<OrderIntent>,
+) {
+    if !matches!(config.decision_mode, V2DecisionMode::LiveCanaryAdmission)
+        || decision.venue_coverage_probe_is_admission
+        || (config.live_canary_venue_coverage_probe_approved
+            && !config.live_canary_venue_coverage_probe_venues.is_empty())
+        || config.live_canary_ranked_execution_venues.is_empty()
+    {
+        return;
+    }
+    let allowed = live_canary_ranked_execution_venue_set(config, true)
+        .expect("nonempty ranked execution venues");
+    intents.retain(|intent| match intent {
+        OrderIntent::Place(place) => allowed.contains(&place.venue_id.to_ascii_lowercase()),
+        OrderIntent::Replace(replace) => allowed.contains(&replace.venue_id.to_ascii_lowercase()),
+        OrderIntent::Cancel(cancel) => allowed.contains(&cancel.venue_id.to_ascii_lowercase()),
+        OrderIntent::CancelAll(cancel_all) => cancel_all
+            .venue_id
+            .as_ref()
+            .map(|venue_id| allowed.contains(&venue_id.to_ascii_lowercase()))
+            .unwrap_or(false),
+    });
 }
 
 fn live_canary_venue_coverage_sticky_resting_enabled(
@@ -1574,6 +1648,7 @@ mod tests {
             pair_edge_enabled: true,
             pair_conditioned_admission_enabled: true,
             live_canary_admission_approved: true,
+            live_canary_ranked_execution_venues: vec!["lighter".to_string()],
             order_intent_enabled: true,
             require_phase51_gate: true,
             ..V2ShadowConfig::default()
@@ -2101,22 +2176,85 @@ mod tests {
         assert!(decision.gate_state.live_canary_profile_metadata_present);
         assert!(decision.gate_state.live_canary_post_only_enforced);
         assert!(decision.gate_state.live_canary_reduce_only_not_enforced);
+        assert!(
+            decision
+                .gate_state
+                .live_canary_ranked_execution_venues_present
+        );
+        assert_eq!(
+            decision.live_canary_ranked_execution_venues,
+            vec!["lighter".to_string()]
+        );
         assert_eq!(decision.baseline_mm_order_creating_intent_count, 4);
         assert_eq!(decision.order_intent_output_count, 1);
         assert_eq!(decision.suppressed_mm_order_creating_intent_count, 3);
         assert!(!decision.pressure_complete_claim);
         assert!(!decision.blocker_cleared);
-        assert_eq!(intents.len(), 2, "one MM intent plus cancel retained");
+        assert_eq!(intents.len(), 1, "only the Lighter MM intent is retained");
         assert!(
             matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "lighter" && place.side == Side::Sell)
         );
-        assert!(matches!(&intents[1], OrderIntent::Cancel(_)));
 
         let serialized = serde_json::to_string(&decision).expect("serialize");
         assert!(!serialized.contains("raw-client-id-must-not-emit"));
         assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
         assert!(!serialized.contains("raw-group-must-not-emit"));
         assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_ranked_execution_allowlist_holds_when_only_non_lighter_is_positive() {
+        let config = live_canary_admission_config();
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Sell, 105.0),
+            mm_place(3, "lighter", Side::Sell, 100.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.admission_reason, "no_positive_ranked_candidates");
+        assert!(decision.gate_state.satisfied());
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert_eq!(decision.baseline_mm_order_creating_intent_count, 2);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 2);
+        assert!(decision.admitted_candidates.is_empty());
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn v2_live_canary_ranked_execution_allowlist_is_required_for_live_gate() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_ranked_execution_venues.clear();
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(0, "extended", Side::Buy, 99.0),
+            mm_place(3, "lighter", Side::Sell, 105.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(
+            decision.admission_reason,
+            "live_canary_admission_gate_not_satisfied"
+        );
+        assert!(!decision.gate_state.satisfied());
+        assert!(
+            !decision
+                .gate_state
+                .live_canary_ranked_execution_venues_present
+        );
+        assert!(!decision.can_filter_existing_intents);
+        assert_eq!(decision.suppressed_mm_order_creating_intent_count, 0);
+        assert_eq!(intents.len(), 2, "missing gate must not mutate intents");
     }
 
     #[test]
@@ -2229,14 +2367,12 @@ mod tests {
                 .expect("filter")
                 .expect("decision");
 
-        assert_eq!(decision.admission_status, "ADMITTED");
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.admission_reason, "no_positive_ranked_candidates");
         assert_eq!(decision.authority_scope, "live_canary_ranked_admission");
         assert!(!decision.venue_coverage_probe_is_admission);
-        assert_eq!(decision.order_intent_output_count, 1);
-        assert_eq!(intents.len(), 1);
-        assert!(
-            matches!(&intents[0], OrderIntent::Place(place) if place.venue_id.as_ref() == "extended")
-        );
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert_eq!(intents.len(), 0);
     }
 
     #[test]

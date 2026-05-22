@@ -29,6 +29,9 @@ def paper_gate_state():
         "live_canary_post_only_enforced": False,
         "live_canary_reduce_only_not_enforced": False,
         "live_canary_baseline_hedge_authority_acknowledged": False,
+        "live_canary_venue_coverage_probe_approved": False,
+        "live_canary_venue_coverage_probe_venues_present": False,
+        "live_canary_ranked_execution_venues_present": False,
     }
 
 
@@ -50,6 +53,7 @@ def live_canary_gate_state():
             "live_canary_post_only_enforced": True,
             "live_canary_reduce_only_not_enforced": True,
             "live_canary_baseline_hedge_authority_acknowledged": True,
+            "live_canary_ranked_execution_venues_present": True,
         }
     )
     return gate
@@ -92,6 +96,7 @@ def admitted_row():
         "ranking_schema_version": 1,
         "ranking_feature_only": False,
         "ranking_is_admission": True,
+        "live_canary_ranked_execution_venues": [],
         "pair_edges": [
             {
                 "snapshot_id": "v2_pair_edge_v1:v2_shadow_intent_v1:0:extended:buy:0:v2_shadow_intent_v1:1:lighter:sell:1",
@@ -126,6 +131,7 @@ def live_canary_admitted_row():
     row["authority_scope"] = "live_canary_ranked_admission"
     row["admission_reason"] = "live_canary_positive_pair_edge_ranked_admission"
     row["gate_state"] = live_canary_gate_state()
+    row["live_canary_ranked_execution_venues"] = ["extended"]
     return row
 
 
@@ -140,6 +146,7 @@ def live_canary_order_path_probe_row():
     row["order_path_probe_is_admission"] = True
     row["ranking_is_admission"] = False
     row["gate_state"]["live_canary_order_path_probe_approved"] = True
+    row["live_canary_ranked_execution_venues"] = ["lighter"]
     row["pair_edges"] = [
         {
             "snapshot_id": "v2_pair_edge_v1:missing_ask",
@@ -524,6 +531,14 @@ class TestV2AuthorityDecisionValidator(unittest.TestCase):
             row["order_intent_output_count"] = 2
             row["baseline_mm_order_creating_intent_count"] = 3
             row["suppressed_mm_order_creating_intent_count"] = 1
+            evidence = write_rows(Path(tmp), [row])
+            with self.assertRaises(validator.V2AuthorityValidationError):
+                validator.validate_v2_authority_decisions(evidence)
+
+    def test_rejects_live_ranked_candidate_outside_execution_allowlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = live_canary_admitted_row()
+            row["live_canary_ranked_execution_venues"] = ["lighter"]
             evidence = write_rows(Path(tmp), [row])
             with self.assertRaises(validator.V2AuthorityValidationError):
                 validator.validate_v2_authority_decisions(evidence)

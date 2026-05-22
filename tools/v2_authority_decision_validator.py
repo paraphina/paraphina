@@ -122,6 +122,9 @@ def _validate_gate_state(row: dict[str, Any], line: int, live_canary: bool) -> b
         "live_canary_post_only_enforced",
         "live_canary_reduce_only_not_enforced",
         "live_canary_baseline_hedge_authority_acknowledged",
+        "live_canary_venue_coverage_probe_approved",
+        "live_canary_venue_coverage_probe_venues_present",
+        "live_canary_ranked_execution_venues_present",
     ]
     for field in expected_bool_fields:
         _require(isinstance(gate_state.get(field), bool), line, f"gate_state.{field} must be bool")
@@ -150,6 +153,7 @@ def _validate_gate_state(row: dict[str, Any], line: int, live_canary: bool) -> b
         and gate_state["live_canary_post_only_enforced"]
         and gate_state["live_canary_reduce_only_not_enforced"]
         and gate_state["live_canary_baseline_hedge_authority_acknowledged"]
+        and gate_state["live_canary_ranked_execution_venues_present"]
     )
     _require(
         not (paper_authority and live_canary_authority),
@@ -193,6 +197,17 @@ def _validate_admitted_candidates(
 ) -> None:
     candidates = row.get("admitted_candidates")
     _require(isinstance(candidates, list), line, "admitted_candidates must be list")
+    ranked_execution_venues = row.get("live_canary_ranked_execution_venues", [])
+    _require(
+        isinstance(ranked_execution_venues, list),
+        line,
+        "live_canary_ranked_execution_venues must be list",
+    )
+    ranked_execution_venue_set = {
+        venue.strip().lower()
+        for venue in ranked_execution_venues
+        if isinstance(venue, str) and venue.strip()
+    }
     candidate_ids: set[str] = set()
     if row.get("admission_status") == "ADMITTED":
         _require(gate_satisfied, line, "ADMITTED row without satisfied gate")
@@ -211,6 +226,12 @@ def _validate_admitted_candidates(
         candidate_ids.add(candidate_id)
         _require(isinstance(candidate.get("venue_index"), int), line, f"admitted_candidates[{idx}] venue_index invalid")
         _require(isinstance(candidate.get("venue_id"), str), line, f"admitted_candidates[{idx}] venue_id invalid")
+        if row.get("decision_mode") == "live_canary_admission" and not venue_coverage_probe:
+            _require(
+                candidate["venue_id"].lower() in ranked_execution_venue_set,
+                line,
+                f"admitted_candidates[{idx}] venue must be in ranked execution allowlist",
+            )
         _require(candidate.get("side") in {"Buy", "Sell"}, line, f"admitted_candidates[{idx}] side invalid")
         _require(isinstance(candidate.get("rank_index"), int), line, f"admitted_candidates[{idx}] rank_index invalid")
         rank_score = candidate.get("rank_score_microusd")
@@ -234,6 +255,21 @@ def _validate_row(row: dict[str, Any], line: int, summary: V2AuthoritySummary) -
         "decision_mode must be paper_admission or live_canary_admission",
     )
     live_canary = decision_mode == "live_canary_admission"
+    ranked_execution_venues = row.get("live_canary_ranked_execution_venues", [])
+    if live_canary:
+        _require(
+            isinstance(ranked_execution_venues, list)
+            and len(ranked_execution_venues) > 0
+            and all(isinstance(venue, str) and venue.strip() for venue in ranked_execution_venues),
+            line,
+            "live-canary row requires non-empty ranked execution venue list",
+        )
+    else:
+        _require(
+            isinstance(ranked_execution_venues, list),
+            line,
+            "paper row ranked execution venue field must be list",
+        )
     authority_scope = row.get("authority_scope")
     if live_canary:
         _require(row.get("execution_mode") == "live", line, "live_canary_admission requires execution_mode live")
