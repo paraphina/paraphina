@@ -6221,9 +6221,18 @@ pub async fn run_live_loop(
                 );
             }
         }
-        if let Err(err) =
-            crate::v2::emit_shadow_decision(&cfg.v2_shadow, now_ms, &mm_quotes, &intents)
-        {
+        let v2_top_of_book_candidates = if cfg.v2_shadow.shadow_top_of_book_candidates_enabled {
+            crate::v2::extract_shadow_top_of_book_candidates(&state)
+        } else {
+            Vec::new()
+        };
+        if let Err(err) = crate::v2::emit_shadow_decision_with_top_of_book_candidates(
+            &cfg.v2_shadow,
+            now_ms,
+            &mm_quotes,
+            &intents,
+            &v2_top_of_book_candidates,
+        ) {
             eprintln!(
                 "[v2] shadow decision emit failed reason={}",
                 err.sanitized_reason()

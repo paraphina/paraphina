@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::config::{V2DecisionMode, V2ShadowConfig};
 use crate::mm::{MmLevel, MmQuote};
+use crate::state::GlobalState;
 use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs};
 
 const V2_SHADOW_SCHEMA_VERSION: u32 = 1;
@@ -422,10 +423,33 @@ pub fn evaluate_shadow_decision(
     quotes: &[MmQuote],
     baseline_plan_intents: &[OrderIntent],
 ) -> Option<V2ShadowDecision> {
+    evaluate_shadow_decision_with_top_of_book_candidates(
+        config,
+        now_ms,
+        quotes,
+        baseline_plan_intents,
+        &[],
+    )
+}
+
+pub fn evaluate_shadow_decision_with_top_of_book_candidates(
+    config: &V2ShadowConfig,
+    now_ms: TimestampMs,
+    quotes: &[MmQuote],
+    baseline_plan_intents: &[OrderIntent],
+    top_of_book_candidates: &[V2ShadowCandidate],
+) -> Option<V2ShadowDecision> {
     if !v2_shadow_active(config) {
         return None;
     }
-    let mut candidates = extract_shadow_candidates(quotes);
+    let mut candidates = if config.shadow_top_of_book_candidates_enabled {
+        top_of_book_candidates.to_vec()
+    } else {
+        Vec::new()
+    };
+    if candidates.is_empty() {
+        candidates = extract_shadow_candidates(quotes);
+    }
     if candidates.is_empty() {
         candidates = extract_shadow_candidates_from_intents(baseline_plan_intents);
     }
@@ -964,8 +988,29 @@ pub fn emit_shadow_decision(
     quotes: &[MmQuote],
     baseline_plan_intents: &[OrderIntent],
 ) -> Result<Option<usize>, V2ShadowError> {
-    let Some(decision) = evaluate_shadow_decision(config, now_ms, quotes, baseline_plan_intents)
-    else {
+    emit_shadow_decision_with_top_of_book_candidates(
+        config,
+        now_ms,
+        quotes,
+        baseline_plan_intents,
+        &[],
+    )
+}
+
+pub fn emit_shadow_decision_with_top_of_book_candidates(
+    config: &V2ShadowConfig,
+    now_ms: TimestampMs,
+    quotes: &[MmQuote],
+    baseline_plan_intents: &[OrderIntent],
+    top_of_book_candidates: &[V2ShadowCandidate],
+) -> Result<Option<usize>, V2ShadowError> {
+    let Some(decision) = evaluate_shadow_decision_with_top_of_book_candidates(
+        config,
+        now_ms,
+        quotes,
+        baseline_plan_intents,
+        top_of_book_candidates,
+    ) else {
         return Ok(None);
     };
     let path = Path::new(&config.output_path);
@@ -979,6 +1024,43 @@ pub fn emit_shadow_decision(
         append_shadow_ev_evaluation(path, &ev_evaluation)?;
     }
     Ok(Some(decision.candidates.len()))
+}
+
+pub fn extract_shadow_top_of_book_candidates(state: &GlobalState) -> Vec<V2ShadowCandidate> {
+    let mut candidates = Vec::with_capacity(state.venues.len() * 2);
+    for (venue_index, venue) in state.venues.iter().enumerate() {
+        if let Some(level) = venue.orderbook_l2.best_bid() {
+            if level.price.is_finite()
+                && level.price > 0.0
+                && level.size.is_finite()
+                && level.size > 0.0
+            {
+                candidates.push(top_of_book_candidate(
+                    venue_index,
+                    venue.id.as_ref(),
+                    Side::Buy,
+                    level.price,
+                    level.size,
+                ));
+            }
+        }
+        if let Some(level) = venue.orderbook_l2.best_ask() {
+            if level.price.is_finite()
+                && level.price > 0.0
+                && level.size.is_finite()
+                && level.size > 0.0
+            {
+                candidates.push(top_of_book_candidate(
+                    venue_index,
+                    venue.id.as_ref(),
+                    Side::Sell,
+                    level.price,
+                    level.size,
+                ));
+            }
+        }
+    }
+    candidates
 }
 
 fn count_baseline_mm_order_creating_intents(intents: &[OrderIntent]) -> usize {
@@ -1091,6 +1173,34 @@ fn candidate_from_level(quote: &MmQuote, side: Side, level: &MmLevel) -> V2Shado
         } else {
             "missing"
         },
+        admission_status: V2ShadowAdmissionStatus::Hold.as_str(),
+        admission_reason: "shadow_only_no_order_authority",
+    }
+}
+
+fn top_of_book_candidate(
+    venue_index: usize,
+    venue_id: &str,
+    side: Side,
+    price: f64,
+    size: f64,
+) -> V2ShadowCandidate {
+    V2ShadowCandidate {
+        candidate_id: format!(
+            "v2_shadow_book_v1:{}:{}:{}",
+            venue_index,
+            venue_id,
+            side.as_v2_str()
+        ),
+        candidate_source: "top_of_book",
+        replay_lineage_state: "shadow_candidate",
+        price_size_source: "orderbook_l2_top",
+        venue_index,
+        venue_id: venue_id.to_string(),
+        side,
+        price,
+        size,
+        target_linkage_state: "missing",
         admission_status: V2ShadowAdmissionStatus::Hold.as_str(),
         admission_reason: "shadow_only_no_order_authority",
     }
@@ -1363,11 +1473,14 @@ impl V2SideExt for Side {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use super::*;
-    use crate::config::V2ShadowConfig;
+    use crate::config::{Config, V2ShadowConfig};
     use crate::mm::{mm_quotes_to_order_intents, MmLevel, MmQuote};
+    use crate::orderbook_l2::BookLevel;
+    use crate::state::GlobalState;
     use crate::types::CanonicalTargetIdentity;
 
     fn quote() -> MmQuote {
@@ -1725,6 +1838,96 @@ mod tests {
         let serialized = serde_json::to_string(&decision).expect("serialize");
         assert!(!serialized.contains("raw-group-must-not-emit"));
         assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_shadow_top_of_book_candidates_cover_all_five_runtime_books() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        assert_eq!(
+            state.venues.len(),
+            5,
+            "default config should preserve all-five venue order"
+        );
+        for (idx, venue) in state.venues.iter_mut().enumerate() {
+            let base = 100.0 + idx as f64;
+            venue
+                .apply_l2_snapshot(
+                    &[BookLevel {
+                        price: base,
+                        size: 0.01 + idx as f64 * 0.001,
+                    }],
+                    &[BookLevel {
+                        price: base + 0.5,
+                        size: 0.02 + idx as f64 * 0.001,
+                    }],
+                    idx as u64 + 1,
+                    10_000 + idx as i64,
+                    1,
+                    0.1,
+                    0.1,
+                )
+                .expect("seed top of book");
+        }
+
+        let candidates = extract_shadow_top_of_book_candidates(&state);
+        assert_eq!(candidates.len(), 10);
+        let venue_ids = candidates
+            .iter()
+            .map(|candidate| candidate.venue_id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            venue_ids,
+            HashSet::from(["extended", "hyperliquid", "aster", "lighter", "paradex"])
+        );
+        for candidate in &candidates {
+            assert_eq!(candidate.candidate_source, "top_of_book");
+            assert_eq!(candidate.replay_lineage_state, "shadow_candidate");
+            assert_eq!(candidate.price_size_source, "orderbook_l2_top");
+            assert_eq!(candidate.target_linkage_state, "missing");
+            assert_eq!(candidate.admission_status, "HOLD");
+            assert_eq!(candidate.admission_reason, "shadow_only_no_order_authority");
+            assert!(candidate.candidate_id.starts_with("v2_shadow_book_v1:"));
+        }
+
+        let mut shadow = shadow_config();
+        shadow.shadow_top_of_book_candidates_enabled = true;
+        let decision = evaluate_shadow_decision_with_top_of_book_candidates(
+            &shadow,
+            10_500,
+            &[quote()],
+            &[],
+            &candidates,
+        )
+        .expect("decision");
+        assert_eq!(decision.candidates.len(), 10);
+        assert_eq!(decision.candidate_rankings.len(), 10);
+        assert_eq!(decision.baseline_plan_intent_count, 0);
+        assert_eq!(decision.baseline_mm_order_creating_intent_count, 0);
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert!(decision.ranking_feature_only);
+        assert!(!decision.ranking_is_admission);
+        assert!(!decision.can_mutate_orders);
+        assert!(!decision.pair_edge_is_admission);
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+
+        let ev_rows = evaluate_shadow_ev_evaluations(
+            shadow.telemetry_schema_version,
+            10_500,
+            &decision.candidates,
+            &decision.candidate_rankings,
+        );
+        assert_eq!(ev_rows.len(), 10);
+        assert!(ev_rows.iter().all(|row| {
+            row.candidate_source == "top_of_book"
+                && row.price_size_source == "orderbook_l2_top"
+                && row.ev_status == "HOLD"
+                && !row.ev_is_admission
+                && !row.can_create_new_intents
+                && !row.can_mutate_live_orders
+                && !row.blocker_cleared
+        }));
     }
 
     #[test]

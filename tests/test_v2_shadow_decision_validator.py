@@ -196,6 +196,49 @@ class TestV2ShadowDecisionValidator(unittest.TestCase):
             self.assertFalse(summary.blocker_cleared_any)
             self.assertFalse(summary.pressure_complete_claim_any)
 
+    def test_top_of_book_candidate_source_passes_when_hold_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            row = valid_row()
+            candidate_id = "v2_shadow_book_v1:0:extended:buy"
+            row["candidates"][0].update(
+                {
+                    "candidate_id": candidate_id,
+                    "candidate_source": "top_of_book",
+                    "price_size_source": "orderbook_l2_top",
+                    "target_linkage_state": "missing",
+                    "venue_id": "extended",
+                }
+            )
+            row["candidate_rankings"][0]["candidate_id"] = candidate_id
+            row["candidate_rankings"][0]["rank_tiebreak_key"] = (
+                f"1:0000:buy:{candidate_id}"
+            )
+            row["pair_edges"][0]["bid_candidate_id"] = candidate_id
+
+            ev = valid_ev_row()
+            ev.update(
+                {
+                    "candidate_id": candidate_id,
+                    "candidate_source": "top_of_book",
+                    "price_size_source": "orderbook_l2_top",
+                    "target_linkage_state": "missing",
+                    "venue_id": "extended",
+                }
+            )
+
+            evidence = Path(td) / "evidence.jsonl"
+            write_jsonl(evidence, [row, ev])
+            summary = validator.validate_v2_shadow_decisions(
+                evidence,
+                require_ev_evaluations=True,
+            )
+
+            self.assertEqual(summary.candidate_count_total, 1)
+            self.assertEqual(summary.ev_evaluation_count_total, 1)
+            self.assertEqual(summary.candidate_target_linkage_states, {"missing": 1})
+            self.assertFalse(summary.blocker_cleared_any)
+            self.assertFalse(summary.pressure_complete_claim_any)
+
     def test_require_ev_evaluations_rejects_missing_candidate_ev(self):
         with tempfile.TemporaryDirectory() as td:
             evidence = Path(td) / "evidence.jsonl"

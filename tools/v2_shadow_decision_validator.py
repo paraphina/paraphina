@@ -32,12 +32,16 @@ ALLOWED_TARGET_LINKAGE_STATES = {"missing", "present_redacted"}
 ALLOWED_SIDES = {"Buy", "Sell"}
 ALLOWED_PAIR_EDGE_INVALID_REASONS = {None, "missing_bid", "missing_ask"}
 ALLOWED_RANKING_STATUSES = {"scored", "missing_cross_venue_reference"}
-ALLOWED_CANDIDATE_SOURCES = {"mm_quote", "baseline_plan"}
+ALLOWED_CANDIDATE_SOURCES = {"mm_quote", "baseline_plan", "top_of_book"}
 ALLOWED_REPLAY_LINEAGE_STATES = {"shadow_candidate"}
-ALLOWED_PRICE_SIZE_SOURCES = {"quote_level", "baseline_plan_sanitized"}
+ALLOWED_PRICE_SIZE_SOURCES = {"quote_level", "baseline_plan_sanitized", "orderbook_l2_top"}
 ALLOWED_EV_STATUSES = {"HOLD"}
 ALLOWED_EV_REASONS = {"shadow_ev_components_unavailable"}
-CANDIDATE_ID_PREFIXES = ("v2_shadow_v1:", "v2_shadow_intent_v1:")
+CANDIDATE_ID_PREFIXES = (
+    "v2_shadow_v1:",
+    "v2_shadow_intent_v1:",
+    "v2_shadow_book_v1:",
+)
 PAIR_EDGE_ID_PREFIX = "v2_pair_edge_v1:"
 
 FORBIDDEN_KEY_NAMES = {

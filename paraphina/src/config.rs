@@ -119,6 +119,7 @@ pub struct V2ShadowConfig {
     pub decision_mode: V2DecisionMode,
     pub output_path: String,
     pub pair_edge_enabled: bool,
+    pub shadow_top_of_book_candidates_enabled: bool,
     pub pair_conditioned_admission_enabled: bool,
     pub live_canary_admission_approved: bool,
     pub live_canary_order_path_probe_approved: bool,
@@ -139,6 +140,7 @@ impl Default for V2ShadowConfig {
             output_path: "/home/ubuntu/source_owner_inbox/phase51/v2_shadow_decisions.jsonl"
                 .to_string(),
             pair_edge_enabled: false,
+            shadow_top_of_book_candidates_enabled: false,
             pair_conditioned_admission_enabled: false,
             live_canary_admission_approved: false,
             live_canary_order_path_probe_approved: false,
@@ -2982,6 +2984,29 @@ impl Config {
             }
         }
 
+        if let Ok(raw) = env::var("PARAPHINA_V2_SHADOW_TOP_OF_BOOK_CANDIDATES") {
+            match parse_bool_env(&raw) {
+                Some(enabled) if matches!(cfg.v2_shadow.decision_mode, V2DecisionMode::Shadow) => {
+                    cfg.v2_shadow.shadow_top_of_book_candidates_enabled = enabled;
+                    eprintln!(
+                        "[config] PARAPHINA_V2_SHADOW_TOP_OF_BOOK_CANDIDATES = {} (shadow-only top-of-book candidate evidence)",
+                        cfg.v2_shadow.shadow_top_of_book_candidates_enabled
+                    );
+                }
+                Some(_) => {
+                    eprintln!(
+                        "[config] PARAPHINA_V2_SHADOW_TOP_OF_BOOK_CANDIDATES ignored outside shadow mode"
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[config] WARN: could not parse PARAPHINA_V2_SHADOW_TOP_OF_BOOK_CANDIDATES = {:?} as bool; using default {}",
+                        raw, cfg.v2_shadow.shadow_top_of_book_candidates_enabled
+                    );
+                }
+            }
+        }
+
         if let Ok(raw) = env::var("PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE") {
             match parse_bool_env(&raw) {
                 Some(enabled)
@@ -3441,6 +3466,7 @@ mod tests {
         const ENABLED_KEY: &str = "PARAPHINA_V2_ENABLE";
         const MODE_KEY: &str = "PARAPHINA_V2_DECISION_MODE";
         const PAIR_EDGE_KEY: &str = "PARAPHINA_V2_PAIR_EDGE_ENABLE";
+        const TOP_OF_BOOK_KEY: &str = "PARAPHINA_V2_SHADOW_TOP_OF_BOOK_CANDIDATES";
         const OUTPUT_PATH_KEY: &str = "PARAPHINA_V2_OUTPUT_PATH";
         const ADMISSION_KEY: &str = "PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE";
         const LIVE_CANARY_APPROVAL_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED";
@@ -3452,6 +3478,7 @@ mod tests {
         let _enabled = EnvGuard::new(ENABLED_KEY);
         let _mode = EnvGuard::new(MODE_KEY);
         let _pair_edge = EnvGuard::new(PAIR_EDGE_KEY);
+        let _top_of_book = EnvGuard::new(TOP_OF_BOOK_KEY);
         let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
         let _admission = EnvGuard::new(ADMISSION_KEY);
         let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
@@ -3463,6 +3490,7 @@ mod tests {
             ENABLED_KEY,
             MODE_KEY,
             PAIR_EDGE_KEY,
+            TOP_OF_BOOK_KEY,
             OUTPUT_PATH_KEY,
             ADMISSION_KEY,
             LIVE_CANARY_APPROVAL_KEY,
@@ -3511,6 +3539,7 @@ mod tests {
         const ENABLED_KEY: &str = "PARAPHINA_V2_ENABLE";
         const MODE_KEY: &str = "PARAPHINA_V2_DECISION_MODE";
         const PAIR_EDGE_KEY: &str = "PARAPHINA_V2_PAIR_EDGE_ENABLE";
+        const TOP_OF_BOOK_KEY: &str = "PARAPHINA_V2_SHADOW_TOP_OF_BOOK_CANDIDATES";
         const OUTPUT_PATH_KEY: &str = "PARAPHINA_V2_OUTPUT_PATH";
         const ADMISSION_KEY: &str = "PARAPHINA_V2_PAIR_CONDITIONED_ADMISSION_ENABLE";
         const LIVE_CANARY_APPROVAL_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED";
@@ -3524,6 +3553,7 @@ mod tests {
         let _enabled = EnvGuard::new(ENABLED_KEY);
         let _mode = EnvGuard::new(MODE_KEY);
         let _pair_edge = EnvGuard::new(PAIR_EDGE_KEY);
+        let _top_of_book = EnvGuard::new(TOP_OF_BOOK_KEY);
         let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
         let _admission = EnvGuard::new(ADMISSION_KEY);
         let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
@@ -3535,6 +3565,7 @@ mod tests {
         env::set_var(ENABLED_KEY, "yes");
         env::set_var(MODE_KEY, "shadow");
         env::set_var(PAIR_EDGE_KEY, "true");
+        env::set_var(TOP_OF_BOOK_KEY, "true");
         env::set_var(OUTPUT_PATH_KEY, "/tmp/paraphina_v2_shadow_test.jsonl");
         env::set_var(ADMISSION_KEY, "true");
         env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
@@ -3547,6 +3578,7 @@ mod tests {
         assert!(cfg.v2_shadow.enabled);
         assert_eq!(cfg.v2_shadow.decision_mode, V2DecisionMode::Shadow);
         assert!(cfg.v2_shadow.pair_edge_enabled);
+        assert!(cfg.v2_shadow.shadow_top_of_book_candidates_enabled);
         assert!(
             !cfg.v2_shadow.pair_conditioned_admission_enabled,
             "shadow mode must ignore paper authority gates"
@@ -3587,17 +3619,20 @@ mod tests {
         const ENABLED_KEY: &str = "PARAPHINA_V2_ENABLE";
         const MODE_KEY: &str = "PARAPHINA_V2_DECISION_MODE";
         const PAIR_EDGE_KEY: &str = "PARAPHINA_V2_PAIR_EDGE_ENABLE";
+        const TOP_OF_BOOK_KEY: &str = "PARAPHINA_V2_SHADOW_TOP_OF_BOOK_CANDIDATES";
         const OUTPUT_PATH_KEY: &str = "PARAPHINA_V2_OUTPUT_PATH";
 
         let _lock = env_lock().lock().unwrap();
         let _enabled = EnvGuard::new(ENABLED_KEY);
         let _mode = EnvGuard::new(MODE_KEY);
         let _pair_edge = EnvGuard::new(PAIR_EDGE_KEY);
+        let _top_of_book = EnvGuard::new(TOP_OF_BOOK_KEY);
         let _output_path = EnvGuard::new(OUTPUT_PATH_KEY);
 
         env::set_var(ENABLED_KEY, "maybe");
         env::set_var(MODE_KEY, "live");
         env::set_var(PAIR_EDGE_KEY, "sometimes");
+        env::set_var(TOP_OF_BOOK_KEY, "maybe");
         env::set_var(OUTPUT_PATH_KEY, "   ");
 
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
