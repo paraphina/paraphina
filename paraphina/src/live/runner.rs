@@ -2016,6 +2016,24 @@ fn v2_live_canary_ranked_execution_validate_order_intents(
     Ok(())
 }
 
+fn startup_pnl_baseline_required_venue_ids_for_ranked_execution_canary(
+    cfg: &Config,
+) -> Option<HashSet<String>> {
+    if cfg.v2_shadow.decision_mode != crate::config::V2DecisionMode::LiveCanaryAdmission {
+        return None;
+    }
+    if cfg.v2_shadow.live_canary_ranked_execution_venues.is_empty() {
+        return None;
+    }
+    Some(
+        cfg.v2_shadow
+            .live_canary_ranked_execution_venues
+            .iter()
+            .map(|venue| venue.to_ascii_lowercase())
+            .collect(),
+    )
+}
+
 fn phase51_lighter_baseline_cleanup_only_enabled() -> bool {
     phase51_true_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV)
 }
@@ -12166,6 +12184,17 @@ fn evaluate_startup_pnl_baseline(
     waited_ticks: u64,
     guard_cfg: StartupPnlBaselineConfig,
 ) -> StartupPnlBaselineStatus {
+    let required_venue_ids =
+        startup_pnl_baseline_required_venue_ids_for_ranked_execution_canary(cfg);
+    let required_account_count = cfg
+        .venues
+        .iter()
+        .filter(|venue| {
+            required_venue_ids.as_ref().map_or(true, |required| {
+                required.contains(&venue.id.to_ascii_lowercase())
+            })
+        })
+        .count();
     let mut status = StartupPnlBaselineStatus {
         enabled: guard_cfg.enabled,
         waited_ticks,
@@ -12176,10 +12205,15 @@ fn evaluate_startup_pnl_baseline(
         daily_realised_pnl: state.daily_realised_pnl,
         daily_unrealised_pnl: state.daily_unrealised_pnl,
         daily_pnl_total: state.daily_pnl_total,
-        required_account_count: cfg.venues.len(),
+        required_account_count,
         ..StartupPnlBaselineStatus::default()
     };
     if !guard_cfg.enabled {
+        return status;
+    }
+    if required_venue_ids.is_some() && status.required_account_count == 0 {
+        status.triggered = true;
+        status.reason = Some("startup_baseline_no_required_execution_venues".to_string());
         return status;
     }
 
@@ -12189,6 +12223,12 @@ fn evaluate_startup_pnl_baseline(
     let mut violating_venues = Vec::new();
 
     for (venue_index, venue_cfg) in cfg.venues.iter().enumerate() {
+        if required_venue_ids
+            .as_ref()
+            .is_some_and(|required| !required.contains(&venue_cfg.id.to_ascii_lowercase()))
+        {
+            continue;
+        }
         let acct = snapshot.account.get(venue_index);
         let fresh = acct
             .filter(|acct| {
@@ -26248,6 +26288,179 @@ mod tests {
             Some("awaiting_account_snapshots_timeout")
         );
         assert!(status.require_full_account_coverage);
+    }
+
+    #[test]
+    fn startup_pnl_baseline_scopes_full_coverage_to_v2_ranked_execution_venues() {
+        let mut cfg = Config::default();
+        cfg.v2_shadow.decision_mode = crate::config::V2DecisionMode::LiveCanaryAdmission;
+        cfg.v2_shadow.live_canary_ranked_execution_venues = vec!["lighter".to_string()];
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 5_000;
+        state.fair_value = Some(2_095.0);
+        state.fair_value_prev = 2_095.0;
+        state.recompute_after_fills(&cfg);
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: if venue.id == "lighter" { 1 } else { 0 },
+                    timestamp_ms: if venue.id == "lighter" {
+                        Some(now_ms)
+                    } else {
+                        None
+                    },
+                    position_tao: 0.0,
+                    avg_entry_price: 0.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: venue.id != "lighter",
+                })
+                .collect(),
+        };
+
+        let mut initialized = vec![false; cfg.venues.len()];
+        initialized[3] = true;
+        let status = evaluate_startup_pnl_baseline(
+            &cfg,
+            &state,
+            &snapshot,
+            &initialized,
+            now_ms,
+            40,
+            StartupPnlBaselineConfig {
+                enabled: true,
+                pnl_abs_limit_usd: 1.0,
+                position_tol_tao: 0.02,
+                max_wait_ticks: 40,
+                require_full_account_coverage: true,
+            },
+        );
+
+        assert!(status.passed);
+        assert!(status.resolved);
+        assert!(!status.triggered);
+        assert_eq!(status.fresh_account_count, 1);
+        assert_eq!(status.required_account_count, 1);
+        assert!(status.pending_venues.is_empty());
+        assert_eq!(status.reason.as_deref(), Some("startup_baseline_ok"));
+    }
+
+    #[test]
+    fn startup_pnl_baseline_still_waits_for_missing_ranked_execution_account() {
+        let mut cfg = Config::default();
+        cfg.v2_shadow.decision_mode = crate::config::V2DecisionMode::LiveCanaryAdmission;
+        cfg.v2_shadow.live_canary_ranked_execution_venues = vec!["lighter".to_string()];
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 5_000;
+        state.fair_value = Some(2_095.0);
+        state.fair_value_prev = 2_095.0;
+        state.recompute_after_fills(&cfg);
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: if venue.id == "lighter" { 0 } else { 1 },
+                    timestamp_ms: if venue.id == "lighter" {
+                        None
+                    } else {
+                        Some(now_ms)
+                    },
+                    position_tao: 0.0,
+                    avg_entry_price: 0.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: venue.id == "lighter",
+                })
+                .collect(),
+        };
+
+        let mut initialized = vec![true; cfg.venues.len()];
+        initialized[3] = false;
+        let status = evaluate_startup_pnl_baseline(
+            &cfg,
+            &state,
+            &snapshot,
+            &initialized,
+            now_ms,
+            40,
+            StartupPnlBaselineConfig {
+                enabled: true,
+                pnl_abs_limit_usd: 1.0,
+                position_tol_tao: 0.02,
+                max_wait_ticks: 40,
+                require_full_account_coverage: true,
+            },
+        );
+
+        assert!(status.triggered);
+        assert!(status.timed_out);
+        assert!(!status.passed);
+        assert_eq!(status.fresh_account_count, 0);
+        assert_eq!(status.required_account_count, 1);
+        assert_eq!(status.pending_venues, vec!["lighter".to_string()]);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("awaiting_account_snapshots_timeout")
+        );
+    }
+
+    #[test]
+    fn startup_pnl_baseline_rejects_ranked_execution_allowlist_without_matching_venue() {
+        let mut cfg = Config::default();
+        cfg.v2_shadow.decision_mode = crate::config::V2DecisionMode::LiveCanaryAdmission;
+        cfg.v2_shadow.live_canary_ranked_execution_venues = vec!["not_a_venue".to_string()];
+        let state = GlobalState::new(&cfg);
+        let now_ms = 5_000;
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: Vec::new(),
+        };
+
+        let status = evaluate_startup_pnl_baseline(
+            &cfg,
+            &state,
+            &snapshot,
+            &vec![false; cfg.venues.len()],
+            now_ms,
+            0,
+            StartupPnlBaselineConfig {
+                enabled: true,
+                pnl_abs_limit_usd: 1.0,
+                position_tol_tao: 0.02,
+                max_wait_ticks: 40,
+                require_full_account_coverage: true,
+            },
+        );
+
+        assert!(status.triggered);
+        assert!(!status.passed);
+        assert_eq!(status.required_account_count, 0);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("startup_baseline_no_required_execution_venues")
+        );
     }
 
     #[test]
