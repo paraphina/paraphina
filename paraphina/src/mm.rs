@@ -514,23 +514,44 @@ fn apply_paradex_touch_clip(
         return result;
     };
 
+    let join_bbo = mm_cfg.paradex_touch_clip_join_bbo();
     let max_offset = max_ticks * tick;
-    let clipped_bid = bid_price.max(best_bid - max_offset).min(passive_bid_limit);
-    let clipped_ask = ask_price.min(best_ask + max_offset).max(passive_ask_limit);
+    let bid_target = if join_bbo {
+        best_bid
+    } else {
+        best_bid - max_offset
+    };
+    let ask_target = if join_bbo {
+        best_ask
+    } else {
+        best_ask + max_offset
+    };
+    let bid_limit = if join_bbo {
+        best_bid
+    } else {
+        passive_bid_limit
+    };
+    let ask_limit = if join_bbo {
+        best_ask
+    } else {
+        passive_ask_limit
+    };
+    let clipped_bid = bid_price.max(bid_target).min(bid_limit);
+    let clipped_ask = ask_price.min(ask_target).max(ask_limit);
 
     let mut snapped_bid = ((clipped_bid / tick) - 1e-9).ceil() * tick;
-    if snapped_bid > passive_bid_limit {
-        snapped_bid = (passive_bid_limit / tick).floor() * tick;
+    if snapped_bid > bid_limit {
+        snapped_bid = (bid_limit / tick).floor() * tick;
     }
     let mut snapped_ask = ((clipped_ask / tick) + 1e-9).floor() * tick;
-    if snapped_ask < passive_ask_limit {
-        snapped_ask = (passive_ask_limit / tick).ceil() * tick;
+    if snapped_ask < ask_limit {
+        snapped_ask = (ask_limit / tick).ceil() * tick;
     }
 
     result.applied =
         (snapped_bid - bid_price).abs() > 1e-9 || (snapped_ask - ask_price).abs() > 1e-9;
-    result.bid_price = snapped_bid.min(passive_bid_limit);
-    result.ask_price = snapped_ask.max(passive_ask_limit);
+    result.bid_price = snapped_bid.min(bid_limit);
+    result.ask_price = snapped_ask.max(ask_limit);
     result
 }
 
@@ -6310,6 +6331,52 @@ mod tests {
         assert!(
             result.bid_price <= best_bid - tick && result.ask_price >= best_ask + tick,
             "clip must preserve passive placement"
+        );
+    }
+
+    #[test]
+    fn paradex_touch_clip_join_bbo_can_quote_at_passive_touch() {
+        let mut cfg = Config::default();
+        cfg.mm.paradex_touch_clip_max_ticks = Some(1.0);
+        cfg.mm.paradex_touch_clip_join_bbo = true;
+        cfg.mm
+            .venue_role_by_venue
+            .insert("paradex".to_string(), MmVenueRole::Fill);
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue in config");
+        state.venues[venue_index].status = VenueStatus::Healthy;
+        state.venues[venue_index].toxicity = 0.0;
+        let best_bid = 299.95;
+        let best_ask = 300.05;
+        let tick = cfg.venues[venue_index].tick_size;
+
+        let result = apply_paradex_touch_clip(
+            &cfg.mm,
+            &cfg.venues[venue_index],
+            &state.venues[venue_index],
+            300.0,
+            0.10,
+            tick,
+            best_bid,
+            best_ask,
+            best_bid - tick,
+            best_ask + tick,
+            best_bid - (40.0 * tick),
+            best_ask + (40.0 * tick),
+        );
+
+        assert!(result.applied, "expected Paradex BBO join clip to bind");
+        assert!(
+            (result.bid_price - best_bid).abs() <= 1e-9,
+            "join-BBO bid must join but not cross the best bid"
+        );
+        assert!(
+            (result.ask_price - best_ask).abs() <= 1e-9,
+            "join-BBO ask must join but not cross the best ask"
         );
     }
 

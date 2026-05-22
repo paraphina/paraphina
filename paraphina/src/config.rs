@@ -551,6 +551,8 @@ pub struct MmConfig {
     pub max_generated_quote_spread_bps_by_venue: BTreeMap<String, f64>,
     /// Optional Paradex fill-role clip that keeps generated quotes near passive touch.
     pub paradex_touch_clip_max_ticks: Option<f64>,
+    /// When Paradex touch clipping is enabled, allow joining BBO rather than quoting one tick back.
+    pub paradex_touch_clip_join_bbo: bool,
     /// Optional per-venue hard cap on MM quote size in TAO.
     pub max_quote_size_tao_by_venue: BTreeMap<String, f64>,
     /// Optional per-venue economic role overrides keyed by venue id.
@@ -695,6 +697,11 @@ impl MmConfig {
     pub fn paradex_touch_clip_max_ticks(&self) -> Option<f64> {
         self.paradex_touch_clip_max_ticks
             .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
+    pub fn paradex_touch_clip_join_bbo(&self) -> bool {
+        self.paradex_touch_clip_max_ticks().is_some() && self.paradex_touch_clip_join_bbo
     }
 
     #[inline]
@@ -1284,6 +1291,7 @@ impl Default for Config {
             max_quote_spread_bps_by_venue: BTreeMap::new(),
             max_generated_quote_spread_bps_by_venue: BTreeMap::new(),
             paradex_touch_clip_max_ticks: None,
+            paradex_touch_clip_join_bbo: false,
             max_quote_size_tao_by_venue: BTreeMap::new(),
             venue_role_by_venue: BTreeMap::new(),
             pre_soft_taper_global_position_tao_by_venue: BTreeMap::new(),
@@ -1510,6 +1518,7 @@ impl Config {
     ///   - PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_<VENUE> (f64, bps)
     ///   - PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_<VENUE> (f64, bps)
     ///   - PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS (f64, ticks; default off)
+    ///   - PARAPHINA_MM_PARADEX_TOUCH_CLIP_JOIN_BBO (bool; default false)
     ///   - PARAPHINA_MM_VENUE_ROLE_<VENUE> (fill|probationary|anchor|noise)
     ///   - PARAPHINA_VOL_REF           (f64)
     ///   - PARAPHINA_DAILY_LOSS_LIMIT  (f64, USD; positive threshold)
@@ -2121,6 +2130,23 @@ impl Config {
                         _ => {
                             eprintln!(
                                 "[config] WARN: could not parse PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS = {:?} as positive f64; leaving Paradex touch clip disabled",
+                                raw
+                            );
+                        }
+                    }
+                }
+                if let Ok(raw) = env::var("PARAPHINA_MM_PARADEX_TOUCH_CLIP_JOIN_BBO") {
+                    match parse_bool_env(&raw) {
+                        Some(enabled) => {
+                            cfg.mm.paradex_touch_clip_join_bbo = enabled;
+                            eprintln!(
+                                "[config] PARAPHINA_MM_PARADEX_TOUCH_CLIP_JOIN_BBO = {} (set Paradex touch clip BBO-join mode)",
+                                cfg.mm.paradex_touch_clip_join_bbo
+                            );
+                        }
+                        None => {
+                            eprintln!(
+                                "[config] WARN: could not parse PARAPHINA_MM_PARADEX_TOUCH_CLIP_JOIN_BBO = {:?} as bool; leaving Paradex touch clip BBO-join mode disabled",
                                 raw
                             );
                         }
@@ -4122,6 +4148,7 @@ mod tests {
         const ASTER_GEN_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_ASTER";
         const ASTER_MAX_QUOTE_SIZE_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_ASTER";
         const PARADEX_TOUCH_CLIP_KEY: &str = "PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS";
+        const PARADEX_TOUCH_JOIN_BBO_KEY: &str = "PARAPHINA_MM_PARADEX_TOUCH_CLIP_JOIN_BBO";
         const HL_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID";
         const EXT_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_EXTENDED";
 
@@ -4149,6 +4176,7 @@ mod tests {
         let _aster_gen_spread_bps = EnvGuard::new(ASTER_GEN_SPREAD_BPS_KEY);
         let _aster_max_quote_size = EnvGuard::new(ASTER_MAX_QUOTE_SIZE_KEY);
         let _paradex_touch_clip = EnvGuard::new(PARADEX_TOUCH_CLIP_KEY);
+        let _paradex_touch_join_bbo = EnvGuard::new(PARADEX_TOUCH_JOIN_BBO_KEY);
         let _hl_role = EnvGuard::new(HL_ROLE_KEY);
         let _ext_role = EnvGuard::new(EXT_ROLE_KEY);
 
@@ -4174,6 +4202,7 @@ mod tests {
         env::set_var(ASTER_GEN_SPREAD_BPS_KEY, "10");
         env::set_var(ASTER_MAX_QUOTE_SIZE_KEY, "0.01");
         env::set_var(PARADEX_TOUCH_CLIP_KEY, "1");
+        env::set_var(PARADEX_TOUCH_JOIN_BBO_KEY, "true");
         env::set_var(HL_ROLE_KEY, "probationary");
         env::set_var(EXT_ROLE_KEY, "noise");
 
@@ -4224,6 +4253,7 @@ mod tests {
         );
         assert_eq!(cfg.mm.max_quote_size_tao_for("aster"), Some(0.01));
         assert_eq!(cfg.mm.paradex_touch_clip_max_ticks(), Some(1.0));
+        assert!(cfg.mm.paradex_touch_clip_join_bbo());
         assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("hyperliquid"), None);
         assert_eq!(
             cfg.mm.venue_role_for("hyperliquid"),
@@ -4256,6 +4286,7 @@ mod tests {
         const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
         const ASTER_MAX_QUOTE_SIZE_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_ASTER";
         const PARADEX_TOUCH_CLIP_KEY: &str = "PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS";
+        const PARADEX_TOUCH_JOIN_BBO_KEY: &str = "PARAPHINA_MM_PARADEX_TOUCH_CLIP_JOIN_BBO";
         const HL_ROLE_KEY: &str = "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID";
 
         let _lock = env_lock().lock().unwrap();
@@ -4275,6 +4306,7 @@ mod tests {
         let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
         let _aster_max_quote_size = EnvGuard::new(ASTER_MAX_QUOTE_SIZE_KEY);
         let _paradex_touch_clip = EnvGuard::new(PARADEX_TOUCH_CLIP_KEY);
+        let _paradex_touch_join_bbo = EnvGuard::new(PARADEX_TOUCH_JOIN_BBO_KEY);
         let _hl_role = EnvGuard::new(HL_ROLE_KEY);
 
         env::set_var(LAMBDA_KEY, "not_a_number");
@@ -4294,6 +4326,7 @@ mod tests {
         env::set_var(EXT_SPREAD_BPS_KEY, "0");
         env::set_var(ASTER_MAX_QUOTE_SIZE_KEY, "0");
         env::set_var(PARADEX_TOUCH_CLIP_KEY, "0");
+        env::set_var(PARADEX_TOUCH_JOIN_BBO_KEY, "true");
         env::set_var(HL_ROLE_KEY, "not_a_role");
 
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
@@ -4322,6 +4355,10 @@ mod tests {
         assert_eq!(cfg.mm.max_quote_spread_bps_for("extended"), None);
         assert_eq!(cfg.mm.max_quote_size_tao_for("aster"), None);
         assert_eq!(cfg.mm.paradex_touch_clip_max_ticks(), None);
+        assert!(
+            !cfg.mm.paradex_touch_clip_join_bbo(),
+            "BBO-join mode must remain unavailable when the touch clip is disabled"
+        );
         assert_eq!(cfg.mm.venue_role_for("hyperliquid"), MmVenueRole::Fill);
 
         env::set_var(PARADEX_TOUCH_CLIP_KEY, "not_a_number");
@@ -4331,6 +4368,12 @@ mod tests {
         env::set_var(PARADEX_TOUCH_CLIP_KEY, "-1");
         let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
         assert_eq!(cfg.mm.paradex_touch_clip_max_ticks(), None);
+
+        env::set_var(PARADEX_TOUCH_CLIP_KEY, "1");
+        env::set_var(PARADEX_TOUCH_JOIN_BBO_KEY, "maybe");
+        let cfg = Config::from_env_or_profile(RiskProfile::Balanced);
+        assert_eq!(cfg.mm.paradex_touch_clip_max_ticks(), Some(1.0));
+        assert!(!cfg.mm.paradex_touch_clip_join_bbo());
     }
 
     #[test]
