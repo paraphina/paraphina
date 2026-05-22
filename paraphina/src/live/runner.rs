@@ -1940,6 +1940,53 @@ fn v2_live_canary_admission_authorized(cfg: &Config) -> bool {
         && cfg.v2_shadow.live_canary_admission_approved
 }
 
+fn v2_live_canary_venue_coverage_stop_after_first_fill_enabled(
+    cfg: &Config,
+    trade_mode: &str,
+    canary_enabled: bool,
+) -> bool {
+    canary_enabled
+        && trade_mode == "live"
+        && phase51_true_env(V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV)
+        && v2_live_canary_admission_authorized(cfg)
+        && cfg.v2_shadow.live_canary_venue_coverage_probe_approved
+        && cfg.v2_shadow.live_canary_venue_coverage_probe_venues.len() == 1
+}
+
+fn v2_live_canary_venue_coverage_allowed_venue(cfg: &Config) -> Option<&str> {
+    (cfg.v2_shadow.live_canary_venue_coverage_probe_venues.len() == 1)
+        .then(|| {
+            cfg.v2_shadow
+                .live_canary_venue_coverage_probe_venues
+                .first()
+                .map(String::as_str)
+        })
+        .flatten()
+}
+
+fn v2_live_canary_venue_coverage_tick_has_allowed_mm_fill(
+    cfg: &Config,
+    fills: &[crate::types::FillEvent],
+) -> bool {
+    let Some(allowed_venue) = v2_live_canary_venue_coverage_allowed_venue(cfg) else {
+        return false;
+    };
+    fills.iter().any(|fill| {
+        fill.purpose == OrderPurpose::Mm
+            && fill.venue_id.as_ref().eq_ignore_ascii_case(allowed_venue)
+    })
+}
+
+fn v2_live_canary_venue_coverage_should_stop_after_first_fill(
+    cfg: &Config,
+    trade_mode: &str,
+    canary_enabled: bool,
+    fills: &[crate::types::FillEvent],
+) -> bool {
+    v2_live_canary_venue_coverage_stop_after_first_fill_enabled(cfg, trade_mode, canary_enabled)
+        && v2_live_canary_venue_coverage_tick_has_allowed_mm_fill(cfg, fills)
+}
+
 fn v2_is_mm_order_creating_intent(intent: &OrderIntent) -> bool {
     match intent {
         OrderIntent::Place(place) => place.purpose == OrderPurpose::Mm,
@@ -3030,6 +3077,8 @@ const PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW";
 const PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY";
+const V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV: &str =
+    "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL";
 
 fn realtime_tick_interval(interval_ms: u64) -> tokio::time::Interval {
     let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
@@ -5604,6 +5653,67 @@ pub async fn run_live_loop(
                 }
             }
             maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
+            break;
+        }
+
+        if v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            cfg,
+            &trade_mode,
+            canary_enabled,
+            &tick_fills,
+        ) {
+            let _ = flush_batched_fills(&mut fill_batcher, cfg, &mut state, now_ms, true);
+            tick_timing.total_us = tick_start.elapsed().as_micros() as u64;
+            if let Some(hooks) = hooks.as_ref() {
+                if let Some(telemetry) = hooks.telemetry.as_ref() {
+                    update_live_telemetry_stats(
+                        telemetry,
+                        state.fv_available,
+                        stale_count,
+                        disabled.len() as u64,
+                        kill_transition,
+                        &would_send_intents,
+                    );
+                    emit_live_telemetry(
+                        &mut telemetry_builder,
+                        telemetry,
+                        cfg,
+                        &state,
+                        now_ms,
+                        tick,
+                        &would_send_intents,
+                        &tick_exec_events,
+                        &tick_fills,
+                        last_exit_intent.as_ref(),
+                        last_hedge_intent.as_ref(),
+                        &pending_drift_events,
+                        &tick_account_position_syncs,
+                        &inventory_soft_governor,
+                        &inventory_brake,
+                        &emergency_residual_fallback,
+                        &projected_mm_budget,
+                        &canary_breach_response,
+                        &stale_market_hygiene,
+                        &startup_pnl_baseline,
+                        &emergency_request_latches,
+                        &mm_order_management,
+                        market_rx_stats_enabled.then_some(&market_rx_stats),
+                        if emit_tick_timing {
+                            Some(&tick_timing)
+                        } else {
+                            None
+                        },
+                        &venue_health_diagnostics,
+                    );
+                    pending_drift_events.clear();
+                }
+            }
+            maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
+            eprintln!(
+                "[v2] live_canary_venue_coverage_stop_after_first_fill=true tick={} venue={}",
+                tick,
+                v2_live_canary_venue_coverage_allowed_venue(cfg).unwrap_or("unknown")
+            );
             break;
         }
 
@@ -16398,6 +16508,112 @@ mod tests {
                 )
             );
         });
+    }
+
+    fn v2_live_canary_venue_coverage_config(venues: Vec<&str>) -> Config {
+        let mut cfg = Config::default();
+        cfg.v2_shadow.enabled = true;
+        cfg.v2_shadow.decision_mode = crate::config::V2DecisionMode::LiveCanaryAdmission;
+        cfg.v2_shadow.live_canary_admission_approved = true;
+        cfg.v2_shadow.live_canary_venue_coverage_probe_approved = true;
+        cfg.v2_shadow.live_canary_venue_coverage_probe_venues =
+            venues.into_iter().map(str::to_string).collect();
+        cfg
+    }
+
+    fn v2_live_canary_venue_coverage_fill(
+        venue_id: &str,
+        purpose: OrderPurpose,
+    ) -> crate::types::FillEvent {
+        crate::types::FillEvent {
+            venue_index: 0,
+            venue_id: venue_id.into(),
+            order_id: None,
+            client_order_id: None,
+            seq: None,
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.01,
+            purpose,
+            fee_bps: 0.0,
+        }
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_stop_after_first_fill_is_default_off() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV]);
+        std::env::remove_var(V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV);
+        let cfg = v2_live_canary_venue_coverage_config(vec!["paradex"]);
+        let fills = vec![v2_live_canary_venue_coverage_fill(
+            "paradex",
+            OrderPurpose::Mm,
+        )];
+
+        assert!(!v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            &cfg, "live", true, &fills
+        ));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_stop_after_first_fill_requires_exact_gate_and_fill() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV]);
+        std::env::set_var(
+            V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV,
+            "true",
+        );
+        let cfg = v2_live_canary_venue_coverage_config(vec!["paradex"]);
+        let fills = vec![v2_live_canary_venue_coverage_fill(
+            "paradex",
+            OrderPurpose::Mm,
+        )];
+
+        assert!(v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            &cfg, "live", true, &fills
+        ));
+        assert!(!v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            &cfg, "paper", true, &fills
+        ));
+        assert!(!v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            &cfg, "live", false, &fills
+        ));
+
+        let non_mm = vec![v2_live_canary_venue_coverage_fill(
+            "paradex",
+            OrderPurpose::Hedge,
+        )];
+        assert!(!v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            &cfg, "live", true, &non_mm
+        ));
+
+        let wrong_venue = vec![v2_live_canary_venue_coverage_fill(
+            "lighter",
+            OrderPurpose::Mm,
+        )];
+        assert!(!v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            &cfg,
+            "live",
+            true,
+            &wrong_venue
+        ));
+
+        let multi_venue_cfg = v2_live_canary_venue_coverage_config(vec!["paradex", "lighter"]);
+        assert!(!v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            &multi_venue_cfg,
+            "live",
+            true,
+            &fills
+        ));
+
+        let mut not_approved = cfg.clone();
+        not_approved.v2_shadow.live_canary_admission_approved = false;
+        assert!(!v2_live_canary_venue_coverage_should_stop_after_first_fill(
+            &not_approved,
+            "live",
+            true,
+            &fills
+        ));
     }
 
     #[test]
