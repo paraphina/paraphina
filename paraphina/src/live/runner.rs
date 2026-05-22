@@ -8490,7 +8490,7 @@ async fn run_canary_exit_cancel_all_cleanup(
     state: &mut GlobalState,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
-    deduper: &mut ExecutionEventDeduper,
+    _deduper: &mut ExecutionEventDeduper,
     order_snapshot_fill_inference_enabled: bool,
     order_state_initialized: &mut [bool],
     tick: u64,
@@ -8544,10 +8544,9 @@ async fn run_canary_exit_cancel_all_cleanup(
         if let Some(events) = events {
             let mut tick_exec_events = Vec::new();
             let mut tick_fills = Vec::new();
-            let fills = apply_priority_response_events(
+            let fills = apply_terminal_cancel_response_events(
                 cfg,
                 state,
-                deduper,
                 events,
                 dispatch_now_ms,
                 order_snapshot_fill_inference_enabled,
@@ -8578,6 +8577,30 @@ async fn run_canary_exit_cancel_all_cleanup(
         live_open_order_count_total(state),
         live_open_order_venue_labels(cfg, state).join(",")
     );
+}
+
+fn apply_terminal_cancel_response_events(
+    cfg: &Config,
+    state: &mut GlobalState,
+    events: Vec<super::types::ExecutionEvent>,
+    now_ms: TimestampMs,
+    order_snapshot_fill_inference_enabled: bool,
+    tick_exec_events: &mut Vec<ExecutionEvent>,
+    tick_fills: &mut Vec<crate::types::FillEvent>,
+    order_state_initialized: &mut [bool],
+) -> Vec<crate::types::FillEvent> {
+    let mut terminal_deduper = ExecutionEventDeduper::new(256);
+    apply_priority_response_events(
+        cfg,
+        state,
+        &mut terminal_deduper,
+        events,
+        now_ms,
+        order_snapshot_fill_inference_enabled,
+        tick_exec_events,
+        tick_fills,
+        order_state_initialized,
+    )
 }
 
 fn build_unlatched_disabled_cancel_intents_for_venues(
@@ -26453,6 +26476,62 @@ mod tests {
             order_ids,
             vec!["oid_1_0".to_string(), "oid_1_1".to_string(),]
         );
+    }
+
+    #[test]
+    fn terminal_cancel_response_replays_repeated_cancel_rejects_with_fresh_deduper() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let now_ms = 31_000;
+
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+        let order_id = state
+            .live_order_state
+            .open_orders()
+            .into_iter()
+            .find(|order| order.venue_index == hyperliquid)
+            .and_then(|order| order.client_order_id.clone())
+            .expect("seeded open order id");
+        let cancel_reject = LiveExecutionEvent::CancelRejected(types::CancelRejected {
+            venue_index: hyperliquid,
+            venue_id: "hyperliquid".to_string(),
+            seq: 1,
+            timestamp_ms: now_ms + 1,
+            order_id: Some(order_id),
+            reason: "sanitized_cancel_reject".to_string(),
+        });
+
+        let mut global_deduper = ExecutionEventDeduper::new(256);
+        assert!(!global_deduper.is_duplicate(&cancel_reject));
+
+        let mut tick_exec_events = Vec::new();
+        let mut tick_fills = Vec::new();
+        let mut order_state_initialized = vec![true; cfg.venues.len()];
+        let _ = apply_priority_response_events(
+            &cfg,
+            &mut state,
+            &mut global_deduper,
+            vec![cancel_reject.clone()],
+            now_ms + 2,
+            false,
+            &mut tick_exec_events,
+            &mut tick_fills,
+            &mut order_state_initialized,
+        );
+        assert_eq!(live_open_order_count_for_venue(&state, hyperliquid), 1);
+
+        let _ = apply_terminal_cancel_response_events(
+            &cfg,
+            &mut state,
+            vec![cancel_reject],
+            now_ms + 3,
+            false,
+            &mut tick_exec_events,
+            &mut tick_fills,
+            &mut order_state_initialized,
+        );
+        assert_eq!(live_open_order_count_for_venue(&state, hyperliquid), 0);
     }
 
     #[test]
