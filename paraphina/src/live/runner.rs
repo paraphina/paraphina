@@ -1936,6 +1936,37 @@ fn v2_live_canary_ranked_execution_known_venue_id(venue_index: usize) -> Option<
     }
 }
 
+fn v2_live_canary_ranked_execution_runtime_venue_id(
+    venue_index: usize,
+) -> Result<Option<String>, ()> {
+    let raw_connectors = match std::env::var("PARAPHINA_LIVE_CONNECTORS") {
+        Ok(raw_connectors) => raw_connectors,
+        Err(_) => return Ok(None),
+    };
+    let selected = raw_connectors
+        .split(',')
+        .map(|venue| venue.trim().to_ascii_lowercase())
+        .filter(|venue| !venue.is_empty())
+        .collect::<HashSet<_>>();
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    // Mirror paraphina_live::apply_explicit_connector_selection_to_config:
+    // explicit connector selection filters cfg.venues while preserving the
+    // canonical Config venue order, regardless of raw env/CLI connector order.
+    let mut runtime_index = 0usize;
+    for venue in ["extended", "hyperliquid", "aster", "lighter", "paradex"] {
+        if !selected.contains(venue) {
+            continue;
+        }
+        if runtime_index == venue_index {
+            return Ok(Some(venue.to_string()));
+        }
+        runtime_index = runtime_index.saturating_add(1);
+    }
+    Err(())
+}
+
 fn v2_live_canary_ranked_execution_validate_venue(
     allowed_venues: &[String],
     venue_id: &str,
@@ -1946,6 +1977,17 @@ fn v2_live_canary_ranked_execution_validate_venue(
     let normalized = venue_id.to_ascii_lowercase();
     if !allowed_venues.iter().any(|venue| venue == &normalized) {
         return Err(non_execution_reason);
+    }
+    match v2_live_canary_ranked_execution_runtime_venue_id(venue_index) {
+        Ok(Some(runtime_venue)) => {
+            return if runtime_venue == normalized {
+                Ok(())
+            } else {
+                Err(venue_index_reason)
+            };
+        }
+        Err(()) => return Err(venue_index_reason),
+        Ok(None) => {}
     }
     match v2_live_canary_ranked_execution_known_venue_id(venue_index) {
         Some(index_venue) if index_venue == normalized => Ok(()),
@@ -17220,6 +17262,80 @@ mod tests {
                 Err("v2_ranked_cancel_venue_index_mismatch")
             );
         });
+    }
+
+    #[test]
+    fn v2_ranked_execution_dispatch_guard_uses_single_connector_runtime_index() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            V2_DECISION_MODE_ENV,
+            "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED",
+            V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV,
+            "PARAPHINA_LIVE_CONNECTORS",
+        ]);
+        std::env::set_var(V2_DECISION_MODE_ENV, "live_canary_admission");
+        std::env::set_var("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "true");
+        std::env::set_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV, "lighter");
+        std::env::set_var("PARAPHINA_LIVE_CONNECTORS", "lighter");
+
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(
+                &[lighter_targeted_place_intent(Side::Buy, "bid")],
+                false
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(
+                &[lighter_cancel_intent()],
+                false
+            ),
+            Ok(())
+        );
+
+        let mut wrong_index = lighter_targeted_place_intent(Side::Buy, "wrong-index");
+        if let OrderIntent::Place(place) = &mut wrong_index {
+            place.venue_index = 3;
+        }
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(&[wrong_index], false),
+            Err("v2_ranked_place_venue_index_mismatch")
+        );
+    }
+
+    #[test]
+    fn v2_ranked_execution_dispatch_guard_ignores_raw_connector_order() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            V2_DECISION_MODE_ENV,
+            "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED",
+            V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV,
+            "PARAPHINA_LIVE_CONNECTORS",
+        ]);
+        std::env::set_var(V2_DECISION_MODE_ENV, "live_canary_admission");
+        std::env::set_var("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "true");
+        std::env::set_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV, "lighter");
+        std::env::set_var("PARAPHINA_LIVE_CONNECTORS", "lighter,extended");
+
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(
+                &[lighter_targeted_place_intent(Side::Buy, "bid")],
+                false
+            ),
+            Err("v2_ranked_place_venue_index_mismatch")
+        );
+
+        let mut canonical_filtered_index = lighter_targeted_place_intent(Side::Buy, "bid");
+        if let OrderIntent::Place(place) = &mut canonical_filtered_index {
+            place.venue_index = 1;
+        }
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(
+                &[canonical_filtered_index],
+                false
+            ),
+            Ok(())
+        );
     }
 
     #[test]
