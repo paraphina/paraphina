@@ -9369,8 +9369,17 @@ fn build_canary_breach_flatten_intents(
             venue_cfg.lot_size_tao.max(1e-9)
         };
         let max_order_size = venue_cfg.max_order_size.max(min_order_size);
-        let size =
-            snap_size_down_to_lot(venue.position_tao.abs().min(max_order_size), min_order_size);
+        let position_abs = venue.position_tao.abs();
+        let mut size = snap_size_down_to_lot(position_abs.min(max_order_size), min_order_size);
+        if size < min_order_size
+            && venue_cfg.id.eq_ignore_ascii_case("lighter")
+            && lighter_terminal_reduce_dust_to_min_lot_enabled()
+            && position_abs > 0.0
+            && position_abs < min_order_size
+            && max_order_size >= min_order_size
+        {
+            size = min_order_size;
+        }
         if size < min_order_size {
             continue;
         }
@@ -11767,6 +11776,10 @@ fn canary_exit_position_flatten_settle_ms() -> u64 {
         .map(|value| value as u64)
         .unwrap_or(1_000)
         .clamp(0, 10_000)
+}
+
+fn lighter_terminal_reduce_dust_to_min_lot_enabled() -> bool {
+    parse_bool_env_default("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", false)
 }
 
 fn canary_exit_position_flatten_residual_venues(
@@ -28037,6 +28050,7 @@ mod tests {
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TOL_TAO",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS",
+            "PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT",
         ]);
 
         std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED");
@@ -28086,6 +28100,13 @@ mod tests {
         assert_eq!(canary_exit_position_flatten_attempts(), 5);
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "1");
         assert_eq!(canary_exit_position_flatten_attempts(), 1);
+
+        std::env::remove_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT");
+        assert!(!lighter_terminal_reduce_dust_to_min_lot_enabled());
+        std::env::set_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "true");
+        assert!(lighter_terminal_reduce_dust_to_min_lot_enabled());
+        std::env::set_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "0");
+        assert!(!lighter_terminal_reduce_dust_to_min_lot_enabled());
     }
 
     #[test]
@@ -29018,6 +29039,56 @@ mod tests {
         let OrderIntent::Place(place) = &intents[0] else {
             panic!("expected flatten place intent");
         };
+        assert_eq!(place.purpose, OrderPurpose::Exit);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!(!place.post_only);
+        assert!((place.size - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_suppress_lighter_dust_by_default() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT"]);
+        std::env::remove_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+
+        seed_terminal_flatten_market(&mut state, &[lighter]);
+        state.venues[lighter].position_tao = -0.0007;
+
+        let targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0001);
+        assert_eq!(targets, vec![lighter]);
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &targets, 78);
+
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_can_reduce_lighter_dust_to_min_lot_when_gated() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT"]);
+        std::env::set_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "true");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+
+        seed_terminal_flatten_market(&mut state, &[lighter]);
+        state.venues[lighter].position_tao = -0.0007;
+
+        let targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0001);
+        assert_eq!(targets, vec![lighter]);
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &targets, 78);
+
+        assert_eq!(intents.len(), 1);
+        let OrderIntent::Place(place) = &intents[0] else {
+            panic!("expected flatten place intent");
+        };
+        assert_eq!(place.venue_index, lighter);
+        assert_eq!(place.side, Side::Buy);
         assert_eq!(place.purpose, OrderPurpose::Exit);
         assert_eq!(place.time_in_force, TimeInForce::Ioc);
         assert!(place.reduce_only);
