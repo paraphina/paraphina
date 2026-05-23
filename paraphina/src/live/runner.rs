@@ -3350,6 +3350,43 @@ fn push_reconcile_drift(
     pending.push(record);
 }
 
+fn open_order_diff_count(internal_orders: &[String], venue_orders: &[String]) -> usize {
+    internal_orders
+        .iter()
+        .filter(|id| !venue_orders.contains(*id))
+        .count()
+        + venue_orders
+            .iter()
+            .filter(|id| !internal_orders.contains(*id))
+            .count()
+}
+
+fn build_open_order_reconcile_drift_record(
+    snapshot: &super::types::OrderSnapshot,
+    internal_orders: &[String],
+    order_tol: usize,
+) -> Option<ReconcileDriftRecord> {
+    let mut venue_orders = snapshot
+        .open_orders
+        .iter()
+        .map(|o| o.order_id.clone())
+        .collect::<Vec<_>>();
+    venue_orders.sort();
+    let diff_count = open_order_diff_count(internal_orders, &venue_orders);
+    (diff_count > order_tol).then(|| ReconcileDriftRecord {
+        timestamp_ms: snapshot.timestamp_ms,
+        venue_index: snapshot.venue_index,
+        venue_id: snapshot.venue_id.clone(),
+        kind: "open_orders".to_string(),
+        internal: Some(internal_orders.len() as f64),
+        venue: Some(venue_orders.len() as f64),
+        diff: Some(internal_orders.len() as f64 - venue_orders.len() as f64),
+        tolerance: Some(order_tol as f64),
+        source: "order_snapshot_post_reconcile".to_string(),
+        available: true,
+    })
+}
+
 const RECONCILE_TOL_EPSILON: f64 = 1e-9;
 const KILL_CANCEL_ALL_TIMEOUT_MS_MIN: u64 = 5_000;
 const KILL_CANCEL_ALL_TIMEOUT_MS_PER_VENUE: u64 = 1_000;
@@ -4387,46 +4424,8 @@ pub async fn run_live_loop(
                                 event: EventLogPayload::OrderSnapshot(snapshot.clone()),
                             });
                         }
-                        if venue_state_initialized(&order_state_initialized, snapshot.venue_index) {
-                            let internal_before = state
-                                .live_order_state
-                                .open_order_ids_by_venue(snapshot.venue_index);
-                            let mut venue_orders = snapshot
-                                .open_orders
-                                .iter()
-                                .map(|o| o.order_id.clone())
-                                .collect::<Vec<_>>();
-                            venue_orders.sort();
-                            let diff_count = internal_before
-                                .iter()
-                                .filter(|id| !venue_orders.contains(*id))
-                                .count()
-                                + venue_orders
-                                    .iter()
-                                    .filter(|id| !internal_before.contains(*id))
-                                    .count();
-                            if diff_count > order_tol {
-                                push_reconcile_drift(
-                                    &mut pending_drift_events,
-                                    &audit_dir,
-                                    ReconcileDriftRecord {
-                                        timestamp_ms: snapshot.timestamp_ms,
-                                        venue_index: snapshot.venue_index,
-                                        venue_id: snapshot.venue_id.clone(),
-                                        kind: "open_orders".to_string(),
-                                        internal: Some(internal_before.len() as f64),
-                                        venue: Some(venue_orders.len() as f64),
-                                        diff: Some(
-                                            internal_before.len() as f64
-                                                - venue_orders.len() as f64,
-                                        ),
-                                        tolerance: Some(order_tol as f64),
-                                        source: "order_snapshot".to_string(),
-                                        available: true,
-                                    },
-                                );
-                            }
-                        }
+                        let order_state_was_initialized =
+                            venue_state_initialized(&order_state_initialized, snapshot.venue_index);
                         // Order snapshots are the venue-side source of truth; reconcile them
                         // into local state instead of hard-killing on transient replace skew.
                         let (core_events, fills) = infer_fills_from_order_snapshot(
@@ -4457,6 +4456,18 @@ pub async fn run_live_loop(
                             &mut state,
                             snapshot.venue_index,
                         );
+                        if order_state_was_initialized {
+                            let internal_after = state
+                                .live_order_state
+                                .open_order_ids_by_venue(snapshot.venue_index);
+                            if let Some(record) = build_open_order_reconcile_drift_record(
+                                &snapshot,
+                                &internal_after,
+                                order_tol,
+                            ) {
+                                push_reconcile_drift(&mut pending_drift_events, &audit_dir, record);
+                            }
+                        }
                         mark_venue_state_initialized(
                             &mut order_state_initialized,
                             snapshot.venue_index,
@@ -17225,6 +17236,63 @@ mod tests {
                 Err("v2_ranked_non_execution_place")
             );
         });
+    }
+
+    #[test]
+    fn order_snapshot_reconcile_drift_ignores_pre_apply_snapshot_skew_after_reconcile() {
+        let mut order_state = crate::live::order_state::LiveOrderState::new();
+        let snapshot = types::OrderSnapshot {
+            venue_index: 2,
+            venue_id: "aster".to_string(),
+            seq: 1,
+            timestamp_ms: 1_000,
+            open_orders: vec![types::OpenOrderSnapshot {
+                order_id: "aster_order_1".to_string(),
+                client_order_id: Some("co_aster_1".to_string()),
+                exchange_order_id: None,
+                side: Side::Buy,
+                price: 2_100.0,
+                size: 0.01,
+                purpose: Some(OrderPurpose::Mm),
+            }],
+        };
+
+        let pre_apply = order_state.open_order_ids_by_venue(snapshot.venue_index);
+        assert!(build_open_order_reconcile_drift_record(&snapshot, &pre_apply, 0).is_some());
+
+        order_state.reconcile_with_supported_replace_gap_grace_ms(&snapshot, 1_000, 1);
+        let post_apply = order_state.open_order_ids_by_venue(snapshot.venue_index);
+        assert_eq!(post_apply, vec!["aster_order_1".to_string()]);
+        assert!(build_open_order_reconcile_drift_record(&snapshot, &post_apply, 0).is_none());
+    }
+
+    #[test]
+    fn order_snapshot_reconcile_drift_reports_only_unresolved_mismatch() {
+        let snapshot = types::OrderSnapshot {
+            venue_index: 2,
+            venue_id: "aster".to_string(),
+            seq: 2,
+            timestamp_ms: 2_000,
+            open_orders: vec![types::OpenOrderSnapshot {
+                order_id: "venue_order_1".to_string(),
+                client_order_id: Some("co_aster_1".to_string()),
+                exchange_order_id: None,
+                side: Side::Sell,
+                price: 2_101.0,
+                size: 0.01,
+                purpose: Some(OrderPurpose::Mm),
+            }],
+        };
+        let internal = vec!["other_order_1".to_string()];
+
+        let record = build_open_order_reconcile_drift_record(&snapshot, &internal, 0)
+            .expect("unresolved mismatch should be reported");
+        assert_eq!(record.kind, "open_orders");
+        assert_eq!(record.venue_id, "aster");
+        assert_eq!(record.internal, Some(1.0));
+        assert_eq!(record.venue, Some(1.0));
+        assert_eq!(record.diff, Some(0.0));
+        assert_eq!(record.source, "order_snapshot_post_reconcile");
     }
 
     #[test]
