@@ -41,6 +41,7 @@ PREFLIGHT_REQUIRED_SNIPPETS = (
     "venue_coverage_probe_venues_present=true",
     "ranked_execution_venues_present=true",
     "exit_cancel_all=true",
+    "exit_cancel_all_sweep_all_venues=true",
     "exit_position_flatten=true",
 )
 

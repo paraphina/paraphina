@@ -1833,7 +1833,7 @@ fn v2_live_canary_admission_preflight_check(
         label: "v2_live_canary_admission",
         ok: gate_state.satisfied(),
         details: format!(
-            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} exit_cancel_all={} exit_position_flatten={} venue_coverage_replacements_disabled={} venue_coverage_probe_approved={} venue_coverage_probe_venues_present={} ranked_execution_venues_present={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
+            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} exit_cancel_all={} exit_cancel_all_sweep_all_venues={} exit_position_flatten={} venue_coverage_replacements_disabled={} venue_coverage_probe_approved={} venue_coverage_probe_venues_present={} ranked_execution_venues_present={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
             gate_state.live_canary_admission_approved,
             gate_state.live_canary_mode_enabled,
             gate_state.live_canary_profile_metadata_present,
@@ -1845,6 +1845,7 @@ fn v2_live_canary_admission_preflight_check(
             gate_state.live_canary_reduce_only_not_enforced,
             gate_state.live_canary_baseline_hedge_authority_acknowledged,
             gate_state.live_canary_exit_cancel_all_enabled,
+            gate_state.live_canary_exit_cancel_all_sweep_all_venues_enabled,
             gate_state.live_canary_exit_position_flatten_enabled,
             gate_state.live_canary_venue_coverage_replacements_disabled,
             gate_state.live_canary_venue_coverage_probe_approved,
@@ -5514,6 +5515,8 @@ mod tests {
         let _baseline_hedge_ack =
             EnvVarGuard::new("PARAPHINA_V2_LIVE_CANARY_BASELINE_HEDGE_AUTHORITY_ACK");
         let _exit_cancel_all = EnvVarGuard::new("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED");
+        let _exit_cancel_all_sweep_all_venues =
+            EnvVarGuard::new("PARAPHINA_CANARY_EXIT_CANCEL_ALL_SWEEP_ALL_VENUES");
         let _exit_position_flatten =
             EnvVarGuard::new("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED");
         let _venue_coverage_replacements_disabled =
@@ -5532,6 +5535,7 @@ mod tests {
         std::env::set_var("PARAPHINA_RUNTIME_CANARY_ENFORCE_REDUCE_ONLY", "0");
         std::env::set_var("PARAPHINA_V2_LIVE_CANARY_BASELINE_HEDGE_AUTHORITY_ACK", "1");
         std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED", "1");
+        std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_SWEEP_ALL_VENUES", "1");
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED", "1");
         std::env::set_var(
             "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS",
@@ -5557,6 +5561,9 @@ mod tests {
             assert!(check.details.contains("reduce_only_not_enforced=true"));
             assert!(check.details.contains("baseline_hedge_authority_ack=true"));
             assert!(check.details.contains("exit_cancel_all=true"));
+            assert!(check
+                .details
+                .contains("exit_cancel_all_sweep_all_venues=true"));
             assert!(check.details.contains("exit_position_flatten=true"));
             assert!(check
                 .details
@@ -5580,6 +5587,9 @@ mod tests {
 
             assert!(!check.ok);
             assert!(check.details.contains("exit_cancel_all=true"));
+            assert!(check
+                .details
+                .contains("exit_cancel_all_sweep_all_venues=true"));
             assert!(check.details.contains("exit_position_flatten=false"));
 
             std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED", "1");
@@ -5589,6 +5599,26 @@ mod tests {
 
             assert!(!check.ok);
             assert!(check.details.contains("exit_cancel_all=false"));
+            assert!(check
+                .details
+                .contains("exit_cancel_all_sweep_all_venues=true"));
+            assert!(check.details.contains("exit_position_flatten=true"));
+        });
+    }
+
+    #[test]
+    fn v2_live_canary_admission_preflight_requires_cancel_all_sweep_all_venues() {
+        with_v2_live_canary_preflight_env(|| {
+            std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_SWEEP_ALL_VENUES");
+            let cfg = v2_live_canary_admission_config();
+            let check = super::v2_live_canary_admission_preflight_check(TradeMode::Live, &cfg)
+                .expect("preflight check should run");
+
+            assert!(!check.ok);
+            assert!(check.details.contains("exit_cancel_all=true"));
+            assert!(check
+                .details
+                .contains("exit_cancel_all_sweep_all_venues=false"));
             assert!(check.details.contains("exit_position_flatten=true"));
         });
     }
@@ -5606,6 +5636,9 @@ mod tests {
 
             assert!(!check.ok);
             assert!(check.details.contains("exit_cancel_all=true"));
+            assert!(check
+                .details
+                .contains("exit_cancel_all_sweep_all_venues=true"));
             assert!(check.details.contains("exit_position_flatten=true"));
             assert!(check
                 .details

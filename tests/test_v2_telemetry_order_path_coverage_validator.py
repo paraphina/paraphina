@@ -23,7 +23,7 @@ def preflight_text() -> str:
         [
             "paraphina_live preflight:",
             "- PASS v2_live_canary_admission approved=true canary_mode=true "
-            "exit_cancel_all=true exit_position_flatten=true "
+            "exit_cancel_all=true exit_cancel_all_sweep_all_venues=true exit_position_flatten=true "
             "venue_coverage_replacements_disabled=true "
             "venue_coverage_probe_approved=true "
             "venue_coverage_probe_venues_present=true "
@@ -202,6 +202,14 @@ class TestV2TelemetryOrderPathCoverageValidator(unittest.TestCase):
         self.assertEqual(report["validation_status"], "HOLD")
         self.assertTrue(
             any(reason.startswith("preflight_missing:venue_coverage_replacements_disabled=true") for reason in report["validation_reasons"])
+        )
+
+    def test_missing_sweep_all_preflight_gate_holds(self):
+        report = self.evaluate(preflight=preflight_text().replace("exit_cancel_all_sweep_all_venues=true ", ""))
+
+        self.assertEqual(report["validation_status"], "HOLD")
+        self.assertTrue(
+            any(reason.startswith("preflight_missing:exit_cancel_all_sweep_all_venues=true") for reason in report["validation_reasons"])
         )
 
     def test_sensitive_key_holds_without_exposing_value(self):

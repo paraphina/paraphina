@@ -183,6 +183,7 @@ pub struct V2AdmissionGateState {
     pub live_canary_reduce_only_not_enforced: bool,
     pub live_canary_baseline_hedge_authority_acknowledged: bool,
     pub live_canary_exit_cancel_all_enabled: bool,
+    pub live_canary_exit_cancel_all_sweep_all_venues_enabled: bool,
     pub live_canary_exit_position_flatten_enabled: bool,
     pub live_canary_venue_coverage_replacements_disabled: bool,
     pub live_canary_order_path_probe_approved: bool,
@@ -206,11 +207,12 @@ impl V2AdmissionGateState {
             && self.live_canary_post_only_enforced
             && self.live_canary_reduce_only_not_enforced
             && self.live_canary_baseline_hedge_authority_acknowledged
+            && self.live_canary_exit_cancel_all_enabled
+            && self.live_canary_exit_cancel_all_sweep_all_venues_enabled
+            && self.live_canary_exit_position_flatten_enabled
             && self.live_canary_ranked_execution_venues_present
             && (!self.live_canary_venue_coverage_probe_approved
-                || (self.live_canary_exit_cancel_all_enabled
-                    && self.live_canary_exit_position_flatten_enabled
-                    && self.live_canary_venue_coverage_replacements_disabled));
+                || self.live_canary_venue_coverage_replacements_disabled);
 
         self.enabled
             && (paper_authority || live_canary_authority)
@@ -234,6 +236,7 @@ pub struct V2AdmissionRuntimeContext {
     pub live_canary_reduce_only_not_enforced: bool,
     pub live_canary_baseline_hedge_authority_acknowledged: bool,
     pub live_canary_exit_cancel_all_enabled: bool,
+    pub live_canary_exit_cancel_all_sweep_all_venues_enabled: bool,
     pub live_canary_exit_position_flatten_enabled: bool,
     pub live_canary_venue_coverage_replacements_disabled: bool,
 }
@@ -386,6 +389,9 @@ impl V2AdmissionRuntimeContext {
             live_canary_exit_cancel_all_enabled: env_flag_true(
                 "PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED",
             ),
+            live_canary_exit_cancel_all_sweep_all_venues_enabled: env_flag_true(
+                "PARAPHINA_CANARY_EXIT_CANCEL_ALL_SWEEP_ALL_VENUES",
+            ),
             live_canary_exit_position_flatten_enabled: env_flag_true(
                 "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED",
             ),
@@ -440,6 +446,8 @@ pub fn admission_gate_state(
         live_canary_baseline_hedge_authority_acknowledged: runtime_context
             .live_canary_baseline_hedge_authority_acknowledged,
         live_canary_exit_cancel_all_enabled: runtime_context.live_canary_exit_cancel_all_enabled,
+        live_canary_exit_cancel_all_sweep_all_venues_enabled: runtime_context
+            .live_canary_exit_cancel_all_sweep_all_venues_enabled,
         live_canary_exit_position_flatten_enabled: runtime_context
             .live_canary_exit_position_flatten_enabled,
         live_canary_venue_coverage_replacements_disabled: runtime_context
@@ -1728,6 +1736,7 @@ mod tests {
             live_canary_reduce_only_not_enforced: true,
             live_canary_baseline_hedge_authority_acknowledged: true,
             live_canary_exit_cancel_all_enabled: true,
+            live_canary_exit_cancel_all_sweep_all_venues_enabled: true,
             live_canary_exit_position_flatten_enabled: true,
             live_canary_venue_coverage_replacements_disabled: true,
         }
@@ -2406,6 +2415,11 @@ mod tests {
         assert!(!decision.gate_state.satisfied());
         assert!(decision.gate_state.live_canary_exit_cancel_all_enabled);
         assert!(
+            decision
+                .gate_state
+                .live_canary_exit_cancel_all_sweep_all_venues_enabled
+        );
+        assert!(
             !decision
                 .gate_state
                 .live_canary_exit_position_flatten_enabled
@@ -2440,6 +2454,34 @@ mod tests {
             intents.len(),
             1,
             "missing cancel-all gate must not mutate intents"
+        );
+
+        let mut context = live_canary_runtime_context();
+        context.live_canary_exit_cancel_all_sweep_all_venues_enabled = false;
+        let mut intents = vec![mm_place(0, "extended", Side::Buy, 99.0)];
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert!(!decision.gate_state.satisfied());
+        assert!(decision.gate_state.live_canary_exit_cancel_all_enabled);
+        assert!(
+            !decision
+                .gate_state
+                .live_canary_exit_cancel_all_sweep_all_venues_enabled
+        );
+        assert!(
+            decision
+                .gate_state
+                .live_canary_exit_position_flatten_enabled
+        );
+        assert!(!decision.venue_coverage_probe_is_admission);
+        assert_eq!(
+            intents.len(),
+            1,
+            "missing sweep-all gate must not mutate intents"
         );
     }
 

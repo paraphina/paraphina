@@ -62,6 +62,7 @@ def _manifest_run_binding_reasons(
     venue_audit_path: Path,
     run_token: str | None,
     audit_captured_after_run: bool,
+    audit_captured_after_terminal_cleanup: bool,
 ) -> tuple[list[str], dict[str, Any]]:
     reasons: list[str] = []
     manifest_meta: dict[str, Any] = {
@@ -69,6 +70,7 @@ def _manifest_run_binding_reasons(
         "canary_manifest_sha256": None,
         "run_token": run_token,
         "audit_captured_after_run_confirmed": audit_captured_after_run,
+        "audit_captured_after_terminal_cleanup_confirmed": audit_captured_after_terminal_cleanup,
     }
     token = run_token.strip() if isinstance(run_token, str) else ""
     if not token:
@@ -111,6 +113,8 @@ def _manifest_run_binding_reasons(
         reasons.append("run_binding_token_not_in_venue_audit_path")
     if not audit_captured_after_run:
         reasons.append("run_binding_after_run_confirmation_missing")
+    if not audit_captured_after_terminal_cleanup:
+        reasons.append("run_binding_after_terminal_cleanup_confirmation_missing")
     return reasons, manifest_meta
 
 
@@ -140,6 +144,7 @@ def evaluate_terminal_flatness(
     canary_manifest_path: Path | None = None,
     run_token: str | None = None,
     audit_captured_after_run: bool = False,
+    audit_captured_after_terminal_cleanup: bool = False,
 ) -> dict[str, Any]:
     if not math.isfinite(position_tol_base) or position_tol_base < 0:
         raise TerminalFlatnessGateError("position tolerance must be finite and non-negative")
@@ -155,11 +160,16 @@ def evaluate_terminal_flatness(
         venue_audit_path=venue_audit_path,
         run_token=run_token,
         audit_captured_after_run=audit_captured_after_run,
+        audit_captured_after_terminal_cleanup=audit_captured_after_terminal_cleanup,
     )
     reasons.extend(binding_reasons)
 
     if data.get("ok") is not True:
         reasons.append("venue_audit_not_ok")
+    if _as_int(data.get("max_open_orders")) != 0:
+        reasons.append("venue_audit_max_open_orders_not_zero")
+    if data.get("allow_unknown_open_orders") is True:
+        reasons.append("venue_audit_allows_unknown_open_orders")
 
     audit_tol = _as_float(data.get("position_tol_base"))
     if audit_tol is None:
@@ -251,6 +261,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Required explicit confirmation that the venue audit was captured after canary exit/cleanup.",
     )
+    parser.add_argument(
+        "--audit-captured-after-terminal-cleanup",
+        action="store_true",
+        help="Required explicit confirmation that the venue audit was captured after terminal cleanup completed.",
+    )
     parser.add_argument("--expected-venues", required=True)
     parser.add_argument("--position-tol-base", type=float, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -264,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
             canary_manifest_path=args.canary_manifest,
             run_token=args.run_token,
             audit_captured_after_run=args.audit_captured_after_run,
+            audit_captured_after_terminal_cleanup=args.audit_captured_after_terminal_cleanup,
         )
     except TerminalFlatnessGateError as exc:
         print(f"V2_TERMINAL_FLATNESS_GATE_ERROR: {exc}", file=sys.stderr)

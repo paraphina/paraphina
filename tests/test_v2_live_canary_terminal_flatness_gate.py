@@ -32,6 +32,7 @@ def audit_doc(**overrides):
         "ok": True,
         "position_tol_base": 0.0025,
         "max_open_orders": 0,
+        "allow_unknown_open_orders": False,
         "results": [venue_result(venue) for venue in EXPECTED],
         "violations": [],
     }
@@ -67,6 +68,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         *,
         manifest: dict | None = None,
         audit_captured_after_run: bool = True,
+        audit_captured_after_terminal_cleanup: bool = True,
         run_token: str = RUN_TOKEN,
     ):
         with tempfile.TemporaryDirectory() as tmp:
@@ -82,6 +84,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
                 canary_manifest_path=canary_manifest,
                 run_token=run_token,
                 audit_captured_after_run=audit_captured_after_run,
+                audit_captured_after_terminal_cleanup=audit_captured_after_terminal_cleanup,
             )
 
     def test_flat_all_venues_passes_without_clearance_claims(self):
@@ -175,6 +178,33 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
         self.assertIn(
             "run_binding_after_run_confirmation_missing",
+            report["terminal_flatness_gate_reasons"],
+        )
+
+    def test_missing_after_terminal_cleanup_confirmation_holds(self):
+        report = self.evaluate(audit_doc(), audit_captured_after_terminal_cleanup=False)
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "run_binding_after_terminal_cleanup_confirmation_missing",
+            report["terminal_flatness_gate_reasons"],
+        )
+
+    def test_nonzero_audit_max_open_orders_holds(self):
+        report = self.evaluate(audit_doc(max_open_orders=1))
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "venue_audit_max_open_orders_not_zero",
+            report["terminal_flatness_gate_reasons"],
+        )
+
+    def test_allow_unknown_open_orders_holds(self):
+        report = self.evaluate(audit_doc(allow_unknown_open_orders=True))
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "venue_audit_allows_unknown_open_orders",
             report["terminal_flatness_gate_reasons"],
         )
 
