@@ -183,6 +183,119 @@ def scan_raw_identifier_fields(value: Any, line_num: int, path: str = "$") -> li
     return errors
 
 
+def _is_nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _validate_string_int_map(value: Any, line_num: int, field: str) -> list[ValidationError]:
+    errors: list[ValidationError] = []
+    if not isinstance(value, dict):
+        return [ValidationError(line_num, f"{field} must be object")]
+    for key, child in value.items():
+        if not isinstance(key, str) or not key:
+            errors.append(ValidationError(line_num, f"{field} keys must be non-empty strings"))
+        if not _is_nonnegative_int(child):
+            errors.append(ValidationError(line_num, f"{field}.{key} must be non-negative integer"))
+    return errors
+
+
+def validate_v2_live_canary_post_cap_accounting(record: dict[str, Any], line_num: int) -> list[ValidationError]:
+    """Validate optional V2 live-canary post-open-order-cap accounting telemetry."""
+    errors: list[ValidationError] = []
+    if "v2_live_canary_dispatch_accounting" in record:
+        errors.append(
+            ValidationError(
+                line_num,
+                "v2_live_canary_dispatch_accounting is obsolete; use v2_live_canary_post_cap_accounting",
+            )
+        )
+    accounting = record.get("v2_live_canary_post_cap_accounting")
+    if accounting is None:
+        return errors
+    if not isinstance(accounting, dict):
+        return errors + [
+            ValidationError(line_num, "v2_live_canary_post_cap_accounting must be object")
+        ]
+
+    int_fields = [
+        "max_open_orders",
+        "outstanding_orders",
+        "allowed_new_order_creating",
+        "pre_cap_intent_count",
+        "post_cap_intent_count",
+        "pre_cap_order_creating_count",
+        "post_cap_order_creating_count",
+        "removed_order_creating",
+    ]
+    for field in int_fields:
+        if not _is_nonnegative_int(accounting.get(field)):
+            errors.append(
+                ValidationError(
+                    line_num,
+                    f"v2_live_canary_post_cap_accounting.{field} must be non-negative integer",
+                )
+            )
+
+    for field in [
+        "pre_cap_order_creating_by_venue",
+        "post_cap_order_creating_by_venue",
+        "open_order_cap_suppressed_by_venue",
+    ]:
+        errors.extend(
+            _validate_string_int_map(
+                accounting.get(field),
+                line_num,
+                f"v2_live_canary_post_cap_accounting.{field}",
+            )
+        )
+
+    reason = accounting.get("open_order_cap_suppressed_reason")
+    if reason is not None and reason != "open_order_cap":
+        errors.append(
+            ValidationError(
+                line_num,
+                "v2_live_canary_post_cap_accounting.open_order_cap_suppressed_reason must be open_order_cap or null",
+            )
+        )
+
+    pre_count = accounting.get("pre_cap_order_creating_count")
+    post_count = accounting.get("post_cap_order_creating_count")
+    removed = accounting.get("removed_order_creating")
+    if all(_is_nonnegative_int(value) for value in [pre_count, post_count, removed]):
+        if post_count > pre_count:
+            errors.append(
+                ValidationError(
+                    line_num,
+                    "v2_live_canary_post_cap_accounting.post_cap_order_creating_count exceeds pre_cap_order_creating_count",
+                )
+            )
+        if removed != pre_count - post_count:
+            errors.append(
+                ValidationError(
+                    line_num,
+                    "v2_live_canary_post_cap_accounting.removed_order_creating must equal pre_cap_order_creating_count minus post_cap_order_creating_count",
+                )
+            )
+        if (removed > 0) != (reason == "open_order_cap"):
+            errors.append(
+                ValidationError(
+                    line_num,
+                    "v2_live_canary_post_cap_accounting.open_order_cap_suppressed_reason must match removed_order_creating",
+                )
+            )
+
+    pre_intents = accounting.get("pre_cap_intent_count")
+    post_intents = accounting.get("post_cap_intent_count")
+    if _is_nonnegative_int(pre_intents) and _is_nonnegative_int(post_intents) and post_intents > pre_intents:
+        errors.append(
+            ValidationError(
+                line_num,
+                "v2_live_canary_post_cap_accounting.post_cap_intent_count exceeds pre_cap_intent_count",
+            )
+        )
+    return errors
+
+
 def load_schema(schema_path: Path) -> dict[str, Any] | None:
     """
     Load the machine-readable schema from JSON file.
@@ -356,6 +469,7 @@ def validate_record(
                 f"field '{field}' must be {str(expected_value).lower()}, got {record[field]}"
             ))
 
+    errors.extend(validate_v2_live_canary_post_cap_accounting(record, line_num))
     errors.extend(scan_raw_identifier_fields(record, line_num))
     
     # Check index monotonicity if applicable

@@ -479,6 +479,60 @@ class TestValidateTelemetryRecord(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_v2_live_canary_post_cap_accounting_shape_passes(self):
+        """Post-cap accounting must report retained order-creating intents distinctly."""
+        record = self._make_valid_record(
+            v2_live_canary_post_cap_accounting={
+                "max_open_orders": 1,
+                "outstanding_orders": 0,
+                "allowed_new_order_creating": 1,
+                "pre_cap_intent_count": 3,
+                "post_cap_intent_count": 2,
+                "pre_cap_order_creating_count": 2,
+                "post_cap_order_creating_count": 1,
+                "removed_order_creating": 1,
+                "pre_cap_order_creating_by_venue": {"lighter": 1, "aster": 1},
+                "post_cap_order_creating_by_venue": {"lighter": 1},
+                "open_order_cap_suppressed_by_venue": {"aster": 1},
+                "open_order_cap_suppressed_reason": "open_order_cap",
+            }
+        )
+
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
+
+        self.assertEqual(errors, [])
+
+    def test_v2_live_canary_obsolete_dispatch_accounting_field_fails(self):
+        """Telemetry must not reintroduce the ambiguous dispatch-accounting name."""
+        record = self._make_valid_record(v2_live_canary_dispatch_accounting={})
+
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
+
+        self.assertTrue(any("obsolete" in error.message for error in errors), errors)
+
+    def test_v2_live_canary_post_cap_accounting_count_mismatch_fails(self):
+        """Post-cap accounting must not obscure suppression math."""
+        record = self._make_valid_record(
+            v2_live_canary_post_cap_accounting={
+                "max_open_orders": 1,
+                "outstanding_orders": 0,
+                "allowed_new_order_creating": 1,
+                "pre_cap_intent_count": 3,
+                "post_cap_intent_count": 2,
+                "pre_cap_order_creating_count": 2,
+                "post_cap_order_creating_count": 1,
+                "removed_order_creating": 0,
+                "pre_cap_order_creating_by_venue": {"lighter": 1, "aster": 1},
+                "post_cap_order_creating_by_venue": {"lighter": 1},
+                "open_order_cap_suppressed_by_venue": {"aster": 1},
+                "open_order_cap_suppressed_reason": "open_order_cap",
+            }
+        )
+
+        errors, _ = validate_record(record, self.schema, 1, None, "t")
+
+        self.assertTrue(any("removed_order_creating" in error.message for error in errors), errors)
+
 
 class TestValidateMcRunsRecord(unittest.TestCase):
     """Test the validate_record function for mc_runs.jsonl schema."""
