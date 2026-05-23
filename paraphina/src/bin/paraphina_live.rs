@@ -1833,7 +1833,7 @@ fn v2_live_canary_admission_preflight_check(
         label: "v2_live_canary_admission",
         ok: gate_state.satisfied(),
         details: format!(
-            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} exit_cancel_all={} exit_position_flatten={} venue_coverage_probe_approved={} venue_coverage_probe_venues_present={} ranked_execution_venues_present={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
+            "approved={} canary_mode={} profile_metadata={} max_position={} max_gross_position={} max_abs_venue_position={} max_open_orders={} post_only={} reduce_only_not_enforced={} baseline_hedge_authority_ack={} exit_cancel_all={} exit_position_flatten={} venue_coverage_replacements_disabled={} venue_coverage_probe_approved={} venue_coverage_probe_venues_present={} ranked_execution_venues_present={} pair_edge={} order_intent={} fast_hedge_disabled={} require_phase51={}",
             gate_state.live_canary_admission_approved,
             gate_state.live_canary_mode_enabled,
             gate_state.live_canary_profile_metadata_present,
@@ -1846,6 +1846,7 @@ fn v2_live_canary_admission_preflight_check(
             gate_state.live_canary_baseline_hedge_authority_acknowledged,
             gate_state.live_canary_exit_cancel_all_enabled,
             gate_state.live_canary_exit_position_flatten_enabled,
+            gate_state.live_canary_venue_coverage_replacements_disabled,
             gate_state.live_canary_venue_coverage_probe_approved,
             gate_state.live_canary_venue_coverage_probe_venues_present,
             gate_state.live_canary_ranked_execution_venues_present,
@@ -5515,6 +5516,8 @@ mod tests {
         let _exit_cancel_all = EnvVarGuard::new("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED");
         let _exit_position_flatten =
             EnvVarGuard::new("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED");
+        let _venue_coverage_replacements_disabled =
+            EnvVarGuard::new("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS");
 
         std::env::set_var("PARAPHINA_RUNTIME_CANARY_PROFILE_PATH", "configs/v2.toml");
         std::env::set_var("PARAPHINA_RUNTIME_CANARY_PROFILE_SHA256", "sanitized-sha");
@@ -5530,6 +5533,10 @@ mod tests {
         std::env::set_var("PARAPHINA_V2_LIVE_CANARY_BASELINE_HEDGE_AUTHORITY_ACK", "1");
         std::env::set_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED", "1");
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ENABLED", "1");
+        std::env::set_var(
+            "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS",
+            "1",
+        );
 
         f()
     }
@@ -5551,6 +5558,9 @@ mod tests {
             assert!(check.details.contains("baseline_hedge_authority_ack=true"));
             assert!(check.details.contains("exit_cancel_all=true"));
             assert!(check.details.contains("exit_position_flatten=true"));
+            assert!(check
+                .details
+                .contains("venue_coverage_replacements_disabled=true"));
             assert!(check
                 .details
                 .contains("ranked_execution_venues_present=true"));
@@ -5580,6 +5590,44 @@ mod tests {
             assert!(!check.ok);
             assert!(check.details.contains("exit_cancel_all=false"));
             assert!(check.details.contains("exit_position_flatten=true"));
+        });
+    }
+
+    #[test]
+    fn v2_live_canary_admission_preflight_rejects_venue_coverage_without_replacement_gate() {
+        with_v2_live_canary_preflight_env(|| {
+            let mut cfg = v2_live_canary_admission_config();
+            cfg.v2_shadow.live_canary_venue_coverage_probe_approved = true;
+            cfg.v2_shadow.live_canary_venue_coverage_probe_venues = vec!["paradex".to_string()];
+
+            std::env::remove_var("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS");
+            let check = super::v2_live_canary_admission_preflight_check(TradeMode::Live, &cfg)
+                .expect("preflight check should run");
+
+            assert!(!check.ok);
+            assert!(check.details.contains("exit_cancel_all=true"));
+            assert!(check.details.contains("exit_position_flatten=true"));
+            assert!(check
+                .details
+                .contains("venue_coverage_replacements_disabled=false"));
+        });
+    }
+
+    #[test]
+    fn v2_live_canary_admission_preflight_does_not_require_replacement_gate_without_coverage() {
+        with_v2_live_canary_preflight_env(|| {
+            let cfg = v2_live_canary_admission_config();
+            std::env::remove_var("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS");
+            let check = super::v2_live_canary_admission_preflight_check(TradeMode::Live, &cfg)
+                .expect("preflight check should run");
+
+            assert!(check.ok, "unexpected preflight failure: {}", check.details);
+            assert!(check
+                .details
+                .contains("venue_coverage_probe_approved=false"));
+            assert!(check
+                .details
+                .contains("venue_coverage_replacements_disabled=false"));
         });
     }
 

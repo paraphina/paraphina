@@ -2227,6 +2227,30 @@ fn v2_live_canary_venue_coverage_should_stop_after_first_fill(
         && v2_live_canary_venue_coverage_tick_has_allowed_mm_fill(cfg, fills)
 }
 
+fn v2_live_canary_venue_coverage_replacements_disabled(cfg: &Config, trade_mode: &str) -> bool {
+    trade_mode == "live"
+        && v2_live_canary_admission_authorized(cfg)
+        && cfg.v2_shadow.live_canary_venue_coverage_probe_approved
+        && !cfg
+            .v2_shadow
+            .live_canary_venue_coverage_probe_venues
+            .is_empty()
+        && phase51_true_env(V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV)
+}
+
+fn v2_live_canary_venue_coverage_suppress_replacements(
+    cfg: &Config,
+    trade_mode: &str,
+    intents: &mut Vec<OrderIntent>,
+) -> usize {
+    if !v2_live_canary_venue_coverage_replacements_disabled(cfg, trade_mode) {
+        return 0;
+    }
+    let before = intents.len();
+    intents.retain(|intent| !matches!(intent, OrderIntent::Replace(_)));
+    before.saturating_sub(intents.len())
+}
+
 fn v2_is_mm_order_creating_intent(intent: &OrderIntent) -> bool {
     match intent {
         OrderIntent::Place(place) => place.purpose == OrderPurpose::Mm,
@@ -3344,6 +3368,8 @@ const PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY";
 const V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL";
+const V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV: &str =
+    "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS";
 const V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES";
 const V2_DECISION_MODE_ENV: &str = "PARAPHINA_V2_DECISION_MODE";
@@ -6450,6 +6476,18 @@ pub async fn run_live_loop(
             .and_then(|hooks| hooks.telemetry.as_ref())
             .map(|telemetry| telemetry.execution_mode)
             .unwrap_or("unknown");
+        let v2_venue_coverage_replacements_suppressed =
+            v2_live_canary_venue_coverage_suppress_replacements(
+                cfg,
+                v2_execution_mode,
+                &mut intents,
+            );
+        if v2_venue_coverage_replacements_suppressed > 0 {
+            eprintln!(
+                "[v2] live_canary_venue_coverage_suppressed_replacements count={}",
+                v2_venue_coverage_replacements_suppressed
+            );
+        }
         if v2_live_order_path_probe_latch_enabled(cfg) && v2_live_order_path_probe_attempted {
             let removed = v2_remove_order_creating_probe_intents(&mut intents);
             if removed > 0 {
@@ -17691,6 +17729,102 @@ mod tests {
             true,
             &fills
         ));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_replacement_suppression_is_default_off() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV]);
+        std::env::remove_var(V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV);
+        let cfg = v2_live_canary_venue_coverage_config(vec!["paradex"]);
+        let mut intents = vec![OrderIntent::Replace(ReplaceOrderIntent {
+            venue_index: 4,
+            venue_id: "paradex".into(),
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            order_id: "redacted-test-order".to_string(),
+            client_order_id: None,
+            phase51_target_key: None,
+        })];
+
+        assert_eq!(
+            v2_live_canary_venue_coverage_suppress_replacements(&cfg, "live", &mut intents),
+            0
+        );
+        assert!(matches!(intents.first(), Some(OrderIntent::Replace(_))));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_replacement_suppression_keeps_place_and_cancel() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV]);
+        std::env::set_var(
+            V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV,
+            "true",
+        );
+        let cfg = v2_live_canary_venue_coverage_config(vec!["paradex"]);
+        let mut intents = vec![
+            OrderIntent::Replace(ReplaceOrderIntent {
+                venue_index: 4,
+                venue_id: "paradex".into(),
+                side: Side::Buy,
+                price: 100.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                order_id: "redacted-test-order".to_string(),
+                client_order_id: None,
+                phase51_target_key: None,
+            }),
+            OrderIntent::Place(PlaceOrderIntent {
+                venue_index: 4,
+                venue_id: "paradex".into(),
+                side: Side::Sell,
+                price: 101.0,
+                size: 0.01,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: None,
+                phase51_target_key: Some(Phase51ForwardRefreshTargetKey {
+                    canonical_group_id: "redacted-cg".to_string(),
+                    order_key: "redacted-ok".to_string(),
+                }),
+            }),
+            OrderIntent::Cancel(CancelOrderIntent {
+                venue_index: 4,
+                venue_id: "paradex".into(),
+                order_id: "redacted-test-order".to_string(),
+            }),
+        ];
+
+        assert_eq!(
+            v2_live_canary_venue_coverage_suppress_replacements(&cfg, "live", &mut intents),
+            1
+        );
+        assert_eq!(intents.len(), 2);
+        assert!(intents
+            .iter()
+            .all(|intent| !matches!(intent, OrderIntent::Replace(_))));
+        assert!(intents
+            .iter()
+            .any(|intent| matches!(intent, OrderIntent::Place(_))));
+        assert!(intents
+            .iter()
+            .any(|intent| matches!(intent, OrderIntent::Cancel(_))));
+        let mut paper_intents = intents.clone();
+        assert_eq!(
+            v2_live_canary_venue_coverage_suppress_replacements(&cfg, "paper", &mut paper_intents),
+            0
+        );
     }
 
     #[test]
