@@ -232,6 +232,26 @@ impl VenueAccountCache {
         self.avg_entry_price = avg_entry_price;
         Ok(())
     }
+
+    fn apply_terminal_truth_snapshot(
+        &mut self,
+        snapshot: &AccountSnapshot,
+    ) -> Result<(), CacheError> {
+        if snapshot.venue_index != self.venue_index {
+            return Err(CacheError::new("venue_index mismatch for account snapshot"));
+        }
+        self.seq = self.seq.max(snapshot.seq);
+        self.last_update_ms = Some(snapshot.timestamp_ms);
+        self.positions = snapshot.positions.clone();
+        self.balances = snapshot.balances.clone();
+        self.funding_8h = snapshot.funding_8h;
+        self.margin = snapshot.margin.clone();
+        self.liquidation = snapshot.liquidation.clone();
+        let (position_tao, avg_entry_price) = derive_position_metrics(&self.positions);
+        self.position_tao = position_tao;
+        self.avg_entry_price = avg_entry_price;
+        Ok(())
+    }
 }
 
 fn derive_position_metrics(positions: &[super::types::PositionSnapshot]) -> (f64, f64) {
@@ -303,6 +323,9 @@ pub struct ReconciliationReport {
     pub account_ok: bool,
     pub issues: Vec<String>,
 }
+
+pub const ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE: &str =
+    "account snapshot seq is behind cache seq";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountFieldDiff {
@@ -380,6 +403,19 @@ impl LiveStateCache {
         } else {
             Err(CacheError::new("account event for unknown venue_index"))
         }
+    }
+
+    pub fn apply_terminal_account_truth_snapshot(
+        &mut self,
+        snapshot: &AccountSnapshot,
+    ) -> Result<(), CacheError> {
+        let Some(cache) = self.account.get_mut(snapshot.venue_index) else {
+            return Err(CacheError::new("account event for unknown venue_index"));
+        };
+        if snapshot.venue_id != cache.venue_id.as_ref() {
+            return Err(CacheError::new("venue_id mismatch for account snapshot"));
+        }
+        cache.apply_terminal_truth_snapshot(snapshot)
     }
 
     pub fn snapshot(&self, now_ms: TimestampMs, max_age_ms: i64) -> CanonicalCacheSnapshot {
@@ -509,7 +545,7 @@ impl LiveStateCache {
         };
         if snapshot.seq < cache.seq {
             report.account_ok = false;
-            report.record_issue("account snapshot seq is behind cache seq");
+            report.record_issue(ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE);
         }
         if snapshot.venue_id != cache.venue_id.as_ref() {
             report.account_ok = false;
@@ -621,6 +657,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::live::orderbook_l2::{BookLevel, BookLevelDelta, BookSide};
+    use crate::live::types::PositionSnapshot;
 
     #[test]
     fn market_cache_staleness_and_seq() {
@@ -719,5 +756,85 @@ mod tests {
             .apply_account_event(&AccountEvent::Snapshot(stale))
             .unwrap_err();
         assert!(err.message.contains("non-monotonic seq"));
+    }
+
+    #[test]
+    fn terminal_account_truth_snapshot_can_refresh_stale_seq_without_lowering_cache_seq() {
+        let cfg = Config::default();
+        let mut cache = LiveStateCache::new(&cfg);
+        let initial = AccountSnapshot {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id.clone(),
+            seq: 5,
+            timestamp_ms: 1_000,
+            positions: Vec::new(),
+            balances: Vec::new(),
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: 10_000.0,
+                used_usd: 0.0,
+                available_usd: 10_000.0,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+        cache
+            .apply_account_event(&AccountEvent::Snapshot(initial.clone()))
+            .expect("apply initial snapshot");
+
+        let stale_seq_truth = AccountSnapshot {
+            seq: 4,
+            timestamp_ms: 2_000,
+            positions: vec![PositionSnapshot {
+                symbol: "ETH".to_string(),
+                size: 0.03,
+                entry_price: 2_350.0,
+            }],
+            ..initial
+        };
+
+        let err = cache
+            .apply_account_event(&AccountEvent::Snapshot(stale_seq_truth.clone()))
+            .unwrap_err();
+        assert!(err.message.contains("non-monotonic seq"));
+
+        cache
+            .apply_terminal_account_truth_snapshot(&stale_seq_truth)
+            .expect("terminal truth can refresh stale-seq same-venue snapshot");
+        let snapshot = cache.snapshot(2_000, 1_000);
+        assert_eq!(snapshot.account[0].seq, 5);
+        assert_eq!(snapshot.account[0].timestamp_ms, Some(2_000));
+        assert!((snapshot.account[0].position_tao - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn terminal_account_truth_snapshot_rejects_structural_mismatch() {
+        let cfg = Config::default();
+        let mut cache = LiveStateCache::new(&cfg);
+        let wrong_venue = AccountSnapshot {
+            venue_index: 0,
+            venue_id: cfg.venues[1].id.clone(),
+            seq: 1,
+            timestamp_ms: 1_000,
+            positions: Vec::new(),
+            balances: Vec::new(),
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: 10_000.0,
+                used_usd: 0.0,
+                available_usd: 10_000.0,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+
+        let err = cache
+            .apply_terminal_account_truth_snapshot(&wrong_venue)
+            .unwrap_err();
+        assert!(err.message.contains("venue_id mismatch"));
     }
 }

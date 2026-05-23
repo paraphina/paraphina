@@ -54,7 +54,10 @@ use crate::types::{
 };
 
 use super::orderbook_l2::OrderBookL2;
-use super::state_cache::{CanonicalCacheSnapshot, LiveStateCache, VenueAccountSnapshot};
+use super::state_cache::{
+    CanonicalCacheSnapshot, LiveStateCache, ReconciliationReport, VenueAccountSnapshot,
+    ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE,
+};
 use super::types::ExecutionEvent as LiveExecutionEvent;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -4800,7 +4803,12 @@ pub async fn run_live_loop(
                     if let Some(diff) = diff {
                         let _ = append_account_reconcile_audit(&audit_dir, now_ms, diff);
                     }
-                    if report.account_ok && account_available {
+                    if apply_terminal_account_truth_refresh(
+                        &mut cache,
+                        &account_snapshot,
+                        &report,
+                        account_available,
+                    ) {
                         refreshed_any = true;
                     }
                 }
@@ -11871,6 +11879,40 @@ fn apply_canary_exit_position_flatten_account_truth_snapshot(
     }
 }
 
+fn terminal_account_truth_refresh_usable(
+    report: &ReconciliationReport,
+    account_available: bool,
+) -> bool {
+    if !account_available {
+        return false;
+    }
+    if report.account_ok {
+        return true;
+    }
+    !report.issues.is_empty()
+        && report
+            .issues
+            .iter()
+            .all(|issue| issue == ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE)
+}
+
+fn apply_terminal_account_truth_refresh(
+    cache: &mut LiveStateCache,
+    account_snapshot: &super::types::AccountSnapshot,
+    report: &ReconciliationReport,
+    account_available: bool,
+) -> bool {
+    if !terminal_account_truth_refresh_usable(report, account_available) {
+        return false;
+    }
+    if report.account_ok {
+        return true;
+    }
+    cache
+        .apply_terminal_account_truth_snapshot(account_snapshot)
+        .is_ok()
+}
+
 async fn refresh_canary_exit_position_flatten_account_truth(
     cfg: &Config,
     state: &mut GlobalState,
@@ -11918,7 +11960,18 @@ async fn refresh_canary_exit_position_flatten_account_truth(
         if let Some(diff) = diff {
             let _ = append_account_reconcile_audit(audit_dir, now_ms, diff);
         }
-        if report.account_ok && account_available {
+        if apply_terminal_account_truth_refresh(
+            cache,
+            &account_snapshot,
+            &report,
+            account_available,
+        ) {
+            if !report.account_ok {
+                eprintln!(
+                    "[runner] canary_exit_position_flatten_cleanup account_refresh_applied_with_reconcile_mismatch phase={} venue={}",
+                    phase, venue.id
+                );
+            }
             refreshed_venues.push(venue_index);
         } else {
             eprintln!(
@@ -28208,6 +28261,121 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn live_account_snapshot_for_venue(
+        cfg: &Config,
+        venue_index: usize,
+        seq: u64,
+        position_tao: f64,
+        timestamp_ms: TimestampMs,
+    ) -> types::AccountSnapshot {
+        types::AccountSnapshot {
+            venue_index,
+            venue_id: cfg.venues[venue_index].id.clone(),
+            seq,
+            timestamp_ms,
+            positions: if position_tao.abs() > 0.0 {
+                vec![types::PositionSnapshot {
+                    symbol: "ETH".to_string(),
+                    size: position_tao,
+                    entry_price: 2_350.0,
+                }]
+            } else {
+                Vec::new()
+            },
+            balances: Vec::new(),
+            funding_8h: None,
+            margin: types::MarginSnapshot {
+                balance_usd: 100.0,
+                used_usd: 0.0,
+                available_usd: 100.0,
+            },
+            liquidation: types::LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        }
+    }
+
+    #[test]
+    fn terminal_account_truth_refresh_allows_fresh_seq_behind_same_venue_truth() {
+        let report = ReconciliationReport {
+            market_ok: true,
+            account_ok: false,
+            issues: vec![ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE.to_string()],
+        };
+        assert!(terminal_account_truth_refresh_usable(&report, true));
+    }
+
+    #[test]
+    fn terminal_account_truth_refresh_rejects_unavailable_or_structural_mismatch() {
+        let seq_behind = ReconciliationReport {
+            market_ok: true,
+            account_ok: false,
+            issues: vec![ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE.to_string()],
+        };
+        assert!(!terminal_account_truth_refresh_usable(&seq_behind, false));
+
+        let venue_mismatch = ReconciliationReport {
+            market_ok: true,
+            account_ok: false,
+            issues: vec!["account snapshot venue_id mismatch".to_string()],
+        };
+        assert!(!terminal_account_truth_refresh_usable(
+            &venue_mismatch,
+            true
+        ));
+    }
+
+    #[test]
+    fn terminal_account_truth_refresh_applies_seq_behind_same_venue_snapshot() {
+        let cfg = Config::default();
+        let lighter = 3;
+        let mut cache = LiveStateCache::new(&cfg);
+        let initial = live_account_snapshot_for_venue(&cfg, lighter, 10, 0.0, 100_000);
+        cache
+            .apply_account_event(&types::AccountEvent::Snapshot(initial))
+            .expect("apply initial snapshot");
+
+        let truth = live_account_snapshot_for_venue(&cfg, lighter, 9, 0.03, 101_000);
+        let (report, diff) = cache.reconcile_account_snapshot_with_diff(&truth);
+        assert!(!report.account_ok);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue == ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE));
+        assert!(diff.is_some());
+
+        assert!(apply_terminal_account_truth_refresh(
+            &mut cache, &truth, &report, true,
+        ));
+        let snapshot = cache.snapshot(101_000, 1_000);
+        assert_eq!(snapshot.account[lighter].seq, 10);
+        assert!((snapshot.account[lighter].position_tao - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn terminal_account_truth_refresh_rejects_wrong_venue_snapshot() {
+        let cfg = Config::default();
+        let lighter = 3;
+        let mut cache = LiveStateCache::new(&cfg);
+        let initial = live_account_snapshot_for_venue(&cfg, lighter, 10, 0.0, 100_000);
+        cache
+            .apply_account_event(&types::AccountEvent::Snapshot(initial))
+            .expect("apply initial snapshot");
+
+        let mut truth = live_account_snapshot_for_venue(&cfg, lighter, 9, 0.03, 101_000);
+        truth.venue_id = cfg.venues[0].id.clone();
+        let (report, _diff) = cache.reconcile_account_snapshot_with_diff(&truth);
+        assert!(!report.account_ok);
+
+        assert!(!apply_terminal_account_truth_refresh(
+            &mut cache, &truth, &report, true,
+        ));
+        let snapshot = cache.snapshot(101_000, 1_000);
+        assert_eq!(snapshot.account[lighter].seq, 10);
+        assert_eq!(snapshot.account[lighter].position_tao, 0.0);
     }
 
     #[test]
