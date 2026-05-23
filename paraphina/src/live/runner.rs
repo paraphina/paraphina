@@ -28356,6 +28356,38 @@ mod tests {
     }
 
     #[test]
+    fn terminal_account_truth_refresh_applies_case_variant_venue_id_snapshot() {
+        let cfg = Config::default();
+        let lighter = 3;
+        let mut cache = LiveStateCache::new(&cfg);
+        let initial = live_account_snapshot_for_venue(&cfg, lighter, 10, -0.01, 100_000);
+        cache
+            .apply_account_event(&types::AccountEvent::Snapshot(initial))
+            .expect("apply initial snapshot");
+
+        let mut truth = live_account_snapshot_for_venue(&cfg, lighter, 9, 0.0, 101_000);
+        truth.venue_id = cfg.venues[lighter].id.to_ascii_uppercase();
+        let (report, diff) = cache.reconcile_account_snapshot_with_diff(&truth);
+        assert!(!report.account_ok);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue == ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE));
+        assert!(!report
+            .issues
+            .iter()
+            .any(|issue| issue == "account snapshot venue_id mismatch"));
+        assert!(diff.is_some());
+
+        assert!(apply_terminal_account_truth_refresh(
+            &mut cache, &truth, &report, true,
+        ));
+        let snapshot = cache.snapshot(101_000, 1_000);
+        assert_eq!(snapshot.account[lighter].seq, 10);
+        assert_eq!(snapshot.account[lighter].position_tao, 0.0);
+    }
+
+    #[test]
     fn terminal_account_truth_refresh_rejects_wrong_venue_snapshot() {
         let cfg = Config::default();
         let lighter = 3;

@@ -412,7 +412,10 @@ impl LiveStateCache {
         let Some(cache) = self.account.get_mut(snapshot.venue_index) else {
             return Err(CacheError::new("account event for unknown venue_index"));
         };
-        if snapshot.venue_id != cache.venue_id.as_ref() {
+        if !snapshot
+            .venue_id
+            .eq_ignore_ascii_case(cache.venue_id.as_ref())
+        {
             return Err(CacheError::new("venue_id mismatch for account snapshot"));
         }
         cache.apply_terminal_truth_snapshot(snapshot)
@@ -529,7 +532,10 @@ impl LiveStateCache {
             report.market_ok = false;
             report.record_issue("market snapshot seq is behind cache seq");
         }
-        if snapshot.venue_id != cache.venue_id.as_ref() {
+        if !snapshot
+            .venue_id
+            .eq_ignore_ascii_case(cache.venue_id.as_ref())
+        {
             report.market_ok = false;
             report.record_issue("market snapshot venue_id mismatch");
         }
@@ -547,7 +553,10 @@ impl LiveStateCache {
             report.account_ok = false;
             report.record_issue(ACCOUNT_SNAPSHOT_SEQ_BEHIND_CACHE_ISSUE);
         }
-        if snapshot.venue_id != cache.venue_id.as_ref() {
+        if !snapshot
+            .venue_id
+            .eq_ignore_ascii_case(cache.venue_id.as_ref())
+        {
             report.account_ok = false;
             report.record_issue("account snapshot venue_id mismatch");
         }
@@ -807,6 +816,59 @@ mod tests {
         assert_eq!(snapshot.account[0].seq, 5);
         assert_eq!(snapshot.account[0].timestamp_ms, Some(2_000));
         assert!((snapshot.account[0].position_tao - 0.03).abs() < 1e-12);
+    }
+
+    #[test]
+    fn terminal_account_truth_snapshot_allows_case_variant_venue_id() {
+        let cfg = Config::default();
+        let mut cache = LiveStateCache::new(&cfg);
+        let venue_index = 3;
+        let initial = AccountSnapshot {
+            venue_index,
+            venue_id: cfg.venues[venue_index].id.clone(),
+            seq: 5,
+            timestamp_ms: 1_000,
+            positions: vec![PositionSnapshot {
+                symbol: "ETH".to_string(),
+                size: -0.01,
+                entry_price: 2_350.0,
+            }],
+            balances: Vec::new(),
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: 10_000.0,
+                used_usd: 10.0,
+                available_usd: 9_990.0,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+        cache
+            .apply_account_event(&AccountEvent::Snapshot(initial.clone()))
+            .expect("apply initial snapshot");
+
+        let uppercase_truth = AccountSnapshot {
+            venue_id: cfg.venues[venue_index].id.to_ascii_uppercase(),
+            seq: 4,
+            timestamp_ms: 2_000,
+            positions: Vec::new(),
+            margin: MarginSnapshot {
+                balance_usd: 10_000.0,
+                used_usd: 0.0,
+                available_usd: 10_000.0,
+            },
+            ..initial
+        };
+
+        cache
+            .apply_terminal_account_truth_snapshot(&uppercase_truth)
+            .expect("terminal truth accepts case-only venue id variant");
+        let snapshot = cache.snapshot(2_000, 1_000);
+        assert_eq!(snapshot.account[venue_index].seq, 5);
+        assert_eq!(snapshot.account[venue_index].timestamp_ms, Some(2_000));
+        assert_eq!(snapshot.account[venue_index].position_tao, 0.0);
     }
 
     #[test]
