@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
-use paraphina::config::{resolve_effective_profile, Config};
+use paraphina::config::{resolve_effective_profile, Config, V2DecisionMode};
 use paraphina::io::GatewayPolicy;
 use paraphina::live::gateway::{GatewayMux, LiveGateway, LiveRestClient, TransportHint};
 use paraphina::live::instrument::{validate_specs, InstrumentSpec};
@@ -1240,6 +1240,14 @@ fn aster_market_symbol() -> String {
     std::env::var("ASTER_MARKET").unwrap_or_else(|_| "BTCUSDT".to_string())
 }
 
+fn hyperliquid_coin_symbol() -> String {
+    std::env::var("HL_COIN").unwrap_or_else(|_| "TAO".to_string())
+}
+
+fn lighter_market_symbol() -> String {
+    std::env::var("LIGHTER_MARKET").unwrap_or_else(|_| "BTC-USD".to_string())
+}
+
 fn extended_market_symbol() -> String {
     std::env::var("EXTENDED_MARKET").unwrap_or_else(|_| "BTCUSDT".to_string())
 }
@@ -1257,6 +1265,83 @@ fn is_valid_symbol(symbol: &str) -> bool {
         && symbol
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn market_base_symbol(symbol: &str) -> String {
+    let mut normalized = symbol.trim().to_ascii_uppercase();
+    for suffix in ["-PERP", "_PERP", ".PERP"] {
+        if normalized.ends_with(suffix) {
+            normalized.truncate(normalized.len() - suffix.len());
+        }
+    }
+    if let Some((base, _)) = normalized.split_once('/') {
+        return base.to_string();
+    }
+    if let Some((base, _)) = normalized.split_once('-') {
+        return base.to_string();
+    }
+    if let Some((base, _)) = normalized.split_once('_') {
+        return base.to_string();
+    }
+    for suffix in ["USDT", "USD"] {
+        if normalized.ends_with(suffix) && normalized.len() > suffix.len() {
+            normalized.truncate(normalized.len() - suffix.len());
+            return normalized;
+        }
+    }
+    normalized
+}
+
+fn v2_market_coherency_preflight_check(
+    connectors: &[ConnectorArg],
+    cfg: &Config,
+) -> Option<PreflightCheck> {
+    if !cfg.v2_shadow.enabled || matches!(cfg.v2_shadow.decision_mode, V2DecisionMode::Off) {
+        return None;
+    }
+
+    let mut selected: Vec<(&'static str, String)> = Vec::new();
+    for connector in connectors {
+        match connector {
+            ConnectorArg::Hyperliquid => selected.push(("hyperliquid", hyperliquid_coin_symbol())),
+            ConnectorArg::Lighter => selected.push(("lighter", lighter_market_symbol())),
+            ConnectorArg::Extended => selected.push(("extended", extended_market_symbol())),
+            ConnectorArg::Aster => selected.push(("aster", aster_market_symbol())),
+            ConnectorArg::Paradex => selected.push(("paradex", paradex_market_symbol())),
+            ConnectorArg::Mock | ConnectorArg::HyperliquidFixture => {}
+        }
+    }
+
+    if selected.len() < 2 {
+        return None;
+    }
+
+    let mut bases: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+    let mut details = Vec::new();
+    for (venue, symbol) in selected {
+        let base = market_base_symbol(&symbol);
+        bases.entry(base.clone()).or_default().push(venue);
+        details.push(format!("{venue}={symbol}:{base}"));
+    }
+
+    let ok = bases.len() == 1;
+    Some(PreflightCheck {
+        label: "v2_market_coherency",
+        ok,
+        details: if ok {
+            format!(
+                "base={} {}",
+                bases.keys().next().unwrap(),
+                details.join(",")
+            )
+        } else {
+            format!(
+                "mixed_bases={} {}",
+                bases.keys().cloned().collect::<Vec<_>>().join("|"),
+                details.join(",")
+            )
+        },
+    })
 }
 
 fn now_ms() -> i64 {
@@ -2028,6 +2113,10 @@ fn run_preflight(
                 format!("invalid symbol={}", market)
             },
         });
+    }
+
+    if let Some(check) = v2_market_coherency_preflight_check(connectors, cfg) {
+        checks.push(check);
     }
 
     if trade_mode == TradeMode::Live {
@@ -5497,6 +5586,88 @@ mod tests {
 
             assert!(!check.ok);
             assert!(check.details.contains("max_gross_position=false"));
+        });
+    }
+
+    fn with_v2_market_coherency_env<R>(f: impl FnOnce() -> R) -> R {
+        let _lock = env_lock().lock().unwrap();
+        let _hl_coin = EnvVarGuard::new("HL_COIN");
+        let _lighter_market = EnvVarGuard::new("LIGHTER_MARKET");
+        let _extended_market = EnvVarGuard::new("EXTENDED_MARKET");
+        let _aster_market = EnvVarGuard::new("ASTER_MARKET");
+        let _paradex_market = EnvVarGuard::new("PARADEX_MARKET");
+        f()
+    }
+
+    fn v2_market_coherency_config() -> paraphina::config::Config {
+        let mut cfg = paraphina::config::Config::default();
+        cfg.v2_shadow.enabled = true;
+        cfg.v2_shadow.decision_mode = paraphina::config::V2DecisionMode::PaperAdmission;
+        cfg
+    }
+
+    #[test]
+    fn v2_market_coherency_preflight_rejects_hyperliquid_default_tao_with_btc_venues() {
+        with_v2_market_coherency_env(|| {
+            std::env::remove_var("HL_COIN");
+            std::env::remove_var("LIGHTER_MARKET");
+            std::env::remove_var("EXTENDED_MARKET");
+            std::env::remove_var("ASTER_MARKET");
+            std::env::remove_var("PARADEX_MARKET");
+            let cfg = v2_market_coherency_config();
+            let connectors = [
+                ConnectorArg::Hyperliquid,
+                ConnectorArg::Lighter,
+                ConnectorArg::Extended,
+                ConnectorArg::Aster,
+                ConnectorArg::Paradex,
+            ];
+
+            let check = super::v2_market_coherency_preflight_check(&connectors, &cfg)
+                .expect("v2 market coherency check should run");
+
+            assert!(!check.ok);
+            assert_eq!(check.label, "v2_market_coherency");
+            assert!(check.details.contains("mixed_bases=BTC|TAO"));
+            assert!(check.details.contains("hyperliquid=TAO:TAO"));
+            assert!(check.details.contains("lighter=BTC-USD:BTC"));
+        });
+    }
+
+    #[test]
+    fn v2_market_coherency_preflight_accepts_symbol_coherent_btc_all_five() {
+        with_v2_market_coherency_env(|| {
+            std::env::set_var("HL_COIN", "BTC");
+            std::env::set_var("LIGHTER_MARKET", "BTC-USD");
+            std::env::set_var("EXTENDED_MARKET", "BTCUSDT");
+            std::env::set_var("ASTER_MARKET", "BTCUSDT");
+            std::env::set_var("PARADEX_MARKET", "BTC-USD-PERP");
+            let cfg = v2_market_coherency_config();
+            let connectors = [
+                ConnectorArg::Hyperliquid,
+                ConnectorArg::Lighter,
+                ConnectorArg::Extended,
+                ConnectorArg::Aster,
+                ConnectorArg::Paradex,
+            ];
+
+            let check = super::v2_market_coherency_preflight_check(&connectors, &cfg)
+                .expect("v2 market coherency check should run");
+
+            assert!(check.ok, "unexpected coherency failure: {}", check.details);
+            assert_eq!(check.label, "v2_market_coherency");
+            assert!(check.details.contains("base=BTC"));
+        });
+    }
+
+    #[test]
+    fn v2_market_coherency_preflight_is_not_added_when_v2_disabled() {
+        with_v2_market_coherency_env(|| {
+            std::env::remove_var("HL_COIN");
+            let cfg = paraphina::config::Config::default();
+            let connectors = [ConnectorArg::Hyperliquid, ConnectorArg::Lighter];
+
+            assert!(super::v2_market_coherency_preflight_check(&connectors, &cfg).is_none());
         });
     }
 
