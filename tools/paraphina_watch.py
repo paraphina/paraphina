@@ -75,9 +75,11 @@ _SHADOW_LATEST_PATH = Path("/tmp/paraphina_shadow_latest")
 _SHADOW_LAST_OUTDIR_PATH = Path("/tmp/paraphina_last_outdir.txt")
 _SHADOW_STATE_PATH = Path("/tmp/paraphina_shadow_runner.state")
 _SHADOW_PID_PATH = Path("/tmp/paraphina_shadow_runner.pid")
+_SOURCE_OWNER_PHASE51_ROOT = Path("/home/ubuntu/source_owner_inbox/phase51")
 _AUTO_TARGET_GLOB_ROOTS: tuple[tuple[Path, tuple[str, ...]], ...] = (
     (Path("/tmp"), ("*/telemetry.jsonl", "*/*/telemetry.jsonl")),
     (_WATCH_REPO_ROOT / "runs", ("*/telemetry.jsonl", "*/*/telemetry.jsonl")),
+    (_SOURCE_OWNER_PHASE51_ROOT, ("*/telemetry.jsonl", "*/*/telemetry.jsonl")),
 )
 
 
@@ -397,7 +399,10 @@ def resolve_current_run_telemetry_path() -> Path:
     if current_path is not None:
         return current_path
 
-    return resolve_latest_telemetry_path()
+    raise FileNotFoundError(
+        "no active current run found; use --latest for the freshest saved artifact "
+        "or --run-dir/--telemetry for an explicit target"
+    )
 
 
 def resolve_current_shadow_telemetry_path() -> Path:
@@ -435,7 +440,7 @@ def resolve_latest_telemetry_path() -> Path:
     raise FileNotFoundError(
         "no telemetry source found; checked current-run markers, "
         "/var/lib/paraphina/out/telemetry.jsonl, /tmp telemetry runs, "
-        "and repo runs/*/telemetry.jsonl"
+        "repo runs/*/telemetry.jsonl, and source_owner_inbox/phase51 telemetry"
     )
 
 
@@ -710,6 +715,8 @@ def runner_status_label(state: "WatchState") -> tuple[str, str]:
     status = state.runner_status
     if status is None:
         return ("runner ?", "dim")
+    if status.state == "no_active":
+        return ("no active run", "bold red")
     pid_text = f" pid {status.runner_pid}" if status.runner_pid is not None else ""
     if status.alive:
         if status.state == "starting":
@@ -1852,6 +1859,21 @@ def _is_shadow_mode(record: dict[str, Any]) -> bool:
     return "shadow" in _mode_token(record)
 
 
+def _mode_display_token(
+    record: dict[str, Any],
+    runner_status: RunnerStatus | None,
+) -> tuple[str, str]:
+    token = _mode_token(record)
+    if "shadow" in token:
+        return ("SHA", "bold red")
+    if runner_status is not None and runner_status.alive:
+        label = token.upper() if token and token != "n/a" else "LIVE"
+        return (label, "bold green")
+    if token and token != "n/a":
+        return ("SNAP", "bold yellow")
+    return ("NO-RUN", "bold red")
+
+
 def _simple_eage_bounds(
     state: WatchState,
     record: dict[str, Any],
@@ -2481,8 +2503,8 @@ def render_frame_expanded(
     run_limit = 20 if term_width < 120 else 28
     if len(run_id) > run_limit:
         run_id = run_id[: run_limit - 1] + "…"
-    mode_token = _mode_token(record)
-    in_shadow = "shadow" in mode_token
+    mode_token, mode_style = _mode_display_token(record, state.runner_status)
+    in_shadow = _is_shadow_mode(record)
     gate_text = "PASS" if gate_pass else f"FAIL({','.join(gate_reasons)})"
     tick_value = record.get("t", "n/a")
     time_text = short_ts(now_ms) if now_ms else "n/a"
@@ -2528,7 +2550,7 @@ def render_frame_expanded(
     left_header = Text("paraphina v1.1", style="bold cyan")
     left_header.append("  watch", style="bold white")
     right_header = Text()
-    right_header.append(mode_token, style="magenta")
+    right_header.append(mode_token, style=mode_style)
     right_header.append("  GATE ", style="dim")
     right_header.append(gate_text, style="bold green" if gate_pass else "bold red")
     right_header.append(f"  t {tick_value}", style="white")
@@ -2844,8 +2866,7 @@ def render_frame_simple(
     pulse = (state.frame_count % 2) == 0
 
     in_shadow = _is_shadow_mode(record)
-    mode_label = "SHA" if in_shadow else "LIVE"
-    mode_style = "bold red" if in_shadow else "bold green"
+    mode_label, mode_style = _mode_display_token(record, state.runner_status)
     min_age_e, max_age_e = _simple_eage_bounds(state, record)
     tick_value = record.get("t", "n/a")
     wall_time_text = wall_clock_utc()
@@ -3641,6 +3662,12 @@ def main() -> int:
         try:
             latest_path = resolver()
         except FileNotFoundError:
+            if args.current_run:
+                state.runner_status = RunnerStatus(
+                    state="no_active",
+                    alive=False,
+                    status_path="current-run registry/process",
+                )
             return
         if latest_path == telemetry_path:
             return

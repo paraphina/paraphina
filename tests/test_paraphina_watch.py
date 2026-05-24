@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -164,6 +165,94 @@ def test_auto_target_candidates_include_systemd_and_globs(tmp_path, monkeypatch)
     assert systemd_telemetry in candidates
     assert tmp_run in candidates
     assert repo_run in candidates
+
+
+def test_default_auto_targets_include_source_owner_phase51_root():
+    watch = _load_watch_module()
+
+    roots = [root for root, _patterns in watch._AUTO_TARGET_GLOB_ROOTS]
+
+    assert watch._SOURCE_OWNER_PHASE51_ROOT in roots
+
+
+def test_resolve_latest_considers_source_owner_phase51_artifacts(tmp_path, monkeypatch):
+    watch = _load_watch_module()
+    tmp_root = tmp_path / "tmp"
+    tmp_candidate = tmp_root / "old_run" / "telemetry.jsonl"
+    tmp_candidate.parent.mkdir(parents=True)
+    tmp_candidate.write_text("{}\n", encoding="utf-8")
+
+    source_owner_root = tmp_path / "source_owner_inbox" / "phase51"
+    source_owner_candidate = source_owner_root / "new_run" / "telemetry.jsonl"
+    source_owner_candidate.parent.mkdir(parents=True)
+    source_owner_candidate.write_text("{}\n", encoding="utf-8")
+
+    os.utime(tmp_candidate, (100.0, 100.0))
+    os.utime(source_owner_candidate, (200.0, 200.0))
+
+    monkeypatch.setattr(watch, "_SYSTEMD_TELEMETRY_PATH", tmp_path / "missing_systemd.jsonl")
+    monkeypatch.setattr(watch, "_SHADOW_LATEST_PATH", tmp_path / "missing_shadow_latest")
+    monkeypatch.setattr(watch, "_SHADOW_LAST_OUTDIR_PATH", tmp_path / "missing_last_outdir.txt")
+    monkeypatch.setattr(
+        watch,
+        "_AUTO_TARGET_GLOB_ROOTS",
+        (
+            (tmp_root, ("*/telemetry.jsonl",)),
+            (source_owner_root, ("*/telemetry.jsonl",)),
+        ),
+    )
+    monkeypatch.setattr(watch, "_iter_running_paraphina_live", lambda: iter(()))
+
+    resolved = watch.resolve_latest_telemetry_path()
+
+    assert resolved == source_owner_candidate.resolve(strict=False)
+
+
+def test_resolve_current_run_fails_closed_without_active_runner(tmp_path, monkeypatch):
+    watch = _load_watch_module()
+    latest_candidate = tmp_path / "latest" / "telemetry.jsonl"
+    latest_candidate.parent.mkdir(parents=True)
+    latest_candidate.write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(watch, "_CURRENT_RUN_POINTER_PATH", tmp_path / "missing_pointer.json")
+    monkeypatch.setattr(watch, "_CURRENT_RUNS_DIR", tmp_path / "missing_registry")
+    monkeypatch.setattr(
+        watch,
+        "_AUTO_TARGET_GLOB_ROOTS",
+        ((latest_candidate.parent.parent, ("*/telemetry.jsonl",)),),
+    )
+    monkeypatch.setattr(watch, "_iter_running_paraphina_live", lambda: iter(()))
+
+    try:
+        watch.resolve_current_run_telemetry_path()
+    except FileNotFoundError as exc:
+        assert "no active current run found" in str(exc)
+    else:
+        raise AssertionError("expected current-run resolution to fail closed")
+
+
+def test_live_record_without_active_runner_displays_snapshot_mode():
+    watch = _load_watch_module()
+
+    label, style = watch._mode_display_token({"trade_mode": "live"}, None)
+
+    assert label == "SNAP"
+    assert style == "bold yellow"
+
+
+def test_runner_status_label_reports_no_active_current_run():
+    watch = _load_watch_module()
+    state = watch.WatchState()
+    state.runner_status = watch.RunnerStatus(
+        state="no_active",
+        alive=False,
+        status_path="current-run registry/process",
+    )
+
+    label, style = watch.runner_status_label(state)
+
+    assert label == "no active run"
+    assert style == "bold red"
 
 
 def test_load_runner_status_falls_back_to_running_process_probe(tmp_path, monkeypatch):
