@@ -2128,6 +2128,46 @@ fn phase51_lighter_baseline_cleanup_only_enabled() -> bool {
     phase51_true_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV)
 }
 
+fn v2_terminal_cleanup_only_enabled() -> bool {
+    phase51_true_env(V2_TERMINAL_CLEANUP_ONLY_ENV)
+}
+
+fn v2_terminal_cleanup_only_filter_intents(
+    intents: &mut Vec<OrderIntent>,
+) -> Result<usize, &'static str> {
+    if !v2_terminal_cleanup_only_enabled() {
+        return Ok(0);
+    }
+    let before = intents.len();
+    let mut filtered = Vec::with_capacity(intents.len());
+    for intent in intents.drain(..) {
+        match intent {
+            OrderIntent::Place(place) => {
+                if matches!(place.purpose, OrderPurpose::Exit | OrderPurpose::Hedge)
+                    && place.time_in_force == TimeInForce::Ioc
+                    && !place.post_only
+                    && place.reduce_only
+                {
+                    filtered.push(OrderIntent::Place(place));
+                } else if place.purpose == OrderPurpose::Mm {
+                    // Terminal cleanup-only mode suppresses normal quote generation
+                    // while allowing the explicit reduce-only closeout path.
+                } else {
+                    return Err("non_cleanup_place");
+                }
+            }
+            OrderIntent::Replace(_) => return Err("replace_disabled"),
+            OrderIntent::Cancel(cancel) => filtered.push(OrderIntent::Cancel(cancel)),
+            OrderIntent::CancelAll(cancel_all) => {
+                filtered.push(OrderIntent::CancelAll(cancel_all));
+            }
+        }
+    }
+    let removed = before.saturating_sub(filtered.len());
+    *intents = filtered;
+    Ok(removed)
+}
+
 fn v2_live_order_path_probe_latch_enabled(cfg: &Config) -> bool {
     cfg.v2_shadow.enabled
         && cfg.v2_shadow.decision_mode == crate::config::V2DecisionMode::LiveCanaryAdmission
@@ -3498,6 +3538,7 @@ const PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_NATIVE_ROLE_STOP_AFTER_FIRST_ROW";
 const PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY";
+const V2_TERMINAL_CLEANUP_ONLY_ENV: &str = "PARAPHINA_V2_TERMINAL_CLEANUP_ONLY";
 const V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL";
 const V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV: &str =
@@ -6565,6 +6606,22 @@ pub async fn run_live_loop(
                 tick, reason
             );
             intents.clear();
+        }
+        match v2_terminal_cleanup_only_filter_intents(&mut intents) {
+            Ok(removed) if removed > 0 => {
+                eprintln!(
+                    "[runner] tick={} v2_terminal_cleanup_only_suppressed_intents count={}",
+                    tick, removed
+                );
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                eprintln!(
+                    "[runner] tick={} v2_terminal_cleanup_only_blocked_request reason={}",
+                    tick, reason
+                );
+                intents.clear();
+            }
         }
         match phase51_lighter_baseline_cleanup_only_filter_intents(cfg, &mut intents) {
             Ok(removed) if removed > 0 => {
@@ -16859,6 +16916,18 @@ mod tests {
         f()
     }
 
+    fn with_v2_terminal_cleanup_only_env<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+        let keys = [V2_TERMINAL_CLEANUP_ONLY_ENV];
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&keys);
+        if enabled {
+            std::env::set_var(V2_TERMINAL_CLEANUP_ONLY_ENV, "true");
+        } else {
+            std::env::remove_var(V2_TERMINAL_CLEANUP_ONLY_ENV);
+        }
+        f()
+    }
+
     #[test]
     fn phase51_lighter_native_role_strict_canary_rejects_replace_and_multi_place() {
         with_phase51_strict_native_role_canary_env(|| {
@@ -17202,6 +17271,88 @@ mod tests {
             assert_eq!(
                 phase51_lighter_baseline_cleanup_only_filter_intents(&cfg, &mut intents),
                 Err("non_lighter_place")
+            );
+        });
+    }
+
+    #[test]
+    fn v2_terminal_cleanup_only_defaults_off() {
+        with_v2_terminal_cleanup_only_env(false, || {
+            let mut intents = vec![lighter_place_intent()];
+            assert_eq!(v2_terminal_cleanup_only_filter_intents(&mut intents), Ok(0));
+            assert_eq!(intents.len(), 1);
+        });
+    }
+
+    #[test]
+    fn v2_terminal_cleanup_only_suppresses_mm_places_across_venues() {
+        with_v2_terminal_cleanup_only_env(true, || {
+            let mut aster_mm = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut aster_mm {
+                place.venue_index = 3;
+                place.venue_id = "aster".into();
+            }
+            let mut intents = vec![lighter_place_intent(), aster_mm];
+            assert_eq!(v2_terminal_cleanup_only_filter_intents(&mut intents), Ok(2));
+            assert!(intents.is_empty());
+        });
+    }
+
+    #[test]
+    fn v2_terminal_cleanup_only_preserves_cleanup_places_and_cancels() {
+        with_v2_terminal_cleanup_only_env(true, || {
+            let mut aster_exit = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut aster_exit {
+                place.venue_index = 3;
+                place.venue_id = "aster".into();
+                place.purpose = OrderPurpose::Exit;
+                place.time_in_force = TimeInForce::Ioc;
+                place.post_only = false;
+                place.reduce_only = true;
+            }
+            let mut hyperliquid_hedge = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut hyperliquid_hedge {
+                place.venue_index = 1;
+                place.venue_id = "hyperliquid".into();
+                place.purpose = OrderPurpose::Hedge;
+                place.time_in_force = TimeInForce::Ioc;
+                place.post_only = false;
+                place.reduce_only = true;
+            }
+            let mut intents = vec![
+                aster_exit,
+                hyperliquid_hedge,
+                lighter_cancel_intent(),
+                OrderIntent::CancelAll(CancelAllOrderIntent {
+                    venue_index: Some(3),
+                    venue_id: Some("aster".into()),
+                }),
+            ];
+            assert_eq!(v2_terminal_cleanup_only_filter_intents(&mut intents), Ok(0));
+            assert_eq!(intents.len(), 4);
+        });
+    }
+
+    #[test]
+    fn v2_terminal_cleanup_only_rejects_replace_and_non_cleanup_places() {
+        with_v2_terminal_cleanup_only_env(true, || {
+            let mut intents = vec![lighter_replace_intent()];
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&mut intents),
+                Err("replace_disabled")
+            );
+
+            let mut non_cleanup = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut non_cleanup {
+                place.purpose = OrderPurpose::Exit;
+                place.time_in_force = TimeInForce::Gtc;
+                place.post_only = true;
+                place.reduce_only = false;
+            }
+            let mut intents = vec![non_cleanup];
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&mut intents),
+                Err("non_cleanup_place")
             );
         });
     }
