@@ -7434,6 +7434,8 @@ pub async fn run_live_loop(
             &mut account_state_initialized,
             &mut applied_account_position_baselines,
             &mut phase51_target_key_registry,
+            order_snapshot_fill_inference_enabled,
+            &mut order_state_initialized,
             tick.saturating_add(100),
         )
         .await;
@@ -12028,6 +12030,26 @@ fn canary_exit_position_flatten_venues(
         .collect()
 }
 
+fn canary_exit_position_flatten_blocking_cancel_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    residual_venues: &[usize],
+) -> Vec<OrderIntent> {
+    let mut intents = Vec::new();
+    let mut seen = HashSet::new();
+    for venue_index in residual_venues.iter().copied() {
+        if !seen.insert(venue_index) || live_open_order_count_for_venue(state, venue_index) == 0 {
+            continue;
+        }
+        intents.extend(build_disabled_cancel_intents_for_venue(
+            cfg,
+            state,
+            venue_index,
+        ));
+    }
+    intents
+}
+
 fn canary_exit_position_flatten_account_truth_check_venues(cfg: &Config) -> Vec<usize> {
     let ranked_execution_venues = v2_live_canary_ranked_execution_allowed_venue_indices(cfg);
     cfg.venues
@@ -12255,6 +12277,8 @@ async fn run_canary_exit_position_flatten_cleanup(
     account_state_initialized: &mut [bool],
     applied_account_position_baselines: &mut [Option<f64>],
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
+    order_snapshot_fill_inference_enabled: bool,
+    order_state_initialized: &mut [bool],
     tick: u64,
 ) {
     let position_tol_tao = canary_exit_position_flatten_tol_tao();
@@ -12340,6 +12364,47 @@ async fn run_canary_exit_position_flatten_cleanup(
                 venue_ids_for_indices(cfg, &residual_venues).join(","),
                 position_tol_tao
             );
+            let cancel_intents =
+                canary_exit_position_flatten_blocking_cancel_intents(cfg, state, &residual_venues);
+            if !cancel_intents.is_empty() {
+                let dispatch_now_ms = now_ms();
+                let dispatch_tick = tick.saturating_add(25).saturating_add(attempt as u64);
+                let timeout_ms = canary_exit_cancel_all_timeout_ms(cancel_intents.len());
+                let (outcome, events, venues) = send_terminal_exit_cancel_intents_sync(
+                    cfg,
+                    priority_order_tx,
+                    phase51_target_key_registry,
+                    cancel_intents,
+                    dispatch_now_ms,
+                    dispatch_tick,
+                    timeout_ms,
+                )
+                .await;
+                eprintln!(
+                    "[runner] canary_exit_position_flatten_cleanup blocking_cancel_dispatched attempt={} outcome={:?} venues={}",
+                    attempt,
+                    outcome,
+                    venue_ids_for_indices(cfg, &venues).join(",")
+                );
+                if let Some(events) = events {
+                    let mut tick_exec_events = Vec::new();
+                    let mut tick_fills = Vec::new();
+                    let fills = apply_terminal_cancel_response_events(
+                        cfg,
+                        state,
+                        events,
+                        dispatch_now_ms,
+                        order_snapshot_fill_inference_enabled,
+                        &mut tick_exec_events,
+                        &mut tick_fills,
+                        order_state_initialized,
+                    );
+                    if !fills.is_empty() {
+                        apply_live_fills(cfg, state, &fills, dispatch_now_ms);
+                        state.recompute_after_fills(cfg);
+                    }
+                }
+            }
         } else {
             eprintln!(
                 "[runner] canary_exit_position_flatten_cleanup attempt={} target_venues={} residual_venues={} position_tol_tao={:.6}",
@@ -29002,6 +29067,33 @@ mod tests {
             canary_exit_position_flatten_venues(&cfg, &state, 0.0025).is_empty(),
             "open orders must block reduce-only flatten dispatch without hiding residual exposure"
         );
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_blocking_cancel_intents_target_residual_open_orders_only() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = 1;
+        let lighter = 3;
+        let now_ms = 45_000;
+
+        state.venues[hyperliquid].position_tao = 0.0;
+        state.venues[lighter].position_tao = -0.01;
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+
+        let residual_venues = canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025);
+        assert_eq!(residual_venues, vec![lighter]);
+
+        let intents =
+            canary_exit_position_flatten_blocking_cancel_intents(&cfg, &state, &residual_venues);
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(
+            &intents[0],
+            OrderIntent::CancelAll(cancel_all)
+                if cancel_all.venue_index == Some(lighter)
+                    && cancel_all.venue_id.as_deref() == Some("lighter")
+        ));
     }
 
     fn account_truth_snapshot_for_venue(
