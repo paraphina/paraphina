@@ -2342,6 +2342,17 @@ fn v2_live_canary_venue_coverage_replacements_disabled(cfg: &Config, trade_mode:
         && phase51_true_env(V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV)
 }
 
+fn v2_live_canary_venue_coverage_baseline_hedge_disabled(cfg: &Config, trade_mode: &str) -> bool {
+    trade_mode == "live"
+        && v2_live_canary_admission_authorized(cfg)
+        && cfg.v2_shadow.live_canary_venue_coverage_probe_approved
+        && !cfg
+            .v2_shadow
+            .live_canary_venue_coverage_probe_venues
+            .is_empty()
+        && phase51_true_env(V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV)
+}
+
 fn v2_live_canary_venue_coverage_suppress_replacements(
     cfg: &Config,
     trade_mode: &str,
@@ -3599,6 +3610,8 @@ const V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL";
 const V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS";
+const V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV: &str =
+    "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE";
 const V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES";
 const V2_DECISION_MODE_ENV: &str = "PARAPHINA_V2_DECISION_MODE";
@@ -7232,8 +7245,22 @@ pub async fn run_live_loop(
         let hedge_due = scheduler.hedge_due(now_ms);
         let hedge_triggered_by_account =
             account_position_changed && state.q_global_tao.abs() > hedge_band_tao;
+        let v2_venue_coverage_baseline_hedge_disabled =
+            v2_live_canary_venue_coverage_baseline_hedge_disabled(cfg, v2_execution_mode);
         if !reserve_priority_path && (hedge_due || hedge_triggered_by_account) {
-            if let Some(plan) = compute_hedge_plan(cfg, &state, now_ms) {
+            if v2_venue_coverage_baseline_hedge_disabled {
+                eprintln!(
+                    "[v2] live_canary_venue_coverage_suppressed_baseline_hedge tick={} trigger={} q_global_tao={:.6} hedge_band_tao={:.6}",
+                    tick,
+                    if hedge_due {
+                        "schedule"
+                    } else {
+                        "account_position_change"
+                    },
+                    state.q_global_tao,
+                    hedge_band_tao,
+                );
+            } else if let Some(plan) = compute_hedge_plan(cfg, &state, now_ms) {
                 let mut hedge_intents = hedge_plan_to_order_intents(&plan);
                 apply_canary_intent_overrides(
                     &mut hedge_intents,
@@ -19195,6 +19222,58 @@ mod tests {
             v2_live_canary_venue_coverage_suppress_replacements(&cfg, "paper", &mut paper_intents),
             0
         );
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_baseline_hedge_suppression_is_default_off() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV]);
+        std::env::remove_var(V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV);
+        let cfg = v2_live_canary_venue_coverage_config(vec!["paradex"]);
+
+        assert!(!v2_live_canary_venue_coverage_baseline_hedge_disabled(
+            &cfg, "live"
+        ));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_baseline_hedge_suppression_requires_exact_gate() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV]);
+        std::env::set_var(
+            V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV,
+            "true",
+        );
+        let cfg = v2_live_canary_venue_coverage_config(vec!["paradex"]);
+
+        assert!(v2_live_canary_venue_coverage_baseline_hedge_disabled(
+            &cfg, "live"
+        ));
+        assert!(!v2_live_canary_venue_coverage_baseline_hedge_disabled(
+            &cfg, "paper"
+        ));
+
+        let mut not_approved = cfg.clone();
+        not_approved.v2_shadow.live_canary_admission_approved = false;
+        assert!(!v2_live_canary_venue_coverage_baseline_hedge_disabled(
+            &not_approved,
+            "live"
+        ));
+
+        let mut no_coverage = cfg.clone();
+        no_coverage
+            .v2_shadow
+            .live_canary_venue_coverage_probe_approved = false;
+        assert!(!v2_live_canary_venue_coverage_baseline_hedge_disabled(
+            &no_coverage,
+            "live"
+        ));
+
+        let empty_allowlist = v2_live_canary_venue_coverage_config(Vec::new());
+        assert!(!v2_live_canary_venue_coverage_baseline_hedge_disabled(
+            &empty_allowlist,
+            "live"
+        ));
     }
 
     #[test]

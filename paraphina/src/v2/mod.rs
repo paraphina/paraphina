@@ -186,6 +186,7 @@ pub struct V2AdmissionGateState {
     pub live_canary_exit_cancel_all_sweep_all_venues_enabled: bool,
     pub live_canary_exit_position_flatten_enabled: bool,
     pub live_canary_venue_coverage_replacements_disabled: bool,
+    pub live_canary_venue_coverage_baseline_hedge_disabled: bool,
     pub live_canary_order_path_probe_approved: bool,
     pub live_canary_venue_coverage_probe_approved: bool,
     pub live_canary_venue_coverage_probe_venues_present: bool,
@@ -212,7 +213,8 @@ impl V2AdmissionGateState {
             && self.live_canary_exit_position_flatten_enabled
             && self.live_canary_ranked_execution_venues_present
             && (!self.live_canary_venue_coverage_probe_approved
-                || self.live_canary_venue_coverage_replacements_disabled);
+                || (self.live_canary_venue_coverage_replacements_disabled
+                    && self.live_canary_venue_coverage_baseline_hedge_disabled));
 
         self.enabled
             && (paper_authority || live_canary_authority)
@@ -239,6 +241,7 @@ pub struct V2AdmissionRuntimeContext {
     pub live_canary_exit_cancel_all_sweep_all_venues_enabled: bool,
     pub live_canary_exit_position_flatten_enabled: bool,
     pub live_canary_venue_coverage_replacements_disabled: bool,
+    pub live_canary_venue_coverage_baseline_hedge_disabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -398,6 +401,9 @@ impl V2AdmissionRuntimeContext {
             live_canary_venue_coverage_replacements_disabled: env_flag_true(
                 "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS",
             ),
+            live_canary_venue_coverage_baseline_hedge_disabled: env_flag_true(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE",
+            ),
         }
     }
 }
@@ -452,6 +458,8 @@ pub fn admission_gate_state(
             .live_canary_exit_position_flatten_enabled,
         live_canary_venue_coverage_replacements_disabled: runtime_context
             .live_canary_venue_coverage_replacements_disabled,
+        live_canary_venue_coverage_baseline_hedge_disabled: runtime_context
+            .live_canary_venue_coverage_baseline_hedge_disabled,
     }
 }
 
@@ -1739,6 +1747,7 @@ mod tests {
             live_canary_exit_cancel_all_sweep_all_venues_enabled: true,
             live_canary_exit_position_flatten_enabled: true,
             live_canary_venue_coverage_replacements_disabled: true,
+            live_canary_venue_coverage_baseline_hedge_disabled: true,
         }
     }
 
@@ -2515,6 +2524,39 @@ mod tests {
             intents.len(),
             1,
             "missing replacement-disable gate must not mutate intents"
+        );
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_probe_requires_baseline_hedge_disabled_gate() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec!["paradex".to_string()];
+        let mut context = live_canary_runtime_context();
+        context.live_canary_venue_coverage_baseline_hedge_disabled = false;
+        let mut intents = vec![mm_place(4, "paradex", Side::Buy, 99.0)];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(
+            decision.admission_reason,
+            "live_canary_admission_gate_not_satisfied"
+        );
+        assert!(!decision.gate_state.satisfied());
+        assert!(
+            !decision
+                .gate_state
+                .live_canary_venue_coverage_baseline_hedge_disabled
+        );
+        assert!(!decision.venue_coverage_probe_is_admission);
+        assert_eq!(
+            intents.len(),
+            1,
+            "missing baseline-hedge-disable gate must not mutate intents"
         );
     }
 

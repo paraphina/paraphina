@@ -37,6 +37,7 @@ SENSITIVE_KEY_MARKERS = (
 PREFLIGHT_REQUIRED_SNIPPETS = (
     "- PASS v2_live_canary_admission",
     "venue_coverage_replacements_disabled=true",
+    "venue_coverage_baseline_hedge_disabled=true",
     "venue_coverage_probe_approved=true",
     "venue_coverage_probe_venues_present=true",
     "ranked_execution_venues_present=true",
