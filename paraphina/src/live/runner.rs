@@ -7529,6 +7529,7 @@ pub async fn run_live_loop(
             &priority_order_tx,
             &mut phase51_target_key_registry,
             &mut deduper,
+            &mut exec_rx,
             &mut order_snapshot_rx,
             order_snapshot_fill_inference_enabled,
             &mut order_state_initialized,
@@ -7560,6 +7561,7 @@ pub async fn run_live_loop(
                 &priority_order_tx,
                 &mut phase51_target_key_registry,
                 &mut deduper,
+                &mut exec_rx,
                 &mut order_snapshot_rx,
                 order_snapshot_fill_inference_enabled,
                 &mut order_state_initialized,
@@ -9164,7 +9166,8 @@ async fn run_canary_exit_cancel_all_cleanup(
     state: &mut GlobalState,
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
-    _deduper: &mut ExecutionEventDeduper,
+    deduper: &mut ExecutionEventDeduper,
+    exec_rx: &mut Option<mpsc::Receiver<super::types::ExecutionEvent>>,
     order_snapshot_rx: &mut Option<mpsc::Receiver<super::types::OrderSnapshot>>,
     order_snapshot_fill_inference_enabled: bool,
     order_state_initialized: &mut [bool],
@@ -9177,6 +9180,21 @@ async fn run_canary_exit_cancel_all_cleanup(
     for attempt in 1..=attempts {
         let mut tick_exec_events = Vec::new();
         let mut tick_fills = Vec::new();
+        let (drained_exec_events, exec_fills) = drain_terminal_execution_event_rx(
+            cfg,
+            state,
+            exec_rx,
+            deduper,
+            now_ms(),
+            order_snapshot_fill_inference_enabled,
+            &mut tick_exec_events,
+            &mut tick_fills,
+            order_state_initialized,
+        );
+        if !exec_fills.is_empty() {
+            apply_live_fills(cfg, state, &exec_fills, now_ms());
+            state.recompute_after_fills(cfg);
+        }
         let (drained_snapshots, snapshot_fills) = drain_terminal_order_snapshot_rx(
             cfg,
             state,
@@ -9195,6 +9213,12 @@ async fn run_canary_exit_cancel_all_cleanup(
             eprintln!(
                 "[runner] canary_exit_cancel_all_cleanup drained_order_snapshots attempt={} count={}",
                 attempt, drained_snapshots
+            );
+        }
+        if drained_exec_events > 0 {
+            eprintln!(
+                "[runner] canary_exit_cancel_all_cleanup drained_execution_events attempt={} count={}",
+                attempt, drained_exec_events
             );
         }
         let tracked_open_orders = live_open_order_count_total(state);
@@ -9271,6 +9295,21 @@ async fn run_canary_exit_cancel_all_cleanup(
     }
     let mut tick_exec_events = Vec::new();
     let mut tick_fills = Vec::new();
+    let (drained_exec_events, exec_fills) = drain_terminal_execution_event_rx(
+        cfg,
+        state,
+        exec_rx,
+        deduper,
+        now_ms(),
+        order_snapshot_fill_inference_enabled,
+        &mut tick_exec_events,
+        &mut tick_fills,
+        order_state_initialized,
+    );
+    if !exec_fills.is_empty() {
+        apply_live_fills(cfg, state, &exec_fills, now_ms());
+        state.recompute_after_fills(cfg);
+    }
     let (drained_snapshots, snapshot_fills) = drain_terminal_order_snapshot_rx(
         cfg,
         state,
@@ -9289,6 +9328,12 @@ async fn run_canary_exit_cancel_all_cleanup(
         eprintln!(
             "[runner] canary_exit_cancel_all_cleanup drained_order_snapshots attempt=final count={}",
             drained_snapshots
+        );
+    }
+    if drained_exec_events > 0 {
+        eprintln!(
+            "[runner] canary_exit_cancel_all_cleanup drained_execution_events attempt=final count={}",
+            drained_exec_events
         );
     }
     if live_open_order_count_total(state) == 0 {
@@ -9346,6 +9391,42 @@ fn drain_terminal_order_snapshot_rx(
         mark_venue_state_initialized(order_state_initialized, snapshot.venue_index);
     }
     (drained, response_fills)
+}
+
+fn drain_terminal_execution_event_rx(
+    cfg: &Config,
+    state: &mut GlobalState,
+    exec_rx: &mut Option<mpsc::Receiver<super::types::ExecutionEvent>>,
+    deduper: &mut ExecutionEventDeduper,
+    now_ms: TimestampMs,
+    order_snapshot_fill_inference_enabled: bool,
+    tick_exec_events: &mut Vec<ExecutionEvent>,
+    tick_fills: &mut Vec<crate::types::FillEvent>,
+    order_state_initialized: &mut [bool],
+) -> (usize, Vec<crate::types::FillEvent>) {
+    let Some(rx) = exec_rx.as_mut() else {
+        return (0, Vec::new());
+    };
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    let drained = events.len();
+    if drained == 0 {
+        return (0, Vec::new());
+    }
+    let fills = apply_priority_response_events(
+        cfg,
+        state,
+        deduper,
+        events,
+        now_ms,
+        order_snapshot_fill_inference_enabled,
+        tick_exec_events,
+        tick_fills,
+        order_state_initialized,
+    );
+    (drained, fills)
 }
 
 fn apply_terminal_cancel_response_events(
@@ -29541,6 +29622,110 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cancel_all_exec_rx_snapshot_drain_clears_stale_aster_open_order_tracking() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "aster")
+            .expect("aster venue");
+        let now_ms = 45_000;
+
+        seed_open_orders(&mut state, aster, 1, now_ms);
+        assert_eq!(live_open_order_count_for_venue(&state, aster), 1);
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(types::ExecutionEvent::OrderSnapshot(types::OrderSnapshot {
+            venue_index: aster,
+            venue_id: cfg.venues[aster].id.clone(),
+            seq: now_ms as u64 + 1,
+            timestamp_ms: now_ms + 1,
+            open_orders: Vec::new(),
+        }))
+        .expect("queue terminal execution snapshot");
+        drop(tx);
+
+        let mut exec_rx = Some(rx);
+        let mut deduper = ExecutionEventDeduper::new(32);
+        let mut order_state_initialized = vec![true; cfg.venues.len()];
+        let mut tick_exec_events = Vec::new();
+        let mut tick_fills = Vec::new();
+        let (drained, fills) = drain_terminal_execution_event_rx(
+            &cfg,
+            &mut state,
+            &mut exec_rx,
+            &mut deduper,
+            now_ms + 2,
+            true,
+            &mut tick_exec_events,
+            &mut tick_fills,
+            &mut order_state_initialized,
+        );
+
+        assert_eq!(drained, 1);
+        assert!(fills.is_empty());
+        assert_eq!(
+            live_open_order_count_for_venue(&state, aster),
+            0,
+            "fresh empty execution-stream order snapshot must clear stale Aster terminal open-order tracking"
+        );
+    }
+
+    #[test]
+    fn terminal_cancel_all_exec_rx_cancel_all_ack_clears_stale_aster_open_order_tracking() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "aster")
+            .expect("aster venue");
+        let now_ms = 45_000;
+
+        seed_open_orders(&mut state, aster, 1, now_ms);
+        assert_eq!(live_open_order_count_for_venue(&state, aster), 1);
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(types::ExecutionEvent::CancelAllAccepted(
+            types::CancelAllAccepted {
+                venue_index: aster,
+                venue_id: cfg.venues[aster].id.clone(),
+                seq: now_ms as u64 + 1,
+                timestamp_ms: now_ms + 1,
+                count: 1,
+            },
+        ))
+        .expect("queue terminal cancel_all ack");
+        drop(tx);
+
+        let mut exec_rx = Some(rx);
+        let mut deduper = ExecutionEventDeduper::new(32);
+        let mut order_state_initialized = vec![true; cfg.venues.len()];
+        let mut tick_exec_events = Vec::new();
+        let mut tick_fills = Vec::new();
+        let (drained, fills) = drain_terminal_execution_event_rx(
+            &cfg,
+            &mut state,
+            &mut exec_rx,
+            &mut deduper,
+            now_ms + 2,
+            true,
+            &mut tick_exec_events,
+            &mut tick_fills,
+            &mut order_state_initialized,
+        );
+
+        assert_eq!(drained, 1);
+        assert!(fills.is_empty());
+        assert_eq!(
+            live_open_order_count_for_venue(&state, aster),
+            0,
+            "terminal execution-stream cancel_all ack must clear stale Aster terminal open-order tracking"
+        );
+    }
+
+    #[test]
     fn canary_exit_position_flatten_targets_only_flat_order_residual_positions() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -29839,22 +30024,27 @@ mod tests {
     }
 
     #[test]
-    fn canary_exit_position_flatten_account_truth_sync_can_clear_terminal_fill_order() {
+    fn canary_exit_position_flatten_account_truth_sync_can_clear_terminal_fill_order_with_newer_order_seq(
+    ) {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
-        let lighter = 3;
+        let aster = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "aster")
+            .expect("aster venue");
         let now_ms = 120_000;
         let mut initialized = vec![false; cfg.venues.len()];
         let mut baselines = vec![None; cfg.venues.len()];
 
-        state.venues[lighter].position_tao = -0.01;
+        state.venues[aster].position_tao = -0.01;
         state.live_order_state.apply_execution_event(
             &ExecutionEvent::OrderAck(crate::types::OrderAck {
-                venue_index: lighter,
-                venue_id: cfg.venues[lighter].id.clone().into(),
+                venue_index: aster,
+                venue_id: cfg.venues[aster].id.clone().into(),
                 order_id: "terminal_cleanup_order".to_string(),
                 client_order_id: Some("terminal_cleanup_client".to_string()),
-                seq: Some(0),
+                seq: Some(10),
                 side: Some(Side::Buy),
                 price: Some(100.0),
                 size: Some(0.01),
@@ -29863,21 +30053,21 @@ mod tests {
             now_ms - 100,
         );
 
-        let snapshot = account_truth_snapshot_for_venue(&cfg, lighter, 0.0, now_ms, Some(now_ms));
+        let snapshot = account_truth_snapshot_for_venue(&cfg, aster, 0.0, now_ms, Some(now_ms));
         let apply = apply_canary_exit_position_flatten_account_truth_snapshot(
             &cfg,
             &mut state,
             &snapshot,
-            &[lighter],
+            &[aster],
             now_ms,
             &mut initialized,
             &mut baselines,
         );
 
-        assert_eq!(apply.fresh_requested_venues, vec![lighter]);
+        assert_eq!(apply.fresh_requested_venues, vec![aster]);
         assert!(apply.position_changed);
         assert_eq!(apply.position_syncs.len(), 1);
-        assert_eq!(state.venues[lighter].position_tao, 0.0);
+        assert_eq!(state.venues[aster].position_tao, 0.0);
 
         let (_events, fills) = infer_fills_from_account_position_syncs(
             &cfg,
@@ -29888,9 +30078,9 @@ mod tests {
 
         assert_eq!(fills.len(), 1);
         assert_eq!(
-            live_open_order_count_for_venue(&state, lighter),
+            live_open_order_count_for_venue(&state, aster),
             0,
-            "terminal account-truth position sync should clear a fully filled cleanup order"
+            "terminal account-truth position sync should clear a fully filled cleanup order even when account seq is lower than order ack seq"
         );
         assert!(
             canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025).is_empty(),

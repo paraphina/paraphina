@@ -796,12 +796,20 @@ impl LiveOrderState {
         if size <= 0.0 {
             return None;
         }
+        // Account-position syncs and private order updates can use independent
+        // sequence domains. Attribute the inferred fill after the tracked order
+        // update so live-order cleanup is not rejected as an older venue seq.
+        let seq = order
+            .last_update_seq
+            .and_then(|prev| prev.checked_add(1))
+            .unwrap_or(snapshot_seq)
+            .max(snapshot_seq);
         Some(InferredFill {
             venue_index,
             venue_id: venue_id.to_string(),
             order_id: order.exchange_order_id.clone(),
             client_order_id: order.client_order_id.clone(),
-            seq: snapshot_seq,
+            seq,
             side: order.side?,
             price: order.price?,
             size,
