@@ -3413,6 +3413,38 @@ fn push_reconcile_drift(
     pending.push(record);
 }
 
+fn queue_open_order_reconcile_drift(
+    pending: &mut Vec<ReconcileDriftRecord>,
+    record: ReconcileDriftRecord,
+) {
+    pending.push(record);
+}
+
+fn finalize_open_order_reconcile_drift(
+    pending: &mut Vec<ReconcileDriftRecord>,
+    audit_dir: &std::path::Path,
+    state: &GlobalState,
+) {
+    pending.retain(|record| {
+        if record.kind != "open_orders" || record.source != "order_snapshot_post_reconcile" {
+            return true;
+        }
+        if record.venue != Some(0.0) {
+            let _ = append_reconcile_drift_audit(audit_dir, record);
+            return true;
+        }
+        let current_internal = state
+            .live_order_state
+            .open_order_ids_by_venue(record.venue_index)
+            .len();
+        if current_internal == 0 {
+            return false;
+        }
+        let _ = append_reconcile_drift_audit(audit_dir, record);
+        true
+    });
+}
+
 fn open_order_diff_count(internal_orders: &[String], venue_orders: &[String]) -> usize {
     internal_orders
         .iter()
@@ -4528,7 +4560,7 @@ pub async fn run_live_loop(
                                 &internal_after,
                                 order_tol,
                             ) {
-                                push_reconcile_drift(&mut pending_drift_events, &audit_dir, record);
+                                queue_open_order_reconcile_drift(&mut pending_drift_events, record);
                             }
                         }
                         mark_venue_state_initialized(
@@ -5974,6 +6006,7 @@ pub async fn run_live_loop(
         // wall-clock values that break replay hash comparison.
         let emit_tick_timing = matches!(mode, LiveRunMode::Realtime { .. });
 
+        finalize_open_order_reconcile_drift(&mut pending_drift_events, &audit_dir, &state);
         pending_drift_events.sort_by(|a, b| {
             (a.venue_index, &a.kind, &a.source).cmp(&(b.venue_index, &b.kind, &b.source))
         });
@@ -17371,6 +17404,114 @@ mod tests {
         assert_eq!(record.venue, Some(1.0));
         assert_eq!(record.diff, Some(0.0));
         assert_eq!(record.source, "order_snapshot_post_reconcile");
+    }
+
+    #[test]
+    fn open_order_reconcile_drift_finalizer_drops_same_tick_cancel_cleared_zero_snapshot() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = 2;
+        let audit_dir = tempfile::tempdir().expect("tempdir");
+        let mut pending = Vec::new();
+
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index,
+                venue_id: "aster".into(),
+                order_id: "oid_aster_1".into(),
+                client_order_id: Some("co_aster_1".into()),
+                seq: Some(1),
+                side: Some(Side::Sell),
+                price: Some(2_100.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            1_000,
+        );
+
+        queue_open_order_reconcile_drift(
+            &mut pending,
+            ReconcileDriftRecord {
+                timestamp_ms: 1_001,
+                venue_index,
+                venue_id: "aster".into(),
+                kind: "open_orders".into(),
+                internal: Some(1.0),
+                venue: Some(0.0),
+                diff: Some(1.0),
+                tolerance: Some(0.0),
+                source: "order_snapshot_post_reconcile".into(),
+                available: true,
+            },
+        );
+
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index,
+                venue_id: "aster".into(),
+                order_id: "oid_aster_1".into(),
+                client_order_id: None,
+                seq: Some(2),
+                side: None,
+                price: None,
+                size: None,
+                purpose: None,
+            }),
+            1_001,
+        );
+
+        finalize_open_order_reconcile_drift(&mut pending, audit_dir.path(), &state);
+
+        assert!(pending.is_empty());
+        assert!(!audit_dir.path().join("reconcile_drift.jsonl").exists());
+    }
+
+    #[test]
+    fn open_order_reconcile_drift_finalizer_preserves_unresolved_zero_snapshot_mismatch() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = 2;
+        let audit_dir = tempfile::tempdir().expect("tempdir");
+        let mut pending = Vec::new();
+
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index,
+                venue_id: "aster".into(),
+                order_id: "oid_aster_1".into(),
+                client_order_id: Some("co_aster_1".into()),
+                seq: Some(1),
+                side: Some(Side::Sell),
+                price: Some(2_100.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            1_000,
+        );
+
+        queue_open_order_reconcile_drift(
+            &mut pending,
+            ReconcileDriftRecord {
+                timestamp_ms: 1_001,
+                venue_index,
+                venue_id: "aster".into(),
+                kind: "open_orders".into(),
+                internal: Some(1.0),
+                venue: Some(0.0),
+                diff: Some(1.0),
+                tolerance: Some(0.0),
+                source: "order_snapshot_post_reconcile".into(),
+                available: true,
+            },
+        );
+
+        finalize_open_order_reconcile_drift(&mut pending, audit_dir.path(), &state);
+
+        assert_eq!(pending.len(), 1);
+        let audit = std::fs::read_to_string(audit_dir.path().join("reconcile_drift.jsonl"))
+            .expect("reconcile drift audit");
+        assert_eq!(audit.lines().count(), 1);
+        assert!(audit.contains("\"venue_id\":\"aster\""));
     }
 
     #[test]
