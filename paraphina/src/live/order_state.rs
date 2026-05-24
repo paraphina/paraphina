@@ -568,6 +568,36 @@ impl LiveOrderState {
         }
     }
 
+    pub fn mark_cancelled_by_client_order_ids(
+        &mut self,
+        client_order_ids: &[String],
+        now_ms: TimestampMs,
+        seq: Option<u64>,
+    ) -> usize {
+        let mut marked = 0;
+        for client_order_id in client_order_ids {
+            let Some(entry) = self.orders.get_mut(client_order_id) else {
+                continue;
+            };
+            if !matches!(
+                entry.status,
+                OrderStatus::Accepted | OrderStatus::PartiallyFilled
+            ) {
+                continue;
+            }
+            entry.status = OrderStatus::Cancelled;
+            entry.updated_ms = now_ms;
+            entry.gap_grace_started_ms = None;
+            entry.last_update_seq = match (entry.last_update_seq, seq) {
+                (Some(prev), Some(next)) => Some(prev.max(next)),
+                (Some(prev), None) => Some(prev),
+                (None, next) => next,
+            };
+            marked += 1;
+        }
+        marked
+    }
+
     fn apply_order_ack(
         &mut self,
         exchange_order_id: String,
