@@ -12086,6 +12086,7 @@ fn mark_canary_exit_position_flatten_incomplete(state: &mut GlobalState) {
 struct CanaryExitPositionFlattenAccountTruthApply {
     fresh_requested_venues: Vec<usize>,
     position_changed: bool,
+    position_syncs: Vec<AccountPositionSyncRecord>,
 }
 
 fn apply_canary_exit_position_flatten_account_truth_snapshot(
@@ -12116,6 +12117,7 @@ fn apply_canary_exit_position_flatten_account_truth_snapshot(
         return CanaryExitPositionFlattenAccountTruthApply {
             fresh_requested_venues,
             position_changed: false,
+            position_syncs: Vec::new(),
         };
     }
 
@@ -12131,6 +12133,7 @@ fn apply_canary_exit_position_flatten_account_truth_snapshot(
     CanaryExitPositionFlattenAccountTruthApply {
         fresh_requested_venues,
         position_changed: account_apply.position_changed,
+        position_syncs: account_apply.position_syncs,
     }
 }
 
@@ -12179,6 +12182,7 @@ async fn refresh_canary_exit_position_flatten_account_truth(
     applied_account_position_baselines: &mut [Option<f64>],
     venue_indices: &[usize],
     position_tol_tao: f64,
+    order_snapshot_fill_inference_enabled: bool,
     tick: u64,
     phase: &str,
 ) -> Vec<usize> {
@@ -12253,6 +12257,17 @@ async fn refresh_canary_exit_position_flatten_account_truth(
     if apply.fresh_requested_venues.is_empty() {
         return Vec::new();
     }
+    if order_snapshot_fill_inference_enabled && !apply.position_syncs.is_empty() {
+        let (_account_fill_events, account_fills) =
+            infer_fills_from_account_position_syncs(cfg, state, &apply.position_syncs, now_ms);
+        if !account_fills.is_empty() {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_inferred_fill_count phase={} count={}",
+                phase,
+                account_fills.len()
+            );
+        }
+    }
 
     let remaining_venues =
         canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
@@ -12301,6 +12316,7 @@ async fn run_canary_exit_position_flatten_cleanup(
                 applied_account_position_baselines,
                 &account_truth_check_venues,
                 position_tol_tao,
+                order_snapshot_fill_inference_enabled,
                 tick.saturating_add(attempt as u64),
                 "pre_clean",
             )
@@ -12343,6 +12359,7 @@ async fn run_canary_exit_position_flatten_cleanup(
             applied_account_position_baselines,
             &residual_venues,
             position_tol_tao,
+            order_snapshot_fill_inference_enabled,
             tick.saturating_add(attempt as u64),
             "pre_dispatch",
         )
@@ -12488,6 +12505,7 @@ async fn run_canary_exit_position_flatten_cleanup(
                 applied_account_position_baselines,
                 &account_truth_check_venues,
                 position_tol_tao,
+                order_snapshot_fill_inference_enabled,
                 tick.saturating_add(50).saturating_add(attempt as u64),
                 "post_dispatch_clean_check",
             )
@@ -12530,6 +12548,7 @@ async fn run_canary_exit_position_flatten_cleanup(
             applied_account_position_baselines,
             &remaining_venues,
             position_tol_tao,
+            order_snapshot_fill_inference_enabled,
             tick.saturating_add(50).saturating_add(attempt as u64),
             "post_dispatch",
         )
@@ -12560,6 +12579,7 @@ async fn run_canary_exit_position_flatten_cleanup(
         applied_account_position_baselines,
         &remaining_venues,
         position_tol_tao,
+        order_snapshot_fill_inference_enabled,
         tick.saturating_add(500),
         "final_check",
     )
@@ -29311,6 +29331,66 @@ mod tests {
         assert!(initialized[lighter]);
         assert_eq!(baselines[lighter], Some(0.0));
         assert!(!state.kill_switch);
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_account_truth_sync_can_clear_terminal_fill_order() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        let now_ms = 120_000;
+        let mut initialized = vec![false; cfg.venues.len()];
+        let mut baselines = vec![None; cfg.venues.len()];
+
+        state.venues[lighter].position_tao = -0.01;
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(crate::types::OrderAck {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id.clone().into(),
+                order_id: "terminal_cleanup_order".to_string(),
+                client_order_id: Some("terminal_cleanup_client".to_string()),
+                seq: Some(0),
+                side: Some(Side::Buy),
+                price: Some(100.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Exit),
+            }),
+            now_ms - 100,
+        );
+
+        let snapshot = account_truth_snapshot_for_venue(&cfg, lighter, 0.0, now_ms, Some(now_ms));
+        let apply = apply_canary_exit_position_flatten_account_truth_snapshot(
+            &cfg,
+            &mut state,
+            &snapshot,
+            &[lighter],
+            now_ms,
+            &mut initialized,
+            &mut baselines,
+        );
+
+        assert_eq!(apply.fresh_requested_venues, vec![lighter]);
+        assert!(apply.position_changed);
+        assert_eq!(apply.position_syncs.len(), 1);
+        assert_eq!(state.venues[lighter].position_tao, 0.0);
+
+        let (_events, fills) = infer_fills_from_account_position_syncs(
+            &cfg,
+            &mut state,
+            &apply.position_syncs,
+            now_ms,
+        );
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(
+            live_open_order_count_for_venue(&state, lighter),
+            0,
+            "terminal account-truth position sync should clear a fully filled cleanup order"
+        );
+        assert!(
+            canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025).is_empty(),
+            "fresh flat venue account truth must leave no terminal residual"
+        );
     }
 
     #[test]
