@@ -7416,6 +7416,7 @@ pub async fn run_live_loop(
             &priority_order_tx,
             &mut phase51_target_key_registry,
             &mut deduper,
+            &mut order_snapshot_rx,
             order_snapshot_fill_inference_enabled,
             &mut order_state_initialized,
             tick,
@@ -7446,6 +7447,7 @@ pub async fn run_live_loop(
                 &priority_order_tx,
                 &mut phase51_target_key_registry,
                 &mut deduper,
+                &mut order_snapshot_rx,
                 order_snapshot_fill_inference_enabled,
                 &mut order_state_initialized,
                 tick.saturating_add(200),
@@ -9050,6 +9052,7 @@ async fn run_canary_exit_cancel_all_cleanup(
     priority_order_tx: &mpsc::Sender<LiveOrderRequest>,
     phase51_target_key_registry: &mut Phase51TargetKeyRegistry,
     _deduper: &mut ExecutionEventDeduper,
+    order_snapshot_rx: &mut Option<mpsc::Receiver<super::types::OrderSnapshot>>,
     order_snapshot_fill_inference_enabled: bool,
     order_state_initialized: &mut [bool],
     tick: u64,
@@ -9059,6 +9062,28 @@ async fn run_canary_exit_cancel_all_cleanup(
     let timeout_ms = canary_exit_cancel_all_timeout_ms(cfg.venues.len());
     let sweep_all_venues = canary_exit_cancel_all_sweep_all_venues_enabled();
     for attempt in 1..=attempts {
+        let mut tick_exec_events = Vec::new();
+        let mut tick_fills = Vec::new();
+        let (drained_snapshots, snapshot_fills) = drain_terminal_order_snapshot_rx(
+            cfg,
+            state,
+            order_snapshot_rx,
+            now_ms(),
+            order_snapshot_fill_inference_enabled,
+            &mut tick_exec_events,
+            &mut tick_fills,
+            order_state_initialized,
+        );
+        if !snapshot_fills.is_empty() {
+            apply_live_fills(cfg, state, &snapshot_fills, now_ms());
+            state.recompute_after_fills(cfg);
+        }
+        if drained_snapshots > 0 {
+            eprintln!(
+                "[runner] canary_exit_cancel_all_cleanup drained_order_snapshots attempt={} count={}",
+                attempt, drained_snapshots
+            );
+        }
         let tracked_open_orders = live_open_order_count_total(state);
         if tracked_open_orders == 0 {
             eprintln!(
@@ -9131,11 +9156,83 @@ async fn run_canary_exit_cancel_all_cleanup(
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
         }
     }
+    let mut tick_exec_events = Vec::new();
+    let mut tick_fills = Vec::new();
+    let (drained_snapshots, snapshot_fills) = drain_terminal_order_snapshot_rx(
+        cfg,
+        state,
+        order_snapshot_rx,
+        now_ms(),
+        order_snapshot_fill_inference_enabled,
+        &mut tick_exec_events,
+        &mut tick_fills,
+        order_state_initialized,
+    );
+    if !snapshot_fills.is_empty() {
+        apply_live_fills(cfg, state, &snapshot_fills, now_ms());
+        state.recompute_after_fills(cfg);
+    }
+    if drained_snapshots > 0 {
+        eprintln!(
+            "[runner] canary_exit_cancel_all_cleanup drained_order_snapshots attempt=final count={}",
+            drained_snapshots
+        );
+    }
+    if live_open_order_count_total(state) == 0 {
+        eprintln!("[runner] canary_exit_cancel_all_cleanup clean_after_snapshot_drain");
+        return;
+    }
     eprintln!(
         "[runner] canary_exit_cancel_all_cleanup incomplete tracked_open_orders={} venues={}",
         live_open_order_count_total(state),
         live_open_order_venue_labels(cfg, state).join(",")
     );
+}
+
+fn drain_terminal_order_snapshot_rx(
+    cfg: &Config,
+    state: &mut GlobalState,
+    order_snapshot_rx: &mut Option<mpsc::Receiver<super::types::OrderSnapshot>>,
+    now_ms: TimestampMs,
+    order_snapshot_fill_inference_enabled: bool,
+    tick_exec_events: &mut Vec<ExecutionEvent>,
+    tick_fills: &mut Vec<crate::types::FillEvent>,
+    order_state_initialized: &mut [bool],
+) -> (usize, Vec<crate::types::FillEvent>) {
+    let Some(rx) = order_snapshot_rx.as_mut() else {
+        return (0, Vec::new());
+    };
+    let mut drained = 0usize;
+    let mut response_fills = Vec::new();
+    while let Ok(snapshot) = rx.try_recv() {
+        drained = drained.saturating_add(1);
+        let (core_events, fills) = infer_fills_from_order_snapshot(
+            cfg,
+            state,
+            &snapshot,
+            now_ms,
+            order_snapshot_fill_inference_enabled,
+        );
+        if !core_events.is_empty() {
+            tick_exec_events.extend(core_events.iter().cloned());
+        }
+        if !fills.is_empty() {
+            tick_fills.extend(fills.iter().cloned());
+            response_fills.extend(fills);
+        }
+        state
+            .live_order_state
+            .reconcile_with_supported_replace_gap_grace_ms(
+                &snapshot,
+                now_ms,
+                cfg.mm
+                    .supported_replace_snapshot_gap_grace_ms_for(&snapshot.venue_id)
+                    as TimestampMs,
+            );
+        sync_venue_order_tracking_from_live_order_state(cfg, state, snapshot.venue_index);
+        mark_venue_state_initialized(order_state_initialized, snapshot.venue_index);
+    }
+    (drained, response_fills)
 }
 
 fn apply_terminal_cancel_response_events(
@@ -29033,6 +29130,51 @@ mod tests {
                 if cancel_all.venue_index == Some(lighter)
                     && cancel_all.venue_id.as_deref() == Some("lighter")
         ));
+    }
+
+    #[test]
+    fn terminal_cancel_all_snapshot_drain_clears_stale_open_order_tracking() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        let now_ms = 45_000;
+
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+        assert_eq!(live_open_order_count_for_venue(&state, lighter), 1);
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.try_send(types::OrderSnapshot {
+            venue_index: lighter,
+            venue_id: cfg.venues[lighter].id.clone(),
+            seq: now_ms as u64 + 1,
+            timestamp_ms: now_ms + 1,
+            open_orders: Vec::new(),
+        })
+        .expect("queue terminal order snapshot");
+        drop(tx);
+
+        let mut order_snapshot_rx = Some(rx);
+        let mut order_state_initialized = vec![true; cfg.venues.len()];
+        let mut tick_exec_events = Vec::new();
+        let mut tick_fills = Vec::new();
+        let (drained, fills) = drain_terminal_order_snapshot_rx(
+            &cfg,
+            &mut state,
+            &mut order_snapshot_rx,
+            now_ms + 2,
+            true,
+            &mut tick_exec_events,
+            &mut tick_fills,
+            &mut order_state_initialized,
+        );
+
+        assert_eq!(drained, 1);
+        assert!(fills.is_empty());
+        assert_eq!(
+            live_open_order_count_for_venue(&state, lighter),
+            0,
+            "fresh empty venue order snapshot must clear stale terminal open-order tracking"
+        );
     }
 
     #[test]
