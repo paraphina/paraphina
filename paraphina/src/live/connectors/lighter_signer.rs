@@ -45,7 +45,7 @@ impl LighterSignerClient {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("signer error status={} body={}", status, body);
+            anyhow::bail!("signer error status={} reason=non_success", status);
         }
         let parsed: SignerResponse = serde_json::from_str(&body)?;
         Ok(SignedTx {

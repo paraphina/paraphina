@@ -250,7 +250,7 @@ fn phase51_lighter_replace_error_context(
         );
     }
     format!(
-        "lighter replace context market_id={} identity_kind={} identity_state={} price={} base_amount={} client_order_id_state={}",
+        "lighter replace context market_id={} identity_kind={} identity_state={} price={} base_amount={} client_request_state={}",
         market_id,
         identity_label,
         if raw_order_id > 0 { "present_redacted" } else { "absent" },
@@ -4310,7 +4310,7 @@ mod tests {
             "client-raw",
         );
         assert!(replace.contains("identity_state=present_redacted"));
-        assert!(replace.contains("client_order_id_state=present_redacted"));
+        assert!(replace.contains("client_request_state=present_redacted"));
         assert!(!replace.contains("123456789"));
         assert!(!replace.contains("client-raw"));
     }
@@ -5628,6 +5628,90 @@ mod tests {
         orderbooks.assert_hits_async(1).await;
         sign.assert_async().await;
         sendtx.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn lighter_replace_order_signer_error_is_telemetry_safe() {
+        let api = MockServer::start_async().await;
+        let signer = MockServer::start_async().await;
+        let orderbooks = api
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "order_books": [
+                        {
+                            "symbol": "BTC-USD",
+                            "market_id": 7,
+                            "price_decimals": 2,
+                            "size_decimals": 3
+                        }
+                    ]
+                }));
+            })
+            .await;
+        let sign = signer
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sign")
+                    .body_contains("\"op\":\"modify_order\"");
+                then.status(400).json_body(serde_json::json!({
+                    "error": "unsupported op: 'modify_order'",
+                    "client_order_id": "raw-client"
+                }));
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: api.base_url(),
+            market: "BTC-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: Some(signer.base_url()),
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let err = connector
+            .replace_order(LiveRestReplaceRequest {
+                venue_index: 0,
+                venue_id: "LIGHTER".to_string(),
+                order_id: "55".to_string(),
+                side: Side::Buy,
+                price: 100.22,
+                size: 1.25,
+                purpose: OrderPurpose::Mm,
+                time_in_force: TimeInForce::Gtc,
+                post_only: true,
+                reduce_only: false,
+                client_order_id: "77".to_string(),
+            })
+            .await
+            .expect_err("signer error must fail");
+        let rendered = err.message;
+        assert!(rendered.contains("signer_error"));
+        assert!(rendered.contains("reason=non_success"));
+        assert!(rendered.contains("client_request_state=present_redacted"));
+        for forbidden in [
+            "unsupported op",
+            "modify_order",
+            "client_order_id",
+            "raw-client",
+            "body=",
+            "response_body",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "replace signer error leaked {forbidden}: {rendered}"
+            );
+        }
+        orderbooks.assert_hits_async(1).await;
+        sign.assert_async().await;
     }
 
     #[tokio::test]
@@ -7535,7 +7619,7 @@ impl LiveRestClient for LighterConnector {
                     ));
                 }
                 return Err(LiveGatewayError::fatal(format!(
-                    "lighter: client_order_id exceeds uint48 max client_order_id_state=present_redacted max={}",
+                    "lighter: client request id exceeds uint48 max client_request_state=present_redacted max={}",
                     LIGHTER_CLIENT_ORDER_INDEX_MAX
                 )));
             }
@@ -7600,7 +7684,7 @@ impl LiveRestClient for LighterConnector {
                             );
                         } else {
                             eprintln!(
-                                "WARN: Lighter emergency IOC signer timeout client_order_id_state=present_redacted timeout_ms={}",
+                                "WARN: Lighter emergency IOC signer timeout client_request_state=present_redacted timeout_ms={}",
                                 timeout_duration.as_millis()
                             );
                         }
@@ -7636,7 +7720,7 @@ impl LiveRestClient for LighterConnector {
                             );
                         } else {
                             eprintln!(
-                                "WARN: Lighter emergency IOC sendtx timeout client_order_id_state=present_redacted timeout_ms={}",
+                                "WARN: Lighter emergency IOC sendtx timeout client_request_state=present_redacted timeout_ms={}",
                                 timeout_duration.as_millis()
                             );
                         }
@@ -7863,7 +7947,7 @@ impl LiveRestClient for LighterConnector {
                 );
             } else {
                 eprintln!(
-                    "INFO: Lighter native replace submit market_id={} identity_kind={} identity_state=present_redacted client_order_id_state=present_redacted price={} base_amount={}",
+                    "INFO: Lighter native replace submit market_id={} identity_kind={} identity_state=present_redacted client_request_state=present_redacted price={} base_amount={}",
                     market_id, identity_label, price, base_amount
                 );
             }

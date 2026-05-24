@@ -2514,6 +2514,7 @@ fn build_order_records(
                     rej.order_id.as_deref(),
                     rej.client_order_id.as_deref(),
                 );
+                let reason = telemetry_safe_order_reject_reason(&rej.reason);
                 orders.push(serde_json::json!({
                     "action": action,
                     "status": "reject",
@@ -2527,7 +2528,7 @@ fn build_order_records(
                     "reduce_only": Option::<bool>::None,
                     "purpose": Option::<String>::None,
                     "risk_regime": format!("{:?}", state.risk_regime),
-                    "reason": rej.reason,
+                    "reason": reason,
                     "action_id": action_id,
                     "decision_id": decision_id,
                 }));
@@ -2546,6 +2547,33 @@ fn build_order_records(
     would_send.sort_by_key(order_sort_key);
 
     (orders, would_send, truncated)
+}
+
+fn telemetry_safe_order_reject_reason(reason: &str) -> String {
+    let reason_lc = reason.to_ascii_lowercase();
+    const UNSAFE_FRAGMENTS: &[&str] = &[
+        "auth_token",
+        "authorization:",
+        "bearer ",
+        "body=",
+        "client_order_id",
+        "order_id",
+        "private_key",
+        "raw-client",
+        "raw-order",
+        "request_body",
+        "response_body",
+        "signature",
+        "token",
+    ];
+    if UNSAFE_FRAGMENTS
+        .iter()
+        .any(|fragment| reason_lc.contains(fragment))
+    {
+        "sanitized_order_reject".to_string()
+    } else {
+        reason.to_string()
+    }
 }
 
 fn build_order_action_id(
@@ -3998,6 +4026,69 @@ mod tests {
         let text = serde_json::to_string(&record).expect("serialize");
         assert!(!text.contains("raw-order-place-reject"));
         assert!(!text.contains("raw-client-place-reject"));
+    }
+
+    #[test]
+    fn order_reject_telemetry_sanitizes_raw_error_context() {
+        let cfg = Config::default();
+        let state = GlobalState::new(&cfg);
+        let reject = ExecutionEvent::OrderReject(OrderReject {
+            venue_index: 0,
+            venue_id: cfg.venues[0].id_arc.clone(),
+            order_id: Some("raw-order-place-reject".to_string()),
+            client_order_id: Some("raw-client-place-reject".to_string()),
+            seq: Some(9),
+            purpose: Some(OrderPurpose::Mm),
+            reduce_only: Some(false),
+            reason: "signer error status=400 body={\"client_order_id\":\"raw-client\"}".to_string(),
+        });
+
+        let mut builder = TelemetryBuilder::new(&cfg);
+        let record = builder.build_record(TelemetryInputs {
+            cfg: &cfg,
+            state: &state,
+            tick: 1,
+            now_ms: 1_000,
+            intents: &[],
+            exec_events: &[reject],
+            fills: &[],
+            last_exit_intent: None,
+            last_hedge_intent: None,
+            kill_event: None,
+            shadow_mode: false,
+            execution_mode: "live",
+            reconcile_drift: &[],
+            account_position_syncs: &[],
+            max_orders_per_tick: 16,
+            venue_health_diagnostics: &[],
+        });
+
+        let orders = record
+            .get("orders")
+            .and_then(|value| value.as_array())
+            .expect("orders");
+        let reject_order = orders
+            .iter()
+            .find(|order| order.get("status").and_then(|value| value.as_str()) == Some("reject"))
+            .expect("reject order telemetry");
+        assert_eq!(
+            reject_order.get("reason").and_then(|value| value.as_str()),
+            Some("sanitized_order_reject")
+        );
+
+        let text = serde_json::to_string(&record).expect("serialize");
+        for forbidden in [
+            "client_order_id",
+            "raw-client",
+            "raw-order",
+            "body=",
+            "response_body",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "telemetry leaked {forbidden}: {text}"
+            );
+        }
     }
 
     #[test]
