@@ -2132,18 +2132,56 @@ fn v2_terminal_cleanup_only_enabled() -> bool {
     phase51_true_env(V2_TERMINAL_CLEANUP_ONLY_ENV)
 }
 
+fn v2_terminal_cleanup_only_venue_allowed(
+    cfg: &Config,
+    allowed_venues: &HashSet<usize>,
+    venue_index: Option<usize>,
+    venue_id: Option<&str>,
+) -> bool {
+    let Some(venue_index) = venue_index else {
+        return false;
+    };
+    if !allowed_venues.contains(&venue_index) {
+        return false;
+    }
+    let Some(venue_cfg) = cfg.venues.get(venue_index) else {
+        return false;
+    };
+    venue_id
+        .map(|id| id.eq_ignore_ascii_case(venue_cfg.id.as_str()))
+        .unwrap_or(false)
+}
+
 fn v2_terminal_cleanup_only_filter_intents(
+    cfg: &Config,
     intents: &mut Vec<OrderIntent>,
 ) -> Result<usize, &'static str> {
     if !v2_terminal_cleanup_only_enabled() {
         return Ok(0);
+    }
+    if !v2_live_canary_admission_authorized(cfg) {
+        return Err("not_authorized");
+    }
+    let Some(allowed_venues) = v2_live_canary_ranked_execution_allowed_venue_indices(cfg) else {
+        return Err("missing_ranked_execution_venues");
+    };
+    if allowed_venues.is_empty() {
+        return Err("empty_ranked_execution_venues");
     }
     let before = intents.len();
     let mut filtered = Vec::with_capacity(intents.len());
     for intent in intents.drain(..) {
         match intent {
             OrderIntent::Place(place) => {
-                if matches!(place.purpose, OrderPurpose::Exit | OrderPurpose::Hedge)
+                if !v2_terminal_cleanup_only_venue_allowed(
+                    cfg,
+                    &allowed_venues,
+                    Some(place.venue_index),
+                    Some(place.venue_id.as_ref()),
+                ) {
+                    return Err("non_cleanup_venue");
+                }
+                if place.purpose == OrderPurpose::Exit
                     && place.time_in_force == TimeInForce::Ioc
                     && !place.post_only
                     && place.reduce_only
@@ -2157,8 +2195,26 @@ fn v2_terminal_cleanup_only_filter_intents(
                 }
             }
             OrderIntent::Replace(_) => return Err("replace_disabled"),
-            OrderIntent::Cancel(cancel) => filtered.push(OrderIntent::Cancel(cancel)),
+            OrderIntent::Cancel(cancel) => {
+                if !v2_terminal_cleanup_only_venue_allowed(
+                    cfg,
+                    &allowed_venues,
+                    Some(cancel.venue_index),
+                    Some(cancel.venue_id.as_ref()),
+                ) {
+                    return Err("non_cleanup_venue");
+                }
+                filtered.push(OrderIntent::Cancel(cancel));
+            }
             OrderIntent::CancelAll(cancel_all) => {
+                if !v2_terminal_cleanup_only_venue_allowed(
+                    cfg,
+                    &allowed_venues,
+                    cancel_all.venue_index,
+                    cancel_all.venue_id.as_deref(),
+                ) {
+                    return Err("non_cleanup_venue");
+                }
                 filtered.push(OrderIntent::CancelAll(cancel_all));
             }
         }
@@ -6607,7 +6663,7 @@ pub async fn run_live_loop(
             );
             intents.clear();
         }
-        match v2_terminal_cleanup_only_filter_intents(&mut intents) {
+        match v2_terminal_cleanup_only_filter_intents(cfg, &mut intents) {
             Ok(removed) if removed > 0 => {
                 eprintln!(
                     "[runner] tick={} v2_terminal_cleanup_only_suppressed_intents count={}",
@@ -16928,6 +16984,25 @@ mod tests {
         f()
     }
 
+    fn v2_terminal_cleanup_only_cfg(venues: &[&str]) -> Config {
+        let default_cfg = Config::default();
+        let mut cfg = v2_live_canary_admission_runner_config();
+        cfg.venues = venues
+            .iter()
+            .map(|venue_id| {
+                default_cfg
+                    .venues
+                    .iter()
+                    .find(|venue| venue.id == *venue_id)
+                    .cloned()
+                    .expect("test venue exists")
+            })
+            .collect();
+        cfg.v2_shadow.live_canary_ranked_execution_venues =
+            venues.iter().map(|venue| (*venue).to_string()).collect();
+        cfg
+    }
+
     #[test]
     fn phase51_lighter_native_role_strict_canary_rejects_replace_and_multi_place() {
         with_phase51_strict_native_role_canary_env(|| {
@@ -17278,8 +17353,12 @@ mod tests {
     #[test]
     fn v2_terminal_cleanup_only_defaults_off() {
         with_v2_terminal_cleanup_only_env(false, || {
+            let cfg = Config::default();
             let mut intents = vec![lighter_place_intent()];
-            assert_eq!(v2_terminal_cleanup_only_filter_intents(&mut intents), Ok(0));
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
+                Ok(0)
+            );
             assert_eq!(intents.len(), 1);
         });
     }
@@ -17287,13 +17366,17 @@ mod tests {
     #[test]
     fn v2_terminal_cleanup_only_suppresses_mm_places_across_venues() {
         with_v2_terminal_cleanup_only_env(true, || {
+            let cfg = v2_terminal_cleanup_only_cfg(&["lighter", "aster"]);
             let mut aster_mm = lighter_place_intent();
             if let OrderIntent::Place(place) = &mut aster_mm {
-                place.venue_index = 3;
+                place.venue_index = 1;
                 place.venue_id = "aster".into();
             }
             let mut intents = vec![lighter_place_intent(), aster_mm];
-            assert_eq!(v2_terminal_cleanup_only_filter_intents(&mut intents), Ok(2));
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
+                Ok(2)
+            );
             assert!(intents.is_empty());
         });
     }
@@ -17301,34 +17384,38 @@ mod tests {
     #[test]
     fn v2_terminal_cleanup_only_preserves_cleanup_places_and_cancels() {
         with_v2_terminal_cleanup_only_env(true, || {
+            let cfg = v2_terminal_cleanup_only_cfg(&["lighter", "hyperliquid", "aster"]);
             let mut aster_exit = lighter_place_intent();
             if let OrderIntent::Place(place) = &mut aster_exit {
-                place.venue_index = 3;
+                place.venue_index = 2;
                 place.venue_id = "aster".into();
                 place.purpose = OrderPurpose::Exit;
                 place.time_in_force = TimeInForce::Ioc;
                 place.post_only = false;
                 place.reduce_only = true;
             }
-            let mut hyperliquid_hedge = lighter_place_intent();
-            if let OrderIntent::Place(place) = &mut hyperliquid_hedge {
+            let mut hyperliquid_exit = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut hyperliquid_exit {
                 place.venue_index = 1;
                 place.venue_id = "hyperliquid".into();
-                place.purpose = OrderPurpose::Hedge;
+                place.purpose = OrderPurpose::Exit;
                 place.time_in_force = TimeInForce::Ioc;
                 place.post_only = false;
                 place.reduce_only = true;
             }
             let mut intents = vec![
                 aster_exit,
-                hyperliquid_hedge,
+                hyperliquid_exit,
                 lighter_cancel_intent(),
                 OrderIntent::CancelAll(CancelAllOrderIntent {
-                    venue_index: Some(3),
+                    venue_index: Some(2),
                     venue_id: Some("aster".into()),
                 }),
             ];
-            assert_eq!(v2_terminal_cleanup_only_filter_intents(&mut intents), Ok(0));
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
+                Ok(0)
+            );
             assert_eq!(intents.len(), 4);
         });
     }
@@ -17336,9 +17423,10 @@ mod tests {
     #[test]
     fn v2_terminal_cleanup_only_rejects_replace_and_non_cleanup_places() {
         with_v2_terminal_cleanup_only_env(true, || {
+            let cfg = v2_terminal_cleanup_only_cfg(&["lighter"]);
             let mut intents = vec![lighter_replace_intent()];
             assert_eq!(
-                v2_terminal_cleanup_only_filter_intents(&mut intents),
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
                 Err("replace_disabled")
             );
 
@@ -17351,10 +17439,120 @@ mod tests {
             }
             let mut intents = vec![non_cleanup];
             assert_eq!(
-                v2_terminal_cleanup_only_filter_intents(&mut intents),
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
+                Err("non_cleanup_place")
+            );
+
+            let mut hedge_cleanup_shape = lighter_place_intent();
+            if let OrderIntent::Place(place) = &mut hedge_cleanup_shape {
+                place.purpose = OrderPurpose::Hedge;
+                place.time_in_force = TimeInForce::Ioc;
+                place.post_only = false;
+                place.reduce_only = true;
+            }
+            let mut intents = vec![hedge_cleanup_shape];
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
                 Err("non_cleanup_place")
             );
         });
+    }
+
+    #[test]
+    fn v2_terminal_cleanup_only_requires_authorized_ranked_venue_scope() {
+        with_v2_terminal_cleanup_only_env(true, || {
+            let unauthorized = Config::default();
+            let mut intents = vec![lighter_cancel_intent()];
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&unauthorized, &mut intents),
+                Err("not_authorized")
+            );
+
+            let missing_allowlist = v2_live_canary_admission_runner_config();
+            let mut intents = vec![lighter_cancel_intent()];
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&missing_allowlist, &mut intents),
+                Err("missing_ranked_execution_venues")
+            );
+
+            let cfg = v2_terminal_cleanup_only_cfg(&["aster"]);
+            let mut intents = vec![lighter_cancel_intent()];
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
+                Err("non_cleanup_venue")
+            );
+
+            let cfg = v2_terminal_cleanup_only_cfg(&["lighter"]);
+            let mut intents = vec![OrderIntent::CancelAll(CancelAllOrderIntent {
+                venue_index: None,
+                venue_id: None,
+            })];
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
+                Err("non_cleanup_venue")
+            );
+
+            let mut intents = vec![OrderIntent::CancelAll(CancelAllOrderIntent {
+                venue_index: Some(0),
+                venue_id: Some("aster".into()),
+            })];
+            assert_eq!(
+                v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
+                Err("non_cleanup_venue")
+            );
+        });
+    }
+
+    #[test]
+    fn v2_terminal_cleanup_only_preserved_exit_passes_ranked_dispatch_guard() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            V2_TERMINAL_CLEANUP_ONLY_ENV,
+            V2_DECISION_MODE_ENV,
+            "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED",
+            V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV,
+            "PARAPHINA_LIVE_CONNECTORS",
+        ]);
+        std::env::set_var(V2_TERMINAL_CLEANUP_ONLY_ENV, "true");
+        std::env::set_var(V2_DECISION_MODE_ENV, "live_canary_admission");
+        std::env::set_var("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "true");
+        std::env::set_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV, "lighter");
+        std::env::set_var("PARAPHINA_LIVE_CONNECTORS", "lighter");
+
+        let cfg = v2_terminal_cleanup_only_cfg(&["lighter"]);
+        let mut terminal_exit = lighter_place_intent();
+        if let OrderIntent::Place(place) = &mut terminal_exit {
+            place.purpose = OrderPurpose::Exit;
+            place.time_in_force = TimeInForce::Ioc;
+            place.post_only = false;
+            place.reduce_only = true;
+        }
+        let mut intents = vec![terminal_exit];
+        assert_eq!(
+            v2_terminal_cleanup_only_filter_intents(&cfg, &mut intents),
+            Ok(0)
+        );
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(&intents, true),
+            Ok(())
+        );
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(&intents, false),
+            Err("v2_ranked_non_mm_place")
+        );
+
+        let mut mm_intents = vec![lighter_place_intent()];
+        assert_eq!(
+            v2_terminal_cleanup_only_filter_intents(&cfg, &mut mm_intents),
+            Ok(1)
+        );
+        assert!(mm_intents.is_empty());
+
+        let mut replace_intents = vec![lighter_replace_intent()];
+        assert_eq!(
+            v2_terminal_cleanup_only_filter_intents(&cfg, &mut replace_intents),
+            Err("replace_disabled")
+        );
     }
 
     #[test]
