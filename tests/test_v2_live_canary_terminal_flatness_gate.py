@@ -70,13 +70,19 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         audit_captured_after_run: bool = True,
         audit_captured_after_terminal_cleanup: bool = True,
         run_token: str = RUN_TOKEN,
+        live_stderr: str | None = None,
+        promotion_cleanup_strict: bool = False,
     ):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audit = root / f"{RUN_TOKEN}_terminal_audit.json"
             canary_manifest = root / f"{RUN_TOKEN}_manifest.json"
+            live_stderr_path = None
             write_json(audit, data)
             write_json(canary_manifest, manifest if manifest is not None else manifest_doc())
+            if live_stderr is not None:
+                live_stderr_path = root / f"{RUN_TOKEN}_live_stderr.log"
+                live_stderr_path.write_text(live_stderr, encoding="utf-8")
             return gate.evaluate_terminal_flatness(
                 venue_audit_path=audit,
                 expected_venues=EXPECTED,
@@ -85,6 +91,8 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
                 run_token=run_token,
                 audit_captured_after_run=audit_captured_after_run,
                 audit_captured_after_terminal_cleanup=audit_captured_after_terminal_cleanup,
+                live_stderr_path=live_stderr_path,
+                promotion_cleanup_strict=promotion_cleanup_strict,
             )
 
     def test_flat_all_venues_passes_without_clearance_claims(self):
@@ -230,6 +238,79 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             "run_binding_canary_manifest_already_promotion",
             report["terminal_flatness_gate_reasons"],
         )
+
+    def test_promotion_cleanup_strict_holds_on_terminal_cancel_timeout(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr="[runner] tick=1201 terminal_exit_cancel: timeout after 30000ms waiting for response\n",
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_cancel_timeout_present",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertEqual(report["terminal_cleanup"]["terminal_cancel_timeout_count"], 1)
+        self.assertEqual(report["terminal_cleanup"]["terminal_cancel_timeout_ticks"], [1201])
+
+    def test_non_strict_cleanup_log_preserves_operational_flatness_pass(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr="[runner] tick=1201 terminal_exit_cancel: timeout after 30000ms waiting for response\n",
+            promotion_cleanup_strict=False,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertEqual(report["terminal_cleanup"]["terminal_cancel_timeout_count"], 1)
+
+    def test_promotion_cleanup_strict_holds_on_hyperliquid_cancel_all_backlog(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "HL_POST_SUBMIT submit_path=ws_post post_id=1 action_label=cancel_all "
+                "batch_kind=cancel_all batch_size=1 post_inflight=1\n"
+                "HL_POST_SUBMIT submit_path=ws_post post_id=2 action_label=cancel_all "
+                "batch_kind=cancel_all batch_size=1 post_inflight=2\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_hyperliquid_cancel_all_post_inflight_backlog",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertEqual(report["terminal_cleanup"]["hyperliquid_cancel_all_post_inflight_max"], 2)
+
+    def test_promotion_cleanup_strict_holds_on_missing_account_truth(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=pre_clean venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup blocked_pre_clean_account_truth "
+                "attempt=1 requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.000100\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_account_refresh_not_fresh",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertIn(
+            "terminal_cleanup_account_truth_blocked",
+            report["terminal_flatness_gate_reasons"],
+        )
+
+    def test_promotion_cleanup_strict_requires_cleanup_log(self):
+        report = self.evaluate(audit_doc(), promotion_cleanup_strict=True)
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn("terminal_cleanup_log_missing", report["terminal_flatness_gate_reasons"])
 
 
 if __name__ == "__main__":

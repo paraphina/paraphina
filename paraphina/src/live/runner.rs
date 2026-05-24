@@ -3920,6 +3920,7 @@ pub async fn run_live_loop(
     let terminal_exit_quiesce_config =
         terminal_exit_quiesce_config_from_env(canary_enabled && trade_mode == "live");
     let mut terminal_exit_cancel_state = vec![TerminalExitCancelState::default(); cfg.venues.len()];
+    let mut canary_exit_cancel_all_cleanup_status = CanaryExitCancelAllCleanupStatus::default();
     let mut last_aster_terminal_quiesce_explicit_cancel_retry_ms: Option<TimestampMs> = None;
     let terminal_residual_convergence_config =
         terminal_residual_convergence_config_from_env(canary_enabled && trade_mode == "live");
@@ -7560,6 +7561,7 @@ pub async fn run_live_loop(
             &mut order_snapshot_rx,
             order_snapshot_fill_inference_enabled,
             &mut order_state_initialized,
+            &mut canary_exit_cancel_all_cleanup_status,
             tick,
         )
         .await;
@@ -7592,6 +7594,7 @@ pub async fn run_live_loop(
                 &mut order_snapshot_rx,
                 order_snapshot_fill_inference_enabled,
                 &mut order_state_initialized,
+                &mut canary_exit_cancel_all_cleanup_status,
                 tick.saturating_add(200),
             )
             .await;
@@ -9397,6 +9400,26 @@ fn live_open_order_venue_labels(cfg: &Config, state: &GlobalState) -> Vec<String
         .collect()
 }
 
+#[derive(Debug, Default)]
+struct CanaryExitCancelAllCleanupStatus {
+    clean_state_sweep_dispatched: bool,
+    terminal_cancel_attempts: u32,
+    terminal_cancel_timeouts: u32,
+    clean_after_dispatch_observed: bool,
+    clean_after_snapshot_drain_observed: bool,
+}
+
+fn canary_exit_cancel_all_should_send_clean_state_sweep(
+    sweep_all_venues: bool,
+    cleanup_status: &mut CanaryExitCancelAllCleanupStatus,
+) -> bool {
+    if !sweep_all_venues || cleanup_status.clean_state_sweep_dispatched {
+        return false;
+    }
+    cleanup_status.clean_state_sweep_dispatched = true;
+    true
+}
+
 async fn run_canary_exit_cancel_all_cleanup(
     cfg: &Config,
     state: &mut GlobalState,
@@ -9407,6 +9430,7 @@ async fn run_canary_exit_cancel_all_cleanup(
     order_snapshot_rx: &mut Option<mpsc::Receiver<super::types::OrderSnapshot>>,
     order_snapshot_fill_inference_enabled: bool,
     order_state_initialized: &mut [bool],
+    cleanup_status: &mut CanaryExitCancelAllCleanupStatus,
     tick: u64,
 ) {
     let attempts = canary_exit_cancel_all_attempts();
@@ -9485,15 +9509,18 @@ async fn run_canary_exit_cancel_all_cleanup(
         } else {
             Vec::new()
         };
-        if tracked_open_orders == 0
-            && hyperliquid_explicit_cancel_intents.is_empty()
-            && !sweep_all_venues
-        {
-            eprintln!(
-                "[runner] canary_exit_cancel_all_cleanup clean attempt={} tracked_open_orders=0",
-                attempt
-            );
-            return;
+        if tracked_open_orders == 0 && hyperliquid_explicit_cancel_intents.is_empty() {
+            if !canary_exit_cancel_all_should_send_clean_state_sweep(
+                sweep_all_venues,
+                cleanup_status,
+            ) {
+                eprintln!(
+                    "[runner] canary_exit_cancel_all_cleanup clean attempt={} tracked_open_orders=0 clean_state_sweep_dispatched={}",
+                    attempt,
+                    cleanup_status.clean_state_sweep_dispatched
+                );
+                return;
+            }
         }
         let venues = live_open_order_venue_labels(cfg, state);
         eprintln!(
@@ -9526,6 +9553,12 @@ async fn run_canary_exit_cancel_all_cleanup(
             timeout_ms,
         )
         .await;
+        cleanup_status.terminal_cancel_attempts =
+            cleanup_status.terminal_cancel_attempts.saturating_add(1);
+        if matches!(outcome, OrderWaitOutcomeKind::Timeout) {
+            cleanup_status.terminal_cancel_timeouts =
+                cleanup_status.terminal_cancel_timeouts.saturating_add(1);
+        }
         eprintln!(
             "[runner] canary_exit_cancel_all_cleanup dispatched attempt={} outcome={:?} venue_count={}",
             attempt,
@@ -9551,13 +9584,17 @@ async fn run_canary_exit_cancel_all_cleanup(
             }
         }
         if live_open_order_count_total(state) == 0 {
-            eprintln!(
-                "[runner] canary_exit_cancel_all_cleanup clean_after_dispatch attempt={}",
-                attempt
-            );
-            if !sweep_all_venues {
-                return;
+            if sweep_all_venues {
+                cleanup_status.clean_state_sweep_dispatched = true;
             }
+            cleanup_status.clean_after_dispatch_observed = true;
+            eprintln!(
+                "[runner] canary_exit_cancel_all_cleanup clean_after_dispatch attempt={} attempts={} timeouts={}",
+                attempt,
+                cleanup_status.terminal_cancel_attempts,
+                cleanup_status.terminal_cancel_timeouts
+            );
+            return;
         }
         if settle_ms > 0 && attempt < attempts {
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
@@ -9607,7 +9644,14 @@ async fn run_canary_exit_cancel_all_cleanup(
         );
     }
     if live_open_order_count_total(state) == 0 {
-        eprintln!("[runner] canary_exit_cancel_all_cleanup clean_after_snapshot_drain");
+        cleanup_status.clean_after_snapshot_drain_observed = true;
+        eprintln!(
+            "[runner] canary_exit_cancel_all_cleanup clean_after_snapshot_drain attempts={} timeouts={} clean_after_dispatch={} clean_state_sweep_dispatched={}",
+            cleanup_status.terminal_cancel_attempts,
+            cleanup_status.terminal_cancel_timeouts,
+            cleanup_status.clean_after_dispatch_observed,
+            cleanup_status.clean_state_sweep_dispatched
+        );
         return;
     }
     eprintln!(
@@ -29812,6 +29856,28 @@ mod tests {
         assert!(lighter_terminal_reduce_dust_to_min_lot_enabled());
         std::env::set_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "0");
         assert!(!lighter_terminal_reduce_dust_to_min_lot_enabled());
+    }
+
+    #[test]
+    fn canary_exit_cancel_all_clean_state_sweep_is_one_shot() {
+        let mut cleanup_status = CanaryExitCancelAllCleanupStatus::default();
+
+        assert!(!canary_exit_cancel_all_should_send_clean_state_sweep(
+            false,
+            &mut cleanup_status
+        ));
+        assert!(!cleanup_status.clean_state_sweep_dispatched);
+
+        assert!(canary_exit_cancel_all_should_send_clean_state_sweep(
+            true,
+            &mut cleanup_status
+        ));
+        assert!(cleanup_status.clean_state_sweep_dispatched);
+
+        assert!(!canary_exit_cancel_all_should_send_clean_state_sweep(
+            true,
+            &mut cleanup_status
+        ));
     }
 
     #[test]

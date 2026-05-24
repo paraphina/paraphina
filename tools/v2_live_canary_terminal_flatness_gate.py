@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -118,6 +119,73 @@ def _manifest_run_binding_reasons(
     return reasons, manifest_meta
 
 
+def _terminal_cleanup_report(
+    *,
+    live_stderr_path: Path | None,
+    promotion_cleanup_strict: bool,
+) -> tuple[list[str], dict[str, Any]]:
+    reasons: list[str] = []
+    report: dict[str, Any] = {
+        "promotion_cleanup_strict": promotion_cleanup_strict,
+        "live_stderr_path": str(live_stderr_path) if live_stderr_path else None,
+        "live_stderr_sha256": None,
+        "terminal_cancel_timeout_count": 0,
+        "terminal_cancel_timeout_ticks": [],
+        "hyperliquid_cancel_all_post_inflight_max": 0,
+        "hyperliquid_cancel_all_ws_post_count": 0,
+        "account_refresh_not_fresh_count": 0,
+        "blocked_account_truth_count": 0,
+    }
+    if live_stderr_path is None:
+        if promotion_cleanup_strict:
+            reasons.append("terminal_cleanup_log_missing")
+        return reasons, report
+    if not live_stderr_path.exists():
+        if promotion_cleanup_strict:
+            reasons.append("terminal_cleanup_log_missing")
+        return reasons, report
+
+    report["live_stderr_sha256"] = _sha256(live_stderr_path)
+    text = live_stderr_path.read_text(encoding="utf-8", errors="replace")
+    timeout_ticks: list[int] = []
+    for match in re.finditer(
+        r"tick=(\d+)\s+terminal_exit_cancel:\s+timeout after \d+ms waiting for response",
+        text,
+    ):
+        timeout_ticks.append(int(match.group(1)))
+    report["terminal_cancel_timeout_count"] = len(timeout_ticks)
+    report["terminal_cancel_timeout_ticks"] = timeout_ticks
+
+    post_inflight_max = 0
+    ws_cancel_all_count = 0
+    for match in re.finditer(
+        r"HL_POST_SUBMIT\s+submit_path=ws_post\s+post_id=\d+\s+action_label=cancel_all"
+        r"\s+batch_kind=cancel_all\s+batch_size=\d+\s+post_inflight=(\d+)",
+        text,
+    ):
+        ws_cancel_all_count += 1
+        post_inflight_max = max(post_inflight_max, int(match.group(1)))
+    report["hyperliquid_cancel_all_post_inflight_max"] = post_inflight_max
+    report["hyperliquid_cancel_all_ws_post_count"] = ws_cancel_all_count
+    report["account_refresh_not_fresh_count"] = text.count(
+        "canary_exit_position_flatten_cleanup account_refresh_not_fresh"
+    )
+    report["blocked_account_truth_count"] = text.count(
+        "canary_exit_position_flatten_cleanup blocked_pre_clean_account_truth"
+    ) + text.count("canary_exit_position_flatten_cleanup blocked_post_dispatch_account_truth")
+
+    if promotion_cleanup_strict:
+        if timeout_ticks:
+            reasons.append("terminal_cleanup_cancel_timeout_present")
+        if post_inflight_max > 1:
+            reasons.append("terminal_cleanup_hyperliquid_cancel_all_post_inflight_backlog")
+        if report["account_refresh_not_fresh_count"] > 0:
+            reasons.append("terminal_cleanup_account_refresh_not_fresh")
+        if report["blocked_account_truth_count"] > 0:
+            reasons.append("terminal_cleanup_account_truth_blocked")
+    return reasons, report
+
+
 def _venue_map(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     results = data.get("results")
     if not isinstance(results, list):
@@ -145,6 +213,8 @@ def evaluate_terminal_flatness(
     run_token: str | None = None,
     audit_captured_after_run: bool = False,
     audit_captured_after_terminal_cleanup: bool = False,
+    live_stderr_path: Path | None = None,
+    promotion_cleanup_strict: bool = False,
 ) -> dict[str, Any]:
     if not math.isfinite(position_tol_base) or position_tol_base < 0:
         raise TerminalFlatnessGateError("position tolerance must be finite and non-negative")
@@ -163,6 +233,11 @@ def evaluate_terminal_flatness(
         audit_captured_after_terminal_cleanup=audit_captured_after_terminal_cleanup,
     )
     reasons.extend(binding_reasons)
+    cleanup_reasons, cleanup_report = _terminal_cleanup_report(
+        live_stderr_path=live_stderr_path,
+        promotion_cleanup_strict=promotion_cleanup_strict,
+    )
+    reasons.extend(cleanup_reasons)
 
     if data.get("ok") is not True:
         reasons.append("venue_audit_not_ok")
@@ -237,6 +312,7 @@ def evaluate_terminal_flatness(
             "venue_audit_sha256": _sha256(venue_audit_path),
             **binding_meta,
         },
+        "terminal_cleanup": cleanup_report,
         "governance": {
             "approved_for_promotion": False,
             "approved_for_live": False,
@@ -268,6 +344,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--expected-venues", required=True)
     parser.add_argument("--position-tol-base", type=float, required=True)
+    parser.add_argument(
+        "--live-stderr",
+        type=Path,
+        help="Saved live stderr artifact. Required for promotion cleanup strictness.",
+    )
+    parser.add_argument(
+        "--promotion-cleanup-strict",
+        action="store_true",
+        help="HOLD if terminal cleanup logs contain timeout/account-truth promotion gaps.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -280,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
             run_token=args.run_token,
             audit_captured_after_run=args.audit_captured_after_run,
             audit_captured_after_terminal_cleanup=args.audit_captured_after_terminal_cleanup,
+            live_stderr_path=args.live_stderr,
+            promotion_cleanup_strict=args.promotion_cleanup_strict,
         )
     except TerminalFlatnessGateError as exc:
         print(f"V2_TERMINAL_FLATNESS_GATE_ERROR: {exc}", file=sys.stderr)
