@@ -9137,7 +9137,7 @@ async fn send_terminal_exit_cancel_intents_sync(
         action_batch,
         now_ms,
         timeout_ms,
-        TransportHint::Default,
+        TransportHint::HyperliquidSyncControl,
         "terminal_exit_cancel",
         tick,
     )
@@ -12184,6 +12184,13 @@ fn canary_exit_position_flatten_settle_ms() -> u64 {
         .clamp(0, 10_000)
 }
 
+fn canary_exit_position_flatten_timeout_ms() -> u64 {
+    parse_optional_positive_i64_env("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TIMEOUT_MS")
+        .map(|value| value as u64)
+        .unwrap_or(10_000)
+        .clamp(1_000, 30_000)
+}
+
 fn lighter_terminal_reduce_dust_to_min_lot_enabled() -> bool {
     parse_bool_env_default("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", false)
 }
@@ -12509,6 +12516,7 @@ async fn run_canary_exit_position_flatten_cleanup(
     let position_tol_tao = canary_exit_position_flatten_tol_tao();
     let attempts = canary_exit_position_flatten_attempts();
     let settle_ms = canary_exit_position_flatten_settle_ms();
+    let flatten_timeout_ms = canary_exit_position_flatten_timeout_ms();
     for attempt in 1..=attempts {
         let mut residual_venues =
             canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
@@ -12666,7 +12674,7 @@ async fn run_canary_exit_position_flatten_cleanup(
                     flatten_intents,
                     action_batch,
                     now_ms,
-                    KILL_FLATTEN_TIMEOUT_MS,
+                    flatten_timeout_ms,
                     TransportHint::Default,
                     "canary_exit_position_flatten",
                     dispatch_tick,
@@ -29338,6 +29346,7 @@ mod tests {
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TOL_TAO",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TIMEOUT_MS",
             "PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT",
         ]);
 
@@ -29380,10 +29389,15 @@ mod tests {
         assert_eq!(canary_exit_position_flatten_tol_tao(), 0.01);
         assert_eq!(canary_exit_position_flatten_attempts(), 3);
         assert_eq!(canary_exit_position_flatten_settle_ms(), 1_000);
+        assert_eq!(canary_exit_position_flatten_timeout_ms(), 10_000);
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "0");
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS", "20000");
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TIMEOUT_MS", "40000");
         assert_eq!(canary_exit_position_flatten_attempts(), 3);
         assert_eq!(canary_exit_position_flatten_settle_ms(), 10_000);
+        assert_eq!(canary_exit_position_flatten_timeout_ms(), 30_000);
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TIMEOUT_MS", "250");
+        assert_eq!(canary_exit_position_flatten_timeout_ms(), 1_000);
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "9");
         assert_eq!(canary_exit_position_flatten_attempts(), 5);
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "1");
@@ -31518,6 +31532,62 @@ mod tests {
         assert_eq!(retry.len(), 1);
         assert_eq!(cancel_state[hyperliquid].first_sent_ms, Some(now_ms));
         assert_eq!(cancel_state[hyperliquid].last_sent_ms, Some(now_ms + 2_000));
+    }
+
+    #[tokio::test]
+    async fn terminal_exit_cancel_uses_hyperliquid_sync_control_transport() {
+        let cfg = Config::default();
+        let hyperliquid = 1;
+        assert_eq!(cfg.venues[hyperliquid].id, "hyperliquid");
+
+        let (priority_order_tx, mut priority_order_rx) = mpsc::channel(1);
+        let mut phase51_target_key_registry = Phase51TargetKeyRegistry::default();
+        let now_ms = 120_000;
+        let tick = 42;
+        let cancel_intents = vec![OrderIntent::CancelAll(CancelAllOrderIntent {
+            venue_index: Some(hyperliquid),
+            venue_id: Some(cfg.venues[hyperliquid].id_arc.clone()),
+        })];
+
+        let cancel_fut = send_terminal_exit_cancel_intents_sync(
+            &cfg,
+            &priority_order_tx,
+            &mut phase51_target_key_registry,
+            cancel_intents,
+            now_ms,
+            tick,
+            1_000,
+        );
+        tokio::pin!(cancel_fut);
+
+        let observe_fut = async {
+            let request = priority_order_rx
+                .recv()
+                .await
+                .expect("terminal cancel request");
+            assert_eq!(
+                request.transport_hint,
+                TransportHint::HyperliquidSyncControl
+            );
+            assert!(request.intents.iter().all(|intent| matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all)
+                    if cancel_all.venue_index == Some(hyperliquid)
+            )));
+            match request.response {
+                ResponseMode::Oneshot(response_tx) => {
+                    response_tx.send(Vec::new()).expect("send response")
+                }
+                ResponseMode::FireAndForget => {
+                    panic!("expected synchronous terminal cancel response")
+                }
+            }
+        };
+
+        let ((outcome, events, venues), _) = tokio::join!(cancel_fut, observe_fut);
+        assert_eq!(outcome, OrderWaitOutcomeKind::Events);
+        assert_eq!(events.expect("events").len(), 0);
+        assert_eq!(venues, vec![hyperliquid]);
     }
 
     #[test]
