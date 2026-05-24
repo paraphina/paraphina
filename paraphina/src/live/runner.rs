@@ -12028,6 +12028,32 @@ fn canary_exit_position_flatten_venues(
         .collect()
 }
 
+fn canary_exit_position_flatten_account_truth_check_venues(cfg: &Config) -> Vec<usize> {
+    let ranked_execution_venues = v2_live_canary_ranked_execution_allowed_venue_indices(cfg);
+    cfg.venues
+        .iter()
+        .enumerate()
+        .filter_map(|(venue_index, _)| {
+            if ranked_execution_venues
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&venue_index))
+            {
+                return None;
+            }
+            Some(venue_index)
+        })
+        .collect()
+}
+
+fn canary_exit_position_flatten_fresh_for_all_requested(
+    requested_venues: &[usize],
+    fresh_venues: &[usize],
+) -> bool {
+    requested_venues
+        .iter()
+        .all(|venue_index| fresh_venues.contains(venue_index))
+}
+
 fn mark_canary_exit_position_flatten_incomplete(state: &mut GlobalState) {
     state.kill_switch = true;
     if state.kill_reason == crate::state::KillReason::None {
@@ -12133,12 +12159,12 @@ async fn refresh_canary_exit_position_flatten_account_truth(
     position_tol_tao: f64,
     tick: u64,
     phase: &str,
-) -> bool {
+) -> Vec<usize> {
     let Some(account_tx) = account_tx else {
-        return false;
+        return Vec::new();
     };
     if venue_indices.is_empty() {
-        return false;
+        return Vec::new();
     }
 
     let now_ms = now_ms();
@@ -12189,7 +12215,7 @@ async fn refresh_canary_exit_position_flatten_account_truth(
     }
 
     if refreshed_venues.is_empty() {
-        return false;
+        return Vec::new();
     }
 
     let refreshed_snapshot = cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
@@ -12203,7 +12229,7 @@ async fn refresh_canary_exit_position_flatten_account_truth(
         applied_account_position_baselines,
     );
     if apply.fresh_requested_venues.is_empty() {
-        return false;
+        return Vec::new();
     }
 
     let remaining_venues =
@@ -12215,7 +12241,7 @@ async fn refresh_canary_exit_position_flatten_account_truth(
         apply.position_changed,
         venue_ids_for_indices(cfg, &remaining_venues).join(",")
     );
-    true
+    apply.fresh_requested_venues
 }
 
 async fn run_canary_exit_position_flatten_cleanup(
@@ -12235,11 +12261,49 @@ async fn run_canary_exit_position_flatten_cleanup(
     let attempts = canary_exit_position_flatten_attempts();
     let settle_ms = canary_exit_position_flatten_settle_ms();
     for attempt in 1..=attempts {
-        let residual_venues =
+        let mut residual_venues =
             canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
         if residual_venues.is_empty() {
+            let account_truth_check_venues =
+                canary_exit_position_flatten_account_truth_check_venues(cfg);
+            let fresh_venues = refresh_canary_exit_position_flatten_account_truth(
+                cfg,
+                state,
+                account_tx,
+                cache,
+                audit_dir,
+                last_account_snapshot_ms,
+                account_state_initialized,
+                applied_account_position_baselines,
+                &account_truth_check_venues,
+                position_tol_tao,
+                tick.saturating_add(attempt as u64),
+                "pre_clean",
+            )
+            .await;
+            residual_venues =
+                canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+            if residual_venues.is_empty()
+                && v2_live_canary_admission_authorized(cfg)
+                && !canary_exit_position_flatten_fresh_for_all_requested(
+                    &account_truth_check_venues,
+                    &fresh_venues,
+                )
+            {
+                eprintln!(
+                    "[runner] canary_exit_position_flatten_cleanup blocked_pre_clean_account_truth attempt={} requested_venues={} fresh_venues={} position_tol_tao={:.6}",
+                    attempt,
+                    venue_ids_for_indices(cfg, &account_truth_check_venues).join(","),
+                    venue_ids_for_indices(cfg, &fresh_venues).join(","),
+                    position_tol_tao
+                );
+                mark_canary_exit_position_flatten_incomplete(state);
+                return;
+            }
+        }
+        if residual_venues.is_empty() {
             eprintln!(
-                "[runner] canary_exit_position_flatten_cleanup clean attempt={} position_tol_tao={:.6}",
+                "[runner] canary_exit_position_flatten_cleanup clean_after_account_truth_check attempt={} position_tol_tao={:.6}",
                 attempt, position_tol_tao
             );
             return;
@@ -12343,11 +12407,49 @@ async fn run_canary_exit_position_flatten_cleanup(
                 );
             }
         }
-        let remaining_venues =
+        let mut remaining_venues =
             canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
         if remaining_venues.is_empty() {
+            let account_truth_check_venues =
+                canary_exit_position_flatten_account_truth_check_venues(cfg);
+            let fresh_venues = refresh_canary_exit_position_flatten_account_truth(
+                cfg,
+                state,
+                account_tx,
+                cache,
+                audit_dir,
+                last_account_snapshot_ms,
+                account_state_initialized,
+                applied_account_position_baselines,
+                &account_truth_check_venues,
+                position_tol_tao,
+                tick.saturating_add(50).saturating_add(attempt as u64),
+                "post_dispatch_clean_check",
+            )
+            .await;
+            remaining_venues =
+                canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+            if remaining_venues.is_empty()
+                && v2_live_canary_admission_authorized(cfg)
+                && !canary_exit_position_flatten_fresh_for_all_requested(
+                    &account_truth_check_venues,
+                    &fresh_venues,
+                )
+            {
+                eprintln!(
+                    "[runner] canary_exit_position_flatten_cleanup blocked_post_dispatch_account_truth attempt={} requested_venues={} fresh_venues={} position_tol_tao={:.6}",
+                    attempt,
+                    venue_ids_for_indices(cfg, &account_truth_check_venues).join(","),
+                    venue_ids_for_indices(cfg, &fresh_venues).join(","),
+                    position_tol_tao
+                );
+                mark_canary_exit_position_flatten_incomplete(state);
+                return;
+            }
+        }
+        if remaining_venues.is_empty() {
             eprintln!(
-                "[runner] canary_exit_position_flatten_cleanup clean_after_dispatch attempt={}",
+                "[runner] canary_exit_position_flatten_cleanup clean_after_dispatch_account_truth_check attempt={}",
                 attempt
             );
             return;
@@ -29153,6 +29255,44 @@ mod tests {
     }
 
     #[test]
+    fn canary_exit_position_flatten_account_truth_reveals_stale_internal_clean_residual() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        let now_ms = 120_000;
+        let mut initialized = vec![false; cfg.venues.len()];
+        let mut baselines = vec![None; cfg.venues.len()];
+
+        state.venues[lighter].position_tao = 0.0;
+        assert!(
+            canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025).is_empty(),
+            "test setup must model stale internal flatness"
+        );
+
+        let snapshot = account_truth_snapshot_for_venue(&cfg, lighter, -0.01, now_ms, Some(now_ms));
+        let apply = apply_canary_exit_position_flatten_account_truth_snapshot(
+            &cfg,
+            &mut state,
+            &snapshot,
+            &[lighter],
+            now_ms,
+            &mut initialized,
+            &mut baselines,
+        );
+
+        assert_eq!(apply.fresh_requested_venues, vec![lighter]);
+        assert!(apply.position_changed);
+        assert_eq!(state.venues[lighter].position_tao, -0.01);
+        assert_eq!(
+            canary_exit_position_flatten_residual_venues(&cfg, &state, 0.0025),
+            vec![lighter],
+            "fresh venue account truth must reveal residual exposure before terminal clean closeout"
+        );
+        assert!(initialized[lighter]);
+        assert_eq!(baselines[lighter], Some(-0.01));
+    }
+
+    #[test]
     fn canary_exit_position_flatten_account_truth_rejects_stale_snapshot() {
         let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
@@ -29184,6 +29324,34 @@ mod tests {
         );
         assert!(!initialized[lighter]);
         assert_eq!(baselines[lighter], None);
+    }
+
+    #[test]
+    fn v2_ranked_execution_terminal_account_truth_check_is_scoped_to_allowed_venues() {
+        let mut cfg = v2_live_canary_admission_runner_config();
+        cfg.v2_shadow.live_canary_ranked_execution_venues =
+            vec!["lighter".to_string(), "aster".to_string()];
+
+        with_v2_ranked_execution_env(|| {
+            std::env::set_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV, "lighter,aster");
+            let venues = canary_exit_position_flatten_account_truth_check_venues(&cfg);
+            let venue_ids = venue_ids_for_indices(&cfg, &venues);
+            assert_eq!(venue_ids, vec!["aster".to_string(), "lighter".to_string()]);
+        });
+    }
+
+    #[test]
+    fn v2_ranked_execution_terminal_account_truth_requires_all_requested_fresh_venues() {
+        let requested = vec![2, 3];
+
+        assert!(canary_exit_position_flatten_fresh_for_all_requested(
+            &requested,
+            &[2, 3]
+        ));
+        assert!(!canary_exit_position_flatten_fresh_for_all_requested(
+            &requested,
+            &[3]
+        ));
     }
 
     #[test]
