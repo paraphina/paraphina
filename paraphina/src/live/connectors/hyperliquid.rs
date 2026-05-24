@@ -28,6 +28,7 @@ const HL_WS_READ_TIMEOUT_MS_DEFAULT: u64 = 30_000;
 const HL_WS_POST_RESPONSE_TIMEOUT_MS_DEFAULT: u64 = 15_000;
 const HL_WS_POST_CHANNEL_CAPACITY: usize = 256;
 const HL_WS_POST_MAX_INFLIGHT_DEFAULT: usize = 32;
+const HYPERLIQUID_VENUE_ID: &str = "hyperliquid";
 
 static MONO_START: OnceLock<Instant> = OnceLock::new();
 static HL_WS_AUDIT_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1527,7 +1528,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                             if let Some(account_tx) = self.account_tx.as_ref() {
                                 if let Some(event) = translate_account_event(
                                     &value,
-                                    Some(self.cfg.coin.as_str()),
+                                    Some(HYPERLIQUID_VENUE_ID),
                                     self.cfg.venue_index,
                                 ) {
                                     let _ = account_tx.send(event).await;
@@ -2181,6 +2182,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
                 anyhow::anyhow!("HL_VAULT_ADDRESS is required for account polling")
             })?;
         let info_url = self.current_info_url();
+        let observed_ms = now_ms();
         let value = post_info_request_json(
             &self.http,
             &info_url,
@@ -2190,7 +2192,7 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
         .map_err(|err| anyhow::anyhow!("hyperliquid account snapshot error: {err}"))?;
         let mut snapshot = parse_account_snapshot_with_meta(
             &value,
-            Some(self.cfg.coin.as_str()),
+            Some(HYPERLIQUID_VENUE_ID),
             self.cfg.venue_index,
         )
         .ok_or_else(|| anyhow::anyhow!("invalid account snapshot response"))?;
@@ -2213,10 +2215,10 @@ try_send_ok={} try_send_full={} emit_since_ms={}",
             let spot_snapshot = parse_spot_collateral_snapshot(&spot_value).ok_or_else(|| {
                 anyhow::anyhow!("invalid hyperliquid spot collateral snapshot response")
             })?;
-            snapshot.timestamp_ms = snapshot.timestamp_ms.max(now_ms());
             snapshot.balances = spot_snapshot.balances;
             snapshot.margin = spot_snapshot.margin;
         }
+        snapshot = normalize_direct_account_snapshot(snapshot, observed_ms);
 
         Ok(AccountEvent::Snapshot(snapshot))
     }
@@ -5539,16 +5541,43 @@ mod tests {
             }],
             "time": 1_700_000_000_123i64
         });
-        let snapshot =
-            parse_account_snapshot_with_meta(&payload, Some("ETH"), 7).expect("snapshot");
+        let snapshot = parse_account_snapshot_with_meta(&payload, Some(HYPERLIQUID_VENUE_ID), 7)
+            .expect("snapshot");
         assert_eq!(snapshot.venue_index, 7);
-        assert_eq!(snapshot.venue_id, "ETH");
+        assert_eq!(snapshot.venue_id, HYPERLIQUID_VENUE_ID);
         assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
         assert_eq!(snapshot.positions.len(), 1);
         assert_eq!(snapshot.positions[0].symbol, "ETH");
         assert!((snapshot.margin.balance_usd - 100.0).abs() < 1e-9);
         assert!((snapshot.margin.available_usd - 87.5).abs() < 1e-9);
         assert_eq!(snapshot.liquidation.price_liq, Some(2100.0));
+    }
+
+    #[test]
+    fn direct_account_snapshot_uses_cache_venue_id_and_poll_time_for_freshness() {
+        let payload = serde_json::json!({
+            "marginSummary": {
+                "accountValue": "100.0",
+                "totalMarginUsed": "0.0",
+                "totalRawUsd": "100.0"
+            },
+            "withdrawable": "100.0",
+            "assetPositions": [{
+                "position": {
+                    "coin": "ETH",
+                    "szi": "0.0",
+                    "entryPx": "0.0"
+                }
+            }]
+        });
+        let snapshot = parse_account_snapshot_with_meta(&payload, Some(HYPERLIQUID_VENUE_ID), 1)
+            .expect("snapshot");
+        assert_eq!(snapshot.venue_id, HYPERLIQUID_VENUE_ID);
+        assert_eq!(snapshot.positions[0].symbol, "ETH");
+        assert_eq!(snapshot.timestamp_ms, 0);
+
+        let snapshot = normalize_direct_account_snapshot(snapshot, 1_700_000_123_456);
+        assert_eq!(snapshot.timestamp_ms, 1_700_000_123_456);
     }
 
     #[test]
@@ -5698,10 +5727,11 @@ mod tests {
                 }
             }
         });
-        let event = translate_account_event(&msg, Some("ETH"), 7).expect("account event");
+        let event =
+            translate_account_event(&msg, Some(HYPERLIQUID_VENUE_ID), 7).expect("account event");
         let AccountEvent::Snapshot(snapshot) = event;
         assert_eq!(snapshot.venue_index, 7);
-        assert_eq!(snapshot.venue_id, "ETH");
+        assert_eq!(snapshot.venue_id, HYPERLIQUID_VENUE_ID);
         assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
         assert_eq!(snapshot.positions.len(), 1);
         assert_eq!(snapshot.positions[0].symbol, "ETH");
@@ -5726,11 +5756,12 @@ mod tests {
             }
         });
         let before = now_ms();
-        let event = translate_account_event(&msg, Some("ETH"), 3).expect("account event");
+        let event =
+            translate_account_event(&msg, Some(HYPERLIQUID_VENUE_ID), 3).expect("account event");
         let AccountEvent::Snapshot(snapshot) = event;
         let after = now_ms();
         assert_eq!(snapshot.venue_index, 3);
-        assert_eq!(snapshot.venue_id, "ETH");
+        assert_eq!(snapshot.venue_id, HYPERLIQUID_VENUE_ID);
         assert!(snapshot.timestamp_ms >= before);
         assert!(snapshot.timestamp_ms <= after);
     }
@@ -6785,6 +6816,14 @@ fn parse_purpose(value: Option<&serde_json::Value>) -> Option<OrderPurpose> {
 
 pub fn parse_account_snapshot(data: &serde_json::Value) -> Option<AccountSnapshot> {
     parse_account_snapshot_with_meta(data, None, 0)
+}
+
+fn normalize_direct_account_snapshot(
+    mut snapshot: AccountSnapshot,
+    observed_ms: TimestampMs,
+) -> AccountSnapshot {
+    snapshot.timestamp_ms = snapshot.timestamp_ms.max(observed_ms);
+    snapshot
 }
 
 fn parse_account_snapshot_with_meta(
