@@ -8994,6 +8994,215 @@ fn build_canary_exit_cancel_all_intents(
     cancel_intents
 }
 
+fn hyperliquid_terminal_explicit_cancel_venue_index(cfg: &Config) -> Option<usize> {
+    let venue_index = hyperliquid_venue_index(cfg)?;
+    if v2_live_canary_ranked_execution_allowed_venue_indices(cfg)
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(&venue_index))
+    {
+        return None;
+    }
+    Some(venue_index)
+}
+
+#[cfg(feature = "live_hyperliquid")]
+fn hyperliquid_terminal_first_env_url(plural_name: &str, singular_name: &str) -> Option<String> {
+    if let Ok(raw) = std::env::var(plural_name) {
+        if let Some(url) = raw
+            .split(',')
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+        {
+            return Some(url.to_string());
+        }
+    }
+    std::env::var(singular_name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(feature = "live_hyperliquid")]
+fn hyperliquid_terminal_info_url() -> String {
+    hyperliquid_terminal_first_env_url("HL_INFO_URLS", "HL_INFO_URL").unwrap_or_else(|| {
+        match std::env::var("HL_NETWORK")
+            .unwrap_or_else(|_| "mainnet".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "testnet" => "https://api.hyperliquid-testnet.xyz/info".to_string(),
+            _ => "https://api.hyperliquid.xyz/info".to_string(),
+        }
+    })
+}
+
+#[cfg(feature = "live_hyperliquid")]
+fn hyperliquid_terminal_coin() -> String {
+    std::env::var("HL_COIN")
+        .unwrap_or_else(|_| "TAO".to_string())
+        .trim()
+        .to_ascii_uppercase()
+}
+
+#[cfg(feature = "live_hyperliquid")]
+fn hyperliquid_terminal_account_name() -> Option<String> {
+    std::env::var("HL_VAULT_ADDRESS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn hyperliquid_terminal_open_orders_from_payload(payload: &Value) -> &[Value] {
+    if let Some(array) = payload.as_array() {
+        return array.as_slice();
+    }
+    payload
+        .get("orders")
+        .and_then(|orders| orders.as_array())
+        .or_else(|| payload.get("data").and_then(|data| data.as_array()))
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|data| data.get("orders"))
+                .and_then(|orders| orders.as_array())
+        })
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn hyperliquid_terminal_order_matches_coin(order: &Value, coin: &str) -> bool {
+    let observed = order
+        .get("coin")
+        .or_else(|| order.get("symbol"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    observed == coin
+}
+
+fn hyperliquid_terminal_order_id(order: &Value) -> Option<String> {
+    for key in ["oid", "orderId", "order_id"] {
+        if let Some(value) = order.get(key) {
+            if let Some(text) = value.as_str() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            if let Some(number) = value.as_u64() {
+                return Some(number.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn build_hyperliquid_terminal_explicit_cancel_intents_from_payload(
+    cfg: &Config,
+    venue_index: usize,
+    payload: &Value,
+    coin: &str,
+) -> Result<Vec<OrderIntent>, &'static str> {
+    let Some(venue_cfg) = cfg.venues.get(venue_index) else {
+        return Err("venue_missing");
+    };
+    let mut intents = Vec::new();
+    for order in hyperliquid_terminal_open_orders_from_payload(payload) {
+        if !hyperliquid_terminal_order_matches_coin(order, coin) {
+            continue;
+        }
+        let Some(order_id) = hyperliquid_terminal_order_id(order) else {
+            return Err("open_order_missing_cancel_identifier");
+        };
+        intents.push(OrderIntent::Cancel(crate::types::CancelOrderIntent {
+            venue_index,
+            venue_id: venue_cfg.id_arc.clone(),
+            order_id,
+        }));
+    }
+    Ok(intents)
+}
+
+async fn build_hyperliquid_terminal_explicit_cancel_intents(
+    cfg: &Config,
+) -> Result<Vec<OrderIntent>, &'static str> {
+    #[cfg(not(feature = "live_hyperliquid"))]
+    {
+        let _ = cfg;
+        return Ok(Vec::new());
+    }
+    #[cfg(feature = "live_hyperliquid")]
+    {
+        let Some(venue_index) = hyperliquid_terminal_explicit_cancel_venue_index(cfg) else {
+            return Ok(Vec::new());
+        };
+        let Some(user) = hyperliquid_terminal_account_name() else {
+            return Err("missing_account_name");
+        };
+        let info_url = hyperliquid_terminal_info_url();
+        let coin = hyperliquid_terminal_coin();
+        let client = reqwest::Client::new();
+        let mut last_error = "unknown";
+        let mut saw_successful_empty_query = false;
+        for query_type in ["openOrders", "frontendOpenOrders"] {
+            let response = match client
+                .post(info_url.as_str())
+                .json(&json!({"type": query_type, "user": user.as_str()}))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(_err) => {
+                    last_error = "open_order_query_transport";
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                last_error = "open_order_query_status";
+                continue;
+            }
+            let payload = match response.json::<Value>().await {
+                Ok(payload) => payload,
+                Err(_err) => {
+                    last_error = "open_order_query_json";
+                    continue;
+                }
+            };
+            let intents = build_hyperliquid_terminal_explicit_cancel_intents_from_payload(
+                cfg,
+                venue_index,
+                &payload,
+                coin.as_str(),
+            )?;
+            if !intents.is_empty() {
+                return Ok(intents);
+            }
+            saw_successful_empty_query = true;
+        }
+        if saw_successful_empty_query {
+            return Ok(Vec::new());
+        }
+        Err(last_error)
+    }
+}
+
+fn merge_hyperliquid_terminal_explicit_cancel_intents(
+    cfg: &Config,
+    mut intents: Vec<OrderIntent>,
+    explicit_intents: Vec<OrderIntent>,
+) -> Vec<OrderIntent> {
+    if explicit_intents.is_empty() {
+        return intents;
+    }
+    if let Some(venue_index) = hyperliquid_terminal_explicit_cancel_venue_index(cfg) {
+        let _ = remove_intents_for_venue(&mut intents, venue_index);
+    }
+    intents.extend(explicit_intents);
+    intents
+}
+
 fn terminal_stale_order_reduce_ready_venues(
     cfg: &Config,
     state: &GlobalState,
@@ -9222,7 +9431,37 @@ async fn run_canary_exit_cancel_all_cleanup(
             );
         }
         let tracked_open_orders = live_open_order_count_total(state);
-        if tracked_open_orders == 0 {
+        let hyperliquid_tracked_open_orders = hyperliquid_venue_index(cfg)
+            .map(|venue_index| live_open_order_count_for_venue(state, venue_index))
+            .unwrap_or(0);
+        let hyperliquid_explicit_cancel_intents = if sweep_all_venues
+            || hyperliquid_tracked_open_orders > 0
+        {
+            match build_hyperliquid_terminal_explicit_cancel_intents(cfg).await {
+                Ok(intents) => {
+                    if !intents.is_empty() {
+                        eprintln!(
+                                "[runner] canary_exit_cancel_all_cleanup hyperliquid_explicit_cancel_fallback count={}",
+                                intents.len()
+                            );
+                    }
+                    intents
+                }
+                Err(reason) => {
+                    eprintln!(
+                            "[runner] canary_exit_cancel_all_cleanup hyperliquid_explicit_cancel_fallback skipped reason={}",
+                            reason
+                        );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if tracked_open_orders == 0
+            && hyperliquid_explicit_cancel_intents.is_empty()
+            && !sweep_all_venues
+        {
             eprintln!(
                 "[runner] canary_exit_cancel_all_cleanup clean attempt={} tracked_open_orders=0",
                 attempt
@@ -9236,7 +9475,11 @@ async fn run_canary_exit_cancel_all_cleanup(
             tracked_open_orders,
             venues.join(",")
         );
-        let intents = build_canary_exit_cancel_all_intents(cfg, state, sweep_all_venues);
+        let intents = merge_hyperliquid_terminal_explicit_cancel_intents(
+            cfg,
+            build_canary_exit_cancel_all_intents(cfg, state, sweep_all_venues),
+            hyperliquid_explicit_cancel_intents,
+        );
         if intents.is_empty() {
             eprintln!(
                 "[runner] canary_exit_cancel_all_cleanup no_cancel_intents tracked_open_orders={}",
@@ -29543,6 +29786,126 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn hyperliquid_terminal_explicit_cancel_builds_oid_cancel_intents() {
+        let cfg = Config::default();
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        let payload = json!([
+            {"coin": "ETH", "oid": 12345},
+            {"coin": "ETH", "orderId": "67890"},
+            {"coin": "BTC", "oid": 99999}
+        ]);
+
+        let intents = build_hyperliquid_terminal_explicit_cancel_intents_from_payload(
+            &cfg,
+            hyperliquid,
+            &payload,
+            "ETH",
+        )
+        .expect("explicit cancel intents");
+
+        assert_eq!(intents.len(), 2);
+        assert!(intents.iter().all(|intent| {
+            matches!(
+                intent,
+                OrderIntent::Cancel(cancel)
+                    if cancel.venue_index == hyperliquid
+                        && cancel.venue_id.as_ref() == "hyperliquid"
+            )
+        }));
+        let order_ids = intents
+            .iter()
+            .map(|intent| match intent {
+                OrderIntent::Cancel(cancel) => cancel.order_id.as_str(),
+                other => panic!("expected cancel intent, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order_ids, vec!["12345", "67890"]);
+    }
+
+    #[test]
+    fn hyperliquid_terminal_explicit_cancel_rejects_matching_order_without_cancel_id() {
+        let cfg = Config::default();
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        let payload = json!([{"coin": "ETH", "cloid": "raw-client-id-not-usable"}]);
+
+        let result = build_hyperliquid_terminal_explicit_cancel_intents_from_payload(
+            &cfg,
+            hyperliquid,
+            &payload,
+            "ETH",
+        );
+
+        assert_eq!(result, Err("open_order_missing_cancel_identifier"));
+    }
+
+    #[test]
+    fn hyperliquid_terminal_explicit_cancel_is_scoped_to_ranked_execution_allowlist() {
+        let mut cfg = v2_live_canary_admission_runner_config();
+        cfg.v2_shadow.live_canary_ranked_execution_venues = vec!["lighter".to_string()];
+        assert_eq!(hyperliquid_terminal_explicit_cancel_venue_index(&cfg), None);
+
+        cfg.v2_shadow.live_canary_ranked_execution_venues = vec!["hyperliquid".to_string()];
+        assert_eq!(
+            hyperliquid_terminal_explicit_cancel_venue_index(&cfg),
+            hyperliquid_venue_index(&cfg)
+        );
+    }
+
+    #[test]
+    fn hyperliquid_terminal_explicit_cancel_replaces_generic_sweep_intent() {
+        let mut cfg = v2_live_canary_admission_runner_config();
+        cfg.v2_shadow.live_canary_ranked_execution_venues =
+            vec!["hyperliquid".to_string(), "lighter".to_string()];
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        let lighter = lighter_venue_index(&cfg).expect("lighter venue");
+        let state = GlobalState::new(&cfg);
+        let sweep_intents = build_canary_exit_cancel_all_intents(&cfg, &state, true);
+        assert!(sweep_intents.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all)
+                    if cancel_all.venue_index == Some(hyperliquid)
+            )
+        }));
+        assert!(sweep_intents.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all) if cancel_all.venue_index == Some(lighter)
+            )
+        }));
+
+        let merged = merge_hyperliquid_terminal_explicit_cancel_intents(
+            &cfg,
+            sweep_intents,
+            vec![OrderIntent::Cancel(CancelOrderIntent {
+                venue_index: hyperliquid,
+                venue_id: cfg.venues[hyperliquid].id_arc.clone(),
+                order_id: "venue_open_order_id".to_string(),
+            })],
+        );
+
+        assert!(merged.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::Cancel(cancel) if cancel.venue_index == hyperliquid
+            )
+        }));
+        assert!(!merged.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all)
+                    if cancel_all.venue_index == Some(hyperliquid)
+            )
+        }));
+        assert!(merged.iter().any(|intent| {
+            matches!(
+                intent,
+                OrderIntent::CancelAll(cancel_all) if cancel_all.venue_index == Some(lighter)
+            )
+        }));
     }
 
     #[test]
