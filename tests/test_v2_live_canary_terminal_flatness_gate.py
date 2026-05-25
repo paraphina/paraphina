@@ -298,10 +298,6 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
 
         self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
         self.assertIn(
-            "terminal_cleanup_account_refresh_not_fresh",
-            report["terminal_flatness_gate_reasons"],
-        )
-        self.assertIn(
             "terminal_cleanup_account_truth_blocked",
             report["terminal_flatness_gate_reasons"],
         )
@@ -324,9 +320,42 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "HOLD")
         self.assertEqual(report["closeout_status"]["run_binding_status"], "PASS")
         self.assertIn(
-            "terminal_cleanup_account_refresh_not_fresh",
+            "terminal_cleanup_account_refresh_unresolved",
             report["closeout_status"]["promotion_cleanup_strict_reasons"],
         )
+
+    def test_promotion_cleanup_strict_allows_transient_not_fresh_with_clean_closeout(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=post_dispatch venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertEqual(report["terminal_cleanup"]["account_refresh_not_fresh_count"], 1)
+        self.assertEqual(report["terminal_cleanup"]["clean_terminal_closeout_count"], 1)
+        self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "PASS")
+
+    def test_promotion_cleanup_strict_holds_on_incomplete_residual(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup incomplete "
+                "residual_venues=hyperliquid position_tol_tao=0.000100\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_incomplete_residual_present",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertEqual(report["terminal_cleanup"]["incomplete_residual_count"], 1)
 
     def test_promotion_cleanup_strict_requires_cleanup_log(self):
         report = self.evaluate(audit_doc(), promotion_cleanup_strict=True)

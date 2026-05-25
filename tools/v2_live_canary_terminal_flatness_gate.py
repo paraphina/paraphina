@@ -135,6 +135,8 @@ def _terminal_cleanup_report(
         "hyperliquid_cancel_all_ws_post_count": 0,
         "account_refresh_not_fresh_count": 0,
         "blocked_account_truth_count": 0,
+        "incomplete_residual_count": 0,
+        "clean_terminal_closeout_count": 0,
     }
     if live_stderr_path is None:
         if promotion_cleanup_strict:
@@ -173,16 +175,36 @@ def _terminal_cleanup_report(
     report["blocked_account_truth_count"] = text.count(
         "canary_exit_position_flatten_cleanup blocked_pre_clean_account_truth"
     ) + text.count("canary_exit_position_flatten_cleanup blocked_post_dispatch_account_truth")
+    report["incomplete_residual_count"] = text.count(
+        "canary_exit_position_flatten_cleanup incomplete residual_venues="
+    )
+    report["clean_terminal_closeout_count"] = sum(
+        text.count(marker)
+        for marker in (
+            "canary_exit_position_flatten_cleanup clean_after_account_truth_check",
+            "canary_exit_position_flatten_cleanup clean_after_account_refresh",
+            "canary_exit_position_flatten_cleanup clean_after_dispatch_account_truth_check",
+            "canary_exit_position_flatten_cleanup clean_after_final_account_refresh",
+            "canary_exit_cancel_all_cleanup clean",
+        )
+    )
 
     if promotion_cleanup_strict:
         if timeout_ticks:
             reasons.append("terminal_cleanup_cancel_timeout_present")
         if post_inflight_max > 1:
             reasons.append("terminal_cleanup_hyperliquid_cancel_all_post_inflight_backlog")
-        if report["account_refresh_not_fresh_count"] > 0:
-            reasons.append("terminal_cleanup_account_refresh_not_fresh")
+        if report["incomplete_residual_count"] > 0:
+            reasons.append("terminal_cleanup_incomplete_residual_present")
         if report["blocked_account_truth_count"] > 0:
             reasons.append("terminal_cleanup_account_truth_blocked")
+        if (
+            report["account_refresh_not_fresh_count"] > 0
+            and report["blocked_account_truth_count"] == 0
+            and report["incomplete_residual_count"] == 0
+            and report["clean_terminal_closeout_count"] == 0
+        ):
+            reasons.append("terminal_cleanup_account_refresh_unresolved")
     return reasons, report
 
 
