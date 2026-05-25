@@ -30,6 +30,8 @@ const PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY";
 const PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV: &str =
     "PARAPHINA_PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE";
+const PHASE51_LIGHTER_TERMINAL_EXIT_MARKET_IOC_ENV: &str =
+    "PARAPHINA_LIGHTER_TERMINAL_EXIT_MARKET_IOC_ENABLED";
 const PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_DEFAULT: f64 = 0.01;
 /// Maximum consecutive delta decode failures before forcing a reconnect to
 /// obtain a fresh full snapshot.  Protects against book drift from missed deltas.
@@ -175,6 +177,26 @@ fn phase51_lighter_baseline_cleanup_place_rejection(
         return Some("lighter: baseline cleanup-only rejects size outside cleanup cap");
     }
     None
+}
+
+fn phase51_lighter_terminal_exit_market_ioc_enabled() -> bool {
+    phase51_lighter_true_env(PHASE51_LIGHTER_TERMINAL_EXIT_MARKET_IOC_ENV)
+}
+
+fn phase51_lighter_terminal_exit_market_ioc_request(
+    configured_market: &str,
+    req: &LiveRestPlaceRequest,
+) -> bool {
+    phase51_lighter_terminal_exit_market_ioc_enabled()
+        && req.venue_id.eq_ignore_ascii_case("lighter")
+        && req.purpose == OrderPurpose::Exit
+        && phase51_lighter_baseline_cleanup_market_allowed(configured_market)
+        && matches!(req.time_in_force, TimeInForce::Ioc)
+        && !req.post_only
+        && req.reduce_only
+        && req.size.is_finite()
+        && req.size > 0.0
+        && req.size <= phase51_lighter_baseline_cleanup_max_size() + 1e-12
 }
 
 fn phase51_lighter_strict_maker_only_place_rejection(
@@ -4138,6 +4160,7 @@ mod tests {
                 when.method(POST)
                     .path("/sign")
                     .body_contains("\"op\":\"create_order\"")
+                    .body_contains("\"order_type\":\"limit\"")
                     .body_contains("\"time_in_force\":\"Ioc\"")
                     .body_contains("\"reduce_only\":1")
                     .body_contains("\"order_expiry\":0");
@@ -4186,6 +4209,102 @@ mod tests {
         };
         let resp = connector.place_order(req).await.expect("place");
         assert_eq!(resp.order_id.as_deref(), Some("ioc-cleanup"));
+        orderbooks.assert_hits_async(1).await;
+        sign.assert_async().await;
+        sendtx.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn phase51_lighter_terminal_exit_market_ioc_signs_market_order_when_gated() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "LIGHTER_MARKET_ID",
+            "LIGHTER_MARKET",
+            PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV,
+            PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV,
+            PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV,
+            PHASE51_LIGHTER_TERMINAL_EXIT_MARKET_IOC_ENV,
+        ]);
+        unset_env("LIGHTER_MARKET_ID");
+        unset_env("LIGHTER_MARKET");
+        unset_env(PHASE51_LIGHTER_STRICT_MAKER_ONLY_OBSERVATION_ENV);
+        unset_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV);
+        set_env(PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV, "0.01");
+        set_env(PHASE51_LIGHTER_TERMINAL_EXIT_MARKET_IOC_ENV, "true");
+
+        let api = MockServer::start_async().await;
+        let signer = MockServer::start_async().await;
+        let orderbooks = api
+            .mock_async(|when, then| {
+                when.method(GET).path("/api/v1/orderBooks");
+                then.status(200).json_body(serde_json::json!({
+                    "order_books": [
+                        {
+                            "symbol": "ETH",
+                            "market_id": 0,
+                            "supported_price_decimals": 2,
+                            "supported_size_decimals": 4
+                        }
+                    ]
+                }));
+            })
+            .await;
+        let sign = signer
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sign")
+                    .body_contains("\"op\":\"create_order\"")
+                    .body_contains("\"order_type\":\"market\"")
+                    .body_contains("\"time_in_force\":\"Ioc\"")
+                    .body_contains("\"post_only\":0")
+                    .body_contains("\"reduce_only\":1")
+                    .body_contains("\"order_expiry\":0");
+                then.status(200)
+                    .json_body(serde_json::json!({"tx_type":14,"tx_info":{"signed":true}}));
+            })
+            .await;
+        let sendtx = api
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/api/v1/sendTx")
+                    .body_contains("tx_type=14")
+                    .body_contains("tx_info=%7B%22signed%22%3Atrue%7D");
+                then.status(200)
+                    .json_body(serde_json::json!({"order_id":"market-cleanup"}));
+            })
+            .await;
+        let cfg = LighterConfig {
+            ws_url: "wss://example.invalid".to_string(),
+            rest_url: api.base_url(),
+            market: "ETH-USD".to_string(),
+            venue_id: "LIGHTER".to_string(),
+            venue_index: 0,
+            paper_mode: false,
+            api_key_index: Some(1),
+            account_index: Some(123),
+            api_private_key_hex: Some("deadbeef".to_string()),
+            auth_token: None,
+            nonce_path: None,
+            signer_url: Some(signer.base_url()),
+        };
+        let (market_tx, _market_rx) = mpsc::channel(1);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let connector = LighterConnector::new(cfg, market_tx, exec_tx);
+        let req = LiveRestPlaceRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            side: Side::Buy,
+            price: 2150.0,
+            size: 0.01,
+            purpose: OrderPurpose::Exit,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: "42".to_string(),
+        };
+
+        let resp = connector.place_order(req).await.expect("place");
+        assert_eq!(resp.order_id.as_deref(), Some("market-cleanup"));
         orderbooks.assert_hits_async(1).await;
         sign.assert_async().await;
         sendtx.assert_async().await;
@@ -4498,6 +4617,78 @@ mod tests {
 
         unset_env(PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV);
         assert!(phase51_lighter_baseline_cleanup_place_rejection("BTC-USD", &req).is_none());
+    }
+
+    #[test]
+    fn phase51_lighter_terminal_exit_market_ioc_gate_contract() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV,
+            PHASE51_LIGHTER_BASELINE_CLEANUP_MAX_SIZE_ENV,
+            PHASE51_LIGHTER_TERMINAL_EXIT_MARKET_IOC_ENV,
+        ]);
+        let mut req = LiveRestPlaceRequest {
+            venue_index: 0,
+            venue_id: "LIGHTER".to_string(),
+            side: Side::Buy,
+            price: 2150.0,
+            size: 0.01,
+            purpose: OrderPurpose::Exit,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: "42".to_string(),
+        };
+
+        unset_env(PHASE51_LIGHTER_TERMINAL_EXIT_MARKET_IOC_ENV);
+        assert!(!phase51_lighter_terminal_exit_market_ioc_request(
+            "ETH-USD", &req
+        ));
+
+        set_env(PHASE51_LIGHTER_TERMINAL_EXIT_MARKET_IOC_ENV, "yes");
+        assert!(phase51_lighter_terminal_exit_market_ioc_request(
+            "ETH-USD", &req
+        ));
+
+        req.purpose = OrderPurpose::Hedge;
+        assert!(!phase51_lighter_terminal_exit_market_ioc_request(
+            "ETH-USD", &req
+        ));
+        req.purpose = OrderPurpose::Exit;
+
+        req.time_in_force = TimeInForce::Gtc;
+        assert!(!phase51_lighter_terminal_exit_market_ioc_request(
+            "ETH-USD", &req
+        ));
+        req.time_in_force = TimeInForce::Ioc;
+
+        req.post_only = true;
+        assert!(!phase51_lighter_terminal_exit_market_ioc_request(
+            "ETH-USD", &req
+        ));
+        req.post_only = false;
+
+        req.reduce_only = false;
+        assert!(!phase51_lighter_terminal_exit_market_ioc_request(
+            "ETH-USD", &req
+        ));
+        req.reduce_only = true;
+
+        req.size = 0.010001;
+        assert!(!phase51_lighter_terminal_exit_market_ioc_request(
+            "ETH-USD", &req
+        ));
+        req.size = 0.01;
+
+        req.venue_id = "hyperliquid".to_string();
+        assert!(!phase51_lighter_terminal_exit_market_ioc_request(
+            "ETH-USD", &req
+        ));
+        req.venue_id = "LIGHTER".to_string();
+
+        assert!(!phase51_lighter_terminal_exit_market_ioc_request(
+            "BTC-USD", &req
+        ));
     }
 
     #[test]
@@ -7639,6 +7830,12 @@ impl LiveRestClient for LighterConnector {
                 TimeInForce::Ioc => Some(0),
                 _ => None,
             };
+            let order_type =
+                if phase51_lighter_terminal_exit_market_ioc_request(&self.cfg.market, &req) {
+                    "market"
+                } else {
+                    "limit"
+                };
             let _intent = OrderIntent::Place(crate::types::PlaceOrderIntent {
                 venue_index: req.venue_index,
                 venue_id: req.venue_id.as_str().into(),
@@ -7662,7 +7859,7 @@ impl LiveRestClient for LighterConnector {
                 base_amount,
                 price,
                 is_ask: if req.side == Side::Sell { 1 } else { 0 },
-                order_type: "limit".to_string(),
+                order_type: order_type.to_string(),
                 time_in_force: format!("{:?}", req.time_in_force),
                 post_only: if req.post_only { 1 } else { 0 },
                 reduce_only: if req.reduce_only { 1 } else { 0 },
