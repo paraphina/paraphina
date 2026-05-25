@@ -125,6 +125,7 @@ pub struct V2ShadowConfig {
     pub live_canary_order_path_probe_approved: bool,
     pub live_canary_venue_coverage_probe_approved: bool,
     pub live_canary_venue_coverage_probe_venues: Vec<String>,
+    pub live_canary_venue_coverage_preferred_side: Option<V2VenueCoveragePreferredSide>,
     pub live_canary_venue_coverage_sticky_resting: bool,
     pub live_canary_ranked_execution_venues: Vec<String>,
     pub fast_hedge_enabled: bool,
@@ -147,12 +148,46 @@ impl Default for V2ShadowConfig {
             live_canary_order_path_probe_approved: false,
             live_canary_venue_coverage_probe_approved: false,
             live_canary_venue_coverage_probe_venues: Vec::new(),
+            live_canary_venue_coverage_preferred_side: None,
             live_canary_venue_coverage_sticky_resting: false,
             live_canary_ranked_execution_venues: Vec::new(),
             fast_hedge_enabled: false,
             order_intent_enabled: false,
             require_phase51_gate: true,
             telemetry_schema_version: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum V2VenueCoveragePreferredSide {
+    Buy,
+    Sell,
+    Invalid,
+}
+
+impl V2VenueCoveragePreferredSide {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => None,
+            "buy" => Some(Self::Buy),
+            "sell" => Some(Self::Sell),
+            _ => Some(Self::Invalid),
+        }
+    }
+
+    pub fn matches_side(self, side: crate::types::Side) -> bool {
+        matches!(
+            (self, side),
+            (Self::Buy, crate::types::Side::Buy) | (Self::Sell, crate::types::Side::Sell)
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+            Self::Invalid => "invalid",
         }
     }
 }
@@ -3141,6 +3176,39 @@ impl Config {
                 );
             }
         }
+        if let Ok(raw) = env::var("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE") {
+            if matches!(
+                cfg.v2_shadow.decision_mode,
+                V2DecisionMode::LiveCanaryAdmission
+            ) {
+                cfg.v2_shadow.live_canary_venue_coverage_preferred_side =
+                    V2VenueCoveragePreferredSide::parse(&raw);
+                match cfg.v2_shadow.live_canary_venue_coverage_preferred_side {
+                    Some(side @ V2VenueCoveragePreferredSide::Buy)
+                    | Some(side @ V2VenueCoveragePreferredSide::Sell) => {
+                        eprintln!(
+                            "[config] PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE = {} (venue-coverage probe side filter; not promotion evidence)",
+                            side.as_str()
+                        );
+                    }
+                    Some(V2VenueCoveragePreferredSide::Invalid) => {
+                        eprintln!(
+                            "[config] WARN: invalid PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE = {:?}; venue-coverage probe will fail closed",
+                            raw
+                        );
+                    }
+                    None => {
+                        eprintln!(
+                            "[config] PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE empty; no side filter"
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[config] PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE ignored outside live_canary_admission mode"
+                );
+            }
+        }
         if let Ok(raw) = env::var("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STICKY_RESTING") {
             match parse_bool_env(&raw) {
                 Some(enabled)
@@ -3495,6 +3563,7 @@ mod tests {
         const LIVE_CANARY_APPROVAL_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED";
         const RANKED_EXECUTION_VENUES_KEY: &str =
             "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES";
+        const COVERAGE_SIDE_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE";
         const FAST_HEDGE_KEY: &str = "PARAPHINA_V2_FAST_HEDGE_ENABLE";
         const ORDER_INTENT_KEY: &str = "PARAPHINA_V2_ORDER_INTENT_ENABLE";
         const REQUIRE_PHASE51_KEY: &str = "PARAPHINA_V2_REQUIRE_PHASE51_GATE";
@@ -3508,6 +3577,7 @@ mod tests {
         let _admission = EnvGuard::new(ADMISSION_KEY);
         let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
         let _ranked_execution_venues = EnvGuard::new(RANKED_EXECUTION_VENUES_KEY);
+        let _coverage_side = EnvGuard::new(COVERAGE_SIDE_KEY);
         let _fast_hedge = EnvGuard::new(FAST_HEDGE_KEY);
         let _order_intent = EnvGuard::new(ORDER_INTENT_KEY);
         let _require_phase51 = EnvGuard::new(REQUIRE_PHASE51_KEY);
@@ -3521,6 +3591,7 @@ mod tests {
             ADMISSION_KEY,
             LIVE_CANARY_APPROVAL_KEY,
             RANKED_EXECUTION_VENUES_KEY,
+            COVERAGE_SIDE_KEY,
             FAST_HEDGE_KEY,
             ORDER_INTENT_KEY,
             REQUIRE_PHASE51_KEY,
@@ -3534,6 +3605,7 @@ mod tests {
         env::set_var(ADMISSION_KEY, "true");
         env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
         env::set_var(RANKED_EXECUTION_VENUES_KEY, "lighter");
+        env::set_var(COVERAGE_SIDE_KEY, "buy");
         env::set_var(FAST_HEDGE_KEY, "true");
         env::set_var(ORDER_INTENT_KEY, "true");
         env::set_var(REQUIRE_PHASE51_KEY, "false");
@@ -3558,6 +3630,12 @@ mod tests {
             cfg.v2_shadow.require_phase51_gate,
             "V2 Phase 5.1 gate requirement must not be env-disabled"
         );
+        assert!(
+            cfg.v2_shadow
+                .live_canary_venue_coverage_preferred_side
+                .is_none(),
+            "V2 venue-coverage preferred side must stay disabled outside live_canary_admission"
+        );
     }
 
     #[test]
@@ -3574,6 +3652,7 @@ mod tests {
         const COVERAGE_PROBE_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_APPROVED";
         const COVERAGE_PROBE_VENUES_KEY: &str =
             "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_VENUES";
+        const COVERAGE_SIDE_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE";
         const COVERAGE_STICKY_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STICKY_RESTING";
         const RANKED_EXECUTION_VENUES_KEY: &str =
             "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES";
@@ -3589,6 +3668,7 @@ mod tests {
         let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
         let _coverage_probe = EnvGuard::new(COVERAGE_PROBE_KEY);
         let _coverage_probe_venues = EnvGuard::new(COVERAGE_PROBE_VENUES_KEY);
+        let _coverage_side = EnvGuard::new(COVERAGE_SIDE_KEY);
         let _coverage_sticky = EnvGuard::new(COVERAGE_STICKY_KEY);
         let _ranked_execution_venues = EnvGuard::new(RANKED_EXECUTION_VENUES_KEY);
         let _order_intent = EnvGuard::new(ORDER_INTENT_KEY);
@@ -3602,6 +3682,7 @@ mod tests {
         env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
         env::set_var(COVERAGE_PROBE_KEY, "true");
         env::set_var(COVERAGE_PROBE_VENUES_KEY, "aster,extended");
+        env::set_var(COVERAGE_SIDE_KEY, "buy");
         env::set_var(COVERAGE_STICKY_KEY, "true");
         env::set_var(RANKED_EXECUTION_VENUES_KEY, "lighter");
         env::set_var(ORDER_INTENT_KEY, "true");
@@ -3632,6 +3713,12 @@ mod tests {
         assert!(
             !cfg.v2_shadow.live_canary_venue_coverage_sticky_resting,
             "shadow mode must ignore live-canary sticky resting gates"
+        );
+        assert!(
+            cfg.v2_shadow
+                .live_canary_venue_coverage_preferred_side
+                .is_none(),
+            "shadow mode must ignore live-canary venue-coverage side filters"
         );
         assert!(
             cfg.v2_shadow.live_canary_ranked_execution_venues.is_empty(),
@@ -3687,6 +3774,7 @@ mod tests {
         const COVERAGE_PROBE_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_APPROVED";
         const COVERAGE_PROBE_VENUES_KEY: &str =
             "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_VENUES";
+        const COVERAGE_SIDE_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE";
         const COVERAGE_STICKY_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STICKY_RESTING";
         const RANKED_EXECUTION_VENUES_KEY: &str =
             "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES";
@@ -3702,6 +3790,7 @@ mod tests {
         let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
         let _coverage_probe = EnvGuard::new(COVERAGE_PROBE_KEY);
         let _coverage_probe_venues = EnvGuard::new(COVERAGE_PROBE_VENUES_KEY);
+        let _coverage_side = EnvGuard::new(COVERAGE_SIDE_KEY);
         let _coverage_sticky = EnvGuard::new(COVERAGE_STICKY_KEY);
         let _ranked_execution_venues = EnvGuard::new(RANKED_EXECUTION_VENUES_KEY);
         let _fast_hedge = EnvGuard::new(FAST_HEDGE_KEY);
@@ -3715,6 +3804,7 @@ mod tests {
         env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
         env::set_var(COVERAGE_PROBE_KEY, "true");
         env::set_var(COVERAGE_PROBE_VENUES_KEY, "aster,extended");
+        env::set_var(COVERAGE_SIDE_KEY, "buy");
         env::set_var(COVERAGE_STICKY_KEY, "true");
         env::set_var(RANKED_EXECUTION_VENUES_KEY, "lighter");
         env::set_var(FAST_HEDGE_KEY, "false");
@@ -3743,6 +3833,12 @@ mod tests {
         assert!(
             !cfg.v2_shadow.live_canary_venue_coverage_sticky_resting,
             "paper_admission mode must ignore live-canary sticky resting gates"
+        );
+        assert!(
+            cfg.v2_shadow
+                .live_canary_venue_coverage_preferred_side
+                .is_none(),
+            "paper_admission mode must ignore live-canary venue-coverage side filters"
         );
         assert!(
             cfg.v2_shadow.live_canary_ranked_execution_venues.is_empty(),
@@ -3777,6 +3873,7 @@ mod tests {
         const COVERAGE_PROBE_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_APPROVED";
         const COVERAGE_PROBE_VENUES_KEY: &str =
             "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_VENUES";
+        const COVERAGE_SIDE_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PREFERRED_SIDE";
         const COVERAGE_STICKY_KEY: &str = "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STICKY_RESTING";
         const RANKED_EXECUTION_VENUES_KEY: &str =
             "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES";
@@ -3792,6 +3889,7 @@ mod tests {
         let _live_canary_approval = EnvGuard::new(LIVE_CANARY_APPROVAL_KEY);
         let _coverage_probe = EnvGuard::new(COVERAGE_PROBE_KEY);
         let _coverage_probe_venues = EnvGuard::new(COVERAGE_PROBE_VENUES_KEY);
+        let _coverage_side = EnvGuard::new(COVERAGE_SIDE_KEY);
         let _coverage_sticky = EnvGuard::new(COVERAGE_STICKY_KEY);
         let _ranked_execution_venues = EnvGuard::new(RANKED_EXECUTION_VENUES_KEY);
         let _fast_hedge = EnvGuard::new(FAST_HEDGE_KEY);
@@ -3805,6 +3903,7 @@ mod tests {
         env::set_var(LIVE_CANARY_APPROVAL_KEY, "true");
         env::set_var(COVERAGE_PROBE_KEY, "true");
         env::set_var(COVERAGE_PROBE_VENUES_KEY, " Aster, extended ,paradex ");
+        env::set_var(COVERAGE_SIDE_KEY, " buy ");
         env::set_var(COVERAGE_STICKY_KEY, "true");
         env::set_var(RANKED_EXECUTION_VENUES_KEY, " Lighter ");
         env::set_var(FAST_HEDGE_KEY, "true");
@@ -3830,6 +3929,10 @@ mod tests {
             ]
         );
         assert!(cfg.v2_shadow.live_canary_venue_coverage_sticky_resting);
+        assert_eq!(
+            cfg.v2_shadow.live_canary_venue_coverage_preferred_side,
+            Some(V2VenueCoveragePreferredSide::Buy)
+        );
         assert_eq!(
             cfg.v2_shadow.live_canary_ranked_execution_venues,
             vec!["lighter".to_string()]

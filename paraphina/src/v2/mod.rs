@@ -13,7 +13,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::config::{V2DecisionMode, V2ShadowConfig};
+use crate::config::{V2DecisionMode, V2ShadowConfig, V2VenueCoveragePreferredSide};
 use crate::mm::{MmLevel, MmQuote};
 use crate::state::GlobalState;
 use crate::types::{OrderIntent, OrderPurpose, Side, TimestampMs};
@@ -574,6 +574,7 @@ pub fn evaluate_admission_decision_with_context(
                 &candidates,
                 &rankings,
                 &config.live_canary_venue_coverage_probe_venues,
+                config.live_canary_venue_coverage_preferred_side,
             );
             venue_coverage_probe_is_admission = !selected.is_empty();
             selected
@@ -736,6 +737,7 @@ fn select_live_canary_venue_coverage_probe_candidates(
     candidates: &[V2ShadowCandidate],
     rankings: &[V2ShadowCandidateRanking],
     allowed_venues: &[String],
+    preferred_side: Option<V2VenueCoveragePreferredSide>,
 ) -> Vec<V2AdmittedCandidate> {
     let mut selected = Vec::new();
     let allowed = allowed_venues
@@ -751,6 +753,7 @@ fn select_live_canary_venue_coverage_probe_candidates(
         };
         if candidate.target_linkage_state != "present_redacted"
             || !allowed.contains(candidate.venue_id.as_str())
+            || preferred_side.is_some_and(|side| !side.matches_side(candidate.side))
             || !candidate.price.is_finite()
             || candidate.price <= 0.0
             || !candidate.size.is_finite()
@@ -1628,7 +1631,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::config::{Config, V2ShadowConfig};
+    use crate::config::{Config, V2ShadowConfig, V2VenueCoveragePreferredSide};
     use crate::mm::{mm_quotes_to_order_intents, MmLevel, MmQuote};
     use crate::orderbook_l2::BookLevel;
     use crate::state::GlobalState;
@@ -2400,6 +2403,109 @@ mod tests {
         assert!(!serialized.contains("raw-cancel-order-id-must-not-emit"));
         assert!(!serialized.contains("raw-group-must-not-emit"));
         assert!(!serialized.contains("raw-order-must-not-emit"));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_preferred_side_filters_candidates() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec!["aster".to_string()];
+        config.live_canary_venue_coverage_preferred_side = Some(V2VenueCoveragePreferredSide::Buy);
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(2, "aster", Side::Sell, 101.0),
+            mm_place(2, "aster", Side::Buy, 100.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.authority_scope, "live_canary_venue_coverage_probe");
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert!(decision.venue_coverage_probe_is_admission);
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(decision.admitted_candidates.len(), 1);
+        assert_eq!(decision.admitted_candidates[0].venue_id, "aster");
+        assert_eq!(decision.admitted_candidates[0].side, Side::Buy);
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(
+            &intents[0],
+            OrderIntent::Place(place)
+                if place.venue_id.as_ref() == "aster"
+                    && place.side == Side::Buy
+                    && place.post_only
+                    && !place.reduce_only
+        ));
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_preferred_sell_filters_buy_candidates() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec!["aster".to_string()];
+        config.live_canary_venue_coverage_preferred_side = Some(V2VenueCoveragePreferredSide::Sell);
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(2, "aster", Side::Buy, 100.0),
+            mm_place(2, "aster", Side::Sell, 101.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "ADMITTED");
+        assert!(decision.venue_coverage_probe_is_admission);
+        assert_eq!(decision.order_intent_output_count, 1);
+        assert_eq!(decision.admitted_candidates[0].venue_id, "aster");
+        assert_eq!(decision.admitted_candidates[0].side, Side::Sell);
+        assert_eq!(intents.len(), 1);
+        assert!(matches!(
+            &intents[0],
+            OrderIntent::Place(place)
+                if place.venue_id.as_ref() == "aster"
+                    && place.side == Side::Sell
+                    && place.post_only
+                    && !place.reduce_only
+        ));
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_invalid_preferred_side_fails_closed() {
+        let mut config = live_canary_admission_config();
+        config.live_canary_venue_coverage_probe_approved = true;
+        config.live_canary_venue_coverage_probe_venues = vec!["aster".to_string()];
+        config.live_canary_venue_coverage_preferred_side =
+            Some(V2VenueCoveragePreferredSide::Invalid);
+        let context = live_canary_runtime_context();
+        let mut intents = vec![
+            mm_place(2, "aster", Side::Sell, 101.0),
+            mm_place(2, "aster", Side::Buy, 100.0),
+        ];
+
+        let decision =
+            apply_admission_filter_with_context(&config, "live", 4_500, &mut intents, &context)
+                .expect("filter")
+                .expect("decision");
+
+        assert_eq!(decision.admission_status, "HOLD");
+        assert_eq!(decision.admission_reason, "no_positive_ranked_candidates");
+        assert!(!decision.venue_coverage_probe_is_admission);
+        assert_eq!(decision.order_intent_output_count, 0);
+        assert!(decision.admitted_candidates.is_empty());
+        assert!(
+            intents.is_empty(),
+            "invalid side filter must not pass MM places"
+        );
+        assert!(!decision.pressure_complete_claim);
+        assert!(!decision.blocker_cleared);
     }
 
     #[test]
