@@ -14590,13 +14590,31 @@ fn canary_exit_position_flatten_unwind_price(
     let venue_cfg = cfg.venues.get(venue_index)?;
     let venue = state.venues.get(venue_index)?;
     let tick_size = venue_cfg.tick_size.max(1e-9);
-    venue
+    let mid = venue
         .mid
         .filter(|mid| mid.is_finite() && *mid >= tick_size)?;
     venue
         .spread
         .filter(|spread| spread.is_finite() && *spread > 0.0)?;
+    if let Some(bps) = canary_exit_position_flatten_slippage_bps_for_venue(&venue_cfg.id) {
+        let raw = match side {
+            Side::Buy => mid * (1.0 + bps / 10_000.0),
+            Side::Sell => mid * (1.0 - bps / 10_000.0).max(0.0001),
+        };
+        return snap_aggressive_price_to_tick(raw, tick_size, side);
+    }
     aggressive_unwind_price(cfg, state, venue_index, side)
+}
+
+fn canary_exit_position_flatten_slippage_bps_for_venue(venue_id: &str) -> Option<f64> {
+    let venue_key = venue_id.to_ascii_uppercase().replace('-', "_");
+    parse_optional_positive_f64_env(
+        format!("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_{venue_key}").as_str(),
+    )
+    .or_else(|| {
+        parse_optional_positive_f64_env("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS")
+    })
+    .map(|bps| bps.clamp(0.1, 100.0))
 }
 
 fn inventory_brake_slippage_bps_for_venue(venue_id: &str) -> f64 {
@@ -31647,6 +31665,96 @@ mod tests {
             intents.is_empty(),
             "terminal flatten must not send reduce-only IOC from stale/default fair value"
         );
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_slippage_bps_defaults_to_existing_touch_cushion() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_LIGHTER",
+        ]);
+        std::env::remove_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS");
+        std::env::remove_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_LIGHTER");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        seed_terminal_flatten_market(&mut state, &[lighter]);
+
+        let price =
+            canary_exit_position_flatten_unwind_price(&cfg, &state, lighter, Side::Buy).unwrap();
+
+        assert!((price - 2_000.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_slippage_bps_widens_lighter_buy_price_cap() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_LIGHTER",
+        ]);
+        std::env::remove_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS");
+        std::env::set_var(
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_LIGHTER",
+            "50",
+        );
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        seed_terminal_flatten_market(&mut state, &[lighter]);
+
+        let price =
+            canary_exit_position_flatten_unwind_price(&cfg, &state, lighter, Side::Buy).unwrap();
+
+        assert!((price - 2_010.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_slippage_bps_widens_global_sell_price_cap() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_LIGHTER",
+        ]);
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS", "25");
+        std::env::remove_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_LIGHTER");
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        seed_terminal_flatten_market(&mut state, &[lighter]);
+
+        let price =
+            canary_exit_position_flatten_unwind_price(&cfg, &state, lighter, Side::Sell).unwrap();
+
+        assert!((price - 1_995.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_slippage_bps_ignores_invalid_values() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_LIGHTER",
+        ]);
+        std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS", "-1");
+        std::env::set_var(
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SLIPPAGE_BPS_LIGHTER",
+            "not-a-number",
+        );
+
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+        seed_terminal_flatten_market(&mut state, &[lighter]);
+
+        let price =
+            canary_exit_position_flatten_unwind_price(&cfg, &state, lighter, Side::Buy).unwrap();
+
+        assert!((price - 2_000.10).abs() < 1e-9);
     }
 
     #[test]
