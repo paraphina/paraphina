@@ -228,6 +228,9 @@ def _terminal_cleanup_report(
         "final_account_truth_no_exposure_direct_venue_audit_cleared": False,
         "final_account_truth_no_exposure_venues": [],
         "final_account_truth_no_exposure_coverage_paths": {},
+        "final_account_truth_direct_venue_audit_superseded": False,
+        "final_account_truth_direct_venue_audit_venues": [],
+        "final_account_truth_direct_venue_audit_reason": None,
     }
     if live_stderr_path is None:
         if promotion_cleanup_strict:
@@ -509,8 +512,12 @@ def evaluate_terminal_flatness(
     if (
         promotion_cleanup_strict
         and cleanup_report["blocked_final_account_truth_count"] > 0
+        and cleanup_report["blocked_pre_clean_account_truth_count"] == 0
         and cleanup_report["blocked_post_dispatch_account_truth_count"] == 0
         and cleanup_report["incomplete_residual_count"] == 0
+        and cleanup_report["terminal_cancel_timeout_count"] == 0
+        and cleanup_report["terminal_cancel_all_incomplete_count"] == 0
+        and cleanup_report["hyperliquid_cancel_all_post_inflight_max"] <= 1
         and direct_venue_status == "PASS"
         and run_binding_status == "PASS"
     ):
@@ -537,8 +544,28 @@ def evaluate_terminal_flatness(
                 reason for reason in cleanup_reasons if reason != "terminal_cleanup_account_truth_blocked"
             ]
             reasons = [reason for reason in reasons if reason != "terminal_cleanup_account_truth_blocked"]
+        elif (
+            final_check.get("found") is True
+            and final_check.get("remaining_venues_empty") is True
+            and final_check.get("after_latest_account_refresh_not_fresh") is True
+            and missing_fresh_venues
+        ):
+            cleanup_report["final_account_truth_direct_venue_audit_superseded"] = True
+            cleanup_report["final_account_truth_direct_venue_audit_venues"] = sorted(
+                missing_fresh_venues
+            )
+            cleanup_report[
+                "final_account_truth_direct_venue_audit_reason"
+            ] = "final_freshness_only_gap_cleared_by_bound_direct_venue_audit"
+            cleanup_reasons = [
+                reason for reason in cleanup_reasons if reason != "terminal_cleanup_account_truth_blocked"
+            ]
+            reasons = [reason for reason in reasons if reason != "terminal_cleanup_account_truth_blocked"]
     promotion_cleanup_strict_status = "PASS" if not cleanup_reasons else "HOLD"
     status = "PASS" if not reasons else "HOLD"
+    direct_audit_superseded_final_account_truth = cleanup_report[
+        "final_account_truth_direct_venue_audit_superseded"
+    ]
     return {
         "artifact_type": "v2_live_canary_terminal_flatness_gate",
         "schema_version": 1,
@@ -560,7 +587,8 @@ def evaluate_terminal_flatness(
             "promotion_cleanup_strict_reasons": cleanup_reasons,
             "run_binding_status": run_binding_status,
             "run_binding_reasons": binding_reasons,
-            "promotion_ready": status == "PASS",
+            "promotion_ready": status == "PASS"
+            and not direct_audit_superseded_final_account_truth,
         },
         "governance": {
             "approved_for_promotion": False,

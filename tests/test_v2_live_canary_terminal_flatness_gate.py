@@ -579,7 +579,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             report["terminal_cleanup"]["final_account_truth_no_exposure_venues"], ["paradex"]
         )
 
-    def test_promotion_cleanup_strict_holds_no_exposure_final_account_truth_without_coverage(self):
+    def test_promotion_cleanup_strict_allows_final_freshness_gap_without_order_path_coverage_when_bound_direct_audit_clean(self):
         report = self.evaluate(
             audit_doc(),
             live_stderr=(
@@ -596,13 +596,22 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             promotion_cleanup_strict=True,
         )
 
-        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
-        self.assertIn(
-            "terminal_cleanup_account_truth_blocked",
-            report["terminal_flatness_gate_reasons"],
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertFalse(
+            report["terminal_cleanup"][
+                "final_account_truth_no_exposure_direct_venue_audit_cleared"
+            ]
         )
+        self.assertTrue(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_superseded"]
+        )
+        self.assertEqual(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_venues"],
+            ["paradex"],
+        )
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
 
-    def test_promotion_cleanup_strict_holds_no_exposure_final_account_truth_when_venue_had_actions(self):
+    def test_promotion_cleanup_strict_allows_final_freshness_gap_with_bound_direct_audit_when_venue_had_actions(self):
         report = self.evaluate(
             audit_doc(),
             live_stderr=(
@@ -627,10 +636,100 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             ],
         )
 
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertFalse(
+            report["terminal_cleanup"][
+                "final_account_truth_no_exposure_direct_venue_audit_cleared"
+            ]
+        )
+        self.assertTrue(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_superseded"]
+        )
+        self.assertEqual(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_venues"],
+            ["paradex"],
+        )
+        self.assertEqual(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_reason"],
+            "final_freshness_only_gap_cleared_by_bound_direct_venue_audit",
+        )
+        self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "PASS")
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+        self.assertFalse(report["governance"]["blocker_cleared"])
+        self.assertFalse(report["governance"]["approved_for_promotion"])
+
+    def test_promotion_cleanup_strict_holds_final_direct_audit_supersession_when_remaining_nonempty(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=final_check venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_changed=false "
+                "remaining_venues=paradex\n"
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth "
+                "requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.002500\n"
+            ),
+            promotion_cleanup_strict=True,
+            order_path_coverages=[
+                order_path_coverage_doc(
+                    "paradex",
+                    target_place_intents=1,
+                    observed_order_actions=["place"],
+                    observed_order_statuses=["intent"],
+                )
+            ],
+        )
+
         self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
         self.assertIn(
             "terminal_cleanup_account_truth_blocked",
             report["terminal_flatness_gate_reasons"],
+        )
+        self.assertFalse(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_superseded"]
+        )
+
+    def test_promotion_cleanup_strict_holds_final_direct_audit_supersession_when_incomplete_residual_present(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=final_check venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_changed=false "
+                "remaining_venues=\n"
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth "
+                "requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.002500\n"
+                "[runner] canary_exit_position_flatten_cleanup incomplete "
+                "residual_venues=paradex position_tol_tao=0.002500\n"
+            ),
+            promotion_cleanup_strict=True,
+            order_path_coverages=[
+                order_path_coverage_doc(
+                    "paradex",
+                    target_place_intents=1,
+                    observed_order_actions=["place"],
+                    observed_order_statuses=["intent"],
+                )
+            ],
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_incomplete_residual_present",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertIn(
+            "terminal_cleanup_account_truth_blocked",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertFalse(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_superseded"]
         )
 
     def test_promotion_cleanup_strict_holds_no_exposure_final_account_truth_when_direct_audit_dirty(self):
