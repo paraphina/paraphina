@@ -10213,17 +10213,22 @@ fn build_canary_breach_flatten_intents(
         } else {
             venue_cfg.lot_size_tao.max(1e-9)
         };
-        let max_order_size = venue_cfg.max_order_size.max(min_order_size);
+        let configured_max_order_size = venue_cfg.max_order_size;
+        let max_order_size = configured_max_order_size.max(min_order_size);
         let position_abs = venue.position_tao.abs();
         let mut size = snap_size_down_to_lot(position_abs.min(max_order_size), min_order_size);
-        if size < min_order_size
-            && venue_cfg.id.eq_ignore_ascii_case("lighter")
-            && lighter_terminal_reduce_dust_to_min_lot_enabled()
-            && position_abs > 0.0
-            && position_abs < min_order_size
-            && max_order_size >= min_order_size
-        {
-            size = min_order_size;
+        if size < min_order_size && position_abs > 0.0 && position_abs < min_order_size {
+            if venue_cfg.id.eq_ignore_ascii_case("lighter")
+                && lighter_terminal_reduce_dust_to_min_lot_enabled()
+                && configured_max_order_size >= min_order_size
+            {
+                size = min_order_size;
+            } else if venue_cfg.id.eq_ignore_ascii_case("aster")
+                && aster_terminal_reduce_dust_to_min_lot_enabled()
+                && configured_max_order_size >= min_order_size
+            {
+                size = min_order_size;
+            }
         }
         if size < min_order_size {
             continue;
@@ -12632,6 +12637,10 @@ fn canary_exit_position_flatten_timeout_ms() -> u64 {
 
 fn lighter_terminal_reduce_dust_to_min_lot_enabled() -> bool {
     parse_bool_env_default("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", false)
+}
+
+fn aster_terminal_reduce_dust_to_min_lot_enabled() -> bool {
+    parse_bool_env_default("PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", false)
 }
 
 fn canary_exit_position_flatten_residual_venues(
@@ -29841,6 +29850,7 @@ mod tests {
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TIMEOUT_MS",
             "PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT",
+            "PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT",
         ]);
 
         std::env::remove_var("PARAPHINA_CANARY_EXIT_CANCEL_ALL_ENABLED");
@@ -29902,6 +29912,13 @@ mod tests {
         assert!(lighter_terminal_reduce_dust_to_min_lot_enabled());
         std::env::set_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "0");
         assert!(!lighter_terminal_reduce_dust_to_min_lot_enabled());
+
+        std::env::remove_var("PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT");
+        assert!(!aster_terminal_reduce_dust_to_min_lot_enabled());
+        std::env::set_var("PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "yes");
+        assert!(aster_terminal_reduce_dust_to_min_lot_enabled());
+        std::env::set_var("PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "false");
+        assert!(!aster_terminal_reduce_dust_to_min_lot_enabled());
     }
 
     #[test]
@@ -31424,6 +31441,10 @@ mod tests {
 
     #[test]
     fn canary_breach_flatten_intents_suppress_aster_below_size_step() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT"]);
+        std::env::remove_var("PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT");
+
         let mut cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
         let aster = 2;
@@ -31432,6 +31453,90 @@ mod tests {
         cfg.venues[aster].size_step_tao = 0.01;
         seed_terminal_flatten_market(&mut state, &[aster]);
         state.venues[aster].position_tao = -0.005;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
+
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_can_reduce_aster_dust_to_min_lot_when_gated() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT"]);
+        std::env::set_var("PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "true");
+
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = 2;
+
+        cfg.venues[aster].lot_size_tao = 0.005;
+        cfg.venues[aster].size_step_tao = 0.01;
+        cfg.venues[aster].max_order_size = 0.01;
+        seed_terminal_flatten_market(&mut state, &[aster]);
+        state.venues[aster].position_tao = -0.007;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
+
+        assert_eq!(intents.len(), 1);
+        let OrderIntent::Place(place) = &intents[0] else {
+            panic!("expected flatten place intent");
+        };
+        assert_eq!(place.venue_index, aster);
+        assert_eq!(place.side, Side::Buy);
+        assert_eq!(place.purpose, OrderPurpose::Exit);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!(!place.post_only);
+        assert!((place.size - 0.01).abs() < 1e-12);
+        assert!(place.phase51_target_key.is_none());
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_can_reduce_positive_aster_dust_to_min_lot_when_gated() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT"]);
+        std::env::set_var("PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "true");
+
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = 2;
+
+        cfg.venues[aster].lot_size_tao = 0.005;
+        cfg.venues[aster].size_step_tao = 0.01;
+        cfg.venues[aster].max_order_size = 0.01;
+        seed_terminal_flatten_market(&mut state, &[aster]);
+        state.venues[aster].position_tao = 0.007;
+
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
+
+        assert_eq!(intents.len(), 1);
+        let OrderIntent::Place(place) = &intents[0] else {
+            panic!("expected flatten place intent");
+        };
+        assert_eq!(place.venue_index, aster);
+        assert_eq!(place.side, Side::Sell);
+        assert_eq!(place.purpose, OrderPurpose::Exit);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!(!place.post_only);
+        assert!((place.size - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_do_not_reduce_aster_dust_above_configured_max() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT"]);
+        std::env::set_var("PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "true");
+
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let aster = 2;
+
+        cfg.venues[aster].lot_size_tao = 0.005;
+        cfg.venues[aster].size_step_tao = 0.01;
+        cfg.venues[aster].max_order_size = 0.005;
+        seed_terminal_flatten_market(&mut state, &[aster]);
+        state.venues[aster].position_tao = -0.007;
 
         let intents = build_canary_breach_flatten_intents(&cfg, &state, &[aster], 78);
 
