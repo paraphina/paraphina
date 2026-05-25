@@ -12741,6 +12741,30 @@ fn canary_exit_position_flatten_fresh_for_all_requested(
         .all(|venue_index| fresh_venues.contains(venue_index))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanaryExitFinalAccountTruthDecision {
+    Clean,
+    Blocked,
+    Residual(Vec<usize>),
+}
+
+fn canary_exit_position_flatten_final_account_truth_decision(
+    requested_venues: &[usize],
+    fresh_venues: &[usize],
+    remaining_venues: Vec<usize>,
+    admission_authorized: bool,
+) -> CanaryExitFinalAccountTruthDecision {
+    if !remaining_venues.is_empty() {
+        return CanaryExitFinalAccountTruthDecision::Residual(remaining_venues);
+    }
+    if admission_authorized
+        && !canary_exit_position_flatten_fresh_for_all_requested(requested_venues, fresh_venues)
+    {
+        return CanaryExitFinalAccountTruthDecision::Blocked;
+    }
+    CanaryExitFinalAccountTruthDecision::Clean
+}
+
 fn mark_canary_exit_position_flatten_incomplete(state: &mut GlobalState) {
     state.kill_switch = true;
     if state.kill_reason == crate::state::KillReason::None {
@@ -12947,6 +12971,66 @@ async fn refresh_canary_exit_position_flatten_account_truth(
     apply.fresh_requested_venues
 }
 
+async fn finalize_canary_exit_position_flatten_account_truth(
+    cfg: &Config,
+    state: &mut GlobalState,
+    account_tx: Option<&mpsc::Sender<LiveAccountRequest>>,
+    cache: &mut LiveStateCache,
+    audit_dir: &std::path::Path,
+    last_account_snapshot_ms: &mut [Option<TimestampMs>],
+    account_state_initialized: &mut [bool],
+    applied_account_position_baselines: &mut [Option<f64>],
+    position_tol_tao: f64,
+    order_snapshot_fill_inference_enabled: bool,
+    tick: u64,
+) -> CanaryExitFinalAccountTruthDecision {
+    let account_truth_check_venues = canary_exit_position_flatten_account_truth_check_venues(cfg);
+    let fresh_venues = refresh_canary_exit_position_flatten_account_truth(
+        cfg,
+        state,
+        account_tx,
+        cache,
+        audit_dir,
+        last_account_snapshot_ms,
+        account_state_initialized,
+        applied_account_position_baselines,
+        &account_truth_check_venues,
+        position_tol_tao,
+        order_snapshot_fill_inference_enabled,
+        tick,
+        "final_check",
+    )
+    .await;
+    let remaining_venues =
+        canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+    match canary_exit_position_flatten_final_account_truth_decision(
+        &account_truth_check_venues,
+        &fresh_venues,
+        remaining_venues,
+        v2_live_canary_admission_authorized(cfg),
+    ) {
+        CanaryExitFinalAccountTruthDecision::Clean => {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh"
+            );
+            CanaryExitFinalAccountTruthDecision::Clean
+        }
+        CanaryExitFinalAccountTruthDecision::Blocked => {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth requested_venues={} fresh_venues={} position_tol_tao={:.6}",
+                venue_ids_for_indices(cfg, &account_truth_check_venues).join(","),
+                venue_ids_for_indices(cfg, &fresh_venues).join(","),
+                position_tol_tao
+            );
+            mark_canary_exit_position_flatten_incomplete(state);
+            CanaryExitFinalAccountTruthDecision::Blocked
+        }
+        CanaryExitFinalAccountTruthDecision::Residual(remaining_venues) => {
+            CanaryExitFinalAccountTruthDecision::Residual(remaining_venues)
+        }
+    }
+}
+
 async fn run_canary_exit_position_flatten_cleanup(
     cfg: &Config,
     state: &mut GlobalState,
@@ -13009,11 +13093,33 @@ async fn run_canary_exit_position_flatten_cleanup(
             }
         }
         if residual_venues.is_empty() {
-            eprintln!(
-                "[runner] canary_exit_position_flatten_cleanup clean_after_account_truth_check attempt={} position_tol_tao={:.6}",
-                attempt, position_tol_tao
-            );
-            return;
+            match finalize_canary_exit_position_flatten_account_truth(
+                cfg,
+                state,
+                account_tx,
+                cache,
+                audit_dir,
+                last_account_snapshot_ms,
+                account_state_initialized,
+                applied_account_position_baselines,
+                position_tol_tao,
+                order_snapshot_fill_inference_enabled,
+                tick.saturating_add(500).saturating_add(attempt as u64),
+            )
+            .await
+            {
+                CanaryExitFinalAccountTruthDecision::Clean => {
+                    eprintln!(
+                        "[runner] canary_exit_position_flatten_cleanup clean_after_account_truth_check attempt={} position_tol_tao={:.6}",
+                        attempt, position_tol_tao
+                    );
+                    return;
+                }
+                CanaryExitFinalAccountTruthDecision::Blocked => return,
+                CanaryExitFinalAccountTruthDecision::Residual(venues) => {
+                    residual_venues = venues;
+                }
+            }
         }
         let _ = refresh_canary_exit_position_flatten_account_truth(
             cfg,
@@ -13031,14 +13137,36 @@ async fn run_canary_exit_position_flatten_cleanup(
             "pre_dispatch",
         )
         .await;
-        let residual_venues =
+        let mut residual_venues =
             canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
         if residual_venues.is_empty() {
-            eprintln!(
-                "[runner] canary_exit_position_flatten_cleanup clean_after_account_refresh attempt={}",
-                attempt
-            );
-            return;
+            match finalize_canary_exit_position_flatten_account_truth(
+                cfg,
+                state,
+                account_tx,
+                cache,
+                audit_dir,
+                last_account_snapshot_ms,
+                account_state_initialized,
+                applied_account_position_baselines,
+                position_tol_tao,
+                order_snapshot_fill_inference_enabled,
+                tick.saturating_add(500).saturating_add(attempt as u64),
+            )
+            .await
+            {
+                CanaryExitFinalAccountTruthDecision::Clean => {
+                    eprintln!(
+                        "[runner] canary_exit_position_flatten_cleanup clean_after_account_refresh attempt={}",
+                        attempt
+                    );
+                    return;
+                }
+                CanaryExitFinalAccountTruthDecision::Blocked => return,
+                CanaryExitFinalAccountTruthDecision::Residual(venues) => {
+                    residual_venues = venues;
+                }
+            }
         }
         let target_venues = canary_exit_position_flatten_venues(cfg, state, position_tol_tao);
         if target_venues.is_empty() {
@@ -13200,11 +13328,33 @@ async fn run_canary_exit_position_flatten_cleanup(
             }
         }
         if remaining_venues.is_empty() {
-            eprintln!(
-                "[runner] canary_exit_position_flatten_cleanup clean_after_dispatch_account_truth_check attempt={}",
-                attempt
-            );
-            return;
+            match finalize_canary_exit_position_flatten_account_truth(
+                cfg,
+                state,
+                account_tx,
+                cache,
+                audit_dir,
+                last_account_snapshot_ms,
+                account_state_initialized,
+                applied_account_position_baselines,
+                position_tol_tao,
+                order_snapshot_fill_inference_enabled,
+                tick.saturating_add(500).saturating_add(attempt as u64),
+            )
+            .await
+            {
+                CanaryExitFinalAccountTruthDecision::Clean => {
+                    eprintln!(
+                        "[runner] canary_exit_position_flatten_cleanup clean_after_dispatch_account_truth_check attempt={}",
+                        attempt
+                    );
+                    return;
+                }
+                CanaryExitFinalAccountTruthDecision::Blocked => return,
+                CanaryExitFinalAccountTruthDecision::Residual(venues) => {
+                    remaining_venues = venues;
+                }
+            }
         }
         let _ = refresh_canary_exit_position_flatten_account_truth(
             cfg,
@@ -13222,21 +13372,42 @@ async fn run_canary_exit_position_flatten_cleanup(
             "post_dispatch",
         )
         .await;
-        let remaining_venues =
+        let mut remaining_venues =
             canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
         if remaining_venues.is_empty() {
-            eprintln!(
-                "[runner] canary_exit_position_flatten_cleanup clean_after_account_refresh attempt={}",
-                attempt
-            );
-            return;
+            match finalize_canary_exit_position_flatten_account_truth(
+                cfg,
+                state,
+                account_tx,
+                cache,
+                audit_dir,
+                last_account_snapshot_ms,
+                account_state_initialized,
+                applied_account_position_baselines,
+                position_tol_tao,
+                order_snapshot_fill_inference_enabled,
+                tick.saturating_add(500).saturating_add(attempt as u64),
+            )
+            .await
+            {
+                CanaryExitFinalAccountTruthDecision::Clean => {
+                    eprintln!(
+                        "[runner] canary_exit_position_flatten_cleanup clean_after_account_refresh attempt={}",
+                        attempt
+                    );
+                    return;
+                }
+                CanaryExitFinalAccountTruthDecision::Blocked => return,
+                CanaryExitFinalAccountTruthDecision::Residual(venues) => {
+                    remaining_venues = venues;
+                }
+            }
         }
         if settle_ms > 0 && attempt < attempts {
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
         }
     }
-    let account_truth_check_venues = canary_exit_position_flatten_account_truth_check_venues(cfg);
-    let fresh_venues = refresh_canary_exit_position_flatten_account_truth(
+    match finalize_canary_exit_position_flatten_account_truth(
         cfg,
         state,
         account_tx,
@@ -13245,43 +13416,23 @@ async fn run_canary_exit_position_flatten_cleanup(
         last_account_snapshot_ms,
         account_state_initialized,
         applied_account_position_baselines,
-        &account_truth_check_venues,
         position_tol_tao,
         order_snapshot_fill_inference_enabled,
         tick.saturating_add(500),
-        "final_check",
     )
-    .await;
-    let remaining_venues =
-        canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
-    if remaining_venues.is_empty()
-        && v2_live_canary_admission_authorized(cfg)
-        && !canary_exit_position_flatten_fresh_for_all_requested(
-            &account_truth_check_venues,
-            &fresh_venues,
-        )
+    .await
     {
-        eprintln!(
-            "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth requested_venues={} fresh_venues={} position_tol_tao={:.6}",
-            venue_ids_for_indices(cfg, &account_truth_check_venues).join(","),
-            venue_ids_for_indices(cfg, &fresh_venues).join(","),
-            position_tol_tao
-        );
-        mark_canary_exit_position_flatten_incomplete(state);
-        return;
+        CanaryExitFinalAccountTruthDecision::Clean
+        | CanaryExitFinalAccountTruthDecision::Blocked => {}
+        CanaryExitFinalAccountTruthDecision::Residual(remaining_venues) => {
+            eprintln!(
+                "[runner] canary_exit_position_flatten_cleanup incomplete residual_venues={} position_tol_tao={:.6}",
+                venue_ids_for_indices(cfg, &remaining_venues).join(","),
+                position_tol_tao
+            );
+            mark_canary_exit_position_flatten_incomplete(state);
+        }
     }
-    if remaining_venues.is_empty() {
-        eprintln!(
-            "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh"
-        );
-        return;
-    }
-    eprintln!(
-        "[runner] canary_exit_position_flatten_cleanup incomplete residual_venues={} position_tol_tao={:.6}",
-        venue_ids_for_indices(cfg, &remaining_venues).join(","),
-        position_tol_tao
-    );
-    mark_canary_exit_position_flatten_incomplete(state);
 }
 
 fn canary_exit_cancel_all_sweep_all_venues_enabled() -> bool {
@@ -30871,6 +31022,48 @@ mod tests {
             &requested,
             &[3]
         ));
+    }
+
+    #[test]
+    fn v2_ranked_execution_final_account_truth_decision_requires_fresh_all_requested_when_clean() {
+        let requested = vec![2, 3];
+
+        assert_eq!(
+            canary_exit_position_flatten_final_account_truth_decision(
+                &requested,
+                &[2, 3],
+                Vec::new(),
+                true,
+            ),
+            CanaryExitFinalAccountTruthDecision::Clean
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_truth_decision(
+                &requested,
+                &[3],
+                Vec::new(),
+                true,
+            ),
+            CanaryExitFinalAccountTruthDecision::Blocked
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_truth_decision(
+                &requested,
+                &[2, 3],
+                vec![3],
+                true,
+            ),
+            CanaryExitFinalAccountTruthDecision::Residual(vec![3])
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_truth_decision(
+                &requested,
+                &[3],
+                Vec::new(),
+                false,
+            ),
+            CanaryExitFinalAccountTruthDecision::Clean
+        );
     }
 
     #[test]
