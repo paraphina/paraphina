@@ -23,6 +23,12 @@ class TerminalFlatnessGateError(ValueError):
     pass
 
 
+STRICT_TERMINAL_POSITION_TOL_BASE = 0.0025
+VENUE_TERMINAL_DUST_TOLERANCE_BASE = {
+    "lighter": 0.005,
+}
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -497,6 +503,12 @@ def _venue_map(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return mapped
 
 
+def _safe_strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 def evaluate_terminal_flatness(
     *,
     venue_audit_path: Path,
@@ -568,7 +580,10 @@ def evaluate_terminal_flatness(
         direct_venue_reasons.append("venue_audit_missing_position_tolerance")
     elif abs(audit_tol - position_tol_base) > 1e-12:
         direct_venue_reasons.append("venue_audit_position_tolerance_mismatch")
+    if position_tol_base > STRICT_TERMINAL_POSITION_TOL_BASE + 1e-12:
+        direct_venue_reasons.append("position_tolerance_exceeds_strict_terminal_flatness")
 
+    terminal_dust_venues: list[dict[str, Any]] = []
     for venue in expected:
         result = observed.get(venue)
         if result is None:
@@ -601,6 +616,36 @@ def evaluate_terminal_flatness(
         elif open_orders != 0:
             row_reasons.append("open_orders_present")
 
+        dust_tolerance = VENUE_TERMINAL_DUST_TOLERANCE_BASE.get(venue)
+        dust_candidate = False
+        if (
+            dust_tolerance is not None
+            and position is not None
+            and abs(position) > STRICT_TERMINAL_POSITION_TOL_BASE + 1e-12
+            and abs(position) <= dust_tolerance + 1e-12
+            and open_orders_known
+            and open_orders == 0
+            and not _safe_strings(result.get("errors"))
+        ):
+            result_violations = _safe_strings(result.get("violations"))
+            only_position_violation = not result_violations or all(
+                "position_base" in violation for violation in result_violations
+            )
+            dust_candidate = only_position_violation
+            if dust_candidate:
+                terminal_dust_venues.append(
+                    {
+                        "venue": venue,
+                        "market": result.get("market"),
+                        "position_abs": abs(position),
+                        "strict_position_tol_base": STRICT_TERMINAL_POSITION_TOL_BASE,
+                        "terminal_dust_tolerance_base": dust_tolerance,
+                        "open_order_count": open_orders,
+                        "open_order_count_known": open_orders_known,
+                        "status": "DUST_HOLD",
+                    }
+                )
+
         if row_reasons:
             direct_venue_reasons.extend(f"{venue}:{reason}" for reason in row_reasons)
         venue_rows.append(
@@ -612,6 +657,7 @@ def evaluate_terminal_flatness(
                 "open_order_count_known": open_orders_known,
                 "gate_status": "PASS" if not row_reasons else "HOLD",
                 "reasons": row_reasons,
+                "terminal_dust_candidate": dust_candidate,
             }
         )
 
@@ -692,6 +738,7 @@ def evaluate_terminal_flatness(
     direct_audit_superseded_final_account_truth = cleanup_report[
         "final_account_truth_direct_venue_audit_superseded"
     ]
+    terminal_dust_status = "DUST_HOLD" if terminal_dust_venues else "NOT_APPLICABLE"
     return {
         "artifact_type": "v2_live_canary_terminal_flatness_gate",
         "schema_version": 1,
@@ -706,6 +753,13 @@ def evaluate_terminal_flatness(
             **binding_meta,
         },
         "terminal_cleanup": cleanup_report,
+        "terminal_dust": {
+            "status": terminal_dust_status,
+            "accepted_as_flat": False,
+            "candidate_venues": terminal_dust_venues,
+            "strict_position_tol_base": STRICT_TERMINAL_POSITION_TOL_BASE,
+            "venue_terminal_dust_tolerance_base": VENUE_TERMINAL_DUST_TOLERANCE_BASE,
+        },
         "run_completion": completion_report,
         "closeout_status": {
             "direct_venue_audit_status": direct_venue_status,

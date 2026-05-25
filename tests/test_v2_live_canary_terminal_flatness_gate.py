@@ -108,6 +108,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         min_run_duration_ms: int | None = None,
         promotion_cleanup_strict: bool = False,
         order_path_coverages: list[dict] | None = None,
+        position_tol_base: float = 0.0025,
     ):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -155,7 +156,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             return gate.evaluate_terminal_flatness(
                 venue_audit_path=audit,
                 expected_venues=EXPECTED,
-                position_tol_base=0.0025,
+                position_tol_base=position_tol_base,
                 canary_manifest_path=canary_manifest,
                 run_token=run_token,
                 audit_captured_after_run=audit_captured_after_run,
@@ -199,6 +200,113 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
 
         self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
         self.assertIn("lighter:position_base_not_flat", report["terminal_flatness_gate_reasons"])
+
+    def test_lighter_sub_lot_residual_is_terminal_dust_hold_not_promotion(self):
+        data = audit_doc(
+            ok=False,
+            results=[
+                venue_result("hyperliquid"),
+                venue_result(
+                    "lighter",
+                    position=-0.004,
+                    ok=False,
+                )
+                | {"violations": ["abs(position_base)=0.00400000 > 0.00250000"]},
+                venue_result("extended"),
+                venue_result("aster"),
+                venue_result("paradex"),
+            ],
+            violations=["lighter: abs(position_base)=0.00400000 > 0.00250000"],
+        )
+
+        report = self.evaluate(data)
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertEqual(report["terminal_dust"]["status"], "DUST_HOLD")
+        self.assertFalse(report["terminal_dust"]["accepted_as_flat"])
+        self.assertEqual(report["terminal_dust"]["candidate_venues"][0]["venue"], "lighter")
+        self.assertEqual(
+            report["terminal_dust"]["candidate_venues"][0]["terminal_dust_tolerance_base"],
+            0.005,
+        )
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+        self.assertFalse(report["governance"]["approved_for_promotion"])
+
+    def test_lighter_dust_with_open_order_is_not_dust_candidate(self):
+        data = audit_doc(
+            ok=False,
+            results=[
+                venue_result("hyperliquid"),
+                venue_result("lighter", position=-0.004, open_orders=1, ok=False),
+                venue_result("extended"),
+                venue_result("aster"),
+                venue_result("paradex"),
+            ],
+        )
+
+        report = self.evaluate(data)
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertEqual(report["terminal_dust"]["status"], "NOT_APPLICABLE")
+        self.assertIn("lighter:open_orders_present", report["terminal_flatness_gate_reasons"])
+
+    def test_lighter_above_dust_tolerance_is_not_dust_candidate(self):
+        data = audit_doc(
+            ok=False,
+            results=[
+                venue_result("hyperliquid"),
+                venue_result("lighter", position=-0.006, ok=False),
+                venue_result("extended"),
+                venue_result("aster"),
+                venue_result("paradex"),
+            ],
+        )
+
+        report = self.evaluate(data)
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertEqual(report["terminal_dust"]["status"], "NOT_APPLICABLE")
+        self.assertIn("lighter:position_base_not_flat", report["terminal_flatness_gate_reasons"])
+
+    def test_non_lighter_residual_is_not_dust_candidate(self):
+        data = audit_doc(
+            ok=False,
+            results=[
+                venue_result("hyperliquid"),
+                venue_result("lighter"),
+                venue_result("extended", position=-0.004, ok=False),
+                venue_result("aster"),
+                venue_result("paradex"),
+            ],
+        )
+
+        report = self.evaluate(data)
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertEqual(report["terminal_dust"]["status"], "NOT_APPLICABLE")
+        self.assertIn("extended:position_base_not_flat", report["terminal_flatness_gate_reasons"])
+
+    def test_widened_position_tolerance_cannot_silently_clear_lighter_dust(self):
+        data = audit_doc(
+            position_tol_base=0.005,
+            results=[
+                venue_result("hyperliquid"),
+                venue_result("lighter", position=-0.004, ok=True),
+                venue_result("extended"),
+                venue_result("aster"),
+                venue_result("paradex"),
+            ],
+        )
+
+        report = self.evaluate(data, position_tol_base=0.005)
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "position_tolerance_exceeds_strict_terminal_flatness",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertEqual(report["terminal_dust"]["status"], "DUST_HOLD")
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
 
     def test_open_order_holds(self):
         data = audit_doc(
