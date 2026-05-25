@@ -10305,7 +10305,9 @@ fn build_canary_breach_flatten_intents(
         if venue.status != VenueStatus::Healthy {
             continue;
         }
-        let min_order_size = if venue_cfg.id.eq_ignore_ascii_case("aster") {
+        let min_order_size = if venue_cfg.id.eq_ignore_ascii_case("aster")
+            || venue_cfg.id.eq_ignore_ascii_case("lighter")
+        {
             venue_min_executable_order_size_tao(venue_cfg)
         } else {
             venue_cfg.lot_size_tao.max(1e-9)
@@ -32237,6 +32239,39 @@ mod tests {
 
         seed_terminal_flatten_market(&mut state, &[lighter]);
         state.venues[lighter].position_tao = -0.0007;
+
+        let targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0001);
+        assert_eq!(targets, vec![lighter]);
+        let intents = build_canary_breach_flatten_intents(&cfg, &state, &targets, 78);
+
+        assert_eq!(intents.len(), 1);
+        let OrderIntent::Place(place) = &intents[0] else {
+            panic!("expected flatten place intent");
+        };
+        assert_eq!(place.venue_index, lighter);
+        assert_eq!(place.side, Side::Buy);
+        assert_eq!(place.purpose, OrderPurpose::Exit);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!(!place.post_only);
+        assert!((place.size - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn canary_breach_flatten_intents_use_lighter_size_step_for_dust_minimum() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&["PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT"]);
+        std::env::set_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", "true");
+
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let lighter = 3;
+
+        cfg.venues[lighter].lot_size_tao = 0.005;
+        cfg.venues[lighter].size_step_tao = 0.01;
+        cfg.venues[lighter].max_order_size = 0.01;
+        seed_terminal_flatten_market(&mut state, &[lighter]);
+        state.venues[lighter].position_tao = -0.004;
 
         let targets = canary_exit_position_flatten_venues(&cfg, &state, 0.0001);
         assert_eq!(targets, vec![lighter]);
