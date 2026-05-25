@@ -305,6 +305,28 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             "terminal_cleanup_account_truth_blocked",
             report["terminal_flatness_gate_reasons"],
         )
+        self.assertEqual(report["closeout_status"]["direct_venue_audit_status"], "PASS")
+        self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "HOLD")
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+
+    def test_promotion_cleanup_strict_splits_direct_audit_from_cleanup_hold(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=post_dispatch venue=paradex account_ok=true account_available=false\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertEqual(report["closeout_status"]["direct_venue_audit_status"], "PASS")
+        self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "HOLD")
+        self.assertEqual(report["closeout_status"]["run_binding_status"], "PASS")
+        self.assertIn(
+            "terminal_cleanup_account_refresh_not_fresh",
+            report["closeout_status"]["promotion_cleanup_strict_reasons"],
+        )
 
     def test_promotion_cleanup_strict_requires_cleanup_log(self):
         report = self.evaluate(audit_doc(), promotion_cleanup_strict=True)

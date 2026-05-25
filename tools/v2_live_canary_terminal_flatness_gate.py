@@ -238,24 +238,25 @@ def evaluate_terminal_flatness(
         promotion_cleanup_strict=promotion_cleanup_strict,
     )
     reasons.extend(cleanup_reasons)
+    direct_venue_reasons: list[str] = []
 
     if data.get("ok") is not True:
-        reasons.append("venue_audit_not_ok")
+        direct_venue_reasons.append("venue_audit_not_ok")
     if _as_int(data.get("max_open_orders")) != 0:
-        reasons.append("venue_audit_max_open_orders_not_zero")
+        direct_venue_reasons.append("venue_audit_max_open_orders_not_zero")
     if data.get("allow_unknown_open_orders") is True:
-        reasons.append("venue_audit_allows_unknown_open_orders")
+        direct_venue_reasons.append("venue_audit_allows_unknown_open_orders")
 
     audit_tol = _as_float(data.get("position_tol_base"))
     if audit_tol is None:
-        reasons.append("venue_audit_missing_position_tolerance")
+        direct_venue_reasons.append("venue_audit_missing_position_tolerance")
     elif abs(audit_tol - position_tol_base) > 1e-12:
-        reasons.append("venue_audit_position_tolerance_mismatch")
+        direct_venue_reasons.append("venue_audit_position_tolerance_mismatch")
 
     for venue in expected:
         result = observed.get(venue)
         if result is None:
-            reasons.append(f"{venue}:missing_venue_result")
+            direct_venue_reasons.append(f"{venue}:missing_venue_result")
             venue_rows.append(
                 {
                     "venue": venue,
@@ -285,7 +286,7 @@ def evaluate_terminal_flatness(
             row_reasons.append("open_orders_present")
 
         if row_reasons:
-            reasons.extend(f"{venue}:{reason}" for reason in row_reasons)
+            direct_venue_reasons.extend(f"{venue}:{reason}" for reason in row_reasons)
         venue_rows.append(
             {
                 "venue": venue,
@@ -298,6 +299,10 @@ def evaluate_terminal_flatness(
             }
         )
 
+    reasons.extend(direct_venue_reasons)
+    direct_venue_status = "PASS" if not direct_venue_reasons else "HOLD"
+    run_binding_status = "PASS" if not binding_reasons else "HOLD"
+    promotion_cleanup_strict_status = "PASS" if not cleanup_reasons else "HOLD"
     status = "PASS" if not reasons else "HOLD"
     return {
         "artifact_type": "v2_live_canary_terminal_flatness_gate",
@@ -313,6 +318,15 @@ def evaluate_terminal_flatness(
             **binding_meta,
         },
         "terminal_cleanup": cleanup_report,
+        "closeout_status": {
+            "direct_venue_audit_status": direct_venue_status,
+            "direct_venue_audit_reasons": direct_venue_reasons,
+            "promotion_cleanup_strict_status": promotion_cleanup_strict_status,
+            "promotion_cleanup_strict_reasons": cleanup_reasons,
+            "run_binding_status": run_binding_status,
+            "run_binding_reasons": binding_reasons,
+            "promotion_ready": status == "PASS",
+        },
         "governance": {
             "approved_for_promotion": False,
             "approved_for_live": False,

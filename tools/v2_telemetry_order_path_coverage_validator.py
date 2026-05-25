@@ -64,6 +64,9 @@ class CoverageCounts:
     target_would_send_cancels: int = 0
     non_target_place_intents: int = 0
     non_target_would_send_places: int = 0
+    non_target_reduce_only_ioc_place_intents: int = 0
+    non_target_place_intents_by_purpose: dict[str, int] = field(default_factory=dict)
+    non_target_would_send_places_by_purpose: dict[str, int] = field(default_factory=dict)
     max_place_size: float | None = None
     place_intent_sides: set[str] = field(default_factory=set)
     observed_order_statuses: set[str] = field(default_factory=set)
@@ -83,6 +86,13 @@ class CoverageCounts:
             "target_would_send_cancels": self.target_would_send_cancels,
             "non_target_place_intents": self.non_target_place_intents,
             "non_target_would_send_places": self.non_target_would_send_places,
+            "non_target_reduce_only_ioc_place_intents": self.non_target_reduce_only_ioc_place_intents,
+            "non_target_place_intents_by_purpose": dict(
+                sorted(self.non_target_place_intents_by_purpose.items())
+            ),
+            "non_target_would_send_places_by_purpose": dict(
+                sorted(self.non_target_would_send_places_by_purpose.items())
+            ),
             "max_place_size": self.max_place_size,
             "place_intent_sides": sorted(self.place_intent_sides),
             "observed_order_statuses": sorted(self.observed_order_statuses),
@@ -195,7 +205,17 @@ def _load_telemetry_counts(path: Path, target_venue: str, max_order_size: float 
                     counts.target_replace_events += 1
                 if action == "place" and status == "intent":
                     if not is_mm_order:
+                        purpose_label = purpose or "unknown"
                         counts.non_target_place_intents += 1
+                        counts.non_target_place_intents_by_purpose[purpose_label] = (
+                            counts.non_target_place_intents_by_purpose.get(purpose_label, 0) + 1
+                        )
+                        if (
+                            str(order.get("tif", "")).lower() == "ioc"
+                            and order.get("post_only") is False
+                            and order.get("reduce_only") is True
+                        ):
+                            counts.non_target_reduce_only_ioc_place_intents += 1
                         continue
                     counts.target_place_intents += 1
                     side = order.get("side")
@@ -230,7 +250,12 @@ def _load_telemetry_counts(path: Path, target_venue: str, max_order_size: float 
                     if purpose == "mm":
                         counts.target_would_send_places += 1
                     else:
+                        purpose_label = purpose or "unknown"
                         counts.non_target_would_send_places += 1
+                        counts.non_target_would_send_places_by_purpose[purpose_label] = (
+                            counts.non_target_would_send_places_by_purpose.get(purpose_label, 0)
+                            + 1
+                        )
                 elif action == "cancel":
                     counts.target_would_send_cancels += 1
                 elif action == "replace":

@@ -200,6 +200,12 @@ class TestV2TelemetryOrderPathCoverageValidator(unittest.TestCase):
         self.assertEqual(report["coverage"]["target_place_intents"], 1)
         self.assertEqual(report["coverage"]["non_target_place_intents"], 1)
         self.assertEqual(report["coverage"]["non_target_would_send_places"], 1)
+        self.assertEqual(report["coverage"]["non_target_reduce_only_ioc_place_intents"], 1)
+        self.assertEqual(report["coverage"]["non_target_place_intents_by_purpose"], {"hedge": 1})
+        self.assertEqual(
+            report["coverage"]["non_target_would_send_places_by_purpose"],
+            {"hedge": 1},
+        )
         self.assertEqual(report["coverage"]["max_place_size"], 0.01)
 
     def test_mm_place_size_exceeds_limit_holds(self):
