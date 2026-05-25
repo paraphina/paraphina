@@ -91,7 +91,13 @@ def telemetry_rows(**order_overrides):
             "schema_version": 1,
             "t": 2,
             "orders": [
-                {"venue_id": "paradex", "action": "place", "status": "ack", "size": 0.01},
+                {
+                    "venue_id": "paradex",
+                    "action": "place",
+                    "status": "ack",
+                    "purpose": "Mm",
+                    "size": 0.01,
+                },
                 {"venue_id": "paradex", "action": "cancel", "status": "intent"},
             ],
             "fills": [],
@@ -170,6 +176,37 @@ class TestV2TelemetryOrderPathCoverageValidator(unittest.TestCase):
 
         self.assertEqual(report["validation_status"], "HOLD")
         self.assertIn("target_place_policy_not_strict_post_only_gtc", report["validation_reasons"])
+
+    def test_non_mm_reduce_only_place_intent_is_not_target_mm_coverage(self):
+        rows = telemetry_rows()
+        rows[0]["orders"].append(
+            {
+                "venue_id": "paradex",
+                "action": "place",
+                "status": "intent",
+                "side": "Sell",
+                "purpose": "Hedge",
+                "post_only": False,
+                "reduce_only": True,
+                "tif": "Ioc",
+                "size": 0.02,
+            }
+        )
+        rows[0]["would_send_orders"].append(rows[0]["orders"][-1])
+
+        report = self.evaluate(telemetry=rows)
+
+        self.assertEqual(report["validation_status"], "PASS")
+        self.assertEqual(report["coverage"]["target_place_intents"], 1)
+        self.assertEqual(report["coverage"]["non_target_place_intents"], 1)
+        self.assertEqual(report["coverage"]["non_target_would_send_places"], 1)
+        self.assertEqual(report["coverage"]["max_place_size"], 0.01)
+
+    def test_mm_place_size_exceeds_limit_holds(self):
+        report = self.evaluate(telemetry=telemetry_rows(size=0.02))
+
+        self.assertEqual(report["validation_status"], "HOLD")
+        self.assertIn("target_place_size_exceeds_limit", report["validation_reasons"])
 
     def test_missing_ack_holds(self):
         rows = [{"schema_version": 1, "t": 1, "orders": [telemetry_rows()[0]["orders"][0]], "fills": []}]
