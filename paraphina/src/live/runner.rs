@@ -12635,6 +12635,24 @@ fn canary_exit_position_flatten_timeout_ms() -> u64 {
         .clamp(1_000, 30_000)
 }
 
+fn canary_exit_position_flatten_final_account_refresh_attempts() -> u32 {
+    parse_optional_positive_i64_env(
+        "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_FINAL_ACCOUNT_REFRESH_ATTEMPTS",
+    )
+    .map(|value| value as u32)
+    .unwrap_or(1)
+    .clamp(1, 5)
+}
+
+fn canary_exit_position_flatten_final_account_refresh_retry_settle_ms() -> u64 {
+    parse_optional_positive_i64_env(
+        "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_FINAL_ACCOUNT_REFRESH_RETRY_SETTLE_MS",
+    )
+    .map(|value| value as u64)
+    .unwrap_or(250)
+    .clamp(1, 5_000)
+}
+
 fn lighter_terminal_reduce_dust_to_min_lot_enabled() -> bool {
     parse_bool_env_default("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT", false)
 }
@@ -12739,6 +12757,73 @@ fn canary_exit_position_flatten_fresh_for_all_requested(
     requested_venues
         .iter()
         .all(|venue_index| fresh_venues.contains(venue_index))
+}
+
+fn canary_exit_position_flatten_missing_fresh_venues(
+    requested_venues: &[usize],
+    fresh_venues: &[usize],
+) -> Vec<usize> {
+    requested_venues
+        .iter()
+        .copied()
+        .filter(|venue_index| !fresh_venues.contains(venue_index))
+        .collect()
+}
+
+fn canary_exit_position_flatten_merge_fresh_venues(
+    fresh_venues: &mut Vec<usize>,
+    newly_fresh_venues: &[usize],
+) {
+    for venue_index in newly_fresh_venues {
+        if !fresh_venues.contains(venue_index) {
+            fresh_venues.push(*venue_index);
+        }
+    }
+}
+
+fn canary_exit_position_flatten_final_account_refresh_request_venues(
+    requested_venues: &[usize],
+    fresh_venues: &[usize],
+    attempt: u32,
+    attempts: u32,
+) -> Vec<usize> {
+    if attempt <= 1 || attempt >= attempts {
+        return requested_venues.to_vec();
+    }
+    let missing_venues =
+        canary_exit_position_flatten_missing_fresh_venues(requested_venues, fresh_venues);
+    if missing_venues.is_empty() {
+        requested_venues.to_vec()
+    } else {
+        missing_venues
+    }
+}
+
+fn canary_exit_position_flatten_record_final_account_refresh(
+    requested_venues: &[usize],
+    request_venues: &[usize],
+    fresh_venues: &mut Vec<usize>,
+    newly_fresh_venues: &[usize],
+    attempt: u32,
+    attempts: u32,
+) {
+    if attempt >= attempts
+        || canary_exit_position_flatten_final_account_refresh_can_return_clean(
+            requested_venues,
+            request_venues,
+        )
+    {
+        *fresh_venues = newly_fresh_venues.to_vec();
+    } else {
+        canary_exit_position_flatten_merge_fresh_venues(fresh_venues, newly_fresh_venues);
+    }
+}
+
+fn canary_exit_position_flatten_final_account_refresh_can_return_clean(
+    requested_venues: &[usize],
+    request_venues: &[usize],
+) -> bool {
+    canary_exit_position_flatten_fresh_for_all_requested(requested_venues, request_venues)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12985,22 +13070,108 @@ async fn finalize_canary_exit_position_flatten_account_truth(
     tick: u64,
 ) -> CanaryExitFinalAccountTruthDecision {
     let account_truth_check_venues = canary_exit_position_flatten_account_truth_check_venues(cfg);
-    let fresh_venues = refresh_canary_exit_position_flatten_account_truth(
-        cfg,
-        state,
-        account_tx,
-        cache,
-        audit_dir,
-        last_account_snapshot_ms,
-        account_state_initialized,
-        applied_account_position_baselines,
-        &account_truth_check_venues,
-        position_tol_tao,
-        order_snapshot_fill_inference_enabled,
-        tick,
-        "final_check",
-    )
-    .await;
+    let attempts = canary_exit_position_flatten_final_account_refresh_attempts();
+    let retry_settle_ms = canary_exit_position_flatten_final_account_refresh_retry_settle_ms();
+    let mut fresh_venues: Vec<usize> = Vec::new();
+    for attempt in 1..=attempts {
+        let request_venues = canary_exit_position_flatten_final_account_refresh_request_venues(
+            &account_truth_check_venues,
+            &fresh_venues,
+            attempt,
+            attempts,
+        );
+        if request_venues.is_empty() {
+            break;
+        }
+        let newly_fresh_venues = refresh_canary_exit_position_flatten_account_truth(
+            cfg,
+            state,
+            account_tx,
+            cache,
+            audit_dir,
+            last_account_snapshot_ms,
+            account_state_initialized,
+            applied_account_position_baselines,
+            &request_venues,
+            position_tol_tao,
+            order_snapshot_fill_inference_enabled,
+            tick.saturating_add(attempt as u64).saturating_sub(1),
+            "final_check",
+        )
+        .await;
+        canary_exit_position_flatten_record_final_account_refresh(
+            &account_truth_check_venues,
+            &request_venues,
+            &mut fresh_venues,
+            &newly_fresh_venues,
+            attempt,
+            attempts,
+        );
+        let remaining_venues =
+            canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+        match canary_exit_position_flatten_final_account_truth_decision(
+            &account_truth_check_venues,
+            &fresh_venues,
+            remaining_venues,
+            v2_live_canary_admission_authorized(cfg),
+        ) {
+            CanaryExitFinalAccountTruthDecision::Clean => {
+                if attempt < attempts
+                    && !canary_exit_position_flatten_final_account_refresh_can_return_clean(
+                        &account_truth_check_venues,
+                        &request_venues,
+                    )
+                {
+                    eprintln!(
+                        "[runner] canary_exit_position_flatten_cleanup final_account_truth_retry attempt={} requested_venues={} fresh_venues={} missing_venues= retry_settle_ms={}",
+                        attempt,
+                        venue_ids_for_indices(cfg, &account_truth_check_venues).join(","),
+                        venue_ids_for_indices(cfg, &fresh_venues).join(","),
+                        retry_settle_ms
+                    );
+                    if retry_settle_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(retry_settle_ms)).await;
+                    }
+                    continue;
+                }
+                eprintln!(
+                    "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh"
+                );
+                return CanaryExitFinalAccountTruthDecision::Clean;
+            }
+            CanaryExitFinalAccountTruthDecision::Blocked => {
+                if attempt < attempts {
+                    let missing_venues = canary_exit_position_flatten_missing_fresh_venues(
+                        &account_truth_check_venues,
+                        &fresh_venues,
+                    );
+                    eprintln!(
+                        "[runner] canary_exit_position_flatten_cleanup final_account_truth_retry attempt={} requested_venues={} fresh_venues={} missing_venues={} retry_settle_ms={}",
+                        attempt,
+                        venue_ids_for_indices(cfg, &account_truth_check_venues).join(","),
+                        venue_ids_for_indices(cfg, &fresh_venues).join(","),
+                        venue_ids_for_indices(cfg, &missing_venues).join(","),
+                        retry_settle_ms
+                    );
+                    if retry_settle_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(retry_settle_ms)).await;
+                    }
+                    continue;
+                }
+                eprintln!(
+                    "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth requested_venues={} fresh_venues={} position_tol_tao={:.6}",
+                    venue_ids_for_indices(cfg, &account_truth_check_venues).join(","),
+                    venue_ids_for_indices(cfg, &fresh_venues).join(","),
+                    position_tol_tao
+                );
+                mark_canary_exit_position_flatten_incomplete(state);
+                return CanaryExitFinalAccountTruthDecision::Blocked;
+            }
+            CanaryExitFinalAccountTruthDecision::Residual(remaining_venues) => {
+                return CanaryExitFinalAccountTruthDecision::Residual(remaining_venues);
+            }
+        }
+    }
     let remaining_venues =
         canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
     match canary_exit_position_flatten_final_account_truth_decision(
@@ -30035,6 +30206,8 @@ mod tests {
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS",
             "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TIMEOUT_MS",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_FINAL_ACCOUNT_REFRESH_ATTEMPTS",
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_FINAL_ACCOUNT_REFRESH_RETRY_SETTLE_MS",
             "PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT",
             "PARAPHINA_ASTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT",
         ]);
@@ -30079,18 +30252,58 @@ mod tests {
         assert_eq!(canary_exit_position_flatten_attempts(), 3);
         assert_eq!(canary_exit_position_flatten_settle_ms(), 1_000);
         assert_eq!(canary_exit_position_flatten_timeout_ms(), 10_000);
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_attempts(),
+            1
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_retry_settle_ms(),
+            250
+        );
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "0");
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_SETTLE_MS", "20000");
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TIMEOUT_MS", "40000");
+        std::env::set_var(
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_FINAL_ACCOUNT_REFRESH_ATTEMPTS",
+            "10",
+        );
+        std::env::set_var(
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_FINAL_ACCOUNT_REFRESH_RETRY_SETTLE_MS",
+            "20000",
+        );
         assert_eq!(canary_exit_position_flatten_attempts(), 3);
         assert_eq!(canary_exit_position_flatten_settle_ms(), 10_000);
         assert_eq!(canary_exit_position_flatten_timeout_ms(), 30_000);
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_attempts(),
+            5
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_retry_settle_ms(),
+            5_000
+        );
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_TIMEOUT_MS", "250");
         assert_eq!(canary_exit_position_flatten_timeout_ms(), 1_000);
+        std::env::set_var(
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_FINAL_ACCOUNT_REFRESH_RETRY_SETTLE_MS",
+            "0",
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_retry_settle_ms(),
+            250
+        );
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "9");
         assert_eq!(canary_exit_position_flatten_attempts(), 5);
         std::env::set_var("PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_ATTEMPTS", "1");
         assert_eq!(canary_exit_position_flatten_attempts(), 1);
+        std::env::set_var(
+            "PARAPHINA_CANARY_EXIT_POSITION_FLATTEN_FINAL_ACCOUNT_REFRESH_ATTEMPTS",
+            "1",
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_attempts(),
+            1
+        );
 
         std::env::remove_var("PARAPHINA_LIGHTER_TERMINAL_REDUCE_DUST_TO_MIN_LOT");
         assert!(!lighter_terminal_reduce_dust_to_min_lot_enabled());
@@ -31040,6 +31253,77 @@ mod tests {
             &requested,
             &[3]
         ));
+        assert_eq!(
+            canary_exit_position_flatten_missing_fresh_venues(&requested, &[3]),
+            vec![2]
+        );
+        let mut fresh = vec![3];
+        canary_exit_position_flatten_merge_fresh_venues(&mut fresh, &[2, 3]);
+        assert_eq!(fresh, vec![3, 2]);
+        assert!(canary_exit_position_flatten_fresh_for_all_requested(
+            &requested, &fresh
+        ));
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_request_venues(
+                &requested, &fresh, 2, 3,
+            ),
+            requested,
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_request_venues(
+                &requested, &fresh, 3, 5,
+            ),
+            requested,
+            "a complete intermediate aggregate must force an all-venue refresh before it can clean",
+        );
+        assert!(
+            !canary_exit_position_flatten_final_account_refresh_can_return_clean(&requested, &[2],)
+        );
+        assert!(
+            canary_exit_position_flatten_final_account_refresh_can_return_clean(
+                &requested,
+                &[2, 3],
+            )
+        );
+        assert_eq!(
+            canary_exit_position_flatten_final_account_refresh_request_venues(
+                &requested, &fresh, 3, 3,
+            ),
+            requested
+        );
+        canary_exit_position_flatten_record_final_account_refresh(
+            &requested,
+            &requested,
+            &mut fresh,
+            &[3],
+            3,
+            3,
+        );
+        assert_eq!(
+            fresh,
+            vec![3],
+            "the final retry must replace earlier aggregate freshness so stale early venues cannot false-clear",
+        );
+        assert!(!canary_exit_position_flatten_fresh_for_all_requested(
+            &requested, &fresh
+        ));
+        canary_exit_position_flatten_merge_fresh_venues(&mut fresh, &[2]);
+        assert!(canary_exit_position_flatten_fresh_for_all_requested(
+            &requested, &fresh
+        ));
+        canary_exit_position_flatten_record_final_account_refresh(
+            &requested,
+            &requested,
+            &mut fresh,
+            &[2],
+            3,
+            5,
+        );
+        assert_eq!(
+            fresh,
+            vec![2],
+            "any all-venue retry must replace aggregate freshness, even before the final attempt",
+        );
     }
 
     #[test]
