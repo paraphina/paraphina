@@ -2004,9 +2004,63 @@ fn v2_live_canary_ranked_execution_terminal_reduce_only_exit_place(
         && place.reduce_only
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V2RankedExecutionReduceOnlyMode {
+    None,
+    TerminalExit,
+    EmergencyControl,
+}
+
+fn v2_live_canary_ranked_execution_emergency_reduce_only_enabled() -> bool {
+    phase51_true_env(V2_LIVE_CANARY_ALLOW_EMERGENCY_REDUCE_ONLY_ENV)
+}
+
+fn v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+    label: &str,
+) -> V2RankedExecutionReduceOnlyMode {
+    if label == "canary_exit_position_flatten" {
+        return V2RankedExecutionReduceOnlyMode::TerminalExit;
+    }
+    if v2_live_canary_ranked_execution_emergency_reduce_only_enabled()
+        && matches!(label, "inventory_brake" | "soft_unwind")
+    {
+        return V2RankedExecutionReduceOnlyMode::EmergencyControl;
+    }
+    V2RankedExecutionReduceOnlyMode::None
+}
+
+fn v2_live_canary_ranked_execution_allowed_reduce_only_place(
+    place: &PlaceOrderIntent,
+    mode: V2RankedExecutionReduceOnlyMode,
+) -> bool {
+    if place.time_in_force != TimeInForce::Ioc || place.post_only || !place.reduce_only {
+        return false;
+    }
+    match mode {
+        V2RankedExecutionReduceOnlyMode::None => false,
+        V2RankedExecutionReduceOnlyMode::TerminalExit => place.purpose == OrderPurpose::Exit,
+        V2RankedExecutionReduceOnlyMode::EmergencyControl => {
+            matches!(place.purpose, OrderPurpose::Exit | OrderPurpose::Hedge)
+        }
+    }
+}
+
+#[cfg(test)]
 fn v2_live_canary_ranked_execution_validate_order_intents(
     intents: &[OrderIntent],
     allow_terminal_reduce_only_exit: bool,
+) -> Result<(), &'static str> {
+    let mode = if allow_terminal_reduce_only_exit {
+        V2RankedExecutionReduceOnlyMode::TerminalExit
+    } else {
+        V2RankedExecutionReduceOnlyMode::None
+    };
+    v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(intents, mode)
+}
+
+fn v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+    intents: &[OrderIntent],
+    reduce_only_mode: V2RankedExecutionReduceOnlyMode,
 ) -> Result<(), &'static str> {
     let allowed_venues = match v2_live_canary_ranked_execution_allowed_venues_from_env()? {
         Some(allowed_venues) => allowed_venues,
@@ -2022,9 +2076,10 @@ fn v2_live_canary_ranked_execution_validate_order_intents(
                     "v2_ranked_non_execution_place",
                     "v2_ranked_place_venue_index_mismatch",
                 )?;
-                if allow_terminal_reduce_only_exit
-                    && v2_live_canary_ranked_execution_terminal_reduce_only_exit_place(place)
-                {
+                if v2_live_canary_ranked_execution_allowed_reduce_only_place(
+                    place,
+                    reduce_only_mode,
+                ) {
                     continue;
                 }
                 if place.purpose != OrderPurpose::Mm {
@@ -2754,10 +2809,13 @@ async fn send_order_and_wait_with_status(
         );
         return (OrderWaitOutcomeKind::HandlerDropped, None);
     }
-    if let Err(reason) = v2_live_canary_ranked_execution_validate_order_intents(
-        &intents,
-        allow_terminal_reduce_only_exit,
-    ) {
+    let v2_reduce_only_mode = v2_live_canary_ranked_execution_reduce_only_mode_for_label(label);
+    if let Err(reason) =
+        v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+            &intents,
+            v2_reduce_only_mode,
+        )
+    {
         eprintln!(
             "[runner] tick={} v2_live_canary_ranked_execution_blocked_request reason={}",
             tick, reason
@@ -2827,7 +2885,13 @@ fn send_order_fire_and_forget(
         );
         return false;
     }
-    if let Err(reason) = v2_live_canary_ranked_execution_validate_order_intents(&intents, false) {
+    let v2_reduce_only_mode = v2_live_canary_ranked_execution_reduce_only_mode_for_label(label);
+    if let Err(reason) =
+        v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+            &intents,
+            v2_reduce_only_mode,
+        )
+    {
         eprintln!(
             "[runner] tick={} v2_live_canary_ranked_execution_blocked_request reason={}",
             tick, reason
@@ -3614,6 +3678,8 @@ const V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE";
 const V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES";
+const V2_LIVE_CANARY_ALLOW_EMERGENCY_REDUCE_ONLY_ENV: &str =
+    "PARAPHINA_V2_LIVE_CANARY_ALLOW_EMERGENCY_REDUCE_ONLY";
 const V2_DECISION_MODE_ENV: &str = "PARAPHINA_V2_DECISION_MODE";
 
 fn realtime_tick_interval(interval_ms: u64) -> tokio::time::Interval {
@@ -18664,6 +18730,7 @@ mod tests {
             V2_DECISION_MODE_ENV,
             "PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED",
             V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV,
+            V2_LIVE_CANARY_ALLOW_EMERGENCY_REDUCE_ONLY_ENV,
         ]);
         std::env::set_var(V2_DECISION_MODE_ENV, "live_canary_admission");
         std::env::set_var("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "true");
@@ -18793,6 +18860,122 @@ mod tests {
                     true,
                 ),
                 Err("v2_ranked_non_execution_place")
+            );
+        });
+    }
+
+    #[test]
+    fn v2_ranked_execution_dispatch_guard_allows_emergency_reduce_only_only_when_explicit() {
+        with_v2_ranked_execution_env(|| {
+            let mut inventory_brake = v2_lighter_targeted_place_intent(Side::Sell, "brake");
+            if let OrderIntent::Place(place) = &mut inventory_brake {
+                place.purpose = OrderPurpose::Hedge;
+                place.time_in_force = TimeInForce::Ioc;
+                place.post_only = false;
+                place.reduce_only = true;
+            }
+
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents(
+                    &[inventory_brake.clone()],
+                    false,
+                ),
+                Err("v2_ranked_non_mm_place")
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents(
+                    &[inventory_brake.clone()],
+                    true,
+                ),
+                Err("v2_ranked_non_mm_place")
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+                    &[inventory_brake],
+                    V2RankedExecutionReduceOnlyMode::EmergencyControl,
+                ),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn v2_ranked_execution_dispatch_guard_emergency_reduce_only_keeps_shape_checks() {
+        with_v2_ranked_execution_env(|| {
+            let mut not_reduce_only = v2_lighter_targeted_place_intent(Side::Sell, "brake");
+            if let OrderIntent::Place(place) = &mut not_reduce_only {
+                place.purpose = OrderPurpose::Hedge;
+                place.time_in_force = TimeInForce::Ioc;
+                place.post_only = false;
+                place.reduce_only = false;
+            }
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+                    &[not_reduce_only],
+                    V2RankedExecutionReduceOnlyMode::EmergencyControl,
+                ),
+                Err("v2_ranked_non_mm_place")
+            );
+
+            let mut post_only = v2_lighter_targeted_place_intent(Side::Sell, "brake");
+            if let OrderIntent::Place(place) = &mut post_only {
+                place.purpose = OrderPurpose::Hedge;
+                place.time_in_force = TimeInForce::Gtc;
+                place.post_only = true;
+                place.reduce_only = true;
+            }
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+                    &[post_only],
+                    V2RankedExecutionReduceOnlyMode::EmergencyControl,
+                ),
+                Err("v2_ranked_non_mm_place")
+            );
+
+            let mut non_execution_venue = v2_lighter_targeted_place_intent(Side::Sell, "brake");
+            if let OrderIntent::Place(place) = &mut non_execution_venue {
+                place.venue_index = 0;
+                place.venue_id = "extended".into();
+                place.purpose = OrderPurpose::Hedge;
+                place.time_in_force = TimeInForce::Ioc;
+                place.post_only = false;
+                place.reduce_only = true;
+            }
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+                    &[non_execution_venue],
+                    V2RankedExecutionReduceOnlyMode::EmergencyControl,
+                ),
+                Err("v2_ranked_non_execution_place")
+            );
+        });
+    }
+
+    #[test]
+    fn v2_ranked_execution_reduce_only_label_mode_requires_env_for_emergency_labels() {
+        with_v2_ranked_execution_env(|| {
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_exit_position_flatten"
+                ),
+                V2RankedExecutionReduceOnlyMode::TerminalExit
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label("inventory_brake"),
+                V2RankedExecutionReduceOnlyMode::None
+            );
+            std::env::set_var(V2_LIVE_CANARY_ALLOW_EMERGENCY_REDUCE_ONLY_ENV, "yes");
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label("inventory_brake"),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label("soft_unwind"),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label("other"),
+                V2RankedExecutionReduceOnlyMode::None
             );
         });
     }
