@@ -61,6 +61,36 @@ def manifest_doc(**overrides):
     return data
 
 
+def order_path_coverage_doc(venue: str, **coverage_overrides):
+    coverage = {
+        "bad_place_policy_count": 0,
+        "observed_order_actions": [],
+        "observed_order_statuses": [],
+        "target_cancel_acks": 0,
+        "target_cancel_intents": 0,
+        "target_fills": 0,
+        "target_place_acks": 0,
+        "target_place_intents": 0,
+        "target_replace_events": 0,
+        "target_would_send_cancels": 0,
+        "target_would_send_places": 0,
+        "telemetry_rows": 10,
+    }
+    coverage.update(coverage_overrides)
+    return {
+        "artifact_type": "v2_telemetry_order_path_coverage_manifest",
+        "coverage": coverage,
+        "governance": {
+            "blocker_cleared": False,
+            "pressure_complete_claim": False,
+        },
+        "scope": {
+            "target_venue": venue,
+            "telemetry_only_order_path_coverage": True,
+        },
+    }
+
+
 class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
     def evaluate(
         self,
@@ -72,17 +102,23 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         run_token: str = RUN_TOKEN,
         live_stderr: str | None = None,
         promotion_cleanup_strict: bool = False,
+        order_path_coverages: list[dict] | None = None,
     ):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             audit = root / f"{RUN_TOKEN}_terminal_audit.json"
             canary_manifest = root / f"{RUN_TOKEN}_manifest.json"
             live_stderr_path = None
+            order_path_coverage_paths = []
             write_json(audit, data)
             write_json(canary_manifest, manifest if manifest is not None else manifest_doc())
             if live_stderr is not None:
                 live_stderr_path = root / f"{RUN_TOKEN}_live_stderr.log"
                 live_stderr_path.write_text(live_stderr, encoding="utf-8")
+            for idx, order_path_coverage in enumerate(order_path_coverages or []):
+                path = root / f"{RUN_TOKEN}_order_path_{idx}.json"
+                write_json(path, order_path_coverage)
+                order_path_coverage_paths.append(path)
             return gate.evaluate_terminal_flatness(
                 venue_audit_path=audit,
                 expected_venues=EXPECTED,
@@ -93,6 +129,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
                 audit_captured_after_terminal_cleanup=audit_captured_after_terminal_cleanup,
                 live_stderr_path=live_stderr_path,
                 promotion_cleanup_strict=promotion_cleanup_strict,
+                order_path_coverage_paths=order_path_coverage_paths,
             )
 
     def test_flat_all_venues_passes_without_clearance_claims(self):
@@ -512,6 +549,124 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             report["terminal_flatness_gate_reasons"],
         )
         self.assertEqual(report["terminal_cleanup"]["blocked_final_account_truth_count"], 1)
+
+    def test_promotion_cleanup_strict_allows_final_account_truth_missing_for_no_exposure_venue(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=final_check venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_changed=false "
+                "remaining_venues=\n"
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth "
+                "requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.002500\n"
+            ),
+            promotion_cleanup_strict=True,
+            order_path_coverages=[order_path_coverage_doc("paradex")],
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertEqual(report["terminal_cleanup"]["blocked_final_account_truth_count"], 1)
+        self.assertTrue(
+            report["terminal_cleanup"][
+                "final_account_truth_no_exposure_direct_venue_audit_cleared"
+            ]
+        )
+        self.assertEqual(
+            report["terminal_cleanup"]["final_account_truth_no_exposure_venues"], ["paradex"]
+        )
+
+    def test_promotion_cleanup_strict_holds_no_exposure_final_account_truth_without_coverage(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=final_check venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_changed=false "
+                "remaining_venues=\n"
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth "
+                "requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.002500\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_account_truth_blocked",
+            report["terminal_flatness_gate_reasons"],
+        )
+
+    def test_promotion_cleanup_strict_holds_no_exposure_final_account_truth_when_venue_had_actions(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=final_check venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_changed=false "
+                "remaining_venues=\n"
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth "
+                "requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.002500\n"
+            ),
+            promotion_cleanup_strict=True,
+            order_path_coverages=[
+                order_path_coverage_doc(
+                    "paradex",
+                    target_place_intents=1,
+                    observed_order_actions=["place"],
+                    observed_order_statuses=["intent"],
+                )
+            ],
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_account_truth_blocked",
+            report["terminal_flatness_gate_reasons"],
+        )
+
+    def test_promotion_cleanup_strict_holds_no_exposure_final_account_truth_when_direct_audit_dirty(self):
+        data = audit_doc(
+            ok=False,
+            results=[
+                venue_result("hyperliquid"),
+                venue_result("lighter"),
+                venue_result("extended"),
+                venue_result("aster"),
+                venue_result("paradex", open_orders=1, ok=False),
+            ],
+        )
+        report = self.evaluate(
+            data,
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=final_check venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_changed=false "
+                "remaining_venues=\n"
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth "
+                "requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.002500\n"
+            ),
+            promotion_cleanup_strict=True,
+            order_path_coverages=[order_path_coverage_doc("paradex")],
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn("paradex:open_orders_present", report["terminal_flatness_gate_reasons"])
+        self.assertIn(
+            "terminal_cleanup_account_truth_blocked",
+            report["terminal_flatness_gate_reasons"],
+        )
 
     def test_promotion_cleanup_strict_holds_on_incomplete_residual(self):
         report = self.evaluate(

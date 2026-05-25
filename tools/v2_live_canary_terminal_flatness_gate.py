@@ -37,6 +37,27 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _load_order_path_coverages(paths: list[Path]) -> dict[str, dict[str, Any]]:
+    coverages: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        if not path.exists():
+            raise TerminalFlatnessGateError(f"order-path coverage artifact missing: {path}")
+        data = _load_json(path)
+        if data.get("artifact_type") != "v2_telemetry_order_path_coverage_manifest":
+            raise TerminalFlatnessGateError(f"order-path coverage artifact wrong type: {path}")
+        scope = data.get("scope")
+        if not isinstance(scope, dict):
+            raise TerminalFlatnessGateError(f"order-path coverage artifact missing scope: {path}")
+        venue = scope.get("target_venue")
+        if not isinstance(venue, str) or not venue.strip():
+            raise TerminalFlatnessGateError(f"order-path coverage artifact missing target venue: {path}")
+        normalized = venue.strip().lower()
+        if normalized in coverages:
+            raise TerminalFlatnessGateError(f"duplicate order-path coverage artifact: {normalized}")
+        coverages[normalized] = data
+    return coverages
+
+
 def _as_float(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -59,6 +80,51 @@ def _as_int(value: Any) -> int | None:
 
 def _csv_venues(value: str) -> list[str]:
     return [venue.strip().lower() for venue in value.split(",") if venue.strip()]
+
+
+def _coverage_int(coverage: dict[str, Any], key: str) -> int | None:
+    value = coverage.get(key)
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed
+
+
+def _order_path_coverage_proves_no_exposure(data: dict[str, Any]) -> bool:
+    coverage = data.get("coverage")
+    if not isinstance(coverage, dict):
+        return False
+    zero_fields = (
+        "target_place_intents",
+        "target_place_acks",
+        "target_cancel_intents",
+        "target_cancel_acks",
+        "target_would_send_places",
+        "target_would_send_cancels",
+        "target_replace_events",
+        "target_fills",
+        "bad_place_policy_count",
+    )
+    if any(_coverage_int(coverage, key) != 0 for key in zero_fields):
+        return False
+    observed_actions = coverage.get("observed_order_actions")
+    observed_statuses = coverage.get("observed_order_statuses")
+    if observed_actions not in ([], None):
+        return False
+    if observed_statuses not in ([], None):
+        return False
+    governance = data.get("governance")
+    if not isinstance(governance, dict):
+        return False
+    if governance.get("blocker_cleared") is True or governance.get("pressure_complete_claim") is True:
+        return False
+    scope = data.get("scope")
+    if not isinstance(scope, dict):
+        return False
+    return scope.get("telemetry_only_order_path_coverage") is True
 
 
 def _manifest_run_binding_reasons(
@@ -152,12 +218,16 @@ def _terminal_cleanup_report(
             "found": False,
             "requested_venues": [],
             "fresh_venues": [],
+            "missing_fresh_venues": [],
             "remaining_venues": [],
             "fresh_covers_requested": False,
             "remaining_venues_empty": False,
             "clean_after_final_seen_after": False,
             "after_latest_account_refresh_not_fresh": False,
         },
+        "final_account_truth_no_exposure_direct_venue_audit_cleared": False,
+        "final_account_truth_no_exposure_venues": [],
+        "final_account_truth_no_exposure_coverage_paths": {},
     }
     if live_stderr_path is None:
         if promotion_cleanup_strict:
@@ -255,6 +325,7 @@ def _terminal_cleanup_report(
             "found": True,
             "requested_venues": requested_venues,
             "fresh_venues": fresh_venues,
+            "missing_fresh_venues": sorted(set(requested_venues).difference(fresh_venues)),
             "remaining_venues": remaining_venues,
             "fresh_covers_requested": set(requested_venues).issubset(set(fresh_venues)),
             "remaining_venues_empty": len(remaining_venues) == 0,
@@ -322,6 +393,7 @@ def evaluate_terminal_flatness(
     audit_captured_after_terminal_cleanup: bool = False,
     live_stderr_path: Path | None = None,
     promotion_cleanup_strict: bool = False,
+    order_path_coverage_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
     if not math.isfinite(position_tol_base) or position_tol_base < 0:
         raise TerminalFlatnessGateError("position tolerance must be finite and non-negative")
@@ -345,6 +417,14 @@ def evaluate_terminal_flatness(
         promotion_cleanup_strict=promotion_cleanup_strict,
     )
     reasons.extend(cleanup_reasons)
+    order_path_coverages = _load_order_path_coverages(order_path_coverage_paths or [])
+    order_path_coverage_paths_by_venue = {
+        data["scope"]["target_venue"].strip().lower(): path
+        for path in (order_path_coverage_paths or [])
+        for data in [_load_json(path)]
+        if isinstance(data.get("scope"), dict)
+        and isinstance(data["scope"].get("target_venue"), str)
+    }
     direct_venue_reasons: list[str] = []
 
     if data.get("ok") is not True:
@@ -426,6 +506,37 @@ def evaluate_terminal_flatness(
         else:
             cleanup_reasons.append("terminal_cleanup_cancel_all_incomplete")
             reasons.append("terminal_cleanup_cancel_all_incomplete")
+    if (
+        promotion_cleanup_strict
+        and cleanup_report["blocked_final_account_truth_count"] > 0
+        and cleanup_report["blocked_post_dispatch_account_truth_count"] == 0
+        and cleanup_report["incomplete_residual_count"] == 0
+        and direct_venue_status == "PASS"
+        and run_binding_status == "PASS"
+    ):
+        final_check = cleanup_report["final_check_account_truth"]
+        missing_fresh_venues = list(final_check.get("missing_fresh_venues") or [])
+        if (
+            final_check.get("found") is True
+            and final_check.get("remaining_venues_empty") is True
+            and missing_fresh_venues
+            and all(
+                venue in order_path_coverages
+                and _order_path_coverage_proves_no_exposure(order_path_coverages[venue])
+                for venue in missing_fresh_venues
+            )
+        ):
+            cleanup_report["final_account_truth_no_exposure_direct_venue_audit_cleared"] = True
+            cleanup_report["final_account_truth_no_exposure_venues"] = sorted(missing_fresh_venues)
+            cleanup_report["final_account_truth_no_exposure_coverage_paths"] = {
+                venue: str(order_path_coverage_paths_by_venue[venue])
+                for venue in sorted(missing_fresh_venues)
+                if venue in order_path_coverage_paths_by_venue
+            }
+            cleanup_reasons = [
+                reason for reason in cleanup_reasons if reason != "terminal_cleanup_account_truth_blocked"
+            ]
+            reasons = [reason for reason in reasons if reason != "terminal_cleanup_account_truth_blocked"]
     promotion_cleanup_strict_status = "PASS" if not cleanup_reasons else "HOLD"
     status = "PASS" if not reasons else "HOLD"
     return {
@@ -492,6 +603,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="HOLD if terminal cleanup logs contain timeout/account-truth promotion gaps.",
     )
+    parser.add_argument(
+        "--order-path-coverage",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Optional telemetry order-path coverage manifest. In strict mode, this may clear a "
+            "final account-truth freshness gap only for venues with zero order/fill exposure and "
+            "clean direct venue audit."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -506,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
             audit_captured_after_terminal_cleanup=args.audit_captured_after_terminal_cleanup,
             live_stderr_path=args.live_stderr,
             promotion_cleanup_strict=args.promotion_cleanup_strict,
+            order_path_coverage_paths=args.order_path_coverage,
         )
     except TerminalFlatnessGateError as exc:
         print(f"V2_TERMINAL_FLATNESS_GATE_ERROR: {exc}", file=sys.stderr)
