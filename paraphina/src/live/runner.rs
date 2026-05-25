@@ -2019,6 +2019,15 @@ fn v2_live_canary_ranked_execution_emergency_reduce_only_label(label: &str) -> b
     if matches!(label, "inventory_brake" | "soft_unwind") {
         return true;
     }
+    let canary_breach_label = label.strip_suffix("_async_submit").unwrap_or(label);
+    if matches!(
+        canary_breach_label,
+        "canary_breach_flatten_pre_cancel"
+            | "canary_breach_flatten_post_cancel"
+            | "canary_breach_flatten_retry"
+    ) {
+        return true;
+    }
     for prefix in ["inventory_brake_", "soft_unwind_"] {
         let Some(rest) = label.strip_prefix(prefix) else {
             continue;
@@ -18922,6 +18931,48 @@ mod tests {
     }
 
     #[test]
+    fn v2_ranked_execution_dispatch_guard_allows_canary_breach_exit_only_when_gated() {
+        with_v2_ranked_execution_env(|| {
+            let mut canary_breach_exit =
+                v2_lighter_targeted_place_intent(Side::Buy, "canary_breach");
+            if let OrderIntent::Place(place) = &mut canary_breach_exit {
+                place.purpose = OrderPurpose::Exit;
+                place.time_in_force = TimeInForce::Ioc;
+                place.post_only = false;
+                place.reduce_only = true;
+            }
+
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents(
+                    &[canary_breach_exit.clone()],
+                    false,
+                ),
+                Err("v2_ranked_non_mm_place")
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+                    &[canary_breach_exit.clone()],
+                    V2RankedExecutionReduceOnlyMode::None,
+                ),
+                Err("v2_ranked_non_mm_place")
+            );
+
+            std::env::set_var(V2_LIVE_CANARY_ALLOW_EMERGENCY_REDUCE_ONLY_ENV, "yes");
+            let mode = v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                "canary_breach_flatten_retry_async_submit",
+            );
+            assert_eq!(mode, V2RankedExecutionReduceOnlyMode::EmergencyControl);
+            assert_eq!(
+                v2_live_canary_ranked_execution_validate_order_intents_with_reduce_only_mode(
+                    &[canary_breach_exit],
+                    mode,
+                ),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
     fn v2_ranked_execution_dispatch_guard_emergency_reduce_only_keeps_shape_checks() {
         with_v2_ranked_execution_env(|| {
             let mut not_reduce_only = v2_lighter_targeted_place_intent(Side::Sell, "brake");
@@ -18986,6 +19037,12 @@ mod tests {
                 v2_live_canary_ranked_execution_reduce_only_mode_for_label("inventory_brake"),
                 V2RankedExecutionReduceOnlyMode::None
             );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_breach_flatten_pre_cancel"
+                ),
+                V2RankedExecutionReduceOnlyMode::None
+            );
             std::env::set_var(V2_LIVE_CANARY_ALLOW_EMERGENCY_REDUCE_ONLY_ENV, "yes");
             assert_eq!(
                 v2_live_canary_ranked_execution_reduce_only_mode_for_label("inventory_brake"),
@@ -19008,12 +19065,54 @@ mod tests {
                 V2RankedExecutionReduceOnlyMode::EmergencyControl
             );
             assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_breach_flatten_pre_cancel"
+                ),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_breach_flatten_pre_cancel_async_submit"
+                ),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_breach_flatten_post_cancel"
+                ),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_breach_flatten_post_cancel_async_submit"
+                ),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_breach_flatten_retry"
+                ),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_breach_flatten_retry_async_submit"
+                ),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
                 v2_live_canary_ranked_execution_reduce_only_mode_for_label("other"),
                 V2RankedExecutionReduceOnlyMode::None
             );
             assert_eq!(
                 v2_live_canary_ranked_execution_reduce_only_mode_for_label(
                     "soft_unwind_lighter_other"
+                ),
+                V2RankedExecutionReduceOnlyMode::None
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "canary_breach_flatten_other"
                 ),
                 V2RankedExecutionReduceOnlyMode::None
             );
