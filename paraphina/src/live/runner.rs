@@ -12937,8 +12937,9 @@ async fn refresh_canary_exit_position_flatten_account_truth(
     let remaining_venues =
         canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
     eprintln!(
-        "[runner] canary_exit_position_flatten_cleanup account_refresh_applied phase={} fresh_venues={} position_changed={} remaining_venues={}",
+        "[runner] canary_exit_position_flatten_cleanup account_refresh_applied phase={} requested_venues={} fresh_venues={} position_changed={} remaining_venues={}",
         phase,
+        venue_ids_for_indices(cfg, venue_indices).join(","),
         venue_ids_for_indices(cfg, &apply.fresh_requested_venues).join(","),
         apply.position_changed,
         venue_ids_for_indices(cfg, &remaining_venues).join(",")
@@ -13234,9 +13235,8 @@ async fn run_canary_exit_position_flatten_cleanup(
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
         }
     }
-    let mut remaining_venues =
-        canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
-    let _ = refresh_canary_exit_position_flatten_account_truth(
+    let account_truth_check_venues = canary_exit_position_flatten_account_truth_check_venues(cfg);
+    let fresh_venues = refresh_canary_exit_position_flatten_account_truth(
         cfg,
         state,
         account_tx,
@@ -13245,14 +13245,31 @@ async fn run_canary_exit_position_flatten_cleanup(
         last_account_snapshot_ms,
         account_state_initialized,
         applied_account_position_baselines,
-        &remaining_venues,
+        &account_truth_check_venues,
         position_tol_tao,
         order_snapshot_fill_inference_enabled,
         tick.saturating_add(500),
         "final_check",
     )
     .await;
-    remaining_venues = canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+    let remaining_venues =
+        canary_exit_position_flatten_residual_venues(cfg, state, position_tol_tao);
+    if remaining_venues.is_empty()
+        && v2_live_canary_admission_authorized(cfg)
+        && !canary_exit_position_flatten_fresh_for_all_requested(
+            &account_truth_check_venues,
+            &fresh_venues,
+        )
+    {
+        eprintln!(
+            "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth requested_venues={} fresh_venues={} position_tol_tao={:.6}",
+            venue_ids_for_indices(cfg, &account_truth_check_venues).join(","),
+            venue_ids_for_indices(cfg, &fresh_venues).join(","),
+            position_tol_tao
+        );
+        mark_canary_exit_position_flatten_incomplete(state);
+        return;
+    }
     if remaining_venues.is_empty() {
         eprintln!(
             "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh"

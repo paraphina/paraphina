@@ -57,6 +57,10 @@ def _as_int(value: Any) -> int | None:
     return parsed if math.isfinite(float(parsed)) else None
 
 
+def _csv_venues(value: str) -> list[str]:
+    return [venue.strip().lower() for venue in value.split(",") if venue.strip()]
+
+
 def _manifest_run_binding_reasons(
     *,
     canary_manifest_path: Path | None,
@@ -135,8 +139,18 @@ def _terminal_cleanup_report(
         "hyperliquid_cancel_all_ws_post_count": 0,
         "account_refresh_not_fresh_count": 0,
         "blocked_account_truth_count": 0,
+        "blocked_final_account_truth_count": 0,
         "incomplete_residual_count": 0,
         "clean_terminal_closeout_count": 0,
+        "final_check_account_truth": {
+            "found": False,
+            "requested_venues": [],
+            "fresh_venues": [],
+            "remaining_venues": [],
+            "fresh_covers_requested": False,
+            "remaining_venues_empty": False,
+            "clean_after_final_seen_after": False,
+        },
     }
     if live_stderr_path is None:
         if promotion_cleanup_strict:
@@ -172,9 +186,15 @@ def _terminal_cleanup_report(
     report["account_refresh_not_fresh_count"] = text.count(
         "canary_exit_position_flatten_cleanup account_refresh_not_fresh"
     )
-    report["blocked_account_truth_count"] = text.count(
+    blocked_pre_post_account_truth_count = text.count(
         "canary_exit_position_flatten_cleanup blocked_pre_clean_account_truth"
     ) + text.count("canary_exit_position_flatten_cleanup blocked_post_dispatch_account_truth")
+    report["blocked_final_account_truth_count"] = text.count(
+        "canary_exit_position_flatten_cleanup blocked_final_account_truth"
+    )
+    report["blocked_account_truth_count"] = (
+        blocked_pre_post_account_truth_count + report["blocked_final_account_truth_count"]
+    )
     report["incomplete_residual_count"] = text.count(
         "canary_exit_position_flatten_cleanup incomplete residual_venues="
     )
@@ -189,6 +209,33 @@ def _terminal_cleanup_report(
         )
     )
 
+    final_check_matches = list(
+        re.finditer(
+            r"canary_exit_position_flatten_cleanup account_refresh_applied "
+            r"phase=final_check\s+requested_venues=(\S*)\s+fresh_venues=(\S*)\s+"
+            r"position_changed=\S+\s+remaining_venues=(\S*)",
+            text,
+        )
+    )
+    if final_check_matches:
+        latest = final_check_matches[-1]
+        requested_venues = _csv_venues(latest.group(1))
+        fresh_venues = _csv_venues(latest.group(2))
+        remaining_venues = _csv_venues(latest.group(3))
+        clean_marker_index = text.find(
+            "canary_exit_position_flatten_cleanup clean_after_final_account_refresh",
+            latest.end(),
+        )
+        report["final_check_account_truth"] = {
+            "found": True,
+            "requested_venues": requested_venues,
+            "fresh_venues": fresh_venues,
+            "remaining_venues": remaining_venues,
+            "fresh_covers_requested": set(requested_venues).issubset(set(fresh_venues)),
+            "remaining_venues_empty": len(remaining_venues) == 0,
+            "clean_after_final_seen_after": clean_marker_index >= 0,
+        }
+
     if promotion_cleanup_strict:
         if timeout_ticks:
             reasons.append("terminal_cleanup_cancel_timeout_present")
@@ -198,13 +245,20 @@ def _terminal_cleanup_report(
             reasons.append("terminal_cleanup_incomplete_residual_present")
         if report["blocked_account_truth_count"] > 0:
             reasons.append("terminal_cleanup_account_truth_blocked")
+        final_check_account_truth = report["final_check_account_truth"]
+        account_refresh_not_fresh_cleared = (
+            final_check_account_truth["found"]
+            and final_check_account_truth["fresh_covers_requested"]
+            and final_check_account_truth["remaining_venues_empty"]
+            and final_check_account_truth["clean_after_final_seen_after"]
+        )
         if (
             report["account_refresh_not_fresh_count"] > 0
             and report["blocked_account_truth_count"] == 0
             and report["incomplete_residual_count"] == 0
-            and report["clean_terminal_closeout_count"] == 0
+            and not account_refresh_not_fresh_cleared
         ):
-            reasons.append("terminal_cleanup_account_refresh_unresolved")
+            reasons.append("terminal_cleanup_account_refresh_not_fresh")
     return reasons, report
 
 

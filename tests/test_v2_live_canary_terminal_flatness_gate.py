@@ -320,7 +320,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "HOLD")
         self.assertEqual(report["closeout_status"]["run_binding_status"], "PASS")
         self.assertIn(
-            "terminal_cleanup_account_refresh_unresolved",
+            "terminal_cleanup_account_refresh_not_fresh",
             report["closeout_status"]["promotion_cleanup_strict_reasons"],
         )
 
@@ -330,6 +330,10 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             live_stderr=(
                 "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
                 "phase=post_dispatch venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter,paradex position_changed=false "
+                "remaining_venues=\n"
                 "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh\n"
             ),
             promotion_cleanup_strict=True,
@@ -338,7 +342,53 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
         self.assertEqual(report["terminal_cleanup"]["account_refresh_not_fresh_count"], 1)
         self.assertEqual(report["terminal_cleanup"]["clean_terminal_closeout_count"], 1)
+        self.assertTrue(report["terminal_cleanup"]["final_check_account_truth"]["found"])
+        self.assertTrue(
+            report["terminal_cleanup"]["final_check_account_truth"]["fresh_covers_requested"]
+        )
         self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "PASS")
+
+    def test_promotion_cleanup_strict_requires_full_final_truth_to_clear_not_fresh(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=post_dispatch venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_changed=false "
+                "remaining_venues=\n"
+                "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_account_refresh_not_fresh",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertFalse(
+            report["terminal_cleanup"]["final_check_account_truth"]["fresh_covers_requested"]
+        )
+
+    def test_promotion_cleanup_strict_holds_on_blocked_final_account_truth(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth "
+                "requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.002500\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_account_truth_blocked",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertEqual(report["terminal_cleanup"]["blocked_final_account_truth_count"], 1)
 
     def test_promotion_cleanup_strict_holds_on_incomplete_residual(self):
         report = self.evaluate(
