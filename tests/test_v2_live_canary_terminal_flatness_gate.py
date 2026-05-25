@@ -283,7 +283,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         )
         self.assertEqual(report["terminal_cleanup"]["hyperliquid_cancel_all_post_inflight_max"], 2)
 
-    def test_promotion_cleanup_strict_holds_on_missing_account_truth(self):
+    def test_promotion_cleanup_strict_allows_pre_clean_account_truth_miss_with_clean_direct_audit(self):
         report = self.evaluate(
             audit_doc(),
             live_stderr=(
@@ -296,14 +296,58 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             promotion_cleanup_strict=True,
         )
 
-        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
-        self.assertIn(
-            "terminal_cleanup_account_truth_blocked",
-            report["terminal_flatness_gate_reasons"],
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertEqual(report["terminal_cleanup"]["blocked_pre_clean_account_truth_count"], 1)
+        self.assertTrue(
+            report["terminal_cleanup"]["pre_clean_account_truth_direct_venue_audit_cleared"]
         )
         self.assertEqual(report["closeout_status"]["direct_venue_audit_status"], "PASS")
+        self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "PASS")
+        self.assertTrue(report["closeout_status"]["promotion_ready"])
+
+    def test_promotion_cleanup_strict_holds_pre_clean_account_truth_when_direct_audit_dirty(self):
+        data = audit_doc(
+            ok=False,
+            results=[
+                venue_result("hyperliquid"),
+                venue_result("lighter"),
+                venue_result("extended"),
+                venue_result("aster"),
+                venue_result("paradex", open_orders=1, ok=False),
+            ],
+        )
+        report = self.evaluate(
+            data,
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup blocked_pre_clean_account_truth "
+                "attempt=1 requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.000100\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn("terminal_cleanup_account_truth_blocked", report["terminal_flatness_gate_reasons"])
+        self.assertIn("paradex:open_orders_present", report["terminal_flatness_gate_reasons"])
+        self.assertFalse(
+            report["terminal_cleanup"]["pre_clean_account_truth_direct_venue_audit_cleared"]
+        )
+
+    def test_promotion_cleanup_strict_holds_on_post_dispatch_account_truth(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup blocked_post_dispatch_account_truth "
+                "attempt=1 requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.000100\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn("terminal_cleanup_account_truth_blocked", report["terminal_flatness_gate_reasons"])
+        self.assertEqual(report["terminal_cleanup"]["blocked_post_dispatch_account_truth_count"], 1)
         self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "HOLD")
-        self.assertFalse(report["closeout_status"]["promotion_ready"])
 
     def test_promotion_cleanup_strict_splits_direct_audit_from_cleanup_hold(self):
         report = self.evaluate(
