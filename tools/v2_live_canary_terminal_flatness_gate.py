@@ -135,6 +135,9 @@ def _terminal_cleanup_report(
         "live_stderr_sha256": None,
         "terminal_cancel_timeout_count": 0,
         "terminal_cancel_timeout_ticks": [],
+        "terminal_cancel_all_incomplete_count": 0,
+        "terminal_cancel_all_incomplete_venues": [],
+        "cancel_all_incomplete_direct_venue_audit_cleared": False,
         "hyperliquid_cancel_all_post_inflight_max": 0,
         "hyperliquid_cancel_all_ws_post_count": 0,
         "account_refresh_not_fresh_count": 0,
@@ -153,6 +156,7 @@ def _terminal_cleanup_report(
             "fresh_covers_requested": False,
             "remaining_venues_empty": False,
             "clean_after_final_seen_after": False,
+            "after_latest_account_refresh_not_fresh": False,
         },
     }
     if live_stderr_path is None:
@@ -174,6 +178,14 @@ def _terminal_cleanup_report(
         timeout_ticks.append(int(match.group(1)))
     report["terminal_cancel_timeout_count"] = len(timeout_ticks)
     report["terminal_cancel_timeout_ticks"] = timeout_ticks
+    cancel_all_incomplete_venues: list[str] = []
+    for match in re.finditer(
+        r"canary_exit_cancel_all_cleanup incomplete tracked_open_orders=\d+ venues=(\S*)",
+        text,
+    ):
+        cancel_all_incomplete_venues.extend(_csv_venues(match.group(1)))
+    report["terminal_cancel_all_incomplete_count"] = len(cancel_all_incomplete_venues)
+    report["terminal_cancel_all_incomplete_venues"] = sorted(set(cancel_all_incomplete_venues))
 
     post_inflight_max = 0
     ws_cancel_all_count = 0
@@ -186,8 +198,12 @@ def _terminal_cleanup_report(
         post_inflight_max = max(post_inflight_max, int(match.group(1)))
     report["hyperliquid_cancel_all_post_inflight_max"] = post_inflight_max
     report["hyperliquid_cancel_all_ws_post_count"] = ws_cancel_all_count
-    report["account_refresh_not_fresh_count"] = text.count(
-        "canary_exit_position_flatten_cleanup account_refresh_not_fresh"
+    account_refresh_not_fresh_matches = list(
+        re.finditer(r"canary_exit_position_flatten_cleanup account_refresh_not_fresh", text)
+    )
+    report["account_refresh_not_fresh_count"] = len(account_refresh_not_fresh_matches)
+    latest_account_refresh_not_fresh_end = (
+        account_refresh_not_fresh_matches[-1].end() if account_refresh_not_fresh_matches else -1
     )
     report["blocked_pre_clean_account_truth_count"] = text.count(
         "canary_exit_position_flatten_cleanup blocked_pre_clean_account_truth"
@@ -234,6 +250,7 @@ def _terminal_cleanup_report(
             "canary_exit_position_flatten_cleanup clean_after_final_account_refresh",
             latest.end(),
         )
+        final_check_after_latest_not_fresh = latest.start() > latest_account_refresh_not_fresh_end
         report["final_check_account_truth"] = {
             "found": True,
             "requested_venues": requested_venues,
@@ -242,6 +259,7 @@ def _terminal_cleanup_report(
             "fresh_covers_requested": set(requested_venues).issubset(set(fresh_venues)),
             "remaining_venues_empty": len(remaining_venues) == 0,
             "clean_after_final_seen_after": clean_marker_index >= 0,
+            "after_latest_account_refresh_not_fresh": final_check_after_latest_not_fresh,
         }
 
     if promotion_cleanup_strict:
@@ -259,9 +277,11 @@ def _terminal_cleanup_report(
         final_check_account_truth = report["final_check_account_truth"]
         account_refresh_not_fresh_cleared = (
             final_check_account_truth["found"]
+            and len(final_check_account_truth["requested_venues"]) > 0
             and final_check_account_truth["fresh_covers_requested"]
             and final_check_account_truth["remaining_venues_empty"]
             and final_check_account_truth["clean_after_final_seen_after"]
+            and final_check_account_truth["after_latest_account_refresh_not_fresh"]
         )
         if (
             report["account_refresh_not_fresh_count"] > 0
@@ -400,6 +420,12 @@ def evaluate_terminal_flatness(
         else:
             cleanup_reasons.append("terminal_cleanup_account_truth_blocked")
             reasons.append("terminal_cleanup_account_truth_blocked")
+    if promotion_cleanup_strict and cleanup_report["terminal_cancel_all_incomplete_count"] > 0:
+        if direct_venue_status == "PASS" and run_binding_status == "PASS":
+            cleanup_report["cancel_all_incomplete_direct_venue_audit_cleared"] = True
+        else:
+            cleanup_reasons.append("terminal_cleanup_cancel_all_incomplete")
+            reasons.append("terminal_cleanup_cancel_all_incomplete")
     promotion_cleanup_strict_status = "PASS" if not cleanup_reasons else "HOLD"
     status = "PASS" if not reasons else "HOLD"
     return {

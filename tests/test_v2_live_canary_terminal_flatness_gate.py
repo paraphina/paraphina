@@ -349,6 +349,54 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertEqual(report["terminal_cleanup"]["blocked_post_dispatch_account_truth_count"], 1)
         self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "HOLD")
 
+    def test_promotion_cleanup_strict_allows_tracked_cancel_incomplete_with_clean_direct_audit(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_cancel_all_cleanup incomplete "
+                "tracked_open_orders=1 venues=hyperliquid\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertEqual(report["terminal_cleanup"]["terminal_cancel_all_incomplete_count"], 1)
+        self.assertEqual(
+            report["terminal_cleanup"]["terminal_cancel_all_incomplete_venues"], ["hyperliquid"]
+        )
+        self.assertTrue(
+            report["terminal_cleanup"]["cancel_all_incomplete_direct_venue_audit_cleared"]
+        )
+
+    def test_promotion_cleanup_strict_holds_tracked_cancel_incomplete_when_direct_audit_dirty(self):
+        data = audit_doc(
+            ok=False,
+            results=[
+                venue_result("hyperliquid", open_orders=1, ok=False),
+                venue_result("lighter"),
+                venue_result("extended"),
+                venue_result("aster"),
+                venue_result("paradex"),
+            ],
+        )
+        report = self.evaluate(
+            data,
+            live_stderr=(
+                "[runner] canary_exit_cancel_all_cleanup incomplete "
+                "tracked_open_orders=1 venues=hyperliquid\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_cancel_all_incomplete",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertFalse(
+            report["terminal_cleanup"]["cancel_all_incomplete_direct_venue_audit_cleared"]
+        )
+
     def test_promotion_cleanup_strict_splits_direct_audit_from_cleanup_hold(self):
         report = self.evaluate(
             audit_doc(),
@@ -390,7 +438,38 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertTrue(
             report["terminal_cleanup"]["final_check_account_truth"]["fresh_covers_requested"]
         )
+        self.assertTrue(
+            report["terminal_cleanup"]["final_check_account_truth"][
+                "after_latest_account_refresh_not_fresh"
+            ]
+        )
         self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "PASS")
+
+    def test_promotion_cleanup_strict_requires_final_truth_after_latest_not_fresh(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter,paradex position_changed=false "
+                "remaining_venues=\n"
+                "[runner] canary_exit_position_flatten_cleanup clean_after_final_account_refresh\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=post_dispatch venue=paradex account_ok=true account_available=false\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "terminal_cleanup_account_refresh_not_fresh",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertFalse(
+            report["terminal_cleanup"]["final_check_account_truth"][
+                "after_latest_account_refresh_not_fresh"
+            ]
+        )
 
     def test_promotion_cleanup_strict_requires_full_final_truth_to_clear_not_fresh(self):
         report = self.evaluate(
