@@ -944,6 +944,32 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertEqual(report["run_completion"]["ticks_run"], 20)
         self.assertFalse(report["closeout_status"]["promotion_ready"])
 
+    def test_promotion_cleanup_strict_holds_on_ranked_execution_block(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] tick=752 v2_live_canary_ranked_execution_blocked_request "
+                "reason=v2_ranked_non_mm_place\n"
+                "[runner] canary_exit_cancel_all_cleanup clean attempt=1 "
+                "tracked_open_orders=0 clean_state_sweep_dispatched=true\n"
+            ),
+            min_ticks_run=2400,
+            min_run_duration_ms=600000,
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "run_validation_ranked_execution_blocked_request",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertEqual(report["terminal_cleanup"]["ranked_execution_blocked_request_count"], 1)
+        self.assertEqual(
+            report["terminal_cleanup"]["ranked_execution_blocked_reasons"],
+            ["v2_ranked_non_mm_place"],
+        )
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+
     def test_promotion_cleanup_strict_accepts_completed_same_run_shape(self):
         report = self.evaluate(
             audit_doc(),

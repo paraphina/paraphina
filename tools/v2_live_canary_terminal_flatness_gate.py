@@ -201,6 +201,8 @@ def _terminal_cleanup_report(
         "live_stderr_sha256": None,
         "terminal_cancel_timeout_count": 0,
         "terminal_cancel_timeout_ticks": [],
+        "ranked_execution_blocked_request_count": 0,
+        "ranked_execution_blocked_reasons": [],
         "terminal_cancel_all_incomplete_count": 0,
         "terminal_cancel_all_incomplete_venues": [],
         "cancel_all_incomplete_direct_venue_audit_cleared": False,
@@ -251,6 +253,19 @@ def _terminal_cleanup_report(
         timeout_ticks.append(int(match.group(1)))
     report["terminal_cancel_timeout_count"] = len(timeout_ticks)
     report["terminal_cancel_timeout_ticks"] = timeout_ticks
+    ranked_block_reasons = sorted(
+        set(
+            match.group(1)
+            for match in re.finditer(
+                r"v2_live_canary_ranked_execution_blocked_request reason=(\S+)",
+                text,
+            )
+        )
+    )
+    report["ranked_execution_blocked_request_count"] = len(
+        re.findall(r"v2_live_canary_ranked_execution_blocked_request reason=", text)
+    )
+    report["ranked_execution_blocked_reasons"] = ranked_block_reasons
     cancel_all_incomplete_venues: list[str] = []
     for match in re.finditer(
         r"canary_exit_cancel_all_cleanup incomplete tracked_open_orders=\d+ venues=(\S*)",
@@ -337,6 +352,8 @@ def _terminal_cleanup_report(
         }
 
     if promotion_cleanup_strict:
+        if report["ranked_execution_blocked_request_count"] > 0:
+            reasons.append("run_validation_ranked_execution_blocked_request")
         if timeout_ticks:
             reasons.append("terminal_cleanup_cancel_timeout_present")
         if post_inflight_max > 1:
