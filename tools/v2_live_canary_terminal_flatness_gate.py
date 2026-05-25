@@ -367,6 +367,101 @@ def _terminal_cleanup_report(
     return reasons, report
 
 
+def _run_completion_report(
+    *,
+    live_exit_code_path: Path | None,
+    live_end_utc_path: Path | None,
+    live_summary_path: Path | None,
+    min_ticks_run: int | None,
+    min_run_duration_ms: int | None,
+    promotion_cleanup_strict: bool,
+) -> tuple[list[str], dict[str, Any]]:
+    reasons: list[str] = []
+    report: dict[str, Any] = {
+        "promotion_cleanup_strict": promotion_cleanup_strict,
+        "live_exit_code_path": str(live_exit_code_path) if live_exit_code_path else None,
+        "live_exit_code_sha256": None,
+        "live_end_utc_path": str(live_end_utc_path) if live_end_utc_path else None,
+        "live_end_utc_sha256": None,
+        "live_end_utc_found": False,
+        "live_summary_path": str(live_summary_path) if live_summary_path else None,
+        "live_summary_sha256": None,
+        "live_exit_code": None,
+        "execution_mode": None,
+        "trade_mode": None,
+        "ticks_run": None,
+        "run_duration_ms": None,
+        "min_ticks_run": min_ticks_run,
+        "min_run_duration_ms": min_run_duration_ms,
+        "live_completed_cleanly": False,
+    }
+    if live_exit_code_path is None:
+        if promotion_cleanup_strict:
+            reasons.append("run_completion_exit_code_missing")
+        return reasons, report
+    if not live_exit_code_path.exists():
+        if promotion_cleanup_strict:
+            reasons.append("run_completion_exit_code_missing")
+        return reasons, report
+    report["live_exit_code_sha256"] = _sha256(live_exit_code_path)
+    raw = live_exit_code_path.read_text(encoding="utf-8", errors="replace").strip()
+    try:
+        parsed = int(raw)
+    except ValueError:
+        if promotion_cleanup_strict:
+            reasons.append("run_completion_exit_code_invalid")
+        return reasons, report
+    report["live_exit_code"] = parsed
+    report["live_completed_cleanly"] = parsed == 0
+    if promotion_cleanup_strict and parsed != 0:
+        reasons.append("run_completion_exit_code_nonzero")
+    if live_end_utc_path is None:
+        if promotion_cleanup_strict:
+            reasons.append("run_completion_live_end_missing")
+    elif not live_end_utc_path.exists():
+        if promotion_cleanup_strict:
+            reasons.append("run_completion_live_end_missing")
+    else:
+        report["live_end_utc_sha256"] = _sha256(live_end_utc_path)
+        report["live_end_utc_found"] = bool(
+            live_end_utc_path.read_text(encoding="utf-8", errors="replace").strip()
+        )
+        if promotion_cleanup_strict and not report["live_end_utc_found"]:
+            reasons.append("run_completion_live_end_missing")
+    if live_summary_path is None:
+        if promotion_cleanup_strict:
+            reasons.append("run_completion_summary_missing")
+        return reasons, report
+    if not live_summary_path.exists():
+        if promotion_cleanup_strict:
+            reasons.append("run_completion_summary_missing")
+        return reasons, report
+    report["live_summary_sha256"] = _sha256(live_summary_path)
+    try:
+        summary = _load_json(live_summary_path)
+    except TerminalFlatnessGateError:
+        if promotion_cleanup_strict:
+            reasons.append("run_completion_summary_invalid")
+        return reasons, report
+    report["execution_mode"] = summary.get("execution_mode")
+    report["trade_mode"] = summary.get("trade_mode")
+    report["ticks_run"] = _as_int(summary.get("ticks_run"))
+    report["run_duration_ms"] = _as_int(summary.get("run_duration_ms"))
+    if promotion_cleanup_strict:
+        if summary.get("execution_mode") != "live" or summary.get("trade_mode") != "live":
+            reasons.append("run_completion_summary_not_live")
+        if min_ticks_run is not None and (
+            report["ticks_run"] is None or report["ticks_run"] < min_ticks_run
+        ):
+            reasons.append("run_completion_ticks_short")
+        if min_run_duration_ms is not None and (
+            report["run_duration_ms"] is None
+            or report["run_duration_ms"] < min_run_duration_ms
+        ):
+            reasons.append("run_completion_duration_short")
+    return reasons, report
+
+
 def _venue_map(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     results = data.get("results")
     if not isinstance(results, list):
@@ -395,6 +490,11 @@ def evaluate_terminal_flatness(
     audit_captured_after_run: bool = False,
     audit_captured_after_terminal_cleanup: bool = False,
     live_stderr_path: Path | None = None,
+    live_exit_code_path: Path | None = None,
+    live_end_utc_path: Path | None = None,
+    live_summary_path: Path | None = None,
+    min_ticks_run: int | None = None,
+    min_run_duration_ms: int | None = None,
     promotion_cleanup_strict: bool = False,
     order_path_coverage_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
@@ -420,6 +520,15 @@ def evaluate_terminal_flatness(
         promotion_cleanup_strict=promotion_cleanup_strict,
     )
     reasons.extend(cleanup_reasons)
+    completion_reasons, completion_report = _run_completion_report(
+        live_exit_code_path=live_exit_code_path,
+        live_end_utc_path=live_end_utc_path,
+        live_summary_path=live_summary_path,
+        min_ticks_run=min_ticks_run,
+        min_run_duration_ms=min_run_duration_ms,
+        promotion_cleanup_strict=promotion_cleanup_strict,
+    )
+    reasons.extend(completion_reasons)
     order_path_coverages = _load_order_path_coverages(order_path_coverage_paths or [])
     order_path_coverage_paths_by_venue = {
         data["scope"]["target_venue"].strip().lower(): path
@@ -580,11 +689,14 @@ def evaluate_terminal_flatness(
             **binding_meta,
         },
         "terminal_cleanup": cleanup_report,
+        "run_completion": completion_report,
         "closeout_status": {
             "direct_venue_audit_status": direct_venue_status,
             "direct_venue_audit_reasons": direct_venue_reasons,
             "promotion_cleanup_strict_status": promotion_cleanup_strict_status,
             "promotion_cleanup_strict_reasons": cleanup_reasons,
+            "run_completion_status": "PASS" if not completion_reasons else "HOLD",
+            "run_completion_reasons": completion_reasons,
             "run_binding_status": run_binding_status,
             "run_binding_reasons": binding_reasons,
             "promotion_ready": status == "PASS"
@@ -627,6 +739,31 @@ def main(argv: list[str] | None = None) -> int:
         help="Saved live stderr artifact. Required for promotion cleanup strictness.",
     )
     parser.add_argument(
+        "--live-exit-code",
+        type=Path,
+        help="Saved same-run live exit-code artifact. Required for promotion cleanup strictness.",
+    )
+    parser.add_argument(
+        "--live-end-utc",
+        type=Path,
+        help="Saved same-run live end timestamp artifact. Required for promotion cleanup strictness.",
+    )
+    parser.add_argument(
+        "--live-summary",
+        type=Path,
+        help="Saved same-run summary JSON artifact. Required for promotion cleanup strictness.",
+    )
+    parser.add_argument(
+        "--min-ticks-run",
+        type=int,
+        help="Minimum ticks_run required in the same-run summary for strict promotion cleanup.",
+    )
+    parser.add_argument(
+        "--min-run-duration-ms",
+        type=int,
+        help="Minimum run_duration_ms required in the same-run summary for strict promotion cleanup.",
+    )
+    parser.add_argument(
         "--promotion-cleanup-strict",
         action="store_true",
         help="HOLD if terminal cleanup logs contain timeout/account-truth promotion gaps.",
@@ -655,6 +792,11 @@ def main(argv: list[str] | None = None) -> int:
             audit_captured_after_run=args.audit_captured_after_run,
             audit_captured_after_terminal_cleanup=args.audit_captured_after_terminal_cleanup,
             live_stderr_path=args.live_stderr,
+            live_exit_code_path=args.live_exit_code,
+            live_end_utc_path=args.live_end_utc,
+            live_summary_path=args.live_summary,
+            min_ticks_run=args.min_ticks_run,
+            min_run_duration_ms=args.min_run_duration_ms,
             promotion_cleanup_strict=args.promotion_cleanup_strict,
             order_path_coverage_paths=args.order_path_coverage,
         )

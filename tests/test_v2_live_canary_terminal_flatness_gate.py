@@ -101,6 +101,11 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         audit_captured_after_terminal_cleanup: bool = True,
         run_token: str = RUN_TOKEN,
         live_stderr: str | None = None,
+        live_exit_code: str | None = None,
+        live_end_utc: str | None = None,
+        live_summary: dict | None = None,
+        min_ticks_run: int | None = None,
+        min_run_duration_ms: int | None = None,
         promotion_cleanup_strict: bool = False,
         order_path_coverages: list[dict] | None = None,
     ):
@@ -109,12 +114,40 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
             audit = root / f"{RUN_TOKEN}_terminal_audit.json"
             canary_manifest = root / f"{RUN_TOKEN}_manifest.json"
             live_stderr_path = None
+            live_exit_code_path = None
+            live_end_utc_path = None
+            live_summary_path = None
             order_path_coverage_paths = []
             write_json(audit, data)
             write_json(canary_manifest, manifest if manifest is not None else manifest_doc())
             if live_stderr is not None:
                 live_stderr_path = root / f"{RUN_TOKEN}_live_stderr.log"
                 live_stderr_path.write_text(live_stderr, encoding="utf-8")
+            if live_exit_code is not None or promotion_cleanup_strict:
+                live_exit_code_path = root / f"{RUN_TOKEN}_live_exit_code.txt"
+                live_exit_code_path.write_text(
+                    "0" if live_exit_code is None else live_exit_code,
+                    encoding="utf-8",
+                )
+            if live_end_utc is not None or promotion_cleanup_strict:
+                live_end_utc_path = root / f"{RUN_TOKEN}_live_end_utc.txt"
+                live_end_utc_path.write_text(
+                    "2026-05-25T00:10:00+00:00\n" if live_end_utc is None else live_end_utc,
+                    encoding="utf-8",
+                )
+            if live_summary is not None or promotion_cleanup_strict:
+                live_summary_path = root / f"{RUN_TOKEN}_summary.json"
+                write_json(
+                    live_summary_path,
+                    live_summary
+                    if live_summary is not None
+                    else {
+                        "execution_mode": "live",
+                        "trade_mode": "live",
+                        "ticks_run": 2400,
+                        "run_duration_ms": 600000,
+                    },
+                )
             for idx, order_path_coverage in enumerate(order_path_coverages or []):
                 path = root / f"{RUN_TOKEN}_order_path_{idx}.json"
                 write_json(path, order_path_coverage)
@@ -128,6 +161,11 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
                 audit_captured_after_run=audit_captured_after_run,
                 audit_captured_after_terminal_cleanup=audit_captured_after_terminal_cleanup,
                 live_stderr_path=live_stderr_path,
+                live_exit_code_path=live_exit_code_path,
+                live_end_utc_path=live_end_utc_path,
+                live_summary_path=live_summary_path,
+                min_ticks_run=min_ticks_run,
+                min_run_duration_ms=min_run_duration_ms,
                 promotion_cleanup_strict=promotion_cleanup_strict,
                 order_path_coverage_paths=order_path_coverage_paths,
             )
@@ -789,6 +827,140 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
 
         self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
         self.assertIn("terminal_cleanup_log_missing", report["terminal_flatness_gate_reasons"])
+
+    def test_promotion_cleanup_strict_requires_same_run_exit_code_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audit = root / f"{RUN_TOKEN}_terminal_audit.json"
+            canary_manifest = root / f"{RUN_TOKEN}_manifest.json"
+            live_stderr = root / f"{RUN_TOKEN}_live_stderr.log"
+            write_json(audit, audit_doc())
+            write_json(canary_manifest, manifest_doc())
+            live_stderr.write_text(
+                "[runner] canary_exit_cancel_all_cleanup clean attempt=1 "
+                "tracked_open_orders=0 clean_state_sweep_dispatched=true\n",
+                encoding="utf-8",
+            )
+
+            report = gate.evaluate_terminal_flatness(
+                venue_audit_path=audit,
+                expected_venues=EXPECTED,
+                position_tol_base=0.0025,
+                canary_manifest_path=canary_manifest,
+                run_token=RUN_TOKEN,
+                audit_captured_after_run=True,
+                audit_captured_after_terminal_cleanup=True,
+                live_stderr_path=live_stderr,
+                promotion_cleanup_strict=True,
+            )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn("run_completion_exit_code_missing", report["terminal_flatness_gate_reasons"])
+        self.assertEqual(report["closeout_status"]["run_completion_status"], "HOLD")
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+
+    def test_promotion_cleanup_strict_holds_on_nonzero_same_run_exit_code(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_cancel_all_cleanup clean attempt=1 "
+                "tracked_open_orders=0 clean_state_sweep_dispatched=true\n"
+            ),
+            live_exit_code="-1",
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn("run_completion_exit_code_nonzero", report["terminal_flatness_gate_reasons"])
+        self.assertEqual(report["run_completion"]["live_exit_code"], -1)
+        self.assertFalse(report["run_completion"]["live_completed_cleanly"])
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+
+    def test_promotion_cleanup_strict_holds_without_same_run_end_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audit = root / f"{RUN_TOKEN}_terminal_audit.json"
+            canary_manifest = root / f"{RUN_TOKEN}_manifest.json"
+            live_stderr = root / f"{RUN_TOKEN}_live_stderr.log"
+            live_exit_code = root / f"{RUN_TOKEN}_live_exit_code.txt"
+            summary = root / f"{RUN_TOKEN}_summary.json"
+            write_json(audit, audit_doc())
+            write_json(canary_manifest, manifest_doc())
+            live_stderr.write_text(
+                "[runner] canary_exit_cancel_all_cleanup clean attempt=1 "
+                "tracked_open_orders=0 clean_state_sweep_dispatched=true\n",
+                encoding="utf-8",
+            )
+            live_exit_code.write_text("0\n", encoding="utf-8")
+            write_json(
+                summary,
+                {
+                    "execution_mode": "live",
+                    "trade_mode": "live",
+                    "ticks_run": 2400,
+                    "run_duration_ms": 600000,
+                },
+            )
+
+            report = gate.evaluate_terminal_flatness(
+                venue_audit_path=audit,
+                expected_venues=EXPECTED,
+                position_tol_base=0.0025,
+                canary_manifest_path=canary_manifest,
+                run_token=RUN_TOKEN,
+                audit_captured_after_run=True,
+                audit_captured_after_terminal_cleanup=True,
+                live_stderr_path=live_stderr,
+                live_exit_code_path=live_exit_code,
+                live_summary_path=summary,
+                promotion_cleanup_strict=True,
+            )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn("run_completion_live_end_missing", report["terminal_flatness_gate_reasons"])
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+
+    def test_promotion_cleanup_strict_holds_on_short_cleanup_only_summary(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_cancel_all_cleanup clean attempt=1 "
+                "tracked_open_orders=0 clean_state_sweep_dispatched=true\n"
+            ),
+            live_summary={
+                "execution_mode": "live",
+                "trade_mode": "live",
+                "ticks_run": 20,
+                "run_duration_ms": 5000,
+            },
+            min_ticks_run=2400,
+            min_run_duration_ms=600000,
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn("run_completion_ticks_short", report["terminal_flatness_gate_reasons"])
+        self.assertIn("run_completion_duration_short", report["terminal_flatness_gate_reasons"])
+        self.assertEqual(report["run_completion"]["ticks_run"], 20)
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+
+    def test_promotion_cleanup_strict_accepts_completed_same_run_shape(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_cancel_all_cleanup clean attempt=1 "
+                "tracked_open_orders=0 clean_state_sweep_dispatched=true\n"
+            ),
+            min_ticks_run=2400,
+            min_run_duration_ms=600000,
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertEqual(report["closeout_status"]["run_completion_status"], "PASS")
+        self.assertTrue(report["run_completion"]["live_completed_cleanly"])
+        self.assertTrue(report["run_completion"]["live_end_utc_found"])
+        self.assertTrue(report["closeout_status"]["promotion_ready"])
 
 
 if __name__ == "__main__":
