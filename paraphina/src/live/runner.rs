@@ -2015,6 +2015,28 @@ fn v2_live_canary_ranked_execution_emergency_reduce_only_enabled() -> bool {
     phase51_true_env(V2_LIVE_CANARY_ALLOW_EMERGENCY_REDUCE_ONLY_ENV)
 }
 
+fn v2_live_canary_ranked_execution_emergency_reduce_only_label(label: &str) -> bool {
+    if matches!(label, "inventory_brake" | "soft_unwind") {
+        return true;
+    }
+    for prefix in ["inventory_brake_", "soft_unwind_"] {
+        let Some(rest) = label.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(venue_label) = rest.strip_suffix("_single_flight") else {
+            continue;
+        };
+        if !venue_label.is_empty()
+            && venue_label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn v2_live_canary_ranked_execution_reduce_only_mode_for_label(
     label: &str,
 ) -> V2RankedExecutionReduceOnlyMode {
@@ -2022,7 +2044,7 @@ fn v2_live_canary_ranked_execution_reduce_only_mode_for_label(
         return V2RankedExecutionReduceOnlyMode::TerminalExit;
     }
     if v2_live_canary_ranked_execution_emergency_reduce_only_enabled()
-        && matches!(label, "inventory_brake" | "soft_unwind")
+        && v2_live_canary_ranked_execution_emergency_reduce_only_label(label)
     {
         return V2RankedExecutionReduceOnlyMode::EmergencyControl;
     }
@@ -18974,7 +18996,25 @@ mod tests {
                 V2RankedExecutionReduceOnlyMode::EmergencyControl
             );
             assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "soft_unwind_lighter_single_flight"
+                ),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "inventory_brake_hyperliquid_single_flight"
+                ),
+                V2RankedExecutionReduceOnlyMode::EmergencyControl
+            );
+            assert_eq!(
                 v2_live_canary_ranked_execution_reduce_only_mode_for_label("other"),
+                V2RankedExecutionReduceOnlyMode::None
+            );
+            assert_eq!(
+                v2_live_canary_ranked_execution_reduce_only_mode_for_label(
+                    "soft_unwind_lighter_other"
+                ),
                 V2RankedExecutionReduceOnlyMode::None
             );
         });
