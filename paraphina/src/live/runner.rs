@@ -10358,6 +10358,35 @@ fn build_canary_breach_flatten_intents(
     intents
 }
 
+fn build_canary_exit_position_flatten_intents(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    target_venues: &[usize],
+    tick: u64,
+    now_ms: TimestampMs,
+) -> Vec<OrderIntent> {
+    let mut intents = build_canary_breach_flatten_intents(cfg, state, target_venues, tick);
+    let Some(extended) = extended_venue_index(cfg) else {
+        return intents;
+    };
+    if !target_venues.contains(&extended) || intents_touch_venue(&intents, extended) {
+        return intents;
+    }
+    intents.extend(
+        build_extended_terminal_sub_lot_residual_convergence_intents(
+            cfg,
+            state,
+            snapshot,
+            now_ms,
+            None,
+            EmergencyRequestClass::SoftUnwind,
+            None,
+        ),
+    );
+    intents
+}
+
 fn venue_index_for_order_intent(intent: &OrderIntent) -> Option<usize> {
     match intent {
         OrderIntent::Place(place) => Some(place.venue_index),
@@ -12476,6 +12505,13 @@ fn extended_terminal_sub_lot_reduce_max_lots() -> f64 {
         .max(1.0)
 }
 
+fn extended_terminal_sub_lot_reduce_allow_below_min_notional() -> bool {
+    parse_bool_env_default(
+        "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ALLOW_BELOW_MIN_NOTIONAL",
+        false,
+    )
+}
+
 fn parse_optional_fraction_env(key: &str) -> Option<f64> {
     std::env::var(key)
         .ok()
@@ -13497,8 +13533,22 @@ async fn run_canary_exit_position_flatten_cleanup(
             );
             let dispatch_tick = tick.saturating_add(attempt as u64);
             let now_ms = now_ms();
-            let flatten_intents =
-                build_canary_breach_flatten_intents(cfg, state, &target_venues, dispatch_tick);
+            let mut exit_cleanup_snapshot =
+                cache.snapshot_per_venue(now_ms, &cfg.venues, cfg.book.stale_ms);
+            apply_extended_freeze_market_progress_snapshot_overrides(
+                &mut exit_cleanup_snapshot,
+                state,
+                cfg,
+                now_ms,
+            );
+            let flatten_intents = build_canary_exit_position_flatten_intents(
+                cfg,
+                state,
+                &exit_cleanup_snapshot,
+                &target_venues,
+                dispatch_tick,
+                now_ms,
+            );
             if flatten_intents.is_empty() {
                 eprintln!(
                     "[runner] canary_exit_position_flatten_cleanup no_flatten_intents attempt={} target_venues={}",
@@ -15684,7 +15734,9 @@ fn build_extended_terminal_sub_lot_residual_convergence_intents(
     let Some(price) = inventory_brake_unwind_price(cfg, state, venue_index, side) else {
         return intents;
     };
-    if residual_abs * price + 1e-9 < venue.min_notional_usd {
+    if residual_abs * price + 1e-9 < venue.min_notional_usd
+        && !extended_terminal_sub_lot_reduce_allow_below_min_notional()
+    {
         push_emergency_residual_fallback_record(
             residual_fallback.as_mut().map(|status| &mut **status),
             class,
@@ -26364,6 +26416,150 @@ mod tests {
             .expect("terminal sub-lot record");
         assert_eq!(record.status, EmergencyResidualFallbackDecision::Used);
         assert!((record.clamped_size_tao - 0.006).abs() < 1e-12);
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_uses_extended_sub_lot_when_generic_suppresses_dust() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ALLOW_BELOW_MIN_NOTIONAL",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ALLOW_BELOW_MIN_NOTIONAL",
+            "1",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let tick = 91;
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.004;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == extended { 0.004 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        let target_venues = vec![extended];
+        let generic = build_canary_breach_flatten_intents(&cfg, &state, &target_venues, tick);
+        assert!(generic.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == extended)
+        }));
+
+        let intents = build_canary_exit_position_flatten_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            &target_venues,
+            tick,
+            now_ms,
+        );
+        let place = intents
+            .iter()
+            .find_map(|intent| match intent {
+                OrderIntent::Place(place) if place.venue_index == extended => Some(place),
+                _ => None,
+            })
+            .expect("extended sub-lot exit cleanup intent");
+        assert_eq!(place.side, Side::Sell);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!(!place.post_only);
+        assert!((place.size - 0.004).abs() < 1e-12);
+        assert_eq!(place.purpose, OrderPurpose::Hedge);
+        assert!(place.phase51_target_key.is_none());
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_keeps_extended_sub_lot_disabled_by_default() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ALLOW_BELOW_MIN_NOTIONAL",
+        ]);
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 12_000;
+        let tick = 91;
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.004;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+
+        let snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    position_tao: if venue_index == extended { 0.004 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+        let intents = build_canary_exit_position_flatten_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            &[extended],
+            tick,
+            now_ms,
+        );
+        assert!(intents.iter().all(|intent| {
+            !matches!(intent, OrderIntent::Place(place) if place.venue_index == extended)
+        }));
     }
 
     #[test]
