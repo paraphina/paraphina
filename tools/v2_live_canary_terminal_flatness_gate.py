@@ -688,7 +688,10 @@ def evaluate_terminal_flatness(
         and cleanup_report["blocked_post_dispatch_account_truth_count"] == 0
         and cleanup_report["incomplete_residual_count"] == 0
         and cleanup_report["terminal_cancel_timeout_count"] == 0
-        and cleanup_report["terminal_cancel_all_incomplete_count"] == 0
+        and (
+            cleanup_report["terminal_cancel_all_incomplete_count"] == 0
+            or cleanup_report["cancel_all_incomplete_direct_venue_audit_cleared"]
+        )
         and cleanup_report["hyperliquid_cancel_all_post_inflight_max"] <= 1
         and direct_venue_status == "PASS"
         and run_binding_status == "PASS"

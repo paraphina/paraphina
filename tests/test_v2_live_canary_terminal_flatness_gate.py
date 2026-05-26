@@ -804,6 +804,41 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertFalse(report["governance"]["blocker_cleared"])
         self.assertFalse(report["governance"]["approved_for_promotion"])
 
+    def test_promotion_cleanup_strict_allows_final_freshness_gap_after_cancel_incomplete_cleared_by_direct_audit(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_stderr=(
+                "[runner] canary_exit_cancel_all_cleanup incomplete "
+                "tracked_open_orders=1 venues=hyperliquid\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_not_fresh "
+                "phase=final_check venue=paradex account_ok=true account_available=false\n"
+                "[runner] canary_exit_position_flatten_cleanup account_refresh_applied "
+                "phase=final_check requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_changed=false "
+                "remaining_venues=\n"
+                "[runner] canary_exit_position_flatten_cleanup blocked_final_account_truth "
+                "requested_venues=extended,hyperliquid,aster,lighter,paradex "
+                "fresh_venues=extended,hyperliquid,aster,lighter position_tol_tao=0.002500\n"
+            ),
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "PASS")
+        self.assertTrue(
+            report["terminal_cleanup"]["cancel_all_incomplete_direct_venue_audit_cleared"]
+        )
+        self.assertTrue(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_superseded"]
+        )
+        self.assertEqual(
+            report["terminal_cleanup"]["final_account_truth_direct_venue_audit_venues"],
+            ["paradex"],
+        )
+        self.assertEqual(report["closeout_status"]["promotion_cleanup_strict_status"], "PASS")
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+        self.assertFalse(report["governance"]["blocker_cleared"])
+        self.assertFalse(report["governance"]["approved_for_promotion"])
+
     def test_promotion_cleanup_strict_holds_final_direct_audit_supersession_when_remaining_nonempty(self):
         report = self.evaluate(
             audit_doc(),
