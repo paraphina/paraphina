@@ -461,6 +461,7 @@ impl PaperExecutionAdapter {
                 venue_id,
                 seq: self.account_seq,
                 timestamp_ms: now_ms,
+                open_order_count: None,
                 positions: vec![PositionSnapshot {
                     symbol: "TAO".to_string(),
                     size: position,

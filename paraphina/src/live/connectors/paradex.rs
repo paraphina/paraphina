@@ -3893,6 +3893,7 @@ fn parse_account_snapshot(
                 .get("timestamp_ms")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0),
+            open_order_count: None,
             positions,
             balances,
             funding_8h: value.get("funding_8h").and_then(|v| v.as_f64()),
@@ -3923,6 +3924,7 @@ fn parse_account_snapshot(
                 .get("updated_at")
                 .and_then(parse_i64_value)
                 .unwrap_or(0),
+            open_order_count: None,
             positions: Vec::new(),
             balances: vec![BalanceSnapshot {
                 asset: settlement_asset.to_string(),
@@ -5147,6 +5149,7 @@ fn account_event(
         venue_id: venue_id.to_string(),
         seq,
         timestamp_ms,
+        open_order_count: None,
         positions,
         balances,
         funding_8h: account.funding_8h,

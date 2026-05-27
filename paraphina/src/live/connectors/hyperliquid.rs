@@ -6908,6 +6908,7 @@ fn parse_account_snapshot_with_meta(
         venue_id: venue_id.to_string(),
         seq,
         timestamp_ms,
+        open_order_count: None,
         positions,
         balances,
         funding_8h,
@@ -6983,6 +6984,7 @@ fn parse_clearinghouse_account_snapshot(
         venue_id: venue_id.to_string(),
         seq: data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
         timestamp_ms: data.get("time").and_then(parse_i64_value).unwrap_or(0),
+        open_order_count: None,
         positions,
         balances: vec![BalanceSnapshot {
             asset: "USD".to_string(),

@@ -112,6 +112,7 @@ mod tests {
             venue_id: cfg.venues[0].id.to_string(),
             seq: 1,
             timestamp_ms: now_ms,
+            open_order_count: None,
             positions: vec![PositionSnapshot {
                 symbol: "TAO-PERP".to_string(),
                 size: 2.0,

@@ -130,6 +130,8 @@ pub struct AccountSnapshot {
     pub venue_id: String,
     pub seq: u64,
     pub timestamp_ms: TimestampMs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_order_count: Option<usize>,
     pub positions: Vec<PositionSnapshot>,
     pub balances: Vec<BalanceSnapshot>,
     pub funding_8h: Option<f64>,

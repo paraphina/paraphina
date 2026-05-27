@@ -3897,6 +3897,7 @@ mod tests {
                 "account_index": 123,
                 "available_balance": "990.0",
                 "collateral": "1000.0",
+                "pending_order_count": "0",
                 "transaction_time": 1_700_000_000_123_000i64,
                 "positions": [{
                     "symbol": "ETH",
@@ -3932,6 +3933,7 @@ mod tests {
         assert_eq!(snapshot.venue_id, "LIGHTER");
         assert_eq!(snapshot.venue_index, 3);
         assert_eq!(snapshot.timestamp_ms, 1_700_000_000_123);
+        assert_eq!(snapshot.open_order_count, Some(0));
         assert_eq!(snapshot.positions.len(), 1);
         assert!((snapshot.positions[0].size + 2.5).abs() < 1e-9);
         assert_eq!(snapshot.liquidation.price_liq, Some(2100.0));
@@ -7734,12 +7736,17 @@ fn parse_account_snapshot_with_meta(
             None,
         )
     };
+    let open_order_count = account
+        .get("pending_order_count")
+        .and_then(parse_i64_value)
+        .and_then(|count| usize::try_from(count).ok());
 
     Some(AccountSnapshot {
         venue_index,
         venue_id: venue_id.to_string(),
         seq,
         timestamp_ms,
+        open_order_count,
         positions,
         balances,
         funding_8h,

@@ -32,6 +32,7 @@ mod tests {
             venue_id: "venue_b".to_string(),
             seq: 7,
             timestamp_ms: 2_000,
+            open_order_count: None,
             positions: vec![PositionSnapshot {
                 symbol: "TAO-PERP".to_string(),
                 size: 5.0,

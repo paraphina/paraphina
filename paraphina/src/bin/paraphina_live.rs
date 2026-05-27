@@ -5003,6 +5003,7 @@ fn send_unavailable_account_snapshot_for(
         venue_id: venue.id.clone(),
         seq: 0,
         timestamp_ms: 0,
+        open_order_count: None,
         positions: Vec::new(),
         balances: Vec::new(),
         funding_8h: None,
@@ -5231,6 +5232,7 @@ mod tests {
             venue_id: venue_id.to_string(),
             seq: 7,
             timestamp_ms: 1_234,
+            open_order_count: None,
             positions: vec![PositionSnapshot {
                 symbol: "ETH-USD".to_string(),
                 size,

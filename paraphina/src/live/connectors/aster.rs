@@ -2636,6 +2636,7 @@ fn parse_account_snapshot(
         venue_id: venue_id.to_string(),
         seq,
         timestamp_ms,
+        open_order_count: None,
         positions,
         balances,
         funding_8h: None,
@@ -3598,6 +3599,7 @@ fn account_event(
         venue_id: venue_id.to_string(),
         seq,
         timestamp_ms,
+        open_order_count: None,
         positions,
         balances,
         funding_8h: account.funding_8h,
@@ -4447,6 +4449,7 @@ mod tests {
             venue_id: "ASTER".to_string(),
             seq: 1,
             timestamp_ms: 1000,
+            open_order_count: None,
             positions: vec![PositionSnapshot {
                 symbol: "ETHUSDT".to_string(),
                 size: 0.05,
@@ -4517,6 +4520,7 @@ mod tests {
             venue_id: "ASTER".to_string(),
             seq: 7,
             timestamp_ms: 2_000,
+            open_order_count: None,
             positions: vec![PositionSnapshot {
                 symbol: "ETHUSDT".to_string(),
                 size: 0.02,

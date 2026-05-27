@@ -167,6 +167,7 @@ pub struct VenueAccountCache {
     pub venue_id: Arc<str>,
     pub seq: u64,
     pub last_update_ms: Option<TimestampMs>,
+    pub open_order_count: Option<usize>,
     pub positions: Vec<super::types::PositionSnapshot>,
     pub balances: Vec<super::types::BalanceSnapshot>,
     pub position_tao: f64,
@@ -183,6 +184,7 @@ impl VenueAccountCache {
             venue_id,
             seq: 0,
             last_update_ms: None,
+            open_order_count: None,
             positions: Vec::new(),
             balances: Vec::new(),
             position_tao: 0.0,
@@ -222,6 +224,7 @@ impl VenueAccountCache {
         }
         self.seq = snapshot.seq;
         self.last_update_ms = Some(snapshot.timestamp_ms);
+        self.open_order_count = snapshot.open_order_count;
         self.positions = snapshot.positions.clone();
         self.balances = snapshot.balances.clone();
         self.funding_8h = snapshot.funding_8h;
@@ -242,6 +245,7 @@ impl VenueAccountCache {
         }
         self.seq = self.seq.max(snapshot.seq);
         self.last_update_ms = Some(snapshot.timestamp_ms);
+        self.open_order_count = snapshot.open_order_count;
         self.positions = snapshot.positions.clone();
         self.balances = snapshot.balances.clone();
         self.funding_8h = snapshot.funding_8h;
@@ -290,6 +294,7 @@ pub struct VenueAccountSnapshot {
     pub venue_id: Arc<str>,
     pub seq: u64,
     pub timestamp_ms: Option<TimestampMs>,
+    pub open_order_count: Option<usize>,
     pub position_tao: f64,
     pub avg_entry_price: f64,
     pub funding_8h: Option<f64>,
@@ -444,6 +449,7 @@ impl LiveStateCache {
                 venue_id: a.venue_id.clone(),
                 seq: a.seq,
                 timestamp_ms: a.last_update_ms,
+                open_order_count: a.open_order_count,
                 position_tao: a.position_tao,
                 avg_entry_price: a.avg_entry_price,
                 funding_8h: a.funding_8h,
@@ -502,6 +508,7 @@ impl LiveStateCache {
                     venue_id: a.venue_id.clone(),
                     seq: a.seq,
                     timestamp_ms: a.last_update_ms,
+                    open_order_count: a.open_order_count,
                     position_tao: a.position_tao,
                     avg_entry_price: a.avg_entry_price,
                     funding_8h: a.funding_8h,
@@ -743,6 +750,7 @@ mod tests {
             venue_id: cfg.venues[0].id.clone(),
             seq: 5,
             timestamp_ms: 1_000,
+            open_order_count: None,
             positions: Vec::new(),
             balances: Vec::new(),
             funding_8h: Some(0.001),
@@ -776,6 +784,7 @@ mod tests {
             venue_id: cfg.venues[0].id.clone(),
             seq: 5,
             timestamp_ms: 1_000,
+            open_order_count: None,
             positions: Vec::new(),
             balances: Vec::new(),
             funding_8h: None,
@@ -796,6 +805,7 @@ mod tests {
         let stale_seq_truth = AccountSnapshot {
             seq: 4,
             timestamp_ms: 2_000,
+            open_order_count: Some(0),
             positions: vec![PositionSnapshot {
                 symbol: "ETH".to_string(),
                 size: 0.03,
@@ -815,6 +825,7 @@ mod tests {
         let snapshot = cache.snapshot(2_000, 1_000);
         assert_eq!(snapshot.account[0].seq, 5);
         assert_eq!(snapshot.account[0].timestamp_ms, Some(2_000));
+        assert_eq!(snapshot.account[0].open_order_count, Some(0));
         assert!((snapshot.account[0].position_tao - 0.03).abs() < 1e-12);
     }
 
@@ -828,6 +839,7 @@ mod tests {
             venue_id: cfg.venues[venue_index].id.clone(),
             seq: 5,
             timestamp_ms: 1_000,
+            open_order_count: None,
             positions: vec![PositionSnapshot {
                 symbol: "ETH".to_string(),
                 size: -0.01,
@@ -853,6 +865,7 @@ mod tests {
             venue_id: cfg.venues[venue_index].id.to_ascii_uppercase(),
             seq: 4,
             timestamp_ms: 2_000,
+            open_order_count: None,
             positions: Vec::new(),
             margin: MarginSnapshot {
                 balance_usd: 10_000.0,
@@ -880,6 +893,7 @@ mod tests {
             venue_id: cfg.venues[1].id.clone(),
             seq: 1,
             timestamp_ms: 1_000,
+            open_order_count: None,
             positions: Vec::new(),
             balances: Vec::new(),
             funding_8h: None,

@@ -717,6 +717,7 @@ async fn build_account_snapshot(
         venue_id: cfg.venues[venue_index].id.clone(),
         seq,
         timestamp_ms: now_ms,
+        open_order_count: None,
         positions,
         balances,
         funding_8h: Some(mock_cfg.account_funding_8h),

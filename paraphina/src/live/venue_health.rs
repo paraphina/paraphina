@@ -269,6 +269,7 @@ mod tests {
                 venue_id: cfg.venues[0].id_arc.clone(),
                 seq: 1,
                 timestamp_ms: Some(1_000),
+                open_order_count: None,
                 position_tao: 0.0,
                 avg_entry_price: 0.0,
                 funding_8h: None,

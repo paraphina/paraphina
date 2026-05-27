@@ -14100,6 +14100,25 @@ fn fresh_account_position_tao(
         .map(|acct| acct.position_tao)
 }
 
+fn fresh_account_open_order_count(
+    cfg: &Config,
+    snapshot: &CanonicalCacheSnapshot,
+    venue_index: usize,
+    now_ms: TimestampMs,
+) -> Option<usize> {
+    snapshot
+        .account
+        .get(venue_index)
+        .filter(|acct| {
+            account_cache_snapshot_fresh(
+                acct,
+                now_ms,
+                account_snapshot_max_age_ms_for_venue(cfg, acct.venue_id.as_ref()),
+            )
+        })
+        .and_then(|acct| acct.open_order_count)
+}
+
 fn lighter_orderly_exit_residual_position_tao(
     cfg: &Config,
     state: &GlobalState,
@@ -14118,7 +14137,10 @@ fn lighter_orderly_exit_residual_position_tao(
         return None;
     }
     if live_open_order_count_for_venue(state, venue_index) != 0 && !allow_live_orders {
-        return None;
+        match fresh_account_open_order_count(cfg, snapshot, venue_index, now_ms) {
+            Some(0) => {}
+            Some(_) | None => return None,
+        }
     }
     let account_position_tao = fresh_account_position_tao(cfg, snapshot, venue_index, now_ms)?;
     if !account_position_tao.is_finite() {
@@ -20347,6 +20369,7 @@ mod tests {
                 venue_id: "extended".into(),
                 seq: 1,
                 timestamp_ms: Some(now_ms),
+                open_order_count: None,
                 position_tao: 0.25,
                 avg_entry_price: 100.0,
                 funding_8h: None,
@@ -20393,6 +20416,7 @@ mod tests {
                 venue_id: "lighter".into(),
                 seq: 7,
                 timestamp_ms: Some(now_ms),
+                open_order_count: None,
                 position_tao: 0.0,
                 avg_entry_price: 0.0,
                 funding_8h: None,
@@ -20513,6 +20537,7 @@ mod tests {
             venue_id: "extended".to_string(),
             seq: 2,
             timestamp_ms: now_ms + 500,
+            open_order_count: None,
             positions: vec![types::PositionSnapshot {
                 symbol: "ETH".to_string(),
                 size: 0.05,
@@ -20547,6 +20572,7 @@ mod tests {
             venue_id: "extended".to_string(),
             seq: 2,
             timestamp_ms: now_ms + 500,
+            open_order_count: None,
             positions: vec![types::PositionSnapshot {
                 symbol: "ETH".to_string(),
                 size: 0.05,
@@ -22891,6 +22917,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: state.venues[venue_index].position_tao,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -23201,6 +23228,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: state.venues[venue_index].position_tao,
                     avg_entry_price: 2_000.0,
                     funding_8h: None,
@@ -23290,6 +23318,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: state.venues[venue_index].position_tao,
                     avg_entry_price: 2_000.0,
                     funding_8h: None,
@@ -23403,6 +23432,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: state.venues[venue_index].position_tao,
                     avg_entry_price: 2_000.0,
                     funding_8h: None,
@@ -23510,6 +23540,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: state.venues[venue_index].position_tao,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -24722,6 +24753,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: state.venues[venue_index].position_tao,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -24798,6 +24830,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == 2 { 0.03 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -24847,6 +24880,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -24896,6 +24930,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == lighter { -0.0094 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -24951,6 +24986,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == lighter { -0.0094 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25001,6 +25037,81 @@ mod tests {
     }
 
     #[test]
+    fn lighter_orderly_exit_residual_convergence_uses_fresh_zero_pending_order_truth() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let now_ms = 120_000;
+        let lighter = 3;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[lighter].position_tao = -0.006;
+        state.venues[lighter].mid = Some(2_350.0);
+        state.venues[lighter].spread = Some(0.2);
+        seed_open_orders(&mut state, lighter, 1, now_ms);
+
+        let snapshot_with_pending = |pending: Option<usize>| CanonicalCacheSnapshot {
+            timestamp_ms: now_ms,
+            market: Vec::new(),
+            account: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueAccountSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(now_ms),
+                    open_order_count: if venue_index == lighter {
+                        pending
+                    } else {
+                        None
+                    },
+                    position_tao: if venue_index == lighter { -0.006 } else { 0.0 },
+                    avg_entry_price: 2_350.0,
+                    funding_8h: None,
+                    margin_balance_usd: 100.0,
+                    margin_used_usd: 0.0,
+                    margin_available_usd: 100.0,
+                    price_liq: None,
+                    dist_liq_sigma: None,
+                    is_stale: false,
+                })
+                .collect(),
+        };
+
+        assert!(build_lighter_orderly_exit_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot_with_pending(Some(1)),
+            now_ms,
+            0.0025,
+            None
+        )
+        .is_empty());
+
+        let lighter_exit = build_lighter_orderly_exit_residual_convergence_intents(
+            &cfg,
+            &state,
+            &snapshot_with_pending(Some(0)),
+            now_ms,
+            0.0025,
+            None,
+        )
+        .into_iter()
+        .find_map(|intent| match intent {
+            OrderIntent::Place(place) if place.venue_index == lighter => Some(place),
+            _ => None,
+        })
+        .expect("fresh Lighter account truth with zero pending orders permits residual cleanup");
+
+        assert_eq!(lighter_exit.side, Side::Buy);
+        assert!((lighter_exit.size - 0.006).abs() < 1e-12);
+        assert!(lighter_exit.reduce_only);
+        assert_eq!(lighter_exit.time_in_force, TimeInForce::Ioc);
+    }
+
+    #[test]
     fn lighter_terminal_residual_convergence_allows_stale_internal_live_orders_after_terminal_grace(
     ) {
         let cfg = Config::default();
@@ -25027,6 +25138,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == lighter { -0.006 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25087,6 +25199,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25140,6 +25253,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster {
                         0.01
                     } else if venue_index == lighter {
@@ -25230,6 +25344,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.03 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25305,6 +25420,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { -0.005 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25357,6 +25473,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { -0.005 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25417,6 +25534,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25496,6 +25614,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: timestamp_ms as u64,
                     timestamp_ms: Some(timestamp_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25612,6 +25731,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25703,6 +25823,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25777,6 +25898,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -25962,6 +26084,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { -0.008 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26060,6 +26183,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { -0.008 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26138,6 +26262,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { -0.008 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26216,6 +26341,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == hyperliquid {
                         -0.0044
                     } else {
@@ -26299,6 +26425,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == hyperliquid {
                         -0.0044
                     } else {
@@ -26372,6 +26499,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == extended { 0.006 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26460,6 +26588,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == extended { 0.004 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26537,6 +26666,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == extended { 0.004 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26599,6 +26729,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == extended { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26682,6 +26813,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == extended { -0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26765,6 +26897,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == extended { 0.02 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26841,6 +26974,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == extended { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26913,6 +27047,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == extended { 0.006 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -26993,6 +27128,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27056,6 +27192,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27141,6 +27278,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27257,6 +27395,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27341,6 +27480,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27410,6 +27550,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster {
                         0.01
                     } else if venue_index == lighter {
@@ -27521,6 +27662,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27586,6 +27728,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27648,6 +27791,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27720,6 +27864,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == aster { 0.01 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27771,6 +27916,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27854,6 +28000,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -27940,6 +28087,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28033,6 +28181,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28127,6 +28276,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28223,6 +28373,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28318,6 +28469,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28402,6 +28554,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28501,6 +28654,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28590,6 +28744,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28674,6 +28829,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28766,6 +28922,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28863,6 +29020,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -28953,6 +29111,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -29031,6 +29190,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == hyperliquid {
                         -0.01
                     } else {
@@ -29129,6 +29289,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -29197,6 +29358,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms - 11_000),
+                    open_order_count: None,
                     position_tao: if venue_index == 2 { -0.04 } else { 0.0 },
                     avg_entry_price: 2_350.0,
                     funding_8h: None,
@@ -29262,6 +29424,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 0,
                     timestamp_ms: None,
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 0.0,
                     funding_8h: None,
@@ -29321,6 +29484,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == 2 { 0.01 } else { 0.0 },
                     avg_entry_price: if venue_index == 2 { 3_960.35 } else { 0.0 },
                     funding_8h: None,
@@ -29382,6 +29546,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == 3 { 0.01 } else { 0.0 },
                     avg_entry_price: if venue_index == 3 { 2_074.51 } else { 0.0 },
                     funding_8h: None,
@@ -29438,6 +29603,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 0.0,
                     funding_8h: None,
@@ -29492,6 +29658,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: if venue_index < 2 { 1 } else { 0 },
                     timestamp_ms: if venue_index < 2 { Some(now_ms) } else { None },
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 0.0,
                     funding_8h: None,
@@ -29553,6 +29720,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: if venue_index < 2 { 1 } else { 0 },
                     timestamp_ms: if venue_index < 2 { Some(now_ms) } else { None },
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 0.0,
                     funding_8h: None,
@@ -29621,6 +29789,7 @@ mod tests {
                     } else {
                         None
                     },
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 0.0,
                     funding_8h: None,
@@ -29687,6 +29856,7 @@ mod tests {
                     } else {
                         Some(now_ms)
                     },
+                    open_order_count: None,
                     position_tao: 0.0,
                     avg_entry_price: 0.0,
                     funding_8h: None,
@@ -29793,6 +29963,7 @@ mod tests {
                 venue_id: "lighter".into(),
                 seq: 1,
                 timestamp_ms: Some(now_ms - 2_500),
+                open_order_count: None,
                 position_tao: 0.12,
                 avg_entry_price: 2_350.0,
                 funding_8h: None,
@@ -31379,6 +31550,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms,
+                    open_order_count: None,
                     position_tao: if index == venue_index {
                         position_tao
                     } else {
@@ -31409,6 +31581,7 @@ mod tests {
             venue_id: cfg.venues[venue_index].id.clone(),
             seq,
             timestamp_ms,
+            open_order_count: None,
             positions: if position_tao.abs() > 0.0 {
                 vec![types::PositionSnapshot {
                     symbol: "ETH".to_string(),
@@ -33748,6 +33921,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == hyperliquid {
                         -0.01
                     } else {
@@ -33812,6 +33986,7 @@ mod tests {
                     venue_id: venue.id_arc.clone(),
                     seq: 1,
                     timestamp_ms: Some(now_ms),
+                    open_order_count: None,
                     position_tao: if venue_index == hyperliquid {
                         -0.01
                     } else {
