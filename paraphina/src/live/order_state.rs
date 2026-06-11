@@ -780,15 +780,11 @@ impl LiveOrderState {
 
     fn snapshot_order_key(&self, order: &OpenOrderSnapshot) -> String {
         order
-            .client_order_id
-            .clone()
-            .or_else(|| {
-                order
-                    .exchange_order_id
-                    .as_ref()
-                    .and_then(|id| self.exchange_to_key.get(id).cloned())
-            })
+            .exchange_order_id
+            .as_ref()
+            .and_then(|id| self.exchange_to_key.get(id).cloned())
             .or_else(|| self.exchange_to_key.get(&order.order_id).cloned())
+            .or_else(|| order.client_order_id.clone())
             .or_else(|| order.exchange_order_id.clone())
             .unwrap_or_else(|| order.order_id.clone())
     }
@@ -1407,6 +1403,69 @@ mod tests {
             .orders
             .get("co_aster_snapshot")
             .expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert!(state.open_order_ids_by_venue(2).is_empty());
+    }
+
+    #[test]
+    fn aster_snapshot_prefers_existing_exchange_alias_before_client_id() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                2,
+                "123456789",
+                "co_aster_alias",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                10,
+            ),
+            1_000,
+        );
+
+        state.reconcile(
+            &OrderSnapshot {
+                venue_index: 2,
+                venue_id: "aster".to_string(),
+                seq: 11,
+                timestamp_ms: 2_000,
+                open_orders: vec![OpenOrderSnapshot {
+                    order_id: "123456789".to_string(),
+                    client_order_id: Some("co_aster_alias".to_string()),
+                    exchange_order_id: None,
+                    side: Side::Buy,
+                    price: 100.0,
+                    size: 0.01,
+                    purpose: None,
+                }],
+            },
+            2_000,
+        );
+
+        assert_eq!(state.orders.len(), 1);
+        assert!(state.orders.contains_key("co_aster_alias"));
+        assert_eq!(
+            state.open_order_ids_by_venue(2),
+            vec!["123456789".to_string()]
+        );
+
+        state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 2,
+                venue_id: "aster".into(),
+                order_id: "123456789".to_string(),
+                client_order_id: None,
+                seq: Some(12),
+                side: None,
+                price: None,
+                size: None,
+                purpose: None,
+            }),
+            3_000,
+        );
+
+        let order = state.orders.get("co_aster_alias").expect("tracked order");
         assert_eq!(order.status, OrderStatus::Cancelled);
         assert!(state.open_order_ids_by_venue(2).is_empty());
     }

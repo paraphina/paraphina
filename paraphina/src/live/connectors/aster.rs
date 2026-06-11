@@ -2315,10 +2315,10 @@ impl LiveRestClient for AsterRestClient {
             if !status.is_success() {
                 return Err(map_rest_error(status.as_u16(), &body));
             }
-            let order_id = parse_order_id(&body).or(Some(req.client_order_id));
+            let order_id = parse_order_id(&body).or_else(|| Some(req.client_order_id.clone()));
             Ok(LiveRestResponse {
                 order_id,
-                client_order_id: None,
+                client_order_id: Some(req.client_order_id),
             })
         })
     }
