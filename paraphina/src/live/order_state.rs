@@ -864,14 +864,20 @@ fn supports_supported_replace_snapshot_gap_grace(venue_id: &str, order: &LiveOrd
         && order.side.is_some()
 }
 
+fn supports_independent_snapshot_seq_reconcile(venue_id: &str, order: &LiveOrder) -> bool {
+    (venue_id.eq_ignore_ascii_case("aster")
+        || venue_id.eq_ignore_ascii_case("extended")
+        || venue_id.eq_ignore_ascii_case("lighter"))
+        && order.purpose == Some(OrderPurpose::Mm)
+        && order.side.is_some()
+}
+
 fn supports_missing_snapshot_lower_seq_reconcile(venue_id: &str, order: &LiveOrder) -> bool {
-    venue_id.eq_ignore_ascii_case("lighter")
-        && supports_supported_replace_snapshot_gap_grace(venue_id, order)
+    supports_independent_snapshot_seq_reconcile(venue_id, order)
 }
 
 fn supports_present_snapshot_lower_seq_reconcile(venue_id: &str, order: &LiveOrder) -> bool {
-    venue_id.eq_ignore_ascii_case("lighter")
-        && supports_supported_replace_snapshot_gap_grace(venue_id, order)
+    supports_independent_snapshot_seq_reconcile(venue_id, order)
 }
 
 fn supported_replace_snapshot_gap_id_state(raw: Option<&str>) -> &'static str {
@@ -1321,6 +1327,75 @@ mod tests {
             state.open_order_ids_by_venue(1),
             vec!["oid_lighter".to_string()]
         );
+    }
+
+    #[test]
+    fn lower_seq_aster_missing_snapshot_cancels_stale_mm_order() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                2,
+                "oid_aster",
+                "co_aster",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        state.reconcile(
+            &OrderSnapshot {
+                venue_index: 2,
+                venue_id: "aster".to_string(),
+                seq: 3,
+                timestamp_ms: 2_000,
+                open_orders: Vec::new(),
+            },
+            2_000,
+        );
+
+        let order = state.orders.get("co_aster").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.gap_grace_started_ms, None);
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_order_ids_by_venue(2).is_empty());
+    }
+
+    #[test]
+    fn lower_seq_extended_missing_snapshot_enters_gap_grace_without_open_count() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                0,
+                "oid_extended",
+                "co_extended",
+                Side::Sell,
+                101.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        let empty_extended_snapshot = OrderSnapshot {
+            venue_index: 0,
+            venue_id: "extended".to_string(),
+            seq: 3,
+            timestamp_ms: 2_000,
+            open_orders: Vec::new(),
+        };
+        state.reconcile(&empty_extended_snapshot, 2_000);
+
+        let order = state.orders.get("co_extended").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::SnapshotGapGrace);
+        assert_eq!(order.gap_grace_started_ms, Some(2_000));
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_order_ids_by_venue(0).is_empty());
+        assert_eq!(state.active_orders().len(), 1);
     }
 
     #[test]
