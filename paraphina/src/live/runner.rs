@@ -3184,6 +3184,7 @@ fn drain_ordered_events(
     l2_snapshot_coalesce: bool,
     coalesce_ready_mask: u64,
     saw_l2_snapshot_mask_this_tick: &mut u64,
+    market_rx_drain_max_per_tick: Option<usize>,
     tick_delta_buffer_max: Option<usize>,
 ) -> Vec<OrderedEvent> {
     let mut out = Vec::with_capacity(64);
@@ -3210,7 +3211,20 @@ fn drain_ordered_events(
         }
     };
 
-    while let Ok(event) = market_rx.try_recv() {
+    let mut market_drained_this_call = 0usize;
+    loop {
+        if let Some(max) = market_rx_drain_max_per_tick {
+            if market_drained_this_call >= max {
+                if let Some(stats) = market_stats.as_deref_mut() {
+                    stats.cap_hits += 1;
+                }
+                break;
+            }
+        }
+        let Ok(event) = market_rx.try_recv() else {
+            break;
+        };
+        market_drained_this_call = market_drained_this_call.saturating_add(1);
         if let super::types::MarketDataEvent::L2Snapshot(snapshot) = &event {
             let vi = snapshot.venue_index;
             if vi < 64 {
@@ -4149,6 +4163,11 @@ pub async fn run_live_loop(
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0);
+    let market_rx_drain_max_per_tick: Option<usize> =
+        std::env::var("PARAPHINA_MARKET_RX_DRAIN_MAX_PER_TICK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0);
     let mut ext_seen_total: u64 = 0;
     let mut ext_seen_snapshot: u64 = 0;
     let mut ext_seen_delta: u64 = 0;
@@ -4405,6 +4424,7 @@ pub async fn run_live_loop(
             snapshot_coalesce_now,
             coalesce_ready_mask,
             &mut saw_l2_snapshot_mask_this_tick,
+            market_rx_drain_max_per_tick,
             tick_delta_buffer_max,
         ));
         let mut ordered_events = Vec::new();
@@ -20380,6 +20400,7 @@ mod tests {
             coalesce_ready_mask,
             &mut saw_l2_snapshot_mask_this_tick,
             None,
+            None,
         );
 
         let mut snapshots = 0;
@@ -20402,6 +20423,65 @@ mod tests {
         assert_eq!(snapshots, 1);
         assert_eq!(deltas, 0);
         assert_eq!(snapshot_seq, Some(13));
+    }
+
+    #[test]
+    fn market_rx_drain_cap_leaves_remaining_events_for_next_tick() {
+        let (market_tx, mut market_rx) = mpsc::channel(8);
+        let (_account_tx, mut account_rx) = mpsc::channel(1);
+        let mut exec_rx: Option<mpsc::Receiver<types::ExecutionEvent>> = None;
+        let mut order_snapshot_rx: Option<mpsc::Receiver<types::OrderSnapshot>> = None;
+        let mut saw_l2_snapshot_mask_this_tick: u64 = 0;
+        let mut stats = MarketRxStats::default();
+
+        for seq in 1..=3_u64 {
+            market_tx
+                .try_send(types::MarketDataEvent::L2Delta(types::L2Delta {
+                    venue_index: 0,
+                    venue_id: "TAO".to_string(),
+                    seq,
+                    timestamp_ms: 1_700_000_000_000 + seq as i64,
+                    changes: vec![BookLevelDelta {
+                        side: BookSide::Bid,
+                        price: 100.0 + seq as f64,
+                        size: 1.0,
+                    }],
+                }))
+                .unwrap();
+        }
+
+        let out = drain_ordered_events(
+            &mut market_rx,
+            &mut account_rx,
+            &mut exec_rx,
+            &mut order_snapshot_rx,
+            Some(&mut stats),
+            false,
+            false,
+            0,
+            &mut saw_l2_snapshot_mask_this_tick,
+            Some(2),
+            None,
+        );
+
+        let seqs = out
+            .iter()
+            .filter_map(|event| match &event.event {
+                CanonicalEvent::Market(types::MarketDataEvent::L2Delta(delta)) => Some(delta.seq),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(stats.drained, 2);
+        assert_eq!(stats.cap_hits, 1);
+
+        let remaining = market_rx
+            .try_recv()
+            .expect("third market event should remain queued for next tick");
+        match remaining {
+            types::MarketDataEvent::L2Delta(delta) => assert_eq!(delta.seq, 3),
+            other => panic!("unexpected remaining event: {other:?}"),
+        }
     }
 
     #[test]
@@ -21152,6 +21232,7 @@ mod tests {
             coalesce_ready_mask,
             &mut saw_l2_snapshot_mask_this_tick,
             None,
+            None,
         );
 
         let mut snapshots = 0;
@@ -21244,6 +21325,7 @@ mod tests {
             true,
             coalesce_ready_mask,
             &mut saw_l2_snapshot_mask_this_tick,
+            None,
             None,
         );
 
