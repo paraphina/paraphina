@@ -4594,6 +4594,63 @@ fn normalize_hyperliquid_batch_window_expanded_intents(
     passthrough
 }
 
+fn paradex_reduce_only_ioc_is_terminal(
+    venue_id: &str,
+    purpose: paraphina::types::OrderPurpose,
+    time_in_force: paraphina::types::TimeInForce,
+    post_only: bool,
+    reduce_only: bool,
+) -> bool {
+    venue_id.eq_ignore_ascii_case("paradex")
+        && time_in_force == paraphina::types::TimeInForce::Ioc
+        && !post_only
+        && reduce_only
+        && matches!(
+            purpose,
+            paraphina::types::OrderPurpose::Hedge | paraphina::types::OrderPurpose::Exit
+        )
+}
+
+fn place_intent_needs_terminal_ack(place: &paraphina::types::PlaceOrderIntent) -> bool {
+    paradex_reduce_only_ioc_is_terminal(
+        place.venue_id.as_ref(),
+        place.purpose,
+        place.time_in_force,
+        place.post_only,
+        place.reduce_only,
+    )
+}
+
+fn replace_intent_needs_terminal_ack(replace: &paraphina::types::ReplaceOrderIntent) -> bool {
+    paradex_reduce_only_ioc_is_terminal(
+        replace.venue_id.as_ref(),
+        replace.purpose,
+        replace.time_in_force,
+        replace.post_only,
+        replace.reduce_only,
+    )
+}
+
+fn append_non_resting_order_terminal_ack(
+    events: &mut Vec<paraphina::live::types::ExecutionEvent>,
+    venue_index: usize,
+    venue_id: &str,
+    order_id: &str,
+    now_ms: paraphina::types::TimestampMs,
+    seq: &mut u64,
+) {
+    *seq = seq.wrapping_add(1);
+    events.push(paraphina::live::types::ExecutionEvent::CancelAccepted(
+        paraphina::live::types::CancelAccepted {
+            venue_index,
+            venue_id: venue_id.to_string(),
+            seq: *seq,
+            timestamp_ms: now_ms,
+            order_id: order_id.to_string(),
+        },
+    ));
+}
+
 fn execution_events_from_gateway_result(
     intent: paraphina::types::OrderIntent,
     result: paraphina::live::gateway::LiveResult<paraphina::live::gateway::LiveRestResponse>,
@@ -4609,23 +4666,37 @@ fn execution_events_from_gateway_result(
         paraphina::types::OrderIntent::Place(place) => {
             *seq = seq.wrapping_add(1);
             match result {
-                Ok(resp) => vec![ExecutionEvent::OrderAccepted(OrderAccepted {
-                    venue_index: place.venue_index,
-                    venue_id: place.venue_id.to_string(),
-                    seq: *seq,
-                    timestamp_ms: now_ms,
-                    order_id: resp.order_id.clone().unwrap_or_else(|| {
+                Ok(resp) => {
+                    let order_id = resp.order_id.clone().unwrap_or_else(|| {
                         place
                             .client_order_id
                             .clone()
                             .unwrap_or_else(|| "unknown".to_string())
-                    }),
-                    client_order_id: resp.client_order_id.or(place.client_order_id.clone()),
-                    side: place.side,
-                    price: place.price,
-                    size: place.size,
-                    purpose: place.purpose,
-                })],
+                    });
+                    let mut events = vec![ExecutionEvent::OrderAccepted(OrderAccepted {
+                        venue_index: place.venue_index,
+                        venue_id: place.venue_id.to_string(),
+                        seq: *seq,
+                        timestamp_ms: now_ms,
+                        order_id: order_id.clone(),
+                        client_order_id: resp.client_order_id.or(place.client_order_id.clone()),
+                        side: place.side,
+                        price: place.price,
+                        size: place.size,
+                        purpose: place.purpose,
+                    })];
+                    if place_intent_needs_terminal_ack(&place) {
+                        append_non_resting_order_terminal_ack(
+                            &mut events,
+                            place.venue_index,
+                            place.venue_id.as_ref(),
+                            &order_id,
+                            now_ms,
+                            seq,
+                        );
+                    }
+                    events
+                }
                 Err(err) => vec![ExecutionEvent::OrderRejected(OrderRejected {
                     venue_index: place.venue_index,
                     venue_id: place.venue_id.to_string(),
@@ -4698,21 +4769,32 @@ fn execution_events_from_gateway_result(
                     venue_id: replace.venue_id.to_string(),
                     seq: *seq,
                     timestamp_ms: now_ms,
-                    order_id: replace.order_id,
+                    order_id: replace.order_id.clone(),
                 }));
                 *seq = seq.wrapping_add(1);
+                let accepted_order_id = order_id.unwrap_or_else(|| "unknown".to_string());
                 events.push(ExecutionEvent::OrderAccepted(OrderAccepted {
                     venue_index: replace.venue_index,
                     venue_id: replace.venue_id.to_string(),
                     seq: *seq,
                     timestamp_ms: now_ms,
-                    order_id: order_id.unwrap_or_else(|| "unknown".to_string()),
+                    order_id: accepted_order_id.clone(),
                     client_order_id,
                     side: replace.side,
                     price: replace.price,
                     size: replace.size,
                     purpose: replace.purpose,
                 }));
+                if replace_intent_needs_terminal_ack(&replace) {
+                    append_non_resting_order_terminal_ack(
+                        &mut events,
+                        replace.venue_index,
+                        replace.venue_id.as_ref(),
+                        &accepted_order_id,
+                        now_ms,
+                        seq,
+                    );
+                }
                 events
             }
             Err(err) => {
@@ -4789,23 +4871,34 @@ async fn handle_live_gateway_place<C: LiveRestClient>(
     match res {
         Ok(resp) => {
             *seq = seq.wrapping_add(1);
+            let order_id = resp.order_id.clone().unwrap_or_else(|| {
+                place
+                    .client_order_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
             events.push(ExecutionEvent::OrderAccepted(OrderAccepted {
                 venue_index: place.venue_index,
                 venue_id: place.venue_id.to_string(),
                 seq: *seq,
                 timestamp_ms: now_ms,
-                order_id: resp.order_id.clone().unwrap_or_else(|| {
-                    place
-                        .client_order_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string())
-                }),
+                order_id: order_id.clone(),
                 client_order_id: place.client_order_id.clone(),
                 side: place.side,
                 price: place.price,
                 size: place.size,
                 purpose: place.purpose,
             }));
+            if place_intent_needs_terminal_ack(&place) {
+                append_non_resting_order_terminal_ack(
+                    &mut events,
+                    place.venue_index,
+                    place.venue_id.as_ref(),
+                    &order_id,
+                    now_ms,
+                    seq,
+                );
+            }
         }
         Err(err) => {
             *seq = seq.wrapping_add(1);
@@ -6403,6 +6496,112 @@ mod tests {
             }
             other => panic!("expected order accepted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ioc_place_gateway_result_emits_terminal_close_after_accept() {
+        let intent = OrderIntent::Place(PlaceOrderIntent {
+            venue_index: 4,
+            venue_id: "paradex".into(),
+            side: Side::Sell,
+            price: 101.0,
+            size: 0.01,
+            purpose: OrderPurpose::Hedge,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: Some("co_pdx_ioc".to_string()),
+            phase51_target_key: None,
+        });
+        let mut seq = 10_u64;
+        let events = super::execution_events_from_gateway_result(
+            intent,
+            Ok(paraphina::live::gateway::LiveRestResponse {
+                order_id: Some("pdx_ioc".to_string()),
+                client_order_id: Some("co_pdx_ioc".to_string()),
+            }),
+            1_000,
+            &mut seq,
+        );
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ExecutionEvent::OrderAccepted(ack) => {
+                assert_eq!(ack.order_id, "pdx_ioc");
+                assert_eq!(ack.client_order_id.as_deref(), Some("co_pdx_ioc"));
+            }
+            other => panic!("expected order accepted, got {other:?}"),
+        }
+        match &events[1] {
+            ExecutionEvent::CancelAccepted(cancel) => {
+                assert_eq!(cancel.venue_id, "paradex");
+                assert_eq!(cancel.order_id, "pdx_ioc");
+            }
+            other => panic!("expected terminal cancel accepted, got {other:?}"),
+        }
+        assert_eq!(seq, 12);
+    }
+
+    #[test]
+    fn non_paradex_ioc_place_gateway_result_does_not_terminalize() {
+        let intent = OrderIntent::Place(PlaceOrderIntent {
+            venue_index: 2,
+            venue_id: "aster".into(),
+            side: Side::Sell,
+            price: 101.0,
+            size: 0.01,
+            purpose: OrderPurpose::Hedge,
+            time_in_force: TimeInForce::Ioc,
+            post_only: false,
+            reduce_only: true,
+            client_order_id: Some("co_aster_ioc".to_string()),
+            phase51_target_key: None,
+        });
+        let mut seq = 30_u64;
+        let events = super::execution_events_from_gateway_result(
+            intent,
+            Ok(paraphina::live::gateway::LiveRestResponse {
+                order_id: Some("aster_ioc".to_string()),
+                client_order_id: Some("co_aster_ioc".to_string()),
+            }),
+            3_000,
+            &mut seq,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ExecutionEvent::OrderAccepted(_)));
+        assert_eq!(seq, 31);
+    }
+
+    #[test]
+    fn gtc_place_gateway_result_emits_accept_without_terminal_close() {
+        let intent = OrderIntent::Place(PlaceOrderIntent {
+            venue_index: 4,
+            venue_id: "paradex".into(),
+            side: Side::Buy,
+            price: 100.0,
+            size: 0.01,
+            purpose: OrderPurpose::Mm,
+            time_in_force: TimeInForce::Gtc,
+            post_only: true,
+            reduce_only: false,
+            client_order_id: Some("co_pdx_gtc".to_string()),
+            phase51_target_key: None,
+        });
+        let mut seq = 20_u64;
+        let events = super::execution_events_from_gateway_result(
+            intent,
+            Ok(paraphina::live::gateway::LiveRestResponse {
+                order_id: Some("pdx_gtc".to_string()),
+                client_order_id: Some("co_pdx_gtc".to_string()),
+            }),
+            2_000,
+            &mut seq,
+        );
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ExecutionEvent::OrderAccepted(_)));
+        assert_eq!(seq, 21);
     }
 
     #[test]

@@ -2195,6 +2195,51 @@ mod tests {
     }
 
     #[test]
+    fn paradex_reduce_only_ioc_terminal_ack_sequence_not_open_and_remains_fill_attributable() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 4,
+                venue_id: "paradex".into(),
+                order_id: "oid_pdx_ioc".to_string(),
+                client_order_id: Some("co_pdx_ioc".to_string()),
+                seq: Some(1),
+                side: Some(Side::Sell),
+                price: Some(100.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Hedge),
+            }),
+            1_000,
+        );
+        state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 4,
+                venue_id: "paradex".into(),
+                order_id: "oid_pdx_ioc".to_string(),
+                client_order_id: Some("co_pdx_ioc".to_string()),
+                seq: Some(2),
+                side: None,
+                price: None,
+                size: None,
+                purpose: None,
+            }),
+            1_001,
+        );
+
+        assert!(state.open_order_ids_by_venue(4).is_empty());
+        assert!(state.open_orders().is_empty());
+
+        let inferred = state.infer_fills_from_position_delta(4, "paradex", -0.01, 3, 1_500);
+
+        assert_eq!(inferred.len(), 1);
+        assert_eq!(inferred[0].order_id.as_deref(), Some("oid_pdx_ioc"));
+        assert_eq!(inferred[0].client_order_id.as_deref(), Some("co_pdx_ioc"));
+        assert_eq!(inferred[0].side, Side::Sell);
+        assert_eq!(inferred[0].purpose, OrderPurpose::Hedge);
+        assert!((inferred[0].size - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
     fn account_position_delta_can_attribute_delayed_paradex_cancelled_order_fill() {
         let mut state = LiveOrderState::new();
         state.register_mm_decision_lineage(
