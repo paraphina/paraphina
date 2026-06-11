@@ -611,6 +611,7 @@ impl TelemetryBuilder {
             }
             let Some(source_decision_id) = lookup_order_decision_id(
                 state,
+                Some(fill.venue_index),
                 fill.order_id.as_deref(),
                 fill.client_order_id.as_deref(),
             ) else {
@@ -2432,8 +2433,12 @@ fn build_order_records(
             client_order_id.as_ref(),
             order_id.as_ref(),
         );
-        let decision_id =
-            lookup_order_decision_id(state, order_id.as_deref(), client_order_id.as_deref());
+        let decision_id = lookup_order_decision_id(
+            state,
+            (venue_index >= 0).then_some(venue_index as usize),
+            order_id.as_deref(),
+            client_order_id.as_deref(),
+        );
         let record = serde_json::json!({
             "action": action,
             "status": "intent",
@@ -2474,6 +2479,7 @@ fn build_order_records(
                 );
                 let decision_id = lookup_order_decision_id(
                     state,
+                    Some(ack.venue_index),
                     Some(&ack.order_id),
                     ack.client_order_id.as_deref(),
                 );
@@ -2511,6 +2517,7 @@ fn build_order_records(
                 );
                 let decision_id = lookup_order_decision_id(
                     state,
+                    Some(rej.venue_index),
                     rej.order_id.as_deref(),
                     rej.client_order_id.as_deref(),
                 );
@@ -2636,6 +2643,7 @@ fn build_fill_records(
         let record = find_fill_record(state, fill, now_ms);
         let decision_id = lookup_order_decision_id(
             state,
+            Some(fill.venue_index),
             fill.order_id.as_deref(),
             fill.client_order_id.as_deref(),
         );
@@ -2690,18 +2698,20 @@ fn build_fill_records(
 #[cfg(feature = "live")]
 fn lookup_order_decision_id(
     state: &GlobalState,
+    venue_index: Option<usize>,
     order_id: Option<&str>,
     client_order_id: Option<&str>,
 ) -> Option<String> {
     state
         .live_order_state
-        .decision_id_for_order(order_id, client_order_id)
+        .decision_id_for_order(venue_index?, order_id, client_order_id)
         .map(str::to_string)
 }
 
 #[cfg(not(feature = "live"))]
 fn lookup_order_decision_id(
     _state: &GlobalState,
+    _venue_index: Option<usize>,
     _order_id: Option<&str>,
     _client_order_id: Option<&str>,
 ) -> Option<String> {
@@ -2760,6 +2770,7 @@ fn attribute_hedge_source_decision(
             }
             let Some(source_decision_id) = lookup_order_decision_id(
                 state,
+                Some(venue_index),
                 fill.order_id.as_deref(),
                 fill.client_order_id.as_deref(),
             ) else {

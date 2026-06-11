@@ -65,7 +65,7 @@ pub struct InferredFill {
 #[derive(Debug, Default, Clone)]
 pub struct LiveOrderState {
     orders: HashMap<String, LiveOrder>,
-    exchange_to_key: HashMap<String, String>,
+    exchange_to_key: HashMap<(usize, String), String>,
 }
 
 impl LiveOrderState {
@@ -163,13 +163,28 @@ impl LiveOrderState {
 
     pub fn decision_id_for_order(
         &self,
+        venue_index: usize,
         order_id: Option<&str>,
         client_order_id: Option<&str>,
     ) -> Option<&str> {
         let key = client_order_id
-            .map(ToOwned::to_owned)
-            .or_else(|| order_id.and_then(|id| self.exchange_to_key.get(id).cloned()))
-            .or_else(|| order_id.map(ToOwned::to_owned))?;
+            .and_then(|id| {
+                self.orders
+                    .get(id)
+                    .is_some_and(|order| order.venue_index == venue_index)
+                    .then(|| id.to_string())
+            })
+            .or_else(|| {
+                order_id.and_then(|id| self.order_key_for_exchange_id_on_venue(venue_index, id))
+            })
+            .or_else(|| {
+                order_id.and_then(|id| {
+                    self.orders
+                        .get(id)
+                        .is_some_and(|order| order.venue_index == venue_index)
+                        .then(|| id.to_string())
+                })
+            })?;
         self.orders.get(&key)?.decision_id.as_deref()
     }
 
@@ -313,7 +328,8 @@ impl LiveOrderState {
                         entry.gap_grace_started_ms = None;
                         entry.last_update_seq = Some(prev.max(snapshot.seq));
                         if let Some(exchange_order_id) = exchange_order_id {
-                            self.exchange_to_key.insert(exchange_order_id, key.clone());
+                            self.exchange_to_key
+                                .insert((snapshot.venue_index, exchange_order_id), key.clone());
                         }
                     }
                     seen.insert(key, true);
@@ -351,7 +367,8 @@ impl LiveOrderState {
             entry.gap_grace_started_ms = None;
             entry.last_update_seq = Some(snapshot.seq);
             if let Some(exchange_order_id) = exchange_order_id {
-                self.exchange_to_key.insert(exchange_order_id, key.clone());
+                self.exchange_to_key
+                    .insert((snapshot.venue_index, exchange_order_id), key.clone());
             }
             seen.insert(key, true);
         }
@@ -649,7 +666,8 @@ impl LiveOrderState {
         entry.updated_ms = now_ms;
         entry.gap_grace_started_ms = None;
         entry.last_update_seq = seq;
-        self.exchange_to_key.insert(exchange_order_id, key);
+        self.exchange_to_key
+            .insert((venue_index, exchange_order_id), key);
     }
 
     fn apply_cancel_ack(
@@ -796,7 +814,9 @@ impl LiveOrderState {
         venue_index: usize,
         exchange_order_id: &str,
     ) -> Option<String> {
-        let key = self.exchange_to_key.get(exchange_order_id)?;
+        let key = self
+            .exchange_to_key
+            .get(&(venue_index, exchange_order_id.to_string()))?;
         let order = self.orders.get(key)?;
         (order.venue_index == venue_index).then(|| key.clone())
     }
@@ -1541,6 +1561,102 @@ mod tests {
     }
 
     #[test]
+    fn terminal_events_use_venue_scoped_exchange_aliases_after_collision() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 1,
+                venue_id: "lighter".into(),
+                order_id: "shared_terminal_order_id".to_string(),
+                client_order_id: Some("co_lighter_terminal".to_string()),
+                seq: Some(10),
+                side: Some(Side::Buy),
+                price: Some(100.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            1_000,
+        );
+        state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 2,
+                venue_id: "aster".into(),
+                order_id: "shared_terminal_order_id".to_string(),
+                client_order_id: Some("co_aster_terminal".to_string()),
+                seq: Some(10),
+                side: Some(Side::Sell),
+                price: Some(101.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            1_000,
+        );
+
+        state.apply_execution_event(
+            &ExecutionEvent::Fill(crate::types::FillEvent {
+                venue_index: 1,
+                venue_id: "lighter".into(),
+                order_id: Some("shared_terminal_order_id".to_string()),
+                client_order_id: None,
+                seq: Some(11),
+                side: Side::Buy,
+                price: 100.0,
+                size: 0.004,
+                purpose: OrderPurpose::Mm,
+                fee_bps: 0.0,
+            }),
+            1_100,
+        );
+        assert_eq!(
+            state.orders.get("co_lighter_terminal").unwrap().status,
+            OrderStatus::PartiallyFilled
+        );
+        assert_eq!(
+            state.orders.get("co_aster_terminal").unwrap().status,
+            OrderStatus::Accepted
+        );
+
+        state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 2,
+                venue_id: "aster".into(),
+                order_id: "shared_terminal_order_id".to_string(),
+                client_order_id: None,
+                seq: Some(12),
+                side: None,
+                price: None,
+                size: None,
+                purpose: None,
+            }),
+            1_200,
+        );
+        assert_eq!(
+            state.orders.get("co_aster_terminal").unwrap().status,
+            OrderStatus::Cancelled
+        );
+        assert_eq!(state.orders.len(), 2);
+
+        state.apply_execution_event(
+            &ExecutionEvent::OrderReject(OrderReject {
+                venue_index: 1,
+                venue_id: "lighter".into(),
+                order_id: Some("shared_terminal_order_id".to_string()),
+                client_order_id: None,
+                seq: Some(13),
+                purpose: None,
+                reduce_only: None,
+                reason: "sanitized_terminal_reject".to_string(),
+            }),
+            1_300,
+        );
+        assert_eq!(
+            state.orders.get("co_lighter_terminal").unwrap().status,
+            OrderStatus::Rejected
+        );
+        assert_eq!(state.orders.len(), 2);
+    }
+
+    #[test]
     fn lower_seq_extended_missing_snapshot_enters_gap_grace_without_open_count() {
         let mut state = LiveOrderState::new();
         state.apply_execution_event(
@@ -2127,7 +2243,7 @@ mod tests {
         assert_eq!(inferred[0].side, Side::Buy);
         assert!((inferred[0].size - 0.01).abs() < 1e-9);
         assert_eq!(
-            state.decision_id_for_order(Some("oid_pdx"), Some("co_pdx")),
+            state.decision_id_for_order(4, Some("oid_pdx"), Some("co_pdx")),
             Some("d_pdx_mm_buy")
         );
     }
@@ -2147,7 +2263,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.decision_id_for_order(None, Some("co_1")),
+            state.decision_id_for_order(0, None, Some("co_1")),
             Some("d1_mm_v0_buy")
         );
 
@@ -2166,7 +2282,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.decision_id_for_order(Some("oid_1"), Some("co_1")),
+            state.decision_id_for_order(0, Some("oid_1"), Some("co_1")),
             Some("d1_mm_v0_buy")
         );
 
@@ -2187,7 +2303,7 @@ mod tests {
         );
 
         assert_eq!(
-            state.decision_id_for_order(Some("oid_1"), Some("co_1")),
+            state.decision_id_for_order(0, Some("oid_1"), Some("co_1")),
             Some("d1_mm_v0_buy")
         );
     }
