@@ -16493,7 +16493,17 @@ fn apply_market_event_to_core_with_extended_truth(
         super::types::MarketDataEvent::L2Snapshot(snapshot) => {
             if let Some(v) = state.venues.get_mut(snapshot.venue_index) {
                 let is_extended = snapshot.venue_index == EXTENDED_IDX;
-                let current = if is_extended { Some(v.clone()) } else { None };
+                let venue_id = cfg
+                    .venues
+                    .get(snapshot.venue_index)
+                    .map(|venue| venue.id.as_str())
+                    .unwrap_or("unknown");
+                let freeze_top_of_book = is_extended || venue_id.eq_ignore_ascii_case("paradex");
+                let current = if freeze_top_of_book {
+                    Some(v.clone())
+                } else {
+                    None
+                };
                 let mut candidate = current.clone().unwrap_or_else(|| v.clone());
                 if let Ok(metrics) = candidate.apply_l2_snapshot(
                     &snapshot.bids,
@@ -16524,10 +16534,11 @@ fn apply_market_event_to_core_with_extended_truth(
                     });
                     if let Some(reason) = current
                         .as_ref()
-                        .and_then(|prev| extended_freeze_reason(cfg, prev, &candidate))
+                        .and_then(|prev| top_of_book_freeze_reason(cfg, prev, &candidate))
                     {
-                        // Keep Extended's internal book/sequence in sync, but do not let a
-                        // distorted top of book overwrite the last good quoted state.
+                        // Keep the internal book/sequence in sync, but do not let a distorted
+                        // top of book overwrite the last good quoted state and contaminate
+                        // local vol/toxicity.
                         v.orderbook_l2 = candidate.orderbook_l2;
                         v.last_book_update_ms = candidate.last_book_update_ms;
                         if let Some(truth) = truth.as_mut() {
@@ -16535,7 +16546,9 @@ fn apply_market_event_to_core_with_extended_truth(
                             truth.freeze_reason = Some(reason);
                         }
                         eprintln!(
-                            "WARN: Extended core book update frozen mid={} spread={}",
+                            "WARN: {} core book update frozen reason={:?} mid={} spread={}",
+                            venue_id,
+                            reason,
                             candidate.mid.unwrap_or(0.0),
                             candidate.spread.unwrap_or(0.0)
                         );
@@ -16554,7 +16567,17 @@ fn apply_market_event_to_core_with_extended_truth(
         super::types::MarketDataEvent::L2Delta(delta) => {
             if let Some(v) = state.venues.get_mut(delta.venue_index) {
                 let is_extended = delta.venue_index == EXTENDED_IDX;
-                let current = if is_extended { Some(v.clone()) } else { None };
+                let venue_id = cfg
+                    .venues
+                    .get(delta.venue_index)
+                    .map(|venue| venue.id.as_str())
+                    .unwrap_or("unknown");
+                let freeze_top_of_book = is_extended || venue_id.eq_ignore_ascii_case("paradex");
+                let current = if freeze_top_of_book {
+                    Some(v.clone())
+                } else {
+                    None
+                };
                 let mut candidate = current.clone().unwrap_or_else(|| v.clone());
                 if let Ok(metrics) = candidate.apply_l2_delta(
                     &delta.changes,
@@ -16584,10 +16607,11 @@ fn apply_market_event_to_core_with_extended_truth(
                     });
                     if let Some(reason) = current
                         .as_ref()
-                        .and_then(|prev| extended_freeze_reason(cfg, prev, &candidate))
+                        .and_then(|prev| top_of_book_freeze_reason(cfg, prev, &candidate))
                     {
-                        // Keep Extended's internal book/sequence in sync, but do not let a
-                        // distorted top of book overwrite the last good quoted state.
+                        // Keep the internal book/sequence in sync, but do not let a distorted
+                        // top of book overwrite the last good quoted state and contaminate
+                        // local vol/toxicity.
                         v.orderbook_l2 = candidate.orderbook_l2;
                         v.last_book_update_ms = candidate.last_book_update_ms;
                         if let Some(truth) = truth.as_mut() {
@@ -16595,7 +16619,9 @@ fn apply_market_event_to_core_with_extended_truth(
                             truth.freeze_reason = Some(reason);
                         }
                         eprintln!(
-                            "WARN: Extended core book update frozen mid={} spread={}",
+                            "WARN: {} core book update frozen reason={:?} mid={} spread={}",
+                            venue_id,
+                            reason,
                             candidate.mid.unwrap_or(0.0),
                             candidate.spread.unwrap_or(0.0)
                         );
@@ -16640,15 +16666,7 @@ fn apply_market_event_to_core_with_extended_truth(
     None
 }
 
-fn should_freeze_extended_top_of_book(
-    cfg: &Config,
-    current: &VenueState,
-    candidate: &VenueState,
-) -> bool {
-    extended_freeze_reason(cfg, current, candidate).is_some()
-}
-
-fn extended_freeze_reason(
+fn top_of_book_freeze_reason(
     cfg: &Config,
     current: &VenueState,
     candidate: &VenueState,
@@ -20889,6 +20907,202 @@ mod tests {
                 size: 5.0,
             }],
         })
+    }
+
+    fn paradex_snapshot(
+        seq: u64,
+        timestamp_ms: TimestampMs,
+        bid_px: f64,
+        ask_px: f64,
+    ) -> types::MarketDataEvent {
+        types::MarketDataEvent::L2Snapshot(types::L2Snapshot {
+            venue_index: 4,
+            venue_id: "paradex".to_string(),
+            seq,
+            timestamp_ms,
+            bids: vec![BookLevel {
+                price: bid_px,
+                size: 5.0,
+            }],
+            asks: vec![BookLevel {
+                price: ask_px,
+                size: 5.0,
+            }],
+        })
+    }
+
+    fn paradex_delta(
+        seq: u64,
+        timestamp_ms: TimestampMs,
+        changes: Vec<BookLevelDelta>,
+    ) -> types::MarketDataEvent {
+        types::MarketDataEvent::L2Delta(types::L2Delta {
+            venue_index: 4,
+            venue_id: "paradex".to_string(),
+            seq,
+            timestamp_ms,
+            changes,
+        })
+    }
+
+    #[test]
+    fn paradex_wide_spread_snapshot_freezes_last_good_top() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        apply_market_event_to_core(
+            &mut state,
+            &cfg,
+            &paradex_snapshot(1, 1_000, 2080.0, 2080.1),
+            1_000,
+            false,
+        );
+        let good_mid = state.venues[4].mid.expect("good mid");
+        let good_spread = state.venues[4].spread.expect("good spread");
+        let good_prev_ln_mid = state.venues[4].prev_ln_mid;
+        let good_local_vol_short = state.venues[4].local_vol_short;
+        let good_local_vol_long = state.venues[4].local_vol_long;
+
+        let truth = apply_market_event_to_core_with_extended_truth(
+            &mut state,
+            &cfg,
+            &paradex_snapshot(2, 1_100, 1631.235, 1653.705),
+            1_100,
+            false,
+        );
+
+        assert!(
+            truth.is_none(),
+            "Paradex should not use Extended truth sidecar"
+        );
+        assert_eq!(state.venues[4].mid, Some(good_mid));
+        assert_eq!(state.venues[4].spread, Some(good_spread));
+        assert_eq!(state.venues[4].prev_ln_mid, good_prev_ln_mid);
+        assert_eq!(state.venues[4].local_vol_short, good_local_vol_short);
+        assert_eq!(state.venues[4].local_vol_long, good_local_vol_long);
+        assert_eq!(state.venues[4].last_book_update_ms, Some(1_100));
+        assert_eq!(state.venues[4].last_mid_update_ms, Some(1_000));
+        assert_eq!(
+            state.venues[4]
+                .orderbook_l2
+                .best_bid()
+                .expect("best bid after freeze")
+                .price,
+            1631.235
+        );
+        assert_eq!(
+            state.venues[4]
+                .orderbook_l2
+                .best_ask()
+                .expect("best ask after freeze")
+                .price,
+            1653.705
+        );
+    }
+
+    #[test]
+    fn paradex_large_mid_jump_snapshot_freezes_last_good_top() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        apply_market_event_to_core(
+            &mut state,
+            &cfg,
+            &paradex_snapshot(1, 1_000, 2080.0, 2080.1),
+            1_000,
+            false,
+        );
+        let good_mid = state.venues[4].mid.expect("good mid");
+        let good_spread = state.venues[4].spread.expect("good spread");
+        let good_local_vol_short = state.venues[4].local_vol_short;
+
+        let truth = apply_market_event_to_core_with_extended_truth(
+            &mut state,
+            &cfg,
+            &paradex_snapshot(2, 1_100, 2111.45, 2111.55),
+            1_100,
+            false,
+        );
+
+        assert!(
+            truth.is_none(),
+            "Paradex should not use Extended truth sidecar"
+        );
+        assert_eq!(state.venues[4].mid, Some(good_mid));
+        assert_eq!(state.venues[4].spread, Some(good_spread));
+        assert_eq!(state.venues[4].local_vol_short, good_local_vol_short);
+        assert_eq!(state.venues[4].last_book_update_ms, Some(1_100));
+        assert_eq!(state.venues[4].last_mid_update_ms, Some(1_000));
+        assert_eq!(
+            state.venues[4]
+                .orderbook_l2
+                .best_bid()
+                .expect("best bid after freeze")
+                .price,
+            2111.45
+        );
+    }
+
+    #[test]
+    fn paradex_wide_spread_delta_freezes_last_good_top() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+
+        apply_market_event_to_core(
+            &mut state,
+            &cfg,
+            &paradex_snapshot(1, 1_000, 2080.0, 2080.1),
+            1_000,
+            false,
+        );
+        let good_mid = state.venues[4].mid.expect("good mid");
+        let good_spread = state.venues[4].spread.expect("good spread");
+        let good_prev_ln_mid = state.venues[4].prev_ln_mid;
+        let good_local_vol_short = state.venues[4].local_vol_short;
+        let good_local_vol_long = state.venues[4].local_vol_long;
+
+        let truth = apply_market_event_to_core_with_extended_truth(
+            &mut state,
+            &cfg,
+            &paradex_delta(
+                2,
+                1_100,
+                vec![
+                    BookLevelDelta {
+                        side: BookSide::Ask,
+                        price: 2080.1,
+                        size: 0.0,
+                    },
+                    BookLevelDelta {
+                        side: BookSide::Ask,
+                        price: 2124.0,
+                        size: 5.0,
+                    },
+                ],
+            ),
+            1_100,
+            false,
+        );
+
+        assert!(
+            truth.is_none(),
+            "Paradex should not use Extended truth sidecar"
+        );
+        assert_eq!(state.venues[4].mid, Some(good_mid));
+        assert_eq!(state.venues[4].spread, Some(good_spread));
+        assert_eq!(state.venues[4].prev_ln_mid, good_prev_ln_mid);
+        assert_eq!(state.venues[4].local_vol_short, good_local_vol_short);
+        assert_eq!(state.venues[4].local_vol_long, good_local_vol_long);
+        assert_eq!(state.venues[4].last_book_update_ms, Some(1_100));
+        assert_eq!(state.venues[4].last_mid_update_ms, Some(1_000));
+        assert_eq!(
+            state.venues[4]
+                .orderbook_l2
+                .best_ask()
+                .expect("best ask after freeze")
+                .price,
+            2124.0
+        );
     }
 
     #[test]
