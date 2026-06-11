@@ -1542,6 +1542,16 @@ fn update_applied_account_position_baselines(
     }
 }
 
+fn account_position_drift_should_audit_or_kill(
+    pos_kill_exempt: bool,
+    venue_position_changed_since_apply: bool,
+    position_drift_explained_by_live_orders: bool,
+) -> bool {
+    !(pos_kill_exempt
+        || venue_position_changed_since_apply
+        || position_drift_explained_by_live_orders)
+}
+
 fn account_position_drift_explained_by_live_orders(
     state: &GlobalState,
     snapshot: &super::types::AccountSnapshot,
@@ -4632,22 +4642,6 @@ pub async fn run_live_loop(
                         let pos_venue = derive_position_tao(&snapshot.positions);
                         let pos_diff = pos_internal - pos_venue;
                         if diff_exceeds(pos_internal, pos_venue, pos_tol) {
-                            push_reconcile_drift(
-                                &mut pending_drift_events,
-                                &audit_dir,
-                                ReconcileDriftRecord {
-                                    timestamp_ms: snapshot.timestamp_ms,
-                                    venue_index: snapshot.venue_index,
-                                    venue_id: snapshot.venue_id.clone(),
-                                    kind: "position_tao".to_string(),
-                                    internal: Some(pos_internal),
-                                    venue: Some(pos_venue),
-                                    diff: Some(pos_diff),
-                                    tolerance: Some(pos_tol),
-                                    source: "account_snapshot".to_string(),
-                                    available: true,
-                                },
-                            );
                             let venue_position_changed_since_apply =
                                 !applied_account_position_baselines
                                     .get(snapshot.venue_index)
@@ -4666,21 +4660,40 @@ pub async fn run_live_loop(
                                 );
                             let pos_kill_exempt = reconcile_pos_kill_exempt_venues
                                 .contains(&snapshot.venue_id.to_ascii_lowercase());
+                            let unresolved_position_drift =
+                                account_position_drift_should_audit_or_kill(
+                                    pos_kill_exempt,
+                                    venue_position_changed_since_apply,
+                                    position_drift_explained_by_live_orders,
+                                );
                             // A fresh account-side position change should be synchronized into
                             // state first. Reconciliation kills are reserved for stable,
                             // already-applied venue positions that state still fails to match.
                             // When tracked live orders fully explain the venue-side delta,
                             // let account-sync fill inference converge before escalating.
-                            if pos_kill_exempt
-                                || venue_position_changed_since_apply
-                                || position_drift_explained_by_live_orders
-                            {
+                            if !unresolved_position_drift {
                                 if let Some(streak) =
                                     position_drift_streaks.get_mut(snapshot.venue_index)
                                 {
                                     *streak = 0;
                                 }
                             } else {
+                                push_reconcile_drift(
+                                    &mut pending_drift_events,
+                                    &audit_dir,
+                                    ReconcileDriftRecord {
+                                        timestamp_ms: snapshot.timestamp_ms,
+                                        venue_index: snapshot.venue_index,
+                                        venue_id: snapshot.venue_id.clone(),
+                                        kind: "position_tao".to_string(),
+                                        internal: Some(pos_internal),
+                                        venue: Some(pos_venue),
+                                        diff: Some(pos_diff),
+                                        tolerance: Some(pos_tol),
+                                        source: "account_snapshot".to_string(),
+                                        available: true,
+                                    },
+                                );
                                 let drift_streak = if let Some(streak) =
                                     position_drift_streaks.get_mut(snapshot.venue_index)
                                 {
@@ -20622,6 +20635,22 @@ mod tests {
             .expect("tracked order");
         assert_eq!(live_order.status, OrderStatus::PartiallyFilled);
         assert_eq!(live_order.remaining_qty, Some(0.3));
+    }
+
+    #[test]
+    fn account_position_drift_audit_is_reserved_for_unresolved_mismatch() {
+        assert!(account_position_drift_should_audit_or_kill(
+            false, false, false
+        ));
+        assert!(!account_position_drift_should_audit_or_kill(
+            true, false, false
+        ));
+        assert!(!account_position_drift_should_audit_or_kill(
+            false, true, false
+        ));
+        assert!(!account_position_drift_should_audit_or_kill(
+            false, false, true
+        ));
     }
 
     #[test]
