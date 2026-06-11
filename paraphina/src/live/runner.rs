@@ -10374,13 +10374,14 @@ fn build_canary_exit_position_flatten_intents(
         return intents;
     }
     intents.extend(
-        build_extended_terminal_sub_lot_residual_convergence_intents(
+        build_extended_terminal_sub_lot_residual_convergence_intents_with_purpose(
             cfg,
             state,
             snapshot,
             now_ms,
             None,
             EmergencyRequestClass::SoftUnwind,
+            OrderPurpose::Exit,
             None,
         ),
     );
@@ -15679,6 +15680,28 @@ fn build_extended_terminal_sub_lot_residual_convergence_intents(
     now_ms: TimestampMs,
     terminal_stale_order_reduce_venues: Option<&HashSet<usize>>,
     class: EmergencyRequestClass,
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Vec<OrderIntent> {
+    build_extended_terminal_sub_lot_residual_convergence_intents_with_purpose(
+        cfg,
+        state,
+        snapshot,
+        now_ms,
+        terminal_stale_order_reduce_venues,
+        class,
+        OrderPurpose::Hedge,
+        residual_fallback,
+    )
+}
+
+fn build_extended_terminal_sub_lot_residual_convergence_intents_with_purpose(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    terminal_stale_order_reduce_venues: Option<&HashSet<usize>>,
+    class: EmergencyRequestClass,
+    purpose: OrderPurpose,
     mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
 ) -> Vec<OrderIntent> {
     let mut intents = Vec::new();
@@ -15787,7 +15810,7 @@ fn build_extended_terminal_sub_lot_residual_convergence_intents(
         side,
         price,
         size: residual_abs,
-        purpose: OrderPurpose::Hedge,
+        purpose,
         time_in_force: TimeInForce::Ioc,
         post_only: false,
         reduce_only: true,
@@ -26533,6 +26556,7 @@ mod tests {
         assert_eq!(place.side, Side::Sell);
         assert_eq!(place.time_in_force, TimeInForce::Ioc);
         assert!(place.reduce_only);
+        assert_eq!(place.purpose, OrderPurpose::Hedge);
         assert!((place.size - 0.006).abs() < 1e-12);
         let record = residual_fallback
             .records
@@ -26555,6 +26579,8 @@ mod tests {
         let _env = EnvGuard::new(&[
             "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
             "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ALLOW_BELOW_MIN_NOTIONAL",
+            V2_DECISION_MODE_ENV,
+            V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV,
         ]);
         std::env::set_var(
             "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
@@ -26628,7 +26654,14 @@ mod tests {
         assert!(place.reduce_only);
         assert!(!place.post_only);
         assert!((place.size - 0.004).abs() < 1e-12);
-        assert_eq!(place.purpose, OrderPurpose::Hedge);
+        assert_eq!(place.purpose, OrderPurpose::Exit);
+        assert!(v2_live_canary_ranked_execution_terminal_reduce_only_exit_place(place));
+        std::env::set_var(V2_DECISION_MODE_ENV, "live_canary_admission");
+        std::env::set_var(V2_LIVE_CANARY_RANKED_EXECUTION_VENUES_ENV, "extended");
+        assert_eq!(
+            v2_live_canary_ranked_execution_validate_order_intents(&intents, true),
+            Ok(())
+        );
         assert!(place.phase51_target_key.is_none());
     }
 
