@@ -865,9 +865,10 @@ fn supports_supported_replace_snapshot_gap_grace(venue_id: &str, order: &LiveOrd
 }
 
 fn supports_independent_snapshot_seq_reconcile(venue_id: &str, order: &LiveOrder) -> bool {
-    (venue_id.eq_ignore_ascii_case("aster")
-        || venue_id.eq_ignore_ascii_case("extended")
-        || venue_id.eq_ignore_ascii_case("lighter"))
+    if venue_id.eq_ignore_ascii_case("aster") || venue_id.eq_ignore_ascii_case("extended") {
+        return order.side.is_some();
+    }
+    venue_id.eq_ignore_ascii_case("lighter")
         && order.purpose == Some(OrderPurpose::Mm)
         && order.side.is_some()
 }
@@ -1361,6 +1362,52 @@ mod tests {
         assert_eq!(order.status, OrderStatus::Cancelled);
         assert_eq!(order.gap_grace_started_ms, None);
         assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_order_ids_by_venue(2).is_empty());
+    }
+
+    #[test]
+    fn lower_seq_aster_missing_snapshot_cancels_snapshot_origin_order_without_purpose() {
+        let mut state = LiveOrderState::new();
+        state.reconcile(
+            &OrderSnapshot {
+                venue_index: 2,
+                venue_id: "aster".to_string(),
+                seq: 20_000,
+                timestamp_ms: 1_000,
+                open_orders: vec![OpenOrderSnapshot {
+                    order_id: "oid_aster_snapshot".to_string(),
+                    client_order_id: Some("co_aster_snapshot".to_string()),
+                    exchange_order_id: None,
+                    side: Side::Sell,
+                    price: 101.0,
+                    size: 0.01,
+                    purpose: None,
+                }],
+            },
+            1_000,
+        );
+
+        assert_eq!(
+            state.open_order_ids_by_venue(2),
+            vec!["oid_aster_snapshot".to_string()]
+        );
+
+        state.reconcile(
+            &OrderSnapshot {
+                venue_index: 2,
+                venue_id: "aster".to_string(),
+                seq: 3,
+                timestamp_ms: 2_000,
+                open_orders: Vec::new(),
+            },
+            2_000,
+        );
+
+        let order = state
+            .orders
+            .get("co_aster_snapshot")
+            .expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Cancelled);
         assert!(state.open_order_ids_by_venue(2).is_empty());
     }
 
