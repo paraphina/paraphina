@@ -9252,18 +9252,24 @@ fn build_hyperliquid_terminal_explicit_cancel_intents_from_payload(
     Ok(intents)
 }
 
+#[derive(Debug, Default)]
+struct HyperliquidTerminalExplicitCancelQuery {
+    intents: Vec<OrderIntent>,
+    successful_empty_query: bool,
+}
+
 async fn build_hyperliquid_terminal_explicit_cancel_intents(
     cfg: &Config,
-) -> Result<Vec<OrderIntent>, &'static str> {
+) -> Result<HyperliquidTerminalExplicitCancelQuery, &'static str> {
     #[cfg(not(feature = "live_hyperliquid"))]
     {
         let _ = cfg;
-        return Ok(Vec::new());
+        return Ok(HyperliquidTerminalExplicitCancelQuery::default());
     }
     #[cfg(feature = "live_hyperliquid")]
     {
         let Some(venue_index) = hyperliquid_terminal_explicit_cancel_venue_index(cfg) else {
-            return Ok(Vec::new());
+            return Ok(HyperliquidTerminalExplicitCancelQuery::default());
         };
         let Some(user) = hyperliquid_terminal_account_name() else {
             return Err("missing_account_name");
@@ -9304,15 +9310,44 @@ async fn build_hyperliquid_terminal_explicit_cancel_intents(
                 coin.as_str(),
             )?;
             if !intents.is_empty() {
-                return Ok(intents);
+                return Ok(HyperliquidTerminalExplicitCancelQuery {
+                    intents,
+                    successful_empty_query: false,
+                });
             }
             saw_successful_empty_query = true;
         }
         if saw_successful_empty_query {
-            return Ok(Vec::new());
+            return Ok(HyperliquidTerminalExplicitCancelQuery {
+                intents: Vec::new(),
+                successful_empty_query: true,
+            });
         }
         Err(last_error)
     }
+}
+
+fn clear_hyperliquid_terminal_empty_open_order_tracking(
+    cfg: &Config,
+    state: &mut GlobalState,
+    now_ms: TimestampMs,
+    successful_empty_query: bool,
+) -> usize {
+    if !successful_empty_query {
+        return 0;
+    }
+    let Some(venue_index) = hyperliquid_terminal_explicit_cancel_venue_index(cfg) else {
+        return 0;
+    };
+    let tracked = live_open_order_count_for_venue(state, venue_index);
+    if tracked == 0 {
+        return 0;
+    }
+    state
+        .live_order_state
+        .cancel_all(Some(venue_index), now_ms, None);
+    sync_venue_order_tracking_from_live_order_state(cfg, state, venue_index);
+    tracked
 }
 
 fn merge_hyperliquid_terminal_explicit_cancel_intents(
@@ -9622,34 +9657,46 @@ async fn run_canary_exit_cancel_all_cleanup(
                 attempt, drained_exec_events
             );
         }
-        let tracked_open_orders = live_open_order_count_total(state);
+        let mut tracked_open_orders = live_open_order_count_total(state);
         let hyperliquid_tracked_open_orders = hyperliquid_venue_index(cfg)
             .map(|venue_index| live_open_order_count_for_venue(state, venue_index))
             .unwrap_or(0);
-        let hyperliquid_explicit_cancel_intents = if sweep_all_venues
-            || hyperliquid_tracked_open_orders > 0
-        {
-            match build_hyperliquid_terminal_explicit_cancel_intents(cfg).await {
-                Ok(intents) => {
-                    if !intents.is_empty() {
-                        eprintln!(
+        let (hyperliquid_explicit_cancel_intents, hyperliquid_empty_open_order_query) =
+            if sweep_all_venues || hyperliquid_tracked_open_orders > 0 {
+                match build_hyperliquid_terminal_explicit_cancel_intents(cfg).await {
+                    Ok(query) => {
+                        if !query.intents.is_empty() {
+                            eprintln!(
                                 "[runner] canary_exit_cancel_all_cleanup hyperliquid_explicit_cancel_fallback count={}",
-                                intents.len()
+                                query.intents.len()
                             );
+                        }
+                        (query.intents, query.successful_empty_query)
                     }
-                    intents
-                }
-                Err(reason) => {
-                    eprintln!(
+                    Err(reason) => {
+                        eprintln!(
                             "[runner] canary_exit_cancel_all_cleanup hyperliquid_explicit_cancel_fallback skipped reason={}",
                             reason
                         );
-                    Vec::new()
+                        (Vec::new(), false)
+                    }
                 }
-            }
-        } else {
-            Vec::new()
-        };
+            } else {
+                (Vec::new(), false)
+            };
+        let cleared_hyperliquid_stale_orders = clear_hyperliquid_terminal_empty_open_order_tracking(
+            cfg,
+            state,
+            now_ms(),
+            hyperliquid_empty_open_order_query,
+        );
+        if cleared_hyperliquid_stale_orders > 0 {
+            tracked_open_orders = live_open_order_count_total(state);
+            eprintln!(
+                "[runner] canary_exit_cancel_all_cleanup hyperliquid_empty_open_order_query_cleared_stale_tracking count={}",
+                cleared_hyperliquid_stale_orders
+            );
+        }
         if tracked_open_orders == 0 && hyperliquid_explicit_cancel_intents.is_empty() {
             if !canary_exit_cancel_all_should_send_clean_state_sweep(
                 sweep_all_venues,
@@ -10366,25 +10413,49 @@ fn build_canary_exit_position_flatten_intents(
     tick: u64,
     now_ms: TimestampMs,
 ) -> Vec<OrderIntent> {
-    let mut intents = build_canary_breach_flatten_intents(cfg, state, target_venues, tick);
-    let Some(extended) = extended_venue_index(cfg) else {
-        return intents;
-    };
-    if !target_venues.contains(&extended) || intents_touch_venue(&intents, extended) {
-        return intents;
+    let mut terminal_intents = Vec::new();
+    if let Some(hyperliquid) = hyperliquid_venue_index(cfg) {
+        if target_venues.contains(&hyperliquid) {
+            terminal_intents.extend(
+                build_hyperliquid_terminal_sub_lot_residual_convergence_intents_with_purpose(
+                    cfg,
+                    state,
+                    snapshot,
+                    now_ms,
+                    OrderPurpose::Exit,
+                    None,
+                ),
+            );
+        }
     }
-    intents.extend(
-        build_extended_terminal_sub_lot_residual_convergence_intents_with_purpose(
-            cfg,
-            state,
-            snapshot,
-            now_ms,
-            None,
-            EmergencyRequestClass::SoftUnwind,
-            OrderPurpose::Exit,
-            None,
-        ),
-    );
+    if let Some(extended) = extended_venue_index(cfg) {
+        if target_venues.contains(&extended) {
+            terminal_intents.extend(
+                build_extended_terminal_sub_lot_residual_convergence_intents_with_purpose(
+                    cfg,
+                    state,
+                    snapshot,
+                    now_ms,
+                    None,
+                    EmergencyRequestClass::SoftUnwind,
+                    OrderPurpose::Exit,
+                    None,
+                ),
+            );
+        }
+    }
+
+    let terminal_venues = terminal_intents
+        .iter()
+        .filter_map(venue_index_for_order_intent)
+        .collect::<HashSet<_>>();
+    let generic_target_venues = target_venues
+        .iter()
+        .copied()
+        .filter(|venue_index| !terminal_venues.contains(venue_index))
+        .collect::<Vec<_>>();
+    let mut intents = build_canary_breach_flatten_intents(cfg, state, &generic_target_venues, tick);
+    intents.extend(terminal_intents);
     intents
 }
 
@@ -10397,6 +10468,7 @@ fn venue_index_for_order_intent(intent: &OrderIntent) -> Option<usize> {
     }
 }
 
+#[cfg(test)]
 fn intents_touch_venue(intents: &[OrderIntent], venue_index: usize) -> bool {
     intents
         .iter()
@@ -15560,6 +15632,24 @@ fn build_hyperliquid_terminal_sub_lot_residual_convergence_intents(
     state: &GlobalState,
     snapshot: &CanonicalCacheSnapshot,
     now_ms: TimestampMs,
+    residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
+) -> Vec<OrderIntent> {
+    build_hyperliquid_terminal_sub_lot_residual_convergence_intents_with_purpose(
+        cfg,
+        state,
+        snapshot,
+        now_ms,
+        OrderPurpose::Hedge,
+        residual_fallback,
+    )
+}
+
+fn build_hyperliquid_terminal_sub_lot_residual_convergence_intents_with_purpose(
+    cfg: &Config,
+    state: &GlobalState,
+    snapshot: &CanonicalCacheSnapshot,
+    now_ms: TimestampMs,
+    purpose: OrderPurpose,
     mut residual_fallback: Option<&mut EmergencyResidualFallbackStatus>,
 ) -> Vec<OrderIntent> {
     let mut intents = Vec::new();
@@ -15662,7 +15752,7 @@ fn build_hyperliquid_terminal_sub_lot_residual_convergence_intents(
         side,
         price,
         size: residual_abs,
-        purpose: OrderPurpose::Hedge,
+        purpose,
         time_in_force: TimeInForce::Ioc,
         post_only: false,
         reduce_only: true,
@@ -15753,8 +15843,8 @@ fn build_extended_terminal_sub_lot_residual_convergence_intents_with_purpose(
     };
     let residual_position_tao = account.position_tao;
     let residual_abs = residual_position_tao.abs();
-    let configured_lot = venue.lot_size_tao.max(1e-9);
-    let max_abs = configured_lot * extended_terminal_sub_lot_reduce_max_lots();
+    let executable_step = venue.size_step_tao.max(venue.lot_size_tao).max(1e-9);
+    let max_abs = executable_step * extended_terminal_sub_lot_reduce_max_lots();
     if residual_abs <= min_abs + 1e-9 {
         return intents;
     }
@@ -31240,6 +31330,61 @@ mod tests {
     }
 
     #[test]
+    fn hyperliquid_terminal_empty_open_order_query_clears_stale_tracking() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        let now_ms = 45_000;
+
+        state.venues[hyperliquid].position_tao = -0.01;
+        seed_terminal_flatten_market(&mut state, &[hyperliquid]);
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+        assert_eq!(live_open_order_count_for_venue(&state, hyperliquid), 1);
+        assert!(canary_exit_position_flatten_venues(&cfg, &state, 0.0025).is_empty());
+
+        let cleared = clear_hyperliquid_terminal_empty_open_order_tracking(
+            &cfg,
+            &mut state,
+            now_ms + 1,
+            true,
+        );
+
+        assert_eq!(cleared, 1);
+        assert_eq!(live_open_order_count_for_venue(&state, hyperliquid), 0);
+        assert_eq!(
+            canary_exit_position_flatten_venues(&cfg, &state, 0.0025),
+            vec![hyperliquid],
+            "successful empty Hyperliquid venue-truth query must unblock same-run residual flattening"
+        );
+    }
+
+    #[test]
+    fn hyperliquid_terminal_empty_open_order_tracking_is_not_cleared_without_successful_query() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        let now_ms = 45_000;
+
+        state.venues[hyperliquid].position_tao = -0.01;
+        seed_terminal_flatten_market(&mut state, &[hyperliquid]);
+        seed_open_orders(&mut state, hyperliquid, 1, now_ms);
+
+        let cleared = clear_hyperliquid_terminal_empty_open_order_tracking(
+            &cfg,
+            &mut state,
+            now_ms + 1,
+            false,
+        );
+
+        assert_eq!(cleared, 0);
+        assert_eq!(live_open_order_count_for_venue(&state, hyperliquid), 1);
+        assert!(
+            canary_exit_position_flatten_venues(&cfg, &state, 0.0025).is_empty(),
+            "query failures must remain conservative and keep stale internal orders blocking flatten dispatch"
+        );
+    }
+
+    #[test]
     fn v2_ranked_execution_terminal_cancel_all_is_scoped_to_allowed_venues() {
         let mut cfg = v2_live_canary_admission_runner_config();
         cfg.v2_shadow.live_canary_ranked_execution_venues = vec!["lighter".to_string()];
@@ -31471,6 +31616,121 @@ mod tests {
             canary_exit_position_flatten_venues(&cfg, &state, 0.0025).is_empty(),
             "open orders must block reduce-only flatten dispatch without hiding residual exposure"
         );
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_uses_hyperliquid_terminal_sub_lot_exit_helper() {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_MIN_ABS_TAO",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        std::env::set_var(
+            "PARAPHINA_HYPERLIQUID_TERMINAL_SUB_LOT_REDUCE_MIN_ABS_TAO",
+            "0.0025",
+        );
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let hyperliquid = hyperliquid_venue_index(&cfg).expect("hyperliquid venue");
+        let now_ms = 60_000;
+
+        state.fair_value = Some(4_100.0);
+        state.fair_value_prev = 4_100.0;
+        state.venues[hyperliquid].position_tao = -0.0026;
+        state.venues[hyperliquid].mid = Some(4_100.0);
+        state.venues[hyperliquid].spread = Some(0.2);
+        let snapshot =
+            account_truth_snapshot_for_venue(&cfg, hyperliquid, -0.0026, now_ms, Some(now_ms));
+
+        let intents = build_canary_exit_position_flatten_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            &[hyperliquid],
+            91,
+            now_ms,
+        );
+
+        assert_eq!(intents.len(), 1);
+        let place = match &intents[0] {
+            OrderIntent::Place(place) => place,
+            other => panic!("expected place intent, got {other:?}"),
+        };
+        assert_eq!(place.venue_index, hyperliquid);
+        assert_eq!(place.side, Side::Buy);
+        assert_eq!(place.purpose, OrderPurpose::Exit);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!(!place.post_only);
+        assert!((place.size - 0.0026).abs() < 1e-12);
+        assert!(place.phase51_target_key.is_none());
+    }
+
+    #[test]
+    fn canary_exit_position_flatten_prefers_extended_terminal_helper_for_executable_step_residual()
+    {
+        let _guard = ENV_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new(&[
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_MAX_LOTS",
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ALLOW_BELOW_MIN_NOTIONAL",
+        ]);
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ONLY_ENABLED",
+            "1",
+        );
+        std::env::set_var("PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_MAX_LOTS", "1");
+        std::env::set_var(
+            "PARAPHINA_EXTENDED_TERMINAL_SUB_LOT_REDUCE_ALLOW_BELOW_MIN_NOTIONAL",
+            "1",
+        );
+        let mut cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let extended = extended_venue_index(&cfg).expect("extended venue");
+        let now_ms = 60_000;
+        cfg.venues[extended].lot_size_tao = 0.005;
+        cfg.venues[extended].size_step_tao = 0.01;
+
+        state.fair_value = Some(2_350.0);
+        state.fair_value_prev = 2_350.0;
+        state.venues[extended].position_tao = 0.009;
+        state.venues[extended].mid = Some(2_351.0);
+        state.venues[extended].spread = Some(0.2);
+        let snapshot =
+            account_truth_snapshot_for_venue(&cfg, extended, 0.009, now_ms, Some(now_ms));
+
+        let intents = build_canary_exit_position_flatten_intents(
+            &cfg,
+            &state,
+            &snapshot,
+            &[extended],
+            91,
+            now_ms,
+        );
+
+        assert_eq!(intents.len(), 1);
+        let place = match &intents[0] {
+            OrderIntent::Place(place) => place,
+            other => panic!("expected place intent, got {other:?}"),
+        };
+        assert_eq!(place.venue_index, extended);
+        assert_eq!(place.side, Side::Sell);
+        assert_eq!(place.purpose, OrderPurpose::Exit);
+        assert_eq!(place.time_in_force, TimeInForce::Ioc);
+        assert!(place.reduce_only);
+        assert!(!place.post_only);
+        assert!((place.size - 0.009).abs() < 1e-12);
+        assert!(place.phase51_target_key.is_none());
     }
 
     #[test]
