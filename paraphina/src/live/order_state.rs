@@ -192,6 +192,7 @@ impl LiveOrderState {
                     self.apply_cancel_ack(
                         ack.order_id.clone(),
                         ack.client_order_id.clone(),
+                        ack.venue_index,
                         now_ms,
                         ack.seq,
                     );
@@ -251,7 +252,7 @@ impl LiveOrderState {
         let supported_replace_gap_grace_ms = supported_replace_gap_grace_ms.max(1);
         let mut seen = HashMap::new();
         for order in &snapshot.open_orders {
-            let key = self.snapshot_order_key(order);
+            let key = self.snapshot_order_key(snapshot.venue_index, order);
             let exchange_order_id = snapshot_exchange_order_id(order);
             let entry = self.orders.entry(key.clone()).or_insert_with(|| LiveOrder {
                 decision_id: None,
@@ -416,7 +417,7 @@ impl LiveOrderState {
         let mut seen = HashMap::new();
         let mut inferred = Vec::new();
         for order in &snapshot.open_orders {
-            let key = self.snapshot_order_key(order);
+            let key = self.snapshot_order_key(snapshot.venue_index, order);
             let Some(entry) = self.orders.get(&key) else {
                 seen.insert(key, true);
                 continue;
@@ -655,15 +656,22 @@ impl LiveOrderState {
         &mut self,
         exchange_order_id: String,
         client_order_id: Option<String>,
+        venue_index: usize,
         now_ms: TimestampMs,
         seq: Option<u64>,
     ) {
         if let Some(key) = client_order_id
             .clone()
-            .or_else(|| self.exchange_to_key.get(&exchange_order_id).cloned())
+            .filter(|id| {
+                self.orders
+                    .get(id)
+                    .is_some_and(|entry| entry.venue_index == venue_index)
+            })
+            .or_else(|| self.order_key_for_exchange_id_on_venue(venue_index, &exchange_order_id))
             .or_else(|| {
                 self.orders
-                    .contains_key(&exchange_order_id)
+                    .get(&exchange_order_id)
+                    .is_some_and(|entry| entry.venue_index == venue_index)
                     .then_some(exchange_order_id)
             })
         {
@@ -695,10 +703,15 @@ impl LiveOrderState {
     ) {
         let key = client_order_id
             .clone()
+            .filter(|id| {
+                self.orders
+                    .get(id)
+                    .is_none_or(|entry| entry.venue_index == venue_index)
+            })
             .or_else(|| {
                 exchange_order_id
                     .as_ref()
-                    .and_then(|id| self.exchange_to_key.get(id).cloned())
+                    .and_then(|id| self.order_key_for_exchange_id_on_venue(venue_index, id))
             })
             .or_else(|| exchange_order_id.clone())
             .unwrap_or_else(|| format!("rejected_{}_{}", venue_index, now_ms));
@@ -746,7 +759,7 @@ impl LiveOrderState {
             .or_else(|| {
                 exchange_order_id
                     .as_ref()
-                    .and_then(|id| self.exchange_to_key.get(id).cloned())
+                    .and_then(|id| self.order_key_for_exchange_id_on_venue(venue_index, id))
             })
             .or_else(|| exchange_order_id.clone());
         let Some(key) = key else {
@@ -778,12 +791,22 @@ impl LiveOrderState {
         entry.last_update_seq = seq;
     }
 
-    fn snapshot_order_key(&self, order: &OpenOrderSnapshot) -> String {
+    fn order_key_for_exchange_id_on_venue(
+        &self,
+        venue_index: usize,
+        exchange_order_id: &str,
+    ) -> Option<String> {
+        let key = self.exchange_to_key.get(exchange_order_id)?;
+        let order = self.orders.get(key)?;
+        (order.venue_index == venue_index).then(|| key.clone())
+    }
+
+    fn snapshot_order_key(&self, venue_index: usize, order: &OpenOrderSnapshot) -> String {
         order
             .exchange_order_id
             .as_ref()
-            .and_then(|id| self.exchange_to_key.get(id).cloned())
-            .or_else(|| self.exchange_to_key.get(&order.order_id).cloned())
+            .and_then(|id| self.order_key_for_exchange_id_on_venue(venue_index, id))
+            .or_else(|| self.order_key_for_exchange_id_on_venue(venue_index, &order.order_id))
             .or_else(|| order.client_order_id.clone())
             .or_else(|| order.exchange_order_id.clone())
             .unwrap_or_else(|| order.order_id.clone())
@@ -1408,19 +1431,20 @@ mod tests {
     }
 
     #[test]
-    fn aster_snapshot_prefers_existing_exchange_alias_before_client_id() {
+    fn aster_snapshot_prefers_existing_same_venue_exchange_alias_before_client_id() {
         let mut state = LiveOrderState::new();
         state.apply_execution_event(
-            &ack(
-                2,
-                "123456789",
-                "co_aster_alias",
-                Side::Buy,
-                100.0,
-                0.01,
-                OrderPurpose::Mm,
-                10,
-            ),
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 2,
+                venue_id: "aster".into(),
+                order_id: "123456789".to_string(),
+                client_order_id: None,
+                seq: Some(10),
+                side: Some(Side::Buy),
+                price: Some(100.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
             1_000,
         );
 
@@ -1444,7 +1468,7 @@ mod tests {
         );
 
         assert_eq!(state.orders.len(), 1);
-        assert!(state.orders.contains_key("co_aster_alias"));
+        assert!(state.orders.contains_key("123456789"));
         assert_eq!(
             state.open_order_ids_by_venue(2),
             vec!["123456789".to_string()]
@@ -1465,9 +1489,55 @@ mod tests {
             3_000,
         );
 
-        let order = state.orders.get("co_aster_alias").expect("tracked order");
+        let order = state.orders.get("123456789").expect("tracked order");
         assert_eq!(order.status, OrderStatus::Cancelled);
         assert!(state.open_order_ids_by_venue(2).is_empty());
+    }
+
+    #[test]
+    fn snapshot_exchange_aliases_are_venue_scoped() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: 1,
+                venue_id: "lighter".into(),
+                order_id: "shared_venue_order_id".to_string(),
+                client_order_id: Some("co_lighter_shared".to_string()),
+                seq: Some(10),
+                side: Some(Side::Sell),
+                price: Some(101.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            1_000,
+        );
+
+        state.reconcile(
+            &OrderSnapshot {
+                venue_index: 2,
+                venue_id: "aster".to_string(),
+                seq: 11,
+                timestamp_ms: 2_000,
+                open_orders: vec![OpenOrderSnapshot {
+                    order_id: "shared_venue_order_id".to_string(),
+                    client_order_id: Some("co_aster_shared".to_string()),
+                    exchange_order_id: None,
+                    side: Side::Buy,
+                    price: 100.0,
+                    size: 0.01,
+                    purpose: None,
+                }],
+            },
+            2_000,
+        );
+
+        assert_eq!(state.orders.len(), 2);
+        assert!(state.orders.contains_key("co_lighter_shared"));
+        assert!(state.orders.contains_key("co_aster_shared"));
+        assert_eq!(
+            state.open_order_ids_by_venue(2),
+            vec!["shared_venue_order_id".to_string()]
+        );
     }
 
     #[test]
