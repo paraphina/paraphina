@@ -336,7 +336,7 @@ fn single_venue_quote_result(
 }
 
 pub const HYPERLIQUID_TOUCH_CLIP_MAX_TICKS: f64 = 8.0;
-const HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS: f64 = 2.0;
+pub const HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS: f64 = 2.0;
 pub const TOUCH_MODE_ASTER_FILL: &str = "aster_fill";
 pub const TOUCH_MODE_HYPERLIQUID_CLIP: &str = "hyperliquid_clip";
 pub const TOUCH_MODE_PARADEX_CLIP: &str = "paradex_clip";

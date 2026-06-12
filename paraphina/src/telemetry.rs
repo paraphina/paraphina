@@ -83,7 +83,7 @@ use crate::mm::venue_utility_conversion_penalties_enabled;
 use crate::mm::{
     compute_mm_quotes_with_now, compute_mm_reservation_components, compute_venue_targets,
     compute_venue_utility_decision, quote_spread_gate_reason, VenueUtilityDecision,
-    HYPERLIQUID_TOUCH_CLIP_MAX_TICKS,
+    HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS, HYPERLIQUID_TOUCH_CLIP_MAX_TICKS,
 };
 use crate::state::{
     funding_rate_for_decision, GlobalState, KillEvent, RiskRegime, VenueUtilityTier,
@@ -1273,6 +1273,15 @@ fn build_quote_levels(
             _ => 0.0,
         };
         let touch_mode_applied = touch_mode_kind.is_some();
+        let hyperliquid_touch_clip_max_ticks = cfg
+            .mm
+            .hyperliquid_touch_clip_max_ticks()
+            .unwrap_or(HYPERLIQUID_TOUCH_CLIP_MAX_TICKS)
+            .max(
+                cfg.mm
+                    .hyperliquid_passive_touch_buffer_ticks()
+                    .unwrap_or(HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS),
+            );
 
         out.push(build_quote_level_record(
             idx,
@@ -1290,6 +1299,7 @@ fn build_quote_levels(
             bid_touch_offset_ticks,
             touch_mode_applied,
             touch_mode_kind,
+            hyperliquid_touch_clip_max_ticks,
             generated_spread_cap_applied,
             generated_spread_cap_bid_suppressed,
             generated_spread_cap_ask_suppressed,
@@ -1313,6 +1323,7 @@ fn build_quote_levels(
             ask_touch_offset_ticks,
             touch_mode_applied,
             touch_mode_kind,
+            hyperliquid_touch_clip_max_ticks,
             generated_spread_cap_applied,
             generated_spread_cap_bid_suppressed,
             generated_spread_cap_ask_suppressed,
@@ -1360,6 +1371,7 @@ fn build_quote_level_record(
     touch_offset_ticks: f64,
     touch_mode_applied: bool,
     touch_mode_kind: Option<&'static str>,
+    hyperliquid_touch_clip_max_ticks: f64,
     generated_spread_cap_applied: bool,
     generated_spread_cap_bid_suppressed: bool,
     generated_spread_cap_ask_suppressed: bool,
@@ -1446,7 +1458,7 @@ fn build_quote_level_record(
     record.insert(
         "touch_clip_max_ticks".to_string(),
         if matches!(touch_mode_kind, Some("hyperliquid_clip")) {
-            JsonValue::from(HYPERLIQUID_TOUCH_CLIP_MAX_TICKS)
+            JsonValue::from(hyperliquid_touch_clip_max_ticks)
         } else {
             JsonValue::Null
         },
@@ -4455,6 +4467,67 @@ mod tests {
             .expect("execution_visibility_gap_venues");
         assert_eq!(venues.len(), 1);
         assert_eq!(venues[0].as_str(), Some("paradex"));
+    }
+
+    #[test]
+    fn quote_level_reports_resolved_hyperliquid_touch_clip_max_ticks() {
+        let diag = QuoteTelemetryDiagnostics {
+            quote_state: "active",
+            edge: 0.25,
+            q_raw: 0.01,
+            size_final: 0.01,
+            margin_cap: 1.0,
+            liq_factor: 1.0,
+            candidate_size_pre_margin: 0.01,
+            candidate_size_post_margin: 0.01,
+            candidate_size_post_taper: 0.01,
+            candidate_size_pre_utility: 0.01,
+            candidate_size_post_utility: 0.01,
+            candidate_notional_post_utility: 12.0,
+            lot_size_tao: 0.005,
+            candidate_price_pre_utility: 1200.0,
+            candidate_edge_pre_utility: 0.25,
+            utility_role: "fill",
+            utility_tier: "full",
+            utility_reason: "healthy",
+            utility_size_multiplier: 1.0,
+            utility_extra_edge_usd: 0.0,
+            edge_threshold: 0.02,
+            base_edge_threshold: 0.02,
+            hedge_cost_edge_floor: 0.0,
+            suppression_reason: None,
+            prune_stage: "active",
+            book_age_ms: 10,
+            book_stale_threshold_ms: 5_000,
+        };
+
+        let quote = build_quote_level_record(
+            1,
+            "hyperliquid",
+            "Ask",
+            1200.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            1200.4,
+            0.0,
+            12.0,
+            true,
+            Some("hyperliquid_clip"),
+            12.0,
+            false,
+            false,
+            false,
+            "active",
+            0.0,
+            &diag,
+        );
+
+        assert_eq!(quote["touch_clip_applied"].as_bool(), Some(true));
+        assert_eq!(quote["touch_clip_max_ticks"].as_f64(), Some(12.0));
     }
 
     #[test]
