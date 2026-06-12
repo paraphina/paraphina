@@ -594,6 +594,10 @@ pub struct MmConfig {
     pub paradex_touch_clip_max_ticks: Option<f64>,
     /// When Paradex touch clipping is enabled, allow joining BBO rather than quoting one tick back.
     pub paradex_touch_clip_join_bbo: bool,
+    /// Optional Hyperliquid-only passive touch buffer in ticks before post-only submission.
+    pub hyperliquid_passive_touch_buffer_ticks: Option<f64>,
+    /// Optional Hyperliquid-only clip that keeps generated quotes near passive touch.
+    pub hyperliquid_touch_clip_max_ticks: Option<f64>,
     /// Optional per-venue hard cap on MM quote size in TAO.
     pub max_quote_size_tao_by_venue: BTreeMap<String, f64>,
     /// Optional per-venue economic role overrides keyed by venue id.
@@ -743,6 +747,18 @@ impl MmConfig {
     #[inline]
     pub fn paradex_touch_clip_join_bbo(&self) -> bool {
         self.paradex_touch_clip_max_ticks().is_some() && self.paradex_touch_clip_join_bbo
+    }
+
+    #[inline]
+    pub fn hyperliquid_passive_touch_buffer_ticks(&self) -> Option<f64> {
+        self.hyperliquid_passive_touch_buffer_ticks
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    #[inline]
+    pub fn hyperliquid_touch_clip_max_ticks(&self) -> Option<f64> {
+        self.hyperliquid_touch_clip_max_ticks
+            .filter(|v| v.is_finite() && *v > 0.0)
     }
 
     #[inline]
@@ -1333,6 +1349,8 @@ impl Default for Config {
             max_generated_quote_spread_bps_by_venue: BTreeMap::new(),
             paradex_touch_clip_max_ticks: None,
             paradex_touch_clip_join_bbo: false,
+            hyperliquid_passive_touch_buffer_ticks: None,
+            hyperliquid_touch_clip_max_ticks: None,
             max_quote_size_tao_by_venue: BTreeMap::new(),
             venue_role_by_venue: BTreeMap::new(),
             pre_soft_taper_global_position_tao_by_venue: BTreeMap::new(),
@@ -1560,6 +1578,8 @@ impl Config {
     ///   - PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_<VENUE> (f64, bps)
     ///   - PARAPHINA_MM_PARADEX_TOUCH_CLIP_MAX_TICKS (f64, ticks; default off)
     ///   - PARAPHINA_MM_PARADEX_TOUCH_CLIP_JOIN_BBO (bool; default false)
+    ///   - PARAPHINA_MM_HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS (f64, ticks)
+    ///   - PARAPHINA_MM_HYPERLIQUID_TOUCH_CLIP_MAX_TICKS (f64, ticks)
     ///   - PARAPHINA_MM_VENUE_ROLE_<VENUE> (fill|probationary|anchor|noise)
     ///   - PARAPHINA_VOL_REF           (f64)
     ///   - PARAPHINA_DAILY_LOSS_LIMIT  (f64, USD; positive threshold)
@@ -2188,6 +2208,43 @@ impl Config {
                         None => {
                             eprintln!(
                                 "[config] WARN: could not parse PARAPHINA_MM_PARADEX_TOUCH_CLIP_JOIN_BBO = {:?} as bool; leaving Paradex touch clip BBO-join mode disabled",
+                                raw
+                            );
+                        }
+                    }
+                }
+            }
+
+            if venue.id.eq_ignore_ascii_case("hyperliquid") {
+                if let Ok(raw) = env::var("PARAPHINA_MM_HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS") {
+                    match raw.parse::<f64>() {
+                        Ok(v) if v.is_finite() && v > 0.0 => {
+                            cfg.mm.hyperliquid_passive_touch_buffer_ticks = Some(v);
+                            eprintln!(
+                                "[config] PARAPHINA_MM_HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS = {} (set Hyperliquid passive touch buffer)",
+                                v
+                            );
+                        }
+                        _ => {
+                            eprintln!(
+                                "[config] WARN: could not parse PARAPHINA_MM_HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS = {:?} as positive f64; leaving Hyperliquid passive touch buffer on default",
+                                raw
+                            );
+                        }
+                    }
+                }
+                if let Ok(raw) = env::var("PARAPHINA_MM_HYPERLIQUID_TOUCH_CLIP_MAX_TICKS") {
+                    match raw.parse::<f64>() {
+                        Ok(v) if v.is_finite() && v > 0.0 => {
+                            cfg.mm.hyperliquid_touch_clip_max_ticks = Some(v);
+                            eprintln!(
+                                "[config] PARAPHINA_MM_HYPERLIQUID_TOUCH_CLIP_MAX_TICKS = {} (set Hyperliquid passive touch clip)",
+                                v
+                            );
+                        }
+                        _ => {
+                            eprintln!(
+                                "[config] WARN: could not parse PARAPHINA_MM_HYPERLIQUID_TOUCH_CLIP_MAX_TICKS = {:?} as positive f64; leaving Hyperliquid touch clip on default",
                                 raw
                             );
                         }
@@ -4380,6 +4437,9 @@ mod tests {
         const HL_PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS_HYPERLIQUID";
         const SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL";
         const HL_SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL_HYPERLIQUID";
+        const HL_PASSIVE_TOUCH_BUFFER_KEY: &str =
+            "PARAPHINA_MM_HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS";
+        const HL_TOUCH_CLIP_KEY: &str = "PARAPHINA_MM_HYPERLIQUID_TOUCH_CLIP_MAX_TICKS";
         const EXT_SPREAD_USD_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_EXTENDED";
         const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
         const ASTER_GEN_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_GENERATED_SPREAD_BPS_ASTER";
@@ -4408,6 +4468,8 @@ mod tests {
         let _hl_price_tol = EnvGuard::new(HL_PRICE_TOL_KEY);
         let _size_tol = EnvGuard::new(SIZE_TOL_KEY);
         let _hl_size_tol = EnvGuard::new(HL_SIZE_TOL_KEY);
+        let _hl_passive_touch_buffer = EnvGuard::new(HL_PASSIVE_TOUCH_BUFFER_KEY);
+        let _hl_touch_clip = EnvGuard::new(HL_TOUCH_CLIP_KEY);
         let _ext_spread_usd = EnvGuard::new(EXT_SPREAD_USD_KEY);
         let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
         let _aster_gen_spread_bps = EnvGuard::new(ASTER_GEN_SPREAD_BPS_KEY);
@@ -4434,6 +4496,8 @@ mod tests {
         env::set_var(HL_PRICE_TOL_KEY, "4.0");
         env::set_var(SIZE_TOL_KEY, "0.25");
         env::set_var(HL_SIZE_TOL_KEY, "0.35");
+        env::set_var(HL_PASSIVE_TOUCH_BUFFER_KEY, "3");
+        env::set_var(HL_TOUCH_CLIP_KEY, "4");
         env::set_var(EXT_SPREAD_USD_KEY, "3.0");
         env::set_var(EXT_SPREAD_BPS_KEY, "15");
         env::set_var(ASTER_GEN_SPREAD_BPS_KEY, "10");
@@ -4482,6 +4546,8 @@ mod tests {
         assert!((cfg.mm.size_tol_rel - 0.25).abs() < 1e-9);
         assert!((cfg.mm.size_tol_rel_for("hyperliquid") - 0.35).abs() < 1e-9);
         assert!((cfg.mm.size_tol_rel_for("paradex") - 0.25).abs() < 1e-9);
+        assert_eq!(cfg.mm.hyperliquid_passive_touch_buffer_ticks(), Some(3.0));
+        assert_eq!(cfg.mm.hyperliquid_touch_clip_max_ticks(), Some(4.0));
         assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("extended"), Some(3.0));
         assert_eq!(cfg.mm.max_quote_spread_bps_for("extended"), Some(15.0));
         assert_eq!(
@@ -4519,6 +4585,9 @@ mod tests {
         const HL_PRICE_TOL_KEY: &str = "PARAPHINA_MM_PRICE_TOL_TICKS_HYPERLIQUID";
         const SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL";
         const HL_SIZE_TOL_KEY: &str = "PARAPHINA_MM_SIZE_TOL_REL_HYPERLIQUID";
+        const HL_PASSIVE_TOUCH_BUFFER_KEY: &str =
+            "PARAPHINA_MM_HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS";
+        const HL_TOUCH_CLIP_KEY: &str = "PARAPHINA_MM_HYPERLIQUID_TOUCH_CLIP_MAX_TICKS";
         const EXT_SPREAD_USD_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_USD_EXTENDED";
         const EXT_SPREAD_BPS_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SPREAD_BPS_EXTENDED";
         const ASTER_MAX_QUOTE_SIZE_KEY: &str = "PARAPHINA_MM_MAX_QUOTE_SIZE_TAO_ASTER";
@@ -4539,6 +4608,8 @@ mod tests {
         let _hl_price_tol = EnvGuard::new(HL_PRICE_TOL_KEY);
         let _size_tol = EnvGuard::new(SIZE_TOL_KEY);
         let _hl_size_tol = EnvGuard::new(HL_SIZE_TOL_KEY);
+        let _hl_passive_touch_buffer = EnvGuard::new(HL_PASSIVE_TOUCH_BUFFER_KEY);
+        let _hl_touch_clip = EnvGuard::new(HL_TOUCH_CLIP_KEY);
         let _ext_spread_usd = EnvGuard::new(EXT_SPREAD_USD_KEY);
         let _ext_spread_bps = EnvGuard::new(EXT_SPREAD_BPS_KEY);
         let _aster_max_quote_size = EnvGuard::new(ASTER_MAX_QUOTE_SIZE_KEY);
@@ -4559,6 +4630,8 @@ mod tests {
         env::set_var(HL_PRICE_TOL_KEY, "not_a_number");
         env::set_var(SIZE_TOL_KEY, "not_a_number");
         env::set_var(HL_SIZE_TOL_KEY, "not_a_number");
+        env::set_var(HL_PASSIVE_TOUCH_BUFFER_KEY, "0");
+        env::set_var(HL_TOUCH_CLIP_KEY, "not_a_number");
         env::set_var(EXT_SPREAD_USD_KEY, "not_a_number");
         env::set_var(EXT_SPREAD_BPS_KEY, "0");
         env::set_var(ASTER_MAX_QUOTE_SIZE_KEY, "0");
@@ -4588,6 +4661,8 @@ mod tests {
         assert!((cfg.mm.price_tol_ticks_for("hyperliquid") - 1.0).abs() < 1e-9);
         assert!((cfg.mm.size_tol_rel - 0.10).abs() < 1e-9);
         assert!((cfg.mm.size_tol_rel_for("hyperliquid") - 0.10).abs() < 1e-9);
+        assert_eq!(cfg.mm.hyperliquid_passive_touch_buffer_ticks(), None);
+        assert_eq!(cfg.mm.hyperliquid_touch_clip_max_ticks(), None);
         assert_eq!(cfg.mm.max_quote_spread_abs_usd_for("extended"), None);
         assert_eq!(cfg.mm.max_quote_spread_bps_for("extended"), None);
         assert_eq!(cfg.mm.max_quote_size_tao_for("aster"), None);

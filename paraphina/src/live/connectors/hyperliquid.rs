@@ -2787,13 +2787,9 @@ impl LiveRestClient for HyperliquidConnector {
 fn map_rest_error(err: anyhow::Error) -> LiveGatewayError {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
-    let sanitized = || {
-        format!(
-            "Hyperliquid live gateway error sanitized_reason={}",
-            hyperliquid_rest_error_reason(&msg)
-        )
-    };
-    if lower.contains("post") && lower.contains("only") {
+    let reason = hyperliquid_rest_error_reason(&msg);
+    let sanitized = || format!("Hyperliquid live gateway error sanitized_reason={}", reason);
+    if reason == "post_only_would_match" || reason == "bad_alo_px" {
         return LiveGatewayError::post_only_reject(sanitized());
     }
     if lower.contains("reduce") && lower.contains("only") {
@@ -2818,6 +2814,8 @@ fn hyperliquid_rest_error_reason(raw: &str) -> &'static str {
         "retryable"
     } else if lower.contains("reduce") && lower.contains("only") {
         "reduce_only_violation"
+    } else if lower.contains("bad_alo_px") {
+        "bad_alo_px"
     } else {
         ws_post_exchange_error_reason(raw)
     }
@@ -4621,6 +4619,31 @@ mod tests {
         assert!(!err.message.contains("2124.4"));
         assert!(!err.message.contains("payload"));
         assert!(!err.message.contains("order_id"));
+    }
+
+    #[test]
+    fn map_rest_error_classifies_bad_alo_px_as_sanitized_post_only_reject() {
+        let err = map_rest_error(anyhow::anyhow!(
+            "Hyperliquid ws_post action exchange_errors_count=1 exchange_reasons=bad_alo_px:1 response_type=order payload={{\"order_id\":\"123\"}}"
+        ));
+        assert_eq!(err.kind, LiveGatewayErrorKind::PostOnlyReject);
+        assert!(err.message.contains("sanitized_reason=bad_alo_px"));
+        assert!(!err.message.contains("payload"));
+        assert!(!err.message.contains("order_id"));
+        assert!(!err.message.contains("123"));
+    }
+
+    #[test]
+    fn map_rest_error_classifies_top_level_bad_alo_px_without_raw_echo() {
+        let err = map_rest_error(anyhow::anyhow!(
+            "Hyperliquid ws_post action exchange_errors=BadAloPx bbo=2124.4@2124.5 payload={{\"statuses\":[]}}"
+        ));
+        assert_eq!(err.kind, LiveGatewayErrorKind::PostOnlyReject);
+        assert!(err.message.contains("sanitized_reason=bad_alo_px"));
+        assert!(!err.message.contains("BadAloPx"));
+        assert!(!err.message.contains("bbo"));
+        assert!(!err.message.contains("2124.4"));
+        assert!(!err.message.contains("payload"));
     }
 
     #[test]

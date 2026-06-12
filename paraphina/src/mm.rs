@@ -433,9 +433,11 @@ fn paradex_touch_clip_eligible(
         && quote_spread_gate_reason(mm_cfg, &vcfg.id, Some(mid), Some(spread)).is_none()
 }
 
-fn passive_touch_buffer_ticks(vcfg: &VenueConfig) -> f64 {
+fn passive_touch_buffer_ticks(mm_cfg: &MmConfig, vcfg: &VenueConfig) -> f64 {
     if vcfg.id == "hyperliquid" {
-        HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS
+        mm_cfg
+            .hyperliquid_passive_touch_buffer_ticks()
+            .unwrap_or(HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS)
     } else {
         1.0
     }
@@ -466,7 +468,11 @@ fn apply_hyperliquid_touch_clip(
         return result;
     }
 
-    let max_offset = HYPERLIQUID_TOUCH_CLIP_MAX_TICKS * tick;
+    let max_offset_ticks = mm_cfg
+        .hyperliquid_touch_clip_max_ticks()
+        .unwrap_or(HYPERLIQUID_TOUCH_CLIP_MAX_TICKS)
+        .max(passive_touch_buffer_ticks(mm_cfg, vcfg));
+    let max_offset = max_offset_ticks * tick;
     let clipped_bid = bid_price.max(best_bid - max_offset).min(passive_bid_limit);
     let clipped_ask = ask_price.min(best_ask + max_offset).max(passive_ask_limit);
 
@@ -2246,7 +2252,7 @@ fn compute_single_venue_quotes_fast<const DISABLE_FV: bool, const DISABLE_TOX: b
     // Enforce passivity: default one tick off touch. Hyperliquid uses a
     // slightly wider buffer to avoid live post-only rejections under small
     // touch moves; the Aster fill-role exception can still clip to 0-1 tick.
-    let passive_touch_buffer = passive_touch_buffer_ticks(vcfg) * tick;
+    let passive_touch_buffer = passive_touch_buffer_ticks(mm_cfg, vcfg) * tick;
     let passive_bid_limit = best_bid - passive_touch_buffer;
     let passive_ask_limit = best_ask + passive_touch_buffer;
 
@@ -2764,7 +2770,7 @@ fn compute_single_venue_quotes(
     // Enforce passivity: default one tick off touch. Hyperliquid uses a
     // slightly wider buffer to avoid live post-only rejections under small
     // touch moves; the Aster fill-role exception can still clip to 0-1 tick.
-    let passive_touch_buffer = passive_touch_buffer_ticks(vcfg) * tick;
+    let passive_touch_buffer = passive_touch_buffer_ticks(mm_cfg, vcfg) * tick;
     let passive_bid_limit = best_bid - passive_touch_buffer;
     let passive_ask_limit = best_ask + passive_touch_buffer;
 
@@ -6176,6 +6182,45 @@ mod tests {
     }
 
     #[test]
+    fn hyperliquid_touch_clip_respects_configured_max_ticks() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .venue_role_by_venue
+            .insert("hyperliquid".to_string(), MmVenueRole::Probationary);
+        cfg.mm.hyperliquid_touch_clip_max_ticks = Some(3.0);
+        let mut state = GlobalState::new(&cfg);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "hyperliquid")
+            .expect("hyperliquid venue in config");
+        state.venues[venue_index].status = VenueStatus::Healthy;
+        state.venues[venue_index].toxicity = 0.0;
+        let best_bid = 2_167.00;
+        let best_ask = 2_167.10;
+        let tick = cfg.venues[venue_index].tick_size.max(1e-6);
+
+        let result = apply_hyperliquid_touch_clip(
+            &cfg.mm,
+            &cfg.venues[venue_index],
+            &state.venues[venue_index],
+            (best_bid + best_ask) * 0.5,
+            best_ask - best_bid,
+            tick,
+            best_bid,
+            best_ask,
+            best_bid - tick,
+            best_ask + tick,
+            best_bid - (22.0 * tick),
+            best_ask + (18.0 * tick),
+        );
+
+        assert!(result.applied, "expected Hyperliquid touch clip to bind");
+        assert!((best_bid - result.bid_price) / tick <= 3.0 + 1e-9);
+        assert!((result.ask_price - best_ask) / tick <= 3.0 + 1e-9);
+    }
+
+    #[test]
     fn hyperliquid_touch_clip_marks_quotes_with_touch_mode_kind() {
         let mut cfg = Config::default();
         cfg.mm
@@ -6429,6 +6474,28 @@ mod tests {
     }
 
     #[test]
+    fn hyperliquid_passive_touch_buffer_override_is_hyperliquid_only() {
+        let mut cfg = Config::default();
+        cfg.mm.hyperliquid_passive_touch_buffer_ticks = Some(3.0);
+        let venue_index = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "hyperliquid")
+            .expect("hyperliquid venue in config");
+        assert_eq!(
+            passive_touch_buffer_ticks(&cfg.mm, &cfg.venues[venue_index]),
+            3.0
+        );
+
+        let non_hyperliquid = cfg
+            .venues
+            .iter()
+            .find(|venue| venue.id != "hyperliquid")
+            .expect("non-hyperliquid venue in config");
+        assert_eq!(passive_touch_buffer_ticks(&cfg.mm, non_hyperliquid), 1.0);
+    }
+
+    #[test]
     fn hyperliquid_passive_touch_buffer_is_two_ticks() {
         let cfg = Config::default();
         let venue_index = cfg
@@ -6437,7 +6504,7 @@ mod tests {
             .position(|venue| venue.id == "hyperliquid")
             .expect("hyperliquid venue in config");
         assert_eq!(
-            passive_touch_buffer_ticks(&cfg.venues[venue_index]),
+            passive_touch_buffer_ticks(&cfg.mm, &cfg.venues[venue_index]),
             HYPERLIQUID_PASSIVE_TOUCH_BUFFER_TICKS
         );
 
@@ -6446,7 +6513,7 @@ mod tests {
             .iter()
             .find(|venue| venue.id != "hyperliquid")
             .expect("non-hyperliquid venue in config");
-        assert_eq!(passive_touch_buffer_ticks(non_hyperliquid), 1.0);
+        assert_eq!(passive_touch_buffer_ticks(&cfg.mm, non_hyperliquid), 1.0);
     }
 
     /// Milestone F: Quote staleness guard prevents quoting on stale venue data.
