@@ -16793,10 +16793,11 @@ fn apply_extended_freeze_market_progress_snapshot_overrides(
     let Some(venue_state) = state.venues.get(EXTENDED_IDX) else {
         return;
     };
-    if !venue_state.quote_quarantined {
-        return;
-    }
-    let Some(last_mid_update_ms) = venue_state.last_mid_update_ms else {
+    let Some(progress_anchor_ms) = (if venue_state.quote_quarantined {
+        venue_state.last_mid_update_ms
+    } else {
+        venue_state.last_mid_apply_ms
+    }) else {
         return;
     };
     let stale_ms = cfg
@@ -16804,7 +16805,7 @@ fn apply_extended_freeze_market_progress_snapshot_overrides(
         .get(EXTENDED_IDX)
         .map(|venue| venue.effective_stale_ms(cfg.book.stale_ms))
         .unwrap_or(cfg.book.stale_ms);
-    if compute_stale_market_age_ms(now_ms, Some(last_mid_update_ms)) > stale_ms {
+    if compute_stale_market_age_ms(now_ms, Some(progress_anchor_ms)) > stale_ms {
         return;
     }
     if venue_state.mid.is_none() || venue_state.spread.is_none() {
@@ -16817,7 +16818,7 @@ fn apply_extended_freeze_market_progress_snapshot_overrides(
     else {
         return;
     };
-    market.timestamp_ms = Some(last_mid_update_ms);
+    market.timestamp_ms = Some(progress_anchor_ms);
     market.mid = venue_state.mid;
     market.spread = venue_state.spread;
     market.depth_near_mid = venue_state.depth_near_mid;
@@ -21384,6 +21385,93 @@ mod tests {
             &state,
             &cfg,
             1_000 + stale_ms + 1,
+        );
+
+        assert!(snapshot.market[0].is_stale);
+        assert_eq!(snapshot.market[0].timestamp_ms, Some(1_000));
+        assert_eq!(snapshot.market[0].mid, Some(1_900.0));
+    }
+
+    #[test]
+    fn extended_fresh_local_apply_overrides_stale_exchange_timestamp() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let stale_ms = cfg.venues[0].effective_stale_ms(cfg.book.stale_ms);
+        state.venues[0].mid = Some(2_080.05);
+        state.venues[0].spread = Some(0.1);
+        state.venues[0].depth_near_mid = 10_000.0;
+        state.venues[0].last_mid_update_ms = Some(1_000);
+        state.venues[0].last_mid_apply_ms = Some(4_000);
+
+        let mut snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: 4_000 + stale_ms,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(1_000),
+                    mid: Some(1_900.0 + venue_index as f64),
+                    spread: Some(10.0),
+                    depth_near_mid: 1.0,
+                    is_stale: true,
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        apply_extended_freeze_market_progress_snapshot_overrides(
+            &mut snapshot,
+            &state,
+            &cfg,
+            4_000 + stale_ms,
+        );
+
+        assert!(!snapshot.market[0].is_stale);
+        assert_eq!(snapshot.market[0].timestamp_ms, Some(4_000));
+        assert_eq!(snapshot.market[0].mid, state.venues[0].mid);
+        assert_eq!(snapshot.market[0].spread, state.venues[0].spread);
+        assert_eq!(snapshot.market[0].depth_near_mid, 10_000.0);
+    }
+
+    #[test]
+    fn extended_local_apply_override_fails_closed_when_apply_anchor_is_old() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        let stale_ms = cfg.venues[0].effective_stale_ms(cfg.book.stale_ms);
+        state.venues[0].mid = Some(2_080.05);
+        state.venues[0].spread = Some(0.1);
+        state.venues[0].last_mid_update_ms = Some(1_000);
+        state.venues[0].last_mid_apply_ms = Some(2_000);
+
+        let mut snapshot = CanonicalCacheSnapshot {
+            timestamp_ms: 2_000 + stale_ms + 1,
+            market: cfg
+                .venues
+                .iter()
+                .enumerate()
+                .map(|(venue_index, venue)| VenueMarketSnapshot {
+                    venue_index,
+                    venue_id: venue.id_arc.clone(),
+                    seq: 1,
+                    timestamp_ms: Some(1_000),
+                    mid: Some(1_900.0 + venue_index as f64),
+                    spread: Some(10.0),
+                    depth_near_mid: 1.0,
+                    is_stale: true,
+                })
+                .collect(),
+            account: Vec::new(),
+        };
+
+        apply_extended_freeze_market_progress_snapshot_overrides(
+            &mut snapshot,
+            &state,
+            &cfg,
+            2_000 + stale_ms + 1,
         );
 
         assert!(snapshot.market[0].is_stale);

@@ -1265,6 +1265,20 @@ fn extended_should_rearm_post_publish_stream_fallback(
     hedge_mode == Some(ExtendedHedgeMode::PostPublishStreamFallback)
 }
 
+fn extended_should_clear_full_orderbook_preference_after_session(
+    reason: ExtendedPublicReconnectReason,
+    post_publish_fallback_used: bool,
+    session_duration: Duration,
+    healthy_reset: Duration,
+) -> bool {
+    if reason == ExtendedPublicReconnectReason::DegradedStreamRebootstrapGap {
+        return true;
+    }
+    session_duration >= healthy_reset
+        && reason != ExtendedPublicReconnectReason::StaleWatchdog
+        && !post_publish_fallback_used
+}
+
 fn extended_failure_escalation_suppressed(
     reason: ExtendedPublicReconnectReason,
     stale_watchdog_count_window: usize,
@@ -1749,10 +1763,12 @@ impl ExtendedConnector {
             if self
                 .prefer_full_orderbook_on_reconnect
                 .load(Ordering::Relaxed)
-                && session_duration >= stale_watchdog_healthy_reset
-                && outcome.reason != ExtendedPublicReconnectReason::StaleWatchdog
-                && outcome.reason != ExtendedPublicReconnectReason::DegradedStreamRebootstrapGap
-                && !post_publish_fallback_used
+                && extended_should_clear_full_orderbook_preference_after_session(
+                    outcome.reason,
+                    post_publish_fallback_used,
+                    session_duration,
+                    stale_watchdog_healthy_reset,
+                )
             {
                 self.prefer_full_orderbook_on_reconnect
                     .store(false, Ordering::Relaxed);
@@ -7732,6 +7748,40 @@ printf '%s\n' '{"timestamp_ms":1700000000000,"collateral_asset":"USDC","balance_
             ExtendedHedgeMode::BackendAttach
         )));
         assert!(!extended_should_rearm_post_publish_stream_fallback(None));
+    }
+
+    #[test]
+    fn extended_degraded_rebootstrap_clears_full_orderbook_reconnect_preference() {
+        assert!(extended_should_clear_full_orderbook_preference_after_session(
+            ExtendedPublicReconnectReason::DegradedStreamRebootstrapGap,
+            false,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+        ));
+        assert!(extended_should_clear_full_orderbook_preference_after_session(
+            ExtendedPublicReconnectReason::DegradedStreamRebootstrapGap,
+            true,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+        ));
+        assert!(!extended_should_clear_full_orderbook_preference_after_session(
+            ExtendedPublicReconnectReason::StaleWatchdog,
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        assert!(!extended_should_clear_full_orderbook_preference_after_session(
+            ExtendedPublicReconnectReason::ReadTimeout,
+            true,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        assert!(extended_should_clear_full_orderbook_preference_after_session(
+            ExtendedPublicReconnectReason::ReadTimeout,
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
     }
 
     #[test]
