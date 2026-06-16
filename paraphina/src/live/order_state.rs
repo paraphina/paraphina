@@ -907,7 +907,7 @@ fn supports_independent_snapshot_seq_reconcile(venue_id: &str, order: &LiveOrder
     if venue_id.eq_ignore_ascii_case("aster") || venue_id.eq_ignore_ascii_case("extended") {
         return order.side.is_some();
     }
-    venue_id.eq_ignore_ascii_case("lighter")
+    (venue_id.eq_ignore_ascii_case("lighter") || venue_id.eq_ignore_ascii_case("paradex"))
         && order.purpose == Some(OrderPurpose::Mm)
         && order.side.is_some()
 }
@@ -1186,6 +1186,54 @@ mod tests {
         assert_eq!(order.gap_grace_started_ms, Some(2_000));
         assert!(state.open_orders().is_empty());
         assert_eq!(state.active_orders().len(), 1);
+    }
+
+    #[test]
+    fn lower_seq_paradex_missing_snapshot_reconciles_after_gap_grace() {
+        let mut state = LiveOrderState::new();
+        state.apply_execution_event(
+            &ack(
+                4,
+                "pdx_oid_1",
+                "co_pdx_1",
+                Side::Buy,
+                100.0,
+                0.01,
+                OrderPurpose::Mm,
+                20_000,
+            ),
+            1_000,
+        );
+
+        let empty_paradex_snapshot = OrderSnapshot {
+            venue_index: 4,
+            venue_id: "paradex".to_string(),
+            seq: 3,
+            timestamp_ms: 2_000,
+            open_orders: Vec::new(),
+        };
+        state.reconcile(&empty_paradex_snapshot, 2_000);
+
+        let order = state.orders.get("co_pdx_1").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::SnapshotGapGrace);
+        assert_eq!(order.gap_grace_started_ms, Some(2_000));
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_orders().is_empty());
+        assert_eq!(state.active_orders().len(), 1);
+
+        state.reconcile(
+            &OrderSnapshot {
+                timestamp_ms: 4_001,
+                ..empty_paradex_snapshot
+            },
+            4_001,
+        );
+
+        let order = state.orders.get("co_pdx_1").expect("tracked order");
+        assert_eq!(order.status, OrderStatus::Cancelled);
+        assert_eq!(order.gap_grace_started_ms, None);
+        assert_eq!(order.last_update_seq, Some(20_000));
+        assert!(state.open_order_ids_by_venue(4).is_empty());
     }
 
     #[test]
