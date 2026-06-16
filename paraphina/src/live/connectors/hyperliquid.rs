@@ -4780,7 +4780,7 @@ mod tests {
         assert_eq!(response_type, "action");
         let err = result.expect_err("top level err response");
         let err = err.to_string();
-        assert!(err.contains("top_level_err sanitized_reason=exchange_error"));
+        assert!(err.contains("top_level_err sanitized_reason=api_wallet_not_found"));
         assert!(!err.contains("User or API Wallet does not exist"));
         assert!(!err.contains("payload"));
     }
@@ -4818,6 +4818,9 @@ mod tests {
                 "reduce_only_violation",
             ),
             ("Bad Alo Px", "bad_alo_px"),
+            ("User or API Wallet does not exist", "api_wallet_not_found"),
+            ("Deposit required before trading", "deposit_required"),
+            ("Invalid order id supplied", "invalid_order_id"),
         ];
         for (raw, expected) in cases {
             assert_eq!(ws_post_exchange_error_reason(raw), expected, "raw={raw}");
@@ -4835,6 +4838,20 @@ mod tests {
         assert!(!err.message.contains("Oracle price band"));
         assert!(!err.message.contains("oid"));
         assert!(!err.message.contains("signature"));
+        assert!(!err.message.contains("payload"));
+    }
+
+    #[test]
+    fn map_rest_error_classifies_deposit_required_without_raw_echo() {
+        let err = map_rest_error(anyhow::anyhow!(
+            r#"Hyperliquid rejected response=\"Deposit required for wallet=0xabc\" payload={{\"authorization\":\"secret\"}}"#
+        ));
+
+        assert_eq!(err.kind, LiveGatewayErrorKind::Fatal);
+        assert!(err.message.contains("sanitized_reason=deposit_required"));
+        assert!(!err.message.contains("Deposit required"));
+        assert!(!err.message.contains("wallet"));
+        assert!(!err.message.contains("authorization"));
         assert!(!err.message.contains("payload"));
     }
 
@@ -6714,6 +6731,20 @@ fn ws_post_exchange_error_reason(raw: &str) -> &'static str {
         || (lower.contains("exceeds") && lower.contains("position"))
     {
         "max_position"
+    } else if lower.contains("api wallet") && lower.contains("does not exist")
+        || lower.contains("user") && lower.contains("wallet") && lower.contains("does not exist")
+    {
+        "api_wallet_not_found"
+    } else if lower.contains("deposit required")
+        || lower.contains("deposit") && lower.contains("required")
+        || lower.contains("no deposit")
+    {
+        "deposit_required"
+    } else if lower.contains("invalid order id")
+        || lower.contains("invalid oid")
+        || lower.contains("bad order id")
+    {
+        "invalid_order_id"
     } else {
         "exchange_error"
     }
