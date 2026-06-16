@@ -4786,6 +4786,59 @@ mod tests {
     }
 
     #[test]
+    fn ws_post_sanitized_payload_reason_classifies_object_message_without_raw_echo() {
+        let payload = json!({
+            "message": "Price violates tick size for order_id=123 at px=2124.4",
+            "headers": { "authorization": "secret-token" }
+        });
+
+        assert_eq!(ws_post_sanitized_payload_reason(&payload), "tick_size");
+    }
+
+    #[test]
+    fn ws_post_sanitized_payload_reason_classifies_nested_array_without_raw_echo() {
+        let payload = json!({
+            "response": [{
+                "error": "Order value below min notional, client_order_id=abc"
+            }]
+        });
+
+        assert_eq!(ws_post_sanitized_payload_reason(&payload), "min_notional");
+    }
+
+    #[test]
+    fn ws_post_exchange_error_reason_classifies_known_safe_hyperliquid_reasons() {
+        let cases = [
+            ("Oracle price band would be breached", "oracle_price_band"),
+            ("Order not found for oid 123", "missing_order"),
+            ("Open interest cap exceeded", "open_interest_cap"),
+            ("Maximum position limit exceeded", "max_position"),
+            (
+                "Reduce only order would increase position",
+                "reduce_only_violation",
+            ),
+            ("Bad Alo Px", "bad_alo_px"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(ws_post_exchange_error_reason(raw), expected, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn map_rest_error_reports_known_reason_without_raw_echo() {
+        let err = map_rest_error(anyhow::anyhow!(
+            r#"Hyperliquid rejected message=Oracle price band would be breached oid=123 payload={{"signature":"abc"}}"#
+        ));
+
+        assert_eq!(err.kind, LiveGatewayErrorKind::Fatal);
+        assert!(err.message.contains("sanitized_reason=oracle_price_band"));
+        assert!(!err.message.contains("Oracle price band"));
+        assert!(!err.message.contains("oid"));
+        assert!(!err.message.contains("signature"));
+        assert!(!err.message.contains("payload"));
+    }
+
+    #[test]
     fn parse_ws_post_response_sanitizes_action_decode_failures() {
         let value = json!({
             "channel": "post",
@@ -6573,11 +6626,42 @@ fn ws_post_sanitized_label(raw: &str) -> &'static str {
     }
 }
 
+fn ws_post_reason_is_specific(reason: &str) -> bool {
+    !matches!(
+        reason,
+        "exchange_error"
+            | "object_payload"
+            | "array_payload"
+            | "null_payload"
+            | "bool_payload"
+            | "number_payload"
+    )
+}
+
 fn ws_post_sanitized_payload_reason(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::String(raw) => ws_post_exchange_error_reason(raw),
-        serde_json::Value::Object(_) => "object_payload",
-        serde_json::Value::Array(_) => "array_payload",
+        serde_json::Value::Object(map) => {
+            for key in ["message", "error", "reason", "response", "payload"] {
+                if let Some(reason) = map
+                    .get(key)
+                    .map(ws_post_sanitized_payload_reason)
+                    .filter(|reason| ws_post_reason_is_specific(reason))
+                {
+                    return reason;
+                }
+            }
+            "object_payload"
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let reason = ws_post_sanitized_payload_reason(item);
+                if ws_post_reason_is_specific(reason) {
+                    return reason;
+                }
+            }
+            "array_payload"
+        }
         serde_json::Value::Null => "null_payload",
         serde_json::Value::Bool(_) => "bool_payload",
         serde_json::Value::Number(_) => "number_payload",
@@ -6588,15 +6672,48 @@ fn ws_post_exchange_error_reason(raw: &str) -> &'static str {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("post only") && lower.contains("immediately matched") {
         "post_only_would_match"
-    } else if lower.contains("badalopx") {
+    } else if lower.contains("badalopx")
+        || lower.contains("bad_alo_px")
+        || lower.contains("bad alo px")
+    {
         "bad_alo_px"
     } else if lower.contains("insufficient") && lower.contains("margin") {
         "insufficient_margin"
+    } else if lower.contains("reduce") && lower.contains("only") {
+        "reduce_only_violation"
     } else if lower.contains("rate") && lower.contains("limit")
         || lower.contains("too many requests")
         || lower.contains("429")
     {
         "rate_limited"
+    } else if lower.contains("tick size")
+        || lower.contains("tick_size")
+        || lower.contains("invalid tick")
+    {
+        "tick_size"
+    } else if lower.contains("min notional")
+        || lower.contains("minimum notional")
+        || (lower.contains("minimum") && lower.contains("order") && lower.contains("value"))
+    {
+        "min_notional"
+    } else if lower.contains("oracle") && (lower.contains("price") || lower.contains("band")) {
+        "oracle_price_band"
+    } else if lower.contains("missing order")
+        || lower.contains("order not found")
+        || lower.contains("unknown oid")
+        || (lower.contains("oid") && lower.contains("not found"))
+        || (lower.contains("order") && lower.contains("does not exist"))
+    {
+        "missing_order"
+    } else if lower.contains("open interest") && (lower.contains("cap") || lower.contains("limit"))
+    {
+        "open_interest_cap"
+    } else if lower.contains("max position")
+        || lower.contains("maximum position")
+        || lower.contains("position limit")
+        || (lower.contains("exceeds") && lower.contains("position"))
+    {
+        "max_position"
     } else {
         "exchange_error"
     }
