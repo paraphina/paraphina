@@ -2696,12 +2696,15 @@ impl AsterAccountState {
                     .get("wb")
                     .and_then(parse_f64)
                     .unwrap_or_else(|| self.balances.get(asset).map(|b| b.total).unwrap_or(0.0));
-                let available = balance.get("cw").and_then(parse_f64).unwrap_or_else(|| {
-                    self.balances
-                        .get(asset)
-                        .map(|b| b.available)
-                        .unwrap_or(total)
-                });
+                // Aster ACCOUNT_UPDATE balance rows expose cw as cross-wallet balance,
+                // not REST availableBalance. Treating it as free margin can overstate
+                // available capital between REST account refreshes. Preserve the last
+                // REST-derived available value and clamp it to the updated wallet balance.
+                let available = self
+                    .balances
+                    .get(asset)
+                    .map(|b| b.available.min(total))
+                    .unwrap_or(0.0);
                 self.balances.insert(
                     asset.to_string(),
                     BalanceSnapshot {
@@ -4507,10 +4510,61 @@ mod tests {
         assert!((next.positions[0].size - 0.01).abs() < 1e-9);
         assert_eq!(next.balances.len(), 1);
         assert!((next.balances[0].total - 102.5).abs() < 1e-9);
-        assert!((next.balances[0].available - 96.0).abs() < 1e-9);
+        // ACCOUNT_UPDATE cw is cross-wallet balance, not free available margin.
+        assert!((next.balances[0].available - 90.0).abs() < 1e-9);
         assert!((next.margin.balance_usd - 102.5).abs() < 1e-9);
-        assert!((next.margin.available_usd - 96.0).abs() < 1e-9);
-        assert!((next.margin.used_usd - 6.5).abs() < 1e-9);
+        assert!((next.margin.available_usd - 90.0).abs() < 1e-9);
+        assert!((next.margin.used_usd - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn account_state_clamps_available_margin_to_wallet_balance() {
+        let snapshot = AccountSnapshot {
+            venue_index: 2,
+            venue_id: "ASTER".to_string(),
+            seq: 1,
+            timestamp_ms: 1000,
+            open_order_count: None,
+            positions: Vec::new(),
+            balances: vec![BalanceSnapshot {
+                asset: "USDT".to_string(),
+                total: 100.0,
+                available: 90.0,
+            }],
+            funding_8h: None,
+            margin: MarginSnapshot {
+                balance_usd: 100.0,
+                used_usd: 10.0,
+                available_usd: 90.0,
+            },
+            liquidation: LiquidationSnapshot {
+                price_liq: None,
+                dist_liq_sigma: None,
+            },
+        };
+        let mut state = AsterAccountState::from_snapshot(snapshot);
+        let update = serde_json::json!({
+            "e": "ACCOUNT_UPDATE",
+            "E": 2000,
+            "a": {
+                "B": [{
+                    "a": "USDT",
+                    "wb": "80.0",
+                    "cw": "1000.0"
+                }],
+                "P": []
+            }
+        });
+
+        let next = state
+            .apply_update(&update, 2, 2000)
+            .expect("snapshot after account update");
+
+        assert!((next.balances[0].total - 80.0).abs() < 1e-9);
+        assert!((next.balances[0].available - 80.0).abs() < 1e-9);
+        assert!((next.margin.balance_usd - 80.0).abs() < 1e-9);
+        assert!((next.margin.available_usd - 80.0).abs() < 1e-9);
+        assert!((next.margin.used_usd - 0.0).abs() < 1e-9);
     }
 
     #[test]
