@@ -2019,10 +2019,12 @@ impl ParadexRestClient {
         let value: Value = serde_json::from_str(&body).map_err(|err| {
             LiveGatewayError::fatal(format!("paradex account parse error: {err}"))
         })?;
+        let observed_ms = now_ms();
         let mut snapshot =
             parse_account_snapshot(&value, venue_id, venue_index).ok_or_else(|| {
                 LiveGatewayError::fatal("paradex account snapshot missing required fields")
             })?;
+        snapshot.timestamp_ms = observed_ms;
         if snapshot.positions.is_empty() {
             if let Ok(positions) = self.fetch_position_snapshots().await {
                 snapshot.positions = positions;
@@ -7208,13 +7210,18 @@ mod tests {
             })
             .await;
 
+        let before_poll_ms = now_ms();
         let snapshot = client
             .fetch_account_snapshot("PARADEX", 4)
             .await
             .expect("snapshot");
+        let after_poll_ms = now_ms();
 
         account_mock.assert_async().await;
         positions_mock.assert_async().await;
+        assert_ne!(snapshot.timestamp_ms, 1_700_000_000_123i64);
+        assert!(snapshot.timestamp_ms >= before_poll_ms);
+        assert!(snapshot.timestamp_ms <= after_poll_ms);
         assert_eq!(snapshot.positions.len(), 1);
         assert_eq!(snapshot.positions[0].symbol, "ETH-USD-PERP");
         assert!((snapshot.positions[0].size + 1.07).abs() < 1e-9);
