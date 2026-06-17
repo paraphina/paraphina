@@ -203,6 +203,7 @@ pub enum VenueUtilityReason {
     SpreadPathology,
     AdverseSelection,
     RejectPressure,
+    CoverageProbe,
 }
 
 impl VenueUtilityReason {
@@ -213,6 +214,7 @@ impl VenueUtilityReason {
             VenueUtilityReason::SpreadPathology => "spread_pathology",
             VenueUtilityReason::AdverseSelection => "adverse_selection",
             VenueUtilityReason::RejectPressure => "reject_pressure",
+            VenueUtilityReason::CoverageProbe => "coverage_probe",
         }
     }
 }

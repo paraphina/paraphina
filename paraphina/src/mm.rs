@@ -807,6 +807,73 @@ fn pre_soft_taper_side(
 }
 
 #[allow(clippy::manual_clamp)]
+fn env_flag_true(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_list_contains(name: &str, target: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .any(|venue| venue.trim().eq_ignore_ascii_case(target))
+        })
+        .unwrap_or(false)
+}
+
+fn paradex_coverage_probe_utility_bypass_enabled() -> bool {
+    matches!(
+        std::env::var("PARAPHINA_TRADE_MODE").ok().as_deref(),
+        Some("live")
+    ) && matches!(
+        std::env::var("PARAPHINA_V2_DECISION_MODE").ok().as_deref(),
+        Some("live_canary_admission")
+    ) && env_flag_true("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED")
+        && env_flag_true("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_APPROVED")
+        && env_flag_true("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS")
+        && env_flag_true("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE")
+        && env_flag_true("PARAPHINA_V2_LIVE_CANARY_PARADEX_COVERAGE_UTILITY_BYPASS")
+        && env_list_contains(
+            "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_VENUES",
+            "paradex",
+        )
+        && env_list_contains(
+            "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES",
+            "paradex",
+        )
+}
+
+fn apply_paradex_coverage_probe_utility_bypass(
+    vcfg: &VenueConfig,
+    vstate: &VenueState,
+    decision: &mut VenueUtilityDecision,
+) {
+    if vcfg.id != "paradex"
+        || !matches!(vstate.status, VenueStatus::Healthy)
+        || decision.role != MmVenueRole::Fill
+        || !matches!(decision.tier, VenueUtilityTier::Suppressed)
+        || !matches!(decision.reason, VenueUtilityReason::SpreadPathology)
+        || !paradex_coverage_probe_utility_bypass_enabled()
+    {
+        return;
+    }
+
+    decision.tier = VenueUtilityTier::Full;
+    decision.reason = VenueUtilityReason::CoverageProbe;
+    decision.extra_edge_usd = 0.0;
+    decision.size_multiplier = 1.0;
+    decision.role_cap_applied = false;
+}
+
 pub(crate) fn compute_venue_utility_decision(
     mm_cfg: &MmConfig,
     q_global_tao: f64,
@@ -925,6 +992,8 @@ pub(crate) fn compute_venue_utility_decision(
             pre_soft_taper_size_multiplier: 1.0,
         }
     };
+
+    apply_paradex_coverage_probe_utility_bypass(vcfg, vstate, &mut decision);
 
     match role {
         MmVenueRole::Fill => {}
@@ -4070,6 +4139,73 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
     use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    struct EnvGuard {
+        key: &'static str,
+        old_value: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old_value = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, old_value }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let old_value = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn mm_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn paradex_coverage_probe_env_gates() -> Vec<EnvGuard> {
+        vec![
+            EnvGuard::set("PARAPHINA_TRADE_MODE", "live"),
+            EnvGuard::set("PARAPHINA_V2_DECISION_MODE", "live_canary_admission"),
+            EnvGuard::set("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "true"),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_APPROVED",
+                "true",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS",
+                "true",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE",
+                "true",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_PARADEX_COVERAGE_UTILITY_BYPASS",
+                "true",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_VENUES",
+                "paradex",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES",
+                "paradex",
+            ),
+        ]
+    }
 
     /// Helper to create a test config and state.
     fn setup_test() -> (Config, GlobalState) {
@@ -5275,6 +5411,155 @@ mod tests {
         );
         assert_eq!(decision.tier, VenueUtilityTier::Suppressed);
         assert_eq!(decision.reason, VenueUtilityReason::SpreadPathology);
+    }
+
+    #[test]
+    fn paradex_coverage_probe_utility_bypass_defaults_off() {
+        let _lock = mm_env_lock().lock().unwrap();
+        let _guards = [
+            EnvGuard::unset("PARAPHINA_TRADE_MODE"),
+            EnvGuard::unset("PARAPHINA_V2_DECISION_MODE"),
+            EnvGuard::unset("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED"),
+            EnvGuard::unset("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_APPROVED"),
+            EnvGuard::unset("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS"),
+            EnvGuard::unset("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE"),
+            EnvGuard::unset("PARAPHINA_V2_LIVE_CANARY_PARADEX_COVERAGE_UTILITY_BYPASS"),
+            EnvGuard::unset("PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_VENUES"),
+            EnvGuard::unset("PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES"),
+        ];
+        let (cfg, mut state) = setup_test();
+        let paradex_idx = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue");
+        state.venues[paradex_idx].utility.spread_gate_hit_ewma = 3.0;
+        state.venues[paradex_idx].utility.mm_fill_count_ewma = 0.0;
+
+        let decision = compute_venue_utility_decision(
+            &cfg.mm,
+            state.q_global_tao,
+            &cfg.venues[paradex_idx],
+            &state.venues[paradex_idx],
+            true,
+        );
+
+        assert_eq!(decision.tier, VenueUtilityTier::Suppressed);
+        assert_eq!(decision.reason, VenueUtilityReason::SpreadPathology);
+    }
+
+    #[test]
+    fn paradex_coverage_probe_utility_bypass_requires_explicit_probe_gates() {
+        let _lock = mm_env_lock().lock().unwrap();
+        let _guards = [
+            EnvGuard::set("PARAPHINA_TRADE_MODE", "live"),
+            EnvGuard::set("PARAPHINA_V2_DECISION_MODE", "live_canary_admission"),
+            EnvGuard::set("PARAPHINA_V2_LIVE_CANARY_ADMISSION_APPROVED", "true"),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_APPROVED",
+                "true",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS",
+                "true",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE",
+                "true",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_PARADEX_COVERAGE_UTILITY_BYPASS",
+                "false",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_PROBE_VENUES",
+                "paradex",
+            ),
+            EnvGuard::set(
+                "PARAPHINA_V2_LIVE_CANARY_RANKED_EXECUTION_VENUES",
+                "paradex",
+            ),
+        ];
+        let (cfg, mut state) = setup_test();
+        let paradex_idx = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue");
+        state.venues[paradex_idx].utility.spread_gate_hit_ewma = 3.0;
+        state.venues[paradex_idx].utility.mm_fill_count_ewma = 0.0;
+
+        let decision = compute_venue_utility_decision(
+            &cfg.mm,
+            state.q_global_tao,
+            &cfg.venues[paradex_idx],
+            &state.venues[paradex_idx],
+            true,
+        );
+
+        assert_eq!(decision.tier, VenueUtilityTier::Suppressed);
+        assert_eq!(decision.reason, VenueUtilityReason::SpreadPathology);
+    }
+
+    #[test]
+    fn paradex_coverage_probe_utility_bypass_lifts_paradex_spread_pathology_only() {
+        let _lock = mm_env_lock().lock().unwrap();
+        let _guards = paradex_coverage_probe_env_gates();
+        let (cfg, mut state) = setup_test();
+        let paradex_idx = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue");
+        state.venues[paradex_idx].utility.spread_gate_hit_ewma = 3.0;
+        state.venues[paradex_idx].utility.mm_fill_count_ewma = 0.0;
+
+        let decision = compute_venue_utility_decision(
+            &cfg.mm,
+            state.q_global_tao,
+            &cfg.venues[paradex_idx],
+            &state.venues[paradex_idx],
+            true,
+        );
+
+        assert_eq!(decision.tier, VenueUtilityTier::Full);
+        assert_eq!(decision.reason, VenueUtilityReason::CoverageProbe);
+
+        state.venues[0].utility.spread_gate_hit_ewma = 3.0;
+        state.venues[0].utility.mm_fill_count_ewma = 0.0;
+        let non_paradex = compute_venue_utility_decision(
+            &cfg.mm,
+            state.q_global_tao,
+            &cfg.venues[0],
+            &state.venues[0],
+            true,
+        );
+        assert_eq!(non_paradex.tier, VenueUtilityTier::Suppressed);
+        assert_eq!(non_paradex.reason, VenueUtilityReason::SpreadPathology);
+    }
+
+    #[test]
+    fn paradex_coverage_probe_utility_bypass_does_not_bypass_spread_gate() {
+        let _lock = mm_env_lock().lock().unwrap();
+        let _guards = paradex_coverage_probe_env_gates();
+        let (mut cfg, mut state) = setup_test();
+        let paradex_idx = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id == "paradex")
+            .expect("paradex venue");
+        cfg.mm
+            .max_quote_spread_bps_by_venue
+            .insert("paradex".to_string(), 1.0);
+        state.venues[paradex_idx].spread = Some(1.00);
+        state.venues[paradex_idx].utility.spread_gate_hit_ewma = 3.0;
+        state.venues[paradex_idx].utility.mm_fill_count_ewma = 0.0;
+
+        let quotes = compute_mm_quotes(&cfg, &state);
+        assert!(quotes[paradex_idx].bid.is_none());
+        assert!(quotes[paradex_idx].ask.is_none());
+        assert_eq!(quotes[paradex_idx].bid_terminal_reason, "spread_bps_cap");
+        assert_eq!(quotes[paradex_idx].ask_terminal_reason, "spread_bps_cap");
     }
 
     #[test]
