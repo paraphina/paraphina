@@ -2427,6 +2427,43 @@ fn v2_live_canary_venue_coverage_should_stop_after_first_fill(
         && v2_live_canary_venue_coverage_tick_has_allowed_mm_fill(cfg, fills)
 }
 
+fn v2_live_canary_venue_coverage_stop_on_account_position_change_enabled(
+    cfg: &Config,
+    trade_mode: &str,
+    canary_enabled: bool,
+) -> bool {
+    v2_live_canary_venue_coverage_stop_after_first_fill_enabled(cfg, trade_mode, canary_enabled)
+        && phase51_true_env(V2_LIVE_CANARY_VENUE_COVERAGE_STOP_ON_ACCOUNT_POSITION_CHANGE_ENV)
+}
+
+fn v2_live_canary_venue_coverage_tick_has_allowed_account_position_change(
+    cfg: &Config,
+    account_position_syncs: &[AccountPositionSyncRecord],
+) -> bool {
+    let Some(allowed_venue) = v2_live_canary_venue_coverage_allowed_venue(cfg) else {
+        return false;
+    };
+    account_position_syncs.iter().any(|sync| {
+        sync.venue_id.eq_ignore_ascii_case(allowed_venue) && sync.position_delta_tao.abs() > 1e-9
+    })
+}
+
+fn v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+    cfg: &Config,
+    trade_mode: &str,
+    canary_enabled: bool,
+    account_position_syncs: &[AccountPositionSyncRecord],
+) -> bool {
+    v2_live_canary_venue_coverage_stop_on_account_position_change_enabled(
+        cfg,
+        trade_mode,
+        canary_enabled,
+    ) && v2_live_canary_venue_coverage_tick_has_allowed_account_position_change(
+        cfg,
+        account_position_syncs,
+    )
+}
+
 fn v2_live_canary_venue_coverage_replacements_disabled(cfg: &Config, trade_mode: &str) -> bool {
     trade_mode == "live"
         && v2_live_canary_admission_authorized(cfg)
@@ -3776,6 +3813,8 @@ const PHASE51_LIGHTER_BASELINE_CLEANUP_ONLY_ENV: &str =
 const V2_TERMINAL_CLEANUP_ONLY_ENV: &str = "PARAPHINA_V2_TERMINAL_CLEANUP_ONLY";
 const V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL";
+const V2_LIVE_CANARY_VENUE_COVERAGE_STOP_ON_ACCOUNT_POSITION_CHANGE_ENV: &str =
+    "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_STOP_ON_ACCOUNT_POSITION_CHANGE";
 const V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS_ENV: &str =
     "PARAPHINA_V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_REPLACEMENTS";
 const V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV: &str =
@@ -6355,12 +6394,20 @@ pub async fn run_live_loop(
             break;
         }
 
-        if v2_live_canary_venue_coverage_should_stop_after_first_fill(
+        let stop_after_first_fill = v2_live_canary_venue_coverage_should_stop_after_first_fill(
             cfg,
             &trade_mode,
             canary_enabled,
             &tick_fills,
-        ) {
+        );
+        let stop_after_account_position_change =
+            v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                cfg,
+                &trade_mode,
+                canary_enabled,
+                &tick_account_position_syncs,
+            );
+        if stop_after_first_fill || stop_after_account_position_change {
             let _ = flush_batched_fills(&mut fill_batcher, cfg, &mut state, now_ms, true);
             tick_timing.total_us = tick_start.elapsed().as_micros() as u64;
             if let Some(hooks) = hooks.as_ref() {
@@ -6409,11 +6456,19 @@ pub async fn run_live_loop(
                 }
             }
             maybe_print_market_rx_stats(tick, market_rx_stats_enabled, &market_rx_stats);
-            eprintln!(
-                "[v2] live_canary_venue_coverage_stop_after_first_fill=true tick={} venue={}",
-                tick,
-                v2_live_canary_venue_coverage_allowed_venue(cfg).unwrap_or("unknown")
-            );
+            let allowed_venue =
+                v2_live_canary_venue_coverage_allowed_venue(cfg).unwrap_or("unknown");
+            if stop_after_first_fill {
+                eprintln!(
+                    "[v2] live_canary_venue_coverage_stop_after_first_fill=true tick={} venue={}",
+                    tick, allowed_venue
+                );
+            } else {
+                eprintln!(
+                    "[v2] live_canary_venue_coverage_stop_after_account_position_change=true tick={} venue={}",
+                    tick, allowed_venue
+                );
+            }
             break;
         }
 
@@ -20121,6 +20176,25 @@ mod tests {
         }
     }
 
+    fn v2_live_canary_venue_coverage_account_sync(
+        venue_id: &str,
+        position_delta_tao: f64,
+    ) -> AccountPositionSyncRecord {
+        AccountPositionSyncRecord {
+            venue_index: 0,
+            venue_id: venue_id.to_string(),
+            snapshot_seq: 1,
+            snapshot_timestamp_ms: Some(1_000),
+            ingest_now_ms: 1_001,
+            pre_position_tao: 0.0,
+            post_position_tao: position_delta_tao,
+            position_delta_tao,
+            pre_margin_available_usd: 100.0,
+            post_margin_available_usd: 100.0,
+            source: "account_snapshot",
+        }
+    }
+
     #[test]
     fn v2_live_canary_venue_coverage_stop_after_first_fill_is_default_off() {
         let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -20196,6 +20270,113 @@ mod tests {
             true,
             &fills
         ));
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_account_position_stop_is_default_off() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV,
+            V2_LIVE_CANARY_VENUE_COVERAGE_STOP_ON_ACCOUNT_POSITION_CHANGE_ENV,
+        ]);
+        std::env::set_var(
+            V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV,
+            "true",
+        );
+        std::env::remove_var(V2_LIVE_CANARY_VENUE_COVERAGE_STOP_ON_ACCOUNT_POSITION_CHANGE_ENV);
+        let cfg = v2_live_canary_venue_coverage_config(vec!["hyperliquid"]);
+        let syncs = vec![v2_live_canary_venue_coverage_account_sync(
+            "hyperliquid",
+            -0.01,
+        )];
+
+        assert!(
+            !v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                &cfg, "live", true, &syncs
+            )
+        );
+    }
+
+    #[test]
+    fn v2_live_canary_venue_coverage_account_position_stop_requires_exact_gates_and_venue() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV,
+            V2_LIVE_CANARY_VENUE_COVERAGE_STOP_ON_ACCOUNT_POSITION_CHANGE_ENV,
+        ]);
+        std::env::set_var(
+            V2_LIVE_CANARY_VENUE_COVERAGE_STOP_AFTER_FIRST_FILL_ENV,
+            "true",
+        );
+        std::env::set_var(
+            V2_LIVE_CANARY_VENUE_COVERAGE_STOP_ON_ACCOUNT_POSITION_CHANGE_ENV,
+            "true",
+        );
+        let cfg = v2_live_canary_venue_coverage_config(vec!["hyperliquid"]);
+        let syncs = vec![v2_live_canary_venue_coverage_account_sync(
+            "hyperliquid",
+            -0.01,
+        )];
+
+        assert!(
+            v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                &cfg, "live", true, &syncs
+            )
+        );
+        assert!(
+            !v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                &cfg, "paper", true, &syncs
+            )
+        );
+        assert!(
+            !v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                &cfg, "live", false, &syncs
+            )
+        );
+
+        let wrong_venue = vec![v2_live_canary_venue_coverage_account_sync("lighter", -0.01)];
+        assert!(
+            !v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                &cfg,
+                "live",
+                true,
+                &wrong_venue
+            )
+        );
+
+        let zero_delta = vec![v2_live_canary_venue_coverage_account_sync(
+            "hyperliquid",
+            0.0,
+        )];
+        assert!(
+            !v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                &cfg,
+                "live",
+                true,
+                &zero_delta
+            )
+        );
+
+        let multi_venue_cfg = v2_live_canary_venue_coverage_config(vec!["hyperliquid", "lighter"]);
+        assert!(
+            !v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                &multi_venue_cfg,
+                "live",
+                true,
+                &syncs
+            )
+        );
+
+        let mut not_approved = cfg.clone();
+        not_approved.v2_shadow.live_canary_admission_approved = false;
+        assert!(
+            !v2_live_canary_venue_coverage_should_stop_after_account_position_change(
+                &not_approved,
+                "live",
+                true,
+                &syncs
+            )
+        );
     }
 
     #[test]
