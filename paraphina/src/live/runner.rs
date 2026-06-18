@@ -2449,6 +2449,55 @@ fn v2_live_canary_venue_coverage_baseline_hedge_disabled(cfg: &Config, trade_mod
         && phase51_true_env(V2_LIVE_CANARY_VENUE_COVERAGE_DISABLE_BASELINE_HEDGE_ENV)
 }
 
+fn v2_live_canary_venue_coverage_account_reconcile_allowed_venues(
+    cfg: &Config,
+    trade_mode: &str,
+    canary_enabled: bool,
+) -> Option<HashSet<String>> {
+    if !(trade_mode == "live"
+        && canary_enabled
+        && v2_live_canary_admission_authorized(cfg)
+        && cfg.v2_shadow.live_canary_venue_coverage_probe_approved
+        && !cfg
+            .v2_shadow
+            .live_canary_venue_coverage_probe_venues
+            .is_empty())
+    {
+        return None;
+    }
+    Some(
+        cfg.v2_shadow
+            .live_canary_venue_coverage_probe_venues
+            .iter()
+            .map(|venue| venue.trim().to_ascii_lowercase())
+            .filter(|venue| !venue.is_empty())
+            .collect(),
+    )
+}
+
+fn account_reconcile_request_venue_indices(
+    cfg: &Config,
+    trade_mode: &str,
+    canary_enabled: bool,
+) -> Vec<usize> {
+    let Some(allowed_venues) = v2_live_canary_venue_coverage_account_reconcile_allowed_venues(
+        cfg,
+        trade_mode,
+        canary_enabled,
+    ) else {
+        return (0..cfg.venues.len()).collect();
+    };
+    cfg.venues
+        .iter()
+        .enumerate()
+        .filter_map(|(venue_index, venue)| {
+            allowed_venues
+                .contains(&venue.id.trim().to_ascii_lowercase())
+                .then_some(venue_index)
+        })
+        .collect()
+}
+
 fn v2_live_canary_venue_coverage_suppress_replacements(
     cfg: &Config,
     trade_mode: &str,
@@ -3888,6 +3937,8 @@ pub async fn run_live_loop(
     let canary_enabled = std::env::var("PARAPHINA_CANARY_MODE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let account_reconcile_request_venue_indices =
+        account_reconcile_request_venue_indices(cfg, &trade_mode, canary_enabled);
     let canary_max_position_tao = std::env::var("PARAPHINA_CANARY_MAX_POSITION_TAO")
         .ok()
         .and_then(|v| v.parse::<f64>().ok());
@@ -4279,7 +4330,7 @@ pub async fn run_live_loop(
                 .unwrap_or(true);
             if should_reconcile {
                 last_account_reconcile_ms = Some(now_ms);
-                for venue_index in 0..cfg.venues.len() {
+                for venue_index in account_reconcile_request_venue_indices.iter().copied() {
                     if let Some(snapshot) =
                         send_account_and_wait(tx, venue_index, now_ms, 500, tick).await
                     {
@@ -20293,6 +20344,44 @@ mod tests {
             &empty_allowlist,
             "live"
         ));
+    }
+
+    #[test]
+    fn account_reconcile_request_venue_indices_default_to_all_venues() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let cfg = Config::default();
+
+        assert_eq!(
+            account_reconcile_request_venue_indices(&cfg, "live", true),
+            vec![0, 1, 2, 3, 4]
+        );
+
+        let coverage_cfg = v2_live_canary_venue_coverage_config(vec!["paradex"]);
+        assert_eq!(
+            account_reconcile_request_venue_indices(&coverage_cfg, "paper", true),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            account_reconcile_request_venue_indices(&coverage_cfg, "live", false),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn account_reconcile_request_venue_indices_scope_v2_coverage_canary() {
+        let _lock = ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let cfg = v2_live_canary_venue_coverage_config(vec!["paradex"]);
+
+        assert_eq!(
+            account_reconcile_request_venue_indices(&cfg, "live", true),
+            vec![4]
+        );
+
+        let lighter_cfg = v2_live_canary_venue_coverage_config(vec!["lighter"]);
+        assert_eq!(
+            account_reconcile_request_venue_indices(&lighter_cfg, "live", true),
+            vec![3]
+        );
     }
 
     #[test]
