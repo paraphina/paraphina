@@ -11392,6 +11392,109 @@ fn projected_exposure_within_limits(
             .is_none_or(|limit| projection.q_max_abs_venue_tao <= limit + 1e-9)
 }
 
+
+fn projected_venue_cap_would_breach(
+    state: &GlobalState,
+    quote: &crate::mm::MmQuote,
+    ledger: &MmVenueExposureLedger,
+    side: Side,
+    quote_size_tao: f64,
+    venue_limit_tao: f64,
+) -> bool {
+    let Some(venue) = state.venues.get(quote.venue_index) else {
+        return false;
+    };
+    if !side_increases_abs_position(side, venue.position_tao) {
+        return false;
+    }
+    let quote_size_tao = quote_size_tao.max(0.0);
+    let same_side_exposure_tao = match side {
+        Side::Buy => ledger.bid.uncancelled_live_tao().max(quote_size_tao),
+        Side::Sell => ledger.ask.uncancelled_live_tao().max(quote_size_tao),
+    };
+    let projected_position_tao = match side {
+        Side::Buy => venue.position_tao + same_side_exposure_tao,
+        Side::Sell => venue.position_tao - same_side_exposure_tao,
+    };
+    projected_position_tao.abs() > venue_limit_tao + 1e-9
+}
+
+fn apply_projected_venue_cap_prepass_to_quotes(
+    state: &GlobalState,
+    ledgers: &[MmVenueExposureLedger],
+    venue_limit_tao: Option<f64>,
+    quotes: &mut [crate::mm::MmQuote],
+) -> Vec<ProjectedMmBudgetVenueStatus> {
+    let Some(venue_limit_tao) = venue_limit_tao.filter(|limit| limit.is_finite() && *limit > 0.0)
+    else {
+        return Vec::new();
+    };
+    let mut suppressed_venues = Vec::new();
+    for quote in quotes.iter_mut() {
+        let Some(ledger) = ledgers.get(quote.venue_index) else {
+            continue;
+        };
+        let mut suppress_bid = false;
+        let mut suppress_ask = false;
+        if let Some(bid) = quote.bid.as_ref() {
+            if projected_venue_cap_would_breach(
+                state,
+                quote,
+                ledger,
+                Side::Buy,
+                bid.size,
+                venue_limit_tao,
+            ) {
+                quote.bid = None;
+                quote.bid_terminal_reason = "projected_venue_cap_suppressed";
+                suppress_bid = true;
+            }
+        }
+        if let Some(ask) = quote.ask.as_ref() {
+            if projected_venue_cap_would_breach(
+                state,
+                quote,
+                ledger,
+                Side::Sell,
+                ask.size,
+                venue_limit_tao,
+            ) {
+                quote.ask = None;
+                quote.ask_terminal_reason = "projected_venue_cap_suppressed";
+                suppress_ask = true;
+            }
+        }
+        if suppress_bid || suppress_ask {
+            suppressed_venues.push(ProjectedMmBudgetVenueStatus {
+                venue_index: quote.venue_index,
+                venue_id: quote.venue_id.to_string(),
+                selected: false,
+                keep_bid: false,
+                keep_ask: false,
+                suppress_bid,
+                suppress_ask,
+                live_worsening_exposure_tao: 0.0,
+                candidate_size_tao: 0.0,
+                net_delta_tao: 0.0,
+                gross_increment_tao: 0.0,
+                projected_abs_venue_tao: 0.0,
+                rotation_rank: usize::MAX,
+                tracked_live_bid_tao: ledger.bid.tracked_live_tao(),
+                tracked_live_ask_tao: ledger.ask.tracked_live_tao(),
+                unmanaged_live_bid_tao: ledger.bid.unmanaged_live_tao(),
+                unmanaged_live_ask_tao: ledger.ask.unmanaged_live_tao(),
+                cancel_covered_live_bid_tao: ledger.bid.cancel_covered_live_tao(),
+                cancel_covered_live_ask_tao: ledger.ask.cancel_covered_live_tao(),
+                pending_new_bid_tao: ledger.bid.pending_new_tao,
+                pending_new_ask_tao: ledger.ask.pending_new_tao,
+                effective_bid_tao: ledger.bid.uncancelled_live_tao(),
+                effective_ask_tao: ledger.ask.uncancelled_live_tao(),
+            });
+        }
+    }
+    suppressed_venues
+}
+
 fn apply_projected_mm_budget_to_quotes(
     cfg: &Config,
     state: &GlobalState,
@@ -11435,6 +11538,37 @@ fn apply_projected_mm_budget_to_quotes(
     };
     if !status.configured {
         return status;
+    }
+
+    let venue_cap_suppressed = apply_projected_venue_cap_prepass_to_quotes(
+        state,
+        &raw_venue_ledgers,
+        limits.max_abs_venue_position_tao,
+        quotes,
+    );
+    if !venue_cap_suppressed.is_empty() {
+        status.applied = true;
+        for venue_status in venue_cap_suppressed {
+            if !status
+                .suppressed_venues
+                .iter()
+                .any(|existing| existing == &venue_status.venue_id)
+            {
+                status
+                    .suppressed_venues
+                    .push(venue_status.venue_id.to_string());
+            }
+            status.venues.push(venue_status);
+        }
+        let prepass_projection = effective_projected_exposure_from_mm_intents(
+            state,
+            &crate::mm::mm_quotes_to_order_intents(quotes),
+        );
+        status.projected_q_global_after_tao = prepass_projection.q_global_tao;
+        status.projected_q_gross_after_tao = prepass_projection.q_gross_tao;
+        status.projected_q_max_abs_venue_after_tao = prepass_projection.q_max_abs_venue_tao;
+        status.budget_after_within_limits =
+            projected_exposure_within_limits(&prepass_projection, limits);
     }
 
     let fill_quotes: Vec<usize> = quotes
@@ -22877,6 +23011,240 @@ mod tests {
 
         assert!((projected_net_position_tao(&state) - 0.0).abs() < 1e-9);
         assert!((projected_gross_position_tao(&state) - 0.05).abs() < 1e-9);
+    }
+
+
+    fn projected_budget_test_quote(venue_index: usize, venue_id: &str) -> MmQuote {
+        MmQuote {
+            venue_index,
+            venue_id: venue_id.into(),
+            bid: Some(MmLevel {
+                price: 1_999.0,
+                size: 0.01,
+                canonical_target_identity: None,
+            }),
+            ask: Some(MmLevel {
+                price: 2_001.0,
+                size: 0.01,
+                canonical_target_identity: None,
+            }),
+            generated_spread_cap_applied: false,
+            generated_spread_cap_bid_suppressed: false,
+            generated_spread_cap_ask_suppressed: false,
+            touch_mode_kind: None,
+            bid_terminal_reason: "active",
+            ask_terminal_reason: "active",
+        }
+    }
+
+    #[test]
+    fn projected_mm_budget_suppresses_bid_when_next_lot_would_breach_venue_cap() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].position_tao = 0.02;
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.recompute_after_fills(&cfg);
+        let mut quotes = vec![projected_budget_test_quote(0, "extended")];
+
+        let status = apply_projected_mm_budget_to_quotes(
+            &cfg,
+            &state,
+            0,
+            InventoryBrakeLimits {
+                max_position_tao: None,
+                max_gross_position_tao: None,
+                max_abs_venue_position_tao: Some(0.02),
+            },
+            &mut quotes,
+        );
+
+        assert!(status.configured);
+        assert!(status.applied);
+        assert_eq!(status.suppressed_venues, vec!["extended".to_string()]);
+        assert_eq!(status.venues.len(), 1);
+        assert!(status.venues[0].suppress_bid);
+        assert!(!status.venues[0].suppress_ask);
+        assert!(quotes[0].bid.is_none());
+        assert!(quotes[0].ask.is_some());
+        assert_eq!(
+            quotes[0].bid_terminal_reason,
+            "projected_venue_cap_suppressed"
+        );
+        assert!(status.budget_after_within_limits);
+        assert!(status.projected_q_max_abs_venue_after_tao <= 0.02 + 1e-9);
+    }
+
+    #[test]
+    fn projected_mm_budget_suppresses_ask_when_next_lot_would_breach_negative_venue_cap() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].position_tao = -0.02;
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.recompute_after_fills(&cfg);
+        let mut quotes = vec![projected_budget_test_quote(0, "extended")];
+
+        let status = apply_projected_mm_budget_to_quotes(
+            &cfg,
+            &state,
+            0,
+            InventoryBrakeLimits {
+                max_position_tao: None,
+                max_gross_position_tao: None,
+                max_abs_venue_position_tao: Some(0.02),
+            },
+            &mut quotes,
+        );
+
+        assert!(status.configured);
+        assert!(status.applied);
+        assert_eq!(status.suppressed_venues, vec!["extended".to_string()]);
+        assert_eq!(status.venues.len(), 1);
+        assert!(!status.venues[0].suppress_bid);
+        assert!(status.venues[0].suppress_ask);
+        assert!(quotes[0].bid.is_some());
+        assert!(quotes[0].ask.is_none());
+        assert_eq!(
+            quotes[0].ask_terminal_reason,
+            "projected_venue_cap_suppressed"
+        );
+        assert!(status.budget_after_within_limits);
+        assert!(status.projected_q_max_abs_venue_after_tao <= 0.02 + 1e-9);
+    }
+
+    #[test]
+    fn projected_mm_budget_allows_exact_venue_cap_touch_for_non_fill_role() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .venue_role_by_venue
+            .insert("extended".to_string(), MmVenueRole::Probationary);
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].position_tao = 0.01;
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.recompute_after_fills(&cfg);
+        let mut quotes = vec![projected_budget_test_quote(0, "extended")];
+
+        let status = apply_projected_mm_budget_to_quotes(
+            &cfg,
+            &state,
+            0,
+            InventoryBrakeLimits {
+                max_position_tao: None,
+                max_gross_position_tao: None,
+                max_abs_venue_position_tao: Some(0.02),
+            },
+            &mut quotes,
+        );
+
+        assert!(status.configured);
+        assert!(!status.applied);
+        assert!(status.suppressed_venues.is_empty());
+        assert!(status.venues.is_empty());
+        assert!(quotes[0].bid.is_some());
+        assert!(quotes[0].ask.is_some());
+    }
+
+    #[test]
+    fn projected_mm_budget_venue_cap_prepass_ignores_absent_or_zero_venue_cap() {
+        let cfg = Config::default();
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].position_tao = 0.02;
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.recompute_after_fills(&cfg);
+
+        for venue_cap in [None, Some(0.0)] {
+            let mut quotes = vec![projected_budget_test_quote(0, "extended")];
+            let status = apply_projected_mm_budget_to_quotes(
+                &cfg,
+                &state,
+                0,
+                InventoryBrakeLimits {
+                    max_position_tao: Some(1.0),
+                    max_gross_position_tao: None,
+                    max_abs_venue_position_tao: venue_cap,
+                },
+                &mut quotes,
+            );
+
+            assert!(status.configured);
+            assert!(!status.applied);
+            assert!(status.suppressed_venues.is_empty());
+            assert!(status.venues.is_empty());
+            assert!(quotes[0].bid.is_some());
+            assert!(quotes[0].ask.is_some());
+        }
+    }
+
+    #[test]
+    fn projected_mm_budget_prepass_unmanaged_cleanup_survives_early_return() {
+        let mut cfg = Config::default();
+        cfg.mm
+            .venue_role_by_venue
+            .insert("lighter".to_string(), MmVenueRole::Fill);
+        cfg.mm
+            .max_quote_size_tao_by_venue
+            .insert("lighter".to_string(), 0.01);
+        let mut state = GlobalState::new(&cfg);
+        let lighter = cfg
+            .venues
+            .iter()
+            .position(|venue| venue.id.eq_ignore_ascii_case("lighter"))
+            .expect("lighter venue");
+        state.venues[lighter].position_tao = -0.02;
+        state.live_order_state.apply_execution_event(
+            &ExecutionEvent::OrderAck(OrderAck {
+                venue_index: lighter,
+                venue_id: cfg.venues[lighter].id_arc.clone(),
+                order_id: "lighter_unmanaged_ask".to_string(),
+                client_order_id: Some("co_lighter_unmanaged_ask".to_string()),
+                seq: Some(1),
+                side: Some(Side::Sell),
+                price: Some(2_001.0),
+                size: Some(0.01),
+                purpose: Some(OrderPurpose::Mm),
+            }),
+            1_000,
+        );
+        state.venues[lighter].mm_open_ask = None;
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.recompute_after_fills(&cfg);
+        let mut quotes = vec![projected_budget_test_quote(lighter, "lighter")];
+
+        let status = apply_projected_mm_budget_to_quotes(
+            &cfg,
+            &state,
+            2_000,
+            InventoryBrakeLimits {
+                max_position_tao: None,
+                max_gross_position_tao: None,
+                max_abs_venue_position_tao: Some(0.02),
+            },
+            &mut quotes,
+        );
+        assert_eq!(status.venues.len(), 1);
+        assert!(status.venues[0].suppress_ask);
+        assert!(quotes[0].ask.is_none());
+
+        let mut intents = Vec::new();
+        let appended = append_projected_mm_budget_unmanaged_suppression_cancels(
+            &cfg,
+            &state,
+            &status,
+            2_000,
+            &mut intents,
+        );
+
+        assert_eq!(appended, 1);
+        assert!(matches!(
+            &intents[0],
+            OrderIntent::Cancel(cancel)
+                if cancel.venue_index == lighter
+                    && cancel.order_id == "lighter_unmanaged_ask"
+        ));
     }
 
     #[test]
