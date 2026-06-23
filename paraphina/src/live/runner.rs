@@ -11392,6 +11392,20 @@ fn projected_exposure_within_limits(
             .is_none_or(|limit| projection.q_max_abs_venue_tao <= limit + 1e-9)
 }
 
+fn projected_exposure_inside_live_admission_limits(
+    projection: &ProjectedExposureView,
+    limits: InventoryBrakeLimits,
+) -> bool {
+    limits
+        .max_position_tao
+        .is_none_or(|limit| projection.q_global_tao.abs() + 1e-9 < limit)
+        && limits
+            .max_gross_position_tao
+            .is_none_or(|limit| projection.q_gross_tao + 1e-9 < limit)
+        && limits
+            .max_abs_venue_position_tao
+            .is_none_or(|limit| projection.q_max_abs_venue_tao + 1e-9 < limit)
+}
 
 fn projected_venue_cap_would_breach(
     state: &GlobalState,
@@ -11416,7 +11430,7 @@ fn projected_venue_cap_would_breach(
         Side::Buy => venue.position_tao + same_side_exposure_tao,
         Side::Sell => venue.position_tao - same_side_exposure_tao,
     };
-    projected_position_tao.abs() > venue_limit_tao + 1e-9
+    projected_position_tao.abs() + 1e-9 >= venue_limit_tao
 }
 
 fn apply_projected_venue_cap_prepass_to_quotes(
@@ -11663,7 +11677,7 @@ fn apply_projected_mm_budget_to_quotes(
             ask_after,
             ProjectedExposureSource::RawState,
         );
-        if projected_exposure_within_limits(&projection_after, limits) {
+        if projected_exposure_inside_live_admission_limits(&projection_after, limits) {
             selected.insert(candidate.venue_index);
             projected_bid_sizes = projection_after.bid_sizes_tao;
             projected_ask_sizes = projection_after.ask_sizes_tao;
@@ -23013,7 +23027,6 @@ mod tests {
         assert!((projected_gross_position_tao(&state) - 0.05).abs() < 1e-9);
     }
 
-
     fn projected_budget_test_quote(venue_index: usize, venue_id: &str) -> MmQuote {
         MmQuote {
             venue_index,
@@ -23114,11 +23127,8 @@ mod tests {
     }
 
     #[test]
-    fn projected_mm_budget_allows_exact_venue_cap_touch_for_non_fill_role() {
-        let mut cfg = Config::default();
-        cfg.mm
-            .venue_role_by_venue
-            .insert("extended".to_string(), MmVenueRole::Probationary);
+    fn projected_mm_budget_suppresses_exact_venue_cap_touch() {
+        let cfg = Config::default();
         let mut state = GlobalState::new(&cfg);
         state.venues[0].position_tao = 0.01;
         state.fair_value = Some(2_000.0);
@@ -23139,11 +23149,16 @@ mod tests {
         );
 
         assert!(status.configured);
-        assert!(!status.applied);
-        assert!(status.suppressed_venues.is_empty());
-        assert!(status.venues.is_empty());
-        assert!(quotes[0].bid.is_some());
+        assert!(status.applied);
+        assert_eq!(status.suppressed_venues, vec!["extended".to_string()]);
+        assert!(status.venues[0].suppress_bid);
+        assert!(!status.venues[0].suppress_ask);
+        assert!(quotes[0].bid.is_none());
         assert!(quotes[0].ask.is_some());
+        assert_eq!(
+            quotes[0].bid_terminal_reason,
+            "projected_venue_cap_suppressed"
+        );
     }
 
     #[test]
@@ -23322,6 +23337,63 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn projected_mm_budget_suppresses_inventory_increasing_sides_when_gross_touch_would_reach_cap()
+    {
+        let mut cfg = Config::default();
+        for venue in &cfg.venues {
+            cfg.mm
+                .venue_role_by_venue
+                .insert(venue.id.clone(), MmVenueRole::Fill);
+            cfg.mm
+                .max_quote_size_tao_by_venue
+                .insert(venue.id.clone(), 0.01);
+        }
+        let mut state = GlobalState::new(&cfg);
+        state.venues[0].position_tao = 0.02;
+        state.venues[1].position_tao = -0.02;
+        state.fair_value = Some(2_000.0);
+        state.fair_value_prev = 2_000.0;
+        state.recompute_after_fills(&cfg);
+
+        assert!((gross_position_tao(&state) - 0.04).abs() < 1e-9);
+
+        let mut quotes = cfg
+            .venues
+            .iter()
+            .enumerate()
+            .map(|(venue_index, venue)| projected_budget_test_quote(venue_index, &venue.id))
+            .collect::<Vec<_>>();
+
+        let status = apply_projected_mm_budget_to_quotes(
+            &cfg,
+            &state,
+            0,
+            InventoryBrakeLimits {
+                max_position_tao: Some(0.08),
+                max_gross_position_tao: Some(0.05),
+                max_abs_venue_position_tao: Some(0.05),
+            },
+            &mut quotes,
+        );
+
+        assert!(status.configured);
+        assert!(status.applied);
+        assert!(status.selected_venues.is_empty());
+        assert_eq!(status.suppressed_venues.len(), cfg.venues.len());
+        assert!((status.projected_q_gross_after_tao - 0.04).abs() < 1e-9);
+        assert!(status.budget_after_within_limits);
+
+        assert!(quotes[0].bid.is_none());
+        assert!(quotes[0].ask.is_some());
+        assert!(quotes[1].bid.is_some());
+        assert!(quotes[1].ask.is_none());
+        for quote in quotes.iter().skip(2) {
+            assert!(quote.bid.is_none());
+            assert!(quote.ask.is_none());
+        }
     }
 
     #[test]
@@ -23631,17 +23703,12 @@ mod tests {
 
         assert!(projected_mm_budget.projected_q_gross_before_tao > 0.06);
         assert!(projected_mm_budget.projected_q_global_before_tao < -0.06);
-        assert!(projected_mm_budget.budget_after_within_limits);
-        assert_eq!(projected_mm_budget.selected_venues.len(), 2);
+        assert!(!projected_mm_budget.budget_after_within_limits);
+        assert_eq!(projected_mm_budget.selected_venues.len(), 0);
         assert_eq!(
             projected_mm_budget.suppressed_venues.len(),
-            cfg.venues.len() - 2
+            cfg.venues.len()
         );
-        assert!(projected_mm_budget
-            .venues
-            .iter()
-            .any(|venue| { !venue.selected && venue.cancel_covered_live_ask_tao >= 0.03 - 1e-9 }));
-
         let mut intents = Vec::new();
         let appended = append_projected_mm_budget_unmanaged_suppression_cancels(
             &cfg,
