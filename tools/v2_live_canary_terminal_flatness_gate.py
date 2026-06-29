@@ -414,6 +414,9 @@ def _run_completion_report(
         "trade_mode": None,
         "ticks_run": None,
         "run_duration_ms": None,
+        "kill_events": None,
+        "venue_disabled_events": None,
+        "venue_staleness_events": None,
         "min_ticks_run": min_ticks_run,
         "min_run_duration_ms": min_run_duration_ms,
         "live_completed_cleanly": False,
@@ -470,9 +473,16 @@ def _run_completion_report(
     report["trade_mode"] = summary.get("trade_mode")
     report["ticks_run"] = _as_int(summary.get("ticks_run"))
     report["run_duration_ms"] = _as_int(summary.get("run_duration_ms"))
+    report["kill_events"] = _as_int(summary.get("kill_events"))
+    report["venue_disabled_events"] = _as_int(summary.get("venue_disabled_events"))
+    report["venue_staleness_events"] = _as_int(summary.get("venue_staleness_events"))
     if promotion_cleanup_strict:
         if summary.get("execution_mode") != "live" or summary.get("trade_mode") != "live":
             reasons.append("run_completion_summary_not_live")
+        if report["kill_events"] is None:
+            reasons.append("run_completion_kill_events_missing")
+        elif report["kill_events"] != 0:
+            reasons.append("run_completion_kill_events_present")
         if min_ticks_run is not None and (
             report["ticks_run"] is None or report["ticks_run"] < min_ticks_run
         ):

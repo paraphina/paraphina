@@ -147,6 +147,7 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
                         "trade_mode": "live",
                         "ticks_run": 2400,
                         "run_duration_ms": 600000,
+                        "kill_events": 0,
                     },
                 )
             for idx, order_path_coverage in enumerate(order_path_coverages or []):
@@ -1000,6 +1001,48 @@ class TestV2LiveCanaryTerminalFlatnessGate(unittest.TestCase):
         self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
         self.assertIn("run_completion_exit_code_missing", report["terminal_flatness_gate_reasons"])
         self.assertEqual(report["closeout_status"]["run_completion_status"], "HOLD")
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+
+    def test_promotion_cleanup_strict_holds_on_same_run_kill_event(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_summary={
+                "execution_mode": "live",
+                "trade_mode": "live",
+                "ticks_run": 2400,
+                "run_duration_ms": 600000,
+                "kill_events": 1,
+                "venue_staleness_events": 29,
+            },
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "run_completion_kill_events_present",
+            report["terminal_flatness_gate_reasons"],
+        )
+        self.assertEqual(report["run_completion"]["kill_events"], 1)
+        self.assertEqual(report["run_completion"]["venue_staleness_events"], 29)
+        self.assertFalse(report["closeout_status"]["promotion_ready"])
+
+    def test_promotion_cleanup_strict_requires_same_run_kill_event_count(self):
+        report = self.evaluate(
+            audit_doc(),
+            live_summary={
+                "execution_mode": "live",
+                "trade_mode": "live",
+                "ticks_run": 2400,
+                "run_duration_ms": 600000,
+            },
+            promotion_cleanup_strict=True,
+        )
+
+        self.assertEqual(report["terminal_flatness_gate_status"], "HOLD")
+        self.assertIn(
+            "run_completion_kill_events_missing",
+            report["terminal_flatness_gate_reasons"],
+        )
         self.assertFalse(report["closeout_status"]["promotion_ready"])
 
     def test_promotion_cleanup_strict_holds_on_nonzero_same_run_exit_code(self):

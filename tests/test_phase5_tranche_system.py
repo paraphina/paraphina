@@ -143,6 +143,29 @@ def _minimal_control_pack():
     }
 
 
+def _clean_direct_venue_audit():
+    return {
+        "ok": True,
+        "position_tol_base": 0.0025,
+        "max_open_orders": 0,
+        "allow_unknown_open_orders": False,
+        "violations": [],
+        "results": [
+            {
+                "venue": venue,
+                "market": "ETH",
+                "position_base": 0.0,
+                "open_order_count": 0,
+                "open_order_count_known": True,
+                "ok": True,
+                "violations": [],
+                "errors": [],
+            }
+            for venue in ["hyperliquid", "lighter", "extended", "aster", "paradex"]
+        ],
+    }
+
+
 class TestPhase5TrancheSystem(unittest.TestCase):
     def setUp(self):
         self.mod = _load_module()
@@ -520,6 +543,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_active_state_post": "active",
                     "systemd_sub_state_post": "running",
@@ -1426,6 +1451,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_nrestarts_post": "0",
                 }
@@ -1451,6 +1478,156 @@ class TestPhase5TrancheSystem(unittest.TestCase):
         self.assertFalse(autoscore["clean"]["passed"])
         self.assertIn("guard_intervened", {rule["path"] for rule in autoscore["clean"]["failed_rules"]})
 
+    def test_autoscore_default_clean_rules_fail_reconcile_mismatch(self):
+        tranche = _minimal_queue()["serialized_mainline"][0]
+        run_root = self.repo_root / "promotion_runs" / "default_reconcile_mismatch"
+        run_root.mkdir(parents=True, exist_ok=True)
+        (run_root / "live_closeout_bundle.json").write_text(
+            json.dumps(
+                {
+                    "summary_exists": True,
+                    "report_exists": True,
+                    "metrics_exists": True,
+                    "guard_result_exists": True,
+                    "health_post_complete": True,
+                    "systemd_post_complete": True,
+                    "closeout_contract_complete": True,
+                    "guard_intervened": False,
+                    "guard_window_completed": True,
+                    "first_pre_restore_venue_audit_clean": True,
+                    "pre_restore_cleanup_required": False,
+                    "pre_restore_venue_audit_clean": True,
+                    "post_rollback_venue_audit_clean": True,
+                    "healthy_post": True,
+                    "ready_post": True,
+                    "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 1,
+                    "account_unavailable_reconcile_drift_count": 0,
+                    "trade_mode_post": "shadow",
+                    "systemd_nrestarts_post": "0",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_root / "live_segment_summary.json").write_text("{}", encoding="utf-8")
+        (run_root / "live_metrics.json").write_text("{}", encoding="utf-8")
+        (run_root / "telemetry_report_live_segment.md").write_text("report\n", encoding="utf-8")
+        (run_root / "guard_result.json").write_text(json.dumps({"exit_code": 0}), encoding="utf-8")
+        (run_root / "health_post.json").write_text(json.dumps({"healthy": True}), encoding="utf-8")
+        (run_root / "systemd_post.txt").write_text("NRestarts=0\n", encoding="utf-8")
+
+        autoscore = self.mod.autoscore_run(
+            tranche,
+            _minimal_control_pack(),
+            run_root,
+            300,
+            self.repo_root,
+        )
+
+        failed_paths = {rule["path"] for rule in autoscore["clean"]["failed_rules"]}
+        self.assertFalse(autoscore["clean"]["passed"])
+        self.assertIn("reconcile_mismatch_count_post", failed_paths)
+        self.assertEqual(autoscore["suggested_action"], "hold")
+
+    def test_autoscore_default_clean_rules_fail_account_unavailable_drift(self):
+        tranche = _minimal_queue()["serialized_mainline"][0]
+        run_root = self.repo_root / "promotion_runs" / "default_account_unavailable"
+        run_root.mkdir(parents=True, exist_ok=True)
+        (run_root / "live_closeout_bundle.json").write_text(
+            json.dumps(
+                {
+                    "summary_exists": True,
+                    "report_exists": True,
+                    "metrics_exists": True,
+                    "guard_result_exists": True,
+                    "health_post_complete": True,
+                    "systemd_post_complete": True,
+                    "closeout_contract_complete": True,
+                    "guard_intervened": False,
+                    "guard_window_completed": True,
+                    "first_pre_restore_venue_audit_clean": True,
+                    "pre_restore_cleanup_required": False,
+                    "pre_restore_venue_audit_clean": True,
+                    "post_rollback_venue_audit_clean": True,
+                    "healthy_post": True,
+                    "ready_post": True,
+                    "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "trade_mode_post": "shadow",
+                    "systemd_nrestarts_post": "0",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_root / "reconcile_drift.jsonl").write_text(
+            json.dumps(
+                {
+                    "kind": "account_unavailable",
+                    "source": "account_snapshot",
+                    "venue_id": "all",
+                    "available": False,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (run_root / "live_segment_summary.json").write_text("{}", encoding="utf-8")
+        (run_root / "live_metrics.json").write_text("{}", encoding="utf-8")
+        (run_root / "telemetry_report_live_segment.md").write_text("report\n", encoding="utf-8")
+        (run_root / "guard_result.json").write_text(json.dumps({"exit_code": 0}), encoding="utf-8")
+        (run_root / "health_post.json").write_text(json.dumps({"healthy": True}), encoding="utf-8")
+        (run_root / "systemd_post.txt").write_text("NRestarts=0\n", encoding="utf-8")
+
+        closeout = self.mod.load_closeout_bundle(run_root)
+        autoscore = self.mod.autoscore_run(
+            tranche,
+            _minimal_control_pack(),
+            run_root,
+            300,
+            self.repo_root,
+        )
+
+        failed_paths = {rule["path"] for rule in autoscore["clean"]["failed_rules"]}
+        self.assertEqual(closeout["account_unavailable_reconcile_drift_count"], 1)
+        self.assertFalse(autoscore["clean"]["passed"])
+        self.assertIn("account_unavailable_reconcile_drift_count", failed_paths)
+        self.assertEqual(autoscore["suggested_action"], "hold")
+
+    def test_load_closeout_bundle_reconcile_drift_file_overrides_stale_embedded_zero(self):
+        run_root = self.repo_root / "promotion_runs" / "stale_account_unavailable_zero"
+        run_root.mkdir(parents=True, exist_ok=True)
+        (run_root / "live_closeout_bundle.json").write_text(
+            json.dumps(
+                {
+                    "summary_exists": True,
+                    "account_unavailable_reconcile_drift_count": 0,
+                    "total_reconcile_drift_count": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_root / "reconcile_drift.jsonl").write_text(
+            json.dumps({"kind": "account_unavailable", "venue_id": "aster", "available": False}) + "\n",
+            encoding="utf-8",
+        )
+
+        closeout = self.mod.load_closeout_bundle(run_root)
+
+        self.assertEqual(closeout["total_reconcile_drift_count"], 1)
+        self.assertEqual(closeout["account_unavailable_reconcile_drift_count"], 1)
+
+    def test_direct_venue_audit_clean_requires_expected_venue_set_when_provided(self):
+        payload = _clean_direct_venue_audit()
+        payload["results"] = [payload["results"][0]]
+
+        clean, reasons = self.mod.direct_venue_audit_clean(
+            payload,
+            expected_venues={"hyperliquid", "lighter", "extended", "aster", "paradex"},
+        )
+
+        self.assertFalse(clean)
+        self.assertIn("audit missing expected venues: aster,extended,lighter,paradex", reasons)
+
     def test_autoscore_blocks_clean_continue_when_restore_cleanup_was_required(self):
         tranche = _minimal_queue()["serialized_mainline"][0]
         run_root = self.repo_root / "promotion_runs" / "restore_cleanup_required"
@@ -1471,6 +1648,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_active_state_post": "active",
                     "systemd_sub_state_post": "running",
@@ -1552,6 +1731,7 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_nrestarts_post": "0",
                     "reconcile_mismatch_count_post": 1,
@@ -1622,6 +1802,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_nrestarts_post": "0",
                 }
@@ -2153,7 +2335,10 @@ class TestPhase5TrancheSystem(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (run_root / "direct_venue_audit_post_20260422T1308Z.json").write_text("{}", encoding="utf-8")
+        (run_root / "direct_venue_audit_post_20260422T1308Z.json").write_text(
+            json.dumps(_clean_direct_venue_audit()),
+            encoding="utf-8",
+        )
 
         lineage_root = self.repo_root / "promotion_runs" / "lineage_live"
         lineage_root.mkdir(parents=True, exist_ok=True)
@@ -2338,6 +2523,125 @@ class TestPhase5TrancheSystem(unittest.TestCase):
         self.assertEqual(spec["completion_standard"]["non_hyperliquid_fill_venues_in_final_soak"], 3)
         self.assertEqual(spec["closeout_disposition"]["verdict"], "hold")
 
+    def test_build_reopened_final_topology_spec_holds_on_partial_final_direct_venue_audit(self):
+        exact_overlay = self.repo_root / "exact_surface_stage_overlay.env"
+        exact_overlay.write_text(
+            "\n".join(
+                [
+                    "PARAPHINA_LIVE_CONNECTORS=hyperliquid,lighter,extended,aster,paradex",
+                    "PARAPHINA_FV_DISABLED_VENUES=",
+                    "PARAPHINA_EXCLUDED_VENUES=",
+                    "PARAPHINA_MM_VENUE_ROLE_HYPERLIQUID=fill",
+                    "PARAPHINA_MM_VENUE_ROLE_LIGHTER=fill",
+                    "PARAPHINA_MM_VENUE_ROLE_EXTENDED=fill",
+                    "PARAPHINA_MM_VENUE_ROLE_ASTER=fill",
+                    "PARAPHINA_MM_VENUE_ROLE_PARADEX=fill",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        exact_runtime = self.repo_root / "target" / "release" / "paraphina_live"
+        exact_runtime.parent.mkdir(parents=True, exist_ok=True)
+        exact_runtime.write_text("bin", encoding="utf-8")
+        control_pack = _minimal_control_pack()
+        source_tranche = _minimal_queue()["serialized_mainline"][0]
+        source_tranche["env_diff"] = {"stage_overlay_source": str(exact_overlay)}
+        source_tranche["candidate"]["runtime_binary"] = str(exact_runtime)
+        final_tranche = {"id": self.mod.REOPENED_FINAL_CLOSEOUT_ID}
+        run_root = self.repo_root / "promotion_runs" / "partial_direct_audit_final"
+        run_root.mkdir(parents=True, exist_ok=True)
+        (run_root / "live_segment_summary.json").write_text("{}", encoding="utf-8")
+        (run_root / "telemetry_report_live_segment.md").write_text("report\n", encoding="utf-8")
+        (run_root / "guard_result.json").write_text(json.dumps({"exit_code": 0}), encoding="utf-8")
+        (run_root / "live_closeout_bundle.json").write_text(
+            json.dumps(
+                {
+                    "segment_start_utc": "2026-04-22T11:08:18.000000Z",
+                    "segment_end_utc": "2026-04-22T13:08:18.000000Z",
+                    "tick_count": 28800,
+                    "fill_count_total": 20,
+                    "fill_base_total": 0.2,
+                    "guard_window_completed": True,
+                    "guard_exit_code": 0,
+                    "guard_intervened": False,
+                    "pre_restore_venue_audit_clean": True,
+                    "post_rollback_venue_audit_clean": True,
+                    "healthy_post": True,
+                    "ready_post": True,
+                    "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
+                    "systemd_nrestarts_post": 0,
+                    "trade_mode_post": "shadow",
+                    "summary_exists": True,
+                    "report_exists": True,
+                    "metrics_exists": True,
+                    "guard_result_exists": True,
+                    "health_post_complete": True,
+                    "systemd_post_complete": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_root / "live_metrics.json").write_text(
+            json.dumps(
+                {
+                    "execution_scorecard": {
+                        "hyperliquid": {"place_i": 1, "place_ack": 1, "cancel_i": 1, "cancel_ack": 1, "fills": 1, "fill_base": 0.01},
+                        "lighter": {"place_i": 1, "place_ack": 1, "cancel_i": 1, "cancel_ack": 1, "fills": 4, "fill_base": 0.04},
+                        "extended": {"place_i": 1, "place_ack": 1, "cancel_i": 1, "cancel_ack": 1, "fills": 4, "fill_base": 0.04},
+                        "aster": {"place_i": 1, "place_ack": 1, "cancel_i": 1, "cancel_ack": 1, "fills": 4, "fill_base": 0.04},
+                        "paradex": {"place_i": 1, "place_ack": 1, "cancel_i": 1, "cancel_ack": 1, "fills": 7, "fill_base": 0.07},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_root / "balance_snapshot_comparison.json").write_text(
+            json.dumps(
+                {
+                    "exists": True,
+                    "venue_count": 5,
+                    "total": {
+                        "pre_usd": "317.00000000",
+                        "post_usd": "317.01000000",
+                        "delta_usd": "0.01000000",
+                        "abs_delta_usd_float": 0.01,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        partial_audit = _clean_direct_venue_audit()
+        partial_audit["results"] = [partial_audit["results"][0]]
+        (run_root / "direct_venue_audit_post_20260422T1308Z.json").write_text(
+            json.dumps(partial_audit),
+            encoding="utf-8",
+        )
+
+        spec = self.mod.build_reopened_final_topology_spec(
+            final_tranche,
+            source_tranche,
+            control_pack,
+            self.repo_root,
+            run_root,
+            lineage=None,
+        )
+
+        self.assertEqual(spec["status"], "hold_closeout")
+        self.assertFalse(spec["completion_standard"]["passed"])
+        self.assertFalse(spec["completion_standard"]["final_direct_venue_audit_clean"])
+        self.assertIn(
+            "audit missing expected venues: aster,extended,lighter,paradex",
+            spec["completion_standard"]["final_direct_venue_audit_reasons"],
+        )
+        self.assertFalse(spec["evidence"]["final_direct_venue_audit"]["ok"])
+        self.assertIn(
+            "audit missing expected venues: aster,extended,lighter,paradex",
+            spec["evidence"]["final_direct_venue_audit"]["reasons"],
+        )
+
     def test_write_manual_live_stage_contracts_emits_stage_contract_files(self):
         queue = _minimal_queue()
         tranche = queue["serialized_mainline"][0]
@@ -2369,6 +2673,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_nrestarts_post": "0",
                 }
@@ -4042,6 +4348,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_active_state_post": "active",
                     "systemd_sub_state_post": "running",
@@ -6675,6 +6983,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_active_state_post": "active",
                     "systemd_sub_state_post": "running",
@@ -6794,6 +7104,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                         "healthy_post": True,
                         "ready_post": True,
                         "kill_events_present_post": False,
+                        "reconcile_mismatch_count_post": 0,
+                        "account_unavailable_reconcile_drift_count": 0,
                         "trade_mode_post": "shadow",
                         "systemd_active_state_post": "active",
                         "systemd_sub_state_post": "running",
@@ -7016,6 +7328,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_nrestarts_post": "0",
                 }
@@ -7108,6 +7422,8 @@ class TestPhase5TrancheSystem(unittest.TestCase):
                     "healthy_post": True,
                     "ready_post": True,
                     "kill_events_present_post": False,
+                    "reconcile_mismatch_count_post": 0,
+                    "account_unavailable_reconcile_drift_count": 0,
                     "trade_mode_post": "shadow",
                     "systemd_nrestarts_post": "0",
                 }

@@ -261,6 +261,8 @@ DEFAULT_AUTOSCORE_RULES = {
         {"source": "closeout", "path": "healthy_post", "op": "==", "value": True, "severity": "fail"},
         {"source": "closeout", "path": "ready_post", "op": "==", "value": True, "severity": "fail"},
         {"source": "closeout", "path": "kill_events_present_post", "op": "==", "value": False, "severity": "fail"},
+        {"source": "closeout", "path": "reconcile_mismatch_count_post", "op": "==", "value": 0, "severity": "fail"},
+        {"source": "closeout", "path": "account_unavailable_reconcile_drift_count", "op": "==", "value": 0, "severity": "fail"},
         {"source": "closeout", "path": "trade_mode_post", "op": "==", "value": "shadow", "severity": "fail"},
         {"source": "closeout", "path": "systemd_nrestarts_post", "op": "==", "value": "0", "severity": "fail"},
     ],
@@ -2219,6 +2221,31 @@ def load_json_payload_with_path(path: Path | None) -> dict[str, Any]:
     return payload
 
 
+def reconcile_drift_counts(path: Path | None) -> dict[str, int]:
+    counts = {
+        "total_reconcile_drift_count": 0,
+        "account_unavailable_reconcile_drift_count": 0,
+    }
+    if path is None or not path.exists():
+        return counts
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                counts["total_reconcile_drift_count"] += 1
+                continue
+            if not isinstance(row, dict):
+                counts["total_reconcile_drift_count"] += 1
+                continue
+            counts["total_reconcile_drift_count"] += 1
+            if row.get("kind") == "account_unavailable":
+                counts["account_unavailable_reconcile_drift_count"] += 1
+    return counts
+
+
 def venue_scorecard(metrics: dict[str, Any], venue: str) -> dict[str, Any]:
     scorecard = metrics.get("execution_scorecard")
     if not isinstance(scorecard, dict):
@@ -2348,6 +2375,12 @@ def build_reopened_final_topology_spec(
         }
 
     final_direct_audit_path = latest_direct_venue_audit_post_path(run_root)
+    final_direct_audit_payload = load_json_payload_with_path(final_direct_audit_path)
+    final_direct_audit_clean, final_direct_audit_reasons = direct_venue_audit_clean(
+        final_direct_audit_payload,
+        expected_venues=venues,
+    )
+    final_direct_audit_clean = bool(final_direct_audit_payload.get("exists")) and final_direct_audit_clean
     non_hyperliquid_fill_venues = sum(
         1 for venue, payload in final_fills.items() if venue != "hyperliquid" and safe_int(payload["fill_count"]) > 0
     )
@@ -2376,9 +2409,14 @@ def build_reopened_final_topology_spec(
             and closeout.get("post_rollback_venue_audit_clean")
             and not closeout.get("kill_events_present_post")
             and safe_int(closeout.get("reconcile_mismatch_count_post")) == 0
+            and safe_int(closeout.get("account_unavailable_reconcile_drift_count")) == 0
             and str(closeout.get("trade_mode_post") or "") == "shadow"
         ),
-        "final_direct_venue_audit_clean": bool(closeout.get("post_rollback_venue_audit_clean")),
+        "final_direct_venue_audit_exists": bool(final_direct_audit_payload.get("exists")),
+        "final_direct_venue_audit_clean": bool(
+            closeout.get("post_rollback_venue_audit_clean") and final_direct_audit_clean
+        ),
+        "final_direct_venue_audit_reasons": final_direct_audit_reasons,
     }
     completion_standard_passed = bool(
         completion_standard["no_connector_excluded_for_unresolved_defect"]
@@ -2408,6 +2446,9 @@ def build_reopened_final_topology_spec(
             "guard_intervened": bool(closeout.get("guard_intervened")),
             "kill_events_present_post": bool(closeout.get("kill_events_present_post")),
             "reconcile_mismatch_count_post": safe_int(closeout.get("reconcile_mismatch_count_post")),
+            "account_unavailable_reconcile_drift_count": safe_int(
+                closeout.get("account_unavailable_reconcile_drift_count")
+            ),
             "systemd_nrestarts_post": safe_int(closeout.get("systemd_nrestarts_post")),
             "trade_mode_post": closeout.get("trade_mode_post"),
             "final_pnl_total_usd": safe_float(closeout.get("final_pnl_total")),
@@ -2422,6 +2463,12 @@ def build_reopened_final_topology_spec(
                 "venue_count": balance_venue_count,
                 "total": balance_total,
             },
+            "final_direct_venue_audit": {
+                "path": final_direct_audit_payload.get("path"),
+                "exists": bool(final_direct_audit_payload.get("exists")),
+                "clean": bool(final_direct_audit_clean),
+                "reasons": final_direct_audit_reasons,
+            },
         }
     }
     if lineage_payload is not None:
@@ -2429,7 +2476,9 @@ def build_reopened_final_topology_spec(
     if final_direct_audit_path is not None:
         evidence["final_direct_venue_audit"] = {
             "path": str(final_direct_audit_path),
-            "ok": True,
+            "exists": bool(final_direct_audit_payload.get("exists")),
+            "ok": bool(final_direct_audit_clean),
+            "reasons": final_direct_audit_reasons,
             "max_open_orders": 0,
             "position_tol_base": 0.0025,
         }
@@ -2754,14 +2803,18 @@ def record_result(
     else:
         history_entry["state_sync_blocked_promotion"] = False
     queue[section][index]["status"] = status_map[effective_decision]
-    child_activation_allowed = (
-        True
-        if effective_decision == "promote"
-        else fail_child_activation_allowed(tranche, observed_blocker_family, precondition_failed)
-    )
-    next_target = tranche.get("next_if_pass") if effective_decision == "promote" else (
-        tranche_fail_child_target(tranche, observed_blocker_family) if child_activation_allowed else None
-    )
+    if requested_decision == "promote" and state_sync_blocked:
+        child_activation_allowed = False
+        next_target = None
+    else:
+        child_activation_allowed = (
+            True
+            if effective_decision == "promote"
+            else fail_child_activation_allowed(tranche, observed_blocker_family, precondition_failed)
+        )
+        next_target = tranche.get("next_if_pass") if effective_decision == "promote" else (
+            tranche_fail_child_target(tranche, observed_blocker_family) if child_activation_allowed else None
+        )
     if should_suppress_reopened_long_soak_fail_loop(
         queue,
         tranche,
@@ -4468,6 +4521,7 @@ def recover_live_closeout(
         ):
             if key in economics_attribution:
                 closeout_economics_attribution[key] = economics_attribution[key]
+    reconcile_counts = reconcile_drift_counts(run_root / "reconcile_drift.jsonl")
     latest_history = latest_history_entry(tranche) or {}
     surface_id = safe_tranche_surface_id(tranche, control_pack, repo_root)
     closeout_bundle = {
@@ -4534,6 +4588,8 @@ def recover_live_closeout(
         "ready_post": health_post_payload.get("ready"),
         "kill_events_present_post": health_post_payload.get("kill_events_present"),
         "reconcile_mismatch_count_post": health_post_payload.get("reconcile_mismatch_count"),
+        "total_reconcile_drift_count": reconcile_counts["total_reconcile_drift_count"],
+        "account_unavailable_reconcile_drift_count": reconcile_counts["account_unavailable_reconcile_drift_count"],
         "systemd_active_state_post": systemd_post.get("ActiveState"),
         "systemd_sub_state_post": systemd_post.get("SubState"),
         "systemd_nrestarts_post": systemd_post.get("NRestarts"),
@@ -4660,17 +4716,27 @@ def direct_venue_audit_clean(
     *,
     position_tol_base: float = 0.0025,
     max_open_orders: int = 0,
+    expected_venues: list[str] | set[str] | tuple[str, ...] | None = None,
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     if not isinstance(payload, dict):
         return False, ["audit payload is not an object"]
+    if payload.get("ok") is not True:
+        reasons.append("audit ok is not true")
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        reasons.append("audit results missing")
+        results = []
+    expected = {str(venue).lower() for venue in (expected_venues or []) if str(venue)}
+    observed: set[str] = set()
     for violation in payload.get("violations") or []:
         reasons.append(str(violation))
-    for item in payload.get("results") or []:
+    for item in results:
         if not isinstance(item, dict):
             reasons.append("audit result entry is not an object")
             continue
-        venue = str(item.get("venue") or "unknown")
+        venue = str(item.get("venue") or "unknown").lower()
+        observed.add(venue)
         if item.get("ok") is not True:
             reasons.append(f"{venue}: ok is not true")
         try:
@@ -4690,6 +4756,13 @@ def direct_venue_audit_clean(
             open_orders = 0
         if open_orders > max_open_orders:
             reasons.append(f"{venue}: open_order_count={open_orders} > {max_open_orders}")
+    if expected:
+        missing = sorted(expected - observed)
+        unexpected = sorted(observed - expected)
+        if missing:
+            reasons.append(f"audit missing expected venues: {','.join(missing)}")
+        if unexpected:
+            reasons.append(f"audit contains unexpected venues: {','.join(unexpected)}")
     return not reasons, reasons
 
 
@@ -7041,6 +7114,19 @@ def load_closeout_bundle(run_root: Path | None) -> dict[str, Any]:
     closeout["report_exists"] = bool(closeout.get("report_exists")) or (run_root / "telemetry_report_live_segment.md").exists()
     closeout["metrics_exists"] = bool(closeout.get("metrics_exists")) or (run_root / "live_metrics.json").exists()
     closeout["guard_result_exists"] = bool(closeout.get("guard_result_exists")) or (run_root / "guard_result.json").exists()
+    reconcile_drift_path = run_root / "reconcile_drift.jsonl"
+    reconcile_counts = reconcile_drift_counts(reconcile_drift_path)
+    if reconcile_drift_path.exists():
+        closeout["total_reconcile_drift_count"] = reconcile_counts["total_reconcile_drift_count"]
+        closeout["account_unavailable_reconcile_drift_count"] = reconcile_counts[
+            "account_unavailable_reconcile_drift_count"
+        ]
+    else:
+        closeout.setdefault("total_reconcile_drift_count", reconcile_counts["total_reconcile_drift_count"])
+        closeout.setdefault(
+            "account_unavailable_reconcile_drift_count",
+            reconcile_counts["account_unavailable_reconcile_drift_count"],
+        )
     closeout["closeout_contract_complete"] = bool(
         closeout.get("summary_exists")
         and closeout.get("report_exists")
