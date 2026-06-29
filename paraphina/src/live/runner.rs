@@ -3757,6 +3757,18 @@ fn finalize_open_order_reconcile_drift(
     });
 }
 
+fn should_emit_account_unavailable_reconcile_drift(
+    audit_account_unavailable_after_drain: bool,
+    startup_pnl_baseline_cfg: StartupPnlBaselineConfig,
+    startup_pnl_baseline_resolved: bool,
+    startup_pnl_baseline_wait_ticks: u64,
+) -> bool {
+    audit_account_unavailable_after_drain
+        && (!startup_pnl_baseline_cfg.enabled
+            || startup_pnl_baseline_resolved
+            || startup_pnl_baseline_wait_ticks >= startup_pnl_baseline_cfg.max_wait_ticks)
+}
+
 fn open_order_diff_count(internal_orders: &[String], venue_orders: &[String]) -> usize {
     internal_orders
         .iter()
@@ -5068,7 +5080,12 @@ pub async fn run_live_loop(
 
         let event_drain_elapsed_us = tick_start.elapsed().as_micros() as u64;
 
-        if audit_account_unavailable_after_drain {
+        if should_emit_account_unavailable_reconcile_drift(
+            audit_account_unavailable_after_drain,
+            startup_pnl_baseline_cfg,
+            startup_pnl_baseline_resolved,
+            startup_pnl_baseline_wait_ticks,
+        ) {
             let has_fresh_snapshot = last_account_snapshot_ms
                 .iter()
                 .enumerate()
@@ -30646,6 +30663,53 @@ mod tests {
         assert_eq!(aster_attr.reject_count, 1);
         assert_eq!(aster_attr.mm_reject_count, 0);
         assert_eq!(aster_attr.benign_reduce_only_reject_count, 1);
+    }
+
+    #[test]
+    fn account_unavailable_drift_is_suppressed_only_during_startup_warmup() {
+        let startup_cfg = StartupPnlBaselineConfig {
+            enabled: true,
+            pnl_abs_limit_usd: 1.0,
+            position_tol_tao: 0.0025,
+            max_wait_ticks: 40,
+            require_full_account_coverage: false,
+        };
+
+        assert!(!should_emit_account_unavailable_reconcile_drift(
+            true,
+            startup_cfg,
+            false,
+            39
+        ));
+        assert!(should_emit_account_unavailable_reconcile_drift(
+            true,
+            startup_cfg,
+            false,
+            40
+        ));
+        assert!(should_emit_account_unavailable_reconcile_drift(
+            true,
+            startup_cfg,
+            true,
+            0
+        ));
+        assert!(!should_emit_account_unavailable_reconcile_drift(
+            false,
+            startup_cfg,
+            true,
+            40
+        ));
+
+        let disabled_startup_cfg = StartupPnlBaselineConfig {
+            enabled: false,
+            ..startup_cfg
+        };
+        assert!(should_emit_account_unavailable_reconcile_drift(
+            true,
+            disabled_startup_cfg,
+            false,
+            0
+        ));
     }
 
     #[test]
